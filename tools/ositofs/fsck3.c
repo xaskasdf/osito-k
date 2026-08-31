@@ -16,6 +16,8 @@ static uint8_t *block_bitmap;
 static uint8_t *reachable;
 static uint8_t *claimed_blocks;
 static uint8_t *raw_claimed_blocks;
+static uint32_t *block_owner;
+static char **inode_paths;
 static osfs3_inode_t *inode_table;
 static uint32_t errors;
 static uint32_t fatal_errors;
@@ -45,6 +47,14 @@ static int alloc_aligned(void **out, size_t bytes)
     if (posix_memalign(out, 4096, bytes) != 0) return -1;
     memset(*out, 0, bytes);
     return 0;
+}
+
+static char *copy_string(const char *value)
+{
+    size_t length = strlen(value) + 1;
+    char *copy = malloc(length);
+    if (copy) memcpy(copy, value, length);
+    return copy;
 }
 
 static int dentry_valid(const osfs3_dentry_t *entry, uint32_t remaining)
@@ -374,8 +384,17 @@ static int claim_inode_blocks(uint32_t ino)
             if (!bitmap_test(block_bitmap, block))
                 report("extent block missing from bitmap", block);
             if (bitmap_test(claimed_blocks, block)) {
-                report("data block claimed twice", block);
+                uint32_t first = block_owner[block];
+                fprintf(stderr,
+                        "fsck.ositofs3: data block claimed twice: %u "
+                        "(inode %u %s, inode %u %s)\n",
+                        block, first,
+                        first && inode_paths[first] ? inode_paths[first] : "?",
+                        ino, inode_paths[ino] ? inode_paths[ino] : "?");
+                errors++;
                 fatal_errors++;
+            } else {
+                block_owner[block] = ino;
             }
             bitmap_set(claimed_blocks, block);
         }
@@ -406,6 +425,7 @@ static void check_inode(uint32_t ino, uint32_t expected_parent,
             repairs++;
         }
     }
+    if (!inode_paths[ino]) inode_paths[ino] = copy_string(path ? path : "?");
     if (bitmap_test(reachable, ino)) return;
     bitmap_set(reachable, ino);
 
@@ -629,6 +649,9 @@ int main(int argc, char **argv)
         alloc_aligned((void **)&claimed_blocks, OSFS3_BLOCK_SIZE) < 0 ||
         alloc_aligned((void **)&raw_claimed_blocks, OSFS3_BLOCK_SIZE) < 0)
         return 1;
+    block_owner = calloc(superblock.total_blocks, sizeof(*block_owner));
+    inode_paths = calloc(superblock.total_inodes, sizeof(*inode_paths));
+    if (!block_owner || !inode_paths) return 1;
     if (osfs3_read_block(device_fd, OSFS3_INODE_BITMAP_BLK,
                          inode_bitmap) < 0 ||
         osfs3_read_block(device_fd, OSFS3_BLOCK_BITMAP_BLK,
@@ -720,6 +743,10 @@ int main(int argc, char **argv)
     if (repair_mode)
         printf("fsck.ositofs3: %u repair%s applied\n",
                repairs, repairs == 1 ? "" : "s");
+    for (uint32_t ino = 0; ino < superblock.total_inodes; ino++)
+        free(inode_paths[ino]);
+    free(inode_paths);
+    free(block_owner);
     osfs3_close_device(device_fd);
     return fatal_errors || (!repair_mode && errors) ? 1 : 0;
 }

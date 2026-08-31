@@ -15,6 +15,13 @@ typedef LONG HRESULT;
 
 HRESULT WINAPI DirectSoundCreate(LPCGUID lpcGuidDevice, PVOID *ppDS, PVOID pUnkOuter);
 HRESULT WINAPI DirectSoundEnumerateA(PVOID lpDSEnumCallback, PVOID lpContext);
+HRESULT WINAPI DirectSoundEnumerateW(PVOID lpDSEnumCallback, PVOID lpContext);
+HRESULT WINAPI DirectSoundCaptureCreate(LPCGUID lpcGuidDevice, PVOID *ppDSC,
+                                        PVOID pUnkOuter);
+HRESULT WINAPI DirectSoundCaptureEnumerateA(PVOID lpDSEnumCallback,
+                                             PVOID lpContext);
+HRESULT WINAPI DirectSoundCaptureEnumerateW(PVOID lpDSEnumCallback,
+                                             PVOID lpContext);
 
 PVOID dsound_shim_init(void);
 PVOID dsound_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);

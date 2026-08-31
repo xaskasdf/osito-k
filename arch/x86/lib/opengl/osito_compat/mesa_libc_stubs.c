@@ -146,6 +146,8 @@ typedef int once_flag; /* aliased to pthread_once_t  (int)                */
 
 typedef int (*thrd_start_t)(void *);
 
+static void tss_cleanup_current(void);
+
 /* C11 return codes (must match mesa/src/c11/threads.h enum). */
 #define thrd_success  0
 #define thrd_timedout 1
@@ -156,6 +158,7 @@ typedef int (*thrd_start_t)(void *);
 /* ---- syscall numbers + flags (Linux/OsitoK ABI) ---- */
 
 #define SYS_EXIT   60
+#define SYS_GETPID 39
 #define SYS_CLONE  56
 #define SYS_FUTEX  202
 #define SYS_GETTID 186
@@ -172,6 +175,7 @@ typedef int (*thrd_start_t)(void *);
 
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
+#define FUTEX_PRIVATE_FLAG 128
 
 extern long __syscall1(long n, long a);
 extern long __syscall2(long n, long a, long b);
@@ -179,7 +183,6 @@ extern long __syscall3(long n, long a, long b, long c);
 extern long __syscall4(long n, long a, long b, long c, long d);
 extern long __syscall6(long n, long a, long b, long c, long d, long e, long f);
 
-extern void  free(void *);
 extern void *calloc(size_t n, size_t s);
 
 #define INT_MAX_FUTEX 0x7fffffff
@@ -189,14 +192,14 @@ extern void *calloc(size_t n, size_t s);
 static inline int _futex_wait(volatile uint32_t *addr, uint32_t expected) {
     return (int)__syscall6(SYS_FUTEX,
                            (long)(uintptr_t)addr,
-                           FUTEX_WAIT,
+                           FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
                            (long)expected,
                            0, 0, 0);
 }
 static inline int _futex_wake(volatile uint32_t *addr, int n) {
     return (int)__syscall6(SYS_FUTEX,
                            (long)(uintptr_t)addr,
-                           FUTEX_WAKE,
+                           FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
                            (long)n,
                            0, 0, 0);
 }
@@ -318,18 +321,112 @@ int cnd_timedwait(cnd_t *c, mtx_t *m, const void *ts) {
 }
 
 /* ---- thread spawn / join ----
- * Layout: thrd_t holds the tid (kernel writes it via CLONE_PARENT_SETTID +
- * also writes ctid same value). On thread exit, kernel zeroes the ctid word
- * and futex_wakes it (CLONE_CHILD_CLEARTID). thrd_join futex_waits on the
- * tid word until it goes to 0. */
+ * thrd_t is the public TID. A stable registry word is passed as
+ * CLONE_CHILD_CLEARTID so join can wait on the exact address the kernel
+ * clears and wakes at thread exit. */
 
 /* 512 KiB. Mesa's util_queue workers (cache_get_thread, cache_put_thread)
  * don't run deep recursion; 8 MiB was the pthread/glibc default and is
  * massive overkill on OsitoK where calloc eagerly zeroes the page set.
  * Mesa typically spawns 5-10 worker threads — at 8 MiB each we exhausted
  * kernel heap on first boot (0 MB free, dmesg.log creation failed).
- * Stacks also leak (no per-thread cleanup hook), so small is critical. */
+ * Stacks are retained in a bounded pool and reused after join. */
 #define THREAD_STACK_SIZE (512u * 1024u)
+#define THREAD_RECORD_COUNT 128u
+
+typedef struct thread_record {
+    volatile uint32_t active;
+    volatile uint32_t ctid;
+    volatile int result;
+    int tid;
+    int owner_pid;
+    uint32_t detached;
+    uint32_t joining;
+    thrd_start_t func;
+    void *arg;
+    void *stack;
+} thread_record_t;
+
+static thread_record_t thread_records[THREAD_RECORD_COUNT];
+static volatile uint32_t thread_records_lock;
+
+/* Registry operations are short and rare. A yield-based spin lock also
+ * remains correct if a module image is shared by multiple address spaces;
+ * a PRIVATE futex lock would not, because each process has a different key. */
+static void thread_records_acquire(void) {
+    while (__atomic_exchange_n(&thread_records_lock, 1u,
+                               __ATOMIC_ACQUIRE) != 0u)
+        __syscall1(SYS_SCHED_YIELD, 0);
+}
+
+static void thread_records_release(void) {
+    __atomic_store_n(&thread_records_lock, 0u, __ATOMIC_RELEASE);
+}
+
+static thread_record_t *thread_record_find_locked(int tid) {
+    for (unsigned i = 0; i < THREAD_RECORD_COUNT; i++) {
+        if (thread_records[i].active && thread_records[i].tid == tid)
+            return &thread_records[i];
+    }
+    return NULL;
+}
+
+static void thread_record_reset_locked(thread_record_t *record) {
+    record->active = 0;
+    record->ctid = 0;
+    record->result = 0;
+    record->tid = 0;
+    record->detached = 0;
+    record->joining = 0;
+    record->func = NULL;
+    record->arg = NULL;
+    /* Keep owner_pid and stack: the next thread in this process reuses the
+     * allocation instead of growing the heap on every context teardown. */
+}
+
+static thread_record_t *thread_record_reserve_locked(int owner_pid) {
+    thread_record_t *free_record = NULL;
+
+    for (unsigned i = 0; i < THREAD_RECORD_COUNT; i++) {
+        thread_record_t *record = &thread_records[i];
+
+        /* Detached threads have no joiner. Reclaim their slot lazily once
+         * CLONE_CHILD_CLEARTID proves that they have stopped. */
+        if (record->active && record->detached &&
+            __atomic_load_n(&record->ctid, __ATOMIC_ACQUIRE) == 0u)
+            thread_record_reset_locked(record);
+
+        if (!free_record && !record->active)
+            free_record = record;
+    }
+
+    if (!free_record)
+        return NULL;
+
+    /* A shared module image may retain an entry after its owning process is
+     * gone. Never hand that process's heap pointer to a different process. */
+    if (free_record->owner_pid != owner_pid)
+        free_record->stack = NULL;
+
+    free_record->owner_pid = owner_pid;
+    free_record->active = 1;
+    free_record->ctid = 0;
+    free_record->result = 0;
+    free_record->tid = 0;
+    free_record->detached = 0;
+    free_record->joining = 0;
+    free_record->func = NULL;
+    free_record->arg = NULL;
+    return free_record;
+}
+
+static int thread_record_start(void *opaque) {
+    thread_record_t *record = (thread_record_t *)opaque;
+    int result = record->func(record->arg);
+    tss_cleanup_current();
+    __atomic_store_n(&record->result, result, __ATOMIC_RELEASE);
+    return result;
+}
 
 /* Trampoline: child enters here with RDI=func, RSI=arg.
  * Calls func(arg), then SYS_EXIT with the return value. Never returns.
@@ -413,78 +510,102 @@ int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
         printf("[THRD] create: bad args thr=%p func=%p\n", (void*)thr, (void*)func);
         return thrd_error;
     }
-    void *stack = calloc(1, THREAD_STACK_SIZE);
-    if (!stack) {
-        printf("[THRD] create: calloc(%u) returned NULL (heap exhausted?)\n",
-               (unsigned)THREAD_STACK_SIZE);
+    int owner_pid = (int)__syscall1(SYS_GETPID, 0);
+    thread_records_acquire();
+    thread_record_t *record = thread_record_reserve_locked(owner_pid);
+    thread_records_release();
+    if (!record) {
+        printf("[THRD] create: registry exhausted (%u slots)\n",
+               (unsigned)THREAD_RECORD_COUNT);
         return thrd_nomem;
     }
 
-    void *stack_top = (void *)((uintptr_t)stack + THREAD_STACK_SIZE);
+    if (!record->stack)
+        record->stack = calloc(1, THREAD_STACK_SIZE);
+    if (!record->stack) {
+        printf("[THRD] create: calloc(%u) returned NULL (heap exhausted?)\n",
+               (unsigned)THREAD_STACK_SIZE);
+        thread_records_acquire();
+        thread_record_reset_locked(record);
+        thread_records_release();
+        return thrd_nomem;
+    }
 
-    /* CLONE_CHILD_CLEARTID points the kernel at thrd_t so it zeroes the
-     * tid word + futex_wakes on thread exit — which is exactly what
-     * thrd_join needs to detect completion. */
+    record->func = func;
+    record->arg = arg;
+    void *stack_top = (void *)((uintptr_t)record->stack + THREAD_STACK_SIZE);
+
+    /* The public thrd_t only carries the TID. The registry's stable ctid
+     * word is the lifetime/wakeup object used by CLONE_CHILD_CLEARTID. */
     unsigned long flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND
                         | CLONE_THREAD
                         | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
 
-    long tid = _osito_clone(flags, stack_top, thr, thr, func, arg);
+    long tid = _osito_clone(flags, stack_top, thr, (int *)&record->ctid,
+                            thread_record_start, record);
     printf("[THRD] create: _osito_clone returned %ld (errno=-%ld)\n",
            tid, tid < 0 ? -tid : 0);
     if (tid <= 0) {
-        free(stack);
+        thread_records_acquire();
+        thread_record_reset_locked(record);
+        thread_records_release();
         return thrd_error;
     }
-    printf("[THRD] create: spawned tid=%ld stack=%p func=%p\n", tid, stack, (void*)(uintptr_t)func);
-    /* NOTE: stack is leaked on thread exit. We have no per-thread cleanup
-     * hook today; allocator reclaims when proc_free runs. Acceptable for
-     * Mesa's queue threads which live for process lifetime. */
+
+    thread_records_acquire();
+    record->tid = (int)tid;
+    thread_records_release();
+    printf("[THRD] create: spawned tid=%ld stack=%p func=%p\n",
+           tid, record->stack, (void *)(uintptr_t)func);
+    /* The stack remains attached to the registry slot and is reused after
+     * join. This avoids both an exit-epilogue race and repeated heap growth. */
     return thrd_success;
 }
 
 int thrd_join(thrd_t thr, int *res) {
-    volatile uint32_t *w = (volatile uint32_t *)&thr;
-    /* Re-load from the actual word: thrd_t is passed by value so &thr
-     * points at our local copy, which still holds the tid we want to
-     * watch. Kernel CLONE_CHILD_CLEARTID will zero the ORIGINAL caller's
-     * thrd_t; the by-value copy here doesn't get the wake. So we need
-     * the caller's address. Mesa always passes a thrd_t by value (per
-     * c11 spec) but the original lives on caller's stack. The kernel
-     * already zeroed THAT word on thread exit — we just need to poll
-     * the tid via futex on a stable address.
-     *
-     * Workaround: spin on _futex_wait against our local copy of the
-     * word. The kernel won't ever wake this address, so we instead
-     * fall back to a yield loop that checks if the thread (by tid) is
-     * still scheduled. Without a getpid-by-tid syscall, simplest is:
-     * sleep+yield until the thread has exited.
-     *
-     * Pragmatic choice: spin-yield (sched_yield) checking nothing —
-     * Mesa's util_queue_destroy is the only join caller; it first
-     * sets queue->kill_threads then cnd_broadcast(has_queued_cond),
-     * so the worker exits promptly. Wait a bounded number of yields
-     * then return. */
-    (void)w;
     int tid = thr;
-    if (tid <= 0) { if (res) *res = 0; return thrd_success; }
+    if (tid <= 0)
+        return thrd_error;
 
-    /* Yield-spin for up to ~1s of wall time; if the thread is well-behaved
-     * it terminates within microseconds of the wake from cnd_broadcast.
-     * Over-budget: still return success — leaked thread is harmless on
-     * shutdown (kernel reclaims at proc_free). */
-    for (int i = 0; i < 100000; i++) {
-        __syscall1(SYS_SCHED_YIELD, 0);
+    thread_records_acquire();
+    thread_record_t *record = thread_record_find_locked(tid);
+    if (!record || record->detached || record->joining) {
+        thread_records_release();
+        return thrd_error;
     }
-    if (res) *res = 0;
+    record->joining = 1;
+    thread_records_release();
+
+    for (;;) {
+        uint32_t current = __atomic_load_n(&record->ctid, __ATOMIC_ACQUIRE);
+        if (current == 0u)
+            break;
+        _futex_wait(&record->ctid, current);
+    }
+
+    int result = __atomic_load_n(&record->result, __ATOMIC_ACQUIRE);
+    thread_records_acquire();
+    if (record->active && record->tid == tid)
+        thread_record_reset_locked(record);
+    thread_records_release();
+
+    if (res)
+        *res = result;
     return thrd_success;
 }
 
 int thrd_detach(thrd_t t) {
-    /* No process-wide thread table to clear — kernel reclaims on exit.
-     * (void)t silences unused warning. Returns success because Mesa code
-     * paths assume detach succeeds; detach is a hint, not a hard contract. */
-    (void)t;
+    thread_records_acquire();
+    thread_record_t *record = thread_record_find_locked(t);
+    if (!record || record->joining) {
+        thread_records_release();
+        return thrd_error;
+    }
+
+    record->detached = 1;
+    if (__atomic_load_n(&record->ctid, __ATOMIC_ACQUIRE) == 0u)
+        thread_record_reset_locked(record);
+    thread_records_release();
     return thrd_success;
 }
 
@@ -498,6 +619,7 @@ int thrd_equal(thrd_t a, thrd_t b) { return a == b; }
 void thrd_yield(void) { __syscall1(SYS_SCHED_YIELD, 0); }
 
 void thrd_exit(int code) {
+    tss_cleanup_current();
     __syscall1(SYS_EXIT, (long)code);
     for (;;) { }
 }
@@ -513,40 +635,158 @@ int thrd_sleep(const void *t, void *r) {
 }
 
 /* ---- TSS (thread-specific storage) ----
- * NOT actually per-thread — backed by a global slot table. Mesa's TSS use
- * is restricted to compile cache pointers + a debug "is hash table valid"
- * flag, both of which are read-mostly and tolerate aliasing across
- * threads in our setup (Mesa's own threading is bracket-by-bracket; the
- * tss_get caller is the same thread that did tss_set). If/when Mesa
- * grows true cross-thread cache races we'll back this with FS:[key*8].
+ * The graphics module is one shared ELF image, so ordinary globals alias
+ * across every Win32 process. Compiler TLS is not usable here because FS is
+ * owned by the guest process and the module loader has no ELF TLS layout.
+ * Use a bounded table keyed by the kernel TGID/TID pair instead.
  */
-#define TSS_MAX_KEYS 64
-static void *_tss_slots[TSS_MAX_KEYS];
+#define TSS_MAX_KEYS       64u
+#define TSS_THREAD_BUCKETS 1024u
+#define TSS_TOMBSTONE      (~(uint64_t)0)
+#define TSS_DTOR_PASSES    4u
+
+typedef struct tss_thread_entry {
+    volatile uint64_t identity;
+    void *values[TSS_MAX_KEYS];
+} tss_thread_entry_t;
+
+static tss_thread_entry_t _tss_threads[TSS_THREAD_BUCKETS];
+static void (*_tss_dtors[TSS_MAX_KEYS])(void *);
 static uint32_t _tss_next_key = 1;   /* 0 reserved as "uninitialised" */
 
+static uint64_t tss_current_identity(void) {
+    long tgid = __syscall1(SYS_GETPID, 0);
+    long tid = __syscall1(SYS_GETTID, 0);
+    if (tgid <= 0 || tid <= 0) return 0;
+    return ((uint64_t)(uint32_t)tgid << 32) | (uint32_t)tid;
+}
+
+static uint32_t tss_identity_hash(uint64_t identity) {
+    identity ^= identity >> 33;
+    identity *= 0xff51afd7ed558ccdULL;
+    identity ^= identity >> 33;
+    return (uint32_t)identity & (TSS_THREAD_BUCKETS - 1u);
+}
+
+static tss_thread_entry_t *tss_find_entry(uint64_t identity, int create) {
+    if (!identity || identity == TSS_TOMBSTONE) return NULL;
+
+    uint32_t start = tss_identity_hash(identity);
+    tss_thread_entry_t *tombstone = NULL;
+
+retry:
+    for (uint32_t probe = 0; probe < TSS_THREAD_BUCKETS; probe++) {
+        tss_thread_entry_t *entry =
+            &_tss_threads[(start + probe) & (TSS_THREAD_BUCKETS - 1u)];
+        uint64_t owner = __atomic_load_n(&entry->identity, __ATOMIC_ACQUIRE);
+
+        if (owner == identity) return entry;
+        if (owner == TSS_TOMBSTONE) {
+            if (!tombstone) tombstone = entry;
+            continue;
+        }
+        if (owner != 0) continue;
+        if (!create) return NULL;
+
+        tss_thread_entry_t *target = tombstone ? tombstone : entry;
+        uint64_t expected = tombstone ? TSS_TOMBSTONE : 0;
+        if (__atomic_compare_exchange_n(&target->identity, &expected, identity,
+                                        0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
+            return target;
+        tombstone = NULL;
+        goto retry;
+    }
+
+    if (create && tombstone) {
+        uint64_t expected = TSS_TOMBSTONE;
+        if (__atomic_compare_exchange_n(&tombstone->identity, &expected,
+                                        identity, 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
+            return tombstone;
+        tombstone = NULL;
+        goto retry;
+    }
+    return NULL;
+}
+
+static int tss_entry_empty(tss_thread_entry_t *entry) {
+    for (uint32_t key = 1; key < TSS_MAX_KEYS; key++)
+        if (__atomic_load_n(&entry->values[key], __ATOMIC_ACQUIRE))
+            return 0;
+    return 1;
+}
+
 int tss_create(tss_t *key, void (*dtor)(void *)) {
-    (void)dtor;
     if (!key) return thrd_error;
     uint32_t k = __atomic_fetch_add(&_tss_next_key, 1u, __ATOMIC_ACQ_REL);
     if (k >= TSS_MAX_KEYS) return thrd_error;
     *key = (tss_t)k;
-    _tss_slots[k] = NULL;
+    __atomic_store_n(&_tss_dtors[k], dtor, __ATOMIC_RELEASE);
     return thrd_success;
 }
 
 void tss_delete(tss_t key) {
-    if ((unsigned)key < TSS_MAX_KEYS) _tss_slots[key] = NULL;
+    uint32_t k = (uint32_t)key;
+    if (k == 0 || k >= TSS_MAX_KEYS) return;
+    __atomic_store_n(&_tss_dtors[k], NULL, __ATOMIC_RELEASE);
+    for (uint32_t i = 0; i < TSS_THREAD_BUCKETS; i++)
+        __atomic_store_n(&_tss_threads[i].values[k], NULL, __ATOMIC_RELEASE);
 }
 
 void *tss_get(tss_t key) {
-    if ((unsigned)key >= TSS_MAX_KEYS) return NULL;
-    return _tss_slots[key];
+    uint32_t k = (uint32_t)key;
+    if (k == 0 || k >= TSS_MAX_KEYS) return NULL;
+    tss_thread_entry_t *entry =
+        tss_find_entry(tss_current_identity(), 0);
+    return entry
+        ? __atomic_load_n(&entry->values[k], __ATOMIC_ACQUIRE)
+        : NULL;
 }
 
 int tss_set(tss_t key, void *val) {
-    if ((unsigned)key >= TSS_MAX_KEYS) return thrd_error;
-    _tss_slots[key] = val;
+    uint32_t k = (uint32_t)key;
+    if (k == 0 || k >= TSS_MAX_KEYS) return thrd_error;
+
+    uint64_t identity = tss_current_identity();
+    tss_thread_entry_t *entry = tss_find_entry(identity, val != NULL);
+    if (!entry) return val ? thrd_error : thrd_success;
+
+    __atomic_store_n(&entry->values[k], val, __ATOMIC_RELEASE);
+    if (!val && tss_entry_empty(entry)) {
+        uint64_t expected = identity;
+        __atomic_compare_exchange_n(&entry->identity, &expected,
+                                    TSS_TOMBSTONE, 0, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE);
+    }
     return thrd_success;
+}
+
+static void tss_cleanup_current(void) {
+    uint64_t identity = tss_current_identity();
+    tss_thread_entry_t *entry = tss_find_entry(identity, 0);
+    if (!entry) return;
+
+    for (uint32_t pass = 0; pass < TSS_DTOR_PASSES; pass++) {
+        int invoked = 0;
+        for (uint32_t key = 1; key < TSS_MAX_KEYS; key++) {
+            void *value = __atomic_exchange_n(&entry->values[key], NULL,
+                                              __ATOMIC_ACQ_REL);
+            void (*dtor)(void *) =
+                __atomic_load_n(&_tss_dtors[key], __ATOMIC_ACQUIRE);
+            if (value && dtor) {
+                invoked = 1;
+                dtor(value);
+            }
+        }
+        if (!invoked) break;
+    }
+
+    for (uint32_t key = 1; key < TSS_MAX_KEYS; key++)
+        __atomic_store_n(&entry->values[key], NULL, __ATOMIC_RELEASE);
+    uint64_t expected = identity;
+    __atomic_compare_exchange_n(&entry->identity, &expected, TSS_TOMBSTONE,
+                                0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
 /* ---- u_thread_create — Mesa's thin wrapper over thrd_create ---------

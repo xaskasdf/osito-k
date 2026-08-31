@@ -221,6 +221,44 @@ void  _ZdaPvm(void *p, size_t n) { (void)n; free(p); }        /* operator delete
 void _ZSt20__throw_length_errorPKc(const char *msg) { (void)msg; abort(); }
 void _ZSt19__throw_logic_errorPKc(const char *msg)  { (void)msg; abort(); }
 void _ZSt17__throw_bad_allocv(void)                 { abort(); }
+void _ZSt28__throw_bad_array_new_lengthv(void)      { abort(); }
+
+/* Itanium C++ ABI guard variables use byte 0 for completion. Byte 1 is
+ * the in-progress lock so local statics remain safe across GL threads. */
+int __cxa_guard_acquire(unsigned long long *guard)
+{
+    unsigned char *state = (unsigned char *)guard;
+    if (__atomic_load_n(&state[0], __ATOMIC_ACQUIRE)) return 0;
+
+    for (;;) {
+        unsigned char expected = 0;
+        if (__atomic_compare_exchange_n(&state[1], &expected, 1, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            if (__atomic_load_n(&state[0], __ATOMIC_ACQUIRE)) {
+                __atomic_store_n(&state[1], 0, __ATOMIC_RELEASE);
+                return 0;
+            }
+            return 1;
+        }
+        if (__atomic_load_n(&state[0], __ATOMIC_ACQUIRE)) return 0;
+        __asm__ volatile ("pause" ::: "memory");
+    }
+}
+
+void __cxa_guard_release(unsigned long long *guard)
+{
+    unsigned char *state = (unsigned char *)guard;
+    __atomic_store_n(&state[0], 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&state[1], 0, __ATOMIC_RELEASE);
+}
+
+void __cxa_guard_abort(unsigned long long *guard)
+{
+    unsigned char *state = (unsigned char *)guard;
+    __atomic_store_n(&state[1], 0, __ATOMIC_RELEASE);
+}
+
+void __cxa_pure_virtual(void) { abort(); }
 
 void _Unwind_Resume(void *exc) { (void)exc; abort(); }
 

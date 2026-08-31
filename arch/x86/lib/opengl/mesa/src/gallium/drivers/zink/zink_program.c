@@ -38,8 +38,63 @@
 #include "util/u_debug.h"
 #include "util/u_memory.h"
 #include "util/u_prim.h"
+
+extern void okgl_trace(const char *message);
 #include "nir_serialize.h"
 #include "nir/nir_draw_helpers.h"
+
+static void
+okgl_trace_precompile_stage(gl_shader_stage stage, const char *phase)
+{
+   if (!strcmp(phase, "queued")) {
+      switch (stage) {
+      case MESA_SHADER_VERTEX: okgl_trace("[OKGL-PRECOMP] queued-vs\n"); return;
+      case MESA_SHADER_TESS_CTRL: okgl_trace("[OKGL-PRECOMP] queued-tcs\n"); return;
+      case MESA_SHADER_TESS_EVAL: okgl_trace("[OKGL-PRECOMP] queued-tes\n"); return;
+      case MESA_SHADER_GEOMETRY: okgl_trace("[OKGL-PRECOMP] queued-gs\n"); return;
+      case MESA_SHADER_FRAGMENT: okgl_trace("[OKGL-PRECOMP] queued-fs\n"); return;
+      default: okgl_trace("[OKGL-PRECOMP] queued-other\n"); return;
+      }
+   }
+   if (!strcmp(phase, "worker")) {
+      switch (stage) {
+      case MESA_SHADER_VERTEX: okgl_trace("[OKGL-PRECOMP] worker-vs\n"); return;
+      case MESA_SHADER_TESS_CTRL: okgl_trace("[OKGL-PRECOMP] worker-tcs\n"); return;
+      case MESA_SHADER_TESS_EVAL: okgl_trace("[OKGL-PRECOMP] worker-tes\n"); return;
+      case MESA_SHADER_GEOMETRY: okgl_trace("[OKGL-PRECOMP] worker-gs\n"); return;
+      case MESA_SHADER_FRAGMENT: okgl_trace("[OKGL-PRECOMP] worker-fs\n"); return;
+      default: okgl_trace("[OKGL-PRECOMP] worker-other\n"); return;
+      }
+   }
+   if (!strcmp(phase, "worker-done")) {
+      switch (stage) {
+      case MESA_SHADER_VERTEX: okgl_trace("[OKGL-PRECOMP] worker-done-vs\n"); return;
+      case MESA_SHADER_TESS_CTRL: okgl_trace("[OKGL-PRECOMP] worker-done-tcs\n"); return;
+      case MESA_SHADER_TESS_EVAL: okgl_trace("[OKGL-PRECOMP] worker-done-tes\n"); return;
+      case MESA_SHADER_GEOMETRY: okgl_trace("[OKGL-PRECOMP] worker-done-gs\n"); return;
+      case MESA_SHADER_FRAGMENT: okgl_trace("[OKGL-PRECOMP] worker-done-fs\n"); return;
+      default: okgl_trace("[OKGL-PRECOMP] worker-done-other\n"); return;
+      }
+   }
+   if (!strcmp(phase, "wait")) {
+      switch (stage) {
+      case MESA_SHADER_VERTEX: okgl_trace("[OKGL-PRECOMP] wait-vs\n"); return;
+      case MESA_SHADER_TESS_CTRL: okgl_trace("[OKGL-PRECOMP] wait-tcs\n"); return;
+      case MESA_SHADER_TESS_EVAL: okgl_trace("[OKGL-PRECOMP] wait-tes\n"); return;
+      case MESA_SHADER_GEOMETRY: okgl_trace("[OKGL-PRECOMP] wait-gs\n"); return;
+      case MESA_SHADER_FRAGMENT: okgl_trace("[OKGL-PRECOMP] wait-fs\n"); return;
+      default: okgl_trace("[OKGL-PRECOMP] wait-other\n"); return;
+      }
+   }
+   switch (stage) {
+   case MESA_SHADER_VERTEX: okgl_trace("[OKGL-PRECOMP] ready-vs\n"); return;
+   case MESA_SHADER_TESS_CTRL: okgl_trace("[OKGL-PRECOMP] ready-tcs\n"); return;
+   case MESA_SHADER_TESS_EVAL: okgl_trace("[OKGL-PRECOMP] ready-tes\n"); return;
+   case MESA_SHADER_GEOMETRY: okgl_trace("[OKGL-PRECOMP] ready-gs\n"); return;
+   case MESA_SHADER_FRAGMENT: okgl_trace("[OKGL-PRECOMP] ready-fs\n"); return;
+   default: okgl_trace("[OKGL-PRECOMP] ready-other\n"); return;
+   }
+}
 
 /* for pipeline cache */
 #define XXH_INLINE_ALL
@@ -1002,6 +1057,10 @@ create_program(struct zink_context *ctx, bool is_compute)
    util_queue_fence_init(&pg->cache_fence);
    pg->is_compute = is_compute;
    pg->ctx = ctx;
+   if (!is_compute)
+      okgl_trace(pg->uses_shobj
+                 ? "[OKGL-SHOBJ] create-program=1\n"
+                 : "[OKGL-SHOBJ] create-program=0\n");
    return (void*)pg;
 }
 
@@ -1153,6 +1212,9 @@ gfx_program_create(struct zink_context *ctx,
             break;
       }
    }
+   okgl_trace(prog->base.uses_shobj
+              ? "[OKGL-SHOBJ] gfx-create-return=1\n"
+              : "[OKGL-SHOBJ] gfx-create-return=0\n");
    return prog;
 
 fail:
@@ -1171,28 +1233,39 @@ gfx_program_init(struct zink_context *ctx, struct zink_gfx_program *prog)
    /* iterate in reverse order to create TES before generated TCS */
    for (int i = MESA_SHADER_FRAGMENT; i >= MESA_SHADER_VERTEX; i--) {
       if (prog->shaders[i]) {
+         okgl_trace_precompile_stage((gl_shader_stage)i, "wait");
          util_queue_fence_wait(&prog->shaders[i]->precompile.fence);
+         okgl_trace_precompile_stage((gl_shader_stage)i, "ready");
          /* this may have already been precompiled for separate shader */
+         okgl_trace("[OKGL-PROGINIT] deserialize-begin\n");
          if (i == MESA_SHADER_TESS_CTRL && prog->shaders[i]->non_fs.is_generated && prog->shaders[MESA_SHADER_TESS_CTRL]->nir)
             zink_shader_tcs_init(screen, prog->shaders[MESA_SHADER_TESS_CTRL], nir[MESA_SHADER_TESS_EVAL], &nir[i]);
          else
             nir[i] = zink_shader_deserialize(screen, prog->shaders[i]);
+         okgl_trace("[OKGL-PROGINIT] deserialize-end\n");
       } else {
          nir[i] = NULL;
       }
    }
+   okgl_trace("[OKGL-PROGINIT] assign-io-begin\n");
    assign_io(screen, nir);
+   okgl_trace("[OKGL-PROGINIT] assign-io-end\n");
+   okgl_trace("[OKGL-PROGINIT] serialize-begin\n");
    for (unsigned i = 0; i < ZINK_GFX_SHADER_COUNT; i++) {
       if (nir[i])
          zink_shader_serialize_blob(nir[i], &prog->blobs[i]);
       ralloc_free(nir[i]);
    }
+   okgl_trace("[OKGL-PROGINIT] serialize-end\n");
 
+   okgl_trace("[OKGL-PROGINIT] lib-cache-begin\n");
    if (screen->optimal_keys)
       prog->libs = find_or_create_lib_cache(screen, prog);
    if (prog->libs)
       p_atomic_inc(&prog->libs->refcount);
+   okgl_trace("[OKGL-PROGINIT] lib-cache-end\n");
 
+   okgl_trace("[OKGL-PROGINIT] hash-begin\n");
    struct mesa_blake3 sctx;
    _mesa_blake3_init(&sctx);
    for (int i = 0; i < ZINK_GFX_SHADER_COUNT; ++i) {
@@ -1200,10 +1273,16 @@ gfx_program_init(struct zink_context *ctx, struct zink_gfx_program *prog)
          _mesa_blake3_update(&sctx, prog->shaders[i]->base.sha1, sizeof(prog->shaders[i]->base.sha1));
    }
    _mesa_blake3_final(&sctx, prog->base.blake3);
+   okgl_trace("[OKGL-PROGINIT] hash-end\n");
 
+   okgl_trace("[OKGL-PROGINIT] descriptors-begin\n");
    if (!zink_descriptor_program_init(ctx, &prog->base))
       goto fail;
+   okgl_trace("[OKGL-PROGINIT] descriptors-end\n");
 
+   okgl_trace(prog->base.uses_shobj
+              ? "[OKGL-SHOBJ] gfx-init-return=1\n"
+              : "[OKGL-SHOBJ] gfx-init-return=0\n");
    return prog;
 
 fail:
@@ -1221,6 +1300,10 @@ zink_create_gfx_program(struct zink_context *ctx,
    struct zink_gfx_program *prog = gfx_program_create(ctx, stages, vertices_per_patch, gfx_hash);
    if (prog)
       prog = gfx_program_init(ctx, prog);
+   if (prog)
+      okgl_trace(prog->base.uses_shobj
+                 ? "[OKGL-SHOBJ] gfx-public-return=1\n"
+                 : "[OKGL-SHOBJ] gfx-public-return=0\n");
    return prog;
 }
 
@@ -1273,6 +1356,9 @@ create_gfx_program_separable(struct zink_context *ctx, struct zink_shader **stag
 
    prog->is_separable = true;
    prog->gfx_hash = ctx->gfx_hash;
+   okgl_trace(screen->info.have_EXT_shader_object
+              ? "[OKGL-SHOBJ] separable-create=1\n"
+              : "[OKGL-SHOBJ] separable-create=0\n");
    prog->base.uses_shobj = screen->info.have_EXT_shader_object && !stages[MESA_SHADER_VERTEX]->info.view_mask && !BITSET_TEST(stages[MESA_SHADER_FRAGMENT]->info.system_values_read, SYSTEM_VALUE_SAMPLE_MASK_IN);
 
    prog->stages_remaining = prog->stages_present = ctx->shader_stages;
@@ -2238,6 +2324,9 @@ zink_link_gfx_shader(struct pipe_context *pctx, void **shaders)
       return;
    }
    struct zink_gfx_program *prog = gfx_program_create(ctx, zshaders, 3, hash);
+   okgl_trace(prog->base.uses_shobj
+              ? "[OKGL-SHOBJ] linked-program-initial=1\n"
+              : "[OKGL-SHOBJ] linked-program-initial=0\n");
    u_foreach_bit(i, shader_stages)
       assert(prog->shaders[i]);
    _mesa_hash_table_insert_pre_hashed(ht, hash, prog->shaders, prog);
@@ -2256,8 +2345,14 @@ zink_link_gfx_shader(struct pipe_context *pctx, void **shaders)
       print_pipeline_stats(screen, pipeline, &ctx->dbg);
       VKSCR(DestroyPipeline)(screen->dev, pipeline, NULL);
    } else {
+      okgl_trace(zink_screen(pctx->screen)->info.have_EXT_shader_object
+                 ? "[OKGL-SHOBJ] linked-screen=1\n"
+                 : "[OKGL-SHOBJ] linked-screen=0\n");
       if (zink_screen(pctx->screen)->info.have_EXT_shader_object)
          prog->base.uses_shobj = !zshaders[MESA_SHADER_VERTEX]->info.view_mask && !BITSET_TEST(zshaders[MESA_SHADER_FRAGMENT]->info.system_values_read, SYSTEM_VALUE_SAMPLE_MASK_IN);
+      okgl_trace(prog->base.uses_shobj
+                 ? "[OKGL-SHOBJ] linked-program-final=1\n"
+                 : "[OKGL-SHOBJ] linked-program-final=0\n");
       if (zink_debug & ZINK_DEBUG_NOBGC)
          gfx_program_precompile_job(prog, pctx->screen, 0);
       else
@@ -2288,6 +2383,7 @@ gfx_shader_init_job(void *data, void *gdata, int thread_index)
    struct zink_screen *screen = gdata;
    struct zink_shader *zs = data;
 
+   okgl_trace_precompile_stage(zs->info.stage, "worker");
    zink_shader_init(screen, zs);
 
    if (zink_debug & ZINK_DEBUG_NOPC) {
@@ -2304,6 +2400,7 @@ gfx_shader_init_job(void *data, void *gdata, int thread_index)
    }
    ralloc_free(zs->nir);
    zs->nir = NULL;
+   okgl_trace_precompile_stage(zs->info.stage, "worker-done");
 }
 
 void *
@@ -2324,8 +2421,10 @@ zink_create_gfx_shader_state(struct pipe_context *pctx, const struct pipe_shader
    struct zink_shader *zs = zink_shader_create(zink_screen(pctx->screen), nir);
    if (zink_debug & ZINK_DEBUG_NOBGC)
       gfx_shader_init_job(zs, screen, 0);
-   else
+   else {
+      okgl_trace_precompile_stage(zs->info.stage, "queued");
       util_queue_add_job(&screen->cache_get_thread, zs, &zs->precompile.fence, gfx_shader_init_job, NULL, 0);
+   }
 
    return zs;
 }

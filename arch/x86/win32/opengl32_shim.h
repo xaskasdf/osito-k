@@ -5,6 +5,9 @@
 #include "nttypes.h"
 
 void opengl32_shim_init(void);
+void opengl32_release_process(DWORD owner_tgid);
+BOOL opengl32_has_accelerated_backend(void);
+BOOL opengl32_swap_buffers(HANDLE hdc);
 PVOID opengl32_resolve(const char *func_name, USHORT ordinal,
                        BOOL by_ordinal);
 

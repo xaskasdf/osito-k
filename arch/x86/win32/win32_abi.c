@@ -9,7 +9,7 @@ extern void serial_puts(const char *s);
 /* ── Registry: dll_name → co-located export table ───────────────── */
 
 #define WIN32_ABI_MAX_DLLS 64
-#define WIN32_ABI_MAX_COMPAT32_BRIDGES 32
+#define WIN32_ABI_COMPAT32_BRIDGE_SLOTS 4096
 
 static struct {
     const char         *dll;
@@ -21,8 +21,7 @@ static int g_abi_count;
 static struct {
     const void *native_target;
     const void *compat32_target;
-} g_compat32_bridges[WIN32_ABI_MAX_COMPAT32_BRIDGES];
-static int g_compat32_bridge_count;
+} g_compat32_bridges[WIN32_ABI_COMPAT32_BRIDGE_SLOTS];
 
 void win32_abi_reset(void)
 {
@@ -87,29 +86,46 @@ static uint8_t export_callconv(const WIN32_EXPORT *e)
     return (uint8_t)(e->cc & WIN32_EXPORT_ABI_MASK);
 }
 
+static unsigned compat32_bridge_hash(const void *target)
+{
+    uint64_t value = (uint64_t)(ULONG_PTR)target;
+    value >>= 4;
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    return (unsigned)value & (WIN32_ABI_COMPAT32_BRIDGE_SLOTS - 1);
+}
+
 void win32_abi_register_compat32_bridge(const void *native_target,
                                         const void *compat32_target)
 {
     if (!native_target || !compat32_target) return;
 
-    for (int i = 0; i < g_compat32_bridge_count; i++) {
-        if (g_compat32_bridges[i].native_target == native_target) {
-            g_compat32_bridges[i].compat32_target = compat32_target;
+    unsigned slot = compat32_bridge_hash(native_target);
+    for (unsigned probe = 0; probe < WIN32_ABI_COMPAT32_BRIDGE_SLOTS;
+         probe++) {
+        if (!g_compat32_bridges[slot].native_target ||
+            g_compat32_bridges[slot].native_target == native_target) {
+            g_compat32_bridges[slot].native_target = native_target;
+            g_compat32_bridges[slot].compat32_target = compat32_target;
             return;
         }
+        slot = (slot + 1) & (WIN32_ABI_COMPAT32_BRIDGE_SLOTS - 1);
     }
-    if (g_compat32_bridge_count >= WIN32_ABI_MAX_COMPAT32_BRIDGES) return;
-
-    g_compat32_bridges[g_compat32_bridge_count].native_target = native_target;
-    g_compat32_bridges[g_compat32_bridge_count].compat32_target = compat32_target;
-    g_compat32_bridge_count++;
+    serial_puts("[ABI] PE32 bridge table full\n");
 }
 
 const void *win32_abi_compat32_bridge(const void *native_target)
 {
-    for (int i = 0; i < g_compat32_bridge_count; i++)
-        if (g_compat32_bridges[i].native_target == native_target)
-            return g_compat32_bridges[i].compat32_target;
+    if (!native_target) return NULL;
+    unsigned slot = compat32_bridge_hash(native_target);
+    for (unsigned probe = 0; probe < WIN32_ABI_COMPAT32_BRIDGE_SLOTS;
+         probe++) {
+        if (!g_compat32_bridges[slot].native_target) return NULL;
+        if (g_compat32_bridges[slot].native_target == native_target)
+            return g_compat32_bridges[slot].compat32_target;
+        slot = (slot + 1) & (WIN32_ABI_COMPAT32_BRIDGE_SLOTS - 1);
+    }
     return NULL;
 }
 

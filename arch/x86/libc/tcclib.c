@@ -334,6 +334,13 @@ int ferror(FILE *f) { return f ? (f->flags & _FILE_ERR) != 0 : 0; }
 void clearerr(FILE *f) { if (f) f->flags &= ~(_FILE_EOF | _FILE_ERR); }
 int fileno(FILE *f) { return f ? f->fd : -1; }
 
+void rewind(FILE *f)
+{
+    if (!f) return;
+    (void)fseek(f, 0, SEEK_SET);
+    clearerr(f);
+}
+
 int putchar(int c)
 {
     _stdio_init();
@@ -670,6 +677,11 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
     return r;
 }
 
+int vsprintf(char *buf, const char *fmt, va_list ap)
+{
+    return vsnprintf(buf, (size_t)-1, fmt, ap);
+}
+
 int snprintf(char *buf, size_t size, const char *fmt, ...)
 {
     va_list ap;
@@ -832,6 +844,11 @@ int memcmp(const void *a, const void *b, size_t n)
     for (size_t i = 0; i < n; i++)
         if (pa[i] != pb[i]) return pa[i] - pb[i];
     return 0;
+}
+
+int bcmp(const void *a, const void *b, size_t n)
+{
+    return memcmp(a, b, n);
 }
 
 void *memchr(const void *s, int c, size_t n)
@@ -1090,7 +1107,25 @@ long labs(long x) { return x < 0 ? -x : x; }
 
 /* ── OS stubs — return safe defaults ── */
 
-char *getenv(const char *name) { (void)name; return NULL; }
+char **environ = NULL;
+
+char *getenv(const char *name)
+{
+    if (!name || !*name || !environ)
+        return NULL;
+
+    for (char **entry = environ; *entry; entry++) {
+        const char *lhs = *entry;
+        const char *rhs = name;
+        while (*rhs && *lhs == *rhs) {
+            lhs++;
+            rhs++;
+        }
+        if (!*rhs && *lhs == '=')
+            return (char *)(lhs + 1);
+    }
+    return NULL;
+}
 
 char *getcwd(char *buf, size_t size)
 {
@@ -1110,8 +1145,6 @@ char *realpath(const char *path, char *resolved)
     }
     return strdup(path);
 }
-
-char **environ = NULL;  /* No environment */
 
 int unlink(const char *path) { return (int)__syscall1(SYS_unlink, (long)path); }
 int remove(const char *path) { return unlink(path); }

@@ -37,6 +37,7 @@ extern void *malloc(size_t);
 extern void  free(void *);
 extern int   printf(const char *, ...);
 extern void *memset(void *, int, size_t);
+extern void *memcpy(void *, const void *, size_t);
 
 /* From libvulkan.a (loader). We forward-declare here to keep the
  * include footprint of this TU tiny. */
@@ -73,63 +74,28 @@ extern VkResult vkCreateInstance(const VkInstanceCreateInfo *, const void *, VkI
 extern void     vkDestroyInstance(VkInstance, const void *);
 extern VkResult vkEnumeratePhysicalDevices(VkInstance, uint32_t *, VkPhysicalDevice *);
 
-/* From libmesa_zink.a (osito_compat/zink_screen_ositok.c). We pull in
- * the full p_screen.h so we can call screen->context_create() directly
- * (W4.7a). p_context.h gives us pipe_context::destroy (W4.7-T2). */
+/* From libmesa_zink.a (osito_compat/zink_screen_ositok.c). */
 #include "pipe/p_screen.h"
 #include "pipe/p_context.h"
+#include "pipe/p_state.h"
+#include "frontend/api.h"
+#include "mesa/main/menums.h"
+#include "state_tracker/st_context.h"
+#include "util/u_inlines.h"
+#include "util/u_atomic.h"
 extern struct pipe_screen *
 okGLZinkCreateScreen(VkInstance instance, VkPhysicalDevice phys);
-
-/* The pipe_screen vtable's first useful entry is destroy(); after that
- * comes get_name, get_vendor, etc. context_create lives at offset
- * 18 ABI-wise but we don't need to know that — we walk through the
- * struct via the public header in real callers. For W4.6 we keep
- * this opaque and only call documented entry points. */
-
-/* From libmesa_main.a — declared locally, resolved at link time. */
-typedef int gl_api;
-#define OK_API_OPENGL_COMPAT 1
-
-struct gl_config;
-struct gl_context;
-struct gl_framebuffer;
-struct st_context;
-struct st_config_options;
-
-extern struct st_context *
-st_create_context(gl_api api, struct pipe_context *pipe,
-                  const struct gl_config *visual,
-                  struct st_context *share,
-                  const struct st_config_options *options,
-                  int /* bool */ no_error,
-                  int /* bool */ has_egl_image_validate);
-
-extern void st_destroy_context(struct st_context *st);
-
-/* _mesa_make_current real signature (mesa/main/context.h):
- *   GLboolean _mesa_make_current(struct gl_context *ctx,
- *                                struct gl_framebuffer *draw,
- *                                struct gl_framebuffer *read);
- * Returns 1 on success, 0 on failure. We pass NULL framebuffers — Mesa
- * accepts that (off-screen path uses the dummy framebuffer).
- *
- * st_context's layout begins with `struct gl_context *ctx;` (verified
- * in mesa/src/mesa/state_tracker/st_context.h:128). We mirror just that
- * head locally so we can pluck out the embedded gl_context without
- * pulling the heavy state_tracker headers into this TU. */
-struct ok_st_context_head {
-    struct gl_context *ctx;
-};
-
-extern int /*GLboolean*/
-_mesa_make_current(struct gl_context *ctx,
-                   struct gl_framebuffer *drawBuffer,
-                   struct gl_framebuffer *readBuffer);
 
 /* OsitoK compositor flip — same syscall used by the SHM/SDL paths. */
 #define SYS_GUI_FLIP 507
 extern long syscall(long n, ...);
+
+struct OK_GLContext;
+
+struct ok_frontend_drawable {
+    struct pipe_frontend_drawable base;
+    struct OK_GLContext *owner;
+};
 
 /* Internal context tuple. */
 struct OK_GLContext {
@@ -140,11 +106,104 @@ struct OK_GLContext {
     struct pipe_screen *screen;
     struct pipe_context *pipe;
     struct st_context  *st;
+    struct pipe_frontend_screen frontend_screen;
+    struct st_visual visual;
+    struct ok_frontend_drawable drawable;
+    struct pipe_resource *color_resource;
+    struct pipe_resource *readback_resource;
 };
+
+static uint32_t next_drawable_id = 1;
+
+static int
+ok_frontend_get_param(struct pipe_frontend_screen *fscreen,
+                      enum st_manager_param param)
+{
+    (void)fscreen;
+    (void)param;
+    return 0;
+}
+
+static bool
+ok_drawable_validate(struct st_context *st,
+                     struct pipe_frontend_drawable *drawable,
+                     const enum st_attachment_type *statts,
+                     unsigned count,
+                     struct pipe_resource **out,
+                     struct pipe_resource **resolve)
+{
+    struct ok_frontend_drawable *ok_drawable =
+        (struct ok_frontend_drawable *)drawable;
+    OK_GLContext *ctx = ok_drawable->owner;
+
+    (void)st;
+    if (resolve) *resolve = NULL;
+
+    for (unsigned i = 0; i < count; i++) {
+        switch (statts[i]) {
+        case ST_ATTACHMENT_FRONT_LEFT:
+        case ST_ATTACHMENT_BACK_LEFT:
+            if (!ctx->color_resource) {
+                struct pipe_resource templ;
+                memset(&templ, 0, sizeof(templ));
+                templ.target = PIPE_TEXTURE_2D;
+                templ.format = ctx->visual.color_format;
+                templ.width0 = (uint32_t)ctx->width;
+                templ.height0 = (uint16_t)ctx->height;
+                templ.depth0 = 1;
+                templ.array_size = 1;
+                templ.last_level = 0;
+                templ.nr_samples = ctx->visual.samples;
+                templ.nr_storage_samples = ctx->visual.samples;
+                templ.usage = PIPE_USAGE_DEFAULT;
+                templ.bind = PIPE_BIND_RENDER_TARGET |
+                             PIPE_BIND_SAMPLER_VIEW;
+
+                ctx->color_resource =
+                    ctx->screen->resource_create(ctx->screen, &templ);
+                if (!ctx->color_resource) {
+                    printf("okGL: failed to create drawable resource\n");
+                    return false;
+                }
+            }
+            pipe_resource_reference(&out[i], ctx->color_resource);
+            break;
+        default:
+            printf("okGL: unsupported drawable attachment %d\n",
+                   (int)statts[i]);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool
+ok_drawable_flush_front(struct st_context *st,
+                        struct pipe_frontend_drawable *drawable,
+                        enum st_attachment_type statt)
+{
+    (void)st;
+    (void)drawable;
+    (void)statt;
+    return true;
+}
+
+static bool
+ok_drawable_flush_swapbuffers(struct st_context *st,
+                              struct pipe_frontend_drawable *drawable)
+{
+    (void)st;
+    (void)drawable;
+    return true;
+}
 
 OK_GLContext *
 okGLCreateContext(uint32_t window_id, int width, int height)
 {
+    if (width <= 0 || height <= 0 || width > UINT16_MAX || height > UINT16_MAX)
+        return NULL;
+
     OK_GLContext *ctx = (OK_GLContext *)malloc(sizeof(*ctx));
     if (!ctx) return NULL;
     memset(ctx, 0, sizeof(*ctx));
@@ -183,6 +242,8 @@ okGLCreateContext(uint32_t window_id, int width, int height)
     pd_count = 4;
     vkEnumeratePhysicalDevices(ctx->instance, &pd_count, pds);
     ctx->phys = pds[0];
+    printf("okGL: initial Vulkan pdev count=%u handle=%p\n",
+           pd_count, (void *)ctx->phys);
 
     /* Step 3 — pipe_screen via zink. */
     ctx->screen = okGLZinkCreateScreen(ctx->instance, ctx->phys);
@@ -193,34 +254,45 @@ okGLCreateContext(uint32_t window_id, int width, int height)
         return NULL;
     }
 
-    /* Step 4 — pipe_context (W4.7a). With p_screen.h included above
-     * we can call context_create through the vtable directly. */
-    ctx->pipe = ctx->screen->context_create(ctx->screen, NULL, 0);
-    if (!ctx->pipe) {
-        printf("okGL: pipe_screen->context_create failed\n");
-        ctx->screen->destroy(ctx->screen);
-        vkDestroyInstance(ctx->instance, NULL);
-        free(ctx);
-        return NULL;
-    }
+    ctx->frontend_screen.screen = ctx->screen;
+    ctx->frontend_screen.get_param = ok_frontend_get_param;
 
-    /* Step 5 — st_create_context wires Mesa's dispatch table to ctx->pipe.
-     * W4.7: REQUIRED — fail the whole context-create if it doesn't return.
-     * (Previously gated on `if (ctx->pipe)` which was always-true given the
-     * preceding NULL-check on ctx->pipe; the gate was dead code for W4.6
-     * build-acceptance and is now removed for clarity.) */
-    ctx->st = st_create_context(OK_API_OPENGL_COMPAT, ctx->pipe,
-                                NULL, NULL, NULL, 0, 0);
+    ctx->visual.buffer_mask = ST_ATTACHMENT_BACK_LEFT_MASK;
+    ctx->visual.color_format = PIPE_FORMAT_B8G8R8A8_UNORM;
+    ctx->visual.depth_stencil_format = PIPE_FORMAT_NONE;
+    ctx->visual.accum_format = PIPE_FORMAT_NONE;
+    ctx->visual.samples = 0;
+
+    ctx->drawable.owner = ctx;
+    ctx->drawable.base.stamp = 1;
+    ctx->drawable.base.ID = next_drawable_id++;
+    if (ctx->drawable.base.ID == 0)
+        ctx->drawable.base.ID = next_drawable_id++;
+    ctx->drawable.base.fscreen = &ctx->frontend_screen;
+    ctx->drawable.base.visual = &ctx->visual;
+    ctx->drawable.base.flush_front = ok_drawable_flush_front;
+    ctx->drawable.base.validate = ok_drawable_validate;
+    ctx->drawable.base.flush_swapbuffers = ok_drawable_flush_swapbuffers;
+
+    struct st_context_attribs attribs;
+    memset(&attribs, 0, sizeof(attribs));
+    attribs.profile = API_OPENGL_COMPAT;
+    attribs.major = 1;
+    attribs.minor = 0;
+    attribs.visual = ctx->visual;
+
+    enum st_context_error error = ST_CONTEXT_SUCCESS;
+    ctx->st = st_api_create_context(&ctx->frontend_screen, &attribs,
+                                    &error, NULL);
     if (!ctx->st) {
-        printf("okGL: st_create_context failed\n");
-        /* pipe_context + pipe_screen destroy via vtable — both libGL.a
-         * symbols. Errors here are best-effort cleanup. */
-        if (ctx->pipe->destroy) ctx->pipe->destroy(ctx->pipe);
+        printf("okGL: st_api_create_context failed (%d)\n", (int)error);
+        st_screen_destroy(&ctx->frontend_screen);
         if (ctx->screen->destroy) ctx->screen->destroy(ctx->screen);
         vkDestroyInstance(ctx->instance, NULL);
         free(ctx);
         return NULL;
     }
+    ctx->pipe = ctx->st->pipe;
 
     return ctx;
 }
@@ -228,16 +300,37 @@ okGLCreateContext(uint32_t window_id, int width, int height)
 int
 okGLMakeCurrent(OK_GLContext *ctx)
 {
-    /* okGL convention: 0 = success, non-zero = failure (matches the
-     * hello-gl-clear check `if (okGLMakeCurrent(ctx) != 0) SKIP`).
-     * _mesa_make_current returns GLboolean: 1 = success, 0 = failure. */
-    struct gl_context *gctx = NULL;
-    if (ctx) {
-        if (!ctx->st) return -1;  /* unconfigured context */
-        gctx = ((struct ok_st_context_head *)ctx->st)->ctx;
-    }
-    int ok = _mesa_make_current(gctx, NULL, NULL);
+    if (ctx && !ctx->st) return -1;
+
+    bool ok = ctx
+        ? st_api_make_current(ctx->st, &ctx->drawable.base,
+                             &ctx->drawable.base)
+        : st_api_make_current(NULL, NULL, NULL);
     return ok ? 0 : -1;
+}
+
+int
+okGLResizeContext(OK_GLContext *ctx, uint32_t window_id,
+                  int width, int height)
+{
+    if (!ctx || width <= 0 || height <= 0 ||
+        width > UINT16_MAX || height > UINT16_MAX)
+        return -1;
+
+    ctx->window_id = window_id;
+    if (ctx->width == width && ctx->height == height)
+        return 0;
+
+    if (ctx->st)
+        st_context_flush(ctx->st, ST_FLUSH_END_OF_FRAME,
+                         NULL, NULL, NULL);
+
+    pipe_resource_reference(&ctx->color_resource, NULL);
+    pipe_resource_reference(&ctx->readback_resource, NULL);
+    ctx->width = width;
+    ctx->height = height;
+    p_atomic_inc(&ctx->drawable.base.stamp);
+    return 0;
 }
 
 int
@@ -253,19 +346,104 @@ okGLSwapBuffers(OK_GLContext *ctx)
     return 0;
 }
 
+int
+okGLReadback(OK_GLContext *ctx, void *pixels, int width, int height,
+             int pitch)
+{
+    if (!ctx || !ctx->st || !ctx->pipe || !ctx->color_resource || !pixels ||
+        width <= 0 || height <= 0 || pitch < width * 4)
+        return -1;
+
+    unsigned copy_width = (unsigned)(width < ctx->width ? width : ctx->width);
+    unsigned copy_height =
+        (unsigned)(height < ctx->height ? height : ctx->height);
+    uint64_t readback_size64 =
+        (uint64_t)copy_width * (uint64_t)copy_height * 4u;
+    if (readback_size64 == 0 || readback_size64 > UINT32_MAX)
+        return -1;
+
+    unsigned readback_size = (unsigned)readback_size64;
+    if (!ctx->readback_resource ||
+        ctx->readback_resource->width0 < readback_size) {
+        pipe_resource_reference(&ctx->readback_resource, NULL);
+        ctx->readback_resource = pipe_buffer_create(
+            ctx->screen, PIPE_BIND_LINEAR, PIPE_USAGE_STAGING, readback_size);
+        if (!ctx->readback_resource)
+            return -1;
+    }
+
+    /* Submit rendering and the image-to-buffer copy in order. Mapping the
+     * staging buffer below performs the single required completion wait. */
+    st_context_flush(ctx->st, ST_FLUSH_END_OF_FRAME,
+                     NULL, NULL, NULL);
+
+    struct pipe_box box;
+    memset(&box, 0, sizeof(box));
+    box.width = (int)copy_width;
+    box.height = (int)copy_height;
+    box.depth = 1;
+    ctx->pipe->resource_copy_region(
+        ctx->pipe, ctx->readback_resource, 0, 0, 0, 0,
+        ctx->color_resource, 0, &box);
+
+    struct pipe_transfer *transfer = NULL;
+    const uint8_t *source = (const uint8_t *)pipe_buffer_map(
+        ctx->pipe, ctx->readback_resource, PIPE_MAP_READ, &transfer);
+    if (!source || !transfer)
+        return -1;
+
+    uint8_t *destination = (uint8_t *)pixels;
+    size_t source_stride = (size_t)copy_width * 4u;
+    for (unsigned y = 0; y < copy_height; y++) {
+        /* The state tracker renders this winsys drawable with a top-left
+         * origin, matching the Osito compositor surface layout. */
+        const uint8_t *source_row = source + (size_t)y * source_stride;
+        memcpy(destination + (size_t)y * (size_t)pitch, source_row,
+               (size_t)copy_width * 4U);
+    }
+
+    pipe_buffer_unmap(ctx->pipe, transfer);
+    return 0;
+}
+
 void
 okGLDestroyContext(OK_GLContext *ctx)
 {
     if (!ctx) return;
-    /* Unbind first so Mesa doesn't dereference a stale gl_context after
-     * st_destroy_context tears it down. */
-    _mesa_make_current(NULL, NULL, NULL);
-    if (ctx->st) st_destroy_context(ctx->st);
-    /* W4.7: pipe_context and pipe_screen are vtable dispatches now that
-     * p_screen.h is in scope. Some Gallium drivers tear pipe_context down
-     * inside st_destroy_context — if our pipe survived, kill it explicitly. */
-    if (ctx->pipe && ctx->pipe->destroy) ctx->pipe->destroy(ctx->pipe);
-    if (ctx->screen && ctx->screen->destroy) ctx->screen->destroy(ctx->screen);
-    if (ctx->instance) vkDestroyInstance(ctx->instance, NULL);
+
+    printf("okGL: destroy begin\n");
+    if (ctx->st && st_api_get_current() == ctx->st) {
+        printf("okGL: destroy unbind begin\n");
+        st_api_make_current(NULL, NULL, NULL);
+        printf("okGL: destroy unbind complete\n");
+    }
+    printf("okGL: destroy drawable begin\n");
+    st_api_destroy_drawable(&ctx->drawable.base);
+    printf("okGL: destroy drawable complete\n");
+    if (ctx->st) {
+        printf("okGL: destroy state tracker begin\n");
+        st_destroy_context(ctx->st);
+        printf("okGL: destroy state tracker complete\n");
+        ctx->st = NULL;
+        ctx->pipe = NULL;
+    }
+    printf("okGL: destroy color resource begin\n");
+    pipe_resource_reference(&ctx->color_resource, NULL);
+    pipe_resource_reference(&ctx->readback_resource, NULL);
+    printf("okGL: destroy color resource complete\n");
+    printf("okGL: destroy frontend screen begin\n");
+    st_screen_destroy(&ctx->frontend_screen);
+    printf("okGL: destroy frontend screen complete\n");
+    if (ctx->screen && ctx->screen->destroy) {
+        printf("okGL: destroy pipe screen begin\n");
+        ctx->screen->destroy(ctx->screen);
+        printf("okGL: destroy pipe screen complete\n");
+    }
+    if (ctx->instance) {
+        printf("okGL: destroy Vulkan instance begin\n");
+        vkDestroyInstance(ctx->instance, NULL);
+        printf("okGL: destroy Vulkan instance complete\n");
+    }
     free(ctx);
+    printf("okGL: destroy complete\n");
 }

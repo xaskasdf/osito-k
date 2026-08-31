@@ -237,6 +237,16 @@ BOOL   WINAPI ResetEvent(HANDLE hEvent);
 BOOL   WINAPI PulseEvent(HANDLE hEvent);
 HANDLE WINAPI OpenEventA(DWORD dwDesiredAccess, BOOL bInheritHandle, PCSTR lpName);
 HANDLE WINAPI OpenEventW(DWORD dwDesiredAccess, BOOL bInheritHandle, PCWSTR lpName);
+
+/* Native NTDLL event calls share the Win32 BaseNamedObjects namespace. */
+NTSTATUS kernel32_nt_open_named_event(POBJECT_ATTRIBUTES attributes,
+                                      ACCESS_MASK desired_access,
+                                      PHANDLE event_handle);
+NTSTATUS kernel32_nt_publish_named_event(POBJECT_ATTRIBUTES attributes,
+                                         ACCESS_MASK desired_access,
+                                         HANDLE created_handle,
+                                         PHANDLE event_handle,
+                                         BOOL *already_exists);
 HANDLE WINAPI CreateIoCompletionPort(HANDLE file, HANDLE existing_port,
                                      ULONG_PTR completion_key,
                                      DWORD concurrent_threads);
@@ -464,8 +474,11 @@ bool    win32_normalize_path(PCSTR path, char out[260]);
 bool    win32_directory_exists_normalized(const char *path);
 DWORD   win32_directory_create_normalized(const char *path);
 void    k32_pipe_service_pending(void);
-void    kernel32_inherit_process_environment(DWORD parent_pid,
-                                             DWORD child_pid);
+NTSTATUS kernel32_inherit_process_environment(DWORD parent_pid,
+                                               DWORD child_pid);
+NTSTATUS kernel32_set_process_environment_block(DWORD process_id,
+                                                  PCVOID environment,
+                                                  BOOL unicode);
 void    kernel32_release_process_environment(DWORD process_id);
 SIZE_T  kernel32_build_environment_block_w(DWORD process_id, PWSTR buffer,
                                            SIZE_T capacity);

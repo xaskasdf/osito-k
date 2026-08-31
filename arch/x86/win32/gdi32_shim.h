@@ -52,6 +52,7 @@ typedef struct tagPIXELFORMATDESCRIPTOR {
 #define PFD_DRAW_TO_WINDOW 0x00000004U
 #define PFD_SUPPORT_OPENGL 0x00000020U
 #define PFD_GENERIC_FORMAT  0x00000040U
+#define PFD_GENERIC_ACCELERATED 0x00001000U
 #define PFD_TYPE_RGBA      0
 #define PFD_MAIN_PLANE     0
 
@@ -67,6 +68,8 @@ typedef struct tagPIXELFORMATDESCRIPTOR {
 
 /* GDI API */
 int   WINAPI GetDeviceCaps(HDC hdc, int index);
+BOOL  WINAPI GetDeviceGammaRamp(HDC hdc, PVOID ramp);
+BOOL  WINAPI SetDeviceGammaRamp(HDC hdc, PCVOID ramp);
 HDC   WINAPI CreateDCA(PCSTR lpszDriver, PCSTR lpszDevice,
                        PCSTR lpszOutput, PCVOID lpInitData);
 BOOL  WINAPI DeleteDC(HDC hdc);

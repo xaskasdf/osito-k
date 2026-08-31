@@ -99,6 +99,7 @@ extern uint64_t mem_get_total(void);
 #define WND_FOCUSED     (1 << 4)
 #define WND_DIRTY       (1 << 5)  /* surface has new content */
 #define WND_TASKBAR     (1 << 6)  /* top-level application window */
+#define WND_USER32      (1 << 7)  /* input is delivered through USER32 */
 
 typedef struct {
     uint32_t id;
@@ -162,9 +163,14 @@ static uint32_t  terminal_h;
 static uint32_t cursor_rgba[CURSOR_W * CURSOR_H];
 
 /* Frame-level dirty tracking: skip render when nothing changed */
-static bool     comp_frame_dirty = true;
+static volatile bool comp_frame_dirty = true;
 static int32_t  comp_last_cx = -1, comp_last_cy = -1;
 static uint64_t comp_dirty_tick;  /* force dirty once/sec for RTC clock */
+
+static inline void compositor_request_frame(void)
+{
+    __atomic_store_n(&comp_frame_dirty, true, __ATOMIC_RELEASE);
+}
 
 /* Stats */
 static uint64_t comp_frames;
@@ -213,7 +219,7 @@ uint32_t compositor_create_window(uint32_t shm_handle,
     }
     if (!w) return 0;
 
-    comp_frame_dirty = true;
+    compositor_request_frame();
     w->id = next_window_id++;
     w->x = x;
     w->y = y;
@@ -266,7 +272,7 @@ void compositor_destroy_window(uint32_t window_id)
 {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if ((windows[i].flags & WND_ACTIVE) && windows[i].id == window_id) {
-            comp_frame_dirty = true;
+            compositor_request_frame();
             if (windows[i].shm_handle)
                 shm_unmap(windows[i].shm_handle);
             windows[i].flags = 0;
@@ -290,7 +296,7 @@ void compositor_set_visible(uint32_t window_id, bool visible)
         else
             windows[i].flags &= (uint8_t)~WND_VISIBLE;
         if (windows[i].flags != old_flags)
-            comp_frame_dirty = true;
+            compositor_request_frame();
         return;
     }
 }
@@ -317,7 +323,7 @@ void compositor_set_title(uint32_t window_id, const char *title)
             windows[i].title[k] = updated[k];
             if (!updated[k]) break;
         }
-        if (changed) comp_frame_dirty = true;
+        if (changed) compositor_request_frame();
         return;
     }
 }
@@ -333,7 +339,7 @@ void compositor_set_taskbar(uint32_t window_id, bool taskbar)
         else
             windows[i].flags &= (uint8_t)~WND_TASKBAR;
         if (old_flags != windows[i].flags)
-            comp_frame_dirty = true;
+            compositor_request_frame();
         return;
     }
 }
@@ -352,7 +358,7 @@ void compositor_focus_window(uint32_t window_id)
         windows[selected].flags |= WND_FOCUSED;
         focused_window = selected;
         focused_demo_idx = -1;
-        comp_frame_dirty = true;
+        compositor_request_frame();
     }
 }
 
@@ -364,7 +370,7 @@ void compositor_set_position(uint32_t window_id, int16_t x, int16_t y)
         if (windows[i].x != x || windows[i].y != y) {
             windows[i].x = x;
             windows[i].y = y;
-            comp_frame_dirty = true;
+            compositor_request_frame();
         }
         return;
     }
@@ -377,7 +383,7 @@ void compositor_set_z_order(uint32_t window_id, uint32_t z_order)
             continue;
         if (windows[i].z_order != z_order) {
             windows[i].z_order = z_order;
-            comp_frame_dirty = true;
+            compositor_request_frame();
         }
         return;
     }
@@ -398,7 +404,7 @@ void compositor_set_clip_rect(uint32_t window_id, bool enabled,
             w->clip_y = y;
             w->clip_width = width;
             w->clip_height = height;
-            comp_frame_dirty = true;
+            compositor_request_frame();
         }
         return;
     }
@@ -418,7 +424,7 @@ void compositor_set_size(uint32_t window_id, uint16_t width, uint16_t height)
             windows[i].width = width;
             windows[i].height = height;
             windows[i].flags |= WND_DIRTY;
-            comp_frame_dirty = true;
+            compositor_request_frame();
         }
         return;
     }
@@ -443,7 +449,7 @@ bool compositor_replace_surface(uint32_t window_id, uint32_t shm_handle,
         windows[i].surface_pitch = width;
         windows[i].surface_height = height;
         windows[i].flags |= WND_DIRTY;
-        comp_frame_dirty = true;
+        compositor_request_frame();
         if (old_handle)
             shm_unmap(old_handle);
         return true;
@@ -487,7 +493,7 @@ static void compositor_raise_window_to_front(int idx)
 /* Signal that a window's surface has new content */
 void compositor_signal_dirty(uint32_t window_id)
 {
-    comp_frame_dirty = true;
+    compositor_request_frame();
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if ((windows[i].flags & WND_ACTIVE) && windows[i].id == window_id) {
             windows[i].flags |= WND_DIRTY;
@@ -517,13 +523,31 @@ void compositor_set_fullscreen(uint32_t window_id, bool fullscreen)
 {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if ((windows[i].flags & WND_ACTIVE) && windows[i].id == window_id) {
+            bool was_fullscreen = (windows[i].flags & WND_FULLSCREEN) != 0;
             if (fullscreen) {
                 windows[i].flags |= WND_FULLSCREEN;
                 windows[i].x = 0;
                 windows[i].y = 0;
+                if (!was_fullscreen)
+                    compositor_raise_window_to_front(i);
             } else {
                 windows[i].flags &= ~WND_FULLSCREEN;
             }
+            if (was_fullscreen != fullscreen)
+                compositor_request_frame();
+            return;
+        }
+    }
+}
+
+void compositor_set_user32_managed(uint32_t window_id, bool managed)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if ((windows[i].flags & WND_ACTIVE) && windows[i].id == window_id) {
+            if (managed)
+                windows[i].flags |= WND_USER32;
+            else
+                windows[i].flags &= (uint8_t)~WND_USER32;
             return;
         }
     }
@@ -649,6 +673,7 @@ static void blit_window(uint32_t *dst, uint32_t dst_pitch,
             memcpy(d, s, (uint64_t)bw * sizeof(uint32_t));
         }
     }
+
 }
 
 /* ── Build AA cursor (called once at init) ───────────────────── */
@@ -770,6 +795,21 @@ static void draw_cursor(uint32_t *dst, uint32_t pitch,
             *p = cursor_blend(*p, src);
         }
     }
+}
+
+static inline void draw_cursor_overlay(uint32_t *dst, uint32_t pitch,
+                                       uint32_t scr_w, uint32_t scr_h)
+{
+#ifndef __EMSCRIPTEN__
+    int32_t cx, cy;
+    input_get_cursor(&cx, &cy);
+    draw_cursor(dst, pitch, scr_w, scr_h, cx, cy);
+#else
+    (void)dst;
+    (void)pitch;
+    (void)scr_w;
+    (void)scr_h;
+#endif
 }
 
 /* ── Hit-testing for demo windows ─────────────────────────────── */
@@ -944,7 +984,7 @@ static void focus_demo_window(int index)
     focused_window = -1;
     focused_demo_idx = index;
     gui_desktop_show_window(index);
-    comp_frame_dirty = true;
+    compositor_request_frame();
 }
 
 static void focus_managed_window(int index)
@@ -1231,12 +1271,12 @@ void scaleblit_worker(void *arg, void *result)
     (void)result;
     struct {
         const uint32_t *src; uint32_t *dst;
-        uint32_t dst_pitch, sw, sc, ox, oy, dw;
+        uint32_t src_pitch, dst_pitch, sw, sc, ox, oy, dw;
         uint32_t y_start, y_end;
     } *a = arg;
 
     for (uint32_t _y = a->y_start; _y < a->y_end; _y++) {
-        const uint32_t *_src = a->src + _y * a->sw;
+        const uint32_t *_src = a->src + _y * a->src_pitch;
         uint32_t *_row0 = a->dst + (a->oy + _y * a->sc) * a->dst_pitch + a->ox;
         for (uint32_t _x = 0; _x < a->sw; _x++) {
             uint32_t _px = _src[_x];
@@ -1269,13 +1309,14 @@ static bool __hot compositor_render_frame(void)
         uint64_t now_tick = idt_get_ticks();
         bool cursor_moved = (cx != comp_last_cx || cy != comp_last_cy);
         bool clock_tick   = (now_tick - comp_dirty_tick >= 100); /* 1 sec @ 100Hz */
-        if (!comp_frame_dirty && !cursor_moved && !clock_tick)
+        bool frame_dirty = __atomic_exchange_n(&comp_frame_dirty, false,
+                                                __ATOMIC_ACQ_REL);
+        if (!frame_dirty && !cursor_moved && !clock_tick)
             return false;
         comp_last_cx = cx;
         comp_last_cy = cy;
         if (clock_tick)
             comp_dirty_tick = now_tick;
-        comp_frame_dirty = false;
     }
 
     build_render_order();
@@ -1286,9 +1327,22 @@ static bool __hot compositor_render_frame(void)
         window_t *win = &windows[render_order[_fi]];
         if (!(win->flags & WND_FULLSCREEN) || !win->pixels) continue;
 
+        uint32_t _sw = (uint32_t)win->width;
+        uint32_t _sh = (uint32_t)win->height;
+        uint32_t _sp = (uint32_t)win->surface_pitch;
+        if (!_sw || !_sh || _sp < _sw || win->surface_height < _sh)
+            continue;
+
         /* Direct scanout: source matches screen exactly */
-        if (win->width == (uint16_t)w && win->height == (uint16_t)h) {
-            memcpy(back, win->pixels, (uint64_t)w * h * 4);
+        if (_sw == w && _sh == h) {
+            if (_sp == w) {
+                memcpy(back, win->pixels, (uint64_t)w * h * 4);
+            } else {
+                for (uint32_t _y = 0; _y < h; _y++)
+                    memcpy(back + _y * p, win->pixels + _y * _sp,
+                           (uint64_t)w * 4);
+            }
+            draw_cursor_overlay(back, p, w, h);
             display_mark_dirty();
             comp_direct_scanout++;
             return true;
@@ -1296,12 +1350,51 @@ static bool __hot compositor_render_frame(void)
 
         /* Pixel-perfect: largest integer scale that fits within the screen.
          * For DOOM 320×200 on 1024×768: scale=3 → 960×600, centered. */
-        uint32_t _sw = (uint32_t)win->width;
-        uint32_t _sh = (uint32_t)win->height;
+        /* A source larger than the scanout must be downscaled. Forcing an
+         * integer scale of one makes the centering subtraction underflow and
+         * sends the compositor outside its backbuffer. */
+        if (_sw > w || _sh > h) {
+            uint32_t _dw, _dh;
+            if ((uint64_t)_sw * h >= (uint64_t)_sh * w) {
+                _dw = w;
+                _dh = (uint32_t)(((uint64_t)_sh * w) / _sw);
+            } else {
+                _dh = h;
+                _dw = (uint32_t)(((uint64_t)_sw * h) / _sh);
+            }
+            if (!_dw) _dw = 1;
+            if (!_dh) _dh = 1;
+
+            uint32_t _ox = (w - _dw) / 2;
+            uint32_t _oy = (h - _dh) / 2;
+            uint64_t _xstep = ((uint64_t)_sw << 32) / _dw;
+            uint64_t _ystep = ((uint64_t)_sh << 32) / _dh;
+
+            memset(back, 0, (uint64_t)p * h * 4);
+            uint64_t _ypos = 0;
+            for (uint32_t _dy = 0; _dy < _dh; _dy++, _ypos += _ystep) {
+                uint32_t _sy = (uint32_t)(_ypos >> 32);
+                if (_sy >= _sh) _sy = _sh - 1;
+                const uint32_t *_src = win->pixels + _sy * _sp;
+                uint32_t *_dst = back + (_oy + _dy) * p + _ox;
+                uint64_t _xpos = 0;
+                for (uint32_t _dx = 0; _dx < _dw;
+                     _dx++, _xpos += _xstep) {
+                    uint32_t _sx = (uint32_t)(_xpos >> 32);
+                    if (_sx >= _sw) _sx = _sw - 1;
+                    _dst[_dx] = _src[_sx];
+                }
+            }
+
+            draw_cursor_overlay(back, p, w, h);
+            display_mark_dirty();
+            comp_direct_scanout++;
+            return true;
+        }
+
         uint32_t _scx = w / _sw;
         uint32_t _scy = h / _sh;
         uint32_t _sc  = (_scx < _scy) ? _scx : _scy;
-        if (_sc == 0) _sc = 1;
 
         uint32_t _dw = _sw * _sc;
         uint32_t _dh = _sh * _sc;
@@ -1329,7 +1422,7 @@ static bool __hot compositor_render_frame(void)
 
                 typedef struct {
                     const uint32_t *src; uint32_t *dst;
-                    uint32_t dst_pitch, sw, sc, ox, oy, dw;
+                    uint32_t src_pitch, dst_pitch, sw, sc, ox, oy, dw;
                     uint32_t y_start, y_end;
                 } scaleblit_arg_t;
 
@@ -1339,6 +1432,7 @@ static bool __hot compositor_render_frame(void)
                 for (int i = 0; i < n_ap; i++) {
                     sb_args[i].src = win->pixels;
                     sb_args[i].dst = back;
+                    sb_args[i].src_pitch = _sp;
                     sb_args[i].dst_pitch = p;
                     sb_args[i].sw = _sw;
                     sb_args[i].sc = _sc;
@@ -1352,7 +1446,7 @@ static bool __hot compositor_render_frame(void)
 
                 /* BSP handles the last band */
                 for (uint32_t _y = n_ap * band; _y < _sh; _y++) {
-                    const uint32_t *_src2 = win->pixels + _y * _sw;
+                    const uint32_t *_src2 = win->pixels + _y * _sp;
                     uint32_t *_row0 = back + (_oy + _y * _sc) * p + _ox;
                     for (uint32_t _x = 0; _x < _sw; _x++) {
                         uint32_t _px = _src2[_x];
@@ -1370,7 +1464,7 @@ static bool __hot compositor_render_frame(void)
             } else {
                 /* Serial path */
                 for (uint32_t _y = 0; _y < _sh; _y++) {
-                    const uint32_t *_src2 = win->pixels + _y * _sw;
+                    const uint32_t *_src2 = win->pixels + _y * _sp;
                     uint32_t *_row0 = back + (_oy + _y * _sc) * p + _ox;
                     for (uint32_t _x = 0; _x < _sw; _x++) {
                         uint32_t _px = _src2[_x];
@@ -1385,6 +1479,7 @@ static bool __hot compositor_render_frame(void)
             }
         }
 
+        draw_cursor_overlay(back, p, w, h);
         display_mark_dirty();
         comp_direct_scanout++;
         return true;
@@ -1440,14 +1535,8 @@ static bool __hot compositor_render_frame(void)
         gui_desktop_render_dock(&screen);
     }
 
-    /* Draw cursor on top — but in WASM the canvas already shows the
-     * native browser cursor on top, so a second one drawn into the
-     * framebuffer just looks weird. Skip on WASM. */
-#ifndef __EMSCRIPTEN__
-    int32_t cx, cy;
-    input_get_cursor(&cx, &cy);
-    draw_cursor(back, p, w, h, cx, cy);
-#endif
+    /* Keep the pointer above both managed windows and direct scanout. */
+    draw_cursor_overlay(back, p, w, h);
 
     display_mark_dirty();
     return true;
@@ -1526,20 +1615,22 @@ void compositor_thread(void)
         /* 0. Poll USB HID (xHCI) for new mouse/keyboard reports */
         if (xhci_poll) xhci_poll();
 
-        /* Game mode: if a fullscreen window (e.g. DOOM) is active, stop
-         * draining keyboard events so the process can read them via
-         * SYS_GET_INPUT_EVENT. Only mouse/wheel events are coalesced. */
+        /* Native fullscreen clients (e.g. DOOM) consume SYS_GET_INPUT_EVENT.
+         * USER32 fullscreen windows keep normal queue draining for Alt+Tab;
+         * their HID events are delivered directly by the Win32 bridge. */
         bool has_fullscreen = false;
+        bool has_direct_input_fullscreen = false;
         {
             extern bool input_game_mode;
             for (int _i = 0; _i < MAX_WINDOWS; _i++) {
                 if ((windows[_i].flags & (WND_ACTIVE | WND_FULLSCREEN)) ==
                     (WND_ACTIVE | WND_FULLSCREEN)) {
                     has_fullscreen = true;
-                    break;
+                    if (!(windows[_i].flags & WND_USER32))
+                        has_direct_input_fullscreen = true;
                 }
             }
-            input_game_mode = has_fullscreen;
+            input_game_mode = has_direct_input_fullscreen;
         }
 
         /* 1. Process input with coalescing */
@@ -1646,7 +1737,7 @@ void compositor_thread(void)
             int32_t _cx, _cy;
             input_get_cursor(&_cx, &_cy);
             if (_cx != comp_last_cx || _cy != comp_last_cy)
-                comp_frame_dirty = true;
+                compositor_request_frame();
         }
 
         /* 2. Tick animation engine (100 APIC ticks = 1000ms) */
@@ -1721,7 +1812,7 @@ void compositor_focus_terminal(void)
 
     focused_demo_idx = 0;
     gui_desktop_show_window(0);
-    comp_frame_dirty = true;
+    compositor_request_frame();
     display_mark_dirty();
 }
 

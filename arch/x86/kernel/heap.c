@@ -20,6 +20,7 @@
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
+extern void serial_write(const char *data, uint64_t length);
 extern void fb_puts(const char *s);
 extern void fb_putdec(uint64_t val);
 
@@ -77,6 +78,78 @@ static uint64_t     heap_size;     /* Total heap bytes */
 static uint64_t     heap_used;     /* Currently allocated bytes */
 static uint64_t     alloc_count;   /* Number of active allocations */
 static spinlock_t   heap_lock = SPINLOCK_INIT;
+
+/* Fixed storage keeps allocation profiling independent of the heap itself. */
+#define HEAP_SITE_CAP 1024
+typedef struct {
+    uint64_t alloc_ra;
+    uint64_t alloc_ra2;
+    uint64_t bytes;
+    uint64_t peak_bytes;
+    uint64_t count;
+    uint8_t  used;
+} heap_site_stat_t;
+
+static heap_site_stat_t heap_sites[HEAP_SITE_CAP];
+static uint64_t heap_site_overflow_bytes;
+static uint64_t heap_site_overflow_count;
+
+static heap_site_stat_t *heap_site_find(uint64_t alloc_ra,
+                                        uint64_t alloc_ra2,
+                                        bool create)
+{
+    uint64_t hash = (alloc_ra >> 4) ^ (alloc_ra2 >> 9) ^
+                    (alloc_ra * 0x9E3779B97F4A7C15ULL);
+    uint32_t index = (uint32_t)hash & (HEAP_SITE_CAP - 1);
+
+    for (uint32_t probe = 0; probe < HEAP_SITE_CAP; probe++) {
+        heap_site_stat_t *site =
+            &heap_sites[(index + probe) & (HEAP_SITE_CAP - 1)];
+        if (site->used) {
+            if (site->alloc_ra == alloc_ra && site->alloc_ra2 == alloc_ra2)
+                return site;
+            continue;
+        }
+        if (!create)
+            return NULL;
+        site->used = 1;
+        site->alloc_ra = alloc_ra;
+        site->alloc_ra2 = alloc_ra2;
+        return site;
+    }
+    return NULL;
+}
+
+static void heap_site_account_alloc(uint64_t alloc_ra, uint64_t alloc_ra2,
+                                    uint64_t bytes)
+{
+    heap_site_stat_t *site = heap_site_find(alloc_ra, alloc_ra2, true);
+    if (!site) {
+        heap_site_overflow_bytes += bytes;
+        heap_site_overflow_count++;
+        return;
+    }
+    site->bytes += bytes;
+    site->count++;
+    if (site->bytes > site->peak_bytes)
+        site->peak_bytes = site->bytes;
+}
+
+static void heap_site_account_free(uint64_t alloc_ra, uint64_t alloc_ra2,
+                                   uint64_t bytes)
+{
+    heap_site_stat_t *site = heap_site_find(alloc_ra, alloc_ra2, false);
+    if (site) {
+        site->bytes = bytes <= site->bytes ? site->bytes - bytes : 0;
+        if (site->count)
+            site->count--;
+        return;
+    }
+    heap_site_overflow_bytes = bytes <= heap_site_overflow_bytes
+                             ? heap_site_overflow_bytes - bytes : 0;
+    if (heap_site_overflow_count)
+        heap_site_overflow_count--;
+}
 
 static inline uint64_t heap_lock_irqsave(void)
 {
@@ -260,6 +333,7 @@ static void *_kmalloc_with_ra(uint64_t size, uint64_t alloc_ra, uint64_t alloc_r
             block->alloc_ra2 = alloc_ra2;
             heap_used += block->size;
             alloc_count++;
+            heap_site_account_alloc(alloc_ra, alloc_ra2, block->size);
             return (void *)((uint8_t *)block + sizeof(block_hdr_t));
         }
         block = block->next;
@@ -298,6 +372,66 @@ static void heap_print_sym(uint64_t addr)
     serial_puts("+0x");
     serial_puthex(off, 4);
     serial_puts(")");
+}
+
+typedef struct {
+    char data[512];
+    uint32_t length;
+} heap_diag_line_t;
+
+static void heap_diag_append_char(heap_diag_line_t *line, char value)
+{
+    if (line->length + 1 < sizeof(line->data))
+        line->data[line->length++] = value;
+}
+
+static void heap_diag_append_str(heap_diag_line_t *line, const char *value)
+{
+    while (value && *value && line->length + 1 < sizeof(line->data))
+        line->data[line->length++] = *value++;
+}
+
+static void heap_diag_append_dec(heap_diag_line_t *line, uint64_t value)
+{
+    char digits[20];
+    uint32_t count = 0;
+    if (!value) {
+        heap_diag_append_char(line, '0');
+        return;
+    }
+    while (value && count < sizeof(digits)) {
+        digits[count++] = (char)('0' + value % 10);
+        value /= 10;
+    }
+    while (count)
+        heap_diag_append_char(line, digits[--count]);
+}
+
+static void heap_diag_append_hex(heap_diag_line_t *line, uint64_t value)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    heap_diag_append_str(line, "0x");
+    for (int shift = 60; shift >= 0; shift -= 4)
+        heap_diag_append_char(line, digits[(value >> shift) & 0xF]);
+}
+
+static void heap_diag_append_sym(heap_diag_line_t *line, uint64_t address)
+{
+    uint64_t offset = 0;
+    const char *symbol = kallsyms_lookup(address, &offset);
+    if (!symbol)
+        return;
+    heap_diag_append_str(line, " (");
+    heap_diag_append_str(line, symbol);
+    heap_diag_append_str(line, "+");
+    heap_diag_append_hex(line, offset);
+    heap_diag_append_char(line, ')');
+}
+
+static void heap_diag_emit(heap_diag_line_t *line)
+{
+    heap_diag_append_char(line, '\n');
+    serial_write(line->data, line->length);
 }
 
 static void kfree_unlocked(void *ptr, uint64_t free_ra)
@@ -341,8 +475,13 @@ static void kfree_unlocked(void *ptr, uint64_t free_ra)
         return;
     }
 
-    heap_used -= block->size;
+    uint64_t bytes = block->size;
+    uint64_t alloc_ra = block->alloc_ra;
+    uint64_t alloc_ra2 = block->alloc_ra2;
+
+    heap_used -= bytes;
     alloc_count--;
+    heap_site_account_free(alloc_ra, alloc_ra2, bytes);
 
     free_list_insert(block);
     coalesce(block);
@@ -427,6 +566,83 @@ uint64_t heap_get_count(void)
     uint64_t result = alloc_count;
     heap_unlock_irqrestore(irq_flags);
     return result;
+}
+
+void heap_dump_top_allocators(uint32_t limit)
+{
+    heap_site_stat_t top[16] = {0};
+    uint32_t top_count = 0;
+    uint32_t active_sites = 0;
+    uint64_t tracked_bytes = 0;
+    uint64_t used_snapshot;
+    uint64_t count_snapshot;
+    uint64_t overflow_bytes;
+    uint64_t overflow_count;
+
+    if (!limit || limit > 16)
+        limit = 16;
+
+    uint64_t irq_flags = heap_lock_irqsave();
+    for (uint32_t i = 0; i < HEAP_SITE_CAP; i++) {
+        const heap_site_stat_t *site = &heap_sites[i];
+        if (!site->used || !site->bytes)
+            continue;
+        active_sites++;
+        tracked_bytes += site->bytes;
+
+        uint32_t position;
+        if (top_count < limit) {
+            position = top_count++;
+        } else {
+            if (site->bytes <= top[top_count - 1].bytes)
+                continue;
+            position = top_count - 1;
+        }
+        while (position && site->bytes > top[position - 1].bytes) {
+            top[position] = top[position - 1];
+            position--;
+        }
+        top[position] = *site;
+    }
+    used_snapshot = heap_used;
+    count_snapshot = alloc_count;
+    overflow_bytes = heap_site_overflow_bytes;
+    overflow_count = heap_site_overflow_count;
+    heap_unlock_irqrestore(irq_flags);
+
+    heap_diag_line_t summary = {0};
+    heap_diag_append_str(&summary, "[HEAP-SITES] used_kb=");
+    heap_diag_append_dec(&summary, used_snapshot / 1024);
+    heap_diag_append_str(&summary, " tracked_kb=");
+    heap_diag_append_dec(&summary, tracked_bytes / 1024);
+    heap_diag_append_str(&summary, " allocs=");
+    heap_diag_append_dec(&summary, count_snapshot);
+    heap_diag_append_str(&summary, " active_sites=");
+    heap_diag_append_dec(&summary, active_sites);
+    heap_diag_append_str(&summary, " overflow_kb=");
+    heap_diag_append_dec(&summary, overflow_bytes / 1024);
+    heap_diag_append_str(&summary, " overflow_allocs=");
+    heap_diag_append_dec(&summary, overflow_count);
+    heap_diag_emit(&summary);
+
+    for (uint32_t i = 0; i < top_count; i++) {
+        heap_diag_line_t line = {0};
+        heap_diag_append_str(&line, "[HEAP-SITE] rank=");
+        heap_diag_append_dec(&line, i + 1);
+        heap_diag_append_str(&line, " bytes=");
+        heap_diag_append_dec(&line, top[i].bytes);
+        heap_diag_append_str(&line, " blocks=");
+        heap_diag_append_dec(&line, top[i].count);
+        heap_diag_append_str(&line, " peak=");
+        heap_diag_append_dec(&line, top[i].peak_bytes);
+        heap_diag_append_str(&line, " caller=");
+        heap_diag_append_hex(&line, top[i].alloc_ra);
+        heap_diag_append_sym(&line, top[i].alloc_ra);
+        heap_diag_append_str(&line, " parent=");
+        heap_diag_append_hex(&line, top[i].alloc_ra2);
+        heap_diag_append_sym(&line, top[i].alloc_ra2);
+        heap_diag_emit(&line);
+    }
 }
 
 /* ── Initialize heap ─────────────────────────────────────────── */

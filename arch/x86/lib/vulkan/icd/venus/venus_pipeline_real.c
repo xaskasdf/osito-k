@@ -6,6 +6,7 @@ extern void *memset(void *, int, unsigned long);
 extern void *memcpy(void *, const void *, unsigned long);
 extern unsigned long strlen(const char *);
 extern int printf(const char *, ...);
+extern void okgl_trace(const char *message);
 
 #define VN_CMD_CREATE_GRAPHICS_PIPELINES 65u
 #define VN_CMD_CREATE_COMPUTE_PIPELINES 66u
@@ -34,6 +35,13 @@ static void encode_bytes(struct pipeline_encoder *enc,
 static void encode_u32(struct pipeline_encoder *enc, uint32_t value)
 {
     encode_bytes(enc, &value, sizeof(value));
+}
+
+static void encode_u16(struct pipeline_encoder *enc, uint16_t value)
+{
+    /* Venus reserves a 32-bit wire slot for uint16_t values. */
+    uint32_t wire_value = value;
+    encode_bytes(enc, &wire_value, sizeof(wire_value));
 }
 
 static void encode_u64(struct pipeline_encoder *enc, uint64_t value)
@@ -99,12 +107,44 @@ static void encode_shader_stage(struct pipeline_encoder *enc,
         encode_specialization(enc, info->pSpecializationInfo);
 }
 
+static void encode_vertex_input_pnext(struct pipeline_encoder *enc,
+                                      const void *value)
+{
+    const VkBaseInStructure *next = (const VkBaseInStructure *)value;
+    while (next) {
+        if (next->sType ==
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO) {
+            const VkPipelineVertexInputDivisorStateCreateInfo *state =
+                (const VkPipelineVertexInputDivisorStateCreateInfo *)next;
+            okgl_trace("[OKGL-VKPIPE] vertex-chain=divisor\n");
+            encode_u64(enc, 1);
+            encode_u32(enc, (uint32_t)state->sType);
+            encode_vertex_input_pnext(enc, state->pNext);
+            encode_u32(enc, state->vertexBindingDivisorCount);
+            encode_u64(enc, state->pVertexBindingDivisors
+                                ? state->vertexBindingDivisorCount : 0u);
+            if (state->pVertexBindingDivisors) {
+                for (uint32_t i = 0;
+                     i < state->vertexBindingDivisorCount; i++) {
+                    encode_u32(enc,
+                        state->pVertexBindingDivisors[i].binding);
+                    encode_u32(enc,
+                        state->pVertexBindingDivisors[i].divisor);
+                }
+            }
+            return;
+        }
+        next = next->pNext;
+    }
+    encode_u64(enc, 0);
+}
+
 static void encode_vertex_input(
     struct pipeline_encoder *enc,
     const VkPipelineVertexInputStateCreateInfo *info)
 {
     encode_u32(enc, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);
-    encode_u64(enc, 0);
+    encode_vertex_input_pnext(enc, info->pNext);
     encode_u32(enc, info->flags);
     encode_u32(enc, info->vertexBindingDescriptionCount);
     encode_u64(enc, info->pVertexBindingDescriptions
@@ -145,12 +185,33 @@ static void encode_input_assembly(
     encode_u32(enc, info->primitiveRestartEnable);
 }
 
+static void encode_viewport_pnext(struct pipeline_encoder *enc,
+                                  const void *value)
+{
+    const VkBaseInStructure *next = (const VkBaseInStructure *)value;
+    while (next) {
+        if (next->sType ==
+            VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT) {
+            const VkPipelineViewportDepthClipControlCreateInfoEXT *state =
+                (const VkPipelineViewportDepthClipControlCreateInfoEXT *)next;
+            okgl_trace("[OKGL-VKPIPE] viewport-chain=depth-clip-control\n");
+            encode_u64(enc, 1);
+            encode_u32(enc, (uint32_t)state->sType);
+            encode_viewport_pnext(enc, state->pNext);
+            encode_u32(enc, state->negativeOneToOne);
+            return;
+        }
+        next = next->pNext;
+    }
+    encode_u64(enc, 0);
+}
+
 static void encode_viewport_state(
     struct pipeline_encoder *enc,
     const VkPipelineViewportStateCreateInfo *info)
 {
     encode_u32(enc, VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO);
-    encode_u64(enc, 0);
+    encode_viewport_pnext(enc, info->pNext);
     encode_u32(enc, info->flags);
     encode_u32(enc, info->viewportCount);
     encode_u64(enc, info->pViewports ? info->viewportCount : 0u);
@@ -176,33 +237,61 @@ static void encode_viewport_state(
     }
 }
 
+static void encode_rasterization_pnext(struct pipeline_encoder *enc,
+                                       const void *value)
+{
+    const VkBaseInStructure *next = (const VkBaseInStructure *)value;
+    while (next) {
+        switch (next->sType) {
+        case VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT: {
+            const VkPipelineRasterizationDepthClipStateCreateInfoEXT *state =
+                (const VkPipelineRasterizationDepthClipStateCreateInfoEXT *)next;
+            okgl_trace("[OKGL-VKPIPE] raster-chain=depth-clip\n");
+            encode_u64(enc, 1);
+            encode_u32(enc, (uint32_t)state->sType);
+            encode_rasterization_pnext(enc, state->pNext);
+            encode_u32(enc, state->flags);
+            encode_u32(enc, state->depthClipEnable);
+            return;
+        }
+        case VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO: {
+            const VkPipelineRasterizationLineStateCreateInfo *state =
+                (const VkPipelineRasterizationLineStateCreateInfo *)next;
+            okgl_trace("[OKGL-VKPIPE] raster-chain=line\n");
+            encode_u64(enc, 1);
+            encode_u32(enc, (uint32_t)state->sType);
+            encode_rasterization_pnext(enc, state->pNext);
+            encode_u32(enc, (uint32_t)state->lineRasterizationMode);
+            encode_u32(enc, state->stippledLineEnable);
+            encode_u32(enc, state->lineStippleFactor);
+            encode_u16(enc, state->lineStipplePattern);
+            return;
+        }
+        case VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT: {
+            const VkPipelineRasterizationProvokingVertexStateCreateInfoEXT *state =
+                (const VkPipelineRasterizationProvokingVertexStateCreateInfoEXT *)next;
+            okgl_trace("[OKGL-VKPIPE] raster-chain=provoking-vertex\n");
+            encode_u64(enc, 1);
+            encode_u32(enc, (uint32_t)state->sType);
+            encode_rasterization_pnext(enc, state->pNext);
+            encode_u32(enc, (uint32_t)state->provokingVertexMode);
+            return;
+        }
+        default:
+            next = next->pNext;
+            break;
+        }
+    }
+
+    encode_u64(enc, 0);
+}
+
 static void encode_rasterization(
     struct pipeline_encoder *enc,
     const VkPipelineRasterizationStateCreateInfo *info)
 {
-    const VkPipelineRasterizationDepthClipStateCreateInfoEXT *depth_clip = 0;
-    for (const VkBaseInStructure *next =
-             (const VkBaseInStructure *)info->pNext;
-         next; next = next->pNext) {
-        if (next->sType !=
-            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT) {
-            enc->failed = 1;
-            return;
-        }
-        depth_clip =
-            (const VkPipelineRasterizationDepthClipStateCreateInfoEXT *)next;
-    }
     encode_u32(enc, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO);
-    if (depth_clip) {
-        encode_u64(enc, 1);
-        encode_u32(enc,
-            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT);
-        encode_u64(enc, 0);
-        encode_u32(enc, depth_clip->flags);
-        encode_u32(enc, depth_clip->depthClipEnable);
-    } else {
-        encode_u64(enc, 0);
-    }
+    encode_rasterization_pnext(enc, info->pNext);
     encode_u32(enc, info->flags);
     encode_u32(enc, info->depthClampEnable);
     encode_u32(enc, info->rasterizerDiscardEnable);
@@ -364,17 +453,13 @@ static int encode_graphics_pipeline(
                        info->pStages[i].pNext)->sType);
             return -1;
         }
-    if (info->pVertexInputState->pNext ||
-        info->pInputAssemblyState->pNext ||
-        info->pViewportState->pNext ||
+    if (info->pInputAssemblyState->pNext ||
         info->pMultisampleState->pNext ||
         info->pDepthStencilState->pNext ||
         info->pColorBlendState->pNext ||
         info->pDynamicState->pNext) {
-        printf("[VN pipeline] unsupported state pNext vi=%u ia=%u vp=%u ms=%u ds=%u cb=%u dy=%u\n",
-               !!info->pVertexInputState->pNext,
+        printf("[VN pipeline] unsupported state pNext ia=%u ms=%u ds=%u cb=%u dy=%u\n",
                !!info->pInputAssemblyState->pNext,
-               !!info->pViewportState->pNext,
                !!info->pMultisampleState->pNext,
                !!info->pDepthStencilState->pNext,
                !!info->pColorBlendState->pNext,
@@ -424,12 +509,16 @@ venus_real_CreateGraphicsPipelines(
     const VkGraphicsPipelineCreateInfo *create_infos,
     const VkAllocationCallbacks *allocator, VkPipeline *pipelines)
 {
+    okgl_trace("[OKGL-VKPIPE] venus-enter\n");
     if (!device || pipeline_cache || create_info_count != 1 ||
-        !create_infos || allocator || !pipelines)
+        !create_infos || allocator || !pipelines) {
+        okgl_trace("[OKGL-VKPIPE] venus-invalid-args\n");
         return VK_ERROR_INITIALIZATION_FAILED;
+    }
     uint8_t *command = malloc(PIPELINE_COMMAND_CAPACITY);
     void *object = malloc(1);
     if (!command || !object) {
+        okgl_trace("[OKGL-VKPIPE] venus-alloc-failed\n");
         free(command);
         free(object);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -447,6 +536,7 @@ venus_real_CreateGraphicsPipelines(
     encode_u32(&enc, 1);
     encode_u64(&enc, 1);
     if (encode_graphics_pipeline(&enc, &create_infos[0]) < 0) {
+        okgl_trace("[OKGL-VKPIPE] venus-encode-failed\n");
         free(command);
         free(object);
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -459,6 +549,9 @@ venus_real_CreateGraphicsPipelines(
     int wire_result = enc.failed ? -1 :
         venus_wire_call(self->physical_device->instance->wire,
                         command, enc.offset, reply, sizeof(reply));
+    okgl_trace(wire_result < 0
+                   ? "[OKGL-VKPIPE] venus-wire-failed\n"
+                   : "[OKGL-VKPIPE] venus-wire-replied\n");
     free(command);
     uint32_t returned_command = 0;
     int32_t result = VK_ERROR_DEVICE_LOST;
@@ -474,6 +567,7 @@ venus_real_CreateGraphicsPipelines(
          (returned_count != 1 || returned_id != object_id)))
         result = VK_ERROR_DEVICE_LOST;
     if (result != VK_SUCCESS) {
+        okgl_trace("[OKGL-VKPIPE] venus-host-failed\n");
         printf("[VN pipeline] host create failed wire=%d reply=%u result=%d count=%llu\n",
                wire_result, returned_command, result,
                (unsigned long long)returned_count);
@@ -481,6 +575,7 @@ venus_real_CreateGraphicsPipelines(
         return (VkResult)result;
     }
     pipelines[0] = (VkPipeline)object_id;
+    okgl_trace("[OKGL-VKPIPE] venus-success\n");
     return VK_SUCCESS;
 }
 

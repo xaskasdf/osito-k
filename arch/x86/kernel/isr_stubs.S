@@ -67,6 +67,33 @@ isr_common:
     push %r14
     push %r15
 
+    /* Fault gates use IST3. Keep a per-entry cursor below the live frame so
+     * nested faults cannot overwrite it. R12/R13 are safe scratch registers
+     * here: their interrupted values are already in the GPR save area and the
+     * SysV handler preserves the temporary values across the C call. */
+    xor %r13, %r13
+    mov 120(%rsp), %r10              /* vector */
+    cmp $32, %r10
+    jae .Lisr_fault_cursor_done
+    cmp $1, %r10                     /* IST2 */
+    je .Lisr_fault_cursor_done
+    cmp $2, %r10                     /* IST5 */
+    je .Lisr_fault_cursor_done
+    cmp $3, %r10                     /* IST2 */
+    je .Lisr_fault_cursor_done
+    cmp $8, %r10                     /* IST6 */
+    je .Lisr_fault_cursor_done
+    cmp $18, %r10                    /* IST7 */
+    je .Lisr_fault_cursor_done
+    movq tss_ist3_ptr(%rip), %r13
+    test %r13, %r13
+    jz .Lisr_fault_cursor_done
+    movq (%r13), %r12                /* old IST3 cursor */
+    movq %rsp, %r10
+    subq $16384, %r10                /* room for this handler's call chain */
+    movq %r10, (%r13)
+.Lisr_fault_cursor_done:
+
     /* C requires DF clear. IRETQ restores the interrupted RFLAGS. */
     cld
 
@@ -109,6 +136,14 @@ isr_common:
 
     /* Call C handler */
     call isr_handler
+
+    /* The task may have slept in a PE32 SEH callback. The scheduler restores
+     * its private IST3 cursor before this call chain resumes, so returning the
+     * cursor to the entry value is now safe. */
+    test %r13, %r13
+    jz .Lisr_fault_cursor_restored
+    movq %r12, (%r13)
+.Lisr_fault_cursor_restored:
 
     /* Restore rsp to the GPR area and load FPU state from whichever
      * process is live *now* (the scheduler may have rewritten

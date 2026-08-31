@@ -84,13 +84,15 @@ typedef struct {
 
 /* ── Module structure ──────────────────────────────────────── */
 
-#define DL_MAX_MODULES  32
+#define DL_MAX_MODULES  64
 #define DL_MAX_MOD_NAME 64
 
 typedef struct {
     bool        loaded;
     char        name[DL_MAX_MOD_NAME];
-    void       *base;
+    uint32_t    owner_id;         /* 0 = shared namespace, otherwise private */
+    void       *base;             /* Upper-half virtual image base */
+    void       *phys_base;        /* PMM allocation owned by the module */
     uint64_t    load_bias;
     uint64_t    size;
     uint64_t    pages;
@@ -137,8 +139,10 @@ typedef struct {
 
 void  dl_init(void);
 void *dl_open(const char *filename);
+void *dl_open_private(const char *filename, uint32_t owner_id);
 void *dl_sym(void *handle, const char *name);
 int   dl_close(void *handle);
+int   dl_discard(void *handle);   /* Process teardown: unload without fini */
 void *dl_find(const char *name);
 void  dl_list_modules(void);
 

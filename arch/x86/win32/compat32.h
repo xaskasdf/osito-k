@@ -107,9 +107,15 @@ void compat32_callback(uint32_t func_addr);
  */
 uint32_t compat32_callback_args(uint32_t func_addr, int nargs,
                                 const uint32_t *args);
+uint32_t compat32_callback_args_with_ebp(uint32_t func_addr, int nargs,
+                                         const uint32_t *args,
+                                         uint32_t frame_ebp);
 uint32_t compat32_callback_args_on_stack(uint32_t func_addr, int nargs,
                                          const uint32_t *args,
                                          uint32_t stack_top);
+uint32_t compat32_thread_entry_on_stack(uint32_t func_addr, int nargs,
+                                        const uint32_t *args,
+                                        uint32_t stack_top);
 
 /* Return the active PE32 API caller's ESP for callbacks on this scheduler
  * thread. Zero means there is no validated user-stack context. */
@@ -133,6 +139,21 @@ const char *compat32_get_name(uint32_t thunk_idx);
  * Returns: 1 if handled, 0 if unhandled.
  */
 int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord);
+
+/* Register state captured by the x86 exception entry path.  The dispatcher
+ * expands this into the Win32 CONTEXT32 ABI exposed to PE32 handlers, then
+ * copies any handler changes back before IRET resumes the application. */
+typedef struct {
+    uint32_t eax, ebx, ecx, edx;
+    uint32_t esi, edi, ebp, esp;
+    uint32_t eip, eflags;
+    uint32_t seg_cs, seg_ss, seg_ds, seg_es, seg_fs, seg_gs;
+} compat32_cpu_context_t;
+
+int compat32_seh_dispatch_cpu(PEXCEPTION_RECORD ExceptionRecord,
+                              compat32_cpu_context_t *Context);
+int compat32_seh_dispatch_active(void);
+int compat32_range_readable(uint32_t address, uint32_t size);
 
 /*
  * Global flag: set to 1 when running a PE32 (i386) executable.

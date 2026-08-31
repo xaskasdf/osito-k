@@ -34,6 +34,14 @@ extern void  kfree(void *ptr);
 extern void *kcalloc(uint64_t count, uint64_t size);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
+extern uint64_t mem_get_free(void);
+extern uint64_t mem_get_total(void);
+extern uint64_t heap_get_used(void);
+extern uint64_t heap_get_total(void);
+extern uint64_t heap_get_count(void);
+extern void heap_dump_top_allocators(uint32_t limit);
+extern void nt_vm_get_stats(uint32_t *entries, uint64_t *private_pages,
+                            uint64_t *mapped_pages) __attribute__((weak));
 extern void win32_kernel_thread_reaped(uint32_t pid, int exit_code)
     __attribute__((weak));
 extern void k32_iocp_thread_blocking(void) __attribute__((weak));
@@ -91,8 +99,10 @@ extern void syscall_restore_brk(void);
 #define PROC_ALLOCATING 5
 
 /* Scheduler constants (X-SCHED) */
-#define SCHED_QUANTUM       5       /* default ticks per time slice (50ms @ 100Hz) */
-#define KERNEL_STACK_SIZE   262144  /* 256KB per kernel thread */
+#define SCHED_QUANTUM              5       /* default ticks per time slice (50ms @ 100Hz) */
+#define KERNEL_EXEC_STACK_SIZE     262144  /* scheduler entry and kernel callbacks */
+#define KERNEL_SYSCALL_STACK_SIZE  262144  /* isolated CPL0 SYSCALL call chains */
+#define KERNEL_STACK_SIZE          (KERNEL_EXEC_STACK_SIZE + KERNEL_SYSCALL_STACK_SIZE)
 
 /* QoS priority classes — higher value = higher priority */
 #define QOS_IDLE            0
@@ -225,8 +235,11 @@ static process_t *proctab;
 static void *proctab_storage;
 static int proc_capacity;
 #define COMPAT_IST1_STACK_SIZE 1048576
+#define COMPAT_IST3_STACK_SIZE 1048576
 static uint64_t *sched_compat_ist1;
 static void **sched_compat_ist1_phys;
+static uint64_t *sched_compat_ist3;
+static void **sched_compat_ist3_phys;
 /* Context-switch diagnostics. A saved frame may be resumed exactly once;
  * the next deschedule must replace it with a newer generation. The stack
  * snapshot catches reuse or aliasing of both compat IST1 and Win64 runtime
@@ -248,6 +261,7 @@ static uint32_t sched_irq_off_save_logs;
 static uint32_t sched_irq_off_restore_logs;
 static uint32_t sched_owner_mismatch_logs;
 static uint32_t sched_ist1_guard_logs;
+static uint32_t sched_ist3_guard_logs;
 
 static void proc_tables_release(void)
 {
@@ -257,6 +271,8 @@ static void proc_tables_release(void)
     kfree(sched_frame_stack_rsp);
     kfree(sched_frame_resumed_seq);
     kfree(sched_frame_seq);
+    kfree(sched_compat_ist3_phys);
+    kfree(sched_compat_ist3);
     kfree(sched_compat_ist1_phys);
     kfree(sched_compat_ist1);
     kfree(proctab_storage);
@@ -267,6 +283,8 @@ static void proc_tables_release(void)
     sched_frame_stack_rsp = NULL;
     sched_frame_resumed_seq = NULL;
     sched_frame_seq = NULL;
+    sched_compat_ist3_phys = NULL;
+    sched_compat_ist3 = NULL;
     sched_compat_ist1_phys = NULL;
     sched_compat_ist1 = NULL;
     proctab = NULL;
@@ -285,6 +303,10 @@ static bool proc_tables_allocate(uint32_t capacity)
         capacity, sizeof(*sched_compat_ist1));
     sched_compat_ist1_phys = (void **)kcalloc(
         capacity, sizeof(*sched_compat_ist1_phys));
+    sched_compat_ist3 = (uint64_t *)kcalloc(
+        capacity, sizeof(*sched_compat_ist3));
+    sched_compat_ist3_phys = (void **)kcalloc(
+        capacity, sizeof(*sched_compat_ist3_phys));
     sched_frame_seq = (uint64_t *)kcalloc(capacity,
                                           sizeof(*sched_frame_seq));
     sched_frame_resumed_seq = (uint64_t *)kcalloc(
@@ -299,6 +321,7 @@ static bool proc_tables_allocate(uint32_t capacity)
         capacity, sizeof(*sched_sleep_deadline));
 
     if (!proctab || !sched_compat_ist1 || !sched_compat_ist1_phys ||
+        !sched_compat_ist3 || !sched_compat_ist3_phys ||
         !sched_frame_seq || !sched_frame_resumed_seq ||
         !sched_frame_stack_rsp || !sched_frame_stack_qword0 ||
         !sched_frame_stack_qword1 || !sched_sleep_deadline) {
@@ -332,12 +355,37 @@ static bool sched_compat_ist1_contains(int idx, uint64_t rsp)
     return rsp > base && rsp <= base + COMPAT_IST1_STACK_SIZE;
 }
 
+static bool sched_compat_ist3_contains(int idx, uint64_t rsp)
+{
+    if (idx < 0 || idx >= proc_capacity || !sched_compat_ist3_phys[idx])
+        return false;
+
+    uint64_t base = (uint64_t)PHYS_TO_VIRT(sched_compat_ist3_phys[idx]);
+    return rsp > base && rsp <= base + COMPAT_IST3_STACK_SIZE;
+}
+
 static void sched_ist1_guard_log(const char *op, int idx, uint64_t bad,
                                  uint64_t replacement)
 {
     if (sched_ist1_guard_logs++ >= 64)
         return;
     serial_puts("[SCHED-IST1-GUARD] ");
+    serial_puts(op);
+    serial_puts(" pid=");
+    serial_putdec(proctab[idx].pid);
+    serial_puts(" invalid=0x");
+    serial_puthex(bad, 16);
+    serial_puts(" use=0x");
+    serial_puthex(replacement, 16);
+    serial_puts("\n");
+}
+
+static void sched_ist3_guard_log(const char *op, int idx, uint64_t bad,
+                                 uint64_t replacement)
+{
+    if (sched_ist3_guard_logs++ >= 64)
+        return;
+    serial_puts("[SCHED-IST3-GUARD] ");
     serial_puts(op);
     serial_puts(" pid=");
     serial_putdec(proctab[idx].pid);
@@ -361,6 +409,13 @@ static int sched_stack_owner(uint64_t rsp, const char **kind)
         if (sched_compat_ist1_phys[i]) {
             if (sched_compat_ist1_contains(i, rsp)) {
                 if (kind) *kind = "compat";
+                return i;
+            }
+        }
+
+        if (sched_compat_ist3_phys[i]) {
+            if (sched_compat_ist3_contains(i, rsp)) {
+                if (kind) *kind = "fault";
                 return i;
             }
         }
@@ -534,10 +589,9 @@ static inline void set_current_proc(process_t *p)
     fpu_state_ptrs[idt_get_bsp_apic_id() & 0xFF] = fpu;
 
     /* SYSCALL does not switch stacks in hardware because Osito's ELF tasks
-     * currently run at CPL0. Publish the private 256KB stack for user tasks so
-     * syscall_entry can leave small pthread stacks before calling into C/VFS.
-     * Kernel threads already execute on kernel_stack and must not switch to its
-     * top again while live frames are below it. */
+     * currently run at CPL0. The upper half of each private allocation is a
+     * dedicated syscall stack; the lower half retains dormant scheduler and
+     * Win32 entry frames while PE/ELF code runs on its user stack. */
     syscall_kernel_rsp = p && p->kernel_stack && p->cr3 &&
                          p->cr3 != paging_get_kernel_cr3()
         ? (uint64_t)p->kernel_stack + KERNEL_STACK_SIZE : 0;
@@ -633,6 +687,10 @@ static inline void sched_sleep_cancel(int idx)
 
 static inline void proc_transition(process_t *p, uint32_t new_state)
 {
+    uint64_t irq_flags;
+    __asm__ volatile ("pushfq; popq %0; cli"
+                      : "=r"(irq_flags) :: "memory");
+
     int idx = (int)(p - proctab);
     uint32_t old = __atomic_load_n(&p->state, __ATOMIC_ACQUIRE);
 
@@ -654,6 +712,11 @@ static inline void proc_transition(process_t *p, uint32_t new_state)
     else if (old != PROC_READY && new_state == PROC_READY)
         runq_enqueue(idx);
 
+    /* The run queue is owned by the BSP scheduler. Keep state publication,
+     * links, tail, and ready_count indivisible with respect to its timer ISR;
+     * otherwise a tick can splice a partially enqueued task out of the list. */
+    if (irq_flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
 }
 
 static void runq_init(void)
@@ -690,6 +753,8 @@ static process_t *proc_alloc(const char *name)
             *(uint32_t *)&p->fpu_state[28] = 0x0000FFFF;
             sched_compat_ist1[i] = 0;
             sched_compat_ist1_phys[i] = NULL;
+            sched_compat_ist3[i] = 0;
+            sched_compat_ist3_phys[i] = NULL;
             sched_frame_seq[i] = 0;
             sched_frame_resumed_seq[i] = 0;
             sched_frame_stack_rsp[i] = 0;
@@ -768,21 +833,58 @@ int sched_alloc_compat_ist1(uint32_t pid)
     for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].state == PROC_FREE || proctab[i].pid != pid)
             continue;
-        if (sched_compat_ist1_phys[i]) {
-            if (!sched_compat_ist1_contains(i, sched_compat_ist1[i])) {
-                sched_compat_ist1[i] =
-                    (uint64_t)PHYS_TO_VIRT(sched_compat_ist1_phys[i]) +
-                    COMPAT_IST1_STACK_SIZE;
-            }
-            return 0;
+
+        void *new_ist1 = NULL;
+        void *new_ist3 = NULL;
+        if (!sched_compat_ist1_phys[i]) {
+            new_ist1 = mem_alloc_aligned(COMPAT_IST1_STACK_SIZE, 4096);
+            if (!new_ist1)
+                return -1;
         }
 
-        void *phys = mem_alloc_aligned(COMPAT_IST1_STACK_SIZE, 4096);
-        if (!phys)
+        if (!sched_compat_ist3_phys[i]) {
+            new_ist3 = mem_alloc_aligned(COMPAT_IST3_STACK_SIZE, 4096);
+            if (!new_ist3) {
+                if (new_ist1)
+                    mem_free_pages(new_ist1, COMPAT_IST1_STACK_SIZE / 4096);
+                return -1;
+            }
+        }
+
+        if (new_ist1) {
+            sched_compat_ist1_phys[i] = new_ist1;
+            sched_compat_ist1[i] = (uint64_t)PHYS_TO_VIRT(new_ist1) +
+                                   COMPAT_IST1_STACK_SIZE;
+        } else if (!sched_compat_ist1_contains(i, sched_compat_ist1[i])) {
+            sched_compat_ist1[i] =
+                (uint64_t)PHYS_TO_VIRT(sched_compat_ist1_phys[i]) +
+                COMPAT_IST1_STACK_SIZE;
+        }
+
+        if (new_ist3) {
+            sched_compat_ist3_phys[i] = new_ist3;
+            sched_compat_ist3[i] = (uint64_t)PHYS_TO_VIRT(new_ist3) +
+                                   COMPAT_IST3_STACK_SIZE;
+        } else if (!sched_compat_ist3_contains(i, sched_compat_ist3[i])) {
+            sched_compat_ist3[i] =
+                (uint64_t)PHYS_TO_VIRT(sched_compat_ist3_phys[i]) +
+                COMPAT_IST3_STACK_SIZE;
+        }
+
+        if (!sched_compat_ist1_phys[i] || !sched_compat_ist3_phys[i])
             return -1;
-        sched_compat_ist1_phys[i] = phys;
-        sched_compat_ist1[i] = (uint64_t)PHYS_TO_VIRT(phys) +
-                               COMPAT_IST1_STACK_SIZE;
+
+        /* win32_child_run allocates these stacks from the already-running
+         * child. Activate them immediately; spawned CreateThread tasks will
+         * receive the same cursors through the normal scheduler restore. */
+        if (current_proc == &proctab[i]) {
+            extern uint64_t *tss_ist1_ptr;
+            extern uint64_t *tss_ist3_ptr;
+            if (tss_ist1_ptr)
+                *tss_ist1_ptr = sched_compat_ist1[i];
+            if (tss_ist3_ptr)
+                *tss_ist3_ptr = sched_compat_ist3[i];
+        }
         return 0;
     }
     return -1;
@@ -949,6 +1051,12 @@ static bool proc_free(process_t *p)
                        COMPAT_IST1_STACK_SIZE / 4096);
         sched_compat_ist1_phys[slot] = NULL;
         sched_compat_ist1[slot] = 0;
+    }
+    if (sched_compat_ist3_phys[slot]) {
+        mem_free_pages(sched_compat_ist3_phys[slot],
+                       COMPAT_IST3_STACK_SIZE / 4096);
+        sched_compat_ist3_phys[slot] = NULL;
+        sched_compat_ist3[slot] = 0;
     }
 
     proc_release_kernel_stack(p);
@@ -1391,7 +1499,7 @@ int proc_get_kernel_stack_bounds(uint64_t *limit, uint64_t *base)
         return -1;
 
     *limit = (uint64_t)current_proc->kernel_stack + 4096;
-    *base = (uint64_t)current_proc->kernel_stack + KERNEL_STACK_SIZE;
+    *base = (uint64_t)current_proc->kernel_stack + KERNEL_EXEC_STACK_SIZE;
     return 0;
 }
 
@@ -1869,6 +1977,15 @@ extern volatile uint64_t sched_switch_cr3;
 
 static int      sched_current_idx = -1;
 
+static bool sched_active_seh_has_private_ist3(void)
+{
+    extern uint64_t *tss_ist3_ptr;
+
+    return sched_current_idx >= 0 && tss_ist3_ptr &&
+           sched_compat_ist3_phys[sched_current_idx] &&
+           sched_compat_ist3_contains(sched_current_idx, *tss_ist3_ptr);
+}
+
 /* Scheduler current-slot accessors used by proc_launch_prepare / proc_exec
  * to make a freshly-exec'd binary the scheduler's tracked process. Without
  * this, proc_exec launches the binary outside the scheduler (sched_current_idx
@@ -1949,6 +2066,17 @@ static inline bool sched_valid_frame_cs(uint64_t cs)
            s == 0x10 || s == 0x43 || s == 0x40;
 }
 
+static inline bool sched_valid_frame_ss(uint64_t ss)
+{
+    uint16_t s = (uint16_t)(ss & 0xFFFF);
+
+    /* Native ELF starts with SS=0x30 and resumes from SYSCALL with the
+     * private 0x98 selector. Compat32/ring-3 frames use the remaining
+     * selectors; zero is valid for interrupt frames without an SS slot. */
+    return s == 0x30 || s == 0x98 || s == 0x48 ||
+           s == 0x3B || s == 0x00;
+}
+
 void __hot sched_tick(void *frame_ptr)
 {
     if (!sched_enabled || sched_current_idx < 0)
@@ -1964,6 +2092,23 @@ void __hot sched_tick(void *frame_ptr)
         if (sched_nested_yield_logs++ < 32)
             serial_puts("[SCHED-NESTED-TICK] rejected\n");
         return;
+    }
+
+    /* A PE32 fault handler may sleep while user-mode SEH runs. Switching is
+     * safe only when its live fault frame is on this task's private IST3. */
+    {
+        extern int compat32_seh_dispatch_active(void);
+        static uint32_t seh_tick_reject_logs;
+        if (compat32_seh_dispatch_active() &&
+            !sched_active_seh_has_private_ist3()) {
+            if (seh_tick_reject_logs++ < 32) {
+                serial_puts("[SCHED-TICK-SEH] rejected pid=");
+                serial_putdec(proctab[sched_current_idx].pid);
+                serial_puts("\n");
+            }
+            __atomic_store_n(&sched_tick_active, 0, __ATOMIC_RELEASE);
+            return;
+        }
     }
 
     /* Wake scheduler sleeps before selecting the next runnable task. */
@@ -2003,20 +2148,27 @@ void __hot sched_tick(void *frame_ptr)
      * while the offending PID and stack owner are still recoverable. */
     {
         extern uint64_t *tss_ist1_ptr;
+        extern uint64_t *tss_ist3_ptr;
         const char *rsp_kind = "none";
-        const char *ist_kind = "none";
+        const char *ist1_kind = "none";
+        const char *ist3_kind = "none";
         int rsp_owner = sched_stack_owner(interrupted_rsp, &rsp_kind);
-        int ist_owner = tss_ist1_ptr
-                      ? sched_stack_owner(*tss_ist1_ptr, &ist_kind) : -1;
+        int ist1_owner = tss_ist1_ptr
+                       ? sched_stack_owner(*tss_ist1_ptr, &ist1_kind) : -1;
+        int ist3_owner = tss_ist3_ptr
+                       ? sched_stack_owner(*tss_ist3_ptr, &ist3_kind) : -1;
         /* Some Win64 process entry paths intentionally switch to a PE-owned
          * stack that is not registered in process_t. Only a stack positively
          * owned by another scheduler slot is a mismatch. */
         bool bad_rsp_owner = rsp_owner >= 0 &&
                              rsp_owner != sched_current_idx;
-        bool bad_ist_owner = sched_compat_ist1_phys[sched_current_idx] &&
-                             ist_owner != sched_current_idx;
+        bool bad_ist1_owner = sched_compat_ist1_phys[sched_current_idx] &&
+                              ist1_owner != sched_current_idx;
+        bool bad_ist3_owner = sched_compat_ist3_phys[sched_current_idx] &&
+                              ist3_owner != sched_current_idx;
 
-        if ((current_proc != cur || bad_rsp_owner || bad_ist_owner) &&
+        if ((current_proc != cur || bad_rsp_owner || bad_ist1_owner ||
+             bad_ist3_owner) &&
             sched_owner_mismatch_logs++ < 64) {
             serial_puts("[SCHED-OWNER-MISMATCH] idx=");
             serial_putdec((uint64_t)sched_current_idx);
@@ -2034,10 +2186,19 @@ void __hot sched_tick(void *frame_ptr)
             }
             serial_puts(" ist1=0x");
             serial_puthex(tss_ist1_ptr ? *tss_ist1_ptr : 0, 16);
-            serial_puts(" ist_owner=");
-            if (ist_owner >= 0) {
-                serial_putdec(proctab[ist_owner].pid);
-                serial_puts("/"); serial_puts(ist_kind);
+            serial_puts(" ist1_owner=");
+            if (ist1_owner >= 0) {
+                serial_putdec(proctab[ist1_owner].pid);
+                serial_puts("/"); serial_puts(ist1_kind);
+            } else {
+                serial_puts("none");
+            }
+            serial_puts(" ist3=0x");
+            serial_puthex(tss_ist3_ptr ? *tss_ist3_ptr : 0, 16);
+            serial_puts(" ist3_owner=");
+            if (ist3_owner >= 0) {
+                serial_putdec(proctab[ist3_owner].pid);
+                serial_puts("/"); serial_puts(ist3_kind);
             } else {
                 serial_puts("none");
             }
@@ -2067,6 +2228,12 @@ void __hot sched_tick(void *frame_ptr)
         : (uint64_t)ist1_stack;
     bool in_compat_shim = interrupted_rsp >= compat_stack &&
                           interrupted_rsp < compat_stack + COMPAT_IST1_STACK_SIZE;
+    uint64_t fault_stack = sched_compat_ist3_phys[sched_current_idx]
+        ? (uint64_t)PHYS_TO_VIRT(sched_compat_ist3_phys[sched_current_idx])
+        : 0;
+    bool in_compat_fault = fault_stack &&
+                           interrupted_rsp > fault_stack &&
+                           interrupted_rsp < fault_stack + COMPAT_IST3_STACK_SIZE;
     uint64_t runtime_stack = (uint64_t)cur->kernel_stack;
     bool in_runtime_stack = cur->kernel_stack &&
                             interrupted_rsp >= runtime_stack + 4096 &&
@@ -2141,9 +2308,10 @@ void __hot sched_tick(void *frame_ptr)
 
     /* ── Context switch ────────────────────────────────────────── */
 
-    /* INT 0x2E may yield while its C call chain is live. Preserve the
-     * process-owned IST1 cursor before another process uses the TSS. */
+    /* INT 0x2E and PE32 SEH may both yield with live kernel call chains.
+     * Preserve each process-owned TSS cursor before another task runs. */
     extern uint64_t *tss_ist1_ptr;
+    extern uint64_t *tss_ist3_ptr;
     if (tss_ist1_ptr) {
         uint64_t cursor = *tss_ist1_ptr;
         if (!sched_compat_ist1_phys[sched_current_idx]) {
@@ -2162,6 +2330,24 @@ void __hot sched_tick(void *frame_ptr)
                                  replacement);
         }
     }
+    if (tss_ist3_ptr) {
+        uint64_t cursor = *tss_ist3_ptr;
+        if (!sched_compat_ist3_phys[sched_current_idx]) {
+            sched_compat_ist3[sched_current_idx] = 0;
+        } else if (sched_compat_ist3_contains(sched_current_idx, cursor)) {
+            sched_compat_ist3[sched_current_idx] = cursor;
+        } else {
+            uint64_t replacement = sched_compat_ist3[sched_current_idx];
+            if (!sched_compat_ist3_contains(sched_current_idx, replacement)) {
+                uint64_t base = (uint64_t)PHYS_TO_VIRT(
+                    sched_compat_ist3_phys[sched_current_idx]);
+                replacement = base + COMPAT_IST3_STACK_SIZE;
+                sched_compat_ist3[sched_current_idx] = replacement;
+            }
+            sched_ist3_guard_log("save", sched_current_idx, cursor,
+                                 replacement);
+        }
+    }
 
     /* IST4 belongs to the CPU and will be reused by the next interrupt.
      * Copy the complete return frame into task-owned storage before the
@@ -2173,6 +2359,8 @@ void __hot sched_tick(void *frame_ptr)
     sched_frame_stack_rsp[sched_current_idx] = 0;
     if ((in_compat_shim &&
          interrupted_rsp <= compat_stack + COMPAT_IST1_STACK_SIZE - 16) ||
+        (in_compat_fault &&
+         interrupted_rsp <= fault_stack + COMPAT_IST3_STACK_SIZE - 16) ||
         in_runtime_stack) {
         uint64_t *saved_stack = (uint64_t *)interrupted_rsp;
         sched_frame_stack_rsp[sched_current_idx] = interrupted_rsp;
@@ -2324,6 +2512,8 @@ void __hot sched_tick(void *frame_ptr)
             bool runtime_snapshot = next->kernel_stack &&
                 saved_stack_rsp >= next_stack + 4096 &&
                 saved_stack_rsp <= next_stack + KERNEL_STACK_SIZE - 16;
+            bool fault_snapshot =
+                sched_compat_ist3_contains(next_idx, saved_stack_rsp);
             serial_puts("[SCHED-STACK-CLOBBER] pid=");
             serial_putdec(next->pid);
             serial_puts(" by_pid=");
@@ -2341,7 +2531,8 @@ void __hot sched_tick(void *frame_ptr)
             serial_puts("/");
             serial_puthex(now1, 16);
             serial_puts(" kind=");
-            serial_puts(runtime_snapshot ? "runtime" : "compat");
+            serial_puts(runtime_snapshot ? "runtime" :
+                        (fault_snapshot ? "fault" : "compat"));
             serial_puts(" ist1=0x");
             serial_puthex(sched_compat_ist1[next_idx], 16);
             serial_puts("\n");
@@ -2379,6 +2570,24 @@ void __hot sched_tick(void *frame_ptr)
         } else {
             extern void x86_tss_reset_ist1(void);
             x86_tss_reset_ist1();
+        }
+    }
+    if (tss_ist3_ptr) {
+        uint64_t cursor = sched_compat_ist3[next_idx];
+        if (sched_compat_ist3_phys[next_idx]) {
+            if (!sched_compat_ist3_contains(next_idx, cursor)) {
+                uint64_t base = (uint64_t)PHYS_TO_VIRT(
+                    sched_compat_ist3_phys[next_idx]);
+                uint64_t replacement = base + COMPAT_IST3_STACK_SIZE;
+                sched_ist3_guard_log("restore", next_idx, cursor,
+                                     replacement);
+                cursor = replacement;
+                sched_compat_ist3[next_idx] = replacement;
+            }
+            *tss_ist3_ptr = cursor;
+        } else {
+            extern void x86_tss_reset_ist3(void);
+            x86_tss_reset_ist3();
         }
     }
     wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
@@ -2436,10 +2645,8 @@ void __hot sched_tick(void *frame_ptr)
             frame[17] = next->saved_frame_rip;
             rip = next->saved_frame_rip;
         }
-        bool bad_cs  = (cs != 0x38 && cs != 0x28 && cs != 0x43 && cs != 0x40);
-        /* Native shims may yield before returning to compat32, while SS is
-         * still the valid 32-bit data selector used by the caller. */
-        bool bad_ss  = (ss != 0x30 && ss != 0x48 && ss != 0x3B && ss != 0x00);
+        bool bad_cs = !sched_valid_frame_cs(cs);
+        bool bad_ss = !sched_valid_frame_ss(ss);
         /* A low (user-space) RIP is corruption only for a KERNEL thread,
          * whose entry is a kernel function at a high RIP. User-ELF processes
          * legitimately run their own code at low addresses (e.g. 0x20000000)
@@ -2518,10 +2725,9 @@ static int sched_spawn_with_address_space(const char *name,
         return -1;
     }
 
-    /* Allocate the runtime stack via the upper-half direct map. The stack
-     * top RSP needs to be reachable from any process's CR3, and only
-     * PML4[256] (the kernel mirror) is shared across all CR3s once the
-     * lower-half identity map disappears. */
+    /* Allocate isolated execution and syscall stacks as one upper-half block.
+     * Both RSP tops must be reachable from every process CR3; PML4[256] (the
+     * kernel mirror) remains shared after the lower identity map disappears. */
     void *stack_phys = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
     if (!stack_phys) {
         proc_transition(p, PROC_FREE);
@@ -2536,7 +2742,7 @@ static int sched_spawn_with_address_space(const char *name,
     extern int paging_unmap_page(uint64_t virt);
     paging_unmap_page((uint64_t)stack);
 
-    uint64_t stack_top = (uint64_t)stack + KERNEL_STACK_SIZE;
+    uint64_t stack_top = (uint64_t)stack + KERNEL_EXEC_STACK_SIZE;
 
     /* The initial return context is canonical process state, not a live frame
      * on a CPU or runtime stack. */
@@ -2625,6 +2831,24 @@ int sched_spawn_in_address_space_blocked(const char *name,
 void sched_yield(void)
 {
     if (!sched_enabled || sched_current_idx < 0) return;
+
+    /* Keep the legacy no-switch fallback for boot/shell contexts that do not
+     * own a private IST3. Normal Win32 tasks can yield from inside SEH. */
+    {
+        extern int compat32_seh_dispatch_active(void);
+        static uint32_t seh_yield_reject_logs;
+        if (compat32_seh_dispatch_active() &&
+            !sched_active_seh_has_private_ist3()) {
+            if (seh_yield_reject_logs++ < 32) {
+                serial_puts("[SCHED-YIELD-SEH] rejected pid=");
+                serial_putdec(proctab[sched_current_idx].pid);
+                serial_puts(" caller=0x");
+                serial_puthex((uint64_t)__builtin_return_address(0), 16);
+                serial_puts("\n");
+            }
+            return;
+        }
+    }
 
     uint64_t entry_flags;
     __asm__ volatile ("pushfq; popq %0" : "=r"(entry_flags));
@@ -3450,14 +3674,20 @@ static void futex_init(void)
 #define FUTEX_EAGAIN       11
 #define FUTEX_ENOMEM       12
 #define FUTEX_ETIMEDOUT    110
-#define FUTEX_PTE_PRESENT  1ULL
-#define FUTEX_USER_TOP     0x0000800000000000ULL
+#define FUTEX_LOW_TOP      0x0000800000000000ULL
 
 static int futex_validate_uaddr(uint64_t uaddr)
 {
     if (uaddr < 0x1000 || (uaddr & 3))
         return -FUTEX_EINVAL;
-    if (uaddr > FUTEX_USER_TOP - sizeof(uint32_t))
+
+    /* Native ELF modules and their libc heap run from the shared upper-half
+     * direct map. Reject the non-canonical hole, but allow both canonical
+     * halves; futex_prefault_read32 verifies that the selected CR3 actually
+     * maps the address before dereferencing it. */
+    if (uaddr >= FUTEX_LOW_TOP && uaddr < KERNEL_VBASE)
+        return -FUTEX_EFAULT;
+    if (uaddr > UINT64_MAX - (sizeof(uint32_t) - 1))
         return -FUTEX_EFAULT;
     return 0;
 }
@@ -3485,16 +3715,26 @@ static int futex_prefault_read32(uint64_t uaddr, int *value)
         return rc;
 
     uint64_t cr3 = proc_current_cr3();
-    uint64_t *pte = cr3 ? paging_get_pte_in_cr3(cr3, uaddr)
-                        : paging_get_pte(uaddr);
-    if (!pte || !(*pte & FUTEX_PTE_PRESENT)) {
-        if (demand_page_fault(uaddr, 0) != 0)
-            return -FUTEX_EFAULT;
-        pte = cr3 ? paging_get_pte_in_cr3(cr3, uaddr)
-                  : paging_get_pte(uaddr);
-        if (!pte || !(*pte & FUTEX_PTE_PRESENT))
-            return -FUTEX_EFAULT;
+    if (!cr3)
+        cr3 = paging_get_kernel_cr3();
+
+    /* Native modules can use large pages in either canonical half. Translation
+     * handles both those mappings and normal 4 KB pages, so consult it before
+     * trying to demand-page a low address that may already be present. */
+    if (cr3 && paging_translate_in_cr3(cr3, uaddr) != UINT64_MAX) {
+        *value = *(volatile int *)(uintptr_t)uaddr;
+        return 0;
     }
+
+    /* Upper-half addresses are never demand-paged. A missing translation is
+     * therefore an invalid futex pointer rather than a recoverable fault. */
+    if (uaddr >= KERNEL_VBASE)
+        return -FUTEX_EFAULT;
+
+    if (demand_page_fault(uaddr, 0) != 0)
+        return -FUTEX_EFAULT;
+    if (!cr3 || paging_translate_in_cr3(cr3, uaddr) == UINT64_MAX)
+        return -FUTEX_EFAULT;
 
     *value = *(volatile int *)(uintptr_t)uaddr;
     return 0;
@@ -3554,9 +3794,13 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
 
     /* A BLOCKED task cannot poll its own deadline (the scheduler never
      * resumes it), so timeout enforcement is done by futex_timeout_sweep()
-     * from sched_tick, which flips us back to READY + sets timed_out. */
+     * from sched_tick, which flips us back to READY + sets timed_out. Yield
+     * synchronously instead of waiting for a hardware timer IRQ: compat32
+     * deliberately masks the local APIC timer while a callback stack is live. */
     while (cur->state == PROC_BLOCKED) {
-        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+        __asm__ volatile ("sti" ::: "memory");
+        sched_yield();
+        __asm__ volatile ("cli; pause" ::: "memory");
     }
 
     flags = futex_lock_irqsave();
@@ -4278,6 +4522,64 @@ int sched_spawn_qos(const char *name, void (*entry)(void), uint8_t qos)
  */
 #define REAP_GRACE_TICKS  1000   /* 10 s at 100 Hz APIC */
 #define REAP_SWEEP_TICKS  100    /* 1 s between sweeps */
+#define RESOURCE_LOG_TICKS 1000  /* serial resource snapshot every 10 s */
+
+static void proc_log_resource_snapshot(void)
+{
+    static uint32_t snapshot_count;
+    uint32_t ready = 0;
+    uint32_t running = 0;
+    uint32_t blocked = 0;
+    uint32_t zombie = 0;
+    uint32_t allocating = 0;
+    uint32_t vm_entries = 0;
+    uint64_t vm_private_pages = 0;
+    uint64_t vm_mapped_pages = 0;
+
+    for (int i = 0; i < proc_capacity; i++) {
+        switch (__atomic_load_n(&proctab[i].state, __ATOMIC_ACQUIRE)) {
+        case PROC_READY:      ready++; break;
+        case PROC_RUNNING:    running++; break;
+        case PROC_BLOCKED:    blocked++; break;
+        case PROC_ZOMBIE:     zombie++; break;
+        case PROC_ALLOCATING: allocating++; break;
+        default: break;
+        }
+    }
+
+    if (nt_vm_get_stats)
+        nt_vm_get_stats(&vm_entries, &vm_private_pages, &vm_mapped_pages);
+
+    serial_puts("[MEMSTAT] pmm_used=");
+    serial_putdec((mem_get_total() - mem_get_free()) / 1024);
+    serial_puts("KB heap_used=");
+    serial_putdec(heap_get_used() / 1024);
+    serial_puts("KB heap_total=");
+    serial_putdec(heap_get_total() / 1024);
+    serial_puts("KB heap_allocs=");
+    serial_putdec(heap_get_count());
+    serial_puts(" tasks(rdy/run/blk/z/alloc)=");
+    serial_putdec(ready);
+    serial_puts("/");
+    serial_putdec(running);
+    serial_puts("/");
+    serial_putdec(blocked);
+    serial_puts("/");
+    serial_putdec(zombie);
+    serial_puts("/");
+    serial_putdec(allocating);
+    serial_puts(" vm(entries/private/mapped_pages)=");
+    serial_putdec(vm_entries);
+    serial_puts("/");
+    serial_putdec(vm_private_pages);
+    serial_puts("/");
+    serial_putdec(vm_mapped_pages);
+    serial_puts("\n");
+
+    snapshot_count++;
+    if ((snapshot_count % 3) == 0)
+        heap_dump_top_allocators(12);
+}
 
 extern uint64_t paging_get_kernel_cr3(void);
 
@@ -4354,6 +4656,7 @@ static void proc_reap_dump(const process_t *p, uint64_t age_ticks,
  * any context that can be preempted; the loop is O(proc_capacity). */
 void proc_reap_zombies(void)
 {
+    uint64_t free_before = mem_get_free();
     int reaped = 0;
     for (int i = 0; i < proc_capacity; i++) {
         process_t *p = &proctab[i];
@@ -4390,17 +4693,33 @@ void proc_reap_zombies(void)
         if (proc_free(p))
             reaped++;
     }
-    (void)reaped;
+    if (reaped) {
+        uint64_t free_after = mem_get_free();
+        uint64_t reclaimed = free_after > free_before
+                           ? free_after - free_before : 0;
+        serial_puts("[reaper] sweep reaped=");
+        serial_putdec((uint64_t)reaped);
+        serial_puts(" reclaimed=");
+        serial_putdec(reclaimed / 1024);
+        serial_puts(" KB\n");
+    }
 }
 
 /* Periodic kthread: sweep zombies once per second. Keep the default QoS:
  * strict priority scheduling can otherwise starve cleanup indefinitely. */
 static void zombie_reaper_thread(void)
 {
+    uint64_t last_resource_log = 0;
+
     serial_puts("[reaper] zombie auto-reaper online (QOS_DEFAULT, "
                 "sweep=1s, grace=10s)\n");
     while (1) {
         proc_reap_zombies();
+        uint64_t now = idt_get_ticks();
+        if (!last_resource_log || now - last_resource_log >= RESOURCE_LOG_TICKS) {
+            proc_log_resource_snapshot();
+            last_resource_log = now;
+        }
         (void)sched_sleep_ticks(REAP_SWEEP_TICKS);
     }
 }
@@ -4497,21 +4816,39 @@ void proc_init(void)
  * which the scheduler isn't ready to context-switch out of. */
 void proc_start_reaper(void)
 {
-    sched_spawn("reaper", zombie_reaper_thread);
+    static bool started;
+    bool expected = false;
+    if (!__atomic_compare_exchange_n(&started, &expected, true, false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE))
+        return;
 
-    int idle_pid = sched_spawn_qos("idle", scheduler_idle_thread, QOS_IDLE);
-    process_t *idle = idle_pid > 0 ? proc_find((uint32_t)idle_pid) : NULL;
-    if (idle)
-        sched_idle_idx = (int)(idle - proctab);
-    else
-        serial_puts("[SCHED] WARNING: idle task unavailable\n");
+    int reaper_pid = sched_spawn("reaper", zombie_reaper_thread);
+    if (reaper_pid < 0) {
+        __atomic_store_n(&started, false, __ATOMIC_RELEASE);
+        serial_puts("[reaper] failed to start\n");
+        return;
+    }
+
+    if (sched_idle_idx < 0) {
+        int idle_pid = sched_spawn_qos("idle", scheduler_idle_thread,
+                                       QOS_IDLE);
+        process_t *idle = idle_pid > 0
+                        ? proc_find((uint32_t)idle_pid) : NULL;
+        if (idle)
+            sched_idle_idx = (int)(idle - proctab);
+        else
+            serial_puts("[SCHED] WARNING: idle task unavailable\n");
+    }
 }
 
 uint32_t proc_count_active(void)
 {
     uint32_t count = 0;
     for (int i = 0; i < proc_capacity; i++) {
-        if (proctab[i].state != PROC_FREE)
+        uint32_t state = __atomic_load_n(&proctab[i].state,
+                                         __ATOMIC_ACQUIRE);
+        if (state != PROC_FREE && state != PROC_ZOMBIE)
             count++;
     }
     return count;

@@ -16,6 +16,7 @@
 
 #include "ntsyscall.h"
 #include "handle.h"
+#include "kernel32_shim.h"
 #include "../kernel/smp.h"
 
 /* ── External ───────────────────────────────────────────────── */
@@ -33,6 +34,7 @@ extern void    *kcalloc(uint64_t count, uint64_t size);
 extern HANDLE_TABLE g_handle_table;
 extern int32_t  proc_current_pid(void);
 extern DWORD    win32_current_process_id(void);
+extern NTSTATUS nt_close_handle_for_process(HANDLE handle, ULONG owner_pid);
 
 #define STATUS_TIMEOUT              ((NTSTATUS)0x00000102)
 #define STATUS_WAIT_0               ((NTSTATUS)0x00000000)
@@ -498,12 +500,22 @@ NTSTATUS sys_NtCreateEvent(ULONG_PTR *args)
 {
     PHANDLE         EventHandle     = (PHANDLE)args[0];
     ACCESS_MASK     DesiredAccess   = (ACCESS_MASK)args[1];
-    /* POBJECT_ATTRIBUTES ObjectAttributes = (POBJECT_ATTRIBUTES)args[2]; */
+    POBJECT_ATTRIBUTES ObjectAttributes = (POBJECT_ATTRIBUTES)args[2];
     ULONG           EventType       = (ULONG)args[3];
     BOOL            InitialState    = (BOOL)args[4];
 
     if (!EventHandle)
         return STATUS_INVALID_PARAMETER;
+
+    *EventHandle = NULL;
+    if (ObjectAttributes) {
+        NTSTATUS open_status = kernel32_nt_open_named_event(
+            ObjectAttributes, DesiredAccess, EventHandle);
+        if (NT_SUCCESS(open_status))
+            return STATUS_OBJECT_NAME_EXISTS;
+        if (open_status != STATUS_OBJECT_NAME_NOT_FOUND)
+            return open_status;
+    }
 
     EVENT_OBJECT *evt = NULL;
     uint64_t flags = ntsync_irq_save();
@@ -534,6 +546,26 @@ NTSTATUS sys_NtCreateEvent(ULONG_PTR *args)
         flags = ntsync_irq_save();
         evt->allocated = FALSE;
         ntsync_irq_restore(flags);
+    }
+    if (NT_SUCCESS(status) && ObjectAttributes) {
+        HANDLE created_handle = *EventHandle;
+        HANDLE effective_handle = created_handle;
+        BOOL already_exists = FALSE;
+        status = kernel32_nt_publish_named_event(
+            ObjectAttributes, DesiredAccess, created_handle,
+            &effective_handle, &already_exists);
+        if (!NT_SUCCESS(status) || already_exists) {
+            ULONG owner_pid = win32_current_process_id();
+            if (!owner_pid) owner_pid = 1;
+            nt_close_handle_for_process(created_handle, owner_pid);
+        }
+        if (!NT_SUCCESS(status)) {
+            *EventHandle = NULL;
+            return status;
+        }
+        *EventHandle = effective_handle;
+        if (already_exists)
+            return STATUS_OBJECT_NAME_EXISTS;
     }
     if (NT_SUCCESS(status) && (ULONG_PTR)*EventHandle == 0x54) {
         serial_puts("[NTSYNC-54] create obj=0x");

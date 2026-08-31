@@ -3110,12 +3110,26 @@ typedef struct {
     UCRT_PROCESS_MODE_VALUES *values;
 } UCRT_PROCESS_MODE_SLOT;
 
+typedef struct {
+    int errno_value;
+    ULONG doserrno_value;
+} UCRT_THREAD_VALUES;
+
+typedef struct _UCRT_THREAD_STATE {
+    struct _UCRT_THREAD_STATE *next;
+    DWORD owner_pid;
+    DWORD owner_tid;
+    UCRT_THREAD_VALUES *values;
+} UCRT_THREAD_STATE;
+
 static UCRT_INVALID_HANDLER_SLOT ucrt_invalid_handlers[
     UCRT_INVALID_HANDLER_SLOTS];
 static UCRT_PROCESS_MODE_SLOT ucrt_process_modes[UCRT_PROCESS_MODE_SLOTS];
+static UCRT_THREAD_STATE *ucrt_thread_states;
 static volatile uint32_t ucrt_state_lock;
 
 static void crt_env_release_process(DWORD process_id);
+static void crt_locale_release_process(DWORD process_id);
 
 static void ucrt_state_lock_acquire(void)
 {
@@ -3129,6 +3143,56 @@ static void ucrt_state_lock_acquire(void)
 static void ucrt_state_lock_release(void)
 {
     __sync_lock_release(&ucrt_state_lock);
+}
+
+static UCRT_THREAD_VALUES *ucrt_thread_state(BOOL create)
+{
+    DWORD owner_pid = win32_current_process_id();
+    DWORD owner_tid = GetCurrentThreadId();
+    if (!owner_pid) owner_pid = 1;
+
+    UCRT_THREAD_VALUES *values = NULL;
+    ucrt_state_lock_acquire();
+    for (UCRT_THREAD_STATE *state = ucrt_thread_states; state;
+         state = state->next) {
+        if (state->owner_pid == owner_pid && state->owner_tid == owner_tid) {
+            values = state->values;
+            break;
+        }
+    }
+
+    if (!values && create) {
+        UCRT_THREAD_STATE *state =
+            (UCRT_THREAD_STATE *)kmalloc(sizeof(*state));
+        values = (UCRT_THREAD_VALUES *)VirtualAlloc(
+            NULL, sizeof(*values), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!state || !values ||
+            (g_compat32_mode &&
+             (ULONG_PTR)values > (ULONG_PTR)UINT32_MAX)) {
+            if (values) VirtualFree(values, 0, MEM_RELEASE);
+            if (state) kfree(state);
+            values = NULL;
+        } else {
+            values->errno_value = 0;
+            values->doserrno_value = 0;
+            state->owner_pid = owner_pid;
+            state->owner_tid = owner_tid;
+            state->values = values;
+            state->next = ucrt_thread_states;
+            ucrt_thread_states = state;
+
+            serial_puts("[CRT-PTD] pid=");
+            serial_putdec(owner_pid);
+            serial_puts(" tid=");
+            serial_putdec(owner_tid);
+            serial_puts(" va=0x");
+            serial_puthex((ULONG_PTR)values,
+                          g_compat32_mode ? 8 : 16);
+            serial_puts("\n");
+        }
+    }
+    ucrt_state_lock_release();
+    return values;
 }
 
 static UCRT_PROCESS_MODE_VALUES *ucrt_process_mode_state(BOOL create)
@@ -3201,6 +3265,7 @@ void msvcrt_release_process(DWORD process_id)
 {
     if (!process_id) return;
 
+    UCRT_THREAD_STATE *released_thread_states = NULL;
     ucrt_state_lock_acquire();
     for (uint32_t i = 0; i < UCRT_PROCESS_MODE_SLOTS; i++) {
         if (ucrt_process_modes[i].owner_pid == process_id) {
@@ -3217,8 +3282,26 @@ void msvcrt_release_process(DWORD process_id)
             ucrt_invalid_handlers[i].handler = NULL;
         }
     }
+    UCRT_THREAD_STATE **link = &ucrt_thread_states;
+    while (*link) {
+        UCRT_THREAD_STATE *state = *link;
+        if (state->owner_pid == process_id) {
+            *link = state->next;
+            state->next = released_thread_states;
+            released_thread_states = state;
+        } else {
+            link = &state->next;
+        }
+    }
     ucrt_state_lock_release();
 
+    while (released_thread_states) {
+        UCRT_THREAD_STATE *next = released_thread_states->next;
+        kfree(released_thread_states);
+        released_thread_states = next;
+    }
+
+    crt_locale_release_process(process_id);
     crt_env_release_process(process_id);
     crt_file_proxy_release_process(process_id);
 }
@@ -3545,45 +3628,139 @@ static CRT_LCONV crt_c_lconv = {
     ._W_negative_sign = crt_wlocale_empty,
 };
 
-static CRT_LCONV32 crt_c_lconv32 = {
-    .int_frac_digits = CRT_CHAR_MAX,
-    .frac_digits = CRT_CHAR_MAX,
-    .p_cs_precedes = CRT_CHAR_MAX,
-    .p_sep_by_space = CRT_CHAR_MAX,
-    .n_cs_precedes = CRT_CHAR_MAX,
-    .n_sep_by_space = CRT_CHAR_MAX,
-    .p_sign_posn = CRT_CHAR_MAX,
-    .n_sign_posn = CRT_CHAR_MAX,
-};
-static BOOL crt_c_lconv32_initialized;
+typedef struct {
+    CRT_LCONV32 lconv;
+    char locale_c[2];
+    char locale_dot[2];
+    char locale_empty[1];
+    WCHAR wlocale_c[2];
+    WCHAR wlocale_dot[2];
+    WCHAR wlocale_empty[1];
+} CRT_LOCALE32_BLOCK;
 
-static void crt_lconv32_init(void)
+typedef struct {
+    DWORD owner_pid;
+    CRT_LOCALE32_BLOCK *block;
+} CRT_LOCALE32_SLOT;
+
+static CRT_LOCALE32_SLOT crt_locale32_slots[UCRT_PROCESS_MODE_SLOTS];
+
+static void crt_locale32_block_init(CRT_LOCALE32_BLOCK *block)
 {
-    if (crt_c_lconv32_initialized) return;
-    uint32_t dot = (uint32_t)(ULONG_PTR)crt_locale_dot;
-    uint32_t empty = (uint32_t)(ULONG_PTR)crt_locale_empty;
-    uint32_t wdot = (uint32_t)(ULONG_PTR)crt_wlocale_dot;
-    uint32_t wempty = (uint32_t)(ULONG_PTR)crt_wlocale_empty;
+    memset(block, 0, sizeof(*block));
+    block->locale_c[0] = 'C';
+    block->locale_dot[0] = '.';
+    block->wlocale_c[0] = 'C';
+    block->wlocale_dot[0] = '.';
 
-    crt_c_lconv32.decimal_point = dot;
-    crt_c_lconv32.thousands_sep = empty;
-    crt_c_lconv32.grouping = empty;
-    crt_c_lconv32.int_curr_symbol = empty;
-    crt_c_lconv32.currency_symbol = empty;
-    crt_c_lconv32.mon_decimal_point = empty;
-    crt_c_lconv32.mon_thousands_sep = empty;
-    crt_c_lconv32.mon_grouping = empty;
-    crt_c_lconv32.positive_sign = empty;
-    crt_c_lconv32.negative_sign = empty;
-    crt_c_lconv32._W_decimal_point = wdot;
-    crt_c_lconv32._W_thousands_sep = wempty;
-    crt_c_lconv32._W_int_curr_symbol = wempty;
-    crt_c_lconv32._W_currency_symbol = wempty;
-    crt_c_lconv32._W_mon_decimal_point = wempty;
-    crt_c_lconv32._W_mon_thousands_sep = wempty;
-    crt_c_lconv32._W_positive_sign = wempty;
-    crt_c_lconv32._W_negative_sign = wempty;
-    crt_c_lconv32_initialized = TRUE;
+    uint32_t dot = (uint32_t)(ULONG_PTR)block->locale_dot;
+    uint32_t empty = (uint32_t)(ULONG_PTR)block->locale_empty;
+    uint32_t wdot = (uint32_t)(ULONG_PTR)block->wlocale_dot;
+    uint32_t wempty = (uint32_t)(ULONG_PTR)block->wlocale_empty;
+
+    block->lconv.decimal_point = dot;
+    block->lconv.thousands_sep = empty;
+    block->lconv.grouping = empty;
+    block->lconv.int_curr_symbol = empty;
+    block->lconv.currency_symbol = empty;
+    block->lconv.mon_decimal_point = empty;
+    block->lconv.mon_thousands_sep = empty;
+    block->lconv.mon_grouping = empty;
+    block->lconv.positive_sign = empty;
+    block->lconv.negative_sign = empty;
+    block->lconv.int_frac_digits = CRT_CHAR_MAX;
+    block->lconv.frac_digits = CRT_CHAR_MAX;
+    block->lconv.p_cs_precedes = CRT_CHAR_MAX;
+    block->lconv.p_sep_by_space = CRT_CHAR_MAX;
+    block->lconv.n_cs_precedes = CRT_CHAR_MAX;
+    block->lconv.n_sep_by_space = CRT_CHAR_MAX;
+    block->lconv.p_sign_posn = CRT_CHAR_MAX;
+    block->lconv.n_sign_posn = CRT_CHAR_MAX;
+    block->lconv._W_decimal_point = wdot;
+    block->lconv._W_thousands_sep = wempty;
+    block->lconv._W_int_curr_symbol = wempty;
+    block->lconv._W_currency_symbol = wempty;
+    block->lconv._W_mon_decimal_point = wempty;
+    block->lconv._W_mon_thousands_sep = wempty;
+    block->lconv._W_positive_sign = wempty;
+    block->lconv._W_negative_sign = wempty;
+}
+
+static CRT_LOCALE32_BLOCK *crt_locale32_state(BOOL create)
+{
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+
+    CRT_LOCALE32_BLOCK *block = NULL;
+    BOOL have_free_slot = FALSE;
+    ucrt_state_lock_acquire();
+    for (uint32_t i = 0; i < UCRT_PROCESS_MODE_SLOTS; i++) {
+        CRT_LOCALE32_SLOT *slot = &crt_locale32_slots[i];
+        if (slot->owner_pid == owner_pid) {
+            block = slot->block;
+            break;
+        }
+        if (!slot->owner_pid)
+            have_free_slot = TRUE;
+    }
+    ucrt_state_lock_release();
+
+    if (block || !create || !have_free_slot)
+        return block;
+
+    CRT_LOCALE32_BLOCK *candidate = (CRT_LOCALE32_BLOCK *)VirtualAlloc(
+        NULL, sizeof(*candidate), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!candidate ||
+        (ULONG_PTR)candidate > (ULONG_PTR)UINT32_MAX - sizeof(*candidate) + 1) {
+        if (candidate)
+            VirtualFree(candidate, 0, MEM_RELEASE);
+        return NULL;
+    }
+    crt_locale32_block_init(candidate);
+
+    CRT_LOCALE32_BLOCK *unused = candidate;
+    ucrt_state_lock_acquire();
+    CRT_LOCALE32_SLOT *free_slot = NULL;
+    for (uint32_t i = 0; i < UCRT_PROCESS_MODE_SLOTS; i++) {
+        CRT_LOCALE32_SLOT *slot = &crt_locale32_slots[i];
+        if (slot->owner_pid == owner_pid) {
+            block = slot->block;
+            break;
+        }
+        if (!slot->owner_pid && !free_slot)
+            free_slot = slot;
+    }
+    if (!block && free_slot) {
+        free_slot->owner_pid = owner_pid;
+        free_slot->block = candidate;
+        block = candidate;
+        unused = NULL;
+    }
+    ucrt_state_lock_release();
+
+    if (unused)
+        VirtualFree(unused, 0, MEM_RELEASE);
+    if (block == candidate) {
+        serial_puts("[CRT] PE32 locale state pid=");
+        serial_putdec(owner_pid);
+        serial_puts(" va=0x");
+        serial_puthex((ULONG_PTR)block, 8);
+        serial_puts("\n");
+    }
+    return block;
+}
+
+static void crt_locale_release_process(DWORD process_id)
+{
+    ucrt_state_lock_acquire();
+    for (uint32_t i = 0; i < UCRT_PROCESS_MODE_SLOTS; i++) {
+        CRT_LOCALE32_SLOT *slot = &crt_locale32_slots[i];
+        if (slot->owner_pid == process_id) {
+            slot->owner_pid = 0;
+            slot->block = NULL;
+        }
+    }
+    ucrt_state_lock_release();
 }
 
 static BOOL crt_locale_category_valid(int category)
@@ -3613,8 +3790,13 @@ char* WINAPI crt_setlocale(int category, const char *locale)
         *crt_errno() = 22; /* EINVAL */
         return NULL;
     }
-    if (!locale || crt_locale_name_is_c(locale))
+    if (!locale || crt_locale_name_is_c(locale)) {
+        if (g_compat32_mode) {
+            CRT_LOCALE32_BLOCK *block = crt_locale32_state(TRUE);
+            return block ? block->locale_c : NULL;
+        }
         return crt_locale_c;
+    }
     return NULL;
 }
 
@@ -3624,16 +3806,21 @@ WCHAR* WINAPI crt_wsetlocale(int category, const WCHAR *locale)
         *crt_errno() = 22; /* EINVAL */
         return NULL;
     }
-    if (!locale || crt_wlocale_name_is_c(locale))
+    if (!locale || crt_wlocale_name_is_c(locale)) {
+        if (g_compat32_mode) {
+            CRT_LOCALE32_BLOCK *block = crt_locale32_state(TRUE);
+            return block ? block->wlocale_c : NULL;
+        }
         return crt_wlocale_c;
+    }
     return NULL;
 }
 
 PVOID WINAPI crt_localeconv(void)
 {
     if (g_compat32_mode) {
-        crt_lconv32_init();
-        return &crt_c_lconv32;
+        CRT_LOCALE32_BLOCK *block = crt_locale32_state(TRUE);
+        return block ? &block->lconv : NULL;
     }
     return &crt_c_lconv;
 }
@@ -3803,8 +3990,8 @@ PVOID WINAPI crt_bsearch(PCVOID key, PCVOID base, SIZE_T nmemb,
 
 /* ── Error ─────────────────────────────────────────────────── */
 
-static int crt_errno_val = 0;
-static ULONG crt_doserrno_val = 0;
+static int crt_errno_fallback;
+static ULONG crt_doserrno_fallback;
 
 static char *crt_error_messages[] = {
     "No error",
@@ -3855,9 +4042,17 @@ static char *crt_error_messages[] = {
 static int crt_sys_nerr_val =
     (int)(sizeof(crt_error_messages) / sizeof(crt_error_messages[0]));
 
-int* WINAPI crt_errno(void) { return &crt_errno_val; }
+int* WINAPI crt_errno(void)
+{
+    UCRT_THREAD_VALUES *values = ucrt_thread_state(TRUE);
+    return values ? &values->errno_value : &crt_errno_fallback;
+}
 
-ULONG* WINAPI crt_doserrno(void) { return &crt_doserrno_val; }
+ULONG* WINAPI crt_doserrno(void)
+{
+    UCRT_THREAD_VALUES *values = ucrt_thread_state(TRUE);
+    return values ? &values->doserrno_value : &crt_doserrno_fallback;
+}
 
 char** WINAPI crt_sys_errlist(void) { return crt_error_messages; }
 
@@ -4081,10 +4276,151 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
     return ExceptionContinueSearch;
 }
 
-/*
- * _except_handler4 — security cookie variant of _except_handler3.
- * In our environment (no ASLR, no stack cookies), delegates to handler3.
- */
+/* 32-bit EH4 scope-table support used by _except_handler4_common. */
+typedef struct __attribute__((packed)) {
+    int32_t previous_try_level;
+    uint32_t filter;
+    uint32_t handler;
+} CRT_EH4_SCOPE_ENTRY32;
+
+static int crt_eh4_read_entry32(uint32_t scope_table, int32_t level,
+                                CRT_EH4_SCOPE_ENTRY32 *entry)
+{
+    if (!entry || level < 0 || level > 4095)
+        return 0;
+
+    uint64_t address = (uint64_t)scope_table + 16ULL +
+                       (uint64_t)(uint32_t)level * 12ULL;
+    if (address > 0xFFFFFFFFULL ||
+        !compat32_range_readable((uint32_t)address, sizeof(*entry)))
+        return 0;
+
+    *entry = *(const CRT_EH4_SCOPE_ENTRY32 *)(ULONG_PTR)(uint32_t)address;
+    return 1;
+}
+
+static int crt_eh4_local_unwind32(uint32_t scope_table,
+                                  uint32_t frame_address,
+                                  int32_t stop_level)
+{
+    uint32_t *frame = (uint32_t *)(ULONG_PTR)frame_address;
+    int32_t level = (int32_t)frame[3];
+    uint32_t frame_ebp = frame_address + 16U;
+
+    for (int guard = 0; level != stop_level && level != -2; guard++) {
+        CRT_EH4_SCOPE_ENTRY32 entry;
+        if (guard >= 1024 ||
+            !crt_eh4_read_entry32(scope_table, level, &entry) ||
+            entry.previous_try_level == level)
+            return 0;
+
+        frame[3] = (uint32_t)entry.previous_try_level;
+        if (!entry.filter && entry.handler) {
+            if (!compat32_range_readable(entry.handler, 1))
+                return 0;
+            (void)compat32_callback_args_with_ebp(entry.handler, 0, NULL,
+                                                   frame_ebp);
+        }
+        level = entry.previous_try_level;
+    }
+    return level == stop_level;
+}
+
+EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
+    ULONG *cookie,
+    PVOID check_cookie,
+    PEXCEPTION_RECORD ExceptionRecord,
+    PVOID EstablisherFrame,
+    PCONTEXT ContextRecord,
+    PVOID DispatcherContext)
+{
+    (void)check_cookie;
+    (void)ContextRecord;
+    (void)DispatcherContext;
+
+    if (!g_compat32_mode)
+        return ExceptionContinueSearch;
+
+    uint32_t cookie_address = (uint32_t)(ULONG_PTR)cookie;
+    uint32_t frame_address = (uint32_t)(ULONG_PTR)EstablisherFrame;
+    uint32_t record_address = (uint32_t)(ULONG_PTR)ExceptionRecord;
+    if (!compat32_range_readable(cookie_address, sizeof(uint32_t)) ||
+        !compat32_range_readable(frame_address, 6U * sizeof(uint32_t)) ||
+        !compat32_range_readable(record_address, 2U * sizeof(uint32_t))) {
+        serial_puts("[SEH4] invalid handler arguments\n");
+        return ExceptionContinueSearch;
+    }
+
+    uint32_t *frame = (uint32_t *)(ULONG_PTR)frame_address;
+    uint32_t scope_table = frame[2] ^
+                           *(const uint32_t *)(ULONG_PTR)cookie_address;
+    if (!compat32_range_readable(scope_table, 16)) {
+        serial_puts("[SEH4] invalid decoded scope table 0x");
+        serial_puthex(scope_table, 8);
+        serial_puts("\n");
+        return ExceptionContinueSearch;
+    }
+
+    DWORD flags = *(const uint32_t *)(ULONG_PTR)(record_address + 4U);
+    if (flags & EXCEPTION_UNWIND) {
+        if (!crt_eh4_local_unwind32(scope_table, frame_address, -2))
+            serial_puts("[SEH4] malformed local unwind metadata\n");
+        return ExceptionContinueSearch;
+    }
+
+    extern PVOID seh32_ep_addr_for_filter(void);
+    uint32_t ep_address = (uint32_t)(ULONG_PTR)seh32_ep_addr_for_filter();
+    if (frame_address >= sizeof(uint32_t) &&
+        compat32_range_readable(frame_address - sizeof(uint32_t),
+                                sizeof(uint32_t)))
+        *(uint32_t *)(ULONG_PTR)(frame_address - sizeof(uint32_t)) = ep_address;
+
+    int32_t level = (int32_t)frame[3];
+    uint32_t frame_ebp = frame_address + 16U;
+    for (int guard = 0; level != -2; guard++) {
+        CRT_EH4_SCOPE_ENTRY32 entry;
+        if (guard >= 1024 ||
+            !crt_eh4_read_entry32(scope_table, level, &entry) ||
+            entry.previous_try_level == level) {
+            serial_puts("[SEH4] malformed scope chain\n");
+            return ExceptionContinueSearch;
+        }
+
+        if (entry.filter) {
+            if (!compat32_range_readable(entry.filter, 1)) {
+                serial_puts("[SEH4] invalid filter address\n");
+                return ExceptionContinueSearch;
+            }
+
+            uint32_t args[1] = { ep_address };
+            int32_t result = (int32_t)compat32_callback_args_with_ebp(
+                entry.filter, 1, args, frame_ebp);
+            if (result == EXCEPTION_CONTINUE_EXECUTION)
+                return ExceptionContinueExecution;
+
+            if (result == EXCEPTION_EXECUTE_HANDLER) {
+                if (!entry.handler ||
+                    !compat32_range_readable(entry.handler, 1) ||
+                    !crt_eh4_local_unwind32(scope_table, frame_address,
+                                             level)) {
+                    serial_puts("[SEH4] invalid execute-handler metadata\n");
+                    return ExceptionContinueSearch;
+                }
+
+                frame[3] = (uint32_t)entry.previous_try_level;
+                TEB32 *teb = compat32_current_teb();
+                if (teb) teb->ExceptionList = frame_address;
+                (void)compat32_callback_args_with_ebp(entry.handler, 0, NULL,
+                                                       frame_ebp);
+                return ExceptionContinueSearch;
+            }
+        }
+
+        level = entry.previous_try_level;
+    }
+    return ExceptionContinueSearch;
+}
+
 EXCEPTION_DISPOSITION WINAPI crt_except_handler4(
     PEXCEPTION_RECORD ExceptionRecord,
     PEH3_EXCEPTION_REGISTRATION EstablisherFrame,
@@ -6657,16 +6993,16 @@ static int crt_tm_from_unix(int64_t unix_seconds, struct crt_tm *result)
 PVOID WINAPI crt_gmtime(const crt_time_t *timer)
 {
     if (!timer) {
-        crt_errno_val = CRT_EINVAL;
+        *crt_errno() = CRT_EINVAL;
         return NULL;
     }
     UCRT_PROCESS_MODE_VALUES *state = ucrt_process_mode_state(TRUE);
     if (!state ||
         crt_tm_from_unix((int64_t)*timer, &state->time_buffer) != 0) {
-        crt_errno_val = CRT_EINVAL;
+        *crt_errno() = CRT_EINVAL;
         return NULL;
     }
-    crt_errno_val = 0;
+    *crt_errno() = 0;
     return (PVOID)&state->time_buffer;
 }
 
@@ -6680,27 +7016,27 @@ int64_t WINAPI crt_time64(int64_t *timer)
 int WINAPI crt_gmtime64_s(PVOID result, const int64_t *timer)
 {
     if (!result || !timer) {
-        crt_errno_val = CRT_EINVAL;
+        *crt_errno() = CRT_EINVAL;
         return CRT_EINVAL;
     }
     int error = crt_tm_from_unix(*timer, (struct crt_tm *)result);
-    crt_errno_val = error;
+    *crt_errno() = error;
     return error;
 }
 
 PVOID WINAPI crt_localtime64(const int64_t *timer)
 {
     if (!timer) {
-        crt_errno_val = CRT_EINVAL;
+        *crt_errno() = CRT_EINVAL;
         return NULL;
     }
 
     UCRT_PROCESS_MODE_VALUES *state = ucrt_process_mode_state(TRUE);
     if (!state || crt_tm_from_unix(*timer, &state->time_buffer) != 0) {
-        crt_errno_val = CRT_EINVAL;
+        *crt_errno() = CRT_EINVAL;
         return NULL;
     }
-    crt_errno_val = 0;
+    *crt_errno() = 0;
     return (PVOID)&state->time_buffer;
 }
 
@@ -6988,7 +7324,7 @@ crt_time_t WINAPI crt_mktime(PVOID tm_ptr)
 {
     struct crt_tm *tm = (struct crt_tm *)tm_ptr;
     if (!tm) {
-        crt_errno_val = 22;
+        *crt_errno() = 22;
         return (crt_time_t)-1;
     }
     WINTIME_CALENDAR calendar;
@@ -7003,7 +7339,7 @@ crt_time_t WINAPI crt_mktime(PVOID tm_ptr)
     calendar.day_of_year = 0;
     int64_t unix_seconds;
     if (wintime_calendar_to_unix(&calendar, &unix_seconds) < 0) {
-        crt_errno_val = 22;
+        *crt_errno() = 22;
         return (crt_time_t)-1;
     }
 
@@ -7013,7 +7349,7 @@ crt_time_t WINAPI crt_mktime(PVOID tm_ptr)
         tm->tm_yday = normalized.day_of_year;
         tm->tm_isdst = 0;
     }
-    crt_errno_val = 0;
+    *crt_errno() = 0;
     return (crt_time_t)unix_seconds;
 }
 
@@ -8248,6 +8584,8 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     /* SEH */
     { "_except_handler3",    (PVOID)crt_except_handler3, 4, CC_CDECL },
     { "_except_handler4",    (PVOID)crt_except_handler4, 4, CC_CDECL },
+    { "_except_handler4_common", (PVOID)crt_except_handler4_common,
+                                                        6, CC_CDECL },
     { "_XcptFilter",         (PVOID)crt_XcptFilter,   2, CC_CDECL },
     { "_setjmp",             (PVOID)crt_compat32_setjmp_marker,
                                                         1, CC_CDECL },

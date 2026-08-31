@@ -24,38 +24,8 @@ typedef uint8_t  u8;
  * (compiled via BLAKE3_ASM_OBJS into libmesa_util.a).
  */
 
-/* ============================================================
- * (1) glcpp preprocessor — INTENTIONAL NO-OP
- * ============================================================
- * Upstream:  mesa/src/compiler/glsl/glcpp/glcpp-{lex,parse}.{l,y}
- *            (~5000 lines of flex+bison, requires generated _lex.c /
- *            _parse.c we don't ship).
- *
- * Path on smoke test:  NEVER REACHED.
- *   - hello-gl-clear.c calls okGLCreateContext + glClearColor + glClear +
- *     okGLSwapBuffers. None of these compile a GLSL shader.
- *   - Mesa Zink internal full-screen blit shaders are pre-compiled SPIR-V
- *     blobs (blorp / zink_blit), no GLSL parsing on hot paths.
- *
- * If we ever add user GLSL programs (glShaderSource / glCompileShader),
- * we'll need to vendor src/compiler/glsl/glcpp/ + add flex/bison-generated
- * outputs to the source tree (no flex in our docker image).
- *
- * Stubs return 0/NULL — callers check parser != NULL and skip when null.
- */
-void *glcpp_parser_create(void *api, void *extensions, void *state) {
-    (void)api;(void)extensions;(void)state;
-    return (void *)0;  /* parser-creation failure → caller bails */
-}
-void glcpp_lex_set_source_string(void *parser, const char *src) {
-    (void)parser;(void)src;  /* no-op: parser is NULL anyway */
-}
-int  glcpp_parser_parse(void *parser) {
-    (void)parser;
-    return 0;  /* "parse succeeded" — but no AST emitted; caller asserts on parser */
-}
-void glcpp_parser_resolve_implicit_version(void *parser) { (void)parser; }
-void glcpp_parser_destroy(void *parser) { (void)parser; }
+/* The generated Mesa glcpp lexer/parser is linked from libmesa_compiler.
+ * User-provided GLSL must never fall back to placeholder parser symbols. */
 
 /* W4.8++ — TGSI exec stubs removed (real impl from tgsi_exec.c in libmesa_gallium.a). */
 /* W4.8++ — u_vbuf stubs removed (real impl from u_vbuf.c in libmesa_gallium.a). */
@@ -349,9 +319,26 @@ void driParseConfigFiles(void *cache, const void *info, int screen_no,
 }
 unsigned char driQueryOptionb(const void *cache, const char *name) {
     (void)cache;(void)name;
-    return 0;  /* default false — matches Mesa drirc bool defaults */
+    return 0;
 }
 
+int driQueryOptioni(const void *cache, const char *name) {
+    (void)cache;(void)name;
+    return 0;
+}
+
+float driQueryOptionf(const void *cache, const char *name) {
+    (void)cache;(void)name;
+    return 0.0f;
+}
+
+char *driQueryOptionstr(const void *cache, const char *name) {
+    static char empty[] = "";
+    (void)cache;(void)name;
+    return empty;
+}
+
+#if 0 /* Superseded by Mesa 25's complete src/vulkan/util/vk_format.c. */
 /* ============================================================
  * (12) vk_format helpers — REAL TABLE-DRIVEN IMPL
  * ============================================================
@@ -661,6 +648,8 @@ unsigned vk_format_from_pipe_format(unsigned pipe_format)
         return VK_FORMAT_UNDEFINED;
     }
 }
+
+#endif
 
 /* W4.10++ — ASTC LUT stubs REMOVED: real impls now provided by
  * texcompress_astc_luts.o + texcompress_astc_luts_wrap.o (Granite

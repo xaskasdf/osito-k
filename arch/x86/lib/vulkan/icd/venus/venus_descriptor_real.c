@@ -47,20 +47,44 @@ static void encode_u64(struct descriptor_encoder *enc, uint64_t value)
     encode_bytes(enc, &value, sizeof(value));
 }
 
+static void encode_set_layout_create_chain(struct descriptor_encoder *enc,
+                                           const void *pnext)
+{
+    const VkBaseInStructure *base = (const VkBaseInStructure *)pnext;
+    while (base) {
+        if (base->sType ==
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO) {
+            const VkDescriptorSetLayoutBindingFlagsCreateInfo *flags =
+                (const VkDescriptorSetLayoutBindingFlagsCreateInfo *)base;
+            encode_u64(enc, 1);
+            encode_u32(enc, (uint32_t)flags->sType);
+            encode_set_layout_create_chain(enc, flags->pNext);
+            encode_u32(enc, flags->bindingCount);
+            encode_u64(enc, flags->pBindingFlags ? flags->bindingCount : 0);
+            for (uint32_t i = 0;
+                 flags->pBindingFlags && i < flags->bindingCount; i++)
+                encode_u32(enc, flags->pBindingFlags[i]);
+            return;
+        }
+        base = base->pNext;
+    }
+    encode_u64(enc, 0);
+}
+
 static int encode_set_layout_create(
     struct descriptor_encoder *enc, struct venus_device_real *device,
     const VkDescriptorSetLayoutCreateInfo *info, uint64_t object_id)
 {
     if (!info || info->sType !=
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO ||
-        info->pNext || (info->bindingCount && !info->pBindings))
+        (info->bindingCount && !info->pBindings))
         return -1;
     encode_u32(enc, VN_CMD_CREATE_DESCRIPTOR_SET_LAYOUT);
     encode_u32(enc, VN_COMMAND_GENERATE_REPLY);
     encode_u64(enc, device->object_id);
     encode_u64(enc, 1); /* pCreateInfo */
     encode_u32(enc, (uint32_t)info->sType);
-    encode_u64(enc, 0); /* pNext */
+    encode_set_layout_create_chain(enc, info->pNext);
     encode_u32(enc, info->flags);
     encode_u32(enc, info->bindingCount);
     encode_u64(enc, info->pBindings ? info->bindingCount : 0);
@@ -486,17 +510,22 @@ venus_real_AllocateDescriptorSets(
     if (!device || !allocate_info || !sets ||
         allocate_info->sType != VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO ||
         allocate_info->pNext || !allocate_info->descriptorPool ||
-        !allocate_info->descriptorSetCount || !allocate_info->pSetLayouts ||
-        allocate_info->descriptorSetCount > 32)
+        !allocate_info->descriptorSetCount || !allocate_info->pSetLayouts)
         return VK_ERROR_INITIALIZATION_FAILED;
     uint32_t count = allocate_info->descriptorSetCount;
-    void *objects[32];
-    memset(objects, 0, sizeof(objects));
+    if (count > (UINT32_MAX - 64u) / 16u)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    void **objects = malloc((size_t)count * sizeof(*objects));
+    if (!objects)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    memset(objects, 0, (size_t)count * sizeof(*objects));
     for (uint32_t i = 0; i < count; i++) {
         objects[i] = malloc(1);
         if (!objects[i]) {
             for (uint32_t j = 0; j < i; j++)
                 free(objects[j]);
+            free(objects);
             return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
     }
@@ -505,6 +534,7 @@ venus_real_AllocateDescriptorSets(
     if (!command) {
         for (uint32_t i = 0; i < count; i++)
             free(objects[i]);
+        free(objects);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     struct descriptor_encoder enc = {
@@ -533,10 +563,12 @@ venus_real_AllocateDescriptorSets(
     if (wire_result < 0) {
         for (uint32_t i = 0; i < count; i++)
             free(objects[i]);
+        free(objects);
         return VK_ERROR_DEVICE_LOST;
     }
     for (uint32_t i = 0; i < count; i++)
         sets[i] = (VkDescriptorSet)(uintptr_t)objects[i];
+    free(objects);
     return VK_SUCCESS;
 }
 

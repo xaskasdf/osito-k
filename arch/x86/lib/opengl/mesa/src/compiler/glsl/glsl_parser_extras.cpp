@@ -41,6 +41,8 @@
 #include "ir_optimization.h"
 #include "builtin_functions.h"
 
+extern "C" void okgl_trace(const char *message);
+
 /**
  * Format a short human-readable description of the given GLSL version.
  */
@@ -65,16 +67,23 @@ _mesa_glsl_parse_state::_mesa_glsl_parse_state(struct gl_context *_ctx,
      api(_ctx->API), cs_input_local_size_specified(false), cs_input_local_size(),
      switch_state(), warnings_enabled(true)
 {
+   okgl_trace("[OKGL-GLSL] parse state body begin\n");
    assert(stage < MESA_SHADER_STAGES);
    this->stage = stage;
 
    this->scanner = NULL;
    this->translation_unit.make_empty();
+   okgl_trace("[OKGL-GLSL] symbol table begin\n");
    this->symbols = new(mem_ctx) glsl_symbol_table;
+   okgl_trace("[OKGL-GLSL] symbol table end\n");
 
+   okgl_trace("[OKGL-GLSL] linear context begin\n");
    this->linalloc = linear_context(this);
+   okgl_trace("[OKGL-GLSL] linear context end\n");
 
+   okgl_trace("[OKGL-GLSL] info log begin\n");
    this->info_log = ralloc_strdup(mem_ctx, "");
+   okgl_trace("[OKGL-GLSL] info log end\n");
    this->error = false;
    this->loop_nesting_ast = NULL;
 
@@ -227,6 +236,7 @@ _mesa_glsl_parse_state::_mesa_glsl_parse_state(struct gl_context *_ctx,
     * outside the compatibility contexts of 3.x.
     */
    this->num_supported_versions = 0;
+   okgl_trace("[OKGL-GLSL] versions enumerate begin\n");
    if (_mesa_is_desktop_gl(ctx)) {
       for (unsigned i = 0; i < ARRAY_SIZE(known_desktop_glsl_versions); i++) {
          if (known_desktop_glsl_versions[i] <= ctx->Const.GLSLVersion) {
@@ -263,10 +273,12 @@ _mesa_glsl_parse_state::_mesa_glsl_parse_state(struct gl_context *_ctx,
       this->supported_versions[this->num_supported_versions].es = true;
       this->num_supported_versions++;
    }
+   okgl_trace("[OKGL-GLSL] versions enumerate end\n");
 
    /* Create a string for use in error messages to tell the user which GLSL
     * versions are supported.
     */
+   okgl_trace("[OKGL-GLSL] versions string begin\n");
    char *supported = ralloc_strdup(this, "");
    for (unsigned i = 0; i < this->num_supported_versions; i++) {
       unsigned ver = this->supported_versions[i].ver;
@@ -282,10 +294,12 @@ _mesa_glsl_parse_state::_mesa_glsl_parse_state(struct gl_context *_ctx,
    }
 
    this->supported_version_string = supported;
+   okgl_trace("[OKGL-GLSL] versions string end\n");
 
    if (ctx->Const.ForceGLSLExtensionsWarn)
       _mesa_glsl_process_extension("all", NULL, "warn", NULL, this);
 
+   okgl_trace("[OKGL-GLSL] qualifiers begin\n");
    this->default_uniform_qualifier = new(this) ast_type_qualifier();
    this->default_uniform_qualifier->flags.q.shared = 1;
    this->default_uniform_qualifier->flags.q.column_major = 1;
@@ -305,6 +319,7 @@ _mesa_glsl_parse_state::_mesa_glsl_parse_state(struct gl_context *_ctx,
    this->gs_input_size = 0;
    this->in_qualifier = new(this) ast_type_qualifier();
    this->out_qualifier = new(this) ast_type_qualifier();
+   okgl_trace("[OKGL-GLSL] qualifiers end\n");
    this->fs_early_fragment_tests = false;
    this->fs_inner_coverage = false;
    this->fs_post_depth_coverage = false;
@@ -338,7 +353,10 @@ _mesa_glsl_parse_state::_mesa_glsl_parse_state(struct gl_context *_ctx,
 
    this->language_version = this->forced_language_version ?
       this->forced_language_version : this->language_version;
+   okgl_trace("[OKGL-GLSL] validate versions begin\n");
    set_valid_gl_and_glsl_versions(NULL);
+   okgl_trace("[OKGL-GLSL] validate versions end\n");
+   okgl_trace("[OKGL-GLSL] parse state body end\n");
 }
 
 /**
@@ -2323,16 +2341,20 @@ _mesa_glsl_compile_shader(struct gl_context *ctx, struct gl_shader *shader,
       return;
    }
 
+   okgl_trace("[OKGL-GLSL] parse state create begin\n");
     struct _mesa_glsl_parse_state *state =
       new(shader) _mesa_glsl_parse_state(ctx, shader->Stage, shader);
+   okgl_trace("[OKGL-GLSL] parse state create end\n");
 
    if (ctx->Const.GenerateTemporaryNames)
       (void) p_atomic_cmpxchg(&ir_variable::temporaries_allocate_names,
                               false, true);
 
    if (!source_has_shader_include || !force_recompile) {
+      okgl_trace("[OKGL-GLSL] preprocess begin\n");
       state->error = glcpp_preprocess(state, &source, &state->info_log,
                                       add_builtin_defines, state, ctx);
+      okgl_trace("[OKGL-GLSL] preprocess end\n");
    }
 
    /* Now that we have run the preprocessor we can check the shader cache and
@@ -2347,10 +2369,18 @@ _mesa_glsl_compile_shader(struct gl_context *ctx, struct gl_shader *shader,
    }
 
    if (!state->error) {
+     okgl_trace("[OKGL-GLSL] lexer ctor begin\n");
      _mesa_glsl_lexer_ctor(state, source);
+     okgl_trace("[OKGL-GLSL] lexer ctor end\n");
+     okgl_trace("[OKGL-GLSL] parser begin\n");
      _mesa_glsl_parse(state);
+     okgl_trace("[OKGL-GLSL] parser end\n");
+     okgl_trace("[OKGL-GLSL] lexer dtor begin\n");
      _mesa_glsl_lexer_dtor(state);
+     okgl_trace("[OKGL-GLSL] lexer dtor end\n");
+     okgl_trace("[OKGL-GLSL] late checks begin\n");
      do_late_parsing_checks(state);
+     okgl_trace("[OKGL-GLSL] late checks end\n");
    }
 
    if (dump_ast) {

@@ -10,6 +10,7 @@ void      virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev,
                           uint8_t func, uint32_t fb_width,
                           uint32_t fb_height);
 bool      virtio_gpu_ready(void);
+bool      virtio_gpu_is_vga_compatible(void);
 uint32_t *virtio_gpu_get_fb(void);
 uint32_t  virtio_gpu_get_width(void);
 uint32_t  virtio_gpu_get_height(void);

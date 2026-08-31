@@ -18,10 +18,18 @@
 #define FP_SUBNORMAL 3
 #define FP_NORMAL    4
 
+#ifndef isnan
 int isnan(double x);
+#endif
+#ifndef isfinite
 int isfinite(double x);
+#endif
+#ifndef isinf
 int isinf(double x);
+#endif
+#ifndef signbit
 int signbit(double x);
+#endif
 int __isnan(double x);
 int __isfinite(double x);
 int __isinf(double x);
@@ -98,9 +106,17 @@ static inline long double log2l(long double x) { return (long double)log2((doubl
 long double ldexpl(long double x, int exp);
 
 /* Macros that QuickJS uses — redirect to functions */
+#ifndef isnan
 #define isnan(x) __isnan(x)
+#endif
+#ifndef isfinite
 #define isfinite(x) __isfinite(x)
+#endif
+#ifndef isinf
 #define isinf(x) __isinf(x)
+#endif
+#ifndef signbit
 #define signbit(x) __signbit(x)
+#endif
 
 #endif

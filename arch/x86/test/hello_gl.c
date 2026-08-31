@@ -7,6 +7,13 @@
 #include <GL/gl.h>
 
 int main(void) {
+    extern char **environ;
+    static char *software_env[] = {
+        "LIBGL_ALWAYS_SOFTWARE=1",
+        0,
+    };
+    environ = software_env;
+
     OK_GLContext *ctx = okGLCreateContext(0, 512, 512);
     if (!ctx) return 1;
     okGLMakeCurrent(ctx);

@@ -49,6 +49,26 @@ OUT_ZINK     := $(BUILD_DIR)/libmesa_zink.a
 OUT_MAIN     := $(BUILD_DIR)/libmesa_main.a
 OUT_GL       := $(BUILD_DIR)/libGL.a
 
+# Static SDK archives use the original non-PIC/hidden code generation.  The
+# Win32 OpenGL ICD builds the same sources into an isolated directory with
+# CODEGEN_FLAGS=-fPIC so they can be linked into an ET_DYN module.
+CODEGEN_FLAGS    ?= -fno-pic
+VISIBILITY_FLAGS ?= -fvisibility=hidden
+CXX_MODE_FLAGS   ?= -std=gnu++17 -fno-exceptions -fno-rtti
+
+MODULE_CC          ?= clang
+MODULE_CXX         ?= clang++
+MODULE_MATH_CC     ?= gcc
+MODULE_AR          ?= llvm-ar
+MODULE_LD          ?= ld.lld
+MODULE_NM          ?= llvm-nm
+MODULE_SYSROOT     ?= $(abspath $(OSITOK_ROOT)/../ok-ported/toolchain/sysroot)
+MODULE_BUILD_DIR   ?= $(OSITOK_ROOT)/arch/x86/build/lib/opengl-module
+MODULE_MESA_DIR    ?= $(MODULE_BUILD_DIR)/mesa
+MODULE_VULKAN_DIR  ?= $(MODULE_BUILD_DIR)/vulkan
+MODULE_RUNTIME_DIR ?= $(MODULE_BUILD_DIR)/runtime
+MODULE_OUT         ?= $(MODULE_BUILD_DIR)/libGL-osito.so
+
 CC          ?= gcc
 CXX         ?= g++
 AR          ?= ar
@@ -119,7 +139,7 @@ CFLAGS := \
   -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
   -Wno-missing-field-initializers -Wno-pointer-arith \
   -Wno-sign-compare \
-  -O2 -fno-pic -fvisibility=hidden \
+  -O2 $(CODEGEN_FLAGS) $(VISIBILITY_FLAGS) \
   -D__OSITO_K__ \
   -DHAVE_FUNC_ATTRIBUTE_PACKED \
   -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
@@ -141,7 +161,7 @@ CFLAGS_COMPILER := \
   -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
   -Wno-missing-field-initializers -Wno-pointer-arith \
   -Wno-sign-compare -Wno-misleading-indentation \
-  -O2 -fno-pic -fvisibility=hidden \
+  -O2 $(CODEGEN_FLAGS) $(VISIBILITY_FLAGS) \
   -D__OSITO_K__ \
   -DHAVE_FUNC_ATTRIBUTE_PACKED \
   -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
@@ -164,7 +184,7 @@ CFLAGS_ZINK := \
   -Wno-sign-compare -Wno-misleading-indentation \
   -Wno-unused-variable -Wno-unused-but-set-variable \
   -Wno-implicit-fallthrough -Wno-switch -Wno-empty-body \
-  -O2 -fno-pic -fvisibility=hidden \
+  -O2 $(CODEGEN_FLAGS) $(VISIBILITY_FLAGS) \
   -D__OSITO_K__ -DZINK -DGALLIUM_HAVE_VK=1 \
   -DHAVE_FUNC_ATTRIBUTE_PACKED \
   -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
@@ -202,7 +222,7 @@ CFLAGS_MAIN := \
   -Wno-sign-compare -Wno-misleading-indentation \
   -Wno-unused-variable -Wno-unused-but-set-variable \
   -Wno-implicit-fallthrough -Wno-switch -Wno-empty-body \
-  -O2 -fno-pic -fvisibility=hidden \
+  -O2 $(CODEGEN_FLAGS) $(VISIBILITY_FLAGS) \
   -D__OSITO_K__ -DHAVE_PTHREAD=1 \
   -DHAVE_OPENGL=1 -DHAVE_OPENGL_ES_1=0 -DHAVE_OPENGL_ES_2=0 \
   -DMAPI_MODE_GLAPI -DMAPI_ABI_HEADER='"shared-glapi/glapi_mapi_tmp.h"' \
@@ -233,7 +253,7 @@ CXXFLAGS_ZINK := \
   -Wno-class-memaccess -Wno-stringop-truncation \
   -Wno-implicit-fallthrough -Wno-switch -Wno-empty-body \
   -Wno-cast-function-type \
-  -O2 -fno-pic -fvisibility=hidden \
+  -O2 $(CODEGEN_FLAGS) $(VISIBILITY_FLAGS) \
   -D__OSITO_K__ -DZINK -DGALLIUM_HAVE_VK=1 \
   -DHAVE_FUNC_ATTRIBUTE_PACKED \
   -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
@@ -273,7 +293,7 @@ CXXFLAGS_COMPILER := \
   -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable \
   -Wno-non-virtual-dtor -Wno-deprecated-declarations \
   -Wno-class-memaccess -Wno-stringop-truncation \
-  -O2 -fno-pic -fvisibility=hidden \
+  -O2 $(CODEGEN_FLAGS) $(VISIBILITY_FLAGS) \
   -D__OSITO_K__ \
   -DHAVE_FUNC_ATTRIBUTE_PACKED \
   -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
@@ -531,13 +551,15 @@ COMPILER_TOP_SRCS    := \
 COMPILER_GLSL_C_SRCS := $(wildcard $(MESA_ROOT)/src/compiler/glsl/*.c)
 COMPILER_GLCPP_SRCS  := \
   $(MESA_ROOT)/src/compiler/glsl/glcpp/pp.c \
-  $(MESA_ROOT)/src/compiler/glsl/glcpp/pp_standalone_scaffolding.c
+  $(MESA_ROOT)/src/compiler/glsl/glcpp/glcpp-lex.c \
+  $(MESA_ROOT)/src/compiler/glsl/glcpp/glcpp-parse.c
 
 # W4.8 — vulkan/util/  (vk_dispatch_table, vk_enum_to_str, vk_extensions)
 VK_UTIL_SRCS         := \
   $(MESA_ROOT)/src/vulkan/util/vk_dispatch_table.c \
   $(MESA_ROOT)/src/vulkan/util/vk_enum_to_str.c \
-  $(MESA_ROOT)/src/vulkan/util/vk_extensions.c
+  $(MESA_ROOT)/src/vulkan/util/vk_extensions.c \
+  $(MESA_ROOT)/src/vulkan/util/vk_format.c
 
 COMPILER_C_SRCS_ABS  := $(COMPILER_TOP_SRCS) $(COMPILER_NIR_SRCS) \
                         $(COMPILER_SPIRV_SRCS) $(COMPILER_GLSL_C_SRCS) \
@@ -747,6 +769,7 @@ MAPI_C_SRCS_ABS    := \
   $(MESA_ROOT)/src/mapi/shared-glapi/glapi.c \
   $(MESA_ROOT)/src/mapi/shared-glapi/stub.c \
   $(MESA_ROOT)/src/mapi/shared-glapi/table.c \
+  $(MESA_ROOT)/src/mapi/glapi/glapi_dispatch.c \
   $(MESA_ROOT)/src/mapi/glapi/glapi_entrypoint.c \
   $(MESA_ROOT)/src/mapi/glapi/glapi_getproc.c \
   $(MESA_ROOT)/src/mapi/glapi/glapi_nop.c
@@ -812,6 +835,13 @@ MAIN_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(MAIN_CXX_SRCS))
 # W4.9 — REAL: MAIN_CXX_OBJS now built via CXX_CROSS (already wired below).
 MAIN_C_OBJS   := $(MAIN_C_OBJS) $(MAIN_CXX_OBJS)
 
+# Every Mesa translation unit force-includes this compatibility contract.
+# These custom rules do not emit dependency files, so track it explicitly to
+# prevent mixed modules with stale dispatch/TLS objects after an ABI change.
+MESA_COMPAT_HEADER := $(OPENGL_ROOT)/osito_compat/mesa_compat.h
+$(UTIL_OBJS) $(GALLIUM_OBJS) $(COMPILER_OBJS) $(ZINK_OBJS) $(MAIN_C_OBJS): \
+  $(MESA_COMPAT_HEADER)
+
 .PHONY: all clean util gallium compiler zink main libgl
 all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK) $(OUT_MAIN) $(OUT_GL)
 util: $(OUT)
@@ -871,13 +901,12 @@ $(BUILD_DIR)/osito_compat/zink_%.o: $(OPENGL_ROOT)/osito_compat/zink_%.c | $(BUI
 	@echo "  CC    osito_compat/zink_$*"
 	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
 
-# W4.7a — okgl_context.c now includes pipe/p_screen.h directly, which
-# transitively pulls util/u_endian.h -> <machine/endian.h>. Use the same
-# header set as the rest of the zink/gallium build.
+# okgl_context.c is the native frontend for Mesa's state tracker. Compile it
+# with the same API and feature defines as the state tracker sources.
 $(BUILD_DIR)/osito_compat/okgl_context.o: $(OPENGL_ROOT)/osito_compat/okgl_context.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CC    osito_compat/okgl_context"
-	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
 
 # Default pattern rule for util/gallium (build/lib/opengl/foo/bar.o : foo/bar.c)
 $(BUILD_DIR)/osito_compat/%.o: $(OPENGL_ROOT)/osito_compat/%.c | $(BUILD_DIR)
@@ -1062,6 +1091,7 @@ $(BUILD_DIR)/mesa/src/vulkan/util/%.o: $(MESA_ROOT)/src/vulkan/util/%.c | $(BUIL
 # is fine because mesa_compat.h wraps things differently in C mode.)
 CXXFLAGS_MAIN := \
   --sysroot=$(SYSROOT) \
+  $(CXX_MODE_FLAGS) \
   -isystem $(SYSROOT)/usr/include/c++/13.2.0 \
   -isystem $(SYSROOT)/usr/include/c++/13.2.0/x86_64-pc-ositok-musl \
   -isystem $(SYSROOT)/usr/include/c++/13.2.0/backward \
@@ -1084,9 +1114,16 @@ CXXFLAGS_MAIN := \
   -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include \
   -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
   -DHAVE_PTHREAD=1 -DHAVE_OPENGL=1 \
+  -DHAVE_FUNC_ATTRIBUTE_PACKED \
+  -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
+  -DHAVE_FUNC_ATTRIBUTE_FORMAT \
+  -DHAVE_FUNC_ATTRIBUTE_UNUSED \
+  -DHAVE_FUNC_ATTRIBUTE_NORETURN \
+  -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
   '-DPACKAGE_VERSION="25-osito"' '-DPACKAGE_BUGREPORT=""' \
   -DMAPI_MODE_GLAPI -DMAPI_ABI_HEADER='"shared-glapi/glapi_mapi_tmp.h"' \
-  -O2 -Wno-narrowing -Wno-unused-parameter -Wno-error
+  -O2 $(CODEGEN_FLAGS) $(VISIBILITY_FLAGS) \
+  -Wno-narrowing -Wno-unused-parameter -Wno-error
 
 # W4.8 — C++ TUs.  Built with CXX_CROSS (ositok cross g++ + libstdc++).
 $(BUILD_DIR)/mesa/src/mesa/main/%.o: $(MESA_ROOT)/src/mesa/main/%.cpp | $(BUILD_DIR)
@@ -1113,3 +1150,63 @@ $(BUILD_DIR):
 clean:
 	@rm -rf $(BUILD_DIR)
 	@echo "  CLEAN $(BUILD_DIR)"
+
+.PHONY: module module-clean
+module:
+	@test -d "$(MODULE_SYSROOT)/usr/include/c++/13.2.0" || \
+	  { echo "Missing OsitoK C++ sysroot: $(MODULE_SYSROOT)"; exit 1; }
+	@$(MAKE) BUILD_DIR="$(MODULE_MESA_DIR)" CODEGEN_FLAGS=-fPIC \
+	  VISIBILITY_FLAGS=-fvisibility=hidden CXX_MODE_FLAGS="$(CXX_MODE_FLAGS)" \
+	  CXX_CROSS="$(MODULE_CXX)" SYSROOT="$(MODULE_SYSROOT)" \
+	  CC="$(MODULE_CC)" AR="$(MODULE_AR)" all
+	@$(MAKE) -C "$(OSITOK_ROOT)/arch/x86/lib/vulkan" \
+	  BUILD_ROOT="$(MODULE_VULKAN_DIR)" CODEGEN_FLAGS=-fPIC \
+	  CC="$(MODULE_CC)" AR="$(MODULE_AR)" all
+	@mkdir -p "$(MODULE_RUNTIME_DIR)"
+	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
+	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  -isystem "$(OSITOK_ROOT)/arch/x86/libc/qjs_headers" \
+	  "$(OSITOK_ROOT)/arch/x86/libc/crt.c" -o "$(MODULE_RUNTIME_DIR)/crt.o"
+	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
+	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  -isystem "$(OSITOK_ROOT)/arch/x86/libc/qjs_headers" \
+	  "$(OSITOK_ROOT)/arch/x86/libc/malloc.c" -o "$(MODULE_RUNTIME_DIR)/malloc.o"
+	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
+	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  -isystem "$(OSITOK_ROOT)/arch/x86/libc/qjs_headers" \
+	  "$(OSITOK_ROOT)/arch/x86/libc/tcclib.c" -o "$(MODULE_RUNTIME_DIR)/tcclib.o"
+	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
+	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  -isystem "$(OSITOK_ROOT)/arch/x86/libc/qjs_headers" \
+	  "$(OSITOK_ROOT)/arch/x86/libc/crtgl.c" -o "$(MODULE_RUNTIME_DIR)/crtgl.o"
+	@$(MODULE_MATH_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
+	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  "$(OSITOK_ROOT)/arch/x86/libc/math.c" -o "$(MODULE_RUNTIME_DIR)/math.o"
+	@$(MODULE_CC) -c -fPIC -fvisibility=hidden -DOSITO_SHARED_MODULE \
+	  "$(OSITOK_ROOT)/arch/x86/libc/syscall.S" -o "$(MODULE_RUNTIME_DIR)/syscall.o"
+	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-stack-protector -fPIC \
+	  -fvisibility=hidden -ffreestanding \
+	  "$(OPENGL_ROOT)/osito_compat/module_syscall.c" \
+	  -o "$(MODULE_RUNTIME_DIR)/module_syscall.o"
+	@$(MODULE_CXX) -c $(CXX_MODE_FLAGS) -O2 -fPIC -fvisibility=hidden \
+	  --sysroot="$(MODULE_SYSROOT)" \
+	  -isystem "$(MODULE_SYSROOT)/usr/include/c++/13.2.0" \
+	  -isystem "$(MODULE_SYSROOT)/usr/include/c++/13.2.0/x86_64-pc-ositok-musl" \
+	  -isystem "$(MODULE_SYSROOT)/usr/include/c++/13.2.0/backward" \
+	  -isystem "$(MODULE_SYSROOT)/usr/include" \
+	  "$(OPENGL_ROOT)/osito_compat/module_cxx_runtime.cpp" \
+	  -o "$(MODULE_RUNTIME_DIR)/module_cxx_runtime.o"
+	@$(MODULE_LD) -shared -Bsymbolic --hash-style=sysv -z text -z noexecstack \
+	  --allow-multiple-definition "$(MODULE_RUNTIME_DIR)"/*.o \
+	  --whole-archive "$(MODULE_MESA_DIR)/libGL.a" \
+	  "$(MODULE_VULKAN_DIR)/libvulkan.a" --no-whole-archive \
+	  -soname libGL-osito.so -o "$(MODULE_OUT)"
+	@imports="$$($(MODULE_NM) -u "$(MODULE_OUT)" | awk '{print $$NF}' | sort -u)"; \
+	if test "$$imports" != "syscall_dispatch"; then \
+	  echo "Unexpected imports in $(MODULE_OUT):"; \
+	  $(MODULE_NM) -u "$(MODULE_OUT)"; exit 1; \
+	fi
+	@echo "  MODULE $(MODULE_OUT)"
+
+module-clean:
+	@rm -rf "$(MODULE_BUILD_DIR)"

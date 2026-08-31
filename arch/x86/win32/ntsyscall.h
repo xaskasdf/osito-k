@@ -98,6 +98,11 @@ void nt_syscall_init(NT_SERVICE_TABLE *table);
 
 /* Release VirtualAlloc regions that belong to a terminating Win32 process. */
 void nt_vm_release_process(ULONG owner_pid);
+void nt_vm_get_stats(uint32_t *entries, uint64_t *private_pages,
+                     uint64_t *mapped_pages);
+/* Return the furthest end of a current-process VirtualAlloc reservation that
+ * intersects the candidate range, zero when free, or UINT64_MAX if invalid. */
+ULONGLONG nt_vm_range_conflict_end(ULONGLONG base, ULONGLONG size);
 /* Dump VMA ownership/protection metadata for a fatal guest address. */
 void nt_vm_debug_address(uint64_t address);
 

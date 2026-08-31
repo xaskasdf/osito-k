@@ -125,6 +125,10 @@ extern void compositor_set_title(uint32_t window_id, const char *title)
     __attribute__((weak));
 extern void compositor_set_taskbar(uint32_t window_id, bool taskbar)
     __attribute__((weak));
+extern void compositor_set_fullscreen(uint32_t window_id, bool fullscreen)
+    __attribute__((weak));
+extern void compositor_set_user32_managed(uint32_t window_id, bool managed)
+    __attribute__((weak));
 extern void compositor_focus_window(uint32_t window_id)
     __attribute__((weak));
 extern bool compositor_replace_surface(uint32_t window_id, uint32_t shm_handle,
@@ -283,6 +287,20 @@ static int window_count = 0;
 static ULONG_PTR next_hwnd = 0xA0000001;
 static int defer_sync_depth;
 static unsigned show_trace_count;
+
+/* ChangeDisplaySettings owns a logical desktop mode. The physical GOP mode
+ * remains fixed; the compositor presents/scales the selected logical mode. */
+typedef struct {
+    int active;
+    int fullscreen;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpp;
+    uint32_t frequency;
+    DWORD owner_pid;
+} USER_DISPLAY_MODE;
+
+static USER_DISPLAY_MODE user_display_mode;
 
 #define MAX_DEFER_WINDOW_POS 8
 
@@ -679,6 +697,43 @@ static void trace_swiftshader_wsi(const char *api, uint64_t caller, HWND hwnd,
     serial_puts("\n");
 }
 
+static void trace_lwjgl_window_call(const char *api, uint32_t caller_eip,
+                                    HWND hwnd, BOOL result,
+                                    const RECT *rect, ULONG_PTR value)
+{
+    LOADED_MODULE *caller_module = dll_find_module_by_address(
+        (PVOID)(ULONG_PTR)caller_eip);
+    if (!caller_module ||
+        u32_stricmp(caller_module->name, "lwjgl.dll") != 0)
+        return;
+
+    static uint32_t trace_count;
+    if (__atomic_fetch_add(&trace_count, 1, __ATOMIC_RELAXED) >= 64)
+        return;
+
+    serial_puts("[LWJGL-WIN32] ");
+    serial_puts(api);
+    serial_puts(" eip=0x");
+    serial_puthex(caller_eip, 8);
+    serial_puts(" hwnd=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)hwnd, 8);
+    serial_puts(" result=");
+    serial_putdec(result ? 1 : 0);
+    serial_puts(" value=0x");
+    serial_puthex((uint64_t)value, 8);
+    if (rect) {
+        serial_puts(" rect=");
+        serial_putdec((uint32_t)rect->left);
+        serial_puts(",");
+        serial_putdec((uint32_t)rect->top);
+        serial_puts(",");
+        serial_putdec((uint32_t)rect->right);
+        serial_puts(",");
+        serial_putdec((uint32_t)rect->bottom);
+    }
+    serial_puts("\n");
+}
+
 static int hwnd_insert_token(HWND hwnd)
 {
     ULONG_PTR value = (ULONG_PTR)hwnd;
@@ -1015,6 +1070,23 @@ static BOOL window_parent_clip_rect(const WINDOW *w, RECT *clip)
     return TRUE;
 }
 
+static BOOL window_should_be_fullscreen(const WINDOW *w)
+{
+    int screen_x, screen_y;
+
+    if (!w || !w->used || w->destroying || w->message_only ||
+        !user_display_mode.active || !user_display_mode.fullscreen ||
+        w->owner_pid != user_display_mode.owner_pid)
+        return FALSE;
+    if (w->parent || (w->style & WS_CHILD) || !(w->style & WS_POPUP))
+        return FALSE;
+
+    window_screen_origin(w, &screen_x, &screen_y);
+    return screen_x == 0 && screen_y == 0 &&
+           w->width == (int)user_display_mode.width &&
+           w->height == (int)user_display_mode.height;
+}
+
 static void sync_all_window_compositor_state(void)
 {
     if (defer_sync_depth > 0)
@@ -1036,6 +1108,11 @@ static void sync_all_window_compositor_state(void)
         if (compositor_set_taskbar)
             compositor_set_taskbar(w->compositor_id,
                                    window_is_taskbar_candidate(w) != FALSE);
+        if (compositor_set_user32_managed)
+            compositor_set_user32_managed(w->compositor_id, true);
+        if (compositor_set_fullscreen)
+            compositor_set_fullscreen(w->compositor_id,
+                                      window_should_be_fullscreen(w) != FALSE);
         if (compositor_set_clip_rect) {
             RECT clip;
             BOOL enabled = window_parent_clip_rect(w, &clip);
@@ -1235,6 +1312,18 @@ static ULONG_PTR next_user_timer_id = 1;
 #define USER_HOOK_CONTEXT_SLOTS  256
 #define USER_HOOK_MAX_DEPTH      32
 #define USER_HOOK_SCRATCH_STRIDE 64
+#define USER_WINDOWPOS_MAX_DEPTH 16
+#define USER_WINDOWPOS_STRIDE    32
+#define USER_CREATE_MAX_DEPTH    16
+#define USER_CREATE_STRIDE       48
+#define USER_WINDOWPOS_OFFSET \
+    (USER_HOOK_MAX_DEPTH * USER_HOOK_SCRATCH_STRIDE)
+#define USER_CREATE_OFFSET \
+    (USER_WINDOWPOS_OFFSET + USER_WINDOWPOS_MAX_DEPTH * USER_WINDOWPOS_STRIDE)
+
+_Static_assert(USER_CREATE_OFFSET +
+               USER_CREATE_MAX_DEPTH * USER_CREATE_STRIDE <= 0x1000,
+               "User32 callback scratch exceeds one page");
 
 typedef struct {
     BOOL used;
@@ -1259,6 +1348,8 @@ typedef struct {
     DWORD pid;
     DWORD tid;
     int depth;
+    int windowpos_depth;
+    int create_depth;
     PVOID scratch_page;
     USER_HOOK_FRAME frames[USER_HOOK_MAX_DEPTH];
 } USER_HOOK_CONTEXT;
@@ -1314,6 +1405,8 @@ static USER_HOOK_CONTEXT *user_hook_context_get(BOOL create)
         context->pid = pid;
         context->tid = tid;
         context->depth = 0;
+        context->windowpos_depth = 0;
+        context->create_depth = 0;
         context->scratch_page = NULL;
     }
 
@@ -1419,6 +1512,23 @@ static LRESULT user_hook_dispatch(int type, int code,
     return result;
 }
 
+static PVOID user32_callback_scratch_page(USER_HOOK_CONTEXT *context)
+{
+    if (!context)
+        return NULL;
+    if (!context->scratch_page) {
+        PVOID page = VirtualAlloc(
+            NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!page ||
+            (g_compat32_mode &&
+             (ULONG_PTR)page + 0x1000 > UINT32_MAX)) {
+            return NULL;
+        }
+        context->scratch_page = page;
+    }
+    return context->scratch_page;
+}
+
 static PVOID user_hook_payload_for_next_frame(SIZE_T size)
 {
     if (size > USER_HOOK_SCRATCH_STRIDE)
@@ -1427,18 +1537,11 @@ static PVOID user_hook_payload_for_next_frame(SIZE_T size)
     USER_HOOK_CONTEXT *context = user_hook_context_get(TRUE);
     if (!context || context->depth >= USER_HOOK_MAX_DEPTH)
         return NULL;
-    if (!context->scratch_page) {
-        context->scratch_page = VirtualAlloc(
-            NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (!context->scratch_page ||
-            (g_compat32_mode &&
-             (ULONG_PTR)context->scratch_page + 0x1000 > UINT32_MAX)) {
-            context->scratch_page = NULL;
-            return NULL;
-        }
-    }
+    PVOID page = user32_callback_scratch_page(context);
+    if (!page)
+        return NULL;
 
-    return (BYTE *)context->scratch_page +
+    return (BYTE *)page +
            context->depth * USER_HOOK_SCRATCH_STRIDE;
 }
 
@@ -1543,6 +1646,8 @@ static void user_hook_release_process(DWORD pid)
             user_hook_contexts[i].pid == pid) {
             user_hook_contexts[i].used = FALSE;
             user_hook_contexts[i].depth = 0;
+            user_hook_contexts[i].windowpos_depth = 0;
+            user_hook_contexts[i].create_depth = 0;
             user_hook_contexts[i].scratch_page = NULL;
         }
     }
@@ -3579,12 +3684,90 @@ LONG_PTR WINAPI GetClassLongPtrW(HWND hwnd, int index)
     if (!entry) return 0;
 
     switch (index) {
-    case -24: return (LONG_PTR)(ULONG_PTR)entry->wndproc;   /* GCLP_WNDPROC */
-    case -18: return entry->cbWndExtra;                    /* GCL_CBWNDEXTRA */
-    case -26: return entry->style;                         /* GCL_STYLE */
-    case -32: return entry->atom;                          /* GCW_ATOM */
+    case -34: return (LONG_PTR)(ULONG_PTR)entry->hIconSm;        /* GCLP_HICONSM */
+    case -32: return entry->atom;                               /* GCW_ATOM */
+    case -26: return entry->style;                              /* GCL_STYLE */
+    case -24: return (LONG_PTR)(ULONG_PTR)entry->wndproc;        /* GCLP_WNDPROC */
+    case -20: return entry->cbClsExtra;                         /* GCL_CBCLSEXTRA */
+    case -18: return entry->cbWndExtra;                         /* GCL_CBWNDEXTRA */
+    case -16: return (LONG_PTR)(ULONG_PTR)entry->hInstance;      /* GCLP_HMODULE */
+    case -14: return (LONG_PTR)(ULONG_PTR)entry->hIcon;          /* GCLP_HICON */
+    case -12: return (LONG_PTR)(ULONG_PTR)entry->hCursor;        /* GCLP_HCURSOR */
+    case -10: return (LONG_PTR)(ULONG_PTR)entry->hbrBackground; /* GCLP_HBRBACKGROUND */
+    case -8:  return (LONG_PTR)entry->menu_name;                 /* GCLP_MENUNAME */
     default:  return 0;
     }
+}
+
+LONG_PTR WINAPI SetClassLongPtrW(HWND hwnd, int index, LONG_PTR value)
+{
+    WINDOW *window = find_window(hwnd);
+    if (!window) {
+        SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
+        return 0;
+    }
+    WNDCLASS_ENTRY *entry =
+        find_class_for_pid(window->class_name, window->owner_pid);
+    if (!entry) {
+        SetLastError(1411); /* ERROR_CLASS_DOES_NOT_EXIST */
+        return 0;
+    }
+
+    LONG_PTR previous;
+    switch (index) {
+    case -34:
+        previous = (LONG_PTR)(ULONG_PTR)entry->hIconSm;
+        entry->hIconSm = (HICON)(ULONG_PTR)value;
+        break;
+    case -26:
+        previous = entry->style;
+        entry->style = (DWORD)value;
+        break;
+    case -24:
+        previous = (LONG_PTR)(ULONG_PTR)entry->wndproc;
+        entry->wndproc = (WNDPROC)(ULONG_PTR)value;
+        break;
+    case -16:
+        previous = (LONG_PTR)(ULONG_PTR)entry->hInstance;
+        entry->hInstance = (HINSTANCE)(ULONG_PTR)value;
+        break;
+    case -14:
+        previous = (LONG_PTR)(ULONG_PTR)entry->hIcon;
+        entry->hIcon = (HICON)(ULONG_PTR)value;
+        break;
+    case -12:
+        previous = (LONG_PTR)(ULONG_PTR)entry->hCursor;
+        entry->hCursor = (HCURSOR)(ULONG_PTR)value;
+        break;
+    case -10:
+        previous = (LONG_PTR)(ULONG_PTR)entry->hbrBackground;
+        entry->hbrBackground = (HBRUSH)(ULONG_PTR)value;
+        break;
+    case -8:
+        previous = (LONG_PTR)entry->menu_name;
+        entry->menu_name = (ULONG_PTR)value;
+        break;
+    default:
+        SetLastError(1413); /* ERROR_INVALID_INDEX */
+        return 0;
+    }
+    return previous;
+}
+
+LONG WINAPI SetClassLongW(HWND hwnd, int index, LONG value)
+{
+    return (LONG)SetClassLongPtrW(hwnd, index, (LONG_PTR)value);
+}
+
+static LONG WINAPI SetClassLongA_u32(HWND hwnd, int index, LONG value)
+{
+    return SetClassLongW(hwnd, index, value);
+}
+
+static LONG_PTR WINAPI SetClassLongPtrA_u32(HWND hwnd, int index,
+                                             LONG_PTR value)
+{
+    return SetClassLongPtrW(hwnd, index, value);
 }
 
 int WINAPI GetClassNameW(HWND hwnd, PWSTR class_name, int max_count)
@@ -3731,18 +3914,15 @@ static BOOL dispatch_windowpos_message(WINDOW *w, DWORD message,
         return TRUE;
     }
 
-    /* PE32 callbacks need the 32-bit WINDOWPOS layout in addressable memory. */
-    static volatile WINDOWPOS32 *slots[16];
-    static unsigned depth;
-    unsigned slot = depth < 16 ? depth : 15;
-    volatile WINDOWPOS32 *wire = slots[slot];
-    if (!wire) {
-        extern void *mem_alloc_pages(uint64_t count);
-        wire = (volatile WINDOWPOS32 *)mem_alloc_pages(1);
-        slots[slot] = wire;
-    }
-    if (!wire)
+    /* PE32 callbacks need a low, process-mapped WINDOWPOS layout. */
+    USER_HOOK_CONTEXT *context = user_hook_context_get(TRUE);
+    PVOID scratch = user32_callback_scratch_page(context);
+    if (!context || !scratch ||
+        context->windowpos_depth >= USER_WINDOWPOS_MAX_DEPTH)
         return FALSE;
+    volatile WINDOWPOS32 *wire = (volatile WINDOWPOS32 *)(
+        (BYTE *)scratch + USER_WINDOWPOS_OFFSET +
+        context->windowpos_depth * USER_WINDOWPOS_STRIDE);
 
     wire->hwnd = (uint32_t)(ULONG_PTR)position->hwnd;
     wire->hwnd_insert_after =
@@ -3753,10 +3933,10 @@ static BOOL dispatch_windowpos_message(WINDOW *w, DWORD message,
     wire->cy = position->cy;
     wire->flags = position->flags;
 
-    depth++;
+    context->windowpos_depth++;
     dispatch_wndproc(w->wndproc, w->handle, message, 0,
                      (LPARAM)(ULONG_PTR)wire);
-    depth--;
+    context->windowpos_depth--;
 
     if (copy_back) {
         position->hwndInsertAfter =
@@ -4049,14 +4229,14 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
         if (g_compat32_mode && w->wndproc) {
             /* 32-bit CREATESTRUCTA (12 dwords) in PE32-accessible memory so the
              * 32-bit StaticProc can dereference lParam. */
-            static volatile uint32_t *cs_slots[16];
-            static unsigned cs_depth;
-            unsigned slot = cs_depth < 16 ? cs_depth : 15;
-            volatile uint32_t *cs = cs_slots[slot];
-            if (!cs) {
-                extern void *mem_alloc_pages(uint64_t count);
-                cs = (volatile uint32_t *)mem_alloc_pages(1);
-                cs_slots[slot] = cs;
+            USER_HOOK_CONTEXT *context = user_hook_context_get(TRUE);
+            PVOID scratch = user32_callback_scratch_page(context);
+            volatile uint32_t *cs = NULL;
+            if (context && scratch &&
+                context->create_depth < USER_CREATE_MAX_DEPTH) {
+                cs = (volatile uint32_t *)(
+                    (BYTE *)scratch + USER_CREATE_OFFSET +
+                    context->create_depth * USER_CREATE_STRIDE);
             }
             if (cs) {
                 cs[0]  = wwindow_addr;                       /* lpCreateParams */
@@ -4071,7 +4251,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
                 cs[9]  = (uint32_t)(ULONG_PTR)lpWindowName;  /* lpszName */
                 cs[10] = (uint32_t)(ULONG_PTR)lpClassName;   /* lpszClass */
                 cs[11] = dwExStyle;                          /* dwExStyle */
-                cs_depth++;
+                context->create_depth++;
                 nc_result = dispatch_wndproc(w->wndproc, w->handle,
                                              WM_NCCREATE, 0,
                                              (LPARAM)(uintptr_t)cs);
@@ -4079,7 +4259,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
                     create_result = dispatch_wndproc(w->wndproc, w->handle,
                                                      WM_CREATE, 0,
                                                      (LPARAM)(uintptr_t)cs);
-                cs_depth--;
+                context->create_depth--;
             } else {
                 nc_result = 0;
             }
@@ -4299,6 +4479,8 @@ void user32_release_process(DWORD pid)
                                  __builtin_return_address(0));
             release_window(&windows[i]);
         }
+    if (user_display_mode.active && user_display_mode.owner_pid == pid)
+        memset(&user_display_mode, 0, sizeof(user_display_mode));
     sync_all_window_compositor_state();
     for (int i = 0; i < wndclass_count; i++)
         if (wndclasses[i].used && wndclasses[i].owner_pid == pid)
@@ -5432,11 +5614,16 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
 
 BOOL WINAPI GetClientRect(HWND hWnd, LPRECT lpRect)
 {
+    uint32_t caller_eip = compat32_get_last_caller_eip();
     WINDOW *w = find_window(hWnd);
     uint64_t caller = (uint64_t)(ULONG_PTR)__builtin_return_address(0);
     BOOL result = w && lpRect ? TRUE : FALSE;
     trace_swiftshader_wsi("GetClientRect", caller, hWnd, w, lpRect, result);
-    if (!result) return FALSE;
+    if (!result) {
+        trace_lwjgl_window_call("GetClientRect", caller_eip, hWnd, FALSE,
+                                NULL, 0);
+        return FALSE;
+    }
     lpRect->left   = 0;
     lpRect->top    = 0;
     lpRect->right  = w->width;
@@ -5458,6 +5645,8 @@ BOOL WINAPI GetClientRect(HWND hWnd, LPRECT lpRect)
             n++;
         }
     }
+    trace_lwjgl_window_call("GetClientRect", caller_eip, hWnd, TRUE,
+                            lpRect, 0);
     return TRUE;
 }
 
@@ -5886,6 +6075,8 @@ static void spi_trace_nonclient(char encoding, UINT size, PVOID pv_param,
 
 static int screen_cx(void);   /* defined below (live GOP size) */
 static int screen_cy(void);
+static int current_mode_cx(void);
+static int current_mode_cy(void);
 
 BOOL WINAPI SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni)
 {
@@ -5899,8 +6090,8 @@ BOOL WINAPI SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UI
         int32_t *rect = (int32_t *)pvParam;
         rect[0] = 0;              /* left */
         rect[1] = 0;              /* top */
-        rect[2] = screen_cx();    /* right */
-        rect[3] = screen_cy();    /* bottom */
+        rect[2] = current_mode_cx();    /* right */
+        rect[3] = current_mode_cy();    /* bottom */
         return TRUE;
     }
     if (uiAction == SPI_GETNONCLIENTMETRICS) {
@@ -6225,23 +6416,50 @@ extern int  ddraw_display_mode_active(void) __attribute__((weak));
 extern void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
             __attribute__((weak));
 
-static int current_mode_cx(void)
+static void current_mode_values(uint32_t *width, uint32_t *height,
+                                uint32_t *bpp, uint32_t *frequency)
 {
+    uint32_t w = 0, h = 0, bits = 0, hz = 60;
+
     if (ddraw_display_mode_active && ddraw_get_display_mode &&
         ddraw_display_mode_active()) {
-        uint32_t w = 0, h = 0; ddraw_get_display_mode(&w, &h, NULL);
-        if (w) return (int)w;
+        ddraw_get_display_mode(&w, &h, &bits);
+    } else if (user_display_mode.active) {
+        w = user_display_mode.width;
+        h = user_display_mode.height;
+        bits = user_display_mode.bpp;
+        hz = user_display_mode.frequency;
     }
-    return screen_cx();
+
+    if (!w) w = (uint32_t)screen_cx();
+    if (!h) h = (uint32_t)screen_cy();
+    if (!bits) bits = 32;
+    if (!hz) hz = 60;
+
+    if (width) *width = w;
+    if (height) *height = h;
+    if (bpp) *bpp = bits;
+    if (frequency) *frequency = hz;
+}
+
+BOOL user32_get_current_display_mode(uint32_t *width, uint32_t *height,
+                                     uint32_t *bpp, uint32_t *frequency)
+{
+    current_mode_values(width, height, bpp, frequency);
+    return TRUE;
+}
+
+static int current_mode_cx(void)
+{
+    uint32_t width = 0;
+    current_mode_values(&width, NULL, NULL, NULL);
+    return (int)width;
 }
 static int current_mode_cy(void)
 {
-    if (ddraw_display_mode_active && ddraw_get_display_mode &&
-        ddraw_display_mode_active()) {
-        uint32_t w = 0, h = 0; ddraw_get_display_mode(&w, &h, NULL);
-        if (h) return (int)h;
-    }
-    return screen_cy();
+    uint32_t height = 0;
+    current_mode_values(NULL, &height, NULL, NULL);
+    return (int)height;
 }
 
 int WINAPI GetSystemMetrics(int nIndex)
@@ -6249,8 +6467,23 @@ int WINAPI GetSystemMetrics(int nIndex)
     switch (nIndex) {
     case SM_CXSCREEN:      return current_mode_cx();
     case SM_CYSCREEN:      return current_mode_cy();
+    case SM_CXICON:
+    case SM_CYICON:
+    case SM_CXCURSOR:
+    case SM_CYCURSOR:
+        return 32;
     case SM_CXFULLSCREEN:  return current_mode_cx();
     case SM_CYFULLSCREEN:  return current_mode_cy();
+    case SM_MOUSEPRESENT:
+    case SM_MOUSEWHEELPRESENT:
+        return 1;
+    case SM_SWAPBUTTON:
+    case SM_MOUSEHORIZONTALWHEELPRESENT:
+        return 0;
+    case SM_CMOUSEBUTTONS: return 3;
+    case SM_CXSMICON:
+    case SM_CYSMICON:
+        return 16;
     case SM_XVIRTUALSCREEN:
     case SM_YVIRTUALSCREEN:
         return 0;
@@ -6265,8 +6498,21 @@ int WINAPI GetSystemMetrics(int nIndex)
 
 int WINAPI GetSystemMetricsForDpi(int nIndex, UINT dpi)
 {
-    (void)dpi;
-    return GetSystemMetrics(nIndex);
+    int value = GetSystemMetrics(nIndex);
+    switch (nIndex) {
+    case SM_CXICON:
+    case SM_CYICON:
+    case SM_CXCURSOR:
+    case SM_CYCURSOR:
+    case SM_CXSMICON:
+    case SM_CYSMICON:
+        if (dpi == 0)
+            dpi = 96;
+        value = (int)(((uint64_t)(uint32_t)value * dpi + 48) / 96);
+        return value > 0 ? value : 1;
+    default:
+        return value;
+    }
 }
 
 typedef struct {
@@ -6878,72 +7124,317 @@ typedef struct {
     uint32_t dmPelsHeight;
     uint32_t dmDisplayFlags;
     uint32_t dmDisplayFrequency;
+    uint32_t dmICMMethod;
+    uint32_t dmICMIntent;
+    uint32_t dmMediaType;
+    uint32_t dmDitherType;
+    uint32_t dmReserved1;
+    uint32_t dmReserved2;
+    uint32_t dmPanningWidth;
+    uint32_t dmPanningHeight;
 } DEVMODEA;
 
-#define DM_BITSPERPEL  0x40000
-#define DM_PELSWIDTH   0x80000
-#define DM_PELSHEIGHT  0x100000
-#define DISP_CHANGE_SUCCESSFUL 0
-#define ENUM_CURRENT_SETTINGS  ((uint32_t)-1)
+typedef struct {
+    WCHAR dmDeviceName[32];
+    uint16_t dmSpecVersion;
+    uint16_t dmDriverVersion;
+    uint16_t dmSize;
+    uint16_t dmDriverExtra;
+    uint32_t dmFields;
+    int32_t  dmPositionX, dmPositionY;
+    uint32_t dmDisplayOrientation;
+    uint32_t dmDisplayFixedOutput;
+    int16_t  dmColor;
+    int16_t  dmDuplex;
+    int16_t  dmYResolution;
+    int16_t  dmTTOption;
+    int16_t  dmCollate;
+    WCHAR    dmFormName[32];
+    uint16_t dmLogPixels;
+    uint32_t dmBitsPerPel;
+    uint32_t dmPelsWidth;
+    uint32_t dmPelsHeight;
+    uint32_t dmDisplayFlags;
+    uint32_t dmDisplayFrequency;
+    uint32_t dmICMMethod;
+    uint32_t dmICMIntent;
+    uint32_t dmMediaType;
+    uint32_t dmDitherType;
+    uint32_t dmReserved1;
+    uint32_t dmReserved2;
+    uint32_t dmPanningWidth;
+    uint32_t dmPanningHeight;
+} DEVMODEW;
 
-LONG WINAPI ChangeDisplaySettingsA(DEVMODEA *dm, uint32_t flags)
+_Static_assert(sizeof(DEVMODEA) == 156, "Win32 DEVMODEA ABI");
+_Static_assert(sizeof(DEVMODEW) == 220, "Win32 DEVMODEW ABI");
+
+#define DM_BITSPERPEL          0x00040000
+#define DM_PELSWIDTH           0x00080000
+#define DM_PELSHEIGHT          0x00100000
+#define DM_DISPLAYFLAGS        0x00200000
+#define DM_DISPLAYFREQUENCY    0x00400000
+
+#define CDS_UPDATEREGISTRY     0x00000001
+#define CDS_TEST               0x00000002
+#define CDS_FULLSCREEN         0x00000004
+#define CDS_GLOBAL             0x00000008
+#define CDS_SET_PRIMARY        0x00000010
+#define CDS_VIDEOPARAMETERS    0x00000020
+#define CDS_ENABLE_UNSAFE      0x00000100
+#define CDS_DISABLE_UNSAFE     0x00000200
+#define CDS_RESET_EX           0x20000000
+#define CDS_RESET              0x40000000
+#define CDS_NORESET            0x10000000
+#define CDS_SUPPORTED_FLAGS    (CDS_UPDATEREGISTRY | CDS_TEST | CDS_FULLSCREEN | \
+                                CDS_GLOBAL | CDS_SET_PRIMARY | \
+                                CDS_VIDEOPARAMETERS | CDS_ENABLE_UNSAFE | \
+                                CDS_DISABLE_UNSAFE | CDS_RESET_EX | CDS_RESET | \
+                                CDS_NORESET)
+
+#define DISP_CHANGE_SUCCESSFUL  0
+#define DISP_CHANGE_BADMODE    -2
+#define DISP_CHANGE_BADFLAGS   -4
+#define DISP_CHANGE_BADPARAM   -5
+#define ENUM_CURRENT_SETTINGS  ((uint32_t)-1)
+#define ENUM_REGISTRY_SETTINGS ((uint32_t)-2)
+
+#define DEVMODEA_DISPLAY_SIZE 124
+#define DEVMODEW_DISPLAY_SIZE 188
+
+static const struct { uint16_t w, h; } base_display_resolutions[] = {
+    {640, 480}, {800, 600}, {1024, 768},
+};
+
+static uint32_t display_resolution_count(void)
 {
-    (void)dm; (void)flags;
-    /* Always succeed — we use the GOP framebuffer as-is */
+    uint32_t physical_w = (uint32_t)screen_cx();
+    uint32_t physical_h = (uint32_t)screen_cy();
+    uint32_t count = sizeof(base_display_resolutions) /
+                     sizeof(base_display_resolutions[0]);
+
+    for (uint32_t i = 0; i < count; i++)
+        if (base_display_resolutions[i].w == physical_w &&
+            base_display_resolutions[i].h == physical_h)
+            return count;
+    return count + 1;
+}
+
+static BOOL display_resolution_at(uint32_t index, uint32_t *width,
+                                  uint32_t *height)
+{
+    uint32_t base_count = sizeof(base_display_resolutions) /
+                          sizeof(base_display_resolutions[0]);
+    if (index < base_count) {
+        *width = base_display_resolutions[index].w;
+        *height = base_display_resolutions[index].h;
+        return TRUE;
+    }
+    if (index == base_count && display_resolution_count() > base_count) {
+        *width = (uint32_t)screen_cx();
+        *height = (uint32_t)screen_cy();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL display_mode_supported(uint32_t width, uint32_t height,
+                                   uint32_t bpp, uint32_t frequency)
+{
+    if (bpp != 16 && bpp != 32)
+        return FALSE;
+    if (frequency != 0 && frequency != 1 && frequency != 60)
+        return FALSE;
+
+    uint32_t count = display_resolution_count();
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t candidate_w = 0, candidate_h = 0;
+        if (display_resolution_at(i, &candidate_w, &candidate_h) &&
+            candidate_w == width && candidate_h == height)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static LONG apply_display_settings(uint32_t fields, uint32_t width,
+                                   uint32_t height, uint32_t bpp,
+                                   uint32_t frequency, uint32_t flags)
+{
+    uint32_t current_w, current_h, current_bpp, current_frequency;
+
+    if (flags & ~CDS_SUPPORTED_FLAGS)
+        return DISP_CHANGE_BADFLAGS;
+
+    current_mode_values(&current_w, &current_h, &current_bpp,
+                        &current_frequency);
+    if (!(fields & DM_PELSWIDTH)) width = current_w;
+    if (!(fields & DM_PELSHEIGHT)) height = current_h;
+    if (!(fields & DM_BITSPERPEL)) bpp = current_bpp;
+    if (!(fields & DM_DISPLAYFREQUENCY)) frequency = current_frequency;
+
+    if (!display_mode_supported(width, height, bpp, frequency))
+        return DISP_CHANGE_BADMODE;
+    if (flags & (CDS_TEST | CDS_NORESET))
+        return DISP_CHANGE_SUCCESSFUL;
+
+    user_display_mode.active = 1;
+    user_display_mode.fullscreen = (flags & CDS_FULLSCREEN) != 0;
+    user_display_mode.width = width;
+    user_display_mode.height = height;
+    user_display_mode.bpp = bpp;
+    user_display_mode.frequency = frequency > 1 ? frequency : 60;
+    user_display_mode.owner_pid = GetCurrentProcessId();
+    g_abs_prev_valid = 0;
+    if (cursor_pos.x >= (LONG)width) cursor_pos.x = (LONG)width - 1;
+    if (cursor_pos.y >= (LONG)height) cursor_pos.y = (LONG)height - 1;
+    sync_all_window_compositor_state();
+
+    serial_puts("[USER32] ChangeDisplaySettings -> ");
+    serial_putdec(width); serial_puts("x"); serial_putdec(height);
+    serial_puts("x"); serial_putdec(bpp);
+    serial_puts(user_display_mode.fullscreen ? " fullscreen\n" : " desktop\n");
     return DISP_CHANGE_SUCCESSFUL;
 }
 
-LONG WINAPI ChangeDisplaySettingsW(void *dm, uint32_t flags)
+static LONG restore_display_settings(uint32_t flags)
 {
-    (void)dm; (void)flags;
+    if (flags & ~CDS_SUPPORTED_FLAGS)
+        return DISP_CHANGE_BADFLAGS;
+    if (flags & (CDS_TEST | CDS_NORESET))
+        return DISP_CHANGE_SUCCESSFUL;
+
+    memset(&user_display_mode, 0, sizeof(user_display_mode));
+    g_abs_prev_valid = 0;
+    sync_all_window_compositor_state();
+    serial_puts("[USER32] ChangeDisplaySettings -> registry mode\n");
     return DISP_CHANGE_SUCCESSFUL;
+}
+
+LONG WINAPI ChangeDisplaySettingsA(DEVMODEA *dm, uint32_t flags)
+{
+    if (!dm)
+        return restore_display_settings(flags);
+    if (dm->dmSize < DEVMODEA_DISPLAY_SIZE)
+        return DISP_CHANGE_BADPARAM;
+    return apply_display_settings(dm->dmFields, dm->dmPelsWidth,
+                                  dm->dmPelsHeight, dm->dmBitsPerPel,
+                                  dm->dmDisplayFrequency, flags);
+}
+
+LONG WINAPI ChangeDisplaySettingsW(DEVMODEW *dm, uint32_t flags)
+{
+    if (!dm)
+        return restore_display_settings(flags);
+    if (dm->dmSize < DEVMODEW_DISPLAY_SIZE)
+        return DISP_CHANGE_BADPARAM;
+    return apply_display_settings(dm->dmFields, dm->dmPelsWidth,
+                                  dm->dmPelsHeight, dm->dmBitsPerPel,
+                                  dm->dmDisplayFrequency, flags);
 }
 
 BOOL WINAPI EnumDisplaySettingsA(const char *device, uint32_t mode, DEVMODEA *dm)
 {
     (void)device;
     if (!dm) return FALSE;
-
-    /* Enumerable resolution × depth table (matches dd_EnumDisplayModes). Some
-     * apps walk EnumDisplaySettings(0,1,2,...) until it returns FALSE to build
-     * their resolution list, so offer the standard set, not a single mode. */
-    static const struct { uint16_t w, h; } res[] = {
-        {640, 480}, {800, 600}, {1024, 768},
-    };
+    uint16_t caller_size = dm->dmSize;
+    uint16_t output_size =
+        (caller_size >= DEVMODEA_DISPLAY_SIZE && caller_size <= sizeof(*dm))
+            ? caller_size : (uint16_t)sizeof(*dm);
     static const uint8_t bpps[] = { 16, 32 };
 
-    memset(dm, 0, sizeof(*dm));
-    dm->dmSize = sizeof(*dm);
-    dm->dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT;
+    /* LWJGL 2's current-mode query passes a full DEVMODEA buffer without
+     * initializing dmSize. Windows accepts that legacy call pattern. */
+    memset(dm, 0, output_size);
+    dm->dmSize = output_size;
+    dm->dmSpecVersion = 0x0401;
+    dm->dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT |
+                   DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY;
     dm->dmDisplayFrequency = 60;
 
     if (mode == ENUM_CURRENT_SETTINGS) {
-        /* Report the live DirectDraw mode (the layer's "current mode" authority)
-         * so user32/gdi32/ddraw agree; fall back to GOP size + 16bpp pre-ddraw. */
-        extern void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
-            __attribute__((weak));
-        uint32_t cw = 0, ch = 0, cb = 0;
-        if (ddraw_get_display_mode) ddraw_get_display_mode(&cw, &ch, &cb);
-        dm->dmBitsPerPel = cb ? cb : 16;
-        dm->dmPelsWidth  = cw ? cw : (uint32_t)screen_cx();
-        dm->dmPelsHeight = ch ? ch : (uint32_t)screen_cy();
+        current_mode_values(&dm->dmPelsWidth, &dm->dmPelsHeight,
+                            &dm->dmBitsPerPel, &dm->dmDisplayFrequency);
+        return TRUE;
+    }
+    if (mode == ENUM_REGISTRY_SETTINGS) {
+        dm->dmBitsPerPel = 32;
+        dm->dmPelsWidth = (uint32_t)screen_cx();
+        dm->dmPelsHeight = (uint32_t)screen_cy();
         return TRUE;
     }
 
     /* index = res-major, bpp-minor */
-    const uint32_t nres = sizeof(res) / sizeof(res[0]);
+    const uint32_t nres = display_resolution_count();
     const uint32_t nbpp = sizeof(bpps) / sizeof(bpps[0]);
     if (mode >= nres * nbpp) return FALSE;
     uint32_t ri = mode / nbpp, bi = mode % nbpp;
     dm->dmBitsPerPel = bpps[bi];
-    dm->dmPelsWidth  = res[ri].w;
-    dm->dmPelsHeight = res[ri].h;
-    return TRUE;
+    return display_resolution_at(ri, &dm->dmPelsWidth, &dm->dmPelsHeight);
 }
 
-BOOL WINAPI EnumDisplaySettingsW(const void *device, uint32_t mode, void *dm)
+BOOL WINAPI EnumDisplaySettingsW(const WCHAR *device, uint32_t mode, DEVMODEW *dm)
 {
-    return EnumDisplaySettingsA((const char *)device, mode, (DEVMODEA *)dm);
+    (void)device;
+    if (!dm) return FALSE;
+    uint16_t caller_size = dm->dmSize;
+    uint16_t output_size =
+        (caller_size >= DEVMODEW_DISPLAY_SIZE && caller_size <= sizeof(*dm))
+            ? caller_size : (uint16_t)sizeof(*dm);
+    static const uint8_t bpps[] = { 16, 32 };
+
+    memset(dm, 0, output_size);
+    dm->dmSize = output_size;
+    dm->dmSpecVersion = 0x0401;
+    dm->dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT |
+                   DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY;
+    dm->dmDisplayFrequency = 60;
+
+    if (mode == ENUM_CURRENT_SETTINGS) {
+        current_mode_values(&dm->dmPelsWidth, &dm->dmPelsHeight,
+                            &dm->dmBitsPerPel, &dm->dmDisplayFrequency);
+        return TRUE;
+    }
+    if (mode == ENUM_REGISTRY_SETTINGS) {
+        dm->dmBitsPerPel = 32;
+        dm->dmPelsWidth = (uint32_t)screen_cx();
+        dm->dmPelsHeight = (uint32_t)screen_cy();
+        return TRUE;
+    }
+
+    const uint32_t nbpp = sizeof(bpps) / sizeof(bpps[0]);
+    const uint32_t nres = display_resolution_count();
+    if (mode >= nres * nbpp) return FALSE;
+    dm->dmBitsPerPel = bpps[mode % nbpp];
+    return display_resolution_at(mode / nbpp, &dm->dmPelsWidth,
+                                 &dm->dmPelsHeight);
+}
+
+LONG WINAPI ChangeDisplaySettingsExA(const char *device, DEVMODEA *dm,
+                                     HWND window, uint32_t flags, void *param)
+{
+    (void)device; (void)window; (void)param;
+    return ChangeDisplaySettingsA(dm, flags);
+}
+
+LONG WINAPI ChangeDisplaySettingsExW(const WCHAR *device, DEVMODEW *dm,
+                                     HWND window, uint32_t flags, void *param)
+{
+    (void)device; (void)window; (void)param;
+    return ChangeDisplaySettingsW(dm, flags);
+}
+
+BOOL WINAPI EnumDisplaySettingsExA(const char *device, uint32_t mode,
+                                   DEVMODEA *dm, uint32_t flags)
+{
+    (void)flags;
+    return EnumDisplaySettingsA(device, mode, dm);
+}
+
+BOOL WINAPI EnumDisplaySettingsExW(const WCHAR *device, uint32_t mode,
+                                   DEVMODEW *dm, uint32_t flags)
+{
+    (void)flags;
+    return EnumDisplaySettingsW(device, mode, dm);
 }
 
 #define GWL_STYLE      (-16)
@@ -7229,6 +7720,7 @@ BOOL WINAPI BringWindowToTop(HWND hWnd)
 
 HWND WINAPI SetFocus(HWND hWnd)
 {
+    uint32_t caller_eip = compat32_get_last_caller_eip();
     HWND old = focus_hwnd;
     /* [CAPDIAG — uncommitted] who flips focus (the capture-flap suspect) */
     {
@@ -7243,7 +7735,8 @@ HWND WINAPI SetFocus(HWND hWnd)
         }
     }
     /* Only track real windows we know about; NULL clears focus. */
-    if (hWnd == NULL || find_window(hWnd)) {
+    BOOL accepted = hWnd == NULL || find_window(hWnd);
+    if (accepted) {
         focus_hwnd = hWnd;
         if (hWnd) {
             WINDOW *focused = find_window(hWnd);
@@ -7264,6 +7757,8 @@ HWND WINAPI SetFocus(HWND hWnd)
                 dispatch_focus_message(hWnd, WM_SETFOCUS, old);
         }
     }
+    trace_lwjgl_window_call("SetFocus", caller_eip, hWnd, accepted,
+                            NULL, (ULONG_PTR)old);
     return old;
 }
 static HANDLE current_window_station = (HANDLE)(ULONG_PTR)0xD0000002;
@@ -9101,9 +9596,12 @@ BOOL WINAPI RedrawWindow(HWND hWnd, const RECT *lprcUpdate,
 
 BOOL WINAPI SetForegroundWindow(HWND hWnd)
 {
+    uint32_t caller_eip = compat32_get_last_caller_eip();
     WINDOW *w = find_window(hWnd);
     if (!w) {
         SetLastError(1400);
+        trace_lwjgl_window_call("SetForegroundWindow", caller_eip, hWnd,
+                                FALSE, NULL, 0);
         return FALSE;
     }
 
@@ -9114,6 +9612,8 @@ BOOL WINAPI SetForegroundWindow(HWND hWnd)
             compositor_focus_window(root->compositor_id);
     }
     dispatch_wm_activate(w);
+    trace_lwjgl_window_call("SetForegroundWindow", caller_eip, hWnd,
+                            TRUE, NULL, 0);
     return TRUE;
 }
 
@@ -9777,8 +10277,8 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
     /* Clamp to screen */
     if (cursor_pos.x < 0) cursor_pos.x = 0;
     if (cursor_pos.y < 0) cursor_pos.y = 0;
-    int screen_width = screen_cx();
-    int screen_height = screen_cy();
+    int screen_width = current_mode_cx();
+    int screen_height = current_mode_cy();
     if (screen_width < 1) screen_width = 1;
     if (screen_height < 1) screen_height = 1;
     if (cursor_pos.x >= screen_width)  cursor_pos.x = screen_width - 1;
@@ -9895,7 +10395,7 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
 void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 {
     g_last_input_time = shim_timeGetTime();
-    int tw = screen_cx(), th = screen_cy();
+    int tw = current_mode_cx(), th = current_mode_cy();
     if (tw < 1) tw = SCREEN_WIDTH;
     if (th < 1) th = SCREEN_HEIGHT;
     /* A live DirectDraw present may scale a smaller source (for example
@@ -12684,6 +13184,13 @@ int user32_window_model_selftest(void)
                    GetSystemMetrics(SM_CXVIRTUALSCREEN) > 0 &&
                    GetSystemMetrics(SM_CYVIRTUALSCREEN) > 0,
                    "virtual-screen metrics", &checks, &failures);
+    wm_test_expect(GetSystemMetrics(SM_CXCURSOR) == 32 &&
+                   GetSystemMetrics(SM_CYCURSOR) == 32 &&
+                   GetSystemMetrics(SM_MOUSEPRESENT) == 1 &&
+                   GetSystemMetrics(SM_CMOUSEBUTTONS) == 3 &&
+                   GetSystemMetrics(SM_MOUSEWHEELPRESENT) == 1 &&
+                   GetSystemMetricsForDpi(SM_CXCURSOR, 192) == 64,
+                   "mouse and cursor metrics", &checks, &failures);
 
     wm_test_destroy_count = 0;
     wm_test_ncdestroy_count = 0;
@@ -13755,6 +14262,10 @@ static const SHIM_EXPORT user32_exports[] = {
     { "GetClassInfoW",      (PVOID)GetClassInfoW_k32, 3, CC_STDCALL },
     { "GetClassWord",       (PVOID)GetClassWord_u32, 2, CC_STDCALL },
     { "GetClassLongPtrW",   (PVOID)GetClassLongPtrW, 2, CC_STDCALL },
+    { "SetClassLongA",      (PVOID)SetClassLongA_u32, 3, CC_STDCALL },
+    { "SetClassLongW",      (PVOID)SetClassLongW, 3, CC_STDCALL },
+    { "SetClassLongPtrA",   (PVOID)SetClassLongPtrA_u32, 3, CC_STDCALL },
+    { "SetClassLongPtrW",   (PVOID)SetClassLongPtrW, 3, CC_STDCALL },
     { "GetClassNameW",      (PVOID)GetClassNameW, 3, CC_STDCALL },
     /* Window creation */
     { "CreateWindowExA",    (PVOID)CreateWindowExA, 12, CC_STDCALL },
@@ -13854,8 +14365,12 @@ static const SHIM_EXPORT user32_exports[] = {
     { "SetProcessDpiAwareness", (PVOID)SetProcessDpiAwareness_u32, 1, CC_STDCALL },
     { "ChangeDisplaySettingsA",   (PVOID)ChangeDisplaySettingsA, 2, CC_STDCALL },
     { "ChangeDisplaySettingsW",   (PVOID)ChangeDisplaySettingsW, 2, CC_STDCALL },
+    { "ChangeDisplaySettingsExA", (PVOID)ChangeDisplaySettingsExA, 5, CC_STDCALL },
+    { "ChangeDisplaySettingsExW", (PVOID)ChangeDisplaySettingsExW, 5, CC_STDCALL },
     { "EnumDisplaySettingsA",     (PVOID)EnumDisplaySettingsA, 3, CC_STDCALL },
     { "EnumDisplaySettingsW",     (PVOID)EnumDisplaySettingsW, 3, CC_STDCALL },
+    { "EnumDisplaySettingsExA",   (PVOID)EnumDisplaySettingsExA, 4, CC_STDCALL },
+    { "EnumDisplaySettingsExW",   (PVOID)EnumDisplaySettingsExW, 4, CC_STDCALL },
     { "GetWindowLongA",     (PVOID)GetWindowLongA, 2, CC_STDCALL },
     { "SetWindowLongA",     (PVOID)SetWindowLongA, 3, CC_STDCALL },
     { "GetWindowLongPtrA",  (PVOID)GetWindowLongPtrA, 2, CC_STDCALL },
@@ -14139,6 +14654,7 @@ PVOID user32_shim_init(void)
     user_icon_lock = SPINLOCK_INIT;
     wndclass_count = 0;
     window_count = 0;
+    memset(&user_display_mode, 0, sizeof(user_display_mode));
     defer_sync_depth = 0;
     show_trace_count = 0;
     next_hdwp = 0xD5000001;
@@ -14174,6 +14690,8 @@ PVOID user32_shim_init(void)
     for (int i = 0; i < USER_HOOK_CONTEXT_SLOTS; i++) {
         user_hook_contexts[i].used = FALSE;
         user_hook_contexts[i].depth = 0;
+        user_hook_contexts[i].windowpos_depth = 0;
+        user_hook_contexts[i].create_depth = 0;
         user_hook_contexts[i].scratch_page = NULL;
     }
     for (int i = 0; i < MSG_QUEUE_SIZE; i++) {

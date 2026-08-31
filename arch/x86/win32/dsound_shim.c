@@ -32,6 +32,7 @@ extern int  hda_is_ready(void);
 #define E_NOINTERFACE     ((HRESULT)0x80004002)
 #define DSERR_GENERIC     ((HRESULT)0x80004005)
 #define DSERR_INVALIDPARAM ((HRESULT)0x80070057)
+#define DSERR_NODRIVER    ((HRESULT)0x88780078)
 
 /* DSBUFFERDESC.dwFlags */
 #define DSBCAPS_PRIMARYBUFFER   0x00000001
@@ -883,13 +884,49 @@ HRESULT WINAPI DirectSoundEnumerateA(PVOID lpDSEnumCallback, PVOID lpContext)
     return DS_OK;
 }
 
+HRESULT WINAPI DirectSoundEnumerateW(PVOID lpDSEnumCallback, PVOID lpContext)
+{
+    return DirectSoundEnumerateA(lpDSEnumCallback, lpContext);
+}
+
+HRESULT WINAPI DirectSoundCaptureCreate(LPCGUID lpcGuidDevice, PVOID *ppDSC,
+                                        PVOID pUnkOuter)
+{
+    (void)lpcGuidDevice;
+    (void)pUnkOuter;
+    if (!ppDSC) return DSERR_INVALIDPARAM;
+    *ppDSC = NULL;
+
+    /* The HDA layer currently exposes playback only. Windows still exports
+     * this function without an input endpoint and reports that at creation. */
+    return DSERR_NODRIVER;
+}
+
+HRESULT WINAPI DirectSoundCaptureEnumerateA(PVOID lpDSEnumCallback,
+                                             PVOID lpContext)
+{
+    (void)lpDSEnumCallback;
+    (void)lpContext;
+    return DS_OK;
+}
+
+HRESULT WINAPI DirectSoundCaptureEnumerateW(PVOID lpDSEnumCallback,
+                                             PVOID lpContext)
+{
+    return DirectSoundCaptureEnumerateA(lpDSEnumCallback, lpContext);
+}
+
 /* ── Export table ──────────────────────────────────────────── */
 
 typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT dsound_exports[] = {
-    { "DirectSoundCreate",     (PVOID)DirectSoundCreate,     3, CC_STDCALL },
-    { "DirectSoundEnumerateA", (PVOID)DirectSoundEnumerateA, 2, CC_STDCALL },
+    { "DirectSoundCreate",            (PVOID)DirectSoundCreate,            3, CC_STDCALL },
+    { "DirectSoundEnumerateA",        (PVOID)DirectSoundEnumerateA,        2, CC_STDCALL },
+    { "DirectSoundEnumerateW",        (PVOID)DirectSoundEnumerateW,        2, CC_STDCALL },
+    { "DirectSoundCaptureCreate",     (PVOID)DirectSoundCaptureCreate,     3, CC_STDCALL },
+    { "DirectSoundCaptureEnumerateA", (PVOID)DirectSoundCaptureEnumerateA, 2, CC_STDCALL },
+    { "DirectSoundCaptureEnumerateW", (PVOID)DirectSoundCaptureEnumerateW, 2, CC_STDCALL },
     { NULL, NULL, 0, CC_STDCALL }
 };
 

@@ -8,6 +8,7 @@
 .code64
 .text
 
+#ifndef OSITO_SHARED_MODULE
 .globl __syscall0
 __syscall0:
     mov %rdi, %rax      /* nr */
@@ -70,6 +71,7 @@ __syscall6:
     mov 8(%rsp), %r9      /* 7th C arg is on stack */
     syscall
     ret
+#endif
 
 /*
  * _setjmp / longjmp — save/restore execution context.
@@ -100,6 +102,7 @@ setjmp:
  * Reads argc/argv from stack before any prologue can corrupt RSP.
  * Stack layout from ELF loader: RSP → argc, argv[0], ..., NULL, envp
  */
+#ifndef OSITO_SHARED_MODULE
 .globl _start
 _start:
     xor %rbp, %rbp          /* Clear frame pointer (ABI requirement) */
@@ -119,6 +122,7 @@ _start:
     jmp .                    /* unreachable */
 
 .extern environ
+#endif
 
 
 .globl longjmp

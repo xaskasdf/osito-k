@@ -91,6 +91,32 @@ __THREAD_INITIAL_EXEC struct _glapi_table *_mesa_glapi_tls_Dispatch
 
 __THREAD_INITIAL_EXEC void *_mesa_glapi_tls_Context;
 
+#ifdef OSITOK_MANUAL_GLAPI_CURRENT
+static once_flag CurrentTSSOnce = ONCE_FLAG_INIT;
+static tss_t CurrentDispatchTSS;
+static tss_t CurrentContextTSS;
+static int CurrentTSSReady;
+
+static void
+init_current_tss(void)
+{
+   if (tss_create(&CurrentDispatchTSS, NULL) != thrd_success)
+      return;
+   if (tss_create(&CurrentContextTSS, NULL) != thrd_success) {
+      tss_delete(CurrentDispatchTSS);
+      return;
+   }
+   CurrentTSSReady = 1;
+}
+
+static bool
+current_tss_ready(void)
+{
+   call_once(&CurrentTSSOnce, init_current_tss);
+   return CurrentTSSReady != 0;
+}
+#endif
+
 /* not used, but defined for compatibility */
 const struct _glapi_table *_mesa_glapi_Dispatch;
 const void *_glapi_Context;
@@ -117,6 +143,12 @@ _glapi_check_multithread(void)
 void
 _mesa_glapi_set_context(void *ptr)
 {
+#ifdef OSITOK_MANUAL_GLAPI_CURRENT
+   if (current_tss_ready()) {
+      tss_set(CurrentContextTSS, ptr);
+      return;
+   }
+#endif
    _mesa_glapi_tls_Context = ptr;
 }
 
@@ -128,6 +160,10 @@ _mesa_glapi_set_context(void *ptr)
 void *
 _mesa_glapi_get_context(void)
 {
+#ifdef OSITOK_MANUAL_GLAPI_CURRENT
+   if (current_tss_ready())
+      return tss_get(CurrentContextTSS);
+#endif
    return _mesa_glapi_tls_Context;
 }
 
@@ -144,6 +180,12 @@ _mesa_glapi_set_dispatch(struct _glapi_table *tbl)
    if (!tbl)
       tbl = (struct _glapi_table *) table_noop_array;
 
+#ifdef OSITOK_MANUAL_GLAPI_CURRENT
+   if (current_tss_ready()) {
+      tss_set(CurrentDispatchTSS, tbl);
+      return;
+   }
+#endif
    _mesa_glapi_tls_Dispatch = tbl;
 }
 
@@ -153,5 +195,11 @@ _mesa_glapi_set_dispatch(struct _glapi_table *tbl)
 struct _glapi_table *
 _mesa_glapi_get_dispatch(void)
 {
+#ifdef OSITOK_MANUAL_GLAPI_CURRENT
+   if (current_tss_ready()) {
+      struct _glapi_table *dispatch = tss_get(CurrentDispatchTSS);
+      return dispatch ? dispatch : (struct _glapi_table *) table_noop_array;
+   }
+#endif
    return _mesa_glapi_tls_Dispatch;
 }

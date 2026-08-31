@@ -11,6 +11,7 @@
 
 #include "../include/types.h"
 #include "../include/boot_info.h"
+#include "../include/paging.h"
 #include "../include/sys/display_syscalls.h"
 
 /* ── External functions ──────────────────────────────────────── */
@@ -49,6 +50,7 @@ extern int      gpu_display_set_mode(const display_edid_mode_t *mode,
 
 /* Virtio-GPU 2D scanout (virtio_gpu.c) — weak so we link without virtio driver */
 extern bool     virtio_gpu_ready(void)      __attribute__((weak));
+extern bool     virtio_gpu_is_vga_compatible(void) __attribute__((weak));
 extern uint32_t *virtio_gpu_get_fb(void)    __attribute__((weak));
 extern uint32_t virtio_gpu_get_width(void)  __attribute__((weak));
 extern uint32_t virtio_gpu_get_height(void) __attribute__((weak));
@@ -70,6 +72,9 @@ uint32_t *display_get_back_buffer(void);
 
 typedef struct {
     uint32_t *gop_fb;        /* Original GOP framebuffer (always visible) */
+    uint32_t  gop_width;
+    uint32_t  gop_height;
+    uint32_t  gop_pitch;
     uint32_t *back;          /* Back buffer (draw here) */
     uint32_t  width;
     uint32_t  height;
@@ -104,6 +109,31 @@ typedef struct {
 } display_t;
 
 static display_t disp;
+
+static uint32_t *display_alloc_back_buffer(uint64_t size)
+{
+    void *physical = mem_alloc_aligned(size, 4096);
+    return physical ? (uint32_t *)PHYS_TO_VIRT(physical) : NULL;
+}
+
+static void display_free_back_buffer(uint32_t *buffer, uint64_t size)
+{
+    if (!buffer) return;
+    mem_free_pages((void *)(uintptr_t)kvirt_to_phys(buffer),
+                   (size + 4095ULL) / 4096ULL);
+}
+
+static bool display_gop_mirror_compatible(void)
+{
+    return disp.gop_fb && disp.width == disp.gop_width &&
+           disp.height == disp.gop_height && disp.pitch == disp.gop_pitch;
+}
+
+static bool display_virtio_owns_primary_scanout(void)
+{
+    return disp.virtio_scanout && virtio_gpu_is_vga_compatible &&
+           virtio_gpu_is_vga_compatible();
+}
 
 /* ── Display mode state (multi-monitor placeholder) ──────────── */
 
@@ -249,6 +279,11 @@ static int display_auto_modeset(void)
         return DISP_ENOTSUP;
     }
 
+    if (!display_virtio_owns_primary_scanout()) {
+        serial_puts("[DISP] Automodeset skipped: virtio is a secondary display\n");
+        return DISP_ENOTSUP;
+    }
+
     uint32_t native_w = 0, native_h = 0;
     if (!virtio_gpu_get_native_mode(&native_w, &native_h))
         return DISP_ENOTSUP;
@@ -345,7 +380,8 @@ int display_modeset_set(uint32_t width, uint32_t height,
     }
 
     if (flags & DISPLAY_SET_NATIVE) {
-        if (disp.virtio_scanout && virtio_gpu_get_native_mode) {
+        if (display_virtio_owns_primary_scanout() &&
+            virtio_gpu_get_native_mode) {
             uint32_t native_w = 0, native_h = 0;
             if (!virtio_gpu_get_native_mode(&native_w, &native_h))
                 return DISP_ENOTSUP;
@@ -395,7 +431,7 @@ int display_modeset_set(uint32_t width, uint32_t height,
     if (width == disp.width && height == disp.height)
         return display_apply_refresh(refresh_hz);
 
-    if (disp.virtio_scanout && virtio_gpu_resize) {
+    if (display_virtio_owns_primary_scanout() && virtio_gpu_resize) {
         int rc = display_set_virtio_mode(width, height);
         if (rc < 0) return rc;
         return display_apply_refresh(refresh_hz);
@@ -485,6 +521,9 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     serial_puts("[DISP] Initializing display subsystem...\n");
 
     disp.gop_fb = gop_base;
+    disp.gop_width = width;
+    disp.gop_height = height;
+    disp.gop_pitch = pitch;
     disp.width  = width;
     disp.height = height;
     disp.pitch  = pitch;
@@ -524,8 +563,8 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     disp.last_flip_tsc = disp_rdtsc();
 
     /* Allocate back buffers (page-aligned for GPU scanout) */
-    disp.buffers[0] = (uint32_t *)mem_alloc_aligned(disp.fb_size, 4096);
-    disp.buffers[1] = (uint32_t *)mem_alloc_aligned(disp.fb_size, 4096);
+    disp.buffers[0] = display_alloc_back_buffer(disp.fb_size);
+    disp.buffers[1] = display_alloc_back_buffer(disp.fb_size);
     if (!disp.buffers[0] || !disp.buffers[1]) {
         serial_puts("[DISP] ERROR: Failed to allocate back buffer(s)\n");
         return -1;
@@ -669,10 +708,10 @@ void display_flip(void)
         /* GPU page flip: tell display engine to scan out from current draw buffer.
          * Then swap to the other buffer for next frame's drawing.
          * Compositor draws into buffers[draw_idx], GPU reads from the one we just flipped. */
-        gpu_display_flip((uint64_t)(uintptr_t)disp.buffers[disp.draw_idx]);
+        gpu_display_flip(kvirt_to_phys(disp.buffers[disp.draw_idx]));
         disp.draw_idx ^= 1;
         disp.back = disp.buffers[disp.draw_idx];
-    } else {
+    } else if (display_gop_mirror_compatible()) {
         /* Back buffer → GOP framebuffer (QEMU / no GPU scanout).
          *
          * Use regular memcpy, NOT memcpy_nt: non-temporal stores
@@ -706,10 +745,10 @@ void display_flip_nowait(void)
 {
     if (!disp.initialized || !disp.dirty) return;
     if (disp.gpu_scanout) {
-        gpu_display_flip((uint64_t)(uintptr_t)disp.buffers[disp.draw_idx]);
+        gpu_display_flip(kvirt_to_phys(disp.buffers[disp.draw_idx]));
         disp.draw_idx ^= 1;
         disp.back = disp.buffers[disp.draw_idx];
-    } else {
+    } else if (display_gop_mirror_compatible()) {
         memcpy(disp.gop_fb, disp.back, disp.fb_size);
     }
     if (disp.virtio_scanout)
@@ -727,8 +766,8 @@ void display_force_refresh(void)
 {
     if (!disp.initialized || !disp.back) return;
     if (disp.gpu_scanout)
-        gpu_display_flip((uint64_t)(uintptr_t)disp.back);
-    else
+        gpu_display_flip(kvirt_to_phys(disp.back));
+    else if (display_gop_mirror_compatible())
         memcpy(disp.gop_fb, disp.back, disp.fb_size);
     if (disp.virtio_scanout)
         virtio_blit(disp.back);
@@ -747,12 +786,12 @@ int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch)
     uint64_t new_size = (uint64_t)new_pitch * new_height * sizeof(uint32_t);
     uint64_t old_size = disp.fb_size;
 
-    uint32_t *b0 = (uint32_t *)mem_alloc_aligned(new_size, 4096);
-    uint32_t *b1 = (uint32_t *)mem_alloc_aligned(new_size, 4096);
+    uint32_t *b0 = display_alloc_back_buffer(new_size);
+    uint32_t *b1 = display_alloc_back_buffer(new_size);
     if (!b0 || !b1) {
         serial_puts("[DISP] Resize failed: cannot allocate buffers\n");
-        if (b0) mem_free_pages(b0, (new_size + 4095ULL) / 4096ULL);
-        if (b1) mem_free_pages(b1, (new_size + 4095ULL) / 4096ULL);
+        display_free_back_buffer(b0, new_size);
+        display_free_back_buffer(b1, new_size);
         return -1;
     }
 
@@ -761,10 +800,8 @@ int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch)
     memset(b1, 0, new_size);
 
     /* Free old buffers */
-    if (disp.buffers[0])
-        mem_free_pages(disp.buffers[0], (old_size + 4095ULL) / 4096ULL);
-    if (disp.buffers[1])
-        mem_free_pages(disp.buffers[1], (old_size + 4095ULL) / 4096ULL);
+    display_free_back_buffer(disp.buffers[0], old_size);
+    display_free_back_buffer(disp.buffers[1], old_size);
 
     disp.width  = new_width;
     disp.height = new_height;

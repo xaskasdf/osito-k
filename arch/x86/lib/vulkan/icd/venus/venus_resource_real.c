@@ -4,6 +4,7 @@ extern void *malloc(unsigned long);
 extern void free(void *);
 extern void *memset(void *, int, unsigned long);
 extern void *memcpy(void *, const void *, unsigned long);
+extern int printf(const char *, ...);
 
 #define VN_CMD_BIND_BUFFER_MEMORY 28u
 #define VN_CMD_GET_BUFFER_MEMORY_REQUIREMENTS 30u
@@ -11,6 +12,8 @@ extern void *memcpy(void *, const void *, unsigned long);
 #define VN_CMD_GET_IMAGE_MEMORY_REQUIREMENTS 31u
 #define VN_CMD_CREATE_BUFFER 50u
 #define VN_CMD_DESTROY_BUFFER 51u
+#define VN_CMD_CREATE_BUFFER_VIEW 52u
+#define VN_CMD_DESTROY_BUFFER_VIEW 53u
 #define VN_CMD_CREATE_IMAGE 54u
 #define VN_CMD_DESTROY_IMAGE 55u
 #define VN_CMD_CREATE_IMAGE_VIEW 57u
@@ -83,6 +86,91 @@ static VkResult result_call(struct venus_device_real *device,
     memcpy(&result, reply + 4, sizeof(result));
     return returned_command == expected_command
         ? (VkResult)result : VK_ERROR_DEVICE_LOST;
+}
+
+static const VkBaseInStructure *
+memory_allocate_next_supported(const VkBaseInStructure *next)
+{
+    while (next) {
+        switch (next->sType) {
+        case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO:
+        case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO:
+        case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO:
+        case VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO:
+            return next;
+        default:
+            next = next->pNext;
+            break;
+        }
+    }
+    return 0;
+}
+
+static void
+encode_memory_allocate_pnext(struct resource_encoder *enc,
+                             const VkBaseInStructure *next)
+{
+    next = memory_allocate_next_supported(next);
+    if (!next) {
+        encode_u64(enc, 0);
+        return;
+    }
+
+    encode_u64(enc, 1);
+    encode_u32(enc, (uint32_t)next->sType);
+    encode_memory_allocate_pnext(enc, next->pNext);
+
+    switch (next->sType) {
+    case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO: {
+        const VkExportMemoryAllocateInfo *info =
+            (const VkExportMemoryAllocateInfo *)next;
+        encode_u32(enc, info->handleTypes);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO: {
+        const VkMemoryAllocateFlagsInfo *info =
+            (const VkMemoryAllocateFlagsInfo *)next;
+        encode_u32(enc, info->flags);
+        encode_u32(enc, info->deviceMask);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO: {
+        const VkMemoryDedicatedAllocateInfo *info =
+            (const VkMemoryDedicatedAllocateInfo *)next;
+        encode_u64(enc, (uint64_t)info->image);
+        encode_u64(enc, (uint64_t)info->buffer);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO: {
+        const VkMemoryOpaqueCaptureAddressAllocateInfo *info =
+            (const VkMemoryOpaqueCaptureAddressAllocateInfo *)next;
+        encode_u64(enc, info->opaqueCaptureAddress);
+        break;
+    }
+    default:
+        enc->failed = 1;
+        break;
+    }
+}
+
+static void
+encode_allocate_memory_command(struct resource_encoder *enc,
+                               const struct venus_device_real *device,
+                               const VkMemoryAllocateInfo *allocate_info,
+                               uint64_t object_id)
+{
+    encode_u32(enc, VN_CMD_ALLOCATE_MEMORY);
+    encode_u32(enc, VN_COMMAND_GENERATE_REPLY);
+    encode_u64(enc, device->object_id);
+    encode_u64(enc, 1); /* pAllocateInfo */
+    encode_u32(enc, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
+    encode_memory_allocate_pnext(
+        enc, (const VkBaseInStructure *)allocate_info->pNext);
+    encode_u64(enc, allocate_info->allocationSize);
+    encode_u32(enc, allocate_info->memoryTypeIndex);
+    encode_u64(enc, 0); /* pAllocator */
+    encode_u64(enc, 1); /* pMemory */
+    encode_u64(enc, object_id);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -189,6 +277,118 @@ venus_real_DestroyBuffer(VkDevice device, VkBuffer buffer,
         (void)venus_wire_submit_async(self->physical_device->instance->wire,
                                       command, sizeof(command));
     free((void *)(uintptr_t)buffer);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_CreateBufferView(VkDevice device,
+                            const VkBufferViewCreateInfo *create_info,
+                            const VkAllocationCallbacks *allocator,
+                            VkBufferView *view)
+{
+    if (!device || !create_info || !view || allocator ||
+        create_info->sType != VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO ||
+        !create_info->buffer || create_info->format == VK_FORMAT_UNDEFINED)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    const VkBufferUsageFlags2CreateInfoKHR *usage_info = 0;
+    for (const VkBaseInStructure *next =
+             (const VkBaseInStructure *)create_info->pNext;
+         next; next = next->pNext) {
+        if (next->sType ==
+            VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR) {
+            usage_info = (const VkBufferUsageFlags2CreateInfoKHR *)next;
+            break;
+        }
+    }
+
+    uint32_t command_size = usage_info ? 112u : 92u;
+    void *object = malloc(1);
+    uint8_t *command = malloc(command_size);
+    if (!object || !command) {
+        free(command);
+        free(object);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    uint64_t object_id = (uint64_t)(uintptr_t)object;
+    struct resource_encoder enc = {
+        .data = command,
+        .capacity = command_size,
+    };
+    struct venus_device_real *self = (struct venus_device_real *)device;
+    encode_u32(&enc, VN_CMD_CREATE_BUFFER_VIEW);
+    encode_u32(&enc, VN_COMMAND_GENERATE_REPLY);
+    encode_u64(&enc, self->object_id);
+    encode_u64(&enc, 1); /* pCreateInfo */
+    encode_u32(&enc, VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO);
+    if (usage_info) {
+        encode_u64(&enc, 1);
+        encode_u32(&enc,
+                   VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR);
+        encode_u64(&enc, 0);
+        encode_u64(&enc, usage_info->usage);
+    } else {
+        encode_u64(&enc, 0);
+    }
+    encode_u32(&enc, create_info->flags);
+    encode_u64(&enc, (uint64_t)create_info->buffer);
+    encode_u32(&enc, (uint32_t)create_info->format);
+    encode_u64(&enc, create_info->offset);
+    encode_u64(&enc, create_info->range);
+    encode_u64(&enc, 0); /* pAllocator */
+    encode_u64(&enc, 1); /* pView */
+    encode_u64(&enc, object_id);
+
+    uint8_t reply[24];
+    memset(reply, 0, sizeof(reply));
+    int wire_result = enc.failed ? -1 :
+        venus_wire_call(self->physical_device->instance->wire,
+                        command, command_size, reply, sizeof(reply));
+    free(command);
+
+    uint32_t returned_command = 0;
+    int32_t result = VK_ERROR_DEVICE_LOST;
+    uint64_t present = 0;
+    uint64_t returned_id = 0;
+    memcpy(&returned_command, reply, 4);
+    memcpy(&result, reply + 4, 4);
+    memcpy(&present, reply + 8, 8);
+    memcpy(&returned_id, reply + 16, 8);
+    if (wire_result < 0 ||
+        returned_command != VN_CMD_CREATE_BUFFER_VIEW ||
+        (result == VK_SUCCESS && (!present || returned_id != object_id)))
+        result = VK_ERROR_DEVICE_LOST;
+    if (result != VK_SUCCESS) {
+        free(object);
+        return (VkResult)result;
+    }
+
+    *view = (VkBufferView)object_id;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_real_DestroyBufferView(VkDevice device, VkBufferView view,
+                             const VkAllocationCallbacks *allocator)
+{
+    (void)allocator;
+    if (!device || !view)
+        return;
+    uint8_t command[32];
+    struct resource_encoder enc = {
+        .data = command,
+        .capacity = sizeof(command),
+    };
+    struct venus_device_real *self = (struct venus_device_real *)device;
+    encode_u32(&enc, VN_CMD_DESTROY_BUFFER_VIEW);
+    encode_u32(&enc, 0);
+    encode_u64(&enc, self->object_id);
+    encode_u64(&enc, (uint64_t)view);
+    encode_u64(&enc, 0); /* pAllocator */
+    if (!enc.failed)
+        (void)venus_wire_submit_async(self->physical_device->instance->wire,
+                                      command, sizeof(command));
+    free((void *)(uintptr_t)view);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -325,28 +525,29 @@ venus_real_AllocateMemory(VkDevice device,
     object->device = self;
     object->size = allocate_info->allocationSize;
 
-    uint8_t command[72];
+    struct resource_encoder size_enc = {
+        .capacity = UINT32_MAX,
+    };
+    encode_allocate_memory_command(&size_enc, self, allocate_info,
+                                   object->object_id);
+    uint8_t *command = size_enc.failed ? 0 : malloc(size_enc.length);
+    if (!command) {
+        free(object);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     struct resource_encoder enc = {
         .data = command,
-        .capacity = sizeof(command),
+        .capacity = size_enc.length,
     };
-    encode_u32(&enc, VN_CMD_ALLOCATE_MEMORY);
-    encode_u32(&enc, VN_COMMAND_GENERATE_REPLY);
-    encode_u64(&enc, self->object_id);
-    encode_u64(&enc, 1); /* pAllocateInfo */
-    encode_u32(&enc, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
-    encode_u64(&enc, 0); /* pNext */
-    encode_u64(&enc, allocate_info->allocationSize);
-    encode_u32(&enc, allocate_info->memoryTypeIndex);
-    encode_u64(&enc, 0); /* pAllocator */
-    encode_u64(&enc, 1); /* pMemory */
-    encode_u64(&enc, object->object_id);
+    encode_allocate_memory_command(&enc, self, allocate_info,
+                                   object->object_id);
 
     uint8_t reply[24];
     memset(reply, 0, sizeof(reply));
     int wire_result = enc.failed ? -1 :
         venus_wire_call(self->physical_device->instance->wire,
-                        command, sizeof(command), reply, sizeof(reply));
+                        command, enc.length, reply, sizeof(reply));
+    free(command);
     uint32_t returned_command = 0;
     int32_t result = VK_ERROR_DEVICE_LOST;
     uint64_t present = 0;
@@ -363,6 +564,7 @@ venus_real_AllocateMemory(VkDevice device,
         free(object);
         return (VkResult)result;
     }
+
     if (venus_wire_resource_create(self->physical_device->instance->wire,
                                    object->size, object->object_id,
                                    &object->resource_id,
@@ -376,7 +578,7 @@ venus_real_AllocateMemory(VkDevice device,
         encode_u32(&free_enc, 0);
         encode_u64(&free_enc, self->object_id);
         encode_u64(&free_enc, object->object_id);
-        encode_u64(&free_enc, 0);
+        encode_u64(&free_enc, 0); /* pAllocator */
         if (!free_enc.failed)
             (void)venus_wire_submit_async(
                 self->physical_device->instance->wire,
@@ -385,6 +587,7 @@ venus_real_AllocateMemory(VkDevice device,
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
     memset(object->mapping, 0, object->size);
+    __asm__ volatile("mfence" ::: "memory");
     *memory = (VkDeviceMemory)object->object_id;
     return VK_SUCCESS;
 }
@@ -408,13 +611,16 @@ venus_real_FreeMemory(VkDevice device, VkDeviceMemory memory,
     encode_u64(&enc, object->device->object_id);
     encode_u64(&enc, object->object_id);
     encode_u64(&enc, 0); /* pAllocator */
-    if (!enc.failed &&
-        venus_wire_submit_async(
+    int submitted = -1;
+    if (!enc.failed)
+        submitted = venus_wire_submit_async(
             object->device->physical_device->instance->wire,
-            command, sizeof(command)) == 0)
+            command, sizeof(command));
+    if (submitted == 0) {
         (void)venus_wire_resource_destroy(
             object->device->physical_device->instance->wire,
             object->resource_id);
+    }
     free(object);
 }
 
@@ -473,6 +679,8 @@ venus_real_CreateImage(VkDevice device,
             format_list = (const VkImageFormatListCreateInfo *)next;
         } else if (next->sType !=
                    VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+            printf("[VN image] unsupported pNext sType=%u\n",
+                   (uint32_t)next->sType);
             return VK_ERROR_INITIALIZATION_FAILED;
         }
     }
@@ -559,6 +767,16 @@ venus_real_CreateImage(VkDevice device,
         (result == VK_SUCCESS && (!present || returned_id != object_id)))
         result = VK_ERROR_DEVICE_LOST;
     if (result != VK_SUCCESS) {
+        printf("[VN image] create failed wire=%d reply_cmd=%u result=%d "
+               "present=%llu fmt=%u extent=%ux%ux%u usage=0x%x "
+               "tiling=%u flags=0x%x pnext=%u bytes=%u encoded=%u\n",
+               wire_result, returned_command, result,
+               (unsigned long long)present, (uint32_t)create_info->format,
+               create_info->extent.width, create_info->extent.height,
+               create_info->extent.depth, create_info->usage,
+               (uint32_t)create_info->tiling, create_info->flags,
+               format_list ? (uint32_t)format_list->sType : 0u,
+               (uint32_t)size, enc.length);
         free(object);
         return (VkResult)result;
     }

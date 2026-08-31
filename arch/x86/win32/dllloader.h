@@ -38,6 +38,7 @@ typedef struct _LOADED_MODULE {
     BOOL            thread_notifications_disabled;
     ULONG           init_order;     /* completed process-attach order */
     int             ref_count;      /* LoadLibrary reference count */
+    BOOL            pinned;         /* retained until process teardown */
 } LOADED_MODULE;
 
 /* ── API ───────────────────────────────────────────────────── */
@@ -99,8 +100,17 @@ LOADED_MODULE *dll_find_module_by_address(PVOID address);
 /* Return a loaded module handle, optionally taking a LoadLibrary reference. */
 PVOID dll_get_module_handle(const char *name, BOOL add_reference);
 
+/* GetModuleHandleEx helpers. Lookup and reference/pin changes are atomic with
+ * respect to FreeLibrary in the owning process. */
+PVOID dll_get_module_handle_ex(const char *name, BOOL add_reference,
+                               BOOL pin);
+PVOID dll_get_module_handle_by_address(PVOID address, BOOL add_reference,
+                                       BOOL pin);
+
 /* Materialize a process-local PE image for a registered built-in shim. */
 PVOID dll_get_shim_module_handle(const char *name, BOOL add_reference);
+PVOID dll_get_shim_module_handle_ex(const char *name, BOOL add_reference,
+                                    BOOL pin);
 
 /* Emit module/base/RVA details for an address while debugging PE faults. */
 void dll_debug_log_address(PVOID address);
@@ -114,10 +124,8 @@ PVOID dll_resolve_export(LOADED_MODULE *mod, const char *func_name,
 void dll_export_lookup_dump(void);
 int  dll_export_lookup_selftest(void);
 
-/*
- * Unload a DLL (calls DllMain(DETACH), frees image).
- */
-void dll_unload(LOADED_MODULE *mod);
+/* Release a LoadLibrary reference. Pinned modules remain until teardown. */
+BOOL dll_release_module(PVOID image_base);
 
 /* Drop every private DLL image owned by a terminating process. */
 void dll_release_process(ULONG owner_pid);

@@ -354,7 +354,7 @@ static int32_t vg3d_release_res(struct vg3d_res *res) {
 }
 
 static int32_t vg3d_host_res_create_blob(uint32_t ctx_id, uint32_t res_id,
-                                         uint64_t size,
+                                         uint64_t size, uint64_t blob_id,
                                          uint64_t *hostmem_offset_out,
                                          uint32_t *map_info_out) {
     if (!(vgpu_device_features() & (1ull << VIRTIO_GPU_F_RESOURCE_BLOB)))
@@ -378,7 +378,7 @@ static int32_t vg3d_host_res_create_blob(uint32_t ctx_id, uint32_t res_id,
     create->blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
     create->blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
     create->nr_entries = 0;
-    create->blob_id = 0;
+    create->blob_id = blob_id;
     create->size = size;
 
     err = vg3d_host_cmd(create, sizeof(*create), "RESOURCE_CREATE_BLOB", 0);
@@ -525,6 +525,7 @@ int32_t vg3d_res_create(uint32_t pid, uint32_t ctx_id,
             if (args->kind == GPU_RES_KIND_BUFFER &&
                 (args->flags & GPU_RES_FLAG_HOST_COHERENT)) {
                 int32_t berr = vg3d_host_res_create_blob(ctx_id, id, sz,
+                                                         args->blob_id,
                                                          &hostmem_offset,
                                                          &map_info);
                 if (berr == 0) {

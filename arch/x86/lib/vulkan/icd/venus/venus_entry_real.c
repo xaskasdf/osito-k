@@ -51,6 +51,11 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name)
         return (PFN_vkVoidFunction)
             venus_real_GetPhysicalDeviceImageFormatProperties2;
     if (instance &&
+        strcmp(name,
+               "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT") == 0)
+        return (PFN_vkVoidFunction)
+            venus_real_GetPhysicalDeviceCalibrateableTimeDomainsEXT;
+    if (instance &&
         strcmp(name, "vkEnumerateDeviceExtensionProperties") == 0)
         return (PFN_vkVoidFunction)
             venus_real_EnumerateDeviceExtensionProperties;
@@ -62,6 +67,10 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name)
         return (PFN_vkVoidFunction)venus_real_GetDeviceQueue;
     if (instance && strcmp(name, "vkDeviceWaitIdle") == 0)
         return (PFN_vkVoidFunction)venus_real_DeviceWaitIdle;
+    if (instance && strcmp(name, "vkQueueWaitIdle") == 0)
+        return (PFN_vkVoidFunction)venus_real_QueueWaitIdle;
+    if (instance && strcmp(name, "vkGetCalibratedTimestampsEXT") == 0)
+        return (PFN_vkVoidFunction)venus_real_GetCalibratedTimestampsEXT;
     if (instance && strcmp(name, "vkCreateDescriptorSetLayout") == 0)
         return (PFN_vkVoidFunction)venus_real_CreateDescriptorSetLayout;
     if (instance && strcmp(name, "vkDestroyDescriptorSetLayout") == 0)
@@ -82,6 +91,18 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name)
         return (PFN_vkVoidFunction)venus_real_CreateSemaphore;
     if (instance && strcmp(name, "vkDestroySemaphore") == 0)
         return (PFN_vkVoidFunction)venus_real_DestroySemaphore;
+    if (instance &&
+        (strcmp(name, "vkGetSemaphoreCounterValue") == 0 ||
+         strcmp(name, "vkGetSemaphoreCounterValueKHR") == 0))
+        return (PFN_vkVoidFunction)venus_real_GetSemaphoreCounterValue;
+    if (instance &&
+        (strcmp(name, "vkWaitSemaphores") == 0 ||
+         strcmp(name, "vkWaitSemaphoresKHR") == 0))
+        return (PFN_vkVoidFunction)venus_real_WaitSemaphores;
+    if (instance &&
+        (strcmp(name, "vkSignalSemaphore") == 0 ||
+         strcmp(name, "vkSignalSemaphoreKHR") == 0))
+        return (PFN_vkVoidFunction)venus_real_SignalSemaphore;
     if (instance && strcmp(name, "vkCreateFence") == 0)
         return (PFN_vkVoidFunction)venus_real_CreateFence;
     if (instance && strcmp(name, "vkDestroyFence") == 0)
@@ -142,8 +163,14 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name)
         (strcmp(name, "vkCmdBindVertexBuffers2") == 0 ||
          strcmp(name, "vkCmdBindVertexBuffers2EXT") == 0))
         return (PFN_vkVoidFunction)venus_real_CmdBindVertexBuffers2;
+    if (instance && strcmp(name, "vkCmdBindVertexBuffers") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdBindVertexBuffers;
     if (instance && strcmp(name, "vkCmdBindPipeline") == 0)
         return (PFN_vkVoidFunction)venus_real_CmdBindPipeline;
+    if (instance &&
+        strcmp(name, "vkCmdSetAttachmentFeedbackLoopEnableEXT") == 0)
+        return (PFN_vkVoidFunction)
+            venus_real_CmdSetAttachmentFeedbackLoopEnableEXT;
     if (instance && strcmp(name, "vkCmdBindIndexBuffer") == 0)
         return (PFN_vkVoidFunction)venus_real_CmdBindIndexBuffer;
     if (instance &&
@@ -164,6 +191,22 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name)
         return (PFN_vkVoidFunction)venus_real_CmdSetPrimitiveTopology;
     if (instance && strcmp(name, "vkCmdSetBlendConstants") == 0)
         return (PFN_vkVoidFunction)venus_real_CmdSetBlendConstants;
+    if (instance && strcmp(name, "vkCmdSetViewport") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdSetViewport;
+    if (instance && strcmp(name, "vkCmdSetScissor") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdSetScissor;
+    if (instance && strcmp(name, "vkCmdSetLineWidth") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdSetLineWidth;
+    if (instance && strcmp(name, "vkCmdSetDepthBias") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdSetDepthBias;
+    if (instance && strcmp(name, "vkCmdSetDepthBounds") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdSetDepthBounds;
+    if (instance && strcmp(name, "vkCmdSetStencilCompareMask") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdSetStencilCompareMask;
+    if (instance && strcmp(name, "vkCmdSetStencilWriteMask") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdSetStencilWriteMask;
+    if (instance && strcmp(name, "vkCmdSetStencilReference") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdSetStencilReference;
     if (instance &&
         (strcmp(name, "vkCmdSetViewportWithCount") == 0 ||
          strcmp(name, "vkCmdSetViewportWithCountEXT") == 0))
@@ -178,10 +221,20 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name)
         return (PFN_vkVoidFunction)venus_real_CmdDrawIndexed;
     if (instance && strcmp(name, "vkCmdBindDescriptorSets") == 0)
         return (PFN_vkVoidFunction)venus_real_CmdBindDescriptorSets;
+    if (instance &&
+        (strcmp(name, "vkCmdPushDescriptorSet") == 0 ||
+         strcmp(name, "vkCmdPushDescriptorSetKHR") == 0))
+        return (PFN_vkVoidFunction)venus_real_CmdPushDescriptorSet;
+    if (instance && strcmp(name, "vkCmdPushConstants") == 0)
+        return (PFN_vkVoidFunction)venus_real_CmdPushConstants;
     if (instance && strcmp(name, "vkCreateBuffer") == 0)
         return (PFN_vkVoidFunction)venus_real_CreateBuffer;
     if (instance && strcmp(name, "vkDestroyBuffer") == 0)
         return (PFN_vkVoidFunction)venus_real_DestroyBuffer;
+    if (instance && strcmp(name, "vkCreateBufferView") == 0)
+        return (PFN_vkVoidFunction)venus_real_CreateBufferView;
+    if (instance && strcmp(name, "vkDestroyBufferView") == 0)
+        return (PFN_vkVoidFunction)venus_real_DestroyBufferView;
     if (instance && strcmp(name, "vkGetBufferMemoryRequirements") == 0)
         return (PFN_vkVoidFunction)venus_real_GetBufferMemoryRequirements;
     if (instance &&

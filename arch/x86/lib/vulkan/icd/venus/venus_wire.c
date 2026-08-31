@@ -338,9 +338,19 @@ int venus_wire_submit_async(struct venus_wire *w, const void *command,
 {
     if (!w)
         return -1;
+    uint32_t command_type = 0;
+    if (command && command_size >= sizeof(command_type))
+        memcpy(&command_type, command, sizeof(command_type));
     wire_lock(w);
     uint32_t tail = 0;
-    int rc = submit_ring(w, 0, 0, command, command_size, &tail, 0);
+    int rc = submit_ring(w, 0, 0, command, command_size, &tail, 1);
+    if (rc < 0) {
+        printf("[VN wire async] command=%u bytes=%u head=%u tail=%u "
+               "status=0x%x\n", command_type, command_size,
+               *(volatile uint32_t *)(w->ring + VN_RING_HEAD_OFFSET),
+               *(volatile uint32_t *)(w->ring + VN_RING_TAIL_OFFSET),
+               *(volatile uint32_t *)(w->ring + VN_RING_STATUS_OFFSET));
+    }
     wire_unlock(w);
     return rc;
 }

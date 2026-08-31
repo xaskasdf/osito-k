@@ -120,6 +120,7 @@ ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status)
     case STATUS_ACCESS_DENIED:          return 5;      /* ERROR_ACCESS_DENIED */
     case STATUS_OBJECT_NAME_NOT_FOUND:  return 2;      /* ERROR_FILE_NOT_FOUND */
     case STATUS_OBJECT_PATH_NOT_FOUND:  return 3;      /* ERROR_PATH_NOT_FOUND */
+    case STATUS_OBJECT_NAME_EXISTS:     return 183;    /* ERROR_ALREADY_EXISTS */
     case STATUS_OBJECT_NAME_COLLISION:  return 183;    /* ERROR_ALREADY_EXISTS */
     case STATUS_ACCESS_VIOLATION:       return 998;    /* ERROR_NOACCESS */
     case STATUS_NOT_IMPLEMENTED:        return 120;    /* ERROR_CALL_NOT_IMPLEMENTED */
@@ -1284,6 +1285,13 @@ NTSTATUS NTAPI NtCreateEvent(PHANDLE EventHandle, ACCESS_MASK DesiredAccess,
     return sys_NtCreateEvent(args);
 }
 
+NTSTATUS NTAPI NtOpenEvent(PHANDLE EventHandle, ACCESS_MASK DesiredAccess,
+                           POBJECT_ATTRIBUTES ObjectAttributes)
+{
+    return kernel32_nt_open_named_event(ObjectAttributes, DesiredAccess,
+                                        EventHandle);
+}
+
 NTSTATUS NTAPI NtSetEvent(HANDLE EventHandle, LONG *PreviousState)
 {
     ULONG_PTR args[2] = {
@@ -1733,6 +1741,7 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "ZwUnmapViewOfSection",      (PVOID)NtUnmapViewOfSection,       2, CC_STDCALL },
     /* Synchronization (Phase 21) */
     { "NtCreateEvent",             (PVOID)NtCreateEvent,              5, CC_STDCALL },
+    { "NtOpenEvent",               (PVOID)NtOpenEvent,                3, CC_STDCALL },
     { "NtSetEvent",                (PVOID)NtSetEvent,                 2, CC_STDCALL },
     { "NtResetEvent",              (PVOID)NtResetEvent,               2, CC_STDCALL },
     { "NtPulseEvent",              (PVOID)NtPulseEvent,               2, CC_STDCALL },
@@ -1747,6 +1756,7 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "ZwSetInformationFile",      (PVOID)NtSetInformationFile,       5, CC_STDCALL },
     { "ZwDuplicateObject",         (PVOID)NtDuplicateObject,          7, CC_STDCALL },
     { "ZwCreateEvent",             (PVOID)NtCreateEvent,              5, CC_STDCALL },
+    { "ZwOpenEvent",               (PVOID)NtOpenEvent,                3, CC_STDCALL },
     { "ZwSetEvent",                (PVOID)NtSetEvent,                 2, CC_STDCALL },
     { "ZwResetEvent",              (PVOID)NtResetEvent,               2, CC_STDCALL },
     { "ZwPulseEvent",              (PVOID)NtPulseEvent,               2, CC_STDCALL },

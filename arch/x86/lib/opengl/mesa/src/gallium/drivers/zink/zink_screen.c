@@ -43,6 +43,13 @@
 #include "util/os_file.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
+
+extern void okgl_trace(const char *message);
+
+#define TRACE_SHOBJ_STATE(screen, stage) \
+   okgl_trace((screen)->info.have_EXT_shader_object \
+              ? "[OKGL-SHOBJ] " stage "=1\n" \
+              : "[OKGL-SHOBJ] " stage "=0\n")
 #include "util/u_string.h"
 #include "util/perf/u_trace.h"
 #include "util/u_transfer_helper.h"
@@ -1499,15 +1506,20 @@ static void
 zink_destroy_screen(struct pipe_screen *pscreen)
 {
    struct zink_screen *screen = zink_screen(pscreen);
+   printf("[ZINK-DESTROY] begin\n");
 
    if (screen->renderdoc_capture_all && p_atomic_dec_zero(&num_screens))
       screen->renderdoc_api->EndFrameCapture(RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(screen->instance), NULL);
 
    hash_table_foreach(&screen->dts, entry)
       zink_kopper_deinit_displaytarget(screen, entry->data);
+   printf("[ZINK-DESTROY] display targets complete\n");
 
-   if (screen->copy_context)
+   if (screen->copy_context) {
+      printf("[ZINK-DESTROY] copy context begin\n");
       screen->copy_context->base.destroy(&screen->copy_context->base);
+      printf("[ZINK-DESTROY] copy context complete\n");
+   }
 
    struct zink_batch_state *bs = screen->free_batch_states;
    while (bs) {
@@ -1515,6 +1527,7 @@ zink_destroy_screen(struct pipe_screen *pscreen)
       zink_batch_state_destroy(screen, bs);
       bs = bs_next;
    }
+   printf("[ZINK-DESTROY] batch states complete\n");
 
    if (VK_NULL_HANDLE != screen->debugUtilsCallbackHandle) {
       VKSCR(DestroyDebugUtilsMessengerEXT)(screen->instance, screen->debugUtilsCallbackHandle, NULL);
@@ -1526,9 +1539,12 @@ zink_destroy_screen(struct pipe_screen *pscreen)
       VKSCR(DestroyPipelineLayout)(screen->dev, screen->gfx_push_constant_layout, NULL);
 
    u_transfer_helper_destroy(pscreen->transfer_helper);
+   printf("[ZINK-DESTROY] transfer helper complete\n");
    if (util_queue_is_initialized(&screen->cache_get_thread)) {
+      printf("[ZINK-DESTROY] cache get queue begin\n");
       util_queue_finish(&screen->cache_get_thread);
       util_queue_destroy(&screen->cache_get_thread);
+      printf("[ZINK-DESTROY] cache get queue complete\n");
    }
 #ifdef ENABLE_SHADER_CACHE
    if (screen->disk_cache && util_queue_is_initialized(&screen->cache_put_thread)) {
@@ -1548,6 +1564,7 @@ zink_destroy_screen(struct pipe_screen *pscreen)
    util_live_shader_cache_deinit(&screen->shaders);
 
    zink_descriptor_layouts_deinit(screen);
+   printf("[ZINK-DESTROY] caches and descriptors complete\n");
 
    if (screen->sem)
       VKSCR(DestroySemaphore)(screen->dev, screen->sem, NULL);
@@ -1555,8 +1572,11 @@ zink_destroy_screen(struct pipe_screen *pscreen)
    if (screen->fence)
       VKSCR(DestroyFence)(screen->dev, screen->fence, NULL);
 
-   if (util_queue_is_initialized(&screen->flush_queue))
+   if (util_queue_is_initialized(&screen->flush_queue)) {
+      printf("[ZINK-DESTROY] flush queue begin\n");
       util_queue_destroy(&screen->flush_queue);
+      printf("[ZINK-DESTROY] flush queue complete\n");
+   }
 
    while (util_dynarray_contains(&screen->semaphores, VkSemaphore))
       VKSCR(DestroySemaphore)(screen->dev, util_dynarray_pop(&screen->semaphores, VkSemaphore), NULL);
@@ -1566,6 +1586,7 @@ zink_destroy_screen(struct pipe_screen *pscreen)
       VKSCR(DestroyDescriptorSetLayout)(screen->dev, screen->bindless_layout, NULL);
 
    if (screen->dev) {
+      printf("[ZINK-DESTROY] device table begin\n");
       simple_mtx_lock(&device_lock);
       set_foreach(&device_table, entry) {
          struct zink_device *zdev = (void*)entry->key;
@@ -1584,12 +1605,15 @@ zink_destroy_screen(struct pipe_screen *pscreen)
          device_table.table = NULL;
       }
       simple_mtx_unlock(&device_lock);
+      printf("[ZINK-DESTROY] device table complete\n");
    }
 
+   printf("[ZINK-DESTROY] instance begin\n");
    simple_mtx_lock(&instance_lock);
    if (screen->instance && --instance_refcount == 0)
       VKSCR(DestroyInstance)(instance, NULL);
    simple_mtx_unlock(&instance_lock);
+   printf("[ZINK-DESTROY] instance complete\n");
 
    util_idalloc_mt_fini(&screen->buffer_ids);
 
@@ -1602,6 +1626,7 @@ zink_destroy_screen(struct pipe_screen *pscreen)
    slab_destroy_parent(&screen->transfer_pool);
    ralloc_free(screen);
    glsl_type_singleton_decref();
+   printf("[ZINK-DESTROY] complete\n");
 }
 
 static int
@@ -1634,7 +1659,11 @@ zink_get_cpu_device_type(const struct zink_screen *screen, uint32_t pdev_count,
    VkPhysicalDeviceProperties props;
 
    for (uint32_t i = 0; i < pdev_count; ++i) {
+      memset(&props, 0, sizeof(props));
       VKSCR(GetPhysicalDeviceProperties)(pdevs[i], &props);
+      printf("[ZINK] cpu candidate[%u]: pdev=%p type=%u api=0x%x name=%s\n",
+             i, (void *)pdevs[i], props.deviceType, props.apiVersion,
+             props.deviceName);
 
       /* if user wants cpu, only give them cpu */
       if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
@@ -1670,10 +1699,19 @@ zink_match_adapter_luid(const struct zink_screen *screen, uint32_t pdev_count, c
 }
 
 static void
-choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
+choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor,
+            uint64_t adapter_luid, bool allow_cpu_device)
 {
+   const char *libgl_software = getenv("LIBGL_ALWAYS_SOFTWARE");
+   const char *d3d_software = getenv("D3D_ALWAYS_SOFTWARE");
    bool cpu = debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false) ||
               debug_get_bool_option("D3D_ALWAYS_SOFTWARE", false);
+
+   printf("[ZINK] choose_pdev: cpu=%u dev=%d:%d luid_lo=0x%x env_libgl=%s env_d3d=%s\n",
+          cpu ? 1u : 0u, (int)dev_major, (int)dev_minor,
+          (unsigned int)adapter_luid,
+          libgl_software ? libgl_software : "<unset>",
+          d3d_software ? d3d_software : "<unset>");
 
    if (cpu || (dev_major > 0 && dev_major < 255) || adapter_luid) {
       uint32_t pdev_count;
@@ -1696,6 +1734,8 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, ui
          return;
       }
       result = VKSCR(EnumeratePhysicalDevices)(screen->instance, &pdev_count, pdevs);
+      printf("[ZINK] choose_pdev: enumerate rc=%d count=%u first=%p\n",
+             result, pdev_count, pdev_count ? (void *)pdevs[0] : NULL);
       assert(result == VK_SUCCESS);
       assert(pdev_count > 0);
 
@@ -1711,6 +1751,9 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, ui
          /* valid cpu device */
          screen->pdev = pdevs[idx];
 
+      printf("[ZINK] choose_pdev: selected index=%d handle=%p\n",
+             idx, idx >= 0 ? (void *)screen->pdev : NULL);
+
       free(pdevs);
 
       if (idx == -1)
@@ -1720,6 +1763,8 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, ui
       VkPhysicalDevice pdev;
       unsigned pdev_count = 1;
       VkResult result = VKSCR(EnumeratePhysicalDevices)(screen->instance, &pdev_count, &pdev);
+      printf("[ZINK] choose_pdev: direct rc=%d count=%u handle=%p\n",
+             result, pdev_count, pdev_count ? (void *)pdev : NULL);
       if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
          if (!screen->driver_name_is_inferred)
             mesa_loge("ZINK: vkEnumeratePhysicalDevices failed (%s)", vk_Result_to_str(result));
@@ -1730,9 +1775,13 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor, ui
       screen->pdev = pdev;
    }
    VKSCR(GetPhysicalDeviceProperties)(screen->pdev, &screen->info.props);
+   printf("[ZINK] pdev properties: type=%u api=0x%x allow_cpu=%u name=%s\n",
+          screen->info.props.deviceType, screen->info.props.apiVersion,
+          allow_cpu_device ? 1u : 0u, screen->info.props.deviceName);
 
    /* allow software rendering only if forced by the user */
-   if (!cpu && screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+   if (!cpu && !allow_cpu_device &&
+       screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
       screen->pdev = VK_NULL_HANDLE;
       return;
    }
@@ -3271,7 +3320,9 @@ zink_cl_cts_version(struct pipe_screen *pscreen)
 }
 
 static struct zink_screen *
-zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
+zink_internal_create_screen(const struct pipe_screen_config *config,
+                            int64_t dev_major, int64_t dev_minor,
+                            uint64_t adapter_luid, bool allow_cpu_device)
 {
    printf("[ZINK] zink_internal_create_screen: ENTRY\n");
    if (getenv("ZINK_USE_LAVAPIPE")) {
@@ -3376,7 +3427,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    }
 
    printf("[ZINK] step2: choose_pdev\n");
-   choose_pdev(screen, dev_major, dev_minor, adapter_luid);
+   choose_pdev(screen, dev_major, dev_minor, adapter_luid, allow_cpu_device);
    if (screen->pdev == VK_NULL_HANDLE) {
       printf("[ZINK] FAIL step2: pdev is VK_NULL_HANDLE (no physical device picked)\n");
       if (!screen->driver_name_is_inferred)
@@ -3404,6 +3455,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       goto fail;
    }
    printf("[ZINK] step3: pdev info OK\n");
+   TRACE_SHOBJ_STATE(screen, "post-device-info");
 
    printf("[ZINK] step4: zink_set_driver_strings\n");
    if (zink_set_driver_strings(screen)) {
@@ -3485,6 +3537,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    fixup_driver_props(screen);
 
    init_driver_workarounds(screen);
+   TRACE_SHOBJ_STATE(screen, "post-workarounds");
 
    printf("[ZINK] step6: zink_create_logical_device\n");
    screen->dev = zink_create_logical_device(screen);
@@ -3493,14 +3546,17 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       goto fail;
    }
    printf("[ZINK] step6: logical device OK\n");
+   TRACE_SHOBJ_STATE(screen, "post-device-create");
 
    vk_device_uncompacted_dispatch_table_load(&screen->vk.device,
                                              screen->vk_GetDeviceProcAddr,
                                              screen->dev);
+   TRACE_SHOBJ_STATE(screen, "post-device-dispatch");
 
    init_queue(screen);
 
    zink_verify_device_extensions(screen);
+   TRACE_SHOBJ_STATE(screen, "post-device-verify");
 
    /* descriptor set indexing is determined by 'compact' descriptor mode:
     * by default, 6 sets are used to provide more granular updating
@@ -3765,12 +3821,14 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    simple_mtx_init(&screen->copy_context_lock, mtx_plain);
 
    init_optimal_keys(screen);
+   TRACE_SHOBJ_STATE(screen, "post-optimal-keys");
 
    screen->screen_id = p_atomic_inc_return(&num_screens);
    zink_tracing = screen->instance_info->have_EXT_debug_utils &&
                   (u_trace_is_enabled(U_TRACE_TYPE_PERFETTO) || u_trace_is_enabled(U_TRACE_TYPE_MARKERS));
 
    screen->frame_marker_emitted = zink_screen_debug_marker_begin(screen, "frame");
+   TRACE_SHOBJ_STATE(screen, "screen-return");
 
    printf("[ZINK] zink_internal_create_screen: SUCCESS — returning screen\n");
    return screen;
@@ -3784,12 +3842,23 @@ fail:
 struct pipe_screen *
 zink_create_screen(struct sw_winsys *winsys, const struct pipe_screen_config *config)
 {
-   struct zink_screen *ret = zink_internal_create_screen(config, -1, -1, 0);
+   struct zink_screen *ret =
+      zink_internal_create_screen(config, -1, -1, 0, false);
    if (ret) {
       ret->drm_fd = -1;
    }
 
    return &ret->base;
+}
+
+struct pipe_screen *
+zink_ositok_create_screen(const struct pipe_screen_config *config)
+{
+   struct zink_screen *ret =
+      zink_internal_create_screen(config, -1, -1, 0, true);
+   if (ret)
+      ret->drm_fd = -1;
+   return ret ? &ret->base : NULL;
 }
 
 static inline int
@@ -3836,7 +3905,7 @@ zink_drm_create_screen(int fd, const struct pipe_screen_config *config)
    if (zink_render_rdev(fd, &dev_major, &dev_minor))
       return NULL;
 
-   ret = zink_internal_create_screen(config, dev_major, dev_minor, 0);
+   ret = zink_internal_create_screen(config, dev_major, dev_minor, 0, false);
 
    if (ret)
       ret->drm_fd = os_dupfd_cloexec(fd);
@@ -3852,7 +3921,8 @@ zink_drm_create_screen(int fd, const struct pipe_screen_config *config)
 struct pipe_screen *
 zink_win32_create_screen(uint64_t adapter_luid)
 {
-   struct zink_screen *ret = zink_internal_create_screen(NULL, -1, -1, adapter_luid);
+   struct zink_screen *ret =
+      zink_internal_create_screen(NULL, -1, -1, adapter_luid, false);
    return ret ? &ret->base : NULL;
 }
 

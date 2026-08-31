@@ -16,6 +16,7 @@ extern int strcmp(const char *, const char *);
 #define VN_CMD_GET_PHYSICAL_DEVICE_FORMAT_PROPERTIES_2 149u
 #define VN_CMD_GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES_2 150u
 #define VN_CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 152u
+#define VN_CMD_GET_PHYSICAL_DEVICE_CALIBRATEABLE_TIME_DOMAINS_EXT 235u
 #define VN_COMMAND_GENERATE_REPLY 1u
 #define VN_PROPERTIES_REPLY_SIZE 1024u
 
@@ -952,6 +953,259 @@ venus_real_GetPhysicalDeviceFormatProperties2(
     }
 }
 
+static const VkBaseInStructure *
+image_format_info_next_supported(const VkBaseInStructure *next)
+{
+    for (; next; next = next->pNext) {
+        switch (next->sType) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO:
+        case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO:
+        case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT:
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT:
+            return next;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
+static uint64_t
+image_format_info_pnext_size(const VkBaseInStructure *next, int *valid)
+{
+    next = image_format_info_next_supported(next);
+    if (!next)
+        return 8;
+
+    uint64_t self_size = 0;
+    switch (next->sType) {
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO:
+    case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO:
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT:
+        self_size = 4;
+        break;
+    case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO: {
+        const VkImageFormatListCreateInfo *list =
+            (const VkImageFormatListCreateInfo *)next;
+        if (list->viewFormatCount && !list->pViewFormats) {
+            *valid = 0;
+            return 0;
+        }
+        self_size = 12u + (uint64_t)list->viewFormatCount * 4u;
+        break;
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT: {
+        const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *modifier =
+            (const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *)next;
+        if (modifier->sharingMode == VK_SHARING_MODE_CONCURRENT &&
+            modifier->queueFamilyIndexCount &&
+            !modifier->pQueueFamilyIndices) {
+            *valid = 0;
+            return 0;
+        }
+        self_size = 24u;
+        if (modifier->sharingMode == VK_SHARING_MODE_CONCURRENT)
+            self_size += (uint64_t)modifier->queueFamilyIndexCount * 4u;
+        break;
+    }
+    default:
+        *valid = 0;
+        return 0;
+    }
+
+    uint64_t child_size = image_format_info_pnext_size(next->pNext, valid);
+    if (!*valid || child_size > UINT32_MAX - 12u - self_size) {
+        *valid = 0;
+        return 0;
+    }
+    return 12u + child_size + self_size;
+}
+
+static void
+encode_image_format_info_pnext(struct wire_encoder *enc,
+                               const VkBaseInStructure *next)
+{
+    next = image_format_info_next_supported(next);
+    if (!next) {
+        encode_u64(enc, 0);
+        return;
+    }
+
+    encode_u64(enc, 1);
+    encode_u32(enc, (uint32_t)next->sType);
+    encode_image_format_info_pnext(enc, next->pNext);
+    switch (next->sType) {
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO: {
+        const VkPhysicalDeviceExternalImageFormatInfo *external =
+            (const VkPhysicalDeviceExternalImageFormatInfo *)next;
+        encode_u32(enc, (uint32_t)external->handleType);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO: {
+        const VkImageFormatListCreateInfo *list =
+            (const VkImageFormatListCreateInfo *)next;
+        encode_u32(enc, list->viewFormatCount);
+        encode_u64(enc, list->viewFormatCount);
+        for (uint32_t i = 0; i < list->viewFormatCount; i++)
+            encode_u32(enc, (uint32_t)list->pViewFormats[i]);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO: {
+        const VkImageStencilUsageCreateInfo *stencil =
+            (const VkImageStencilUsageCreateInfo *)next;
+        encode_u32(enc, stencil->stencilUsage);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT: {
+        const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *modifier =
+            (const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *)next;
+        encode_u64(enc, modifier->drmFormatModifier);
+        encode_u32(enc, (uint32_t)modifier->sharingMode);
+        encode_u32(enc, modifier->queueFamilyIndexCount);
+        uint64_t family_count = modifier->sharingMode ==
+                VK_SHARING_MODE_CONCURRENT
+            ? modifier->queueFamilyIndexCount : 0;
+        encode_u64(enc, family_count);
+        for (uint32_t i = 0; i < family_count; i++)
+            encode_u32(enc, modifier->pQueueFamilyIndices[i]);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT: {
+        const VkPhysicalDeviceImageViewImageFormatInfoEXT *view =
+            (const VkPhysicalDeviceImageViewImageFormatInfoEXT *)next;
+        encode_u32(enc, (uint32_t)view->imageViewType);
+        break;
+    }
+    default:
+        enc->failed = 1;
+        break;
+    }
+}
+
+static VkBaseOutStructure *
+image_format_properties_next_supported(VkBaseOutStructure *next)
+{
+    for (; next; next = next->pNext) {
+        switch (next->sType) {
+        case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES:
+        case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES:
+        case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY:
+        case VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT:
+            return next;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
+static uint64_t
+image_format_properties_pnext_size(VkBaseOutStructure *next, int partial)
+{
+    next = image_format_properties_next_supported(next);
+    if (!next)
+        return 8;
+
+    uint64_t self_size = 0;
+    if (!partial) {
+        switch (next->sType) {
+        case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES:
+            self_size = 12;
+            break;
+        case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES:
+            self_size = 4;
+            break;
+        case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY:
+        case VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT:
+            self_size = 8;
+            break;
+        default:
+            break;
+        }
+    }
+    return 12u + image_format_properties_pnext_size(next->pNext, partial) +
+           self_size;
+}
+
+static void
+encode_image_format_properties_pnext_partial(struct wire_encoder *enc,
+                                             VkBaseOutStructure *next)
+{
+    next = image_format_properties_next_supported(next);
+    if (!next) {
+        encode_u64(enc, 0);
+        return;
+    }
+    encode_u64(enc, 1);
+    encode_u32(enc, (uint32_t)next->sType);
+    encode_image_format_properties_pnext_partial(enc, next->pNext);
+}
+
+static VkBaseOutStructure *
+find_image_format_property(VkBaseOutStructure *next, uint32_t s_type)
+{
+    for (; next; next = next->pNext) {
+        if ((uint32_t)next->sType == s_type)
+            return next;
+    }
+    return 0;
+}
+
+static void
+decode_image_format_properties_pnext(struct wire_decoder *dec,
+                                     VkBaseOutStructure *next)
+{
+    uint64_t present = 0;
+    D64(present);
+    if (dec->failed || !present)
+        return;
+
+    uint32_t s_type = 0;
+    D32(s_type);
+    VkBaseOutStructure *property =
+        find_image_format_property(next, s_type);
+    if (!property) {
+        dec->failed = 1;
+        return;
+    }
+
+    decode_image_format_properties_pnext(dec, property->pNext);
+    switch (property->sType) {
+    case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES: {
+        VkExternalImageFormatProperties *external =
+            (VkExternalImageFormatProperties *)property;
+        D32(external->externalMemoryProperties.externalMemoryFeatures);
+        D32(external->externalMemoryProperties.exportFromImportedHandleTypes);
+        D32(external->externalMemoryProperties.compatibleHandleTypes);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES: {
+        VkSamplerYcbcrConversionImageFormatProperties *ycbcr =
+            (VkSamplerYcbcrConversionImageFormatProperties *)property;
+        D32(ycbcr->combinedImageSamplerDescriptorCount);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY: {
+        VkHostImageCopyDevicePerformanceQuery *performance =
+            (VkHostImageCopyDevicePerformanceQuery *)property;
+        D32(performance->optimalDeviceAccess);
+        D32(performance->identicalMemoryLayout);
+        break;
+    }
+    case VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT: {
+        VkFilterCubicImageViewImageFormatPropertiesEXT *cubic =
+            (VkFilterCubicImageViewImageFormatPropertiesEXT *)property;
+        D32(cubic->filterCubic);
+        D32(cubic->filterCubicMinmax);
+        break;
+    }
+    default:
+        dec->failed = 1;
+        break;
+    }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_real_GetPhysicalDeviceImageFormatProperties2(
     VkPhysicalDevice physical_device,
@@ -962,47 +1216,44 @@ venus_real_GetPhysicalDeviceImageFormatProperties2(
         info->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2 ||
         properties->sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2)
         return VK_ERROR_INITIALIZATION_FAILED;
+    int valid = 1;
+    uint64_t info_chain_size = image_format_info_pnext_size(
+        (const VkBaseInStructure *)info->pNext, &valid);
+    uint64_t property_chain_partial_size =
+        image_format_properties_pnext_size(
+            (VkBaseOutStructure *)properties->pNext, 1);
+    uint64_t property_chain_reply_size =
+        image_format_properties_pnext_size(
+            (VkBaseOutStructure *)properties->pNext, 0);
+    uint64_t command_size64 = 60u + info_chain_size +
+                              property_chain_partial_size;
+    uint64_t reply_size64 = 52u + property_chain_reply_size;
+    if (!valid || command_size64 > UINT32_MAX ||
+        reply_size64 > UINT32_MAX || reply_size64 > 65536u)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    const VkPhysicalDeviceExternalImageFormatInfo *external_info = 0;
-    for (const VkBaseInStructure *in =
-             (const VkBaseInStructure *)info->pNext;
-         in; in = in->pNext) {
-        if (in->sType ==
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)
-            external_info =
-                (const VkPhysicalDeviceExternalImageFormatInfo *)in;
-        else
-            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    uint32_t command_size = (uint32_t)command_size64;
+    uint32_t reply_size = (uint32_t)reply_size64;
+    uint8_t *command = malloc(command_size);
+    uint8_t *reply = malloc(reply_size);
+    if (!command || !reply) {
+        free(command);
+        free(reply);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    VkExternalImageFormatProperties *external_properties = 0;
-    for (VkBaseOutStructure *out = (VkBaseOutStructure *)properties->pNext;
-         out; out = out->pNext) {
-        if (out->sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES)
-            external_properties = (VkExternalImageFormatProperties *)out;
-        else
-            return VK_ERROR_FORMAT_NOT_SUPPORTED;
-    }
-
     struct venus_physical_device_real *physical =
         (struct venus_physical_device_real *)physical_device;
-    uint8_t command[128];
     struct wire_encoder enc = {
         .data = command,
-        .capacity = sizeof(command),
+        .capacity = command_size,
     };
     encode_u32(&enc, VN_CMD_GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES_2);
     encode_u32(&enc, VN_COMMAND_GENERATE_REPLY);
     encode_u64(&enc, physical->object_id);
     encode_u64(&enc, 1); /* pImageFormatInfo */
     encode_u32(&enc, (uint32_t)info->sType);
-    if (external_info) {
-        encode_u64(&enc, 1);
-        encode_u32(&enc, (uint32_t)external_info->sType);
-        encode_u64(&enc, 0);
-        encode_u32(&enc, (uint32_t)external_info->handleType);
-    } else {
-        encode_u64(&enc, 0);
-    }
+    encode_image_format_info_pnext(
+        &enc, (const VkBaseInStructure *)info->pNext);
     encode_u32(&enc, (uint32_t)info->format);
     encode_u32(&enc, (uint32_t)info->type);
     encode_u32(&enc, (uint32_t)info->tiling);
@@ -1010,24 +1261,26 @@ venus_real_GetPhysicalDeviceImageFormatProperties2(
     encode_u32(&enc, info->flags);
     encode_u64(&enc, 1); /* pImageFormatProperties */
     encode_u32(&enc, (uint32_t)properties->sType);
-    if (external_properties) {
-        encode_u64(&enc, 1);
-        encode_u32(&enc, (uint32_t)external_properties->sType);
-        encode_u64(&enc, 0);
-    } else {
-        encode_u64(&enc, 0);
-    }
-    if (enc.failed)
+    encode_image_format_properties_pnext_partial(
+        &enc, (VkBaseOutStructure *)properties->pNext);
+    if (enc.failed || enc.offset != command_size) {
+        free(command);
+        free(reply);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
 
-    uint8_t reply[128];
-    memset(reply, 0, sizeof(reply));
-    if (venus_wire_call(physical->instance->wire, command, enc.offset,
-                        reply, sizeof(reply)) < 0)
+    memset(reply, 0, reply_size);
+    int wire_result = venus_wire_call(physical->instance->wire,
+                                      command, command_size,
+                                      reply, reply_size);
+    free(command);
+    if (wire_result < 0) {
+        free(reply);
         return VK_ERROR_DEVICE_LOST;
+    }
     struct wire_decoder dec_storage = {
         .data = reply,
-        .capacity = sizeof(reply),
+        .capacity = reply_size,
     };
     struct wire_decoder *dec = &dec_storage;
     uint32_t returned_command = 0;
@@ -1042,26 +1295,8 @@ venus_real_GetPhysicalDeviceImageFormatProperties2(
             VN_CMD_GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES_2 ||
         !present || returned_type != (uint32_t)properties->sType)
         dec->failed = 1;
-    uint64_t extension_present = 0;
-    D64(extension_present);
-    if (external_properties) {
-        uint32_t extension_type = 0;
-        uint64_t child_present = 0;
-        D32(extension_type);
-        D64(child_present);
-        if (!extension_present ||
-            extension_type != (uint32_t)external_properties->sType ||
-            child_present)
-            dec->failed = 1;
-        D32(external_properties->externalMemoryProperties.
-                externalMemoryFeatures);
-        D32(external_properties->externalMemoryProperties.
-                exportFromImportedHandleTypes);
-        D32(external_properties->externalMemoryProperties.
-                compatibleHandleTypes);
-    } else if (extension_present) {
-        dec->failed = 1;
-    }
+    decode_image_format_properties_pnext(
+        dec, (VkBaseOutStructure *)properties->pNext);
     D32(properties->imageFormatProperties.maxExtent.width);
     D32(properties->imageFormatProperties.maxExtent.height);
     D32(properties->imageFormatProperties.maxExtent.depth);
@@ -1069,7 +1304,11 @@ venus_real_GetPhysicalDeviceImageFormatProperties2(
     D32(properties->imageFormatProperties.maxArrayLayers);
     D32(properties->imageFormatProperties.sampleCounts);
     D64(properties->imageFormatProperties.maxResourceSize);
-    return dec->failed ? VK_ERROR_DEVICE_LOST : (VkResult)result;
+    if (dec->offset != reply_size)
+        dec->failed = 1;
+    int failed = dec->failed;
+    free(reply);
+    return failed ? VK_ERROR_DEVICE_LOST : (VkResult)result;
 }
 
 #undef DECODE_BOOL_RANGE
@@ -1165,6 +1404,25 @@ static VkResult init_device_extensions(
         free(properties);
         return result == VK_SUCCESS ? VK_ERROR_DEVICE_LOST : result;
     }
+
+    /* The host renderer can expose extensions newer than the guest Venus
+     * transport.  Publish an extension only when this ICD can marshal its
+     * complete command set; otherwise callers will enable it and receive
+     * NULL device entrypoints.  VK_EXT_host_image_copy currently has no
+     * guest protocol implementation (CopyMemoryToImageEXT,
+     * CopyImageToMemoryEXT, CopyImageToImageEXT,
+     * TransitionImageLayoutEXT, or GetImageSubresourceLayout2EXT). */
+    uint32_t supported_count = 0;
+    for (uint32_t i = 0; i < returned_count; i++) {
+        if (strcmp(properties[i].extensionName,
+                   VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0)
+            continue;
+        if (supported_count != i)
+            properties[supported_count] = properties[i];
+        supported_count++;
+    }
+    returned_count = supported_count;
+
     int has_swapchain = 0;
     for (uint32_t i = 0; i < returned_count; i++) {
         if (strcmp(properties[i].extensionName,
@@ -1210,6 +1468,79 @@ venus_real_EnumerateDeviceExtensionProperties(
            (unsigned long)written * sizeof(*properties));
     *property_count = written;
     return written < physical->extension_count ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_GetPhysicalDeviceCalibrateableTimeDomainsEXT(
+    VkPhysicalDevice physical_device, uint32_t *time_domain_count,
+    VkTimeDomainKHR *time_domains)
+{
+    if (!physical_device || !time_domain_count)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    struct venus_physical_device_real *physical =
+        (struct venus_physical_device_real *)physical_device;
+    uint32_t capacity = time_domains ? *time_domain_count : 0;
+    uint64_t reply_size_64 = 28u + (uint64_t)capacity * 4u;
+    if (reply_size_64 > 65536u)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    uint32_t reply_size = (uint32_t)reply_size_64;
+    uint8_t *reply = malloc(reply_size);
+    if (!reply)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    uint8_t command[36];
+    struct wire_encoder enc = {
+        .data = command,
+        .capacity = sizeof(command),
+    };
+    encode_u32(&enc,
+        VN_CMD_GET_PHYSICAL_DEVICE_CALIBRATEABLE_TIME_DOMAINS_EXT);
+    encode_u32(&enc, VN_COMMAND_GENERATE_REPLY);
+    encode_u64(&enc, physical->object_id);
+    encode_u64(&enc, 1); /* pTimeDomainCount */
+    encode_u32(&enc, capacity);
+    encode_u64(&enc, time_domains ? capacity : 0);
+    if (enc.failed) {
+        free(reply);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    memset(reply, 0, reply_size);
+    if (venus_wire_call(physical->instance->wire, command, sizeof(command),
+                        reply, reply_size) < 0) {
+        free(reply);
+        return VK_ERROR_DEVICE_LOST;
+    }
+
+    struct wire_decoder dec_storage = {
+        .data = reply,
+        .capacity = reply_size,
+    };
+    struct wire_decoder *dec = &dec_storage;
+    uint32_t returned_command = 0;
+    int32_t result = VK_ERROR_DEVICE_LOST;
+    uint64_t count_present = 0;
+    uint32_t returned_count = 0;
+    uint64_t array_size = 0;
+    D32(returned_command);
+    D32(result);
+    D64(count_present);
+    D32(returned_count);
+    D64(array_size);
+    if (returned_command !=
+            VN_CMD_GET_PHYSICAL_DEVICE_CALIBRATEABLE_TIME_DOMAINS_EXT ||
+        !count_present || array_size > capacity ||
+        array_size != (time_domains ? returned_count : 0))
+        dec->failed = 1;
+    for (uint32_t i = 0; i < array_size && !dec->failed; i++)
+        D32(time_domains[i]);
+
+    free(reply);
+    if (dec->failed)
+        return VK_ERROR_DEVICE_LOST;
+    *time_domain_count = returned_count;
+    return (VkResult)result;
 }
 
 #undef DARRAY

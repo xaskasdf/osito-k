@@ -98,9 +98,10 @@ static boot_display_mode_t gop_modes[BOOT_MAX_DISPLAY_MODES];
 static UINT32 gop_mode_count;
 static UINT32 gop_selected_mode;
 
-/* Preferred max resolution for optimal performance vs quality balance */
-#define GOP_PREFER_W 1024
-#define GOP_PREFER_H  768
+/* Keep enough desktop space for modern windowed applications while bounding
+ * the compositor cost on firmware that exposes very large GOP modes. */
+#define GOP_PREFER_W 1280
+#define GOP_PREFER_H  800
 
 static EFI_STATUS init_gop(void)
 {
@@ -419,17 +420,6 @@ static EFI_STATUS load_kernel_elf(EFI_HANDLE ImageHandle)
 
         UINT64 seg_base = phdr.p_paddr;
         UINT64 seg_end  = seg_base + phdr.p_memsz;
-        UINT64 pages = (seg_end - (seg_base & ~0xFFFULL) + 0xFFF) >> 12;
-
-        EFI_PHYSICAL_ADDRESS alloc_addr = seg_base & ~0xFFFULL;
-        status = uefi_call_wrapper(BS->AllocatePages, 4,
-                                   AllocateAddress, EfiLoaderData,
-                                   pages, &alloc_addr);
-        if (EFI_ERROR(status)) {
-            Print(L"  AllocatePages at 0x%lx (%d pages) failed: %r\r\n",
-                  alloc_addr, pages, status);
-            return status;
-        }
 
         /* Do not depend on firmware returning clean pages: NOBITS tails such
          * as .bss/.lbss must be zero before the kernel sees them. */

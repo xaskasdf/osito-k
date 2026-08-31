@@ -35,6 +35,8 @@
 #include "zink_program.h"
 #include "zink_screen.h"
 
+extern "C" void okgl_trace(const char *message);
+
 /* runtime-optimized pipeline state hashing */
 template <zink_dynamic_state DYNAMIC_STATE>
 static uint32_t
@@ -179,11 +181,15 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
    entry = _mesa_hash_table_search_pre_hashed(&prog->pipelines[rp_idx][idx], state->final_hash, state);
 
    if (!entry) {
+      okgl_trace("[OKGL-PIPE] cache-miss\n");
       /* always wait on async precompile/cache fence */
       util_queue_fence_wait(&prog->base.cache_fence);
       struct zink_gfx_pipeline_cache_entry *pc_entry = CALLOC_STRUCT(zink_gfx_pipeline_cache_entry);
-      if (!pc_entry)
+      if (!pc_entry) {
+         okgl_trace("[OKGL-PIPE] cache-entry-alloc-failed\n");
          return VK_NULL_HANDLE;
+      }
+      okgl_trace("[OKGL-PIPE] cache-entry-allocated\n");
       /* cache entries must have all state needed to construct pipelines
        * TODO: maybe optimize this since all these values aren't actually needed
        */
@@ -194,9 +200,11 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
       util_queue_fence_init(&pc_entry->fence);
       entry = _mesa_hash_table_insert_pre_hashed(&prog->pipelines[rp_idx][idx], state->final_hash, pc_entry, pc_entry);
       if (prog->base.uses_shobj && !prog->is_separable) {
+         okgl_trace("[OKGL-PIPE] branch-shader-object\n");
          memcpy(pc_entry->shobjs, prog->objs, sizeof(prog->objs));
          zink_gfx_program_compile_queue(ctx, pc_entry);
       } else if (HAVE_LIB && zink_can_use_pipeline_libs(ctx)) {
+         okgl_trace("[OKGL-PIPE] branch-gpl\n");
          /* this is the graphics pipeline library path: find/construct all partial pipelines */
          simple_mtx_lock(&prog->libs->lock);
          struct set_entry *he = _mesa_set_search(&prog->libs->libs, &ctx->gfx_pipeline_state.optimal_key);
@@ -229,6 +237,7 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
                zink_gfx_program_compile_queue(ctx, pc_entry);
          }
       } else {
+         okgl_trace("[OKGL-PIPE] branch-monolithic\n");
          /* optimize by default only when expecting precompiles in order to reduce stuttering */
          if (DYNAMIC_STATE != ZINK_DYNAMIC_VERTEX_INPUT2 && DYNAMIC_STATE != ZINK_DYNAMIC_VERTEX_INPUT)
             pc_entry->pipeline = zink_create_gfx_pipeline(screen, prog, prog->objs, state, state->element_state->binding_map, vkmode, !HAVE_LIB);
@@ -238,8 +247,11 @@ zink_get_gfx_pipeline(struct zink_context *ctx,
             /* trigger async optimized pipeline compile if this was an unoptimized pipeline */
             zink_gfx_program_compile_queue(ctx, pc_entry);
       }
-      if (pc_entry->pipeline == VK_NULL_HANDLE)
+      if (pc_entry->pipeline == VK_NULL_HANDLE) {
+         okgl_trace("[OKGL-PIPE] create-returned-null\n");
          return VK_NULL_HANDLE;
+      }
+      okgl_trace("[OKGL-PIPE] create-returned-pipeline\n");
 
       zink_screen_update_pipeline_cache(screen, &prog->base, false);
    }

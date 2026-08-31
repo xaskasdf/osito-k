@@ -13,6 +13,12 @@
 #define PRIx64 "lx"
 #define PRIX64 "lX"
 #define PRIi64 "ld"
+#define PRIdMAX "ld"
+#define PRIiMAX "ld"
+#define PRIuMAX "lu"
+#define PRIoMAX "lo"
+#define PRIxMAX "lx"
+#define PRIXMAX "lX"
 intmax_t strtoimax(const char *s, char **endp, int base);
 uintmax_t strtoumax(const char *s, char **endp, int base);
 #endif

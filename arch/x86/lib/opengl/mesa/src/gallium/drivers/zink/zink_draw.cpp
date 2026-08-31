@@ -11,6 +11,10 @@
 #include "zink_surface.h"
 #include "zink_inlines.h"
 
+extern "C" void okgl_trace(const char *message);
+
+static unsigned okgl_draw_trace_count;
+
 #include "util/hash_table.h"
 #include "util/u_cpu_detect.h"
 #include "util/u_debug.h"
@@ -270,11 +274,25 @@ update_gfx_pipeline(struct zink_context *ctx, struct zink_batch_state *bs, enum 
       zink_gfx_program_update(ctx);
    bool pipeline_changed = false;
    VkPipeline pipeline = VK_NULL_HANDLE;
+   bool trace_draw = okgl_draw_trace_count++ < 8;
+   if (trace_draw) {
+      okgl_trace(ctx->curr_program->base.uses_shobj
+                 ? "[OKGL-DRAW] uses-shobj=1\n"
+                 : "[OKGL-DRAW] uses-shobj=0\n");
+      okgl_trace(screen->info.have_EXT_shader_object
+                 ? "[OKGL-DRAW] screen-shobj=1\n"
+                 : "[OKGL-DRAW] screen-shobj=0\n");
+   }
    if (!ctx->curr_program->base.uses_shobj) {
       if (screen->info.have_EXT_graphics_pipeline_library)
          pipeline = zink_get_gfx_pipeline<DYNAMIC_STATE, true>(ctx, ctx->curr_program, &ctx->gfx_pipeline_state, mode);
       else
          pipeline = zink_get_gfx_pipeline<DYNAMIC_STATE, false>(ctx, ctx->curr_program, &ctx->gfx_pipeline_state, mode);
+   }
+   if (trace_draw) {
+      okgl_trace(pipeline
+                 ? "[OKGL-DRAW] pipeline=1\n"
+                 : "[OKGL-DRAW] pipeline=0\n");
    }
    if (pipeline) {
       pipeline_changed = prev_pipeline != pipeline;

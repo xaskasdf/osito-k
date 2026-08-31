@@ -46,6 +46,7 @@ struct venus_queue_real {
     uint32_t family_index;
     uint32_t queue_index;
     uint32_t ring_index;
+    VkFence wait_fence;
 };
 
 struct venus_device_real {
@@ -121,6 +122,11 @@ venus_real_GetPhysicalDeviceImageFormatProperties2(
     VkImageFormatProperties2 *properties);
 
 VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_GetPhysicalDeviceCalibrateableTimeDomainsEXT(
+    VkPhysicalDevice physical_device, uint32_t *time_domain_count,
+    VkTimeDomainKHR *time_domains);
+
+VKAPI_ATTR VkResult VKAPI_CALL
 venus_real_EnumerateDeviceExtensionProperties(
     VkPhysicalDevice physical_device, const char *layer_name,
     uint32_t *property_count, VkExtensionProperties *properties);
@@ -141,6 +147,15 @@ venus_real_GetDeviceQueue(VkDevice device, uint32_t queue_family_index,
 
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_real_DeviceWaitIdle(VkDevice device);
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_QueueWaitIdle(VkQueue queue);
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_GetCalibratedTimestampsEXT(
+    VkDevice device, uint32_t timestamp_count,
+    const VkCalibratedTimestampInfoKHR *timestamp_infos,
+    uint64_t *timestamps, uint64_t *max_deviation);
 
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_real_CreateDescriptorSetLayout(
@@ -183,6 +198,16 @@ venus_real_CreateSemaphore(VkDevice device,
 VKAPI_ATTR void VKAPI_CALL
 venus_real_DestroySemaphore(VkDevice device, VkSemaphore semaphore,
                             const VkAllocationCallbacks *allocator);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_GetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore,
+                                    uint64_t *value);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_WaitSemaphores(VkDevice device,
+                          const VkSemaphoreWaitInfo *wait_info,
+                          uint64_t timeout);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_SignalSemaphore(VkDevice device,
+                           const VkSemaphoreSignalInfo *signal_info);
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_real_CreateFence(VkDevice device,
                        const VkFenceCreateInfo *create_info,
@@ -264,6 +289,11 @@ venus_real_CmdBindVertexBuffers2(
     const VkDeviceSize *offsets, const VkDeviceSize *sizes,
     const VkDeviceSize *strides);
 VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdBindVertexBuffers(
+    VkCommandBuffer command_buffer, uint32_t first_binding,
+    uint32_t binding_count, const VkBuffer *buffers,
+    const VkDeviceSize *offsets);
+VKAPI_ATTR void VKAPI_CALL
 venus_real_CmdBindIndexBuffer(VkCommandBuffer command_buffer, VkBuffer buffer,
                               VkDeviceSize offset, VkIndexType index_type);
 VKAPI_ATTR void VKAPI_CALL
@@ -274,6 +304,9 @@ VKAPI_ATTR void VKAPI_CALL
 venus_real_CmdBindPipeline(VkCommandBuffer command_buffer,
                            VkPipelineBindPoint bind_point,
                            VkPipeline pipeline);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdSetAttachmentFeedbackLoopEnableEXT(
+    VkCommandBuffer command_buffer, VkImageAspectFlags aspect_mask);
 VKAPI_ATTR void VKAPI_CALL
 venus_real_CmdSetCullMode(VkCommandBuffer command_buffer,
                           VkCullModeFlags cull_mode);
@@ -286,6 +319,38 @@ venus_real_CmdSetPrimitiveTopology(VkCommandBuffer command_buffer,
 VKAPI_ATTR void VKAPI_CALL
 venus_real_CmdSetBlendConstants(VkCommandBuffer command_buffer,
                                 const float blend_constants[4]);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdSetViewport(VkCommandBuffer command_buffer,
+                          uint32_t first_viewport,
+                          uint32_t viewport_count,
+                          const VkViewport *viewports);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdSetScissor(VkCommandBuffer command_buffer,
+                         uint32_t first_scissor,
+                         uint32_t scissor_count,
+                         const VkRect2D *scissors);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdSetLineWidth(VkCommandBuffer command_buffer, float line_width);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdSetDepthBias(VkCommandBuffer command_buffer,
+                           float constant_factor, float clamp,
+                           float slope_factor);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdSetDepthBounds(VkCommandBuffer command_buffer,
+                             float min_depth_bounds,
+                             float max_depth_bounds);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdSetStencilCompareMask(VkCommandBuffer command_buffer,
+                                    VkStencilFaceFlags face_mask,
+                                    uint32_t compare_mask);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdSetStencilWriteMask(VkCommandBuffer command_buffer,
+                                  VkStencilFaceFlags face_mask,
+                                  uint32_t write_mask);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdSetStencilReference(VkCommandBuffer command_buffer,
+                                  VkStencilFaceFlags face_mask,
+                                  uint32_t reference);
 VKAPI_ATTR void VKAPI_CALL
 venus_real_CmdSetViewportWithCount(VkCommandBuffer command_buffer,
                                    uint32_t viewport_count,
@@ -309,6 +374,17 @@ venus_real_CmdBindDescriptorSets(
     VkPipelineLayout layout, uint32_t first_set,
     uint32_t descriptor_set_count, const VkDescriptorSet *descriptor_sets,
     uint32_t dynamic_offset_count, const uint32_t *dynamic_offsets);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdPushDescriptorSet(
+    VkCommandBuffer command_buffer, VkPipelineBindPoint bind_point,
+    VkPipelineLayout layout, uint32_t set, uint32_t write_count,
+    const VkWriteDescriptorSet *writes);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_CmdPushConstants(VkCommandBuffer command_buffer,
+                            VkPipelineLayout layout,
+                            VkShaderStageFlags stage_flags,
+                            uint32_t offset, uint32_t size,
+                            const void *values);
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_real_CreateBuffer(VkDevice device,
                         const VkBufferCreateInfo *create_info,
@@ -317,6 +393,14 @@ venus_real_CreateBuffer(VkDevice device,
 VKAPI_ATTR void VKAPI_CALL
 venus_real_DestroyBuffer(VkDevice device, VkBuffer buffer,
                          const VkAllocationCallbacks *allocator);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_CreateBufferView(VkDevice device,
+                            const VkBufferViewCreateInfo *create_info,
+                            const VkAllocationCallbacks *allocator,
+                            VkBufferView *view);
+VKAPI_ATTR void VKAPI_CALL
+venus_real_DestroyBufferView(VkDevice device, VkBufferView view,
+                             const VkAllocationCallbacks *allocator);
 VKAPI_ATTR void VKAPI_CALL
 venus_real_GetBufferMemoryRequirements(VkDevice device, VkBuffer buffer,
                                        VkMemoryRequirements *requirements);

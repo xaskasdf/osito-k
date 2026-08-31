@@ -7416,16 +7416,80 @@ typedef struct {
     WCHAR dns_suffix[1];
 } iphlp_payload64_t;
 
+typedef struct {
+    union {
+        uint64_t alignment;
+        struct { uint32_t length, flags; } fields;
+    } header;
+    uint32_t next, sockaddr;
+    int32_t sockaddr_length;
+    uint32_t prefix_origin, suffix_origin, dad_state;
+    uint32_t valid_lifetime, preferred_lifetime, lease_lifetime;
+    uint8_t on_link_prefix_length;
+    uint8_t tail[3];
+} iphlp_unicast32_t;
+
+typedef struct {
+    union {
+        uint64_t alignment;
+        struct { uint32_t length, flags; } fields;
+    } header;
+    uint32_t next, sockaddr;
+    int32_t sockaddr_length;
+    uint32_t prefix_length;
+} iphlp_prefix32_t;
+
+typedef struct {
+    union {
+        uint64_t alignment;
+        struct { uint32_t length, if_index; } fields;
+    } header;
+    uint32_t next, adapter_name, first_unicast;
+    uint32_t first_anycast, first_multicast, first_dns_server;
+    uint32_t dns_suffix, description, friendly_name;
+    uint8_t physical_address[8];
+    uint32_t physical_address_length, flags, mtu, if_type, oper_status;
+    uint32_t ipv6_if_index, zone_indices[16];
+    uint32_t first_prefix;
+    uint8_t tail[232];
+} iphlp_adapter32_t;
+
+typedef struct {
+    iphlp_adapter32_t adapter;
+    iphlp_unicast32_t unicast;
+    iphlp_prefix32_t prefix;
+    uint8_t unicast_sockaddr[16];
+    uint8_t prefix_sockaddr[16];
+    char adapter_name[8];
+    WCHAR friendly_name[8];
+    WCHAR dns_suffix[1];
+} iphlp_payload32_t;
+
 _Static_assert(sizeof(iphlp_adapter64_t) == 448, "IP_ADAPTER_ADDRESSES64 layout");
 _Static_assert(sizeof(iphlp_unicast64_t) == 64, "IP_ADAPTER_UNICAST_ADDRESS64 layout");
 _Static_assert(__builtin_offsetof(iphlp_adapter64_t, friendly_name) == 72,
                "IP_ADAPTER_ADDRESSES64 FriendlyName offset");
 _Static_assert(__builtin_offsetof(iphlp_adapter64_t, first_prefix) == 176,
                "IP_ADAPTER_ADDRESSES64 FirstPrefix offset");
+_Static_assert(sizeof(iphlp_adapter32_t) == 376, "IP_ADAPTER_ADDRESSES32 layout");
+_Static_assert(sizeof(iphlp_unicast32_t) == 48,
+               "IP_ADAPTER_UNICAST_ADDRESS32 layout");
+_Static_assert(sizeof(iphlp_prefix32_t) == 24, "IP_ADAPTER_PREFIX32 layout");
+_Static_assert(sizeof(iphlp_payload32_t) == 512, "GetAdaptersAddresses32 payload");
+_Static_assert(__builtin_offsetof(iphlp_adapter32_t, friendly_name) == 40,
+               "IP_ADAPTER_ADDRESSES32 FriendlyName offset");
+_Static_assert(__builtin_offsetof(iphlp_adapter32_t, first_prefix) == 140,
+               "IP_ADAPTER_ADDRESSES32 FirstPrefix offset");
 
 #define IPHLP_ERROR_INVALID_PARAMETER     87U
+#define IPHLP_ERROR_BUFFER_OVERFLOW       111U
 #define IPHLP_ERROR_INSUFFICIENT_BUFFER  122U
 #define IPHLP_ERROR_NOT_SUPPORTED         50U
+#define IPHLP_ERROR_NO_DATA              232U
+
+#define IPHLP_GAA_SKIP_UNICAST        0x0001U
+#define IPHLP_GAA_INCLUDE_PREFIX      0x0010U
+#define IPHLP_GAA_SKIP_FRIENDLY_NAME  0x0020U
 
 #define IPHLP_TCP_TABLE_BASIC_LISTENER          0U
 #define IPHLP_TCP_TABLE_BASIC_CONNECTIONS       1U
@@ -7874,65 +7938,146 @@ static DWORD WINAPI iphlp_GetExtendedTcpTable(PVOID table, DWORD *size,
     return 0;
 }
 
+static uint8_t iphlp_prefix_length(const uint8_t mask[4])
+{
+    uint8_t length = 0;
+    for (int octet = 0; octet < 4; octet++) {
+        uint8_t bit = 0x80;
+        while (bit && (mask[octet] & bit)) {
+            length++;
+            bit >>= 1;
+        }
+        if (bit) break;
+    }
+    return length;
+}
+
 static ULONG WINAPI iphlp_GetAdaptersAddresses(ULONG family, ULONG flags,
                                                 PVOID reserved, PVOID addresses,
                                                 ULONG *size)
 {
-    (void)flags; (void)reserved;
-    if (!size) return 87; /* ERROR_INVALID_PARAMETER */
-    /* ponytail: PE32 reports no adapters until its pointer layout is needed. */
-    if (g_compat32_mode || (family != 0 && family != 2)) {
+    if (!size || reserved)
+        return IPHLP_ERROR_INVALID_PARAMETER;
+    if (family != 0 && family != 2) {
         *size = 0;
-        return 232; /* ERROR_NO_DATA */
-    }
-    if (!addresses || *size < sizeof(iphlp_payload64_t)) {
-        *size = sizeof(iphlp_payload64_t);
-        return 111; /* ERROR_BUFFER_OVERFLOW */
+        return IPHLP_ERROR_NO_DATA;
     }
 
-    iphlp_payload64_t *p = (iphlp_payload64_t *)addresses;
+    ULONG required = g_compat32_mode ? sizeof(iphlp_payload32_t)
+                                     : sizeof(iphlp_payload64_t);
+    if (!addresses || *size < required) {
+        *size = required;
+        return IPHLP_ERROR_BUFFER_OVERFLOW;
+    }
+
     uint8_t *ip = net_get_ip_ptr();
-    ws_memset(p, 0, sizeof(*p));
+    uint8_t *mask = net_get_netmask_ptr();
+    uint8_t prefix_length = iphlp_prefix_length(mask);
+    BOOL have_unicast = !(flags & IPHLP_GAA_SKIP_UNICAST) &&
+                        (ip[0] || ip[1] || ip[2] || ip[3]);
+    BOOL have_prefix = have_unicast &&
+                       (flags & IPHLP_GAA_INCLUDE_PREFIX);
 
-    p->adapter.length = sizeof(p->adapter);
-    p->adapter.if_index = 1;
-    p->adapter.adapter_name = (uint64_t)(uintptr_t)p->adapter_name;
-    p->adapter.first_unicast = (uint64_t)(uintptr_t)&p->unicast;
-    p->adapter.dns_suffix = (uint64_t)(uintptr_t)p->dns_suffix;
-    p->adapter.friendly_name = (uint64_t)(uintptr_t)p->friendly_name;
-    p->adapter.physical_address_length = 6;
-    net_get_mac(p->adapter.physical_address);
-    p->adapter.flags = 0x84; /* DHCPv4 + IPv4 enabled */
-    p->adapter.mtu = 1500;
-    p->adapter.if_type = 6; /* IF_TYPE_ETHERNET_CSMACD */
-    p->adapter.oper_status = 1; /* IfOperStatusUp */
-    p->adapter.first_prefix = (uint64_t)(uintptr_t)&p->prefix;
-    p->adapter_name[0] = 'o'; p->adapter_name[1] = 's';
-    p->adapter_name[2] = 'i'; p->adapter_name[3] = 't';
-    p->adapter_name[4] = 'o'; p->adapter_name[5] = '0';
-    p->friendly_name[0] = 'o'; p->friendly_name[1] = 's';
-    p->friendly_name[2] = 'i'; p->friendly_name[3] = 't';
-    p->friendly_name[4] = 'o'; p->friendly_name[5] = '0';
+    if (g_compat32_mode) {
+        iphlp_payload32_t *p = (iphlp_payload32_t *)addresses;
+        ws_memset(p, 0, sizeof(*p));
 
-    p->unicast.length = sizeof(p->unicast);
-    p->unicast.sockaddr = (uint64_t)(uintptr_t)p->unicast_sockaddr;
-    p->unicast.sockaddr_length = sizeof(p->unicast_sockaddr);
-    p->unicast.prefix_origin = 3; /* IpPrefixOriginDhcp */
-    p->unicast.suffix_origin = 3; /* IpSuffixOriginDhcp */
-    p->unicast.dad_state = 4; /* IpDadStatePreferred */
-    p->unicast.on_link_prefix_length = 24;
-    p->unicast_sockaddr[0] = 2; /* AF_INET */
-    ws_memcpy(p->unicast_sockaddr + 4, ip, 4);
+        p->adapter.header.fields.length = sizeof(p->adapter);
+        p->adapter.header.fields.if_index = 1;
+        p->adapter.adapter_name = (uint32_t)(uintptr_t)p->adapter_name;
+        p->adapter.first_unicast = have_unicast
+            ? (uint32_t)(uintptr_t)&p->unicast : 0;
+        p->adapter.dns_suffix = (uint32_t)(uintptr_t)p->dns_suffix;
+        p->adapter.description = (uint32_t)(uintptr_t)p->friendly_name;
+        if (!(flags & IPHLP_GAA_SKIP_FRIENDLY_NAME))
+            p->adapter.friendly_name = (uint32_t)(uintptr_t)p->friendly_name;
+        p->adapter.physical_address_length = 6;
+        net_get_mac(p->adapter.physical_address);
+        p->adapter.flags = 0x84; /* DHCPv4 + IPv4 enabled */
+        p->adapter.mtu = 1500;
+        p->adapter.if_type = 6; /* IF_TYPE_ETHERNET_CSMACD */
+        p->adapter.oper_status = 1; /* IfOperStatusUp */
+        p->adapter.first_prefix = have_prefix
+            ? (uint32_t)(uintptr_t)&p->prefix : 0;
+        iphlp_copy_ascii(p->adapter_name, sizeof(p->adapter_name), "osito0");
+        iphlp_copy_wide_ascii(p->friendly_name,
+                              sizeof(p->friendly_name) / sizeof(WCHAR),
+                              "osito0");
 
-    p->prefix.length = sizeof(p->prefix);
-    p->prefix.sockaddr = (uint64_t)(uintptr_t)p->prefix_sockaddr;
-    p->prefix.sockaddr_length = sizeof(p->prefix_sockaddr);
-    p->prefix.prefix_length = 24;
-    p->prefix_sockaddr[0] = 2;
-    ws_memcpy(p->prefix_sockaddr + 4, ip, 4);
-    p->prefix_sockaddr[7] = 0;
+        p->unicast.header.fields.length = sizeof(p->unicast);
+        p->unicast.header.fields.flags = 1; /* DNS eligible */
+        p->unicast.sockaddr = (uint32_t)(uintptr_t)p->unicast_sockaddr;
+        p->unicast.sockaddr_length = sizeof(p->unicast_sockaddr);
+        p->unicast.prefix_origin = 3; /* IpPrefixOriginDhcp */
+        p->unicast.suffix_origin = 3; /* IpSuffixOriginDhcp */
+        p->unicast.dad_state = 4; /* IpDadStatePreferred */
+        p->unicast.valid_lifetime = 0xFFFFFFFFU;
+        p->unicast.preferred_lifetime = 0xFFFFFFFFU;
+        p->unicast.lease_lifetime = 0xFFFFFFFFU;
+        p->unicast.on_link_prefix_length = prefix_length;
+        p->unicast_sockaddr[0] = 2; /* AF_INET */
+        ws_memcpy(p->unicast_sockaddr + 4, ip, 4);
 
-    *size = sizeof(*p);
+        p->prefix.header.fields.length = sizeof(p->prefix);
+        p->prefix.sockaddr = (uint32_t)(uintptr_t)p->prefix_sockaddr;
+        p->prefix.sockaddr_length = sizeof(p->prefix_sockaddr);
+        p->prefix.prefix_length = prefix_length;
+        p->prefix_sockaddr[0] = 2;
+        for (int octet = 0; octet < 4; octet++)
+            p->prefix_sockaddr[4 + octet] = ip[octet] & mask[octet];
+    } else {
+        iphlp_payload64_t *p = (iphlp_payload64_t *)addresses;
+        ws_memset(p, 0, sizeof(*p));
+
+        p->adapter.length = sizeof(p->adapter);
+        p->adapter.if_index = 1;
+        p->adapter.adapter_name = (uint64_t)(uintptr_t)p->adapter_name;
+        p->adapter.first_unicast = have_unicast
+            ? (uint64_t)(uintptr_t)&p->unicast : 0;
+        p->adapter.dns_suffix = (uint64_t)(uintptr_t)p->dns_suffix;
+        p->adapter.description = (uint64_t)(uintptr_t)p->friendly_name;
+        if (!(flags & IPHLP_GAA_SKIP_FRIENDLY_NAME))
+            p->adapter.friendly_name = (uint64_t)(uintptr_t)p->friendly_name;
+        p->adapter.physical_address_length = 6;
+        net_get_mac(p->adapter.physical_address);
+        p->adapter.flags = 0x84; /* DHCPv4 + IPv4 enabled */
+        p->adapter.mtu = 1500;
+        p->adapter.if_type = 6; /* IF_TYPE_ETHERNET_CSMACD */
+        p->adapter.oper_status = 1; /* IfOperStatusUp */
+        p->adapter.first_prefix = have_prefix
+            ? (uint64_t)(uintptr_t)&p->prefix : 0;
+        iphlp_copy_ascii(p->adapter_name, sizeof(p->adapter_name), "osito0");
+        iphlp_copy_wide_ascii(p->friendly_name,
+                              sizeof(p->friendly_name) / sizeof(WCHAR),
+                              "osito0");
+
+        p->unicast.length = sizeof(p->unicast);
+        p->unicast.flags = 1; /* DNS eligible */
+        p->unicast.sockaddr = (uint64_t)(uintptr_t)p->unicast_sockaddr;
+        p->unicast.sockaddr_length = sizeof(p->unicast_sockaddr);
+        p->unicast.prefix_origin = 3; /* IpPrefixOriginDhcp */
+        p->unicast.suffix_origin = 3; /* IpSuffixOriginDhcp */
+        p->unicast.dad_state = 4; /* IpDadStatePreferred */
+        p->unicast.valid_lifetime = 0xFFFFFFFFU;
+        p->unicast.preferred_lifetime = 0xFFFFFFFFU;
+        p->unicast.lease_lifetime = 0xFFFFFFFFU;
+        p->unicast.on_link_prefix_length = prefix_length;
+        p->unicast_sockaddr[0] = 2; /* AF_INET */
+        ws_memcpy(p->unicast_sockaddr + 4, ip, 4);
+
+        p->prefix.length = sizeof(p->prefix);
+        p->prefix.sockaddr = (uint64_t)(uintptr_t)p->prefix_sockaddr;
+        p->prefix.sockaddr_length = sizeof(p->prefix_sockaddr);
+        p->prefix.prefix_length = prefix_length;
+        p->prefix_sockaddr[0] = 2;
+        for (int octet = 0; octet < 4; octet++)
+            p->prefix_sockaddr[4 + octet] = ip[octet] & mask[octet];
+    }
+
+    *size = required;
+    serial_puts(g_compat32_mode
+        ? "[IPHLP] GetAdaptersAddresses PE32: 1 IPv4 adapter\n"
+        : "[IPHLP] GetAdaptersAddresses PE64: 1 IPv4 adapter\n");
     return 0;
 }
 

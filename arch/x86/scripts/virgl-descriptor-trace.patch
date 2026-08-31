@@ -1,0 +1,113 @@
+diff --git a/src/venus/vkr_descriptor_set.c b/src/venus/vkr_descriptor_set.c
+index f435477..167b72d 100644
+--- a/src/venus/vkr_descriptor_set.c
++++ b/src/venus/vkr_descriptor_set.c
+@@ -6,6 +6,9 @@
+
+ #include "vkr_descriptor_set_gen.h"
+
++static uint32_t osito_desc_alloc_trace_count;
++static uint32_t osito_desc_update_trace_count;
++
+ static void
+ vkr_dispatch_vkGetDescriptorSetLayoutSupport(
+    UNUSED struct vn_dispatch_context *dispatch,
+@@ -108,6 +111,17 @@ vkr_dispatch_vkAllocateDescriptorSets(struct vn_dispatch_context *dispatch,
+          vkr_log("Warning: vkAllocateDescriptorSets failed(%u)", result);
+       return;
+    }
++
++   for (uint32_t i = 0; i < arr.count && osito_desc_alloc_trace_count < 512; i++) {
++      const struct vkr_object *obj = arr.objects[i];
++      const VkDescriptorSet host_set = ((const VkDescriptorSet *)arr.handle_storage)[i];
++      osito_desc_alloc_trace_count++;
++      vkr_log("OSITO-DESC-ALLOC id=0x%" PRIx64
++              " obj=%p host=0x%" PRIx64 " pool_id=0x%" PRIx64,
++              obj->id, (const void *)obj,
++              (uint64_t)(uintptr_t)host_set,
++              pool->base.id);
++   }
+
+    vkr_descriptor_set_add_array(ctx, dev, pool, &arr);
+ }
+@@ -138,6 +152,38 @@ vkr_dispatch_vkUpdateDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+
++   for (uint32_t i = 0; i < args->descriptorWriteCount; i++) {
++      const VkWriteDescriptorSet *write = &args->pDescriptorWrites[i];
++      if (!write->pImageInfo)
++         continue;
++      const struct vkr_descriptor_set *set =
++         vkr_descriptor_set_from_handle(write->dstSet);
++      for (uint32_t j = 0; j < write->descriptorCount &&
++           osito_desc_update_trace_count < 1024; j++) {
++         const VkDescriptorImageInfo *info = &write->pImageInfo[j];
++         const struct vkr_object *view =
++            (const struct vkr_object *)(uintptr_t)info->imageView;
++         const struct vkr_object *sampler =
++            (const struct vkr_object *)(uintptr_t)info->sampler;
++         osito_desc_update_trace_count++;
++         vkr_log("OSITO-DESC-UPD set_id=0x%" PRIx64
++                 " set_host=0x%" PRIx64
++                 " binding=%u elem=%u type=%u",
++                 set ? set->base.id : 0,
++                 set ? set->base.handle.u64 : 0,
++                 write->dstBinding, write->dstArrayElement + j,
++                 write->descriptorType);
++         vkr_log("OSITO-DESC-IMG view_id=0x%" PRIx64
++                 " view_host=0x%" PRIx64
++                 " sampler_id=0x%" PRIx64
++                 " sampler_host=0x%" PRIx64,
++                 view ? view->id : 0,
++                 view ? view->handle.u64 : 0,
++                 sampler ? sampler->id : 0,
++                 sampler ? sampler->handle.u64 : 0);
++      }
++   }
++
+    vn_replace_vkUpdateDescriptorSets_args_handle(args);
+    vk->UpdateDescriptorSets(args->device, args->descriptorWriteCount,
+                             args->pDescriptorWrites, args->descriptorCopyCount,
+diff --git a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
+index a59c307..64292aa 100644
+--- a/src/venus/vkr_command_buffer.c
++++ b/src/venus/vkr_command_buffer.c
+@@ -11,6 +11,8 @@
+ #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+ #endif
+
++static uint32_t osito_desc_bind_trace_count;
++
+ #define VKR_CMD_CALL(cmd_name, args, ...)                                                \
+    do {                                                                                  \
+       struct vkr_command_buffer *_cmd =                                                  \
+@@ -218,6 +220,28 @@ static void
+ vkr_dispatch_vkCmdBindDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdBindDescriptorSets *args)
+ {
++   for (uint32_t i = 0; i < args->descriptorSetCount &&
++        osito_desc_bind_trace_count < 1024; i++) {
++      const uint32_t slot = args->firstSet + i;
++      if (slot != 2)
++         continue;
++      const struct vkr_command_buffer *cmd =
++         vkr_command_buffer_from_handle(args->commandBuffer);
++      const struct vkr_object *layout =
++         (const struct vkr_object *)(uintptr_t)args->layout;
++      const struct vkr_object *set =
++         (const struct vkr_object *)(uintptr_t)args->pDescriptorSets[i];
++      osito_desc_bind_trace_count++;
++      vkr_log("OSITO-DESC-BIND cmd_id=0x%" PRIx64
++              " layout_id=0x%" PRIx64
++              " slot=%u set_id=0x%" PRIx64
++              " set_host=0x%" PRIx64,
++              cmd ? cmd->base.id : 0,
++              layout ? layout->id : 0, slot,
++              set ? set->id : 0,
++              set ? set->handle.u64 : 0);
++   }
++
+    VKR_CMD_CALL(CmdBindDescriptorSets, args, args->pipelineBindPoint, args->layout,
+                 args->firstSet, args->descriptorSetCount, args->pDescriptorSets,
+                 args->dynamicOffsetCount, args->pDynamicOffsets);

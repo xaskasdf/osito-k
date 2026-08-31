@@ -38,9 +38,10 @@ syscall_entry:
 
     /* ELF tasks run at CPL0, so SYSCALL leaves RSP on the caller's stack.
      * pthread stacks can be only 16KB, while VFS/NVMe syscall call chains need
-     * substantially more. Switch to the current task's private 256KB kernel
-     * stack when process.c published one. Save both the original RSP and a
-     * switch marker locally: a syscall may sleep and another task will then
+     * substantially more. Switch to the dedicated upper 256KB of the current
+     * task's stack allocation when process.c publishes it. The lower 256KB
+     * retains dormant scheduler/Win32 entry frames. Save both the original RSP
+     * and a switch marker locally: a syscall may sleep and another task will
      * overwrite the global stack selectors before this task resumes. */
     cmpq $0, syscall_kernel_rsp(%rip)
     je .Lsyscall_user_stack

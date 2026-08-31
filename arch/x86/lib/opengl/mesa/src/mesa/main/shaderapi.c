@@ -67,6 +67,10 @@
 #include "util/u_string.h"
 #include "api_exec_decl.h"
 
+#ifdef __OSITO_K__
+extern void okgl_trace(const char *message);
+#endif
+
 #include "state_tracker/st_context.h"
 #include "state_tracker/st_glsl_to_nir.h"
 #include "state_tracker/st_program.h"
@@ -1187,7 +1191,13 @@ static void
 ensure_builtin_types(struct gl_context *ctx)
 {
    if (!ctx->shader_builtin_ref) {
+#ifdef __OSITO_K__
+      okgl_trace("[OKGL-GLSL] builtin init begin\n");
+#endif
       _mesa_glsl_builtin_functions_init_or_ref();
+#ifdef __OSITO_K__
+      okgl_trace("[OKGL-GLSL] builtin init end\n");
+#endif
       ctx->shader_builtin_ref = true;
    }
 }
@@ -1200,6 +1210,10 @@ _mesa_compile_shader(struct gl_context *ctx, struct gl_shader *sh)
 {
    if (!sh)
       return;
+
+#ifdef __OSITO_K__
+   okgl_trace("[OKGL-GLSL] compile enter\n");
+#endif
 
    /* The GL_ARB_gl_spirv spec says:
     *
@@ -1230,7 +1244,13 @@ _mesa_compile_shader(struct gl_context *ctx, struct gl_shader *sh)
       /* this call will set the shader->CompileStatus field to indicate if
        * compilation was successful.
        */
+#ifdef __OSITO_K__
+      okgl_trace("[OKGL-GLSL] frontend begin\n");
+#endif
       _mesa_glsl_compile_shader(ctx, sh, NULL, false, false, false);
+#ifdef __OSITO_K__
+      okgl_trace("[OKGL-GLSL] frontend end\n");
+#endif
 
       if (ctx->_Shader->Flags & GLSL_LOG) {
          _mesa_write_shader_to_file(sh);

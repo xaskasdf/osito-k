@@ -16,6 +16,7 @@
 
 #include "../include/types.h"
 #include "../include/dynlink.h"
+#include "../include/paging.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -41,6 +42,7 @@ extern char *strcpy(char *dst, const char *src);
 /* OsitoFS */
 extern void *osfs2_find(const char *name);
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
+extern uint64_t osfs2_file_size(void *file);
 
 /* ── ELF64 types (local to dl_open) ────────────────────────── */
 
@@ -54,6 +56,10 @@ extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 #define DL_PT_LOAD     1
 #define DL_PT_DYNAMIC  2
 #define DL_PT_TLS      7
+
+#define DL_MAX_FILE_SIZE  (64ULL * 1024 * 1024)
+#define DL_MAX_IMAGE_SIZE (256ULL * 1024 * 1024)
+#define DL_MAX_PHNUM      128
 
 typedef struct {
     uint8_t  e_ident[DL_EI_NIDENT];
@@ -82,6 +88,42 @@ typedef struct {
     uint64_t p_memsz;
     uint64_t p_align;
 } dl_phdr_t;
+
+static bool dl_range_valid(uint64_t offset, uint64_t size, uint64_t limit)
+{
+    return offset <= limit && size <= limit - offset;
+}
+
+static bool dl_image_range_valid(uint64_t address, uint64_t size,
+                                 uint64_t vmin, uint64_t vmax)
+{
+    return address >= vmin && address <= vmax && size <= vmax - address;
+}
+
+static bool dl_is_power_of_two(uint64_t value)
+{
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+static bool dl_strtab_name_valid(const char *strtab, uint64_t strtab_sz,
+                                 uint32_t offset)
+{
+    if (!strtab || offset >= strtab_sz) return false;
+    for (uint64_t i = offset; i < strtab_sz; i++) {
+        if (strtab[i] == '\0') return true;
+    }
+    return false;
+}
+
+static bool dl_module_range_valid(const dl_module_t *m, uint64_t address,
+                                  uint64_t size)
+{
+    if (!m || !m->base || m->pages == 0) return true;
+    uint64_t start = (uint64_t)m->base;
+    uint64_t bytes = m->pages * 4096;
+    return address >= start && address <= start + bytes &&
+           size <= start + bytes - address;
+}
 
 /* ── Module table ───────────────────────────────────────────── */
 
@@ -242,6 +284,7 @@ static const ksym_entry_t ksym_table[] = {
     { "mmap64",         (uint64_t)kern_mmap      },
     { "mprotect",       (uint64_t)kern_mprotect  },
     { "munmap",         (uint64_t)kern_munmap    },
+    { "syscall_dispatch", (uint64_t)syscall_dispatch },
 
     /* TLS */
     { "__tls_get_addr",        (uint64_t)kern_tls_get_addr },
@@ -310,6 +353,43 @@ uint32_t dl_gnu_hash_nsyms(const uint32_t *gnu_hash)
     return last + 1;
 }
 
+static uint32_t dl_gnu_hash_nsyms_bounded(const uint32_t *gnu_hash,
+                                           uint64_t available)
+{
+    if (available < 4 * sizeof(uint32_t)) return 0;
+
+    uint32_t nbuckets = gnu_hash[0];
+    uint32_t symoffset = gnu_hash[1];
+    uint32_t bloom_size = gnu_hash[2];
+    if (nbuckets == 0 || bloom_size == 0) return 0;
+    uint64_t bloom_bytes = (uint64_t)bloom_size * sizeof(uint64_t);
+    uint64_t bucket_bytes = (uint64_t)nbuckets * sizeof(uint32_t);
+    uint64_t prefix = 4 * sizeof(uint32_t);
+    if (!dl_range_valid(prefix, bloom_bytes, available)) return 0;
+    prefix += bloom_bytes;
+    if (!dl_range_valid(prefix, bucket_bytes, available)) return 0;
+
+    const uint32_t *buckets = (const uint32_t *)((const uint8_t *)gnu_hash + prefix);
+    prefix += bucket_bytes;
+    uint64_t chain_count = (available - prefix) / sizeof(uint32_t);
+    const uint32_t *chains = (const uint32_t *)((const uint8_t *)gnu_hash + prefix);
+
+    uint32_t last = 0;
+    for (uint32_t i = 0; i < nbuckets; i++) {
+        if (buckets[i] > last) last = buckets[i];
+    }
+    if (last < symoffset) return symoffset;
+
+    uint64_t chain_index = (uint64_t)last - symoffset;
+    while (chain_index < chain_count) {
+        if (chains[chain_index] & 1) return last + 1;
+        chain_index++;
+        if (last == UINT32_MAX) return 0;
+        last++;
+    }
+    return 0;
+}
+
 /* ── Allocate module slot ───────────────────────────────────── */
 
 static dl_module_t *mod_alloc(void)
@@ -323,10 +403,11 @@ static dl_module_t *mod_alloc(void)
 
 /* ── Find module by name ────────────────────────────────────── */
 
-static dl_module_t *mod_find(const char *name)
+static dl_module_t *mod_find(const char *name, uint32_t owner_id)
 {
     for (int i = 0; i < DL_MAX_MODULES; i++) {
-        if (modules[i].loaded && strcmp(modules[i].name, name) == 0)
+        if (modules[i].loaded && modules[i].owner_id == owner_id &&
+            strcmp(modules[i].name, name) == 0)
             return &modules[i];
     }
     return NULL;
@@ -336,10 +417,13 @@ static dl_module_t *mod_find(const char *name)
 
 static uint64_t resolve_symbol(dl_module_t *m, uint32_t sym_idx)
 {
-    if (sym_idx == 0 || sym_idx >= m->sym_count)
+    if (sym_idx == 0 || sym_idx >= m->sym_count ||
+        !m->symtab || !m->strtab)
         return 0;
 
     dl_sym_t *sym = &m->symtab[sym_idx];
+    if (!dl_strtab_name_valid(m->strtab, m->strtab_sz, sym->st_name))
+        return 0;
     const char *name = m->strtab + sym->st_name;
 
     /* Defined in this module */
@@ -357,6 +441,13 @@ static uint64_t resolve_symbol(dl_module_t *m, uint32_t sym_idx)
     for (int i = 0; i < DL_MAX_MODULES; i++) {
         if (!modules[i].loaded) continue;
         if (&modules[i] == m) continue;
+        if (m->owner_id != 0) {
+            if (modules[i].owner_id != 0 &&
+                modules[i].owner_id != m->owner_id)
+                continue;
+        } else if (modules[i].owner_id != 0) {
+            continue;
+        }
         void *val = dl_sym(&modules[i], name);
         if (val) return (uint64_t)val;
     }
@@ -386,6 +477,14 @@ int dl_apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
         uint32_t type    = ELF64_R_TYPE(rela[i].r_info);
         uint32_t sym_idx = ELF64_R_SYM(rela[i].r_info);
         uint64_t *target = (uint64_t *)(m->load_bias + rela[i].r_offset);
+
+        uint64_t target_size = (type == R_X86_64_TPOFF32) ? 4 : 8;
+        if (type != R_X86_64_NONE &&
+            !dl_module_range_valid(m, (uint64_t)target, target_size)) {
+            serial_puts("[DL] Relocation target outside module\n");
+            failed++;
+            continue;
+        }
 
         switch (type) {
         case R_X86_64_RELATIVE:
@@ -432,6 +531,13 @@ int dl_apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
                 const char *sname = m->strtab + m->symtab[sym_idx].st_name;
                 for (int j = 0; j < DL_MAX_MODULES; j++) {
                     if (!modules[j].loaded || !modules[j].tls_modid) continue;
+                    if (m->owner_id != 0) {
+                        if (modules[j].owner_id != 0 &&
+                            modules[j].owner_id != m->owner_id)
+                            continue;
+                    } else if (modules[j].owner_id != 0) {
+                        continue;
+                    }
                     if (dl_sym(&modules[j], sname)) {
                         modid = modules[j].tls_modid;
                         break;
@@ -522,19 +628,112 @@ uint64_t dl_apply_relr(uint64_t load_bias, const uint64_t *relr, uint64_t count)
 
 /* ── dl_open: load shared object ────────────────────────────── */
 
+static bool dl_rela_targets_valid(const dl_rela_t *rela, uint64_t count,
+                                  uint64_t vmin, uint64_t vmax)
+{
+    for (uint64_t i = 0; i < count; i++) {
+        uint32_t type = ELF64_R_TYPE(rela[i].r_info);
+        uint64_t target_size;
+
+        switch (type) {
+        case R_X86_64_NONE:
+            continue;
+        case R_X86_64_TPOFF32:
+            target_size = 4;
+            break;
+        case R_X86_64_RELATIVE:
+        case R_X86_64_64:
+        case R_X86_64_GLOB_DAT:
+        case R_X86_64_JUMP_SLOT:
+        case R_X86_64_IRELATIVE:
+        case R_X86_64_DTPMOD64:
+        case R_X86_64_DTPOFF64:
+            target_size = 8;
+            break;
+        default:
+            continue;
+        }
+
+        if (!dl_image_range_valid(rela[i].r_offset, target_size, vmin, vmax))
+            return false;
+        if (type == R_X86_64_IRELATIVE &&
+            (rela[i].r_addend < 0 ||
+             !dl_image_range_valid((uint64_t)rela[i].r_addend, 1, vmin, vmax)))
+            return false;
+    }
+    return true;
+}
+
+static bool dl_relr_targets_valid(const uint64_t *relr, uint64_t count,
+                                  uint64_t vmin, uint64_t vmax)
+{
+    uint64_t where = 0;
+    bool have_base = false;
+
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t entry = relr[i];
+        if ((entry & 1) == 0) {
+            if (!dl_image_range_valid(entry, 8, vmin, vmax)) return false;
+            if (entry > UINT64_MAX - 8) return false;
+            where = entry + 8;
+            have_base = true;
+            continue;
+        }
+
+        if (!have_base) return false;
+        uint64_t bitmap = entry >> 1;
+        for (uint64_t bit = 0; bitmap; bit++, bitmap >>= 1) {
+            if ((bitmap & 1) == 0) continue;
+            uint64_t delta = bit * 8;
+            if (where > UINT64_MAX - delta ||
+                !dl_image_range_valid(where + delta, 8, vmin, vmax))
+                return false;
+        }
+        if (where > UINT64_MAX - 63 * 8) return false;
+        where += 63 * 8;
+    }
+    return true;
+}
+
+static void *dl_open_flags_owner(const char *filename, int flags,
+                                 uint32_t owner_id);
+
 void *dl_open(const char *filename)
 {
-    return dl_open_flags(filename, 0);
+    return dl_open_flags_owner(filename, 0, 0);
 }
 
 void *dl_open_flags(const char *filename, int flags)
 {
+    return dl_open_flags_owner(filename, flags, 0);
+}
+
+void *dl_open_private(const char *filename, uint32_t owner_id)
+{
+    if (owner_id == 0) return NULL;
+    return dl_open_flags_owner(filename, 0, owner_id);
+}
+
+static void *dl_open_flags_owner(const char *filename, int flags,
+                                 uint32_t owner_id)
+{
+    const char *error = NULL;
+    uint8_t *data = NULL;
+    void *base = NULL;
+    void *phys_base = NULL;
+    uint64_t total_pages = 0;
+
     serial_puts("[DL] Opening '");
     serial_puts(filename);
-    serial_puts("'\n");
+    serial_puts("'");
+    if (owner_id) {
+        serial_puts(" owner=");
+        serial_putdec(owner_id);
+    }
+    serial_puts("\n");
 
     /* Check if already loaded */
-    dl_module_t *existing = mod_find(filename);
+    dl_module_t *existing = mod_find(filename, owner_id);
     if (existing) {
         existing->refcount++;
         serial_puts("[DL] Already loaded, refcount=");
@@ -551,31 +750,30 @@ void *dl_open_flags(const char *filename, int flags)
     }
 
     /* Read file from OsitoFS */
-    typedef struct { char name[64]; uint64_t size; } finfo_t;
     void *file = osfs2_find(filename);
     if (!file) {
         serial_puts("[DL] File not found\n");
         return NULL;
     }
 
-    finfo_t *fi = (finfo_t *)file;
-    uint64_t file_size = fi->size;
+    uint64_t file_size = osfs2_file_size(file);
 
-    if (file_size < sizeof(dl_ehdr_t) || file_size > 16 * 1024 * 1024) {
-        serial_puts("[DL] Invalid file size\n");
+    if (file_size < sizeof(dl_ehdr_t) || file_size > DL_MAX_FILE_SIZE) {
+        serial_puts("[DL] Invalid file size: ");
+        serial_putdec(file_size);
+        serial_puts(" bytes\n");
         return NULL;
     }
 
-    uint8_t *data = (uint8_t *)kmalloc(file_size);
+    data = (uint8_t *)kmalloc(file_size);
     if (!data) {
         serial_puts("[DL] Out of memory for read\n");
         return NULL;
     }
 
-    if (osfs2_read(file, 0, data, file_size) < 0) {
-        kfree(data);
-        serial_puts("[DL] Read failed\n");
-        return NULL;
+    if (osfs2_read(file, 0, data, file_size) != (int)file_size) {
+        error = "Read failed";
+        goto fail;
     }
 
     /* Validate ELF */
@@ -583,50 +781,92 @@ void *dl_open_flags(const char *filename, int flags)
     if (ehdr->e_ident[0] != 0x7f || ehdr->e_ident[1] != 'E' ||
         ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F' ||
         ehdr->e_ident[4] != DL_ELFCLASS64 || ehdr->e_ident[5] != DL_ELFDATA2LSB ||
-        ehdr->e_machine != DL_EM_X86_64 || ehdr->e_type != DL_ET_DYN) {
-        serial_puts("[DL] Not a valid x86-64 shared object\n");
-        kfree(data);
-        return NULL;
+        ehdr->e_ident[6] != 1 || ehdr->e_version != 1 ||
+        ehdr->e_machine != DL_EM_X86_64 || ehdr->e_type != DL_ET_DYN ||
+        ehdr->e_ehsize != sizeof(dl_ehdr_t) ||
+        ehdr->e_phentsize != sizeof(dl_phdr_t) ||
+        ehdr->e_phnum == 0 || ehdr->e_phnum > DL_MAX_PHNUM) {
+        error = "Not a valid x86-64 shared object";
+        goto fail;
     }
+
+    uint64_t phdr_bytes = (uint64_t)ehdr->e_phnum * sizeof(dl_phdr_t);
+    if (!dl_range_valid(ehdr->e_phoff, phdr_bytes, file_size)) {
+        error = "Program headers outside file";
+        goto fail;
+    }
+    dl_phdr_t *phdrs = (dl_phdr_t *)(data + ehdr->e_phoff);
 
     /* ── Pass 1: find LOAD range ─────────────────────────────── */
 
     uint64_t vmin = UINT64_MAX, vmax = 0;
+    uint64_t load_align = 4096;
     int load_count = 0;
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
-        uint64_t off = ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize;
-        if (off + sizeof(dl_phdr_t) > file_size) break;
-        dl_phdr_t *ph = (dl_phdr_t *)(data + off);
+        dl_phdr_t *ph = &phdrs[i];
+
+        if (ph->p_filesz > 0 &&
+            !dl_range_valid(ph->p_offset, ph->p_filesz, file_size)) {
+            error = "Segment data outside file";
+            goto fail;
+        }
+        if (ph->p_align != 0 &&
+            (!dl_is_power_of_two(ph->p_align) ||
+             ((ph->p_vaddr - ph->p_offset) & (ph->p_align - 1)) != 0)) {
+            error = "Invalid segment alignment";
+            goto fail;
+        }
 
         if (ph->p_type != DL_PT_LOAD || ph->p_memsz == 0) continue;
 
-        if (ph->p_vaddr < vmin) vmin = ph->p_vaddr;
-        if (ph->p_vaddr + ph->p_memsz > vmax)
-            vmax = ph->p_vaddr + ph->p_memsz;
+        if (ph->p_filesz > ph->p_memsz ||
+            ph->p_vaddr > UINT64_MAX - ph->p_memsz) {
+            error = "Invalid LOAD segment size";
+            goto fail;
+        }
+
+        uint64_t seg_start = ph->p_vaddr & ~4095ULL;
+        uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
+        if (seg_end > UINT64_MAX - 4095) {
+            error = "LOAD segment address overflow";
+            goto fail;
+        }
+        seg_end = (seg_end + 4095) & ~4095ULL;
+
+        if (seg_start < vmin) vmin = seg_start;
+        if (seg_end > vmax) vmax = seg_end;
+        if (ph->p_align > load_align) load_align = ph->p_align;
         load_count++;
     }
 
     if (load_count == 0) {
-        serial_puts("[DL] No LOAD segments\n");
-        kfree(data);
-        return NULL;
+        error = "No LOAD segments";
+        goto fail;
     }
 
     uint64_t total_size = vmax - vmin;
-    uint64_t total_pages = (total_size + 4095) / 4096;
+    if (total_size == 0 || total_size > DL_MAX_IMAGE_SIZE ||
+        load_align > DL_MAX_IMAGE_SIZE) {
+        error = "Invalid loaded image size";
+        goto fail;
+    }
+    total_pages = total_size / 4096;
 
-    /* Allocate memory for module */
-    void *base = mem_alloc_aligned(total_pages * 4096, 4096);
-    if (!base) {
+    /* Keep runtime modules in the shared upper-half direct map.  A physical
+     * identity address is also a valid Win32 user VA, so loading there lets a
+     * process mapping (notably HotSpot's heap) hide or overwrite the module. */
+    phys_base = mem_alloc_aligned(total_size, load_align);
+    if (!phys_base) {
         serial_puts("[DL] Failed to allocate ");
         serial_putdec(total_pages);
         serial_puts(" pages\n");
-        kfree(data);
-        return NULL;
+        error = "Module image allocation failed";
+        goto fail;
     }
+    base = PHYS_TO_VIRT(phys_base);
 
-    memset(base, 0, total_pages * 4096);
+    memset(base, 0, total_size);
     uint64_t load_bias = (uint64_t)base - vmin;
 
     serial_puts("[DL] Base: 0x");
@@ -638,14 +878,12 @@ void *dl_open_flags(const char *filename, int flags)
     /* ── Pass 2: copy LOAD segments ──────────────────────────── */
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
-        uint64_t off = ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize;
-        if (off + sizeof(dl_phdr_t) > file_size) break;
-        dl_phdr_t *ph = (dl_phdr_t *)(data + off);
+        dl_phdr_t *ph = &phdrs[i];
 
         if (ph->p_type != DL_PT_LOAD || ph->p_memsz == 0) continue;
 
         uint64_t dest_off = ph->p_vaddr - vmin;
-        if (ph->p_filesz > 0 && ph->p_offset + ph->p_filesz <= file_size)
+        if (ph->p_filesz > 0)
             memcpy((uint8_t *)base + dest_off, data + ph->p_offset, ph->p_filesz);
     }
 
@@ -657,15 +895,26 @@ void *dl_open_flags(const char *filename, int flags)
     uint64_t pt_tls_vaddr = 0;
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
-        uint64_t off = ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize;
-        if (off + sizeof(dl_phdr_t) > file_size) break;
-        dl_phdr_t *ph = (dl_phdr_t *)(data + off);
+        dl_phdr_t *ph = &phdrs[i];
 
         if (ph->p_type == DL_PT_DYNAMIC) {
+            if (dynamic || ph->p_filesz < sizeof(dl_dyn_t) ||
+                ph->p_filesz > ph->p_memsz ||
+                ph->p_filesz % sizeof(dl_dyn_t) != 0 ||
+                !dl_image_range_valid(ph->p_vaddr, ph->p_filesz, vmin, vmax)) {
+                error = "Invalid PT_DYNAMIC segment";
+                goto fail;
+            }
             dynamic = (dl_dyn_t *)((uint8_t *)base + (ph->p_vaddr - vmin));
-            dyn_count = ph->p_memsz / sizeof(dl_dyn_t);
+            dyn_count = ph->p_filesz / sizeof(dl_dyn_t);
         }
         if (ph->p_type == DL_PT_TLS && ph->p_memsz > 0) {
+            if (pt_tls_memsz != 0 || ph->p_filesz > ph->p_memsz ||
+                !dl_image_range_valid(ph->p_vaddr, ph->p_memsz, vmin, vmax) ||
+                (ph->p_align != 0 && !dl_is_power_of_two(ph->p_align))) {
+                error = "Invalid PT_TLS segment";
+                goto fail;
+            }
             pt_tls_filesz = ph->p_filesz;
             pt_tls_memsz  = ph->p_memsz;
             pt_tls_align  = ph->p_align ? ph->p_align : 1;
@@ -675,11 +924,11 @@ void *dl_open_flags(const char *filename, int flags)
 
     /* Free file data — segments already copied */
     kfree(data);
+    data = NULL;
 
     if (!dynamic) {
-        serial_puts("[DL] No PT_DYNAMIC segment\n");
-        mem_free_pages(base, total_pages);
-        return NULL;
+        error = "No PT_DYNAMIC segment";
+        goto fail;
     }
 
     /* ── Parse dynamic table ─────────────────────────────────── */
@@ -691,9 +940,17 @@ void *dl_open_flags(const char *filename, int flags)
     uint64_t dt_init = 0, dt_fini = 0;
     uint64_t dt_init_array = 0, dt_init_arraysz = 0;
     uint64_t dt_relr = 0, dt_relrsz = 0;
+    uint64_t dt_syment = sizeof(dl_sym_t);
+    uint64_t dt_relaent = sizeof(dl_rela_t);
+    uint64_t dt_relrent = sizeof(uint64_t);
+    uint64_t dt_pltrel = 0;
+    bool dynamic_terminated = false;
 
     for (uint64_t i = 0; i < dyn_count; i++) {
-        if (dynamic[i].d_tag == DT_NULL) break;
+        if (dynamic[i].d_tag == DT_NULL) {
+            dynamic_terminated = true;
+            break;
+        }
         switch (dynamic[i].d_tag) {
         case DT_SYMTAB:      dt_symtab      = dynamic[i].d_val; break;
         case DT_STRTAB:      dt_strtab      = dynamic[i].d_val; break;
@@ -710,13 +967,147 @@ void *dl_open_flags(const char *filename, int flags)
         case DT_INIT_ARRAYSZ:dt_init_arraysz = dynamic[i].d_val; break;
         case DT_RELR:        dt_relr        = dynamic[i].d_val; break;
         case DT_RELRSZ:      dt_relrsz      = dynamic[i].d_val; break;
+        case DT_SYMENT:      dt_syment      = dynamic[i].d_val; break;
+        case DT_RELAENT:     dt_relaent     = dynamic[i].d_val; break;
+        case DT_RELRENT:     dt_relrent     = dynamic[i].d_val; break;
+        case DT_PLTREL:      dt_pltrel      = dynamic[i].d_val; break;
         }
     }
 
+    if (!dynamic_terminated) {
+        error = "Unterminated dynamic table";
+        goto fail;
+    }
+    if (dt_syment != sizeof(dl_sym_t) || dt_relaent != sizeof(dl_rela_t) ||
+        dt_relrent != sizeof(uint64_t)) {
+        error = "Unsupported dynamic entry size";
+        goto fail;
+    }
+    if (!dt_symtab || !dt_strtab || dt_strsz == 0 ||
+        !dl_image_range_valid(dt_symtab, sizeof(dl_sym_t), vmin, vmax) ||
+        !dl_image_range_valid(dt_strtab, dt_strsz, vmin, vmax) ||
+        *((char *)(load_bias + dt_strtab + dt_strsz - 1)) != '\0') {
+        error = "Invalid dynamic symbol or string table";
+        goto fail;
+    }
+    if ((dt_init && !dl_image_range_valid(dt_init, 1, vmin, vmax)) ||
+        (dt_fini && !dl_image_range_valid(dt_fini, 1, vmin, vmax)) ||
+        (dt_init_arraysz % sizeof(uint64_t)) != 0 ||
+        (dt_init_arraysz > 0 &&
+         (!dt_init_array ||
+          !dl_image_range_valid(dt_init_array, dt_init_arraysz, vmin, vmax)))) {
+        error = "Invalid initializer metadata";
+        goto fail;
+    }
+
+    if ((dt_relasz % sizeof(dl_rela_t)) != 0 ||
+        (dt_relasz > 0 &&
+         (!dt_rela || !dl_image_range_valid(dt_rela, dt_relasz, vmin, vmax))) ||
+        (dt_pltrelsz % sizeof(dl_rela_t)) != 0 ||
+        (dt_pltrelsz > 0 &&
+         (!dt_jmprel || dt_pltrel != DT_RELA ||
+          !dl_image_range_valid(dt_jmprel, dt_pltrelsz, vmin, vmax))) ||
+        (dt_relrsz % sizeof(uint64_t)) != 0 ||
+        (dt_relrsz > 0 &&
+         (!dt_relr || !dl_image_range_valid(dt_relr, dt_relrsz, vmin, vmax)))) {
+        error = "Invalid relocation metadata";
+        goto fail;
+    }
+
     /* Fill module structure */
+    uint32_t *validated_hashtab = NULL;
+    uint32_t validated_nbucket = 0;
+    uint32_t validated_nchain = 0;
+    uint32_t validated_sym_count = 0;
+
+    if (dt_hash) {
+        if (!dl_image_range_valid(dt_hash, 2 * sizeof(uint32_t), vmin, vmax)) {
+            error = "Invalid SysV hash table";
+            goto fail;
+        }
+        validated_hashtab = (uint32_t *)(load_bias + dt_hash);
+        validated_nbucket = validated_hashtab[0];
+        validated_nchain = validated_hashtab[1];
+        uint64_t hash_words = 2ULL + validated_nbucket + validated_nchain;
+        if (validated_nbucket == 0 || validated_nchain == 0 ||
+            !dl_image_range_valid(dt_hash, hash_words * sizeof(uint32_t),
+                                  vmin, vmax)) {
+            error = "Invalid SysV hash dimensions";
+            goto fail;
+        }
+        validated_sym_count = validated_nchain;
+
+        uint32_t *buckets = validated_hashtab + 2;
+        uint32_t *chains = buckets + validated_nbucket;
+        for (uint32_t i = 0; i < validated_nbucket; i++) {
+            if (buckets[i] >= validated_nchain) {
+                error = "Invalid SysV hash bucket";
+                goto fail;
+            }
+        }
+        for (uint32_t i = 0; i < validated_nchain; i++) {
+            if (chains[i] >= validated_nchain) {
+                error = "Invalid SysV hash chain";
+                goto fail;
+            }
+        }
+    } else if (dt_gnu_hash_val) {
+        if (!dl_image_range_valid(dt_gnu_hash_val, 4 * sizeof(uint32_t),
+                                  vmin, vmax)) {
+            error = "Invalid GNU hash table";
+            goto fail;
+        }
+        uint32_t *gh = (uint32_t *)(load_bias + dt_gnu_hash_val);
+        validated_sym_count = dl_gnu_hash_nsyms_bounded(
+            gh, vmax - dt_gnu_hash_val);
+        if (validated_sym_count == 0) {
+            error = "Invalid GNU hash chains";
+            goto fail;
+        }
+    } else if (dt_strtab > dt_symtab) {
+        uint64_t sym_bytes = dt_strtab - dt_symtab;
+        if (sym_bytes % sizeof(dl_sym_t) != 0 ||
+            sym_bytes / sizeof(dl_sym_t) > UINT32_MAX) {
+            error = "Cannot determine dynamic symbol count";
+            goto fail;
+        }
+        validated_sym_count = (uint32_t)(sym_bytes / sizeof(dl_sym_t));
+    } else {
+        error = "Shared object has no bounded symbol index";
+        goto fail;
+    }
+
+    uint64_t symtab_bytes = (uint64_t)validated_sym_count * sizeof(dl_sym_t);
+    if (validated_sym_count == 0 ||
+        !dl_image_range_valid(dt_symtab, symtab_bytes, vmin, vmax)) {
+        error = "Dynamic symbol table outside image";
+        goto fail;
+    }
+
+    const dl_rela_t *validated_rela =
+        dt_relasz ? (const dl_rela_t *)(load_bias + dt_rela) : NULL;
+    const dl_rela_t *validated_jmprel =
+        dt_pltrelsz ? (const dl_rela_t *)(load_bias + dt_jmprel) : NULL;
+    const uint64_t *validated_relr =
+        dt_relrsz ? (const uint64_t *)(load_bias + dt_relr) : NULL;
+    if ((validated_rela &&
+         !dl_rela_targets_valid(validated_rela,
+                                dt_relasz / sizeof(dl_rela_t), vmin, vmax)) ||
+        (validated_jmprel &&
+         !dl_rela_targets_valid(validated_jmprel,
+                                dt_pltrelsz / sizeof(dl_rela_t), vmin, vmax)) ||
+        (validated_relr &&
+         !dl_relr_targets_valid(validated_relr,
+                                dt_relrsz / sizeof(uint64_t), vmin, vmax))) {
+        error = "Relocation target outside image";
+        goto fail;
+    }
+
     memset(m, 0, sizeof(*m));
     m->loaded    = true;
+    m->owner_id  = owner_id;
     m->base      = base;
+    m->phys_base = phys_base;
     m->load_bias = load_bias;
     m->size      = total_size;
     m->pages     = total_pages;
@@ -739,25 +1130,14 @@ void *dl_open_flags(const char *filename, int flags)
     /* Resolve dynamic pointers (vaddr → loaded address) */
     if (dt_symtab)   m->symtab    = (dl_sym_t *)(load_bias + dt_symtab);
     if (dt_strtab)  { m->strtab   = (char *)(load_bias + dt_strtab); m->strtab_sz = dt_strsz; }
-    if (dt_hash)     m->hashtab   = (uint32_t *)(load_bias + dt_hash);
+    m->hashtab = validated_hashtab;
     if (dt_init)     m->init_fn   = (void (*)(void))(load_bias + dt_init);
     if (dt_fini)     m->fini_fn   = (void (*)(void))(load_bias + dt_fini);
 
     /* Determine symbol count */
-    if (m->hashtab) {
-        m->nbucket   = m->hashtab[0];
-        m->nchain    = m->hashtab[1];
-        m->sym_count = m->nchain;
-    } else if (dt_gnu_hash_val) {
-        uint32_t *gh = (uint32_t *)(load_bias + dt_gnu_hash_val);
-        m->sym_count = dl_gnu_hash_nsyms(gh);
-    } else {
-        /* Heuristic: estimate from strtab proximity */
-        if (dt_strtab > dt_symtab && dt_symtab != 0)
-            m->sym_count = (uint32_t)((dt_strtab - dt_symtab) / sizeof(dl_sym_t));
-        else
-            m->sym_count = 64;  /* Fallback guess */
-    }
+    m->nbucket   = validated_nbucket;
+    m->nchain    = validated_nchain;
+    m->sym_count = validated_sym_count;
 
     serial_puts("[DL] Symbols: ");
     serial_putdec(m->sym_count);
@@ -838,6 +1218,15 @@ void *dl_open_flags(const char *filename, int flags)
     serial_puts("' loaded OK\n");
 
     return m;
+
+fail:
+    if (data) kfree(data);
+    if (phys_base) mem_free_pages(phys_base, total_pages);
+    memset(m, 0, sizeof(*m));
+    serial_puts("[DL] ");
+    serial_puts(error ? error : "Load failed");
+    serial_puts("\n");
+    return NULL;
 }
 
 /* ── dl_link_all: apply relocations + init for deferred modules ── */
@@ -941,9 +1330,10 @@ void *dl_sym(void *handle, const char *name)
         uint32_t *chain  = bucket + m->nbucket;
 
         uint32_t idx = bucket[h % m->nbucket];
-        while (idx != 0 && idx < m->sym_count) {
+        uint32_t steps = 0;
+        while (idx != 0 && idx < m->sym_count && steps++ < m->sym_count) {
             dl_sym_t *sym = &m->symtab[idx];
-            if (sym->st_name < m->strtab_sz &&
+            if (dl_strtab_name_valid(m->strtab, m->strtab_sz, sym->st_name) &&
                 strcmp(m->strtab + sym->st_name, name) == 0) {
                 if (sym->st_shndx != SHN_UNDEF)
                     return (void *)(m->load_bias + sym->st_value);
@@ -957,7 +1347,7 @@ void *dl_sym(void *handle, const char *name)
     for (uint32_t i = 1; i < m->sym_count; i++) {
         dl_sym_t *sym = &m->symtab[i];
         if (sym->st_shndx == SHN_UNDEF) continue;
-        if (sym->st_name >= m->strtab_sz) continue;
+        if (!dl_strtab_name_valid(m->strtab, m->strtab_sz, sym->st_name)) continue;
         if (strcmp(m->strtab + sym->st_name, name) == 0)
             return (void *)(m->load_bias + sym->st_value);
     }
@@ -967,12 +1357,13 @@ void *dl_sym(void *handle, const char *name)
 
 /* ── dl_close: unload module ────────────────────────────────── */
 
-int dl_close(void *handle)
+static int dl_release(void *handle, bool call_fini)
 {
     dl_module_t *m = (dl_module_t *)handle;
     if (!m || !m->loaded)
         return -1;
 
+    if (m->refcount == 0) return -1;
     m->refcount--;
     if (m->refcount > 0) {
         serial_puts("[DL] Refcount=");
@@ -982,7 +1373,7 @@ int dl_close(void *handle)
     }
 
     /* Call fini function */
-    if (m->fini_fn) {
+    if (call_fini && m->fini_fn) {
         serial_puts("[DL] Calling fini\n");
         m->fini_fn();
     }
@@ -991,11 +1382,20 @@ int dl_close(void *handle)
     serial_puts(m->name);
     serial_puts("'\n");
 
-    mem_free_pages(m->base, m->pages);
-    m->loaded = false;
-    m->base = NULL;
+    mem_free_pages(m->phys_base, m->pages);
+    memset(m, 0, sizeof(*m));
 
     return 0;
+}
+
+int dl_close(void *handle)
+{
+    return dl_release(handle, true);
+}
+
+int dl_discard(void *handle)
+{
+    return dl_release(handle, false);
 }
 
 /* ── dl_list: list loaded modules ───────────────────────────── */
@@ -1035,6 +1435,10 @@ void dl_list_modules(void)
         serial_putdec(m->sym_count);
         serial_puts(" ref=");
         serial_putdec(m->refcount);
+        if (m->owner_id) {
+            serial_puts(" owner=");
+            serial_putdec(m->owner_id);
+        }
         serial_puts("\n");
 
         fb_puts(" ");
@@ -1077,7 +1481,7 @@ void dl_list_modules(void)
 
 void *dl_find(const char *name)
 {
-    return mod_find(name);
+    return mod_find(name, 0);
 }
 
 /* ── Initialize dynamic linker ──────────────────────────────── */

@@ -357,6 +357,7 @@ void  pe_free_for_owner(PVOID addr, SIZE_T size, ULONG owner_pid);
 /* PE images are mapped outside the VirtualAlloc VMA tracker. These helpers
  * let NtAllocateVirtualMemory/NtQueryVirtualMemory treat them as occupied. */
 BOOL pe_va_range_conflicts(ULONGLONG base, ULONGLONG size);
+ULONGLONG pe_va_range_conflict_end(ULONGLONG base, ULONGLONG size);
 BOOL pe_va_query_range(ULONGLONG address, ULONGLONG *base,
                        ULONGLONG *size, ULONGLONG *next_base);
 

@@ -108,17 +108,8 @@ ralloc_context(const void *ctx)
 void *
 ralloc_size(const void *ctx, size_t size)
 {
-   /* Some malloc allocation doesn't always align to 16 bytes even on 64 bits
-    * system, from Android bionic/tests/malloc_test.cpp:
-    *  - Allocations of a size that rounds up to a multiple of 16 bytes
-    *    must have at least 16 byte alignment.
-    *  - Allocations of a size that rounds up to a multiple of 8 bytes and
-    *    not 16 bytes, are only required to have at least 8 byte alignment.
-    *
-    * OsitoK W4.7-fix: malloc returns 8-aligned only. Mesa code emits
-    * movaps to zero linear_ctx structs which faults #GP on 8-aligned
-    * memory. Use posix_memalign for guaranteed 16-byte alignment.
-    */
+   /* Keep ralloc headers 16-byte aligned and preserve the standard
+    * posix_memalign/free/realloc ownership contract. */
    size_t alloc_size = align64(size + sizeof(ralloc_header),
                                alignof(ralloc_header));
    void *block = NULL;
@@ -1470,4 +1461,3 @@ ralloc_print_info(FILE *f, const void *p, unsigned flags)
 
    fprintf(f, "====\n");
 }
-

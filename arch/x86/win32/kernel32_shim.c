@@ -481,35 +481,67 @@ static BOOL named_object_contains(const char *name, const char *needle)
 static BOOL named_object_is_steamipc(const char *name)
 {
     return named_object_is_steamchrome(name) ||
+           named_object_contains(name, "steamipc") ||
            named_object_contains(name, "steamservice") ||
            named_object_contains(name, "steamclientservice");
+}
+
+static BOOL named_object_canonicalize(const char *source,
+                                      char name[K32_OBJECT_NAME_MAX])
+{
+    static const char base_named_objects[] = "\\basenamedobjects\\";
+    const char *canonical = source ? source : "";
+
+    for (const char *p = canonical; *p; p++) {
+        int i = 0;
+        while (base_named_objects[i] && p[i] &&
+               named_object_fold(p[i] == '/' ? '\\' : p[i]) ==
+                   base_named_objects[i])
+            i++;
+        if (!base_named_objects[i]) {
+            canonical = p + i;
+            break;
+        }
+    }
+
+    if (named_object_fold(canonical[0]) == 'l' &&
+        named_object_fold(canonical[1]) == 'o' &&
+        named_object_fold(canonical[2]) == 'c' &&
+        named_object_fold(canonical[3]) == 'a' &&
+        named_object_fold(canonical[4]) == 'l' &&
+        (canonical[5] == '\\' || canonical[5] == '/'))
+        canonical += 6;
+
+    int i = 0;
+    while (canonical[i] && i < K32_OBJECT_NAME_MAX - 1) {
+        char c = canonical[i];
+        name[i++] = named_object_fold(c == '/' ? '\\' : c);
+    }
+    name[i] = 0;
+    return !canonical[i];
 }
 
 static BOOL named_object_name_a(PCSTR source,
                                 char name[K32_OBJECT_NAME_MAX])
 {
-    int i = 0;
-    if (source)
-        while (source[i] && i < K32_OBJECT_NAME_MAX - 1) {
-            name[i] = named_object_fold(source[i]);
-            i++;
-        }
-    name[i] = 0;
-    return !source || !source[i];
+    return named_object_canonicalize(source, name);
 }
 
 static BOOL named_object_name_w(PCWSTR source,
                                 char name[K32_OBJECT_NAME_MAX])
 {
+    char ascii[K32_OBJECT_NAME_MAX * 2];
     int i = 0;
-    /* ponytail: named kernel objects use ASCII until a caller needs Unicode. */
-    if (source)
-        while (source[i] && i < K32_OBJECT_NAME_MAX - 1) {
-            name[i] = named_object_fold((char)source[i]);
+    if (source) {
+        while (source[i] && i < (int)sizeof(ascii) - 1) {
+            if (source[i] > 0x7f) return FALSE;
+            ascii[i] = (char)source[i];
             i++;
         }
-    name[i] = 0;
-    return !source || !source[i];
+        if (source[i]) return FALSE;
+    }
+    ascii[i] = 0;
+    return named_object_canonicalize(ascii, name);
 }
 
 static int named_object_find_locked(K32_NAMED_OBJECT *objects, int count,
@@ -5912,6 +5944,25 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
     BOOL trace_angle_request = FALSE;
     LOADED_MODULE *loaded_module = hModule
         ? dll_find_module_by_base((PVOID)hModule) : NULL;
+    BOOL trace_lwjgl_context = !by_ordinal &&
+        k32_path_contains_ci(proc_name, "WindowsContextImplementation");
+    BOOL trace_lwjgl_module = loaded_module &&
+        k32_path_contains_ci(loaded_module->name, "lwjgl.dll");
+    BOOL trace_lwjgl_gpa = trace_lwjgl_context || trace_lwjgl_module;
+
+    if (trace_lwjgl_gpa) {
+        serial_puts("[LWJGL-JNI-GPA] request ");
+        if (by_ordinal)
+            serial_putdec(ordinal);
+        else
+            serial_puts(proc_name);
+        serial_puts(" hmod=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)hModule, 8);
+        serial_puts(" module=");
+        serial_puts(loaded_module && loaded_module->name[0]
+                        ? loaded_module->name : "<unknown>");
+        serial_puts("\n");
+    }
 
     /* If hModule is a loaded PE module, search its exports */
     if (loaded_module && loaded_module->synthetic_shim) {
@@ -5993,6 +6044,11 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
         if (fn) {
             PVOID result = by_ordinal ? fn : angle_trace_egl_export(
                 proc_name, bridge_steamservice_export(mod, proc_name, fn));
+            if (trace_lwjgl_gpa) {
+                serial_puts("[LWJGL-JNI-GPA] resolved 0x");
+                serial_puthex((uint64_t)(ULONG_PTR)result, 8);
+                serial_puts("\n");
+            }
             if (trace_angle_request)
                 angle_gpa_trace_result(proc_name, result, "export");
             return result;
@@ -6025,6 +6081,11 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
 
     /* Fall back to searching all shims and modules */
     PVOID result = dll_resolve_import("", proc_name, ordinal, by_ordinal);
+    if (trace_lwjgl_gpa) {
+        serial_puts("[LWJGL-JNI-GPA] fallback 0x");
+        serial_puthex((uint64_t)(ULONG_PTR)result, 8);
+        serial_puts("\n");
+    }
     if (!result && K32_VERBOSE_DIAGNOSTICS) {
         serial_puts("[GPA] UNRESOLVED: ");
         if (by_ordinal) {
@@ -6087,42 +6148,96 @@ static BOOL store_module_handle(PHANDLE output, HANDLE module)
     return TRUE;
 }
 
+#define K32_GET_MODULE_HANDLE_EX_FLAG_PIN                0x00000001U
+#define K32_GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 0x00000002U
+#define K32_GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS       0x00000004U
+
+static PVOID k32_main_image_from_address(PVOID address)
+{
+    BYTE *base = (BYTE *)win32_current_image_base();
+    if (!base) return NULL;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos->e_lfanew < (LONG)sizeof(*dos) || dos->e_lfanew >= 0x1000)
+        return NULL;
+
+    BYTE *nt_base = base + dos->e_lfanew;
+    if (*(ULONG *)nt_base != IMAGE_NT_SIGNATURE) return NULL;
+    USHORT magic = *(USHORT *)(nt_base + sizeof(ULONG) +
+                               sizeof(IMAGE_FILE_HEADER));
+    ULONG size;
+    if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        size = ((PIMAGE_NT_HEADERS32)nt_base)->OptionalHeader.SizeOfImage;
+    else if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        size = ((PIMAGE_NT_HEADERS64)nt_base)->OptionalHeader.SizeOfImage;
+    else
+        return NULL;
+
+    ULONG_PTR value = (ULONG_PTR)address;
+    ULONG_PTR start = (ULONG_PTR)base;
+    return value >= start && value - start < size ? base : NULL;
+}
+
+static HANDLE k32_get_module_handle_ex_a(DWORD flags, PCSTR module_name)
+{
+    BOOL pin = (flags & K32_GET_MODULE_HANDLE_EX_FLAG_PIN) != 0;
+    BOOL add_reference =
+        (flags & (K32_GET_MODULE_HANDLE_EX_FLAG_PIN |
+                  K32_GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT)) == 0;
+
+    if (flags & K32_GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
+        PVOID address = (PVOID)(ULONG_PTR)module_name;
+        PVOID found = dll_get_module_handle_by_address(
+            address, add_reference, pin);
+        if (!found)
+            found = k32_main_image_from_address(address);
+        return (HANDLE)found;
+    }
+
+    if (!module_name)
+        return GetModuleHandleA(NULL);
+
+    PVOID found = dll_get_module_handle_ex(module_name, add_reference, pin);
+    if (!found)
+        found = dll_get_shim_module_handle_ex(module_name, add_reference, pin);
+    return (HANDLE)found;
+}
+
 BOOL WINAPI GetModuleHandleExA(DWORD flags, PCSTR module_name, PHANDLE module)
 {
-    if ((flags & ~7U) || ((flags & 3U) == 3U) ||
-        ((flags & 4U) && !module_name)) {
+    if (!module || (flags & ~7U) || ((flags & 3U) == 3U) ||
+        ((flags & K32_GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) &&
+         !module_name)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
-    HANDLE found;
-    if (flags & 4U) { /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */
-        LOADED_MODULE *loaded =
-            dll_find_module_by_address((PVOID)(ULONG_PTR)module_name);
-        found = loaded ? (HANDLE)loaded->image.ImageBase
-                       : GetModuleHandleA(NULL);
-    } else {
-        found = GetModuleHandleA(module_name);
-    }
-    return store_module_handle(module, found);
+    return store_module_handle(module,
+                               k32_get_module_handle_ex_a(flags, module_name));
 }
 
 BOOL WINAPI GetModuleHandleExW(DWORD flags, PCWSTR module_name, PHANDLE module)
 {
-    if ((flags & ~7U) || ((flags & 3U) == 3U) ||
-        ((flags & 4U) && !module_name)) {
+    if (!module || (flags & ~7U) || ((flags & 3U) == 3U) ||
+        ((flags & K32_GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) &&
+         !module_name)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
-    HANDLE found;
-    if (flags & 4U) { /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */
-        LOADED_MODULE *loaded =
-            dll_find_module_by_address((PVOID)(ULONG_PTR)module_name);
-        found = loaded ? (HANDLE)loaded->image.ImageBase
-                       : GetModuleHandleW(NULL);
-    } else {
-        found = GetModuleHandleW(module_name);
+
+    if ((flags & K32_GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) || !module_name)
+        return store_module_handle(
+            module, k32_get_module_handle_ex_a(flags, (PCSTR)module_name));
+
+    char narrow[260];
+    int i = 0;
+    while (module_name[i] && i < 259) {
+        narrow[i] = (char)module_name[i];
+        i++;
     }
-    return store_module_handle(module, found);
+    narrow[i] = 0;
+    return store_module_handle(module,
+                               k32_get_module_handle_ex_a(flags, narrow));
 }
 
 static PVOID WINAPI RtlPcToFileHeader_k32(PVOID pc, PVOID *image_base)
@@ -6133,25 +6248,7 @@ static PVOID WINAPI RtlPcToFileHeader_k32(PVOID pc, PVOID *image_base)
     LOADED_MODULE *module = dll_find_module_by_address(pc);
     if (module) return *image_base = module->image.ImageBase;
 
-    BYTE *base = (BYTE *)win32_current_image_base();
-    if (!base) return NULL;
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0)
-        return NULL;
-    BYTE *nt_base = base + dos->e_lfanew;
-    if (*(ULONG *)nt_base != IMAGE_NT_SIGNATURE) return NULL;
-    USHORT magic = *(USHORT *)(nt_base + sizeof(ULONG) + sizeof(IMAGE_FILE_HEADER));
-    ULONG size;
-    if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
-        size = ((PIMAGE_NT_HEADERS32)nt_base)->OptionalHeader.SizeOfImage;
-    else if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-        size = ((PIMAGE_NT_HEADERS64)nt_base)->OptionalHeader.SizeOfImage;
-    else
-        return NULL;
-    ULONG_PTR value = (ULONG_PTR)pc, start = (ULONG_PTR)base;
-    if (value >= start && value - start < size)
-        return *image_base = base;
-    return NULL;
+    return *image_base = k32_main_image_from_address(pc);
 }
 
 static BOOL WINAPI RtlAddFunctionTable_k32(PVOID function_table,
@@ -7838,10 +7935,11 @@ static static_tls_module_t static_tls_modules[MAX_STATIC_TLS_MODULES];
 static int static_tls_module_count;
 static void tls_clear_slot_process(DWORD index, DWORD process_id);
 static BOOL win32_tls_seed_existing_threads(const static_tls_module_t *mod);
-static void win64_tls_reset_all(void);
+static void win64_tls_reset_root(void);
 
 #define MAX_STATIC_TLS64_MODULES 128
 typedef struct {
+    DWORD    owner_pid;
     PPEB     owner;
     DWORD    index;
     PVOID    image_base;
@@ -7854,6 +7952,19 @@ typedef struct {
 
 static static_tls64_module_t static_tls64_modules[MAX_STATIC_TLS64_MODULES];
 static int static_tls64_module_count;
+static volatile int static_tls64_module_lock;
+
+static void static_tls64_lock_acquire(void)
+{
+    while (__atomic_exchange_n(&static_tls64_module_lock, 1,
+                               __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+}
+
+static void static_tls64_lock_release(void)
+{
+    __atomic_store_n(&static_tls64_module_lock, 0, __ATOMIC_RELEASE);
+}
 
 static void tls_process_states_lock_acquire(void)
 {
@@ -8022,7 +8133,7 @@ static void tls_free_static_vector(uint32_t *vector, DWORD owner_pid)
 
 void win32_tls_reset(void)
 {
-    win64_tls_reset_all();
+    win64_tls_reset_root();
     DWORD owner_pid = g_teb32.ClientId_UniqueProcess;
     if (!owner_pid) owner_pid = 1;
     tls_free_static_vector(tls_vector32, owner_pid);
@@ -8801,7 +8912,9 @@ typedef struct {
 
 static win32_thread_ctx_t *g_win32_threads;
 static volatile BYTE *g_win32_thread_slot_reserved;
+static win32_thread_ctx_t **g_win32_threads_by_sched_slot;
 static int g_win32_thread_capacity;
+static int g_win32_thread_sched_capacity;
 static volatile uint32_t g_win32_thread_table_state;
 static WCHAR g_primary_thread_description[64];
 
@@ -8817,7 +8930,8 @@ static BOOL win32_thread_table_ensure(void)
                                     FALSE, __ATOMIC_ACQ_REL,
                                     __ATOMIC_ACQUIRE)) {
         extern uint32_t sched_capacity_get(void);
-        uint32_t capacity = sched_capacity_get();
+        uint32_t scheduler_capacity = sched_capacity_get();
+        uint32_t capacity = scheduler_capacity;
         if (capacity > WIN32_SCHEDULER_SLOT_RESERVE)
             capacity -= WIN32_SCHEDULER_SLOT_RESERVE;
 
@@ -8851,6 +8965,10 @@ static BOOL win32_thread_table_ensure(void)
         g_win32_threads = contexts;
         g_win32_thread_slot_reserved = reserved;
         g_win32_thread_capacity = (int)capacity;
+        g_win32_threads_by_sched_slot = (win32_thread_ctx_t **)kcalloc(
+            scheduler_capacity, sizeof(*g_win32_threads_by_sched_slot));
+        g_win32_thread_sched_capacity = g_win32_threads_by_sched_slot
+            ? (int)scheduler_capacity : 0;
         __atomic_store_n(&g_win32_thread_table_state, 2, __ATOMIC_RELEASE);
         serial_puts("[K32] Win32 thread capacity ");
         serial_putdec(capacity);
@@ -8971,54 +9089,102 @@ static void win64_tls_free_block(PVOID block, SIZE_T size)
         mem_free_pages((void *)VIRT_TO_PHYS(block), pages);
 }
 
-static void win64_tls_free_vector(PPEB owner, PVOID *vector)
+static void win64_tls_free_vector_locked(DWORD owner_pid, PVOID *vector)
 {
     if (!vector) return;
     for (int i = 0; i < static_tls64_module_count; i++) {
         static_tls64_module_t *mod = &static_tls64_modules[i];
-        if (mod->owner != owner || !vector[mod->index]) continue;
+        if (mod->owner_pid != owner_pid || !vector[mod->index]) continue;
         win64_tls_free_block(vector[mod->index], mod->total_size);
         vector[mod->index] = NULL;
     }
 }
 
-static void win64_tls_reset_all(void)
+static void win64_tls_free_vector(DWORD owner_pid, PVOID *vector)
 {
-    for (int i = 0; i < static_tls64_module_count; i++) {
-        static_tls64_module_t *mod = &static_tls64_modules[i];
-        if (tls_vector64 && tls_vector64[mod->index]) {
-            win64_tls_free_block(tls_vector64[mod->index], mod->total_size);
-            tls_vector64[mod->index] = NULL;
+    static_tls64_lock_acquire();
+    win64_tls_free_vector_locked(owner_pid, vector);
+    static_tls64_lock_release();
+}
+
+static void win64_tls_reset_root(void)
+{
+    DWORD owner_pid = (DWORD)(ULONG_PTR)g_teb.ClientId.UniqueProcess;
+    if (!owner_pid) owner_pid = 1;
+
+    static_tls64_lock_acquire();
+    for (int i = 0; i < static_tls64_module_count;) {
+        static_tls64_module_t mod = static_tls64_modules[i];
+        if (mod.owner_pid != owner_pid) {
+            i++;
+            continue;
+        }
+        if (tls_vector64 && tls_vector64[mod.index]) {
+            win64_tls_free_block(tls_vector64[mod.index], mod.total_size);
+            tls_vector64[mod.index] = NULL;
         }
         for (int j = 0; j < g_win32_thread_capacity; j++) {
             win32_thread_ctx_t *ctx = &g_win32_threads[j];
-            if (!ctx->compat32 && ctx->tls_vector64[mod->index]) {
-                win64_tls_free_block(ctx->tls_vector64[mod->index],
-                                     mod->total_size);
-                ctx->tls_vector64[mod->index] = NULL;
+            if (!ctx->compat32 && ctx->owner_pid == owner_pid &&
+                ctx->tls_vector64[mod.index]) {
+                win64_tls_free_block(ctx->tls_vector64[mod.index],
+                                     mod.total_size);
+                ctx->tls_vector64[mod.index] = NULL;
             }
         }
+        for (int j = i + 1; j < static_tls64_module_count; j++)
+            static_tls64_modules[j - 1] = static_tls64_modules[j];
+        static_tls64_module_count--;
     }
-    static_tls64_module_count = 0;
+    static_tls64_lock_release();
 }
 
 static BOOL win64_tls_attach_thread(win32_thread_ctx_t *ctx)
 {
+    DWORD owner_pid = ctx->owner_pid;
     PPEB owner = ctx->owner_peb;
+    static_tls64_module_t attached[MAX_STATIC_TLS64_MODULES];
+    int attached_count = 0;
+
+    static_tls64_lock_acquire();
     for (int i = 0; i < static_tls64_module_count; i++) {
         static_tls64_module_t *mod = &static_tls64_modules[i];
-        if (mod->owner != owner || ctx->tls_vector64[mod->index]) continue;
+        if (mod->owner_pid != owner_pid || ctx->tls_vector64[mod->index])
+            continue;
         ctx->tls_vector64[mod->index] = win64_tls_alloc_block(mod);
         if (!ctx->tls_vector64[mod->index]) {
-            win64_tls_free_vector(owner, ctx->tls_vector64);
+            win64_tls_free_vector_locked(owner_pid, ctx->tls_vector64);
+            static_tls64_lock_release();
             return FALSE;
         }
     }
 
-    typedef void (WINAPI *tls_callback_fn)(PVOID, DWORD, PVOID);
     for (int i = 0; i < static_tls64_module_count; i++) {
         static_tls64_module_t *mod = &static_tls64_modules[i];
-        if (mod->owner != owner) continue;
+        if (mod->owner_pid == owner_pid)
+            attached[attached_count++] = *mod;
+    }
+    static_tls64_lock_release();
+
+    typedef void (WINAPI *tls_callback_fn)(PVOID, DWORD, PVOID);
+    for (int i = 0; i < attached_count; i++) {
+        static_tls64_module_t *mod = &attached[i];
+        if ((uint64_t)(ULONG_PTR)mod->image_base == 0x180000000ULL) {
+            serial_puts("[TLS64-CEF-ATTACH] owner=");
+            serial_putdec(owner_pid);
+            serial_puts(" tid=");
+            serial_putdec(ctx->tid);
+            serial_puts(" kpid=");
+            serial_putdec((uint64_t)(uint32_t)ctx->kernel_pid);
+            serial_puts(" peb=0x");
+            serial_puthex((uint64_t)(ULONG_PTR)owner, 16);
+            serial_puts(" slot=");
+            serial_putdec(mod->index);
+            serial_puts(" block=0x");
+            serial_puthex((uint64_t)(ULONG_PTR)
+                          ctx->tls_vector64[mod->index], 16);
+            serial_puts("\n");
+        }
         uint64_t *callbacks = (uint64_t *)mod->callbacks_addr;
         for (DWORD j = 0; j < mod->callback_count; j++)
             ((tls_callback_fn)(ULONG_PTR)callbacks[j])(
@@ -9029,38 +9195,56 @@ static BOOL win64_tls_attach_thread(win32_thread_ctx_t *ctx)
 
 static void win64_tls_detach_thread(win32_thread_ctx_t *ctx, BOOL callbacks)
 {
-    PPEB owner = ctx->owner_peb;
+    DWORD owner_pid = ctx->owner_pid;
+    static_tls64_module_t attached[MAX_STATIC_TLS64_MODULES];
+    int attached_count = 0;
+
+    static_tls64_lock_acquire();
+    for (int i = 0; i < static_tls64_module_count; i++) {
+        if (static_tls64_modules[i].owner_pid == owner_pid)
+            attached[attached_count++] = static_tls64_modules[i];
+    }
+    static_tls64_lock_release();
+
     if (callbacks) {
         typedef void (WINAPI *tls_callback_fn)(PVOID, DWORD, PVOID);
-        for (int i = static_tls64_module_count - 1; i >= 0; i--) {
-            static_tls64_module_t mod = static_tls64_modules[i];
-            if (mod.owner != owner) continue;
+        for (int i = attached_count - 1; i >= 0; i--) {
+            static_tls64_module_t mod = attached[i];
             uint64_t *entries = (uint64_t *)mod.callbacks_addr;
             for (DWORD j = 0; j < mod.callback_count; j++)
                 ((tls_callback_fn)(ULONG_PTR)entries[j])(
                     mod.image_base, DLL_THREAD_DETACH, NULL);
         }
     }
-    win64_tls_free_vector(owner, ctx->tls_vector64);
+    win64_tls_free_vector(owner_pid, ctx->tls_vector64);
 }
 
 DWORD win64_tls_alloc_static_index(void)
 {
     TEB *teb = win64_current_teb();
-    PPEB owner = teb ? teb->ProcessEnvironmentBlock : NULL;
-    if (!owner || !teb->ThreadLocalStoragePointer) return (DWORD)-1;
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid && teb)
+        owner_pid = (DWORD)(ULONG_PTR)teb->ClientId.UniqueProcess;
+    if (!owner_pid || !teb || !teb->ProcessEnvironmentBlock ||
+        !teb->ThreadLocalStoragePointer)
+        return (DWORD)-1;
 
+    static_tls64_lock_acquire();
     for (DWORD index = 0; index < TLS_MAX_SLOTS; index++) {
         BOOL used = FALSE;
         for (int i = 0; i < static_tls64_module_count; i++) {
-            if (static_tls64_modules[i].owner == owner &&
+            if (static_tls64_modules[i].owner_pid == owner_pid &&
                 static_tls64_modules[i].index == index) {
                 used = TRUE;
                 break;
             }
         }
-        if (!used) return index;
+        if (!used) {
+            static_tls64_lock_release();
+            return index;
+        }
     }
+    static_tls64_lock_release();
     return (DWORD)-1;
 }
 
@@ -9069,11 +9253,15 @@ BOOL win64_tls_register_static(DWORD index, PVOID image_base, PVOID raw_start,
                                PVOID callbacks_addr, DWORD callback_count)
 {
     TEB *teb = win64_current_teb();
-    if (!teb || !teb->ProcessEnvironmentBlock || index >= TLS_MAX_SLOTS ||
-        static_tls64_module_count >= MAX_STATIC_TLS64_MODULES)
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid && teb)
+        owner_pid = (DWORD)(ULONG_PTR)teb->ClientId.UniqueProcess;
+    if (!owner_pid || !teb || !teb->ProcessEnvironmentBlock ||
+        index >= TLS_MAX_SLOTS || !image_base)
         return FALSE;
 
     static_tls64_module_t mod = {
+        .owner_pid = owner_pid,
         .owner = teb->ProcessEnvironmentBlock,
         .index = index,
         .image_base = image_base,
@@ -9084,10 +9272,30 @@ BOOL win64_tls_register_static(DWORD index, PVOID image_base, PVOID raw_start,
         .callback_count = callback_count,
     };
 
+    static_tls64_lock_acquire();
+    if (static_tls64_module_count >= MAX_STATIC_TLS64_MODULES) {
+        static_tls64_lock_release();
+        return FALSE;
+    }
+    for (int i = 0; i < static_tls64_module_count; i++) {
+        static_tls64_module_t *existing = &static_tls64_modules[i];
+        if (existing->owner_pid == mod.owner_pid &&
+            (existing->index == index ||
+             existing->image_base == image_base)) {
+            static_tls64_lock_release();
+            return FALSE;
+        }
+    }
+
+    /* Publish the descriptor before walking existing threads. A thread that
+     * starts during registration now either sees this entry in its attach
+     * pass or is seeded by the loop below; there is no missing-slot window. */
+    static_tls64_modules[static_tls64_module_count++] = mod;
+
     for (int i = 0; i < g_win32_thread_capacity; i++) {
         win32_thread_ctx_t *ctx = &g_win32_threads[i];
-        if (!ctx->active || ctx->compat32 ||
-            ctx->owner_peb != mod.owner ||
+        if (!__atomic_load_n(&ctx->active, __ATOMIC_ACQUIRE) ||
+            ctx->compat32 || ctx->owner_pid != mod.owner_pid ||
             ctx->tls_vector64[index])
             continue;
         ctx->tls_vector64[index] = win64_tls_alloc_block(&mod);
@@ -9095,27 +9303,45 @@ BOOL win64_tls_register_static(DWORD index, PVOID image_base, PVOID raw_start,
             for (int j = 0; j < g_win32_thread_capacity; j++) {
                 win32_thread_ctx_t *rollback = &g_win32_threads[j];
                 if (!rollback->compat32 &&
-                    rollback->owner_peb == mod.owner &&
+                    rollback->owner_pid == mod.owner_pid &&
                     rollback->tls_vector64[index]) {
                     win64_tls_free_block(rollback->tls_vector64[index],
                                          total_size);
                     rollback->tls_vector64[index] = NULL;
                 }
             }
+            static_tls64_module_count--;
+            static_tls64_lock_release();
             return FALSE;
         }
     }
-    static_tls64_modules[static_tls64_module_count++] = mod;
+    static_tls64_lock_release();
+
+    if ((uint64_t)(ULONG_PTR)image_base == 0x180000000ULL) {
+        serial_puts("[TLS64-CEF-REGISTER] owner=");
+        serial_putdec(owner_pid);
+        serial_puts(" peb=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)mod.owner, 16);
+        serial_puts(" slot=");
+        serial_putdec(index);
+        serial_puts("\n");
+    }
     return TRUE;
 }
 
 void win64_tls_unregister_image(PVOID image_base)
 {
     TEB *teb = win64_current_teb();
-    PPEB owner = teb ? teb->ProcessEnvironmentBlock : NULL;
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid && teb)
+        owner_pid = (DWORD)(ULONG_PTR)teb->ClientId.UniqueProcess;
+    if (!owner_pid) return;
+
+    BOOL removed = FALSE;
+    static_tls64_lock_acquire();
     for (int i = 0; i < static_tls64_module_count;) {
         static_tls64_module_t mod = static_tls64_modules[i];
-        if (mod.owner != owner || mod.image_base != image_base) {
+        if (mod.owner_pid != owner_pid || mod.image_base != image_base) {
             i++;
             continue;
         }
@@ -9126,7 +9352,7 @@ void win64_tls_unregister_image(PVOID image_base)
         }
         for (int j = 0; j < g_win32_thread_capacity; j++) {
             win32_thread_ctx_t *ctx = &g_win32_threads[j];
-            if (ctx->owner_peb == owner &&
+            if (ctx->owner_pid == owner_pid &&
                 ctx->tls_vector64[mod.index] && ctx->tls_vector64 != current) {
                 win64_tls_free_block(ctx->tls_vector64[mod.index],
                                      mod.total_size);
@@ -9138,19 +9364,29 @@ void win64_tls_unregister_image(PVOID image_base)
         for (int j = i + 1; j < static_tls64_module_count; j++)
             static_tls64_modules[j - 1] = static_tls64_modules[j];
         static_tls64_module_count--;
+        removed = TRUE;
+    }
+    static_tls64_lock_release();
+
+    if (removed && (uint64_t)(ULONG_PTR)image_base == 0x180000000ULL) {
+        serial_puts("[TLS64-CEF-UNREGISTER] owner=");
+        serial_putdec(owner_pid);
+        serial_puts("\n");
     }
 }
 
 void win64_tls_release_process(TEB *teb)
 {
     if (!teb) return;
-    PPEB owner = teb->ProcessEnvironmentBlock;
     DWORD owner_pid = (DWORD)(ULONG_PTR)teb->ClientId.UniqueProcess;
     if (!owner_pid) owner_pid = win32_current_process_id();
+    if (!owner_pid) return;
     PVOID *vector = (PVOID *)teb->ThreadLocalStoragePointer;
+
+    static_tls64_lock_acquire();
     for (int i = 0; i < static_tls64_module_count;) {
         static_tls64_module_t mod = static_tls64_modules[i];
-        if (mod.owner != owner) {
+        if (mod.owner_pid != owner_pid) {
             i++;
             continue;
         }
@@ -9160,7 +9396,7 @@ void win64_tls_release_process(TEB *teb)
         }
         for (int j = 0; j < g_win32_thread_capacity; j++) {
             win32_thread_ctx_t *ctx = &g_win32_threads[j];
-            if (ctx->owner_peb == owner &&
+            if (ctx->owner_pid == owner_pid &&
                 ctx->tls_vector64[mod.index] && ctx->tls_vector64 != vector) {
                 win64_tls_free_block(ctx->tls_vector64[mod.index],
                                      mod.total_size);
@@ -9169,10 +9405,16 @@ void win64_tls_release_process(TEB *teb)
         }
         tls_trace_slot42("release", mod.index, NULL,
                          (uint64_t)__builtin_return_address(0));
+        if ((uint64_t)(ULONG_PTR)mod.image_base == 0x180000000ULL) {
+            serial_puts("[TLS64-CEF-RELEASE] owner=");
+            serial_putdec(owner_pid);
+            serial_puts("\n");
+        }
         for (int j = i + 1; j < static_tls64_module_count; j++)
             static_tls64_modules[j - 1] = static_tls64_modules[j];
         static_tls64_module_count--;
     }
+    static_tls64_lock_release();
 
     tls_release_process_slots(owner_pid);
 }
@@ -9265,11 +9507,35 @@ static void tls_clear_slot_process(DWORD index, DWORD process_id)
 /* Look up context by kernel PID (called from thread entry) */
 static win32_thread_ctx_t *find_ctx_by_pid(int pid)
 {
+    int current_slot = -1;
+    if (g_win32_threads_by_sched_slot && pid == proc_current_pid()) {
+        extern int sched_current_get(void);
+        current_slot = sched_current_get();
+        if (current_slot >= 0 &&
+            current_slot < g_win32_thread_sched_capacity) {
+            win32_thread_ctx_t *ctx = __atomic_load_n(
+                &g_win32_threads_by_sched_slot[current_slot],
+                __ATOMIC_ACQUIRE);
+            if (ctx &&
+                __atomic_load_n(&ctx->active, __ATOMIC_ACQUIRE) &&
+                __atomic_load_n(&ctx->kernel_pid,
+                                __ATOMIC_ACQUIRE) == pid)
+                return ctx;
+        }
+    }
+
     for (int i = 0; i < g_win32_thread_capacity; i++) {
         if (__atomic_load_n(&g_win32_threads[i].active, __ATOMIC_ACQUIRE) &&
             __atomic_load_n(&g_win32_threads[i].kernel_pid,
-                            __ATOMIC_ACQUIRE) == pid)
+                            __ATOMIC_ACQUIRE) == pid) {
+            if (current_slot >= 0 &&
+                current_slot < g_win32_thread_sched_capacity) {
+                __atomic_store_n(
+                    &g_win32_threads_by_sched_slot[current_slot],
+                    &g_win32_threads[i], __ATOMIC_RELEASE);
+            }
             return &g_win32_threads[i];
+        }
     }
     return NULL;
 }
@@ -9523,7 +9789,7 @@ static void win32_thread_entry_common(void)
         if (win32_tls_attach_thread()) {
             dll_notify_thread(DLL_THREAD_ATTACH);
             uint32_t arg = (uint32_t)ctx->param;
-            ctx->exit_code = compat32_callback_args_on_stack(
+            ctx->exit_code = compat32_thread_entry_on_stack(
                 (uint32_t)ctx->func_addr, 1, &arg,
                 (uint32_t)(ULONG_PTR)((BYTE *)ctx->stack_base - 64));
             dll_notify_thread(DLL_THREAD_DETACH);
@@ -9871,12 +10137,9 @@ static HANDLE WINAPI CreateRemoteThreadEx_k32(
 
 DWORD WINAPI GetCurrentThreadId(void)
 {
-    /* Check if the calling kernel process matches a Win32 thread */
-    int my_pid = proc_current_pid();
-    for (int i = 0; i < g_win32_thread_capacity; i++) {
-        if (g_win32_threads[i].active && g_win32_threads[i].kernel_pid == my_pid)
-            return g_win32_threads[i].tid;
-    }
+    win32_thread_ctx_t *ctx = find_ctx_by_pid(proc_current_pid());
+    if (ctx)
+        return ctx->tid;
     return win32_current_process_thread_id();
 }
 
@@ -11327,6 +11590,138 @@ extern NTSTATUS sys_NtReleaseSemaphore(ULONG_PTR *);
 
 #define K32_MAX_NAMED_EVENTS K32_MAX_NAMED_OBJECTS
 static K32_NAMED_OBJECT named_events[K32_MAX_NAMED_EVENTS];
+
+typedef struct {
+    USHORT length;
+    USHORT maximum_length;
+    ULONG buffer;
+} K32_UNICODE_STRING32;
+
+typedef struct {
+    ULONG length;
+    ULONG root_directory;
+    ULONG object_name;
+    ULONG attributes;
+    ULONG security_descriptor;
+    ULONG security_quality_of_service;
+} K32_OBJECT_ATTRIBUTES32;
+
+static NTSTATUS named_event_name_from_attributes(
+    POBJECT_ATTRIBUTES attributes, char name[K32_OBJECT_NAME_MAX],
+    BOOL *has_name)
+{
+    char raw[K32_OBJECT_NAME_MAX * 2];
+    USHORT byte_length = 0;
+    ULONG_PTR buffer = 0;
+
+    if (!has_name) return STATUS_INVALID_PARAMETER;
+    *has_name = FALSE;
+    name[0] = 0;
+    if (!attributes) return STATUS_SUCCESS;
+
+    if (g_compat32_mode) {
+        K32_OBJECT_ATTRIBUTES32 *attributes32 =
+            (K32_OBJECT_ATTRIBUTES32 *)(ULONG_PTR)
+                ((ULONG_PTR)attributes & 0xFFFFFFFFULL);
+        if (!attributes32->object_name) return STATUS_SUCCESS;
+        K32_UNICODE_STRING32 *string32 =
+            (K32_UNICODE_STRING32 *)(ULONG_PTR)attributes32->object_name;
+        byte_length = string32->length;
+        buffer = (ULONG_PTR)string32->buffer;
+    } else {
+        if (!attributes->ObjectName) return STATUS_SUCCESS;
+        byte_length = attributes->ObjectName->Length;
+        buffer = (ULONG_PTR)attributes->ObjectName->Buffer;
+    }
+
+    if (byte_length & 1) return STATUS_OBJECT_NAME_INVALID;
+    ULONG chars = byte_length / sizeof(WCHAR);
+    if (!chars) return STATUS_SUCCESS;
+    if (!buffer || chars >= sizeof(raw)) return STATUS_OBJECT_NAME_INVALID;
+
+    const WCHAR *wide = (const WCHAR *)buffer;
+    for (ULONG i = 0; i < chars; i++) {
+        if (wide[i] > 0x7f) return STATUS_OBJECT_NAME_INVALID;
+        raw[i] = (char)wide[i];
+    }
+    raw[chars] = 0;
+    if (!named_object_canonicalize(raw, name))
+        return STATUS_OBJECT_NAME_INVALID;
+    *has_name = name[0] != 0;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS kernel32_nt_open_named_event(POBJECT_ATTRIBUTES attributes,
+                                      ACCESS_MASK desired_access,
+                                      PHANDLE event_handle)
+{
+    if (!event_handle) return STATUS_INVALID_PARAMETER;
+    *event_handle = NULL;
+
+    char name[K32_OBJECT_NAME_MAX];
+    BOOL has_name = FALSE;
+    NTSTATUS status = named_event_name_from_attributes(
+        attributes, name, &has_name);
+    if (!NT_SUCCESS(status) || !has_name)
+        return NT_SUCCESS(status) ? STATUS_OBJECT_NAME_NOT_FOUND : status;
+
+    DWORD saved_error = g_last_error;
+    HANDLE handle = named_object_open(
+        named_events, K32_MAX_NAMED_EVENTS, OBJ_TYPE_EVENT,
+        name, desired_access);
+    g_last_error = saved_error;
+    if (!handle) return STATUS_OBJECT_NAME_NOT_FOUND;
+
+    *event_handle = handle;
+    if (named_object_is_steamipc(name)) {
+        serial_puts("[K32-NATIVE-EVENT] open pid=");
+        serial_putdec(win32_current_process_id());
+        serial_puts(" name='");
+        serial_puts(name);
+        serial_puts("' handle=0x");
+        serial_puthex((ULONG_PTR)handle, 16);
+        serial_puts("\n");
+    }
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS kernel32_nt_publish_named_event(POBJECT_ATTRIBUTES attributes,
+                                         ACCESS_MASK desired_access,
+                                         HANDLE created_handle,
+                                         PHANDLE event_handle,
+                                         BOOL *already_exists)
+{
+    if (!created_handle || !event_handle || !already_exists)
+        return STATUS_INVALID_PARAMETER;
+    *event_handle = created_handle;
+    *already_exists = FALSE;
+
+    char name[K32_OBJECT_NAME_MAX];
+    BOOL has_name = FALSE;
+    NTSTATUS status = named_event_name_from_attributes(
+        attributes, name, &has_name);
+    if (!NT_SUCCESS(status) || !has_name)
+        return status;
+
+    DWORD saved_error = g_last_error;
+    HANDLE published = named_object_publish_access(
+        named_events, K32_MAX_NAMED_EVENTS, OBJ_TYPE_EVENT,
+        name, created_handle, desired_access, already_exists);
+    g_last_error = saved_error;
+    if (!published) return STATUS_INSUFFICIENT_RESOURCES;
+
+    *event_handle = published;
+    if (named_object_is_steamipc(name)) {
+        serial_puts("[K32-NATIVE-EVENT] publish pid=");
+        serial_putdec(win32_current_process_id());
+        serial_puts(" name='");
+        serial_puts(name);
+        serial_puts("' handle=0x");
+        serial_puthex((ULONG_PTR)published, 16);
+        serial_puts(*already_exists ? " existing=1\n" : " existing=0\n");
+    }
+    return STATUS_SUCCESS;
+}
 
 static HANDLE create_event_k32(BOOL manual_reset, BOOL initial_state,
                                const char *name, uint64_t caller)
@@ -14290,12 +14685,10 @@ HANDLE WINAPI LoadLibraryExW(PCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
 
 BOOL WINAPI FreeLibrary(HANDLE hLibModule)
 {
-    LOADED_MODULE *mod = dll_find_module_by_base((PVOID)hLibModule);
-    if (!mod) {
+    if (!dll_release_module((PVOID)hLibModule)) {
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
-    dll_unload(mod);
     return TRUE;
 }
 
@@ -17325,7 +17718,7 @@ static PCSTR process_apply_compat_flags(PCSTR image_path, PCSTR command,
         " --net-log-capture-mode=Everything";
     static const char profile_path[] =
         "C:\\Users\\osito\\AppData\\Local\\Steam\\htmlcache";
-    static const char profile_suffix[] = "-fresh";
+    static const char profile_suffix[] = "-fresh-probe-2";
     const char *angle_pos = NULL;
     const char *profile_pos = NULL;
     SIZE_T angle_span = 0;
@@ -17444,12 +17837,13 @@ static PCSTR process_apply_compat_flags(PCSTR image_path, PCSTR command,
     if (add_netlog || add_netlog_capture)
         serial_puts("[K32-COMPAT] enabled Steam CEF network log\n");
     if (redirect_profile)
-        serial_puts("[K32-COMPAT] Steam CEF profile redirected to htmlcache-fresh\n");
+        serial_puts("[K32-COMPAT] Steam CEF profile redirected to htmlcache-fresh-probe-2\n");
     return adjusted;
 }
 
 static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles,
-                                  DWORD flags, PCSTR current_directory,
+                                  DWORD flags, PCVOID environment,
+                                  PCSTR current_directory,
                                   PVOID startup_info, PVOID information)
 {
     if (!information) {
@@ -17520,14 +17914,14 @@ static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles
         return FALSE;
 
     extern NTSTATUS win32_spawn_child(const char *, const char *, const char *,
-                                      PHANDLE, PHANDLE, DWORD *, DWORD *,
+                                      PCVOID, PHANDLE, PHANDLE, DWORD *, DWORD *,
                                       const HANDLE *, DWORD, DWORD);
     HANDLE process = NULL;
     HANDLE thread = NULL;
     DWORD process_id = 0;
     DWORD thread_id = 0;
     NTSTATUS status = win32_spawn_child(
-        image_path, command_to_spawn, directory_to_spawn,
+        image_path, command_to_spawn, directory_to_spawn, environment,
         &process, &thread, &process_id, &thread_id,
         retained, retained_count, flags);
     if (!NT_SUCCESS(status)) {
@@ -17554,19 +17948,19 @@ static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles
 BOOL WINAPI CreateProcessA(PCSTR lpApp, PSTR lpCmd, PVOID a, PVOID b,
                             BOOL c, DWORD d, PVOID e, PCSTR f, PVOID g, PVOID h)
 {
-    (void)a; (void)b; (void)e;
+    (void)a; (void)b;
     serial_puts("[K32] CreateProcessA: app=");
     if (lpApp) serial_puts(lpApp);
     serial_puts(" cmd=");
     if (lpCmd) serial_puts(lpCmd);
     serial_puts("\n");
-    return create_process_common(lpApp, lpCmd, c, d, f, g, h);
+    return create_process_common(lpApp, lpCmd, c, d, e, f, g, h);
 }
 
 BOOL WINAPI CreateProcessW(PCWSTR lpApp, PWSTR lpCmd, PVOID a, PVOID b,
                             BOOL c, DWORD d, PVOID e, PCWSTR f, PVOID g, PVOID h)
 {
-    (void)a; (void)b; (void)e;
+    (void)a; (void)b;
     char app_ascii[260];
     char cmd_ascii[4096];
     char directory_ascii[260];
@@ -17607,7 +18001,7 @@ BOOL WINAPI CreateProcessW(PCWSTR lpApp, PWSTR lpCmd, PVOID a, PVOID b,
     serial_puts("\n");
     return create_process_common(lpApp ? app_ascii : NULL,
                                  lpCmd ? cmd_ascii : NULL, c, d,
-                                 f ? directory_ascii : NULL, g, h);
+                                 e, f ? directory_ascii : NULL, g, h);
 }
 
 #define K32_FORMAT_MESSAGE_ALLOCATE_BUFFER 0x00000100U
@@ -18386,9 +18780,10 @@ typedef struct {
     PCSTR value;
 } K32_ENV_VALUE;
 
-#define K32_MAX_DYNAMIC_ENV 256
+#define K32_MAX_DYNAMIC_ENV 512
 #define K32_ENV_NAME_MAX     64
-#define K32_ENV_VALUE_MAX   512
+#define K32_ENV_VALUE_MAX  1024
+#define K32_ENV_BLOCK_MAX_CHARS 32768
 
 typedef struct {
     BOOL used;
@@ -18569,6 +18964,226 @@ static const K32_ENV_VALUE k32_environment[] = {
     { NULL, NULL }
 };
 
+#define K32_BASE_ENV_COUNT \
+    ((SIZE_T)(sizeof(k32_environment) / sizeof(k32_environment[0]) - 1))
+
+_Static_assert(K32_BASE_ENV_COUNT <= 64,
+               "base environment mask must fit in 64 bits");
+
+typedef struct {
+    char name[K32_ENV_NAME_MAX];
+    char value[K32_ENV_VALUE_MAX];
+} K32_PARSED_ENV_ENTRY;
+
+static WCHAR k32_env_block_char(PCVOID environment, BOOL unicode,
+                                SIZE_T index)
+{
+    return unicode ? ((const WCHAR *)environment)[index]
+                   : (WCHAR)((const BYTE *)environment)[index];
+}
+
+static NTSTATUS k32_env_parse_block_entry(
+    PCVOID environment, BOOL unicode, SIZE_T offset,
+    K32_PARSED_ENV_ENTRY *entry, SIZE_T *next_offset, BOOL *at_end)
+{
+    if (!environment || !entry || !next_offset || !at_end ||
+        offset >= K32_ENV_BLOCK_MAX_CHARS)
+        return STATUS_INVALID_PARAMETER;
+
+    if (!k32_env_block_char(environment, unicode, offset)) {
+        *at_end = TRUE;
+        *next_offset = offset;
+        return STATUS_SUCCESS;
+    }
+
+    SIZE_T length = 0;
+    while (offset + length < K32_ENV_BLOCK_MAX_CHARS &&
+           k32_env_block_char(environment, unicode, offset + length))
+        length++;
+    if (offset + length >= K32_ENV_BLOCK_MAX_CHARS)
+        return STATUS_INVALID_PARAMETER;
+
+    SIZE_T separator = (SIZE_T)-1;
+    for (SIZE_T i = 1; i < length; i++) {
+        if (k32_env_block_char(environment, unicode, offset + i) == '=') {
+            separator = i;
+            break;
+        }
+    }
+    if (separator == (SIZE_T)-1 || separator >= K32_ENV_NAME_MAX ||
+        length - separator - 1 >= K32_ENV_VALUE_MAX)
+        return STATUS_INVALID_PARAMETER;
+
+    for (SIZE_T i = 0; i < separator; i++)
+        entry->name[i] =
+            (char)(k32_env_block_char(environment, unicode, offset + i) & 0xFF);
+    entry->name[separator] = 0;
+
+    SIZE_T value_length = length - separator - 1;
+    for (SIZE_T i = 0; i < value_length; i++)
+        entry->value[i] = (char)(k32_env_block_char(
+            environment, unicode, offset + separator + 1 + i) & 0xFF);
+    entry->value[value_length] = 0;
+
+    *at_end = FALSE;
+    *next_offset = offset + length + 1;
+    return STATUS_SUCCESS;
+}
+
+static int k32_env_base_index(PCSTR name)
+{
+    for (SIZE_T i = 0; i < K32_BASE_ENV_COUNT; i++)
+        if (k32_env_name_equal(name, k32_environment[i].name))
+            return (int)i;
+    return -1;
+}
+
+static int k32_env_find_process_entry_locked(DWORD process_id, PCSTR name)
+{
+    for (int i = 0; i < K32_MAX_DYNAMIC_ENV; i++) {
+        K32_DYNAMIC_ENV_VALUE *entry = &k32_dynamic_environment[i];
+        if (entry->used && entry->process_id == process_id &&
+            k32_env_name_equal(entry->name, name))
+            return i;
+    }
+    return -1;
+}
+
+static int k32_env_find_free_entry_locked(void)
+{
+    for (int i = 0; i < K32_MAX_DYNAMIC_ENV; i++)
+        if (!k32_dynamic_environment[i].used)
+            return i;
+    return -1;
+}
+
+static BOOL k32_env_store_process_entry_locked(DWORD process_id, PCSTR name,
+                                                PCSTR value, BOOL deleted)
+{
+    int slot = k32_env_find_process_entry_locked(process_id, name);
+    if (slot < 0)
+        slot = k32_env_find_free_entry_locked();
+    if (slot < 0)
+        return FALSE;
+
+    K32_DYNAMIC_ENV_VALUE *entry = &k32_dynamic_environment[slot];
+    entry->used = FALSE;
+    entry->process_id = process_id;
+    SIZE_T i = 0;
+    while (name[i] && i < K32_ENV_NAME_MAX - 1) {
+        entry->name[i] = name[i];
+        i++;
+    }
+    entry->name[i] = 0;
+    i = 0;
+    if (value) {
+        while (value[i] && i < K32_ENV_VALUE_MAX - 1) {
+            entry->value[i] = value[i];
+            i++;
+        }
+    }
+    entry->value[i] = 0;
+    entry->deleted = deleted;
+    entry->used = TRUE;
+    return TRUE;
+}
+
+NTSTATUS kernel32_set_process_environment_block(DWORD process_id,
+                                                  PCVOID environment,
+                                                  BOOL unicode)
+{
+    if (!process_id || !environment)
+        return STATUS_INVALID_PARAMETER;
+
+    SIZE_T offset = 0;
+    SIZE_T required = 0;
+    uint64_t seen_base = 0;
+    K32_PARSED_ENV_ENTRY parsed;
+
+    for (;;) {
+        SIZE_T next = 0;
+        BOOL at_end = FALSE;
+        NTSTATUS status = k32_env_parse_block_entry(
+            environment, unicode, offset, &parsed, &next, &at_end);
+        if (!NT_SUCCESS(status))
+            return status;
+        if (at_end)
+            break;
+
+        int base = k32_env_base_index(parsed.name);
+        if (base >= 0) {
+            seen_base |= 1ULL << base;
+            if (k32_strcmp(parsed.value, k32_environment[base].value) != 0)
+                required++;
+        } else {
+            required++;
+        }
+        if (required > K32_MAX_DYNAMIC_ENV)
+            return STATUS_INSUFFICIENT_RESOURCES;
+        offset = next;
+    }
+
+    for (SIZE_T i = 0; i < K32_BASE_ENV_COUNT; i++)
+        if (!(seen_base & (1ULL << i)))
+            required++;
+    if (required > K32_MAX_DYNAMIC_ENV)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    uint64_t irq_flags = k32_environment_lock_irqsave();
+    SIZE_T free_entries = 0;
+    for (int i = 0; i < K32_MAX_DYNAMIC_ENV; i++) {
+        K32_DYNAMIC_ENV_VALUE *entry = &k32_dynamic_environment[i];
+        if (entry->used && entry->process_id == process_id)
+            entry->used = FALSE;
+        if (!entry->used)
+            free_entries++;
+    }
+    if (free_entries < required) {
+        k32_environment_unlock_irqrestore(irq_flags);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    offset = 0;
+    for (;;) {
+        SIZE_T next = 0;
+        BOOL at_end = FALSE;
+        NTSTATUS status = k32_env_parse_block_entry(
+            environment, unicode, offset, &parsed, &next, &at_end);
+        if (!NT_SUCCESS(status)) {
+            k32_environment_unlock_irqrestore(irq_flags);
+            return status;
+        }
+        if (at_end)
+            break;
+
+        int base = k32_env_base_index(parsed.name);
+        if ((base < 0 ||
+             k32_strcmp(parsed.value, k32_environment[base].value) != 0) &&
+            !k32_env_store_process_entry_locked(
+                process_id, parsed.name, parsed.value, FALSE)) {
+            k32_environment_unlock_irqrestore(irq_flags);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        offset = next;
+    }
+    for (SIZE_T i = 0; i < K32_BASE_ENV_COUNT; i++) {
+        if (!(seen_base & (1ULL << i)) &&
+            !k32_env_store_process_entry_locked(
+                process_id, k32_environment[i].name, NULL, TRUE)) {
+            k32_environment_unlock_irqrestore(irq_flags);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+    k32_environment_unlock_irqrestore(irq_flags);
+
+    serial_puts("[K32-ENV] explicit child environment pid=");
+    serial_putdec(process_id);
+    serial_puts(" entries=");
+    serial_putdec(required);
+    serial_puts(unicode ? " unicode\n" : " ansi\n");
+    return STATUS_SUCCESS;
+}
+
 static BOOL k32_env_name_matches_a(PCSTR name, DWORD chars, PCSTR expected)
 {
     DWORD i = 0;
@@ -18718,10 +19333,26 @@ DWORD WINAPI GetEnvironmentVariableW(PCWSTR lpName, PWSTR lpBuffer,
     return len;
 }
 
-void kernel32_inherit_process_environment(DWORD parent_pid, DWORD child_pid)
+NTSTATUS kernel32_inherit_process_environment(DWORD parent_pid,
+                                               DWORD child_pid)
 {
-    if (!parent_pid || !child_pid || parent_pid == child_pid) return;
+    if (!parent_pid || !child_pid || parent_pid == child_pid)
+        return STATUS_INVALID_PARAMETER;
     uint64_t irq_flags = k32_environment_lock_irqsave();
+    SIZE_T required = 0;
+    SIZE_T free_entries = 0;
+    for (int i = 0; i < K32_MAX_DYNAMIC_ENV; i++) {
+        K32_DYNAMIC_ENV_VALUE *entry = &k32_dynamic_environment[i];
+        if (entry->used && entry->process_id == parent_pid)
+            required++;
+        if (!entry->used)
+            free_entries++;
+    }
+    if (free_entries < required) {
+        k32_environment_unlock_irqrestore(irq_flags);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     for (int i = 0; i < K32_MAX_DYNAMIC_ENV; i++) {
         K32_DYNAMIC_ENV_VALUE *source = &k32_dynamic_environment[i];
         if (!source->used || source->process_id != parent_pid) continue;
@@ -18732,12 +19363,16 @@ void kernel32_inherit_process_environment(DWORD parent_pid, DWORD child_pid)
                 break;
             }
         }
-        if (free_slot < 0) break;
+        if (free_slot < 0) {
+            k32_environment_unlock_irqrestore(irq_flags);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
         K32_DYNAMIC_ENV_VALUE *target = &k32_dynamic_environment[free_slot];
         *target = *source;
         target->process_id = child_pid;
     }
     k32_environment_unlock_irqrestore(irq_flags);
+    return STATUS_SUCCESS;
 }
 
 void kernel32_release_process_environment(DWORD process_id)
@@ -24091,6 +24726,47 @@ int kernel32_module_selftest(void)
                            record->owner_pid == win32_current_process_id(),
                            "owner-aware loader record", &checks, &failures);
     int initial_refs = record ? record->ref_count : 0;
+
+    HANDLE referenced = NULL;
+    BOOL referenced_ok = GetModuleHandleExA(0, module_name, &referenced);
+    k32_module_test_expect(referenced_ok && referenced == module && record &&
+                           record->ref_count == initial_refs + 1,
+                           "GetModuleHandleEx takes reference",
+                           &checks, &failures);
+    k32_module_test_expect(referenced && FreeLibrary(referenced) && record &&
+                           record->ref_count == initial_refs,
+                           "GetModuleHandleEx reference balance",
+                           &checks, &failures);
+
+    HANDLE unchanged = NULL;
+    BOOL unchanged_ok = GetModuleHandleExA(
+        K32_GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        module_name, &unchanged);
+    k32_module_test_expect(unchanged_ok && unchanged == module && record &&
+                           record->ref_count == initial_refs,
+                           "GetModuleHandleEx unchanged refcount",
+                           &checks, &failures);
+
+    HANDLE from_address = NULL;
+    BOOL from_address_ok = GetModuleHandleExA(
+        K32_GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        (PCSTR)((BYTE *)module + 0x100), &from_address);
+    k32_module_test_expect(from_address_ok && from_address == module &&
+                           record && record->ref_count == initial_refs + 1,
+                           "GetModuleHandleEx from address",
+                           &checks, &failures);
+    k32_module_test_expect(from_address && FreeLibrary(from_address) &&
+                           record && record->ref_count == initial_refs,
+                           "from-address reference balance",
+                           &checks, &failures);
+
+    HANDLE invalid_address = NULL;
+    SetLastError(0);
+    k32_module_test_expect(
+        !GetModuleHandleExA(K32_GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            (PCSTR)(ULONG_PTR)0x1234, &invalid_address) &&
+        GetLastError() == 126,
+        "from-address rejects unrelated address", &checks, &failures);
 
     HANDLE loaded = LoadLibraryA(module_name);
     k32_module_test_expect(loaded == module && record &&

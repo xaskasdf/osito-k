@@ -76,6 +76,15 @@ ifeq ($(IOCP_TRACE),1)
   KCFLAGS += -DK32_IOCP_TRACE=1
 endif
 
+# Per-operation virtual-memory tracing is useful for allocator corruption
+# investigations, but Steam/CEF can issue thousands of successful calls per
+# second. Keep failures and aggregate VM statistics enabled in normal builds.
+#   make -C arch/x86 CLANG=1 WIN32_VM_TRACE=1
+WIN32_VM_TRACE ?= 0
+ifeq ($(WIN32_VM_TRACE),1)
+  KCFLAGS += -DWIN32_VM_TRACE=1
+endif
+
 # Diagnose native PE calls that return from a Win32 shim with interrupts
 # disabled. This is intentionally opt-in because function instrumentation is
 # too expensive for normal QEMU and hardware runs.
@@ -218,7 +227,7 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
              win32/libusb_shim.c \
              win32/dxgi_shim.c win32/version_shim.c \
             win32/advapi32_shim.c win32/scm.c \
-            win32/ddraw_shim.c win32/dsound_shim.c \
+            win32/ddraw_shim.c win32/dsound_shim.c win32/dinput8_shim.c \
             win32/ole32_shim.c win32/oleacc_shim.c \
              win32/crypt32_shim.c win32/authenticode.c win32/shell32_shim.c \
             win32/comctl32_shim.c win32/comdlg32_shim.c \
@@ -390,6 +399,9 @@ $(BUILD)/win32/compat32.o: win32/compat32.c | $(BUILD)/win32
 $(BUILD)/win32/msvcrt_shim.o: win32/msvcrt_shim.c | $(BUILD)/win32
 	$(CC) $(KCFLAGS_PRECOMP) $(WIN32_IF_AUDIT_FLAGS) -Iwin32 -c -o $@ $<
 
+$(BUILD)/win32/opengl32_shim.o: win32/opengl32_shim.c | $(BUILD)/win32
+	$(CC) $(KCFLAGS_PRECOMP) $(WIN32_IF_AUDIT_FLAGS) -fno-tree-vectorize -fno-slp-vectorize -Iwin32 -Ilib/opengl/mesa/include -c -o $@ $<
+
 $(BUILD)/win32/ddraw_shim.o: win32/ddraw_shim.c | $(BUILD)/win32
 	$(CC) $(KCFLAGS_PRECOMP) $(WIN32_IF_AUDIT_FLAGS) -Iwin32 -c -o $@ $<
 
@@ -427,7 +439,7 @@ TCCFLAGS = -c -nostdlib -Iinclude -I../../include/common -D__KERNEL_X86__=1
 
 # Files that MUST use GCC (SSE/AVX asm constraints, special builtins)
 GCC_ONLY_C = kernel/tensor.c kernel/tensor_avx2.c \
-             win32/compat32.c win32/msvcrt_shim.c
+             win32/compat32.c win32/msvcrt_shim.c win32/opengl32_shim.c
 
 # Everything else uses TCC
 TCC_KERN_SRC = $(filter-out $(GCC_ONLY_C),$(KERN_SRC))
@@ -445,7 +457,8 @@ TCC_DOS_OBJ   = $(TCC_DOS_SRC:%.c=$(TCCDIR)/%.o)
 
 # GCC-only object files (in TCC build dir)
 GCC_TENSOR_OBJ    = $(TCCDIR)/kernel/tensor.o $(TCCDIR)/kernel/tensor_avx2.o
-GCC_WIN32_COMPAT  = $(TCCDIR)/win32/compat32.o $(TCCDIR)/win32/msvcrt_shim.o
+GCC_WIN32_COMPAT  = $(TCCDIR)/win32/compat32.o $(TCCDIR)/win32/msvcrt_shim.o \
+                    $(TCCDIR)/win32/opengl32_shim.o
 GCC_ASM_OBJ       = $(ASM_SRC:%.S=$(TCCDIR)/%.o)
 GCC_WIN32_ASM_OBJ = $(WIN32_ASM:%.S=$(TCCDIR)/%.o)
 
@@ -490,6 +503,9 @@ $(TCCDIR)/win32/compat32.o: win32/compat32.c | $(TCCDIR)/win32
 
 $(TCCDIR)/win32/msvcrt_shim.o: win32/msvcrt_shim.c | $(TCCDIR)/win32
 	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
+
+$(TCCDIR)/win32/opengl32_shim.o: win32/opengl32_shim.c | $(TCCDIR)/win32
+	$(CC) $(KCFLAGS_PRECOMP) -fno-tree-vectorize -fno-slp-vectorize -Iwin32 -Ilib/opengl/mesa/include -c -o $@ $<
 
 # Assembly always uses GCC (TCC assembler missing iretq/lretq)
 $(TCCDIR)/kernel/%.o: kernel/%.S | $(TCCDIR)/kernel

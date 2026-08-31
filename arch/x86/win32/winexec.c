@@ -28,6 +28,7 @@ static USHORT g_exe_subsystem;
 #include "libusb_shim.h"
 #include "ddraw_shim.h"
 #include "dsound_shim.h"
+#include "dinput8_shim.h"
 #include "wsock32_shim.h"
 #include "shell32_shim.h"
 #include "winmm_shim.h"
@@ -48,9 +49,9 @@ extern void  serial_puthex(uint64_t val, int digits);
 extern void  serial_putdec(uint64_t val);
 extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
-extern int   mem_reserve_range(uint64_t phys, uint64_t count);
 extern void  proc_exit(int32_t code);
 extern int32_t proc_current_pid(void);
+extern int32_t proc_current_tgid(void);
 extern void *proc_find_ptr(uint16_t pid);
 extern uint32_t proc_state_of(void *process);
 extern void  sched_yield(void);
@@ -156,13 +157,29 @@ static void pe_va_lock_acquire(void)
                                         __ATOMIC_ACQUIRE))
             return;
 
+        /* Win32 exception/termination paths can leave this process-owned
+         * lock held after a non-local exit.  PE VA operations do not recurse,
+         * so seeing our own owner key means the previous critical section was
+         * abandoned and teardown must recover it before freeing DLL images. */
+        if (expected == owner_key) {
+            uint32_t abandoned_owner = expected;
+            if (__atomic_compare_exchange_n(&pe_va_lock_owner,
+                                            &abandoned_owner, 0U, FALSE,
+                                            __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
+                serial_puts("[PE-LOCK] recovered abandoned self owner kpid=");
+                serial_putdec(kernel_pid > 0 ? (uint32_t)kernel_pid : 0U);
+                serial_puts("\n");
+            }
+            continue;
+        }
+
         uint32_t stale_pid = expected - 1U;
         void *stale_process = stale_pid && stale_pid <= 0xFFFFU
             ? proc_find_ptr((uint16_t)stale_pid)
             : NULL;
-        if (expected != owner_key &&
-            (!stale_process ||
-             proc_state_of(stale_process) == PE_VA_PROC_ZOMBIE)) {
+        if (!stale_process ||
+            proc_state_of(stale_process) == PE_VA_PROC_ZOMBIE) {
             uint32_t stale_owner = expected;
             if (__atomic_compare_exchange_n(&pe_va_lock_owner, &stale_owner,
                                             0U, FALSE, __ATOMIC_ACQ_REL,
@@ -198,11 +215,14 @@ static void pe_va_lock_release(void)
 #endif
 }
 
-static int pe_va_conflict_snapshot(uint64_t base, uint64_t size)
+static uint64_t pe_va_range_conflict_end_snapshot(uint64_t base,
+                                                   uint64_t size)
 {
-    if (!size || base + size < base) return 1;
-    if (compat32_runtime_range_conflicts(base, size)) return 1;
+    if (!size || base + size < base)
+        return UINT64_MAX;
+
     uint64_t end = base + size;
+    uint64_t conflict_end = 0;
     DWORD owner_pid = pe_va_owner();
     int count = __atomic_load_n(&pe_va_count, __ATOMIC_ACQUIRE);
     for (int i = 0; i < count; i++) {
@@ -211,15 +231,60 @@ static int pe_va_conflict_snapshot(uint64_t base, uint64_t size)
         if (!rsize || pe_va_ranges[i].owner_pid != owner_pid) continue;
         uint64_t rend = pe_va_ranges[i].base + rsize;
         if (rend < pe_va_ranges[i].base) continue;
-        if (base < rend && end > pe_va_ranges[i].base)
-            return 1;
+        if (base < rend && end > pe_va_ranges[i].base &&
+            rend > conflict_end)
+            conflict_end = rend;
     }
+    return conflict_end;
+}
+
+ULONGLONG pe_va_range_conflict_end(ULONGLONG base, ULONGLONG size)
+{
+    return pe_va_range_conflict_end_snapshot(base, size);
+}
+
+static int pe_va_conflict_snapshot(uint64_t base, uint64_t size)
+{
+    if (compat32_runtime_range_conflicts(base, size))
+        return 1;
+    if (pe_va_range_conflict_end_snapshot(base, size))
+        return 1;
+
     return 0;
 }
 
 BOOL pe_va_range_conflicts(ULONGLONG base, ULONGLONG size)
 {
+    /* NtAllocateVirtualMemory calls this while holding vm_track_lock. Keep
+     * this public query limited to the lock-free PE/runtime snapshots. */
     return pe_va_conflict_snapshot(base, size) ? TRUE : FALSE;
+}
+
+/* PE placement itself must also avoid mmap/brk and VirtualAlloc ranges. This
+ * is separate from pe_va_range_conflicts so NT allocation cannot recurse into
+ * its own lock while checking image occupancy. */
+static int pe_allocation_conflict_snapshot(uint64_t base, uint64_t size)
+{
+    if (pe_va_conflict_snapshot(base, size))
+        return 1;
+
+#ifndef TEST_HARNESS
+    extern uint64_t syscall_vma_range_conflict_end(uint64_t candidate,
+                                                    uint64_t candidate_size);
+    if (syscall_vma_range_conflict_end(base, size))
+        return 1;
+    if (nt_vm_range_conflict_end(base, size))
+        return 1;
+
+    uint64_t cr3 = pe_va_cr3();
+    if (cr3 && cr3 != paging_get_kernel_cr3()) {
+        uint64_t mapped_end =
+            paging_first_mapped_end_in_cr3(cr3, base, size);
+        if (mapped_end)
+            return 1;
+    }
+#endif
+    return 0;
 }
 
 BOOL pe_va_query_range(ULONGLONG address, ULONGLONG *base,
@@ -307,7 +372,7 @@ static uint64_t pe32_reloc_address(SIZE_T size, uint64_t top)
     while (cursor >= PE32_RELOC_FLOOR + span) {
         uint64_t base = (cursor - span) & ~(PE32_RELOC_GRANULARITY - 1);
         if (base < PE32_RELOC_FLOOR) break;
-        if (!pe_va_conflict_snapshot(base, size))
+        if (!pe_allocation_conflict_snapshot(base, size))
             return base;
         cursor = base;
     }
@@ -324,7 +389,7 @@ static uint64_t pe64_reloc_address(SIZE_T size)
     while (cursor >= PE64_RELOC_FLOOR + span) {
         uint64_t base = (cursor - span) & ~(PE64_RELOC_GRANULARITY - 1);
         if (base < PE64_RELOC_FLOOR) break;
-        if (!pe_va_conflict_snapshot(base, size))
+        if (!pe_allocation_conflict_snapshot(base, size))
             return base;
         cursor = base >= PE64_RELOC_FLOOR + PE64_RELOC_GRANULARITY
                ? base - PE64_RELOC_GRANULARITY
@@ -378,7 +443,8 @@ static PVOID pe_alloc_legacy(PVOID preferred, SIZE_T size, BOOL is_32bit)
     return r;
 #else
     /* Check for VA range conflict before mapping at preferred address */
-    if (preferred && pe_va_conflict_snapshot((uint64_t)preferred, size)) {
+    if (preferred &&
+        pe_allocation_conflict_snapshot((uint64_t)preferred, size)) {
         serial_puts("[pe_alloc] CONFLICT: VA 0x");
         serial_puthex((uint64_t)preferred, 8);
         serial_puts(" already occupied, relocating\n");
@@ -386,44 +452,40 @@ static PVOID pe_alloc_legacy(PVOID preferred, SIZE_T size, BOOL is_32bit)
     }
 
     if (is_32bit) {
-        uint64_t va = 0;
+        if (!pages) return NULL;
 
-        /* PE32 currently shares the kernel's lower-half identity map. Claim
-         * the physical pages whose addresses equal the requested VA before
-         * changing their PTEs. Otherwise a preferred ImageBase can overwrite
-         * a live kernel allocation at the same numeric address. */
-        if (preferred && (((uint64_t)preferred & 0xFFFULL) == 0) &&
-            mem_reserve_range((uint64_t)preferred, pages) == 0) {
-            va = (uint64_t)preferred;
-        } else {
-            uint64_t cursor = PE32_RELOC_TOP;
-            while ((va = pe32_reloc_address(size, cursor)) != 0) {
-                if (mem_reserve_range(va, pages) == 0)
-                    break;
-                cursor = va;
-            }
-        }
+        /* Process CR3s own their complete lower half. Keep PE32 virtual
+         * placement below 2 GB, but back it with ordinary physical pages;
+         * tying VA to PA exhausts as soon as that physical range is in use. */
+        uint64_t va = preferred && (((uint64_t)preferred & 0xFFFULL) == 0)
+                    ? (uint64_t)preferred
+                    : pe32_reloc_address(size, PE32_RELOC_TOP);
 
         if (!va) {
             serial_puts("[pe_alloc] ERROR: PE32 relocation VA exhausted\n");
             return NULL;
         }
 
-        if (pe_map_pages(cr3, va, va, pages) == 0) {
-            pe_va_record(va, size, cr3, va, pages);
+        void *phys = mem_alloc_pages(pages);
+        if (!phys)
+            return NULL;
+
+        uint64_t pa = (uint64_t)phys;
+        if (pe_map_pages(cr3, va, pa, pages) == 0) {
+            pe_va_record(va, size, cr3, pa, pages);
             serial_puts(va == (uint64_t)preferred
-                ? "[pe_alloc] reserved PE32 preferred VA/PA 0x"
-                : "[pe_alloc] relocated PE32 VA/PA 0x");
+                ? "[pe_alloc] mapped PE32 preferred VA 0x"
+                : "[pe_alloc] relocated PE32 VA 0x");
             serial_puthex(va, 8);
+            serial_puts(" -> PA 0x");
+            serial_puthex(pa, 16);
             serial_puts(" pages=0x");
             serial_puthex(pages, 4);
             serial_puts("\n");
             return (PVOID)(ULONG_PTR)va;
         }
 
-        /* Keep the claimed pages quarantined if page-table installation
-         * failed; returning them while their identity mappings are missing
-         * would let a later kernel allocation alias an invalid VA. */
+        mem_free_pages(phys, pages);
         serial_puts("[pe_alloc] ERROR: PE32 page-table map failed\n");
         return NULL;
     }
@@ -466,7 +528,8 @@ PVOID pe_alloc(PVOID preferred, SIZE_T size, BOOL is_32bit)
         return NULL;
     }
 
-    if (preferred && pe_va_conflict_snapshot((uint64_t)preferred, size)) {
+    if (preferred &&
+        pe_allocation_conflict_snapshot((uint64_t)preferred, size)) {
         serial_puts("[pe_alloc] CONFLICT: VA 0x");
         serial_puthex((uint64_t)preferred, 16);
         serial_puts(" already occupied, relocating\n");
@@ -774,18 +837,46 @@ static WIN32_CHILD_CONTEXT *win32_current_child(void)
     extern int32_t proc_current_pid(void);
     extern uint64_t proc_get_gs_base(void);
     int pid = proc_current_pid();
-    DWORD thread_owner_pid = win32_current_thread_process_id();
-    TEB *teb = (TEB *)(ULONG_PTR)proc_get_gs_base();
+
+    /* A child process's primary scheduler task is not represented in the
+     * Win32 worker-thread table. Resolve it by kernel PID before consulting
+     * that much larger table; this path is also used from exception handlers. */
     for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
-        if (!g_win32_children[i].used)
+        WIN32_CHILD_CONTEXT *child = &g_win32_children[i];
+        if (!__atomic_load_n(&child->used, __ATOMIC_ACQUIRE))
             continue;
-        if ((thread_owner_pid &&
-             g_win32_children[i].process_id == thread_owner_pid) ||
-            (!thread_owner_pid &&
-             (g_win32_children[i].kernel_pid == pid ||
-              (teb && teb->ProcessEnvironmentBlock ==
-                          &g_win32_children[i].peb))))
-            return &g_win32_children[i];
+        if (__atomic_load_n(&child->kernel_pid, __ATOMIC_ACQUIRE) == pid)
+            return child;
+    }
+
+    /* The root PE task intentionally has no child context or worker-table
+     * entry. A negative answer is definitive for its primary scheduler PID. */
+    if (__atomic_load_n(&g_win32_main.active, __ATOMIC_ACQUIRE) &&
+        g_win32_main.owner_kernel_pid == pid)
+        return NULL;
+
+    /* Worker TEBs identify their owning child without touching the sparse,
+     * dynamically sized thread-context array. */
+    TEB *teb = (TEB *)(ULONG_PTR)proc_get_gs_base();
+    PPEB process_peb = teb ? teb->ProcessEnvironmentBlock : NULL;
+    if (process_peb) {
+        for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
+            WIN32_CHILD_CONTEXT *child = &g_win32_children[i];
+            if (__atomic_load_n(&child->used, __ATOMIC_ACQUIRE) &&
+                process_peb == &child->peb)
+                return child;
+        }
+    }
+
+    /* Fall back for early worker startup, before its TEB is authoritative. */
+    DWORD thread_owner_pid = win32_current_thread_process_id();
+    if (thread_owner_pid) {
+        for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
+            WIN32_CHILD_CONTEXT *child = &g_win32_children[i];
+            if (__atomic_load_n(&child->used, __ATOMIC_ACQUIRE) &&
+                child->process_id == thread_owner_pid)
+                return child;
+        }
     }
 #endif
     return NULL;
@@ -1141,9 +1232,9 @@ const char *win32_current_directory_override(void)
 {
     WIN32_CHILD_CONTEXT *child = win32_current_child();
     if (!child) return NULL;
-    const char *directory = child->compat_environment32
-        ? child->compat_environment32->current_directory
-        : child->current_directory;
+    /* The child context is authoritative.  The low-memory PE32 block is a
+     * process-parameter snapshot and is refreshed after a CWD change. */
+    const char *directory = child->current_directory;
     return directory[0] ? directory : NULL;
 }
 
@@ -1187,12 +1278,6 @@ void win32_publish_current_image_base(PVOID image_base)
 
 DWORD win32_current_process_id(void)
 {
-#ifndef TEST_HARNESS
-    extern DWORD win32_current_thread_process_id(void);
-    DWORD thread_owner_pid = win32_current_thread_process_id();
-    if (thread_owner_pid)
-        return thread_owner_pid;
-#endif
     WIN32_CHILD_CONTEXT *child = win32_current_child();
     return child ? child->process_id : 1;
 }
@@ -2187,11 +2272,20 @@ done:
 
     oleacc_release_process(child->process_id);
     shell32_release_process(child->process_id);
+    opengl32_release_process((DWORD)child->kernel_pid);
     user32_release_process(child->process_id);
 
-    /* Restore any legacy shared callback, then discard this process's
-     * private DLL images before its PEB/TLS vector disappear. */
+    /* Static TLS ownership belongs to the child PID, not to whichever thread
+     * performs cleanup. Release it while the child's TEB and DLL metadata are
+     * both authoritative, then discard the private images. */
     child_restore_shared_dll_state(child);
+    if (compat32 && child->tls_vector32) {
+        extern void win32_tls_release_process32(TEB32 *teb);
+        win32_tls_release_process32(child->teb32);
+    } else if (child->tls_vector) {
+        extern void win64_tls_release_process(TEB *teb);
+        win64_tls_release_process(&child->teb);
+    }
     dll_release_process(child->process_id);
     nt_process_complete_child(child->process_object, child->thread_object,
                               child->exit_status);
@@ -2200,13 +2294,6 @@ done:
     serial_puts(" status=0x");
     serial_puthex((uint32_t)child->exit_status, 8);
     serial_puts("\n");
-    if (compat32 && child->tls_vector32) {
-        extern void win32_tls_release_process32(TEB32 *teb);
-        win32_tls_release_process32(child->teb32);
-    } else if (child->tls_vector) {
-        extern void win64_tls_release_process(TEB *teb);
-        win64_tls_release_process(&child->teb);
-    }
     child_free_compat_environment32(child);
     if (child->tls_vector) {
         mem_free_pages((void *)VIRT_TO_PHYS(child->tls_vector), 4);
@@ -2380,6 +2467,8 @@ BOOL win32_terminate_child(HANDLE process_handle, NTSTATUS status)
         nt_process_complete_child(child->process_object, child->thread_object,
                                   status);
         if (child->kernel_pid > 0) proc_kill_pid(child->kernel_pid);
+        if (child->kernel_pid > 0)
+            opengl32_release_process((DWORD)child->kernel_pid);
         wsock_release_process(child->process_id);
         advapi32_crypto_release_process(child->process_id);
         kernel32_release_process_environment(child->process_id);
@@ -2391,6 +2480,7 @@ BOOL win32_terminate_child(HANDLE process_handle, NTSTATUS status)
 
 NTSTATUS win32_spawn_child(const char *image_path, const char *command_line,
                            const char *current_directory,
+                           PCVOID environment,
                            PHANDLE process_handle, PHANDLE thread_handle,
                            DWORD *process_id, DWORD *thread_id,
                            const HANDLE *inherited_handles,
@@ -2460,8 +2550,16 @@ NTSTATUS win32_spawn_child(const char *image_path, const char *command_line,
             inherited_handles[i];
     }
 
-    kernel32_inherit_process_environment(GetCurrentProcessId(),
-                                         child->process_id);
+    if (environment) {
+        status = kernel32_set_process_environment_block(
+            child->process_id, environment,
+            (creation_flags & 0x00000400U) != 0); /* CREATE_UNICODE_ENVIRONMENT */
+    } else {
+        status = kernel32_inherit_process_environment(
+            GetCurrentProcessId(), child->process_id);
+    }
+    if (!NT_SUCCESS(status))
+        goto fail_child;
 
     child_copy_string(child->image_path, sizeof(child->image_path), image_path);
     const char *name = image_path;
@@ -2653,6 +2751,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     wsock_release_process(1);
     advapi32_crypto_release_process(1);
     nt_vm_release_process(1);
+    opengl32_release_process((DWORD)proc_current_tgid());
 
     /* A previous PE32 process may have left the shared shim mode selected. */
     g_compat32_mode = 0;
@@ -2667,6 +2766,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     user32_shim_init();   /* re-exec: window/input/activation state reset */
     oleacc_shim_init();
     ddraw_shim_init();    /* re-exec: surfaces/COM proxies/display-mode reset */
+    dinput8_shim_init();  /* re-exec: DirectInput COM32 thunks are process-local */
     opengl32_shim_init(); /* re-exec: WGL query contexts reset */
     libusb_shim_init();   /* native xHCI owns USB; SDL sees an empty bus */
 
@@ -2707,6 +2807,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     dll_register_shim("version.dll",  version_resolve);
     dll_register_shim("ddraw.dll",    ddraw_resolve);
     dll_register_shim("dsound.dll",   dsound_resolve);
+    dll_register_shim("dinput8.dll",  dinput8_resolve);
     dll_register_shim("wsock32.dll",  wsock32_resolve);
     dll_register_shim("ws2_32.dll",   ws2_32_resolve);
     dll_register_shim("mswsock.dll",  ws2_32_resolve);
@@ -2742,6 +2843,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         extern const WIN32_EXPORT *version_abi_table(int *);
         extern const WIN32_EXPORT *ddraw_abi_table(int *);
         extern const WIN32_EXPORT *dsound_abi_table(int *);
+        extern const WIN32_EXPORT *dinput8_abi_table(int *);
         extern const WIN32_EXPORT *wsock32_abi_table(int *);
         extern const WIN32_EXPORT *shell32_abi_table(int *);
         extern const WIN32_EXPORT *shlwapi_abi_table(int *);
@@ -2797,6 +2899,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         win32_abi_register("version.dll",  version_abi_table(&n),  n);
         win32_abi_register("ddraw.dll",    ddraw_abi_table(&n),    n);
         win32_abi_register("dsound.dll",   dsound_abi_table(&n),   n);
+        win32_abi_register("dinput8.dll",  dinput8_abi_table(&n),  n);
         win32_abi_register("wsock32.dll",  wsock32_abi_table(&n),  n);
         win32_abi_register("ws2_32.dll",   wsock32_abi_table(&n),  n);
         win32_abi_register("mswsock.dll",  wsock32_abi_table(&n),  n);
@@ -2822,6 +2925,23 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
      * recursively loads DLLs (via dll_resolve_import → dll_load) and those
      * DLLs need the thunk pool to exist for IAT patching.
      */
+    /* pe_load() can execute PE32 DllMain callbacks before the EXE metadata is
+     * published. Give the direct winexec task its private syscall/fault stacks
+     * now; CreateProcess and CreateThread perform the same setup in their own
+     * launch paths. */
+    if (child_image_bitness(file_data, file_size) == 32) {
+        extern int32_t proc_current_pid(void);
+        extern int sched_alloc_compat_ist1(uint32_t pid);
+        int32_t pid = proc_current_pid();
+        if (pid <= 0 || sched_alloc_compat_ist1((uint32_t)pid) < 0) {
+            serial_puts("[WINEXEC] failed to allocate PE32 private IST stacks\n");
+            return -1;
+        }
+        serial_puts("[WINEXEC] PE32 private IST stacks ready pid=");
+        serial_putdec((uint32_t)pid);
+        serial_puts("\n");
+    }
+
     compat32_init();
 
     /* Create base SEH handler thunk (needs thunk pool from compat32_init) */
@@ -3414,8 +3534,10 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                 }
                 __asm__ volatile ("sti");
                 g_compat32_mode = 0;
+                opengl32_release_process((DWORD)proc_current_tgid());
                 user32_shim_init();
                 ddraw_shim_init();
+                dinput8_shim_init();
                 serial_puts("[WINEXEC] PE process exited, code=");
                 serial_putdec((uint32_t)exit_status);
                 serial_puts(" (SS restored, APIC re-enabled)\n");
@@ -3477,6 +3599,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
 
             wsock_release_process(1);
             advapi32_crypto_release_process(1);
+            opengl32_release_process((DWORD)proc_current_tgid());
             {
                 extern uint64_t paging_get_kernel_cr3(void);
                 __asm__ volatile ("mov %0, %%cr3" : :
@@ -3507,6 +3630,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     /* Cleanup */
     wsock_release_process(1);
     advapi32_crypto_release_process(1);
+    opengl32_release_process((DWORD)proc_current_tgid());
     (void)nt_vm_free_stack(stack_allocation);
     pe_unload(&info);
 

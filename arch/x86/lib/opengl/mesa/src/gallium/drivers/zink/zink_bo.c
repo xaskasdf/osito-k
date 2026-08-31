@@ -42,6 +42,8 @@
 
 struct zink_bo;
 
+extern void okgl_trace(const char *message);
+
 struct zink_sparse_backing_chunk {
    uint32_t begin, end;
 };
@@ -125,6 +127,8 @@ bo_destroy(struct zink_screen *screen, struct pb_buffer *pbuf)
 {
    struct zink_bo *bo = zink_bo(pbuf);
 
+   okgl_trace("[ZBO] destroy enter\n");
+
 #ifdef ZINK_USE_DMABUF
    if (bo->mem && !bo->u.real.use_reusable_pool) {
       simple_mtx_lock(&bo->u.real.export_lock);
@@ -140,15 +144,20 @@ bo_destroy(struct zink_screen *screen, struct pb_buffer *pbuf)
 #endif
 
    if (!bo->u.real.is_user_ptr && bo->u.real.cpu_ptr) {
+      okgl_trace("[ZBO] unmap enter\n");
       bo->u.real.map_count = 1;
       bo->u.real.cpu_ptr = NULL;
       zink_bo_unmap(screen, bo);
+      okgl_trace("[ZBO] unmap leave\n");
    }
 
+   okgl_trace("[ZBO] FreeMemory enter\n");
    VKSCR(FreeMemory)(screen->dev, bo->mem, NULL);
+   okgl_trace("[ZBO] FreeMemory leave\n");
 
    simple_mtx_destroy(&bo->lock);
    FREE(bo);
+   okgl_trace("[ZBO] destroy leave\n");
 }
 
 static bool

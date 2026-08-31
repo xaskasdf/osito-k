@@ -708,6 +708,7 @@ static LOADED_MODULE *module_reserve(const char *dll_name, ULONG owner_pid)
         dl_strcpy_lower(mod->name, strip_path(dll_name), 64);
         dl_strcpy(mod->path, dll_name, sizeof(mod->path));
         mod->ref_count = 1;
+        mod->pinned = FALSE;
         mod->synthetic_shim = FALSE;
         mod->initialized = FALSE;
         mod->thread_notifications_disabled = FALSE;
@@ -789,6 +790,7 @@ static void module_release_record(LOADED_MODULE *mod)
     mod->thread_notifications_disabled = FALSE;
     mod->init_order = 0;
     mod->ref_count = 0;
+    mod->pinned = FALSE;
     shim64_thunk_count[mod - modules] = 0;
     uint8_t *image = (uint8_t *)&mod->image;
     for (unsigned j = 0; j < sizeof(mod->image); j++) image[j] = 0;
@@ -1320,11 +1322,47 @@ static void dl_build_synthetic_shim_image(PVOID image_base, BOOL is_32bit,
     info->Is32Bit = is_32bit;
 }
 
-PVOID dll_get_module_handle(const char *name, BOOL add_reference)
+static void module_take_reference_locked(LOADED_MODULE *mod,
+                                         BOOL add_reference, BOOL pin,
+                                         const char *operation)
+{
+    if (!mod) return;
+
+    int refs_before = mod->ref_count;
+    if (pin) {
+        mod->pinned = TRUE;
+    } else if (add_reference) {
+        if (mod->ref_count < 0x7FFFFFFF)
+            mod->ref_count++;
+        else
+            mod->pinned = TRUE;
+    }
+
+    if (dl_is_libcef(mod->name) && (add_reference || pin)) {
+        serial_puts("[DLL-CEF-REF] op=");
+        serial_puts(operation);
+        serial_puts(" owner=");
+        serial_putdec(mod->owner_pid);
+        serial_puts(" refs-before=");
+        serial_putdec((uint64_t)(uint32_t)refs_before);
+        serial_puts(" refs-after=");
+        serial_putdec((uint64_t)(uint32_t)mod->ref_count);
+        serial_puts(" pinned=");
+        serial_putdec(mod->pinned ? 1 : 0);
+        serial_puts("\n");
+    }
+}
+
+PVOID dll_get_module_handle_ex(const char *name, BOOL add_reference, BOOL pin)
 {
     PVOID image_base = NULL;
     if (!name) return NULL;
 
+    const char *lookup_base = strip_path_bounded(name, 256);
+    static int openal_trace_budget = 24;
+    BOOL trace_openal = lookup_base &&
+        dl_stricmp(lookup_base, "openal32.dll") == 0 &&
+        __atomic_fetch_sub(&openal_trace_budget, 1, __ATOMIC_RELAXED) > 0;
     BOOL trace_shell =
         dl_stricmp(strip_path(name), "shell32.dll") == 0;
     if (trace_shell) {
@@ -1341,9 +1379,47 @@ PVOID dll_get_module_handle(const char *name, BOOL add_reference)
 
     loader_lock_acquire();
     LOADED_MODULE *mod = dll_find_module(name);
+    if (trace_openal) {
+        ULONG owner_pid = dll_current_owner_pid();
+        serial_puts("[DLL-OPENAL] lookup owner=");
+        serial_putdec(owner_pid);
+        serial_puts(" image=0x");
+        serial_puthex(win32_current_image_base(), 16);
+        serial_puts(" bits=");
+        serial_putdec((uint64_t)dll_current_process_bitness());
+        serial_puts(" compat=");
+        serial_putdec((uint64_t)(g_compat32_mode ? 1 : 0));
+        serial_puts(" result=0x");
+        serial_puthex(mod ? (ULONG_PTR)mod->image.ImageBase : 0, 16);
+        serial_puts("\n");
+
+        if (!mod) {
+            char lower[64];
+            dl_strcpy_lower(lower, lookup_base, sizeof(lower));
+            for (int i = 0; i < MAX_LOADED_MODULES; i++) {
+                LOADED_MODULE *candidate = &modules[i];
+                if (__atomic_load_n(&candidate->state,
+                                    __ATOMIC_ACQUIRE) <= 0 ||
+                    !module_matches_name(candidate, lower))
+                    continue;
+                serial_puts("[DLL-OPENAL] candidate state=");
+                serial_putdec((uint64_t)candidate->state);
+                serial_puts(" owner=");
+                serial_putdec(candidate->owner_pid);
+                serial_puts(" bits=");
+                serial_putdec(candidate->image.Is32Bit ? 32 : 64);
+                serial_puts(" refs=");
+                serial_putdec((uint64_t)candidate->ref_count);
+                serial_puts(" base=0x");
+                serial_puthex((ULONG_PTR)candidate->image.ImageBase, 16);
+                serial_puts(" path='");
+                serial_puts(candidate->path);
+                serial_puts("'\n");
+            }
+        }
+    }
     if (mod) {
-        if (add_reference)
-            __atomic_add_fetch(&mod->ref_count, 1, __ATOMIC_RELAXED);
+        module_take_reference_locked(mod, add_reference, pin, "name");
         image_base = mod->image.ImageBase;
     }
     loader_lock_release();
@@ -1365,7 +1441,29 @@ PVOID dll_get_module_handle(const char *name, BOOL add_reference)
     return image_base;
 }
 
-PVOID dll_get_shim_module_handle(const char *name, BOOL add_reference)
+PVOID dll_get_module_handle(const char *name, BOOL add_reference)
+{
+    return dll_get_module_handle_ex(name, add_reference, FALSE);
+}
+
+PVOID dll_get_module_handle_by_address(PVOID address, BOOL add_reference,
+                                       BOOL pin)
+{
+    if (!address) return NULL;
+
+    loader_lock_acquire();
+    LOADED_MODULE *mod = dll_find_module_by_address(address);
+    PVOID image_base = NULL;
+    if (mod) {
+        module_take_reference_locked(mod, add_reference, pin, "address");
+        image_base = mod->image.ImageBase;
+    }
+    loader_lock_release();
+    return image_base;
+}
+
+PVOID dll_get_shim_module_handle_ex(const char *name, BOOL add_reference,
+                                    BOOL pin)
 {
     BOOL trace_shell = name &&
         dl_stricmp(strip_path(name), "shell32.dll") == 0;
@@ -1383,8 +1481,7 @@ PVOID dll_get_shim_module_handle(const char *name, BOOL add_reference)
     loader_lock_acquire();
     LOADED_MODULE *mod = dll_find_module(name);
     if (mod) {
-        if (add_reference)
-            __atomic_add_fetch(&mod->ref_count, 1, __ATOMIC_RELAXED);
+        module_take_reference_locked(mod, add_reference, pin, "shim-name");
         PVOID existing = mod->image.ImageBase;
         loader_lock_release();
         return existing;
@@ -1422,6 +1519,7 @@ PVOID dll_get_shim_module_handle(const char *name, BOOL add_reference)
     dl_build_synthetic_shim_image(image_base, is_32bit, &mod->image);
     mod->synthetic_shim = TRUE;
     __atomic_store_n(&mod->state, 2, __ATOMIC_RELEASE);
+    module_take_reference_locked(mod, add_reference, pin, "shim-create");
 
 #if !defined(OK_QUIET) || !OK_QUIET
     serial_puts("[DLL] mapped shim module ");
@@ -1435,6 +1533,11 @@ PVOID dll_get_shim_module_handle(const char *name, BOOL add_reference)
 
     loader_lock_release();
     return image_base;
+}
+
+PVOID dll_get_shim_module_handle(const char *name, BOOL add_reference)
+{
+    return dll_get_shim_module_handle_ex(name, add_reference, FALSE);
 }
 
 /* ── Resolve export from PE export directory ───────────────── */
@@ -2258,17 +2361,63 @@ void dll_notify_thread(DWORD reason)
 
 /* ── Unload a DLL ──────────────────────────────────────────── */
 
-void dll_unload(LOADED_MODULE *mod)
+BOOL dll_release_module(PVOID requested_base)
 {
-    if (!mod || __atomic_load_n(&mod->state, __ATOMIC_ACQUIRE) <= 0)
-        return;
+    if (!requested_base) return FALSE;
 
     loader_lock_acquire();
-
-    if (__atomic_sub_fetch(&mod->ref_count, 1, __ATOMIC_ACQ_REL) > 0) {
+    LOADED_MODULE *mod = dll_find_module_by_base(requested_base);
+    if (!mod) {
         loader_lock_release();
-        return;
+        return FALSE;
     }
+
+    BOOL trace_openal = dl_stricmp(mod->name, "openal32.dll") == 0;
+    BOOL trace_cef = dl_is_libcef(mod->name);
+    if (trace_openal || trace_cef) {
+        serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] owner="
+                             : "[DLL-OPENAL] unload owner=");
+        serial_putdec(mod->owner_pid);
+        serial_puts(" refs-before=");
+        serial_putdec((uint64_t)mod->ref_count);
+        serial_puts(" pinned=");
+        serial_putdec(mod->pinned ? 1 : 0);
+        serial_puts(" base=0x");
+        serial_puthex((ULONG_PTR)mod->image.ImageBase, 16);
+        serial_puts("\n");
+    }
+
+    if (mod->pinned) {
+        if (trace_openal || trace_cef)
+            serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] retained pinned\n"
+                                  : "[DLL-OPENAL] retained pinned\n");
+        loader_lock_release();
+        return TRUE;
+    }
+
+    if (mod->ref_count <= 0) {
+        if (trace_openal || trace_cef)
+            serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] invalid zero refs\n"
+                                  : "[DLL-OPENAL] invalid zero refs\n");
+        loader_lock_release();
+        return FALSE;
+    }
+
+    mod->ref_count--;
+    if (mod->ref_count > 0) {
+        if (trace_openal || trace_cef) {
+            serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] retained refs="
+                                  : "[DLL-OPENAL] retained refs=");
+            serial_putdec((uint64_t)mod->ref_count);
+            serial_puts("\n");
+        }
+        loader_lock_release();
+        return TRUE;
+    }
+
+    if (trace_openal || trace_cef)
+        serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] releasing image\n"
+                              : "[DLL-OPENAL] releasing image\n");
 
     PVOID image_base = mod->image.ImageBase;
     SIZE_T image_size = mod->image.SizeOfImage;
@@ -2293,6 +2442,7 @@ void dll_unload(LOADED_MODULE *mod)
         pe_unload(&mod->image);
     module_release_record(mod);
     loader_lock_release();
+    return TRUE;
 }
 
 void dll_release_process(ULONG owner_pid)
@@ -2318,11 +2468,9 @@ void dll_release_process(ULONG owner_pid)
         SIZE_T image_size = mod->image.SizeOfImage;
         BOOL synthetic_shim = mod->synthetic_shim;
 
-        /* A crashed process must not re-enter arbitrary DllMain cleanup. */
-        if (image_base && !synthetic_shim && !mod->image.Is32Bit) {
-            extern void win64_tls_unregister_image(PVOID image_base);
-            win64_tls_unregister_image(image_base);
-        }
+        /* A crashed process must not re-enter arbitrary DllMain cleanup.
+         * The caller releases process-owned static TLS explicitly before
+         * entering this image teardown path. */
         if (image_base && synthetic_shim)
             pe_free_for_owner(image_base, image_size, owner_pid);
         else if (image_base)
@@ -2338,10 +2486,6 @@ void dll_release_process(ULONG owner_pid)
             PVOID image_base = mod->image.ImageBase;
             SIZE_T image_size = mod->image.SizeOfImage;
             BOOL synthetic_shim = mod->synthetic_shim;
-            if (image_base && !synthetic_shim && !mod->image.Is32Bit) {
-                extern void win64_tls_unregister_image(PVOID image_base);
-                win64_tls_unregister_image(image_base);
-            }
             if (image_base && synthetic_shim)
                 pe_free_for_owner(image_base, image_size, owner_pid);
             else if (image_base)

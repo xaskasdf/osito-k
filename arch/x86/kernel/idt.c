@@ -13,6 +13,7 @@
 #include "../include/paging.h"
 #include "../include/interrupt.h"
 #include "../include/cpu_features.h"
+#include "../win32/compat32.h"
 #include "smp.h"
 
 /* ── External functions ──────────────────────────────────────── */
@@ -35,6 +36,7 @@ static inline void idt_diag_flush(const char *reason)
 
 /* X-SCHED: scheduler tick (process.c) */
 extern void sched_tick(void *frame);
+extern void sched_yield(void);
 
 /* Paging (paging.c) */
 extern int  paging_set_flags(uint64_t virt, uint64_t flags);
@@ -87,6 +89,59 @@ static bool current_cr3_range_is_mapped(uint64_t address, uint64_t size)
         if (paging_translate_in_cr3(cr3, address + offset) == UINT64_MAX)
             return false;
     return true;
+}
+
+/* A continuable write fault can be part of cross-thread synchronization: one
+ * thread temporarily write-protects a page and the fault handler asks the OS
+ * to retry once its peer restores write access. Windows can preempt the
+ * faulting thread during that retry window. Our compat callback path can mask
+ * the LAPIC timer briefly, so yield explicitly while the live PTE remains
+ * read-only. The bounded loop preserves normal fault semantics for handlers
+ * that did not arrange a protection change. */
+static void compat32_wait_for_write_retry(uint64_t address)
+{
+    const uint32_t max_yields = 64;
+    uint32_t yields = 0;
+    uint64_t entry_flags;
+    uint64_t *pte = paging_get_pte(address);
+    uint64_t pte_value = pte
+                       ? __atomic_load_n(pte, __ATOMIC_ACQUIRE) : 0;
+
+    if (!(pte_value & PTE_PRESENT))
+        return;
+
+    __asm__ volatile ("pushfq; popq %0" : "=r"(entry_flags));
+    while (!(pte_value & PTE_WRITABLE) && yields < max_yields) {
+        if (!(entry_flags & (1ULL << 9)))
+            __asm__ volatile ("sti" ::: "memory");
+        sched_yield();
+        if (!(entry_flags & (1ULL << 9)))
+            __asm__ volatile ("cli" ::: "memory");
+
+        yields++;
+        pte = paging_get_pte(address);
+        pte_value = pte
+                  ? __atomic_load_n(pte, __ATOMIC_ACQUIRE) : 0;
+        if (!(pte_value & PTE_PRESENT))
+            break;
+    }
+
+    if ((pte_value & (PTE_PRESENT | PTE_WRITABLE)) ==
+        (PTE_PRESENT | PTE_WRITABLE)) {
+        __asm__ volatile ("invlpg (%0)" :: "r"(address) : "memory");
+        serial_puts("[SEH32-WRITE-WAIT] resumed address=0x");
+        serial_puthex(address, 16);
+        serial_puts(" yields=");
+        serial_putdec(yields);
+        serial_puts("\n");
+    } else if (yields == max_yields) {
+        static uint32_t timeout_logs;
+        if (timeout_logs++ < 16) {
+            serial_puts("[SEH32-WRITE-WAIT] still protected address=0x");
+            serial_puthex(address, 16);
+            serial_puts("\n");
+        }
+    }
 }
 
 /* NULL page policy: page 0 is read-only+NX. Native ELF user code must fault
@@ -152,6 +207,131 @@ static idt_ptr_t   idtr;
 /* ── Interrupt frame pushed by CPU + our stub ────────────────── */
 
 typedef x86_interrupt_frame_t interrupt_frame_t;
+
+static void compat32_apply_cpu_context(interrupt_frame_t *frame,
+                                       const compat32_cpu_context_t *context)
+{
+    /* NtContinue-style return accepts arithmetic/debug state but does not let
+     * a PE32 handler alter privileged flags or escape the compat selectors. */
+    const uint64_t mutable_eflags = 0x00250DD5ULL;
+    frame->rax = context->eax;
+    frame->rbx = context->ebx;
+    frame->rcx = context->ecx;
+    frame->rdx = context->edx;
+    frame->rsi = context->esi;
+    frame->rdi = context->edi;
+    frame->rbp = context->ebp;
+    frame->rsp = context->esp;
+    frame->rip = context->eip;
+    frame->rflags = (frame->rflags & ~mutable_eflags) |
+                    ((uint64_t)context->eflags & mutable_eflags);
+}
+
+/* NT delivers user-mode CPU faults to SEH before treating them as process
+ * crashes. HotSpot relies on this for safepoint polling pages, where a
+ * protection fault is expected control flow. Return 1 when SEH handled the
+ * exception, 0 when it was unhandled, and -1 for unsupported vectors. */
+static int compat32_dispatch_cpu_exception(interrupt_frame_t *frame,
+                                           uint64_t vector)
+{
+    uint16_t cs = (uint16_t)(frame->cs & 0xFFFF);
+    if ((cs != 0x40 && cs != 0x23) ||
+        (vector != 6 && vector != 13 && vector != 14))
+        return -1;
+
+    typedef struct {
+        uint32_t ExceptionCode;
+        uint32_t ExceptionFlags;
+        uint64_t ExceptionRecord;
+        uint64_t ExceptionAddress;
+        uint32_t NumberParameters;
+        uint32_t pad;
+        uint64_t ExceptionInformation[15];
+    } exception_record64_t;
+
+    exception_record64_t record;
+    for (uint32_t i = 0; i < sizeof(record) / sizeof(uint32_t); i++)
+        ((uint32_t *)&record)[i] = 0;
+
+    uint64_t fault_address = 0;
+    if (vector == 14) {
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_address));
+        if (fault_address < 0x1000 && !(frame->error_code & 16) &&
+            cs != 0x40)
+            return -1;
+        record.ExceptionCode = 0xC0000005; /* STATUS_ACCESS_VIOLATION */
+        record.NumberParameters = 2;
+        record.ExceptionInformation[0] =
+            (frame->error_code & 2) ? 1 : 0;
+        record.ExceptionInformation[1] = (uint32_t)fault_address;
+    } else if (vector == 6) {
+        record.ExceptionCode = 0xC000001D; /* STATUS_ILLEGAL_INSTRUCTION */
+    } else {
+        record.ExceptionCode = 0xC0000005; /* STATUS_ACCESS_VIOLATION */
+    }
+    record.ExceptionAddress = (uint32_t)frame->rip;
+
+    uint16_t seg_ds, seg_es, seg_fs, seg_gs;
+    __asm__ volatile ("movw %%ds, %0" : "=r"(seg_ds));
+    __asm__ volatile ("movw %%es, %0" : "=r"(seg_es));
+    __asm__ volatile ("movw %%fs, %0" : "=r"(seg_fs));
+    __asm__ volatile ("movw %%gs, %0" : "=r"(seg_gs));
+    compat32_cpu_context_t context = {
+        .eax = (uint32_t)frame->rax,
+        .ebx = (uint32_t)frame->rbx,
+        .ecx = (uint32_t)frame->rcx,
+        .edx = (uint32_t)frame->rdx,
+        .esi = (uint32_t)frame->rsi,
+        .edi = (uint32_t)frame->rdi,
+        .ebp = (uint32_t)frame->rbp,
+        .esp = (uint32_t)frame->rsp,
+        .eip = (uint32_t)frame->rip,
+        .eflags = (uint32_t)frame->rflags,
+        .seg_cs = (uint32_t)frame->cs,
+        .seg_ss = (uint32_t)frame->ss,
+        .seg_ds = seg_ds,
+        .seg_es = seg_es,
+        .seg_fs = seg_fs,
+        .seg_gs = seg_gs,
+    };
+
+    if (g_null_page_dirty)
+        null_page_clean();
+
+    if (!compat32_seh_dispatch_cpu((PEXCEPTION_RECORD)&record, &context))
+        return 0;
+
+    extern uint32_t g_compat32_unwind_eip;
+    extern uint32_t g_compat32_unwind_esp;
+    extern uint32_t g_compat32_unwind_ebp;
+    if (g_compat32_unwind_eip) {
+        frame->rip = g_compat32_unwind_eip;
+        frame->rsp = g_compat32_unwind_esp;
+        frame->rbp = g_compat32_unwind_ebp;
+        extern uint32_t g_compat32_unwind_restore_nonvolatile;
+        if (g_compat32_unwind_restore_nonvolatile) {
+            extern uint32_t g_compat32_unwind_ebx;
+            extern uint32_t g_compat32_unwind_esi;
+            extern uint32_t g_compat32_unwind_edi;
+            frame->rbx = g_compat32_unwind_ebx;
+            frame->rsi = g_compat32_unwind_esi;
+            frame->rdi = g_compat32_unwind_edi;
+            g_compat32_unwind_restore_nonvolatile = 0;
+        }
+        g_compat32_unwind_eip = 0;
+        g_compat32_unwind_esp = 0;
+        g_compat32_unwind_ebp = 0;
+    } else {
+        compat32_apply_cpu_context(frame, &context);
+    }
+
+    if (vector == 14 && fault_address >= 0x1000 &&
+        (frame->error_code & 3) == 3 &&
+        frame->rip == record.ExceptionAddress)
+        compat32_wait_for_write_retry(fault_address);
+
+    return 1;
+}
 
 /* ── ISR stub declarations (defined in isr_stubs.S) ──────────── */
 
@@ -379,6 +559,7 @@ struct tss64 kernel_tss __attribute__((aligned(16)));
 /* Exported for int2e_stub.S to update IST1 for re-entrant interrupts */
 uint64_t *tss_ist1_ptr;  /* = &kernel_tss.ist1, set in tss_init() */
 uint64_t *tss_ist2_ptr;  /* = &kernel_tss.ist2, for DOS INT stubs */
+uint64_t *tss_ist3_ptr;  /* = &kernel_tss.ist3, process-owned fault stack */
 
 /* IST1 stack for INT 0x2E — 1MB.
  * int2e_stub.S reserves 16KB per nest (subq $16384). UT99's C++ EH
@@ -473,6 +654,7 @@ static void tss_init(void)
     kernel_tss.iopb_offset = sizeof(struct tss64);
     tss_ist1_ptr = &kernel_tss.ist1;
     tss_ist2_ptr = &kernel_tss.ist2;
+    tss_ist3_ptr = &kernel_tss.ist3;
 
     tss_install_descriptor(GDT_TSS_BSP_INDEX, &kernel_tss);
 
@@ -536,6 +718,11 @@ void x86_tss_reset_ist1(void)
     kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
 }
 
+void x86_tss_reset_ist3(void)
+{
+    kernel_tss.ist3 = (uint64_t)(ist3_stack + IST3_STACK_SIZE);
+}
+
 void x86_tss_reset_rsp0(void)
 {
     kernel_tss.rsp0 = (uint64_t)(ist4_stack + IST4_STACK_SIZE);
@@ -553,6 +740,8 @@ uint32_t isr_tsc_aux_enabled;
 static bool     tsc_deadline_mode;
 static uint64_t tsc_freq;              /* TSC cycles per second */
 static uint64_t tsc_last_tick;         /* TSC value of last virtual 100Hz tick */
+static uint64_t tsc_time_base;         /* TSC epoch used for monotonic time */
+static uint64_t tsc_time_base_ns;      /* Time at tsc_time_base */
 #define MSR_IA32_TSC_DEADLINE  0x6E0
 #define MSR_IA32_TSC_AUX       0xC0000103
 #define APIC_TIMER_TSC_DEADLINE  0x40000  /* LVT bits 18:17 = 10b */
@@ -566,6 +755,21 @@ static inline uint64_t idt_rdtsc(void)
 
 uint64_t idt_get_ticks(void) { return tick_count; }
 uint64_t idt_get_tsc_freq(void) { return tsc_freq; }
+uint64_t idt_get_monotonic_ns(void)
+{
+    uint64_t freq = tsc_freq;
+    uint64_t base = tsc_time_base;
+
+    if (!freq || !base)
+        return tick_count * 10000000ULL;
+
+    uint64_t elapsed = idt_rdtsc() - base;
+    uint64_t seconds = elapsed / freq;
+    uint64_t remainder = elapsed % freq;
+
+    return tsc_time_base_ns + seconds * 1000000000ULL +
+           (remainder * 1000000000ULL) / freq;
+}
 bool     idt_tsc_deadline_active(void) { return tsc_deadline_mode; }
 uint32_t idt_get_bsp_apic_id(void) { return bsp_apic_id_global; }
 
@@ -1880,13 +2084,53 @@ void isr_handler(interrupt_frame_t *frame)
             }
 
             if (null_call_count <= 10) {
+                uint32_t retaddr =
+                    ((uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF))[0];
                 serial_puts("[NULL-CALL] RIP=0x");
                 serial_puthex(cr2, 4);
                 serial_puts(" retaddr=0x");
-                serial_puthex(((uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF))[0], 8);
+                serial_puthex(retaddr, 8);
                 serial_puts(" #");
                 serial_putdec(null_call_count);
                 serial_puts("\n");
+
+                /* A NULL indirect call leaves the return address on the stack.
+                 * Preserve the generated call-site bytes and register target so
+                 * JIT/native-wrapper failures can be diagnosed after teardown. */
+                if (retaddr >= 0x10010 && retaddr < 0x80000000) {
+                    const uint8_t *code =
+                        (const uint8_t *)(uintptr_t)(retaddr - 16);
+                    serial_puts("[NULL-CALL-CODE] @0x");
+                    serial_puthex(retaddr - 16, 8);
+                    serial_puts(":");
+                    for (int i = 0; i < 24; i++) {
+                        serial_puts(" ");
+                        serial_puthex(code[i], 2);
+                    }
+                    serial_puts("\n");
+
+                    const uint8_t *call =
+                        (const uint8_t *)(uintptr_t)(retaddr - 2);
+                    if (call[0] == 0xFF &&
+                        (call[1] & 0xF8) == 0xD0) {
+                        uint8_t reg = call[1] & 7;
+                        uint32_t regvals[8] = {
+                            (uint32_t)frame->rax, (uint32_t)frame->rcx,
+                            (uint32_t)frame->rdx, (uint32_t)frame->rbx,
+                            0, (uint32_t)frame->rbp,
+                            (uint32_t)frame->rsi, (uint32_t)frame->rdi
+                        };
+                        const char *rn[] = {
+                            "eax", "ecx", "edx", "ebx",
+                            "esp", "ebp", "esi", "edi"
+                        };
+                        serial_puts("[NULL-CALL-CODE] call *%");
+                        serial_puts(rn[reg]);
+                        serial_puts(" target=0x");
+                        serial_puthex(regvals[reg], 8);
+                        serial_puts("\n");
+                    }
+                }
             }
             /* After too many NULL calls, force crash recovery instead of
              * looping forever. Was 50 — raised to 5000 so UT99 can
@@ -1937,6 +2181,14 @@ void isr_handler(interrupt_frame_t *frame)
             }
         }
     }
+
+    /* Deliver Win32 user exceptions before producing fatal diagnostics.
+     * Handled access violations are normal for mechanisms such as HotSpot's
+     * safepoint polling page. */
+    int compat32_seh_result =
+        compat32_dispatch_cpu_exception(frame, vec);
+    if (compat32_seh_result > 0)
+        return;
 
     /* CPU exception (vectors 0-31) */
     if (vec < 32) {
@@ -2505,7 +2757,9 @@ void isr_handler(interrupt_frame_t *frame)
          * If no SEH handler catches it, fall through to crash recovery. */
         /* (Bytecode-exec handler moved to early check above line ~463) */
 
-        if ((frame->cs & 0xFFFF) == 0x40 || (frame->cs & 0xFFFF) == 0x23) {
+        if (compat32_seh_result < 0 &&
+            ((frame->cs & 0xFFFF) == 0x40 ||
+             (frame->cs & 0xFFFF) == 0x23)) {
             /* Build EXCEPTION_RECORD for PE32 SEH dispatch */
             typedef struct {
                 uint32_t ExceptionCode;
@@ -2517,6 +2771,7 @@ void isr_handler(interrupt_frame_t *frame)
             } EXCEPTION_RECORD32;
 
             EXCEPTION_RECORD32 er;
+            uint64_t fault_address = 0;
             for (int i = 0; i < (int)sizeof(er)/4; i++)
                 ((uint32_t *)&er)[i] = 0;
 
@@ -2534,6 +2789,7 @@ void isr_handler(interrupt_frame_t *frame)
                 if (cr2 < 0x1000 && !(frame->error_code & 16) &&
                     (frame->cs & 0xFFFF) != 0x40)
                     goto compat32_null_recovery;
+                fault_address = cr2;
                 er.ExceptionCode = 0xC0000005;  /* STATUS_ACCESS_VIOLATION */
                 er.NumberParameters = 2;
                 er.ExceptionInformation[0] = (frame->error_code & 2) ? 1 : 0;
@@ -2555,7 +2811,6 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts("\n");
 
             /* Dispatch to PE32 SEH chain */
-            extern int compat32_seh_dispatch(void *ExceptionRecord);
             /* Cast to the 64-bit EXCEPTION_RECORD expected by dispatch.
              * Build a temporary 64-bit version from our 32-bit one. */
             typedef struct {
@@ -2584,7 +2839,7 @@ void isr_handler(interrupt_frame_t *frame)
              * page 0 (e.g., GMalloc vtable deref → cascading NULL call). */
             if (g_null_page_dirty) null_page_clean();
 
-            int handled = compat32_seh_dispatch((void *)&er64);
+            int handled = compat32_seh_dispatch((PEXCEPTION_RECORD)&er64);
             if (handled) {
                 /* Apply unwind globals to the iretq frame.
                  * int2e_stub.S does this for software exceptions (lines 77-96);
@@ -2602,6 +2857,11 @@ void isr_handler(interrupt_frame_t *frame)
                     g_compat32_unwind_esp = 0;
                     g_compat32_unwind_ebp = 0;
                 }
+
+                if (vec == 14 && fault_address >= 0x1000 &&
+                    (frame->error_code & 3) == 3 &&
+                    frame->rip == er.ExceptionAddress)
+                    compat32_wait_for_write_retry(fault_address);
 
                 serial_puts("  [WIN32] SEH handled — resuming via unwind\n");
                 return;  /* iretq will now jump to catch handler */
@@ -2888,7 +3148,9 @@ static void apic_init(void)
 
     /* Calibrate TSC: PIT measured ~10ms, so TSC freq = elapsed_tsc * 100 */
     tsc_freq = (tsc_cal_end - tsc_cal_start) * 100;
-    tsc_last_tick = idt_rdtsc();
+    tsc_time_base_ns = tick_count * 10000000ULL;
+    tsc_time_base = idt_rdtsc();
+    tsc_last_tick = tsc_time_base;
 
     if (tsc_deadline_mode) {
         /* ── TSC-Deadline mode: sub-microsecond precision ── */

@@ -2,6 +2,8 @@
 #include "zink_device_info.h"
 #include "zink_screen.h"
 
+extern void okgl_trace(const char *message);
+
 bool
 zink_get_physical_device_info(struct zink_screen *screen)
 {
@@ -2065,6 +2067,9 @@ zink_get_physical_device_info(struct zink_screen *screen)
          info->feats.pNext = &info->demote_feats;
       }
 
+   okgl_trace(info->have_EXT_shader_object
+              ? "[OKGL-VK] zink accepts EXT_shader_object\n"
+              : "[OKGL-VK] zink rejects EXT_shader_object\n");
    return true;
 
 fail:

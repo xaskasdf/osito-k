@@ -8,6 +8,8 @@ BUILD_ROOT  ?= $(VULKAN_ROOT)/../../build/lib/vulkan
 OUT         := $(BUILD_ROOT)/libvulkan.a
 .DEFAULT_GOAL := all
 
+CODEGEN_FLAGS ?= -fno-pic
+
 CC       ?= gcc
 AR       ?= ar
 GCC_INC  := $(shell $(CC) -print-file-name=include)
@@ -23,7 +25,7 @@ $(error CC=$(CC) is not a freestanding ELF cross-compiler. \
         nvk_stub Mach-O bug fixed Apr 28.)
 endif
 CFLAGS   := -std=gnu99 -ffreestanding -nostdinc -fno-stack-protector \
-            -mno-red-zone -Wall -Wextra -O2 -fno-pic \
+            -mno-red-zone -Wall -Wextra -O2 $(CODEGEN_FLAGS) \
             -I$(VULKAN_ROOT)/include -I$(VULKAN_ROOT)/loader \
             -I$(VULKAN_ROOT)/../../include \
             -isystem $(GCC_INC) \

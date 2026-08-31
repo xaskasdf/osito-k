@@ -239,6 +239,9 @@ util_queue_thread_func(void *input)
 
    free(input);
 
+   printf("[UQ] worker start queue=%s index=%d tid=%d\n",
+          queue->name, thread_index, (int)thrd_current());
+
    if (queue->flags & UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY) {
       /* Don't inherit the thread affinity from the parent thread.
        * Set the full mask.
@@ -519,8 +522,12 @@ static void
 util_queue_finish_execute(void *data, void *gdata, int num_thread)
 {
    util_barrier *barrier = data;
+   printf("[UQ] finish barrier enter worker=%d barrier=%p\n",
+          num_thread, (void *)barrier);
    if (util_barrier_wait(barrier))
       util_barrier_destroy(barrier);
+   printf("[UQ] finish barrier leave worker=%d barrier=%p\n",
+          num_thread, (void *)barrier);
 }
 
 void
@@ -693,6 +700,9 @@ util_queue_finish(struct util_queue *queue)
     */
    mtx_lock(&queue->lock);
 
+   printf("[UQ] finish begin queue=%s threads=%u queued=%d\n",
+          queue->name, queue->num_threads, queue->num_queued);
+
    /* The number of threads can be changed to 0, e.g. by the atexit handler. */
    if (!queue->num_threads) {
       mtx_unlock(&queue->lock);
@@ -715,11 +725,15 @@ util_queue_finish(struct util_queue *queue)
       util_queue_add_job_locked(queue, &barrier, &fences[i],
                                 util_queue_finish_execute, NULL, 0, true);
    }
+   printf("[UQ] finish queued barriers queue=%s count=%u\n",
+          queue->name, queue->num_threads);
    queue->create_threads_on_demand = true;
    mtx_unlock(&queue->lock);
 
    for (unsigned i = 0; i < queue->num_threads; ++i) {
+      printf("[UQ] finish wait queue=%s fence=%u\n", queue->name, i);
       util_queue_fence_wait(&fences[i]);
+      printf("[UQ] finish signalled queue=%s fence=%u\n", queue->name, i);
       util_queue_fence_destroy(&fences[i]);
    }
 

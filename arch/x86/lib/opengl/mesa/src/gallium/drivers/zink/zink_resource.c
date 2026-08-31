@@ -67,6 +67,8 @@
 
 #define ZINK_EXTERNAL_MEMORY_HANDLE 999
 
+extern void okgl_trace(const char *message);
+
 
 
 struct zink_debug_mem_entry {
@@ -195,25 +197,45 @@ debug_describe_zink_resource_object(char *buf, const struct zink_resource_object
 void
 zink_destroy_resource_object(struct zink_screen *screen, struct zink_resource_object *obj)
 {
+   okgl_trace("[ZR] destroy enter\n");
    if (obj->is_buffer) {
-      while (util_dynarray_contains(&obj->views, VkBufferView))
+      okgl_trace("[ZR] buffer views enter\n");
+      while (util_dynarray_contains(&obj->views, VkBufferView)) {
+         okgl_trace("[ZR] DestroyBufferView enter\n");
          VKSCR(DestroyBufferView)(screen->dev, util_dynarray_pop(&obj->views, VkBufferView), NULL);
+         okgl_trace("[ZR] DestroyBufferView leave\n");
+      }
+      okgl_trace("[ZR] buffer views leave\n");
    } else {
-      while (util_dynarray_contains(&obj->views, VkImageView))
+      okgl_trace("[ZR] image views enter\n");
+      while (util_dynarray_contains(&obj->views, VkImageView)) {
+         okgl_trace("[ZR] DestroyImageView enter\n");
          VKSCR(DestroyImageView)(screen->dev, util_dynarray_pop(&obj->views, VkImageView), NULL);
+         okgl_trace("[ZR] DestroyImageView leave\n");
+      }
+      okgl_trace("[ZR] image views leave\n");
    }
    if (!obj->dt && zink_debug & ZINK_DEBUG_MEM)
       zink_debug_mem_del(screen, obj->bo);
    util_dynarray_fini(&obj->views);
    for (unsigned i = 0; i < ARRAY_SIZE(obj->copies); i++)
       util_dynarray_fini(&obj->copies[i]);
+   okgl_trace("[ZR] arrays released\n");
    if (obj->is_buffer) {
+      okgl_trace("[ZR] DestroyBuffer enter\n");
       VKSCR(DestroyBuffer)(screen->dev, obj->buffer, NULL);
+      okgl_trace("[ZR] DestroyBuffer leave\n");
+      okgl_trace("[ZR] DestroyStorageBuffer enter\n");
       VKSCR(DestroyBuffer)(screen->dev, obj->storage_buffer, NULL);
+      okgl_trace("[ZR] DestroyStorageBuffer leave\n");
    } else if (obj->dt) {
+      okgl_trace("[ZR] display target destroy enter\n");
       zink_kopper_displaytarget_destroy(screen, obj->dt);
+      okgl_trace("[ZR] display target destroy leave\n");
    } else if (!obj->is_aux) {
+      okgl_trace("[ZR] DestroyImage enter\n");
       VKSCR(DestroyImage)(screen->dev, obj->image, NULL);
+      okgl_trace("[ZR] DestroyImage leave\n");
    } else {
 #if defined(ZINK_USE_DMABUF) && !defined(_WIN32)
       close(obj->handle);
@@ -223,9 +245,13 @@ zink_destroy_resource_object(struct zink_screen *screen, struct zink_resource_ob
    simple_mtx_destroy(&obj->view_lock);
    if (obj->dt) {
       FREE(obj->bo); //this is a dummy struct
-   } else
+   } else {
+      okgl_trace("[ZR] bo unref enter\n");
       zink_bo_unref(screen, obj->bo);
+      okgl_trace("[ZR] bo unref leave\n");
+   }
    FREE(obj);
+   okgl_trace("[ZR] destroy leave\n");
 }
 
 static void
@@ -2490,7 +2516,6 @@ zink_image_map(struct pipe_context *pctx,
    struct zink_transfer *trans = create_transfer(ctx, pres, usage, box);
    if (!trans)
       return NULL;
-
    trans->base.b.level = level;
    if (zink_is_swapchain(res))
       /* this is probably a multi-chain which has already been acquired */
@@ -2531,7 +2556,6 @@ zink_image_map(struct pipe_context *pctx,
       trans->staging_res = zink_resource_create(pctx->screen, &templ);
       if (!trans->staging_res)
          goto fail;
-
       struct zink_resource *staging_res = zink_resource(trans->staging_res);
 
       if (usage & PIPE_MAP_READ) {

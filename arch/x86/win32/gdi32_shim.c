@@ -9,6 +9,7 @@
 #include "compat32.h"
 #include "dllloader.h"
 #include "kernel32_shim.h"
+#include "opengl32_shim.h"
 #include "win32_abi.h"
 #include "../fs/vfs.h"
 
@@ -25,10 +26,15 @@ extern uint32_t *fb_get_base(void)   __attribute__((weak));
 extern uint32_t  fb_get_width(void)  __attribute__((weak));
 extern uint32_t  fb_get_height(void) __attribute__((weak));
 extern uint32_t  fb_get_pitch(void)  __attribute__((weak));
+extern uint32_t  display_get_width(void)  __attribute__((weak));
+extern uint32_t  display_get_height(void) __attribute__((weak));
 extern BOOL user32_get_window_surface(HANDLE window, void **pixels, int *width,
                                       int *height, int *pitch)
     __attribute__((weak));
 extern void user32_mark_window_dirty(HANDLE window) __attribute__((weak));
+extern BOOL user32_get_current_display_mode(uint32_t *width, uint32_t *height,
+                                            uint32_t *bpp, uint32_t *frequency)
+    __attribute__((weak));
 
 #define SCREEN_WIDTH  800
 #define SCREEN_HEIGHT 600
@@ -163,6 +169,9 @@ static GDI_BITMAP gdi_bmps[MAX_GDI_BITMAPS];
 static GDI_FONT   gdi_fonts[MAX_GDI_FONTS];
 static GDI_REGION gdi_regions[MAX_GDI_REGIONS];
 static volatile int gdi_region_lock;
+static volatile int gdi_gamma_lock;
+static int gdi_gamma_initialized;
+static WORD gdi_gamma_ramp[3][256];
 static UINT       gdi_blit_trace_count;
 
 /* Handle encoding:
@@ -181,6 +190,11 @@ static UINT       gdi_blit_trace_count;
 #define STOCK_SYSTEM_FONT ((HGDIOBJ)(ULONG_PTR)0xAA00000Du)
 #define OBJ_BITMAP 7
 #define OBJ_FONT   6
+
+#define GDI_BI_RGB            0u
+#define GDI_BI_BITFIELDS      3u
+#define GDI_BI_ALPHABITFIELDS 6u
+#define GDI_DIB_RGB_COLORS    0u
 
 #define IS_DC_HANDLE(h)  (((ULONG_PTR)(h) & TAG_MASK) == DC_TAG)
 #define IS_BMP_HANDLE(h) (((ULONG_PTR)(h) & TAG_MASK) == BMP_TAG)
@@ -279,6 +293,26 @@ static void regions_lock(void)
 static void regions_unlock(void)
 {
     __atomic_store_n(&gdi_region_lock, 0, __ATOMIC_RELEASE);
+}
+
+static void gamma_lock(void)
+{
+    while (__atomic_exchange_n(&gdi_gamma_lock, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+}
+
+static void gamma_unlock(void)
+{
+    __atomic_store_n(&gdi_gamma_lock, 0, __ATOMIC_RELEASE);
+}
+
+static void gamma_initialize(void)
+{
+    if (gdi_gamma_initialized) return;
+    for (int channel = 0; channel < 3; channel++)
+        for (int value = 0; value < 256; value++)
+            gdi_gamma_ramp[channel][value] = (WORD)(value * 257U);
+    gdi_gamma_initialized = 1;
 }
 
 static int alloc_region(void)
@@ -402,18 +436,27 @@ int WINAPI GetDeviceCaps(HDC hdc, int index)
     extern int  ddraw_display_mode_active(void) __attribute__((weak));
     extern void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
                 __attribute__((weak));
-    int hw = (fb_get_width  && fb_get_width())  ? (int)fb_get_width()  : SCREEN_WIDTH;
-    int vh = (fb_get_height && fb_get_height()) ? (int)fb_get_height() : SCREEN_HEIGHT;
-    if (ddraw_display_mode_active && ddraw_get_display_mode &&
-        ddraw_display_mode_active()) {
+    uint32_t physical_w = display_get_width ? display_get_width() : 0;
+    uint32_t physical_h = display_get_height ? display_get_height() : 0;
+    if (!physical_w && fb_get_width) physical_w = fb_get_width();
+    if (!physical_h && fb_get_height) physical_h = fb_get_height();
+    int hw = physical_w ? (int)physical_w : SCREEN_WIDTH;
+    int vh = physical_h ? (int)physical_h : SCREEN_HEIGHT;
+    uint32_t mode_bpp = SCREEN_BPP;
+    if (user32_get_current_display_mode) {
         uint32_t mw = 0, mh = 0;
-        ddraw_get_display_mode(&mw, &mh, NULL);
+        user32_get_current_display_mode(&mw, &mh, &mode_bpp, NULL);
+        if (mw && mh) { hw = (int)mw; vh = (int)mh; }
+    } else if (ddraw_display_mode_active && ddraw_get_display_mode &&
+               ddraw_display_mode_active()) {
+        uint32_t mw = 0, mh = 0;
+        ddraw_get_display_mode(&mw, &mh, &mode_bpp);
         if (mw && mh) { hw = (int)mw; vh = (int)mh; }
     }
     switch (index) {
     case HORZRES:    return hw;
     case VERTRES:    return vh;
-    case BITSPIXEL:  return SCREEN_BPP;
+    case BITSPIXEL:  return (int)mode_bpp;
     case PLANES:     return 1;
     case RASTERCAPS: return 0;
     case TECHNOLOGY: return 1; /* DT_RASDISPLAY */
@@ -424,6 +467,44 @@ int WINAPI GetDeviceCaps(HDC hdc, int index)
 }
 
 /* ── DC creation / destruction ───────────────────────────────── */
+
+BOOL WINAPI GetDeviceGammaRamp(HDC hdc, PVOID ramp)
+{
+    if (!dc_from_handle(hdc)) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+    if (!ramp) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    gamma_lock();
+    gamma_initialize();
+    gdi_memcpy(ramp, gdi_gamma_ramp, sizeof(gdi_gamma_ramp));
+    gamma_unlock();
+    SetLastError(0);
+    return TRUE;
+}
+
+BOOL WINAPI SetDeviceGammaRamp(HDC hdc, PCVOID ramp)
+{
+    if (!dc_from_handle(hdc)) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+    if (!ramp) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    gamma_lock();
+    gamma_initialize();
+    gdi_memcpy(gdi_gamma_ramp, ramp, sizeof(gdi_gamma_ramp));
+    gamma_unlock();
+    SetLastError(0);
+    return TRUE;
+}
 
 HDC WINAPI CreateDCA(PCSTR lpszDriver, PCSTR lpszDevice,
                      PCSTR lpszOutput, PCVOID lpInitData)
@@ -582,13 +663,37 @@ void gdi32_free_screen_dc(HDC hdc)
 
 int WINAPI ChoosePixelFormat(HDC hdc, const PIXELFORMATDESCRIPTOR *ppfd)
 {
-    (void)hdc; (void)ppfd;
+    serial_puts("[GDI32-PFD] ChoosePixelFormat hdc=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)hdc, 8);
+    serial_puts(" pfd=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)ppfd, 8);
+    if (ppfd) {
+        serial_puts(" size=");
+        serial_putdec(ppfd->nSize);
+        serial_puts(" flags=0x");
+        serial_puthex(ppfd->dwFlags, 8);
+        serial_puts(" rgba/depth/stencil=");
+        serial_putdec(ppfd->cColorBits);
+        serial_puts("/");
+        serial_putdec(ppfd->cAlphaBits);
+        serial_puts("/");
+        serial_putdec(ppfd->cDepthBits);
+        serial_puts("/");
+        serial_putdec(ppfd->cStencilBits);
+    }
+    serial_puts(" -> 1\n");
     return 1; /* format #1 */
 }
 
 BOOL WINAPI SetPixelFormat(HDC hdc, int format, const PIXELFORMATDESCRIPTOR *ppfd)
 {
-    (void)hdc; (void)format; (void)ppfd;
+    serial_puts("[GDI32-PFD] SetPixelFormat hdc=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)hdc, 8);
+    serial_puts(" format=");
+    serial_putdec((uint64_t)(uint32_t)format);
+    serial_puts(" pfd=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)ppfd, 8);
+    serial_puts(" -> TRUE\n");
     return TRUE;
 }
 
@@ -601,14 +706,24 @@ int WINAPI GetPixelFormat(HDC hdc)
 int WINAPI DescribePixelFormat(HDC hdc, int iPixelFormat, DWORD nBytes,
                                 LPPIXELFORMATDESCRIPTOR ppfd)
 {
-    (void)hdc; (void)iPixelFormat;
+    serial_puts("[GDI32-PFD] DescribePixelFormat hdc=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)hdc, 8);
+    serial_puts(" format=");
+    serial_putdec((uint64_t)(uint32_t)iPixelFormat);
+    serial_puts(" bytes=");
+    serial_putdec(nBytes);
+    serial_puts(" out=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)ppfd, 8);
+    serial_puts(" -> 1\n");
     if (ppfd && nBytes >= sizeof(PIXELFORMATDESCRIPTOR)) {
         BYTE *p = (BYTE *)ppfd;
         for (SIZE_T i = 0; i < sizeof(PIXELFORMATDESCRIPTOR); i++) p[i] = 0;
         ppfd->nSize       = sizeof(PIXELFORMATDESCRIPTOR);
         ppfd->nVersion    = 1;
         ppfd->dwFlags     = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL |
-                            PFD_DOUBLEBUFFER | PFD_GENERIC_FORMAT;
+                            PFD_DOUBLEBUFFER;
+        if (!opengl32_has_accelerated_backend())
+            ppfd->dwFlags |= PFD_GENERIC_FORMAT;
         ppfd->iPixelType  = PFD_TYPE_RGBA;
         ppfd->cColorBits  = 32;
         ppfd->cRedBits    = 8;
@@ -624,8 +739,7 @@ int WINAPI DescribePixelFormat(HDC hdc, int iPixelFormat, DWORD nBytes,
 
 BOOL WINAPI SwapBuffers(HDC hdc)
 {
-    (void)hdc;
-    return TRUE;
+    return opengl32_swap_buffers(hdc);
 }
 
 /* ── Bitmap creation ─────────────────────────────────────────── */
@@ -681,6 +795,26 @@ HBITMAP WINAPI CreateCompatibleBitmap(HDC hdc, int cx, int cy)
     return bitmap;
 }
 
+static BOOL gdi_native_color_masks(int bpp, DWORD *red, DWORD *green,
+                                   DWORD *blue)
+{
+    if (!red || !green || !blue) return FALSE;
+
+    if (bpp == 16) {
+        *red = 0x0000F800u;
+        *green = 0x000007E0u;
+        *blue = 0x0000001Fu;
+        return TRUE;
+    }
+    if (bpp == 32) {
+        *red = 0x00FF0000u;
+        *green = 0x0000FF00u;
+        *blue = 0x000000FFu;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 int WINAPI GetDIBits(HDC hdc, HBITMAP bitmap, UINT start_scan,
                      UINT scan_lines, PVOID bits, PVOID bitmap_info,
                      UINT usage)
@@ -692,13 +826,57 @@ int WINAPI GetDIBits(HDC hdc, HBITMAP bitmap, UINT start_scan,
         return 0;
 
     BYTE *header = (BYTE *)bitmap_info;
-    *(DWORD *)(header + 0) = 40;                /* biSize */
+    DWORD header_size = *(DWORD *)(header + 0);
+    if (header_size < 40)
+        return 0;
+
+    USHORT requested_bpp = *(USHORT *)(header + 14);
+    DWORD requested_compression = *(DWORD *)(header + 16);
+    BOOL format_query = !bits && requested_bpp == 0;
+    USHORT output_bpp = format_query ? (USHORT)bmp->bpp : requested_bpp;
+    DWORD output_compression = format_query ? GDI_BI_RGB
+                                            : requested_compression;
+
+    if (!output_bpp)
+        output_bpp = (USHORT)bmp->bpp;
+    if (output_bpp != (USHORT)bmp->bpp)
+        return 0; /* Pixel-format conversion is not implemented yet. */
+    if (output_compression != GDI_BI_RGB &&
+        output_compression != GDI_BI_BITFIELDS)
+        return 0;
+
+    DWORD red_mask = 0, green_mask = 0, blue_mask = 0;
+    if (output_compression == GDI_BI_BITFIELDS &&
+        !gdi_native_color_masks(output_bpp, &red_mask, &green_mask,
+                                &blue_mask))
+        return 0;
+
+    *(DWORD *)(header + 0) = header_size;        /* biSize */
     *(LONG *)(header + 4) = bmp->width;         /* biWidth */
     *(LONG *)(header + 8) = bmp->height;        /* biHeight */
     *(USHORT *)(header + 12) = 1;               /* biPlanes */
-    *(USHORT *)(header + 14) = (USHORT)bmp->bpp;/* biBitCount */
-    *(DWORD *)(header + 16) = 0;                /* BI_RGB */
+    *(USHORT *)(header + 14) = output_bpp;       /* biBitCount */
+    *(DWORD *)(header + 16) = output_compression;
     *(DWORD *)(header + 20) = (DWORD)(bmp->pitch * bmp->height);
+
+    if (output_compression == GDI_BI_BITFIELDS) {
+        *(DWORD *)(header + 40) = red_mask;
+        *(DWORD *)(header + 44) = green_mask;
+        *(DWORD *)(header + 48) = blue_mask;
+
+        static UINT bitfields_trace_count;
+        if (bitfields_trace_count++ < 8) {
+            serial_puts("[GDI32] GetDIBits BI_BITFIELDS bpp=");
+            serial_putdec(output_bpp);
+            serial_puts(" masks=0x");
+            serial_puthex(red_mask, 8);
+            serial_puts("/0x");
+            serial_puthex(green_mask, 8);
+            serial_puts("/0x");
+            serial_puthex(blue_mask, 8);
+            serial_puts("\n");
+        }
+    }
 
     UINT available = (UINT)bmp->height - start_scan;
     UINT copied = scan_lines < available ? scan_lines : available;
@@ -2005,11 +2183,6 @@ static BOOL WINAPI Polyline_k32(HDC hdc, const GDI_POINT *points, int count)
 {
     return dc_from_handle(hdc) && points && count >= 2;
 }
-
-#define GDI_BI_RGB            0u
-#define GDI_BI_BITFIELDS      3u
-#define GDI_BI_ALPHABITFIELDS 6u
-#define GDI_DIB_RGB_COLORS    0u
 
 typedef struct {
     const BYTE *bits;
@@ -6551,6 +6724,8 @@ typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_
 
 static const SHIM_EXPORT gdi32_exports[] = {
     { "GetDeviceCaps",       (PVOID)GetDeviceCaps, 2, CC_STDCALL },
+    { "GetDeviceGammaRamp",  (PVOID)GetDeviceGammaRamp, 2, CC_STDCALL },
+    { "SetDeviceGammaRamp",  (PVOID)SetDeviceGammaRamp, 2, CC_STDCALL },
     { "CreateDCA",           (PVOID)CreateDCA, 4, CC_STDCALL },
     { "CreateDCW",           (PVOID)CreateDCW_k32, 4, CC_STDCALL },
     { "CreateICW",           (PVOID)CreateDCW_k32, 4, CC_STDCALL },

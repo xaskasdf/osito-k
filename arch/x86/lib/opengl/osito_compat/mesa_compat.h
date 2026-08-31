@@ -167,26 +167,11 @@ extern unsigned long long strtoull(const char *s, char **end, int base);
 #  include <string.h>
 #endif
 
-/* posix_memalign: wrap libc malloc with manual over-allocation + align.
- * Mesa's ralloc/blob/SIMD codepaths pass alignments of 16/32/64 bytes;
- * returning 8-byte-aligned mem to those would cause #GP on movaps. */
+/* Mesa's ralloc/blob/SIMD paths require allocations that remain compatible
+ * with free() and realloc().  The libc allocator owns the alignment header. */
 #ifndef __cplusplus
-extern void *malloc(size_t);
-extern void  free(void *);
-static inline int posix_memalign(void **out, size_t a, size_t s) {
-    if (a < sizeof(void *) || (a & (a - 1))) return 22; /* EINVAL */
-    void *raw = malloc(s + a - 1 + sizeof(void *));
-    if (!raw) return 12;  /* ENOMEM */
-    void *aligned = (void *)(((uintptr_t)raw + sizeof(void *) + a - 1) & ~(a - 1));
-    ((void **)aligned)[-1] = raw;
-    *out = aligned;
-    return 0;
-}
+extern int posix_memalign(void **out, size_t alignment, size_t size);
 #endif
-/* Companion: callers that mix posix_memalign + free won't recover the raw
- * pointer; for now we live with that — Mesa's util/blob.c uses ralloc which
- * is its own pool so doesn't hit free() on an aligned alloc. Document the
- * constraint here so W4.1+ can add a wrapper if needed. */
 #define HAVE_POSIX_MEMALIGN 1
 
 /* atexit — INTENTIONAL no-op.  Mesa's os_misc.c registers
@@ -229,17 +214,35 @@ static inline int atexit(void (*f)(void)) { (void)f; return 0; }
  *   grep -rn 'pthread_create\b' mesa/src → all wrapped in HAVE_PTHREAD
  *   guards that route through util_queue, which uses thrd_create (real). */
 #ifndef __cplusplus
-typedef int pthread_mutex_t;
-typedef int pthread_cond_t;
-typedef int pthread_t;
+/* Match the target musl pthread ABI used by the C++ translation units.
+ * OsitoK's futex-backed C11 primitives intentionally operate on the first
+ * 32-bit word, while the full size/alignment keeps mixed C/C++ Mesa structs
+ * ABI-compatible. */
+typedef unsigned long pthread_t;
 typedef int pthread_once_t;
-typedef int pthread_key_t;
-typedef int pthread_barrier_t;
-typedef int pthread_mutexattr_t;
-typedef int pthread_condattr_t;
-typedef int pthread_attr_t;
-#define PTHREAD_MUTEX_INITIALIZER 0
-#define PTHREAD_COND_INITIALIZER  0
+typedef unsigned pthread_key_t;
+typedef int pthread_spinlock_t;
+typedef struct { unsigned __attr; } pthread_mutexattr_t;
+typedef struct { unsigned __attr; } pthread_condattr_t;
+typedef struct { unsigned __attr; } pthread_barrierattr_t;
+typedef struct { unsigned __attr[2]; } pthread_rwlockattr_t;
+typedef struct {
+    union { int __i[14]; volatile int __vi[14]; unsigned long __s[7]; } __u;
+} pthread_attr_t;
+typedef struct {
+    union { int __i[10]; volatile int __vi[10]; volatile void *volatile __p[5]; } __u;
+} pthread_mutex_t;
+typedef struct {
+    union { int __i[12]; volatile int __vi[12]; void *__p[6]; } __u;
+} pthread_cond_t;
+typedef struct {
+    union { int __i[14]; volatile int __vi[14]; void *__p[7]; } __u;
+} pthread_rwlock_t;
+typedef struct {
+    union { int __i[8]; volatile int __vi[8]; void *__p[4]; } __u;
+} pthread_barrier_t;
+#define PTHREAD_MUTEX_INITIALIZER {{{0}}}
+#define PTHREAD_COND_INITIALIZER  {{{0}}}
 #define PTHREAD_ONCE_INIT         0
 /* No-op: real synchronization goes through mtx_t/cnd_t/thrd_t in libc_stubs. */
 static inline int pthread_mutex_init(pthread_mutex_t *m, const void *a) { (void)m; (void)a; return 0; }
@@ -265,8 +268,7 @@ static inline int pthread_join(pthread_t t, void **r) { (void)t; (void)r; return
  * smoke-test path doesn't contend, so no-op is correct.  If Mesa shaders
  * ever multi-thread compile (parallel SPIR-V→NIR), upgrade to a futex-backed
  * rwlock here.  Reference: mesa/src/util/rwlock.{c,h}. */
-typedef int pthread_rwlock_t;
-#define PTHREAD_RWLOCK_INITIALIZER 0
+#define PTHREAD_RWLOCK_INITIALIZER {{{0}}}
 static inline int pthread_rwlock_init(pthread_rwlock_t *l, const void *a) { (void)l; (void)a; return 0; }
 static inline int pthread_rwlock_destroy(pthread_rwlock_t *l) { (void)l; return 0; }
 static inline int pthread_rwlock_rdlock(pthread_rwlock_t *l) { (void)l; return 0; }
@@ -317,15 +319,11 @@ static inline long sysconf(int name) {
 #define static_assert(cond, msg) _Static_assert((cond), msg)
 #endif
 
-/* getenv — INTENTIONAL always-NULL.  OsitoK has no environment block at
- * the libc layer.  Mesa uses getenv extensively for debug toggles
- * (MESA_DEBUG, NIR_PRINT, GALLIUM_TRACE, ZINK_DEBUG, etc.) — every one
- * of these is read once and cached; NULL → debug feature off → smoke
- * path matches release behaviour.  If we ever wire env vars (e.g. via
- * a kernel-side prop store), make sure to invalidate Mesa's cached
- * debug_get_option_cached values too. */
+/* Native ELF startup supplies envp and tcclib exposes it through getenv().
+ * Mesa reads these options lazily, so applications can select standard
+ * behavior such as LIBGL_ALWAYS_SOFTWARE before creating a context. */
 #ifndef __cplusplus
-static inline char *getenv(const char *name) { (void)name; return (char *)0; }
+extern char *getenv(const char *name);
 #endif
 
 /* strndup / strnlen — provided by mesa_libc_stubs.c, declared here. */
@@ -567,7 +565,7 @@ static inline int mprotect(void *addr, size_t len, int prot) {
 #define HAVE_PTHREAD 1
 #define USE_X86_64   1
 
-/* W4.7 T0 — Force non-TLS dispatch path (fix W4.5 C1).
+/* Use manual GLAPI current-state storage instead of compiler TLS.
  *
  * mesa/src/util/u_thread.h sets:
  *   #if DETECT_OS_APPLE → __thread
@@ -575,18 +573,16 @@ static inline int mprotect(void *addr, size_t len, int prot) {
  *   #else → thread_local
  *
  * On OsitoK we are -ffreestanding -nostdinc, no __GLIBC__ defined, so the
- * "else" branch picks plain thread_local. Problem: the OsitoK ELF loader
- * for tests doesn't initialize %fs (the TLS register), so any access to
- * a thread_local variable would trap. Even if we wired %fs, single-threaded
- * OsitoK doesn't need TLS for the GL dispatch table at all.
+ * "else" branch picks plain thread_local. The shared graphics-module loader
+ * has no ELF TLS layout, while guest Win32 threads already own FS/GS.
  *
- * Force __THREAD_INITIAL_EXEC to expand to nothing → _mesa_glapi_tls_Dispatch
- * and _mesa_glapi_tls_Context become plain process globals. This is safe on
- * single-threaded OsitoK and avoids the missing %fs setup entirely.
+ * Keep the ABI symbols as plain globals, but route all authoritative GLAPI
+ * reads and writes through the TGID/TID-backed C11 TSS implementation.
  *
  * We #include detect_os.h first so DETECT_OS_APPLE is defined (= 0 on us),
  * preventing u_thread.h's first arm from triggering. */
-#define __THREAD_INITIAL_EXEC /* empty: non-TLS globals */
+#define OSITOK_MANUAL_GLAPI_CURRENT 1
+#define __THREAD_INITIAL_EXEC /* ABI placeholders; not authoritative state */
 /* W4.2 — In C++ mode hosted glibc supplies real secure_getenv.
  * Tell Mesa not to redefine it as static inline. */
 #ifdef __cplusplus

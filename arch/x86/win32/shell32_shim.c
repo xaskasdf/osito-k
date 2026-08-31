@@ -720,6 +720,10 @@ static HRESULT WINAPI SHGetKnownFolderPath_k32(LPCGUID folder, DWORD flags,
     return 0;
 }
 
+static int WINAPI SHCreateDirectoryExA_k32(HWND hwnd, PCSTR path,
+                                            PVOID security_attributes);
+static DWORD shell_ensure_special_folder_w(HWND hwnd, PCWSTR path);
+
 static HRESULT WINAPI SHGetFolderPathW_k32(HWND hwnd, int csidl, HANDLE token,
                                             DWORD flags, PWSTR out_path)
 {
@@ -757,6 +761,14 @@ static HRESULT WINAPI SHGetFolderPathW_k32(HWND hwnd, int csidl, HANDLE token,
         i++;
     }
     out_path[i] = 0;
+
+    if (csidl & 0x8000) { /* CSIDL_FLAG_CREATE */
+        DWORD error = shell_ensure_special_folder_w(hwnd, out_path);
+        if (error) {
+            out_path[0] = 0;
+            return (HRESULT)(0x80070000U | (error & 0xFFFFU));
+        }
+    }
     return 0;
 }
 
@@ -878,11 +890,57 @@ static int WINAPI SHCreateDirectoryExA_k32(HWND hwnd, PCSTR path,
     return 0;
 }
 
+static DWORD shell_ensure_special_folder_w(HWND hwnd, PCWSTR path)
+{
+    char narrow_path[260];
+    DWORD i = 0;
+    if (!path || !*path) return 87; /* ERROR_INVALID_PARAMETER */
+    while (path[i]) {
+        if (i >= sizeof(narrow_path) - 1 || path[i] > 0x7F)
+            return 206; /* ERROR_FILENAME_EXCED_RANGE */
+        narrow_path[i] = (char)path[i];
+        i++;
+    }
+    narrow_path[i] = 0;
+
+    int result = SHCreateDirectoryExA_k32(hwnd, narrow_path, NULL);
+    return result == 0 || result == 183 ? 0 : (DWORD)result;
+}
+
 static BOOL WINAPI SHGetSpecialFolderPathW_k32(HWND hwnd, PWSTR out_path,
                                                 int csidl, BOOL create)
 {
-    DWORD flags = create ? 0x8000U : 0; /* CSIDL_FLAG_CREATE */
-    return SHGetFolderPathW_k32(hwnd, csidl, NULL, flags, out_path) == 0;
+    if (!out_path) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    int requested_csidl = csidl | (create ? 0x8000 : 0);
+    HRESULT status = SHGetFolderPathW_k32(hwnd, requested_csidl, NULL, 0,
+                                           out_path);
+    if (status != 0) {
+        SetLastError((DWORD)status & 0xFFFFU);
+        return FALSE;
+    }
+    SetLastError(0);
+    return TRUE;
+}
+
+static BOOL WINAPI SHGetSpecialFolderPathA_k32(HWND hwnd, PSTR out_path,
+                                                int csidl, BOOL create)
+{
+    if (!out_path) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    int requested_csidl = csidl | (create ? 0x8000 : 0);
+    HRESULT status = SHGetFolderPathA_k32(hwnd, requested_csidl, NULL, 0,
+                                           out_path);
+    if (status != 0) {
+        SetLastError((DWORD)status & 0xFFFFU);
+        return FALSE;
+    }
+    SetLastError(0);
+    return TRUE;
 }
 
 PVOID WINAPI CommandLineToArgvW(PCWSTR cmd, int *argc_out)
@@ -1108,6 +1166,7 @@ static const SHIM_EXPORT shell32_exports[] = {
     { "SHGetFolderPathA",   (PVOID)SHGetFolderPathA_k32, 5, CC_STDCALL },
     { "SHGetFolderPathW",   (PVOID)SHGetFolderPathW_k32, 5, CC_STDCALL },
     { "SHGetSettings",      (PVOID)SHGetSettings_k32,    2, CC_STDCALL },
+    { "SHGetSpecialFolderPathA", (PVOID)SHGetSpecialFolderPathA_k32, 4, CC_STDCALL },
     { "SHGetSpecialFolderPathW", (PVOID)SHGetSpecialFolderPathW_k32, 4, CC_STDCALL },
     { "SHGetKnownFolderPath", (PVOID)SHGetKnownFolderPath_k32, 4, CC_STDCALL },
     { "SHGetSpecialFolderLocation", (PVOID)SHGetSpecialFolderLocation_k32, 3, CC_STDCALL },

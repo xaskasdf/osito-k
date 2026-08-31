@@ -30,6 +30,12 @@
 extern "C" {
 #endif
 
+#if defined(__GNUC__)
+#define OKGL_PUBLIC __attribute__((visibility("default")))
+#else
+#define OKGL_PUBLIC
+#endif
+
 /* Opaque context handle.  Internally points to a heap-allocated
  * OK_GLContext_Internal that owns the VkInstance / VkDevice / VkSurface
  * / pipe_screen / pipe_context / st_context tuple. */
@@ -46,18 +52,30 @@ typedef struct OK_GLContext OK_GLContext;
  *
  * The first call performs lazy one-shot initialisation of the Vulkan
  * loader + zink screen.  Subsequent calls reuse the cached singletons. */
-OK_GLContext *okGLCreateContext(uint32_t window_id, int width, int height);
+OKGL_PUBLIC OK_GLContext *okGLCreateContext(uint32_t window_id, int width,
+                                            int height);
 
 /* Bind ctx to the calling thread.  Pass NULL to unbind.  After this
  * returns, GL calls on the calling thread route through ctx. */
-int okGLMakeCurrent(OK_GLContext *ctx);
+OKGL_PUBLIC int okGLMakeCurrent(OK_GLContext *ctx);
+
+/* Rebind an existing context to a resized/recreated compositor window.
+ * This invalidates the state-tracker drawable so its color attachment is
+ * recreated at the new geometry before the next draw. */
+OKGL_PUBLIC int okGLResizeContext(OK_GLContext *ctx, uint32_t window_id,
+                                 int width, int height);
 
 /* Present ctx's back-buffer to the bound window.  No-op for off-screen
  * contexts. */
-int okGLSwapBuffers(OK_GLContext *ctx);
+OKGL_PUBLIC int okGLSwapBuffers(OK_GLContext *ctx);
+
+/* Copy the current BGRA8 back-buffer into a compositor-owned surface.
+ * `pitch` is the destination row stride in bytes. */
+OKGL_PUBLIC int okGLReadback(OK_GLContext *ctx, void *pixels, int width,
+                             int height, int pitch);
 
 /* Destroy ctx.  After this returns ctx is invalid; never deref it. */
-void okGLDestroyContext(OK_GLContext *ctx);
+OKGL_PUBLIC void okGLDestroyContext(OK_GLContext *ctx);
 
 #ifdef __cplusplus
 }  /* extern "C" */

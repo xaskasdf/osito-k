@@ -85,6 +85,8 @@ NTSTATUS NTAPI NtSetValueKey(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID,
 NTSTATUS NTAPI NtCreateEvent(PHANDLE EventHandle, ACCESS_MASK DesiredAccess,
                        POBJECT_ATTRIBUTES ObjectAttributes,
                        ULONG EventType, BOOL InitialState);
+NTSTATUS NTAPI NtOpenEvent(PHANDLE EventHandle, ACCESS_MASK DesiredAccess,
+                           POBJECT_ATTRIBUTES ObjectAttributes);
 NTSTATUS NTAPI NtSetEvent(HANDLE EventHandle, LONG *PreviousState);
 NTSTATUS NTAPI NtResetEvent(HANDLE EventHandle, LONG *PreviousState);
 NTSTATUS NTAPI NtPulseEvent(HANDLE EventHandle, LONG *PreviousState);

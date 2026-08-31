@@ -11,6 +11,7 @@ extern int printf(const char *, ...);
 #define VN_CMD_CREATE_DEVICE 11u
 #define VN_CMD_DESTROY_DEVICE 12u
 #define VN_CMD_GET_DEVICE_QUEUE_2 155u
+#define VN_CMD_GET_CALIBRATED_TIMESTAMPS_EXT 236u
 #define VN_COMMAND_GENERATE_REPLY 1u
 #define VN_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA 1000384005u
 
@@ -105,6 +106,10 @@ static int get_feature_body(const VkBaseInStructure *feature,
                             const void **body, uint32_t *body_size)
 {
     switch (feature->sType) {
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+        FEATURE_RANGE(VkPhysicalDeviceFeatures2, feature,
+                      features, features);
+        break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
         FEATURE_RANGE(VkPhysicalDeviceVulkan11Features, feature,
                       storageBuffer16BitAccess, shaderDrawParameters);
@@ -122,6 +127,24 @@ static int get_feature_body(const VkBaseInStructure *feature,
                       feature, attachmentFeedbackLoopLayout,
                       attachmentFeedbackLoopLayout);
         break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT:
+        FEATURE_RANGE(
+            VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT,
+            feature, attachmentFeedbackLoopDynamicState,
+            attachmentFeedbackLoopDynamicState);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT:
+        FEATURE_RANGE(VkPhysicalDevice4444FormatsFeaturesEXT, feature,
+                      formatA4R4G4B4, formatA4B4G4R4);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT:
+        FEATURE_RANGE(VkPhysicalDeviceBorderColorSwizzleFeaturesEXT, feature,
+                      borderColorSwizzle, borderColorSwizzleFromImage);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COLOR_WRITE_ENABLE_FEATURES_EXT:
+        FEATURE_RANGE(VkPhysicalDeviceColorWriteEnableFeaturesEXT, feature,
+                      colorWriteEnable, colorWriteEnable);
+        break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT:
         FEATURE_RANGE(VkPhysicalDeviceCustomBorderColorFeaturesEXT, feature,
                       customBorderColors, customBorderColorWithoutFormat);
@@ -129,6 +152,10 @@ static int get_feature_body(const VkBaseInStructure *feature,
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT:
         FEATURE_RANGE(VkPhysicalDeviceDepthClipEnableFeaturesEXT, feature,
                       depthClipEnable, depthClipEnable);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT:
+        FEATURE_RANGE(VkPhysicalDeviceDepthClipControlFeaturesEXT, feature,
+                      depthClipControl, depthClipControl);
         break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT:
         FEATURE_RANGE(VkPhysicalDeviceDepthBiasControlFeaturesEXT, feature,
@@ -144,10 +171,29 @@ static int get_feature_body(const VkBaseInStructure *feature,
                       feature, fragmentShaderSampleInterlock,
                       fragmentShaderShadingRateInterlock);
         break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES:
+        FEATURE_RANGE(VkPhysicalDeviceDynamicRenderingLocalReadFeatures,
+                      feature, dynamicRenderingLocalRead,
+                      dynamicRenderingLocalRead);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT:
+        FEATURE_RANGE(
+            VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT,
+            feature, dynamicRenderingUnusedAttachments,
+            dynamicRenderingUnusedAttachments);
+        break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT:
         FEATURE_RANGE(VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
                       feature, graphicsPipelineLibrary,
                       graphicsPipelineLibrary);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES:
+        FEATURE_RANGE(VkPhysicalDeviceHostImageCopyFeatures, feature,
+                      hostImageCopy, hostImageCopy);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT:
+        FEATURE_RANGE(VkPhysicalDeviceImage2DViewOf3DFeaturesEXT, feature,
+                      image2DViewOf3D, sampler2DViewOf3D);
         break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES:
         FEATURE_RANGE(VkPhysicalDeviceLineRasterizationFeatures, feature,
@@ -157,9 +203,28 @@ static int get_feature_body(const VkBaseInStructure *feature,
         FEATURE_RANGE(VkPhysicalDeviceMemoryPriorityFeaturesEXT, feature,
                       memoryPriority, memoryPriority);
         break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES:
+        FEATURE_RANGE(VkPhysicalDeviceMaintenance6Features, feature,
+                      maintenance6, maintenance6);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR:
+        FEATURE_RANGE(VkPhysicalDeviceMaintenance7FeaturesKHR, feature,
+                      maintenance7, maintenance7);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT:
+        FEATURE_RANGE(
+            VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT,
+            feature, multisampledRenderToSingleSampled,
+            multisampledRenderToSingleSampled);
+        break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT:
         FEATURE_RANGE(VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT, feature,
                       nonSeamlessCubeMap, nonSeamlessCubeMap);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVES_GENERATED_QUERY_FEATURES_EXT:
+        FEATURE_RANGE(VkPhysicalDevicePrimitivesGeneratedQueryFeaturesEXT,
+                      feature, primitivesGeneratedQuery,
+                      primitivesGeneratedQueryWithNonZeroStreams);
         break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT:
         FEATURE_RANGE(VkPhysicalDeviceRobustness2FeaturesEXT, feature,
@@ -168,6 +233,11 @@ static int get_feature_body(const VkBaseInStructure *feature,
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT:
         FEATURE_RANGE(VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT,
                       feature, shaderModuleIdentifier, shaderModuleIdentifier);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT:
+        FEATURE_RANGE(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT, feature,
+                      shaderBufferFloat32Atomics,
+                      sparseImageFloat32AtomicAdd);
         break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT:
         FEATURE_RANGE(VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT,
@@ -181,6 +251,17 @@ static int get_feature_body(const VkBaseInStructure *feature,
         FEATURE_RANGE(VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT,
                       feature, vertexAttributeInstanceRateDivisor,
                       vertexAttributeInstanceRateZeroDivisor);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_FEATURES_EXT:
+        FEATURE_RANGE(VkPhysicalDeviceLegacyVertexAttributesFeaturesEXT,
+                      feature, legacyVertexAttributes,
+                      legacyVertexAttributes);
+        break;
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR:
+        FEATURE_RANGE(
+            VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
+            feature, workgroupMemoryExplicitLayout,
+            workgroupMemoryExplicitLayout16BitAccess);
         break;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES:
         FEATURE_RANGE(VkPhysicalDeviceMaintenance5Features, feature,
@@ -204,6 +285,8 @@ static int get_feature_body(const VkBaseInStructure *feature,
                       shaderRawAccessChains, shaderRawAccessChains);
         break;
     default:
+        printf("[VENUS] create device: unsupported feature sType=%u\n",
+               (uint32_t)feature->sType);
         return -1;
     }
     return 0;
@@ -254,8 +337,12 @@ static int encode_device_create(struct device_encoder *enc,
     for (uint32_t i = 0; i < info->queueCreateInfoCount; i++) {
         const VkDeviceQueueCreateInfo *queue = &info->pQueueCreateInfos[i];
         if (queue->sType != VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO ||
-            queue->pNext || !queue->queueCount || !queue->pQueuePriorities)
+            queue->pNext || !queue->queueCount || !queue->pQueuePriorities) {
+            printf("[VENUS] create device: invalid queue[%u] sType=%u pNext=%p count=%u priorities=%p\n",
+                   i, (uint32_t)queue->sType, queue->pNext,
+                   queue->queueCount, queue->pQueuePriorities);
             return -1;
+        }
         encode_u32(enc, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
         encode_u64(enc, 0); /* pNext */
         encode_u32(enc, queue->flags);
@@ -414,8 +501,11 @@ venus_real_CreateDevice(VkPhysicalDevice physical_device,
 
     struct device_encoder size_enc = { .capacity = UINT32_MAX };
     if (encode_device_create(&size_enc, self->physical_device, create_info,
-                             self->object_id) < 0 || !size_enc.length)
+                             self->object_id) < 0 || !size_enc.length) {
+        printf("[VENUS] create device: sizing encode failed length=%u\n",
+               size_enc.length);
         goto fail_guest;
+    }
     uint8_t *command = malloc(size_enc.length);
     if (!command)
         goto fail_guest;
@@ -425,6 +515,8 @@ venus_real_CreateDevice(VkPhysicalDevice physical_device,
     };
     if (encode_device_create(&enc, self->physical_device, create_info,
                              self->object_id) < 0) {
+        printf("[VENUS] create device: final encode failed length=%u capacity=%u\n",
+               enc.length, enc.capacity);
         free(command);
         goto fail_guest;
     }
@@ -433,8 +525,11 @@ venus_real_CreateDevice(VkPhysicalDevice physical_device,
     int wire_result = venus_wire_call(instance->wire, command, enc.length,
                                       reply, sizeof(reply));
     free(command);
-    if (wire_result < 0)
+    if (wire_result < 0) {
+        printf("[VENUS] create device: wire call failed rc=%d\n",
+               wire_result);
         goto fail_guest;
+    }
     uint32_t command_type;
     int32_t result;
     uint64_t present;
@@ -443,9 +538,13 @@ venus_real_CreateDevice(VkPhysicalDevice physical_device,
     memcpy(&result, reply + 4, 4);
     memcpy(&present, reply + 8, 8);
     memcpy(&returned_id, reply + 16, 8);
-    if (command_type != VN_CMD_CREATE_DEVICE)
+    if (command_type != VN_CMD_CREATE_DEVICE) {
+        printf("[VENUS] create device: bad reply command=%u\n",
+               command_type);
         goto fail_guest;
+    }
     if (result != VK_SUCCESS) {
+        printf("[VENUS] create device: host result=%d\n", result);
         for (uint32_t i = 0; i < self->queue_count; i++)
             release_ring_index(instance, self->queues[i].ring_index);
         free(self->queues);
@@ -453,12 +552,19 @@ venus_real_CreateDevice(VkPhysicalDevice physical_device,
         return (VkResult)result;
     }
     if (!present || returned_id != self->object_id) {
+        printf("[VENUS] create device: bad handle present=%llu returned=%p expected=%p\n",
+               (unsigned long long)present, (void *)(uintptr_t)returned_id,
+               (void *)(uintptr_t)self->object_id);
         destroy_host_device(self);
         goto fail_guest;
     }
 
     for (uint32_t i = 0; i < self->queue_count; i++) {
         if (init_host_queue(&self->queues[i]) < 0) {
+            printf("[VENUS] create device: queue init failed index=%u family=%u queue=%u ring=%u\n",
+                   i, self->queues[i].family_index,
+                   self->queues[i].queue_index,
+                   self->queues[i].ring_index);
             destroy_host_device(self);
             goto fail_guest;
         }
@@ -483,6 +589,11 @@ venus_real_DestroyDevice(VkDevice device,
         return;
     struct venus_device_real *self = (struct venus_device_real *)device;
     struct venus_instance_real *instance = self->physical_device->instance;
+    for (uint32_t i = 0; i < self->queue_count; i++) {
+        if (self->queues[i].wait_fence)
+            venus_real_DestroyFence(
+                device, self->queues[i].wait_fence, 0);
+    }
     destroy_host_device(self);
     for (uint32_t i = 0; i < self->queue_count; i++)
         release_ring_index(instance, self->queues[i].ring_index);
@@ -535,4 +646,97 @@ venus_real_DeviceWaitIdle(VkDevice device)
         }
     }
     return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_real_GetCalibratedTimestampsEXT(
+    VkDevice device, uint32_t timestamp_count,
+    const VkCalibratedTimestampInfoKHR *timestamp_infos,
+    uint64_t *timestamps, uint64_t *max_deviation)
+{
+    if (!device || (timestamp_count && !timestamp_infos))
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    uint64_t command_size_64 = 44u + (uint64_t)timestamp_count * 16u;
+    uint64_t reply_size_64 = 24u +
+        (timestamps ? (uint64_t)timestamp_count * 8u : 0u) +
+        (max_deviation ? 8u : 0u);
+    if (command_size_64 > UINT32_MAX || reply_size_64 > 65536u)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    uint32_t command_size = (uint32_t)command_size_64;
+    uint32_t reply_size = (uint32_t)reply_size_64;
+    uint8_t *command = malloc(command_size);
+    uint8_t *reply = malloc(reply_size);
+    if (!command || !reply) {
+        free(command);
+        free(reply);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    struct venus_device_real *self = (struct venus_device_real *)device;
+    struct device_encoder enc = {
+        .data = command,
+        .capacity = command_size,
+    };
+    encode_u32(&enc, VN_CMD_GET_CALIBRATED_TIMESTAMPS_EXT);
+    encode_u32(&enc, VN_COMMAND_GENERATE_REPLY);
+    encode_u64(&enc, self->object_id);
+    encode_u32(&enc, timestamp_count);
+    encode_u64(&enc, timestamp_infos ? timestamp_count : 0);
+    for (uint32_t i = 0; i < timestamp_count; i++) {
+        encode_u32(&enc,
+                   VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT);
+        encode_u64(&enc, 0); /* no supported pNext structures */
+        encode_u32(&enc, (uint32_t)timestamp_infos[i].timeDomain);
+    }
+    encode_u64(&enc, timestamps ? timestamp_count : 0);
+    encode_u64(&enc, max_deviation ? 1 : 0);
+    if (enc.failed || enc.length != command_size) {
+        free(command);
+        free(reply);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    memset(reply, 0, reply_size);
+    struct venus_instance_real *instance = self->physical_device->instance;
+    int wire_result = venus_wire_call(instance->wire, command, command_size,
+                                      reply, reply_size);
+    free(command);
+    if (wire_result < 0) {
+        free(reply);
+        return VK_ERROR_DEVICE_LOST;
+    }
+
+    uint32_t offset = 0;
+    uint32_t returned_command = 0;
+    int32_t result = VK_ERROR_DEVICE_LOST;
+    uint64_t array_size = 0;
+    uint64_t max_deviation_present = 0;
+    memcpy(&returned_command, reply + offset, 4);
+    offset += 4;
+    memcpy(&result, reply + offset, 4);
+    offset += 4;
+    memcpy(&array_size, reply + offset, 8);
+    offset += 8;
+    if (returned_command != VN_CMD_GET_CALIBRATED_TIMESTAMPS_EXT ||
+        array_size != (timestamps ? timestamp_count : 0)) {
+        free(reply);
+        return VK_ERROR_DEVICE_LOST;
+    }
+    if (array_size) {
+        memcpy(timestamps, reply + offset,
+               (unsigned long)array_size * sizeof(*timestamps));
+        offset += (uint32_t)array_size * sizeof(*timestamps);
+    }
+    memcpy(&max_deviation_present, reply + offset, 8);
+    offset += 8;
+    if (!!max_deviation_present != !!max_deviation) {
+        free(reply);
+        return VK_ERROR_DEVICE_LOST;
+    }
+    if (max_deviation_present)
+        memcpy(max_deviation, reply + offset, sizeof(*max_deviation));
+    free(reply);
+    return (VkResult)result;
 }

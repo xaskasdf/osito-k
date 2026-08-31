@@ -36,6 +36,8 @@
 #include "util/u_debug.h"
 #include "util/u_prim.h"
 
+extern void okgl_trace(const char *message);
+
 VkPipeline
 zink_create_gfx_pipeline(struct zink_screen *screen,
                          struct zink_gfx_program *prog,
@@ -45,9 +47,13 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
                          VkPrimitiveTopology primitive_topology,
                          bool optimize)
 {
+   okgl_trace("[OKGL-PIPE] monolithic-enter\n");
    struct zink_rasterizer_hw_state *hw_rast_state = (void*)&state->dyn_state3;
    VkPipelineVertexInputStateCreateInfo vertex_input_state;
    bool needs_vi = !screen->info.have_EXT_vertex_input_dynamic_state;
+   okgl_trace(needs_vi
+              ? "[OKGL-PIPE] needs-vertex-input=1\n"
+              : "[OKGL-PIPE] needs-vertex-input=0\n");
    if (needs_vi) {
       memset(&vertex_input_state, 0, sizeof(vertex_input_state));
       vertex_input_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -274,7 +280,7 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
 
    assert(state->rast_prim != MESA_PRIM_COUNT || zink_debug & ZINK_DEBUG_SHADERDB);
 
-   VkPipelineRasterizationLineStateCreateInfoEXT rast_line_state;
+   VkPipelineRasterizationLineStateCreateInfoEXT rast_line_state = {0};
    if (screen->info.have_EXT_line_rasterization &&
        !state->shader_keys.key[MESA_SHADER_FRAGMENT].key.fs.lower_line_smooth) {
       rast_line_state.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT;
@@ -385,6 +391,7 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
    VkPipelineShaderStageCreateInfo shader_stages[ZINK_GFX_SHADER_COUNT];
    VkShaderModuleCreateInfo smci[ZINK_GFX_SHADER_COUNT] = {0};
    uint32_t num_stages = 0;
+   bool has_inline_stage = false;
    for (int i = 0; i < ZINK_GFX_SHADER_COUNT; ++i) {
       if (!(prog->stages_present & BITFIELD_BIT(i)))
          continue;
@@ -396,6 +403,7 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
       if (objs[i].mod) {
          stage.module = objs[i].mod;
       } else {
+         has_inline_stage = true;
          smci[i].sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
          stage.pNext = &smci[i];
          smci[i].codeSize = objs[i].spirv->num_words * sizeof(uint32_t);
@@ -404,6 +412,12 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
       shader_stages[num_stages++] = stage;
    }
    assert(num_stages > 0);
+   okgl_trace(has_inline_stage
+              ? "[OKGL-PIPE] shader-stage-inline=1\n"
+              : "[OKGL-PIPE] shader-stage-inline=0\n");
+   okgl_trace(num_stages == 2
+              ? "[OKGL-PIPE] shader-stages=2\n"
+              : "[OKGL-PIPE] shader-stages-other\n");
 
    pci.pStages = shader_stages;
    pci.stageCount = num_stages;
@@ -411,14 +425,45 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
    VkPipeline pipeline;
    u_rwlock_wrlock(&prog->base.pipeline_cache_lock);
    VkResult result;
+   okgl_trace(prog->base.pipeline_cache
+              ? "[OKGL-PIPE] vk-create-cache=1\n"
+              : "[OKGL-PIPE] vk-create-cache=0\n");
    VRAM_ALLOC_LOOP(result,
       VKSCR(CreateGraphicsPipelines)(screen->dev, prog->base.pipeline_cache, 1, &pci, NULL, &pipeline),
       u_rwlock_wrunlock(&prog->base.pipeline_cache_lock);
       if (result != VK_SUCCESS) {
+         switch (result) {
+         case VK_ERROR_OUT_OF_HOST_MEMORY:
+            okgl_trace("[OKGL-PIPE] result=OUT_OF_HOST_MEMORY\n");
+            break;
+         case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+            okgl_trace("[OKGL-PIPE] result=OUT_OF_DEVICE_MEMORY\n");
+            break;
+         case VK_ERROR_INITIALIZATION_FAILED:
+            okgl_trace("[OKGL-PIPE] result=INITIALIZATION_FAILED\n");
+            break;
+         case VK_ERROR_DEVICE_LOST:
+            okgl_trace("[OKGL-PIPE] result=DEVICE_LOST\n");
+            break;
+         case VK_ERROR_FEATURE_NOT_PRESENT:
+            okgl_trace("[OKGL-PIPE] result=FEATURE_NOT_PRESENT\n");
+            break;
+         case VK_ERROR_EXTENSION_NOT_PRESENT:
+            okgl_trace("[OKGL-PIPE] result=EXTENSION_NOT_PRESENT\n");
+            break;
+         default:
+            okgl_trace("[OKGL-PIPE] result=OTHER_ERROR\n");
+            break;
+         }
+         okgl_trace("[OKGL-PIPE] vk-create-failed\n");
          mesa_loge("ZINK: vkCreateGraphicsPipelines failed (%s)", vk_Result_to_str(result));
          return VK_NULL_HANDLE;
       }
    );
+
+   okgl_trace(pipeline
+              ? "[OKGL-PIPE] vk-create-success\n"
+              : "[OKGL-PIPE] vk-create-success-null\n");
 
    return pipeline;
 }

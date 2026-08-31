@@ -92,12 +92,21 @@ struct osito_device {
 struct osito_memory {
     struct osito_device *owner;
     VkDeviceMemory        real;
+    VkDeviceSize          allocation_size;
+    uint32_t              memory_type_index;
+    void                 *mapped_data;
+    VkDeviceSize          mapped_offset;
+    VkDeviceSize          mapped_size;
 };
 
 struct osito_buffer {
     struct osito_device *owner;
     VkBuffer              real;
     VkDeviceSize          size;
+    struct osito_memory  *memory;
+    VkDeviceSize          memory_offset;
+    uint8_t              *trace_shadow;
+    VkDeviceSize          trace_shadow_size;
 };
 
 /* W3b.4 — remaining non-dispatchable wrappers.
@@ -117,10 +126,23 @@ struct osito_image {
     VkImage               real;
     uint32_t              width;
     uint32_t              height;
+    VkFormat              format;
+    VkImageUsageFlags     usage;
+    struct osito_memory  *memory;
+    VkDeviceSize          memory_offset;
+    VkDeviceSize          memory_size;
+    VkDeviceSize          memory_alignment;
+    struct osito_image   *trace_next;
+    uint32_t              trace_staging_memory_type;
+    uint8_t               trace_dashboard;
 };
 struct osito_image_view {
     struct osito_device *owner;
     VkImageView           real;
+    VkImage               image;
+    struct osito_image   *image_wrapper;
+    uint32_t              width;
+    uint32_t              height;
 };
 struct osito_buffer_view {
     struct osito_device *owner;
@@ -142,11 +164,51 @@ struct osito_cmd_pool {
     struct osito_device *owner;
     VkCommandPool         real;
 };
+struct osito_descriptor_set;
+struct osito_trace_draw {
+    struct osito_buffer  *vertex_buffers[2];
+    VkDeviceSize          vertex_offsets[2];
+    VkDeviceSize          vertex_strides[2];
+    struct osito_buffer  *index_buffer;
+    struct osito_descriptor_set *descriptor_set;
+    VkDeviceSize          index_offset;
+    VkIndexType           index_type;
+    VkImage               image;
+    VkImage               submit_image;
+    uint64_t              record_hash;
+    uint32_t              sequence;
+    uint32_t              element_count;
+    uint32_t              first_element;
+    uint32_t              descriptor_generation;
+    uint32_t              submit_descriptor_generation;
+    int32_t               vertex_offset;
+    uint8_t               indexed;
+    uint8_t               valid;
+};
+struct osito_trace_image_copy {
+    struct osito_buffer  *buffer;
+    struct osito_image   *image;
+    VkDeviceSize          buffer_offset;
+    uint32_t              row_length;
+    uint64_t              record_hashes[4];
+    uint8_t               valid;
+};
 /* Command buffer is a dispatchable handle — VK_LOADER_DATA first. */
 struct osito_cmd_buffer {
     VK_LOADER_DATA        loader_data;
     struct osito_device  *owner;
     VkCommandBuffer       real;
+    struct osito_descriptor_set *trace_graphics_set2;
+    uint32_t               trace_draw_sequence;
+    struct osito_buffer   *trace_vertex_buffers[4];
+    VkDeviceSize           trace_vertex_offsets[4];
+    VkDeviceSize           trace_vertex_strides[4];
+    struct osito_buffer   *trace_index_buffer;
+    VkDeviceSize           trace_index_offset;
+    VkIndexType            trace_index_type;
+    uint32_t               trace_dashboard_draw_count;
+    struct osito_trace_draw trace_draw_samples[4];
+    struct osito_trace_image_copy trace_image_copies[2];
 };
 
 /* W3b.5 — WSI + sync + queue wrappers. Surface is instance-scoped;
@@ -161,6 +223,7 @@ struct osito_queue {
     VK_LOADER_DATA        loader_data;
     struct osito_device  *owner;
     VkQueue               real;
+    uint32_t              family_index;
     struct osito_queue   *next;
 };
 struct osito_fence {
@@ -193,10 +256,25 @@ struct osito_descriptor_pool {
 struct osito_descriptor_set {
     struct osito_device  *owner;
     VkDescriptorSet       real;
+    VkImageView           image_view;
+    VkImage               image;
+    VkSampler             sampler;
+    VkImageLayout         image_layout;
+    struct osito_image   *trace_image;
+    uint32_t              image_width;
+    uint32_t              image_height;
+    uint32_t              image_binding;
+    uint32_t              image_array_element;
+    uint32_t              image_generation;
+    uint32_t              logged_image_generation;
 };
 struct osito_descriptor_update_template {
     struct osito_device        *owner;
     VkDescriptorUpdateTemplate  real;
+    VkDescriptorUpdateTemplateType template_type;
+    VkPipelineBindPoint         pipeline_bind_point;
+    uint32_t                    entry_count;
+    VkDescriptorUpdateTemplateEntry entries[];
 };
 struct osito_event {
     struct osito_device  *owner;
@@ -233,6 +311,7 @@ PFN_vkVoidFunction osito_loader_get_instance_proc_addr(VkInstance, const char *)
 
 /* Minimal libc bridges — real symbols live in OsitoK libc (tcclib.c + malloc.c). */
 extern void *malloc(size_t n);
+extern void *calloc(size_t n, size_t size);
 extern void  free(void *p);
 extern void *memset(void *p, int c, size_t n);
 extern void *memcpy(void *d, const void *s, size_t n);

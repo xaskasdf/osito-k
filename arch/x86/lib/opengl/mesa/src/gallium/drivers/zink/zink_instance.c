@@ -32,23 +32,39 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
 
    GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, EnumerateInstanceExtensionProperties);
    GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, EnumerateInstanceLayerProperties);
+   printf("[ZINK] instance procs: enum_ext=%p enum_layer=%p\n",
+          (void *)vk_EnumerateInstanceExtensionProperties,
+          (void *)vk_EnumerateInstanceLayerProperties);
    if (!vk_EnumerateInstanceExtensionProperties ||
-       !vk_EnumerateInstanceLayerProperties)
-      return false;
+       !vk_EnumerateInstanceLayerProperties) {
+      printf("[ZINK] instance FAIL: missing enumeration proc\n");
+      return VK_NULL_HANDLE;
+   }
 
    // Build up the extensions from the reported ones but only for the unnamed layer
    uint32_t extension_count = 0;
-   if (vk_EnumerateInstanceExtensionProperties(NULL, &extension_count, NULL) != VK_SUCCESS) {
+   VkResult extension_result =
+      vk_EnumerateInstanceExtensionProperties(NULL, &extension_count, NULL);
+   printf("[ZINK] instance extensions: count result=%d count=%u\n",
+          (int)extension_result, extension_count);
+   if (extension_result != VK_SUCCESS) {
        if (!screen->driver_name_is_inferred)
            mesa_loge("ZINK: vkEnumerateInstanceExtensionProperties failed");
    } else {
        VkExtensionProperties *extension_props = malloc(extension_count * sizeof(VkExtensionProperties));
        if (extension_props) {
-           if (vk_EnumerateInstanceExtensionProperties(NULL, &extension_count, extension_props) != VK_SUCCESS) {
+           extension_result = vk_EnumerateInstanceExtensionProperties(
+              NULL, &extension_count, extension_props);
+           printf("[ZINK] instance extensions: fill result=%d count=%u\n",
+                  (int)extension_result, extension_count);
+           if (extension_result != VK_SUCCESS) {
                if (!screen->driver_name_is_inferred)
                    mesa_loge("ZINK: vkEnumerateInstanceExtensionProperties failed");
            } else {
               for (uint32_t i = 0; i < extension_count; i++) {
+                printf("[ZINK] instance extension[%u]=%s spec=%u\n", i,
+                       extension_props[i].extensionName,
+                       extension_props[i].specVersion);
                 if (!strcmp(extension_props[i].extensionName, "VK_EXT_debug_utils")) {
                     have_EXT_debug_utils = true;
                 }
@@ -88,7 +104,11 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
     // Build up the layers from the reported ones
     uint32_t layer_count = 0;
 
-    if (vk_EnumerateInstanceLayerProperties(&layer_count, NULL) != VK_SUCCESS) {
+    VkResult layer_result =
+       vk_EnumerateInstanceLayerProperties(&layer_count, NULL);
+    printf("[ZINK] instance layers: count result=%d count=%u\n",
+           (int)layer_result, layer_count);
+    if (layer_result != VK_SUCCESS) {
         if (!screen->driver_name_is_inferred)
            mesa_loge("ZINK: vkEnumerateInstanceLayerProperties failed");
     } else {
@@ -189,14 +209,28 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
    ici.ppEnabledLayerNames = layers;
    ici.enabledLayerCount = num_layers;
 
-   GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, CreateInstance);
-   assert(vk_CreateInstance);
+   printf("[ZINK] instance create: api=0x%x extensions=%u layers=%u\n",
+          ai.apiVersion, num_extensions, num_layers);
+   for (uint32_t i = 0; i < num_extensions; i++)
+      printf("[ZINK] instance enable extension[%u]=%s\n", i, extensions[i]);
+   for (uint32_t i = 0; i < num_layers; i++)
+      printf("[ZINK] instance enable layer[%u]=%s\n", i, layers[i]);
 
-   VkInstance instance;
+   GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, CreateInstance);
+   printf("[ZINK] instance create proc=%p\n", (void *)vk_CreateInstance);
+   if (!vk_CreateInstance) {
+      printf("[ZINK] instance FAIL: vkCreateInstance proc missing\n");
+      return VK_NULL_HANDLE;
+   }
+
+   VkInstance instance = VK_NULL_HANDLE;
    VkResult err = vk_CreateInstance(&ici, NULL, &instance);
+   printf("[ZINK] instance create result=%d (%s) handle=%p\n",
+          (int)err, vk_Result_to_str(err), (void *)instance);
    if (err != VK_SUCCESS) {
       if (!screen->driver_name_is_inferred)
           mesa_loge("ZINK: vkCreateInstance failed (%s)", vk_Result_to_str(err));
+      return VK_NULL_HANDLE;
    }
 
    return instance;

@@ -247,6 +247,14 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler4(
     PCONTEXT ContextRecord,
     PVOID DispatcherContext);
 
+EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
+    ULONG *cookie,
+    PVOID check_cookie,
+    PEXCEPTION_RECORD ExceptionRecord,
+    PVOID EstablisherFrame,
+    PCONTEXT ContextRecord,
+    PVOID DispatcherContext);
+
 int  WINAPI crt_XcptFilter(int code, PVOID pointers);
 
 /* PE32 non-local jumps are completed by compat32_dispatch, which has the

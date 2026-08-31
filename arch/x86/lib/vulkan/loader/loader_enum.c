@@ -1,11 +1,17 @@
 #include "loader.h"
 
+extern int printf(const char *, ...);
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vkEnumeratePhysicalDevices(VkInstance instance,
                            uint32_t *pPhysicalDeviceCount,
                            VkPhysicalDevice *pPhysicalDevices) {
     if (!instance || !pPhysicalDeviceCount) return VK_ERROR_INITIALIZATION_FAILED;
     struct osito_instance *self = osito_instance_from(instance);
+    printf("[VKLOADER] enum pdev: instance=%p icds=%u output=%p cap=%u\n",
+           (void *)instance, self->icd_instance_count,
+           (void *)pPhysicalDevices,
+           pPhysicalDevices ? *pPhysicalDeviceCount : 0);
 
     /* First pass: sum up counts across ICDs. */
     uint32_t total = 0;
@@ -16,9 +22,13 @@ vkEnumeratePhysicalDevices(VkInstance instance,
         PFN_vkEnumeratePhysicalDevices enum_fn =
             (PFN_vkEnumeratePhysicalDevices)ci->icd->get_proc_addr(ci->handle,
                                                                    "vkEnumeratePhysicalDevices");
+        printf("[VKLOADER] enum pdev: icd[%u]=%s child=%p proc=%p\n",
+               i, ci->icd->name, (void *)ci->handle, (void *)enum_fn);
         if (!enum_fn) continue;
         uint32_t n = 0;
         VkResult rc = enum_fn(ci->handle, &n, NULL);
+        printf("[VKLOADER] enum pdev: icd[%u] count rc=%d count=%u\n",
+               i, (int)rc, n);
         if (rc == VK_SUCCESS) {
             per_icd_count[i] = n;
             total += n;
@@ -56,6 +66,8 @@ vkEnumeratePhysicalDevices(VkInstance instance,
 
         uint32_t got = want;
         VkResult rc = enum_fn(ci->handle, &got, raw);
+        printf("[VKLOADER] enum pdev: icd[%u] fill rc=%d want=%u got=%u\n",
+               i, (int)rc, want, got);
         if (rc == VK_INCOMPLETE) overall = VK_INCOMPLETE;
 
         for (uint32_t j = 0; j < got && written < cap; j++) {
@@ -65,12 +77,19 @@ vkEnumeratePhysicalDevices(VkInstance instance,
             set_loader_magic_value(pw);
             pw->owner = ci;
             pw->real  = raw[j];
-            pPhysicalDevices[written++] = osito_phys_to(pw);
+            VkPhysicalDevice wrapped = osito_phys_to(pw);
+            pPhysicalDevices[written] = wrapped;
+            printf("[VKLOADER] enum pdev: slot=%u raw=%p wrapper=%p out=%p readback=%p\n",
+                   written, (void *)raw[j], (void *)pw, (void *)wrapped,
+                   (void *)pPhysicalDevices[written]);
+            written++;
         }
         free(raw);
     }
 
     *pPhysicalDeviceCount = written;
     if (written < total) overall = VK_INCOMPLETE;
+    printf("[VKLOADER] enum pdev: return rc=%d written=%u total=%u\n",
+           (int)overall, written, total);
     return overall;
 }

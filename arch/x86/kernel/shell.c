@@ -7527,6 +7527,11 @@ q4kgdone:
                     compositor_abort_start();
                     sh_puts("ERROR: compositor spawn failed\n");
                 } else {
+                    /* Boot-time spawning used to race the shell handoff.
+                     * Once the compositor exists, scheduling is established
+                     * and the zombie reaper can safely reclaim app workers. */
+                    extern void proc_start_reaper(void);
+                    proc_start_reaper();
                     sh_puts("Desktop launched. Compositor running.\n");
                     /* Yield immediately so the compositor's first frame renders
                      * before we return to the shell's input poll. Without this

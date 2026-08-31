@@ -240,14 +240,25 @@ typedef LRESULT (WINAPI *HOOKPROC)(int, WPARAM, LPARAM);
 /* System metrics */
 #define SM_CXSCREEN         0
 #define SM_CYSCREEN         1
+#define SM_CXICON           11
+#define SM_CYICON           12
+#define SM_CXCURSOR         13
+#define SM_CYCURSOR         14
 #define SM_CXFULLSCREEN     16
 #define SM_CYFULLSCREEN     17
+#define SM_MOUSEPRESENT     19
+#define SM_SWAPBUTTON       23
+#define SM_CMOUSEBUTTONS    43
+#define SM_CXSMICON         49
+#define SM_CYSMICON         50
+#define SM_MOUSEWHEELPRESENT 75
 #define SM_XVIRTUALSCREEN   76
 #define SM_YVIRTUALSCREEN   77
 #define SM_CXVIRTUALSCREEN  78
 #define SM_CYVIRTUALSCREEN  79
 #define SM_CMONITORS        80
 #define SM_SAMEDISPLAYFORMAT 81
+#define SM_MOUSEHORIZONTALWHEELPRESENT 91
 
 /* Cursor constants */
 #define IDC_ARROW           ((PCSTR)(ULONG_PTR)32512)
@@ -630,6 +641,7 @@ HDWP    WINAPI DeferWindowPos(HDWP hWinPosInfo, HWND hWnd,
 BOOL    WINAPI EndDeferWindowPos(HDWP hWinPosInfo);
 BOOL    user32_get_window_surface(HWND hwnd, void **pixels, int *width,
                                   int *height, int *pitch);
+uint32_t user32_get_window_compositor_id(HWND hwnd);
 void    user32_mark_window_dirty(HWND hwnd);
 
 /* Message loop */
@@ -741,6 +753,8 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
                              int raw_dx, int raw_dy,
                              DWORD buttons, short wheel_delta);
 void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons);
+BOOL user32_get_current_display_mode(uint32_t *width, uint32_t *height,
+                                     uint32_t *bpp, uint32_t *frequency);
 
 /* Misc */
 int     WINAPI MessageBoxA(HWND hWnd, PCSTR lpText, PCSTR lpCaption, DWORD uType);
@@ -853,6 +867,8 @@ LONG    WINAPI SetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong);
 LONG_PTR WINAPI GetWindowLongPtrW(HWND hWnd, int nIndex);
 LONG_PTR WINAPI SetWindowLongPtrW(HWND hWnd, int nIndex, LONG_PTR dwNewLong);
 LONG_PTR WINAPI GetClassLongPtrW(HWND hWnd, int nIndex);
+LONG_PTR WINAPI SetClassLongPtrW(HWND hWnd, int nIndex, LONG_PTR dwNewLong);
+LONG    WINAPI SetClassLongW(HWND hWnd, int nIndex, LONG dwNewLong);
 int     WINAPI GetClassNameW(HWND hWnd, PWSTR class_name, int max_count);
 BOOL    WINAPI IsWindow(HWND hWnd);
 BOOL    WINAPI IsIconic(HWND hWnd);

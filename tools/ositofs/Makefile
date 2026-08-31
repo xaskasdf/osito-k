@@ -10,7 +10,8 @@ LDFLAGS =
 
 TOOLS_V2 = mkfs.ositofs ositofs-write ositofs-ls ositofs-info ositofs-read \
            ositofs-delete ositofs-fsck ositofs-rename ositofs-defrag
-TOOLS_V3 = mkfs.ositofs3 ositofs-write3 ositofs-read3 ositofs-fsck3
+TOOLS_V3 = mkfs.ositofs3 ositofs-write3 ositofs-read3 ositofs-ls3 \
+           ositofs-fsck3
 
 all: $(TOOLS_V2) $(TOOLS_V3)
 
@@ -58,6 +59,9 @@ ositofs-write3: write3.o common_v3.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 ositofs-read3: read3.o common_v3.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+ositofs-ls3: ls3.o common_v3.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 ositofs-fsck3: fsck3.o common_v3.o

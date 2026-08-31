@@ -44,8 +44,8 @@ okGLZinkCreateScreen(VkInstance instance, VkPhysicalDevice phys)
     (void)instance;
     (void)phys;
 
-    /* sw_winsys=NULL triggers Zink's internal headless / swrast handling.
-     * That's fine for the W4.4 smoke; later waves replace this with an
-     * OsitoK winsys backed by SHM + the compositor surface extension. */
-    return zink_create_screen(NULL, &config);
+    /* Venus can expose its virtual renderer as a CPU Vulkan device even
+     * when the host transport is accelerated. The OsitoK entry accepts
+     * that device explicitly without changing Zink's standard policy. */
+    return zink_ositok_create_screen(&config);
 }

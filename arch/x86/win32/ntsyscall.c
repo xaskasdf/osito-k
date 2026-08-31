@@ -19,6 +19,7 @@
 #include "handle.h"
 #include "pe.h"
 #include "dllloader.h"
+#include "dinput8_shim.h"
 #include "kernel32_shim.h"
 #include "msvcrt_shim.h"
 #include "../include/fd.h"
@@ -691,6 +692,7 @@ void nt_vm_release_process(ULONG owner_pid)
 
     /* The CRT caches pointers into this process's user mappings. Remove those
      * references before the mappings themselves are torn down. */
+    dinput8_release_process(owner_pid);
     msvcrt_release_process(owner_pid);
 
     uint64_t released_pages = 0;
@@ -750,6 +752,32 @@ void nt_vm_release_process(ULONG owner_pid)
     }
 }
 
+void nt_vm_get_stats(uint32_t *entries, uint64_t *private_pages,
+                     uint64_t *mapped_pages)
+{
+    uint32_t entry_count = 0;
+    uint64_t private_count = 0;
+    uint64_t mapped_count = 0;
+    uint64_t vm_irq_flags = vm_track_lock_irqsave();
+
+    for (int i = 0; i < vm_track_count; i++) {
+        const vm_track_entry_t *entry = &vm_track[i];
+        if (!vm_track_entry_committed(entry))
+            continue;
+
+        uint64_t pages = (entry->size + 4095) / 4096;
+        entry_count++;
+        mapped_count += pages;
+        if (entry->owns_phys && !entry->section)
+            private_count += pages;
+    }
+
+    vm_track_unlock_irqrestore(vm_irq_flags);
+    if (entries) *entries = entry_count;
+    if (private_pages) *private_pages = private_count;
+    if (mapped_pages) *mapped_pages = mapped_count;
+}
+
 static int vm_track_contains(uint64_t va, SIZE_T size)
 {
     ULONG owner_pid = nt_current_owner_pid();
@@ -790,6 +818,30 @@ static int vm_track_overlaps(uint64_t va, SIZE_T size)
     return 0;
 }
 
+ULONGLONG nt_vm_range_conflict_end(ULONGLONG va, ULONGLONG size)
+{
+    uint64_t end = va + size;
+    if (!size || end < va)
+        return UINT64_MAX;
+
+    ULONG owner_pid = nt_current_owner_pid();
+    uint64_t owner_cr3 = nt_current_cr3();
+    uint64_t conflict_end = 0;
+    uint64_t vm_irq_flags = vm_track_lock_irqsave();
+    for (int i = 0; i < vm_track_count; i++) {
+        uint64_t entry_end = vm_track[i].va + vm_track[i].size;
+        if (vm_track[i].owner_pid != owner_pid ||
+            vm_track[i].cr3 != owner_cr3 ||
+            entry_end < vm_track[i].va || va >= entry_end ||
+            vm_track[i].va >= end)
+            continue;
+        if (entry_end > conflict_end)
+            conflict_end = entry_end;
+    }
+    vm_track_unlock_irqrestore(vm_irq_flags);
+    return conflict_end;
+}
+
 /* Return the end of the first owner-local VMA or PE image intersecting the
  * candidate range. Must hold vm_track_lock. */
 static uint64_t vm_range_conflict_end_locked(uint64_t va, SIZE_T size,
@@ -808,6 +860,14 @@ static uint64_t vm_range_conflict_end_locked(uint64_t va, SIZE_T size,
             vm_track[i].va < end && entry_end > conflict_end)
             conflict_end = entry_end;
     }
+
+    extern uint64_t syscall_vma_range_conflict_end(uint64_t base,
+                                                    uint64_t size);
+    uint64_t mmap_end = syscall_vma_range_conflict_end(va, size);
+    if (mmap_end == UINT64_MAX)
+        return UINT64_MAX;
+    if (mmap_end > conflict_end)
+        conflict_end = mmap_end;
 
     uint64_t image_base = 0;
     uint64_t image_size = 0;
@@ -986,7 +1046,7 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect,
      * INT 0x2E thunk return. Cross-reference with FMW-ASSERT logs to
      * identify which alloc became a Pool->Mem that later failed the
      * pool-integrity check. */
-#ifndef OK_QUIET
+#if defined(WIN32_VM_TRACE) && WIN32_VM_TRACE
     {
         extern uint32_t compat32_get_last_caller_eip(void);
         uint32_t ceip = compat32_get_last_caller_eip();
@@ -2433,7 +2493,7 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
     *BaseAddress = addr;
     *RegionSize  = size;
 
-#ifndef OK_QUIET
+#if defined(WIN32_VM_TRACE) && WIN32_VM_TRACE
     nt_log_hex("NtAllocateVirtualMemory: ", (ULONGLONG)addr);
     nt_log_hex("  size = ", size);
 #endif
@@ -2509,7 +2569,7 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
         (FreeType != MEM_DECOMMIT && FreeType != MEM_RELEASE))
         return STATUS_INVALID_PARAMETER;
 
-#ifndef OK_QUIET
+#if defined(WIN32_VM_TRACE) && WIN32_VM_TRACE
     nt_log_hex("NtFreeVirtualMemory: ", (ULONGLONG)*BaseAddress);
     nt_log_hex("  FreeType = ", FreeType);
 #endif
@@ -2538,7 +2598,7 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
         *BaseAddress = (PVOID)va;
         *RegionSize = size;
         vm_track_unlock_irqrestore(vm_irq_flags);
-#ifndef OK_QUIET
+#if defined(WIN32_VM_TRACE) && WIN32_VM_TRACE
         nt_log_hex("  decommit size = ", size);
 #endif
         return STATUS_SUCCESS;
@@ -2557,7 +2617,7 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
     vm_track_unlock_irqrestore(vm_irq_flags);
     if (!NT_SUCCESS(release_status))
         return release_status;
-#ifndef OK_QUIET
+#if defined(WIN32_VM_TRACE) && WIN32_VM_TRACE
     nt_log_hex("  release size = ", tracked);
 #endif
 
@@ -3229,7 +3289,7 @@ NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args)
     *BaseAddress = (PVOID)base;
     *RegionSize = size;
 
-#ifndef OK_QUIET
+#if defined(WIN32_VM_TRACE) && WIN32_VM_TRACE
     nt_log_hex("NtProtectVirtualMemory: base=", base);
     nt_log_hex("  new_protect=", NewProtect);
 #endif
@@ -3421,13 +3481,53 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
     if (have_image) {
         uint64_t image_end = image_base +
                              ((image_size + 0xFFFULL) & ~0xFFFULL);
-        mbi->BaseAddress = (PVOID)page_base;
+        uint64_t region_start = page_base;
+        uint64_t region_end = page_base + 4096;
+        uint64_t *image_pte = nt_get_pte_in(cr3, page_base);
+        BOOL committed = image_pte && (*image_pte & PTE_ADDR_MASK);
+        ULONG protect = committed
+                        ? nt_page_flags_to_protect(*image_pte) : 0;
+
+        /* Section protections are encoded in the process page tables. Report
+         * only the contiguous run with matching attributes so callers such as
+         * MinGW's pseudo-relocator do not restore .data/.bss as executable
+         * read-only memory after temporarily unprotecting .text. */
+        while (region_start > image_base) {
+            uint64_t previous = region_start - 4096;
+            uint64_t *pte = nt_get_pte_in(cr3, previous);
+            BOOL page_committed = pte && (*pte & PTE_ADDR_MASK);
+            if (page_committed != committed ||
+                (committed && nt_page_flags_to_protect(*pte) != protect))
+                break;
+            region_start = previous;
+        }
+        while (region_end < image_end) {
+            uint64_t *pte = nt_get_pte_in(cr3, region_end);
+            BOOL page_committed = pte && (*pte & PTE_ADDR_MASK);
+            if (page_committed != committed ||
+                (committed && nt_page_flags_to_protect(*pte) != protect))
+                break;
+            region_end += 4096;
+        }
+
+        mbi->BaseAddress = (PVOID)region_start;
         mbi->AllocationBase = (PVOID)image_base;
         mbi->AllocationProtect = PAGE_EXECUTE_READ;
-        mbi->RegionSize = image_end - page_base;
-        mbi->State = MEM_COMMIT;
-        mbi->Protect = PAGE_EXECUTE_READ;
+        mbi->RegionSize = region_end - region_start;
+        mbi->State = committed ? MEM_COMMIT : MEM_RESERVE;
+        mbi->Protect = protect;
         mbi->Type = MEM_IMAGE;
+        if (trace_query) {
+            serial_puts("[VQ-IMAGE] addr=0x");
+            serial_puthex(addr, 16);
+            serial_puts(" base=0x");
+            serial_puthex(region_start, 16);
+            serial_puts(" size=0x");
+            serial_puthex(mbi->RegionSize, 16);
+            serial_puts(" prot=0x");
+            serial_puthex(protect, 8);
+            serial_puts("\n");
+        }
         return STATUS_SUCCESS;
     }
 

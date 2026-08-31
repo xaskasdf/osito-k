@@ -41,6 +41,7 @@ extern long __syscall6(long nr, long a1, long a2, long a3, long a4, long a5, lon
 #define SYS_fcntl     72
 #define SYS_getcwd    79
 #define SYS_chdir     80
+#define SYS_readlink  89
 #define SYS_umask     95
 #define SYS_setpgid   109
 #define SYS_getppid   110
@@ -89,6 +90,13 @@ int close(int fd)
     long ret = __syscall1(SYS_close, fd);
     if (ret < 0) { errno = (int)-ret; return -1; }
     return (int)ret;
+}
+
+ssize_t readlink(const char *path, char *buf, size_t bufsiz)
+{
+    long ret = __syscall3(SYS_readlink, (long)path, (long)buf, (long)bufsiz);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (ssize_t)ret;
 }
 
 long lseek(int fd, long offset, int whence)

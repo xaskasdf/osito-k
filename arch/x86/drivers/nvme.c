@@ -778,9 +778,8 @@ int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
     uint64_t lba = byte_offset / nvme.lba_size;
     uint64_t lba_offset = byte_offset % nvme.lba_size;
 
-    /* Allocate a temporary aligned DMA buffer for the read.
-     * temp_phys is what nvme_read hands to the controller as PRP1;
-     * temp_virt is the kernel CPU view used for the memcpy below. */
+    /* Allocate an aligned buffer and pass its direct-map alias through the
+     * synchronous API; nvme_read translates that virtual range into PRPs. */
     void *temp_phys = mem_alloc_aligned(4096 * 2, 4096);
     if (!temp_phys) return -1;
     uint8_t *temp_virt = (uint8_t *)PHYS_TO_VIRT(temp_phys);
@@ -794,7 +793,7 @@ int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
         uint32_t read_lbas = (uint32_t)((cur_offset + remaining + nvme.lba_size - 1) / nvme.lba_size);
         if (read_lbas > 8) read_lbas = 8;  /* 4KB at a time */
 
-        if (nvme_read(cur_lba, read_lbas, temp_phys) < 0) {
+        if (nvme_read(cur_lba, read_lbas, temp_virt) < 0) {
             mem_free_pages(temp_phys, 2);
             return -1;
         }
@@ -872,7 +871,7 @@ int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
 
         /* Read-modify-write if not aligned */
         if (cur_offset != 0 || remaining < (uint64_t)rw_lbas * nvme.lba_size) {
-            if (nvme_read(cur_lba, rw_lbas, temp_phys) < 0) {
+            if (nvme_read(cur_lba, rw_lbas, temp_virt) < 0) {
                 mem_free_pages(temp_phys, 2);
                 return -1;
             }
@@ -882,7 +881,7 @@ int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
         uint64_t copy = remaining < avail ? remaining : avail;
         memcpy(temp_virt + cur_offset, src, copy);
 
-        if (nvme_write(cur_lba, rw_lbas, temp_phys) < 0) {
+        if (nvme_write(cur_lba, rw_lbas, temp_virt) < 0) {
             mem_free_pages(temp_phys, 2);
             return -1;
         }

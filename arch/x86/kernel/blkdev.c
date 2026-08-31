@@ -296,7 +296,7 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
         }
 
         for (uint32_t i = 0; i < want; i++) tmp[intra + i] = src[i];
-        if (d->write(lba, sectors, tmp_phys) < 0) {
+        if (d->write(lba, sectors, tmp) < 0) {
             serial_puts("[BLK] disk_write_bytes: write failed lba=");
             serial_putdec(lba);
             serial_puts("\n");

@@ -3835,7 +3835,8 @@ zink_set_framebuffer_state(struct pipe_context *pctx,
          res->fb_bind_count++;
          res->fb_binds |= BITFIELD_BIT(i);
          batch_ref_fb_surface(ctx, ctx->fb_state.cbufs[i]);
-         if (util_format_has_alpha1(psurf->format)) {
+         if ((unsigned)psurf->format < PIPE_FORMAT_COUNT &&
+             util_format_has_alpha1(psurf->format)) {
             if (!res->valid && !zink_fb_clear_full_exists(ctx, i))
                ctx->void_clears |= (PIPE_CLEAR_COLOR0 << i);
          }

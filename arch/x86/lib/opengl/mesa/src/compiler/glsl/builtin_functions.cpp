@@ -88,6 +88,8 @@
 #include "builtin_functions.h"
 #include "util/hash_table.h"
 
+extern "C" void okgl_trace(const char *message);
+
 #ifndef M_PIf
 #define M_PIf   ((float) M_PI)
 #endif
@@ -9504,10 +9506,15 @@ static uint32_t builtin_users = 0;
 extern "C" void
 _mesa_glsl_builtin_functions_init_or_ref()
 {
+   okgl_trace("[OKGL-GLSL] builtin lock begin\n");
    simple_mtx_lock(&builtins_lock);
-   if (builtin_users++ == 0)
+   if (builtin_users++ == 0) {
+      okgl_trace("[OKGL-GLSL] builtin catalog begin\n");
       builtins.initialize();
+      okgl_trace("[OKGL-GLSL] builtin catalog end\n");
+   }
    simple_mtx_unlock(&builtins_lock);
+   okgl_trace("[OKGL-GLSL] builtin lock end\n");
 }
 
 extern "C" void

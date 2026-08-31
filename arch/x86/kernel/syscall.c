@@ -86,6 +86,8 @@ extern void  kfree(void *ptr);
 
 /* Timer */
 extern uint64_t idt_get_ticks(void);
+extern uint64_t idt_get_tsc_freq(void);
+extern uint64_t idt_get_monotonic_ns(void);
 
 /* Physical memory */
 extern void *mem_alloc_pages(uint64_t count);
@@ -569,18 +571,13 @@ void syscall_seed_stdio(fd_entry_t *fds)
 #include "../include/sys_caps.h"
 #define BRK_HEAP_SIZE  (g_sys_caps.brk_heap_size ? g_sys_caps.brk_heap_size : (16ULL * 1024 * 1024))
 
-static uint8_t *brk_base;      /* start of brk region */
-static uint8_t *brk_current;   /* current break */
-static uint8_t *brk_max;       /* end of brk region */
+static void brk_reset_current(void);
 
 /* Reset brk to base for a new process — called from proc_exec before elf_exec.
  * Zeroes the heap so the new process starts with clean memory. */
 void sys_brk_reset(void)
 {
-    if (brk_base) {
-        memset(brk_base, 0, (uint64_t)(brk_current - brk_base));
-        brk_current = brk_base;
-    }
+    brk_reset_current();
 }
 
 /* ── mmap/VFS shared definitions ───────────────────────────────── */
@@ -628,6 +625,7 @@ void sys_brk_reset(void)
 #define VMA_THREAD_STACK 4  /* demand-paged mmap assigned to CLONE_THREAD */
 #define VMA_DEFERRED_STACK 5 /* munmapped stack, free after thread exit */
 #define VMA_DEFERRED_SHARED_STACK 6
+#define VMA_BRK         7   /* TGID-owned, demand-paged process break */
 
 typedef struct {
     uint64_t    base;        /* virtual address */
@@ -729,14 +727,18 @@ static inline bool vma_owned_by_current(const vma_t *v)
     return ct != 0 && v->owner_tgid != 0 && (uint32_t)ct == v->owner_tgid;
 }
 
-static bool vma_range_overlaps_current(uint64_t base, uint64_t pages)
+/* Return the furthest end of an owned VMA intersecting [base, base + size).
+ * PE images and Win32 VirtualAlloc reservations live in separate registries;
+ * their allocators call this helper before installing mappings. */
+uint64_t syscall_vma_range_conflict_end(uint64_t base, uint64_t size)
 {
-    if (pages == 0 || pages > (UINT64_MAX / 4096ULL))
-        return true;
-
-    uint64_t end = base + pages * 4096ULL;
+    if (size == 0)
+        return UINT64_MAX;
+    uint64_t end = base + size;
     if (end < base)
-        return true;
+        return UINT64_MAX;
+
+    uint64_t conflict_end = 0;
 
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
@@ -744,13 +746,14 @@ static bool vma_range_overlaps_current(uint64_t base, uint64_t pages)
 
         uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096ULL;
         if (vma_end < vma_table[i].base)
-            return true;
+            return UINT64_MAX;
 
-        if (base < vma_end && end > vma_table[i].base)
-            return true;
+        if (base < vma_end && end > vma_table[i].base &&
+            vma_end > conflict_end)
+            conflict_end = vma_end;
     }
 
-    return false;
+    return conflict_end;
 }
 
 int syscall_assign_thread_stack(void *thread, uint64_t stack_pointer)
@@ -765,6 +768,21 @@ int syscall_assign_thread_stack(void *thread, uint64_t stack_pointer)
             continue;
         if (vma_table[i].owner && proc_tgid_of(vma_table[i].owner) != tgid)
             continue;
+        /* pthread implementations may place a thread stack inside memory
+         * obtained from brk. That storage remains allocator-owned by the
+         * whole thread group; retyping or transferring the VMA would make
+         * the next brk() lose its heap and let the thread reaper free it. */
+        if (vma_table[i].type == VMA_BRK) {
+            extern uint32_t proc_pid_of(void *p);
+            serial_puts("[VMA-STACK] brk-backed pid=");
+            serial_putdec(proc_pid_of(thread));
+            serial_puts(" sp=0x");
+            serial_puthex(stack_pointer, 16);
+            serial_puts(" heap=0x");
+            serial_puthex(vma_table[i].base, 16);
+            serial_puts("\n");
+            return 0;
+        }
         if (vma_table[i].type != VMA_SHARED_STACK)
             vma_table[i].type = VMA_THREAD_STACK;
         vma_table[i].owner = thread;
@@ -984,7 +1002,7 @@ int quarantine_check_uaf(uint64_t fault_addr, uint32_t pid)
     return 0;
 }
 
-static void vma_free_pages_in_cr3(vma_t *v, uint64_t cr3, uint32_t pid)
+static uint64_t vma_free_pages_in_cr3(vma_t *v, uint64_t cr3, uint32_t pid)
 {
     if (v->type == VMA_SHARED_STACK ||
         v->type == VMA_DEFERRED_SHARED_STACK) {
@@ -1002,14 +1020,19 @@ static void vma_free_pages_in_cr3(vma_t *v, uint64_t cr3, uint32_t pid)
         serial_putdec(v->pages);
         serial_puts("\n");
         mem_free_pages((void *)VIRT_TO_PHYS(v->base), v->pages);
-        return;
+        return v->pages;
     }
 
     /* Expire old quarantine entries periodically */
     if (quarantine_enabled)
         quarantine_expire();
 
-    for (uint64_t p = 0; p < v->pages; p++) {
+    uint64_t pages = v->pages;
+    if (v->type == VMA_BRK)
+        pages = (v->file_size + 4095ULL) / 4096ULL;
+
+    uint64_t freed_pages = 0;
+    for (uint64_t p = 0; p < pages; p++) {
         uint64_t va = v->base + p * 4096;
         uint64_t *pte = cr3 ? paging_get_pte_in_cr3(cr3, va)
                             : paging_get_pte(va);
@@ -1022,15 +1045,78 @@ static void vma_free_pages_in_cr3(vma_t *v, uint64_t cr3, uint32_t pid)
                 quarantine_page(phys, va, pid);
             else
                 mem_free_pages((void *)phys, 1);
+            freed_pages++;
         }
     }
+    return freed_pages;
 }
 
-static void vma_free_pages(vma_t *v)
+static uint64_t vma_free_pages(vma_t *v)
 {
     extern int32_t proc_current_pid(void);
     uint64_t cr3 = v->owner ? proc_current_cr3() : 0;
-    vma_free_pages_in_cr3(v, cr3, (uint32_t)proc_current_pid());
+    return vma_free_pages_in_cr3(v, cr3, (uint32_t)proc_current_pid());
+}
+
+static vma_t *brk_vma_current(void)
+{
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (vma_table[i].type == VMA_BRK &&
+            vma_owned_by_current(&vma_table[i]))
+            return &vma_table[i];
+    }
+    return NULL;
+}
+
+static void brk_decommit_tail(vma_t *v, uint64_t new_size,
+                              uint64_t old_size)
+{
+    if (!v || new_size >= old_size)
+        return;
+
+    uint64_t first = (new_size + 4095ULL) & ~4095ULL;
+    uint64_t end = (old_size + 4095ULL) & ~4095ULL;
+    uint64_t capacity = v->pages * 4096ULL;
+    if (end > capacity)
+        end = capacity;
+
+    uint64_t cr3 = proc_current_cr3();
+    uint32_t pid = (uint32_t)proc_current_pid();
+    if (quarantine_enabled)
+        quarantine_expire();
+
+    for (uint64_t offset = first; offset < end; offset += 4096ULL) {
+        uint64_t va = v->base + offset;
+        uint64_t *pte = cr3 ? paging_get_pte_in_cr3(cr3, va)
+                            : paging_get_pte(va);
+        if (!pte || !(*pte & PTE_PRESENT_BIT))
+            continue;
+
+        uint64_t phys = *pte & PTE_ADDR_MASK_;
+        if (cr3) paging_unmap_page_in_cr3(cr3, va);
+        else     paging_unmap_page(va);
+
+        if (quarantine_enabled)
+            quarantine_page(phys, va, pid);
+        else
+            mem_free_pages((void *)phys, 1);
+    }
+}
+
+static void brk_reset_current(void)
+{
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (vma_table[i].type != VMA_BRK ||
+            !vma_owned_by_current(&vma_table[i]))
+            continue;
+        uint64_t freed_pages = vma_free_pages(&vma_table[i]);
+        serial_puts("[BRK] reset tgid=");
+        serial_putdec(vma_table[i].owner_tgid);
+        serial_puts(" committed=");
+        serial_putdec(freed_pages * 4);
+        serial_puts("KB\n");
+        vma_clear_slot(&vma_table[i]);
+    }
 }
 
 /* ── Public VMA registration (called from elf.c for demand paging) ── */
@@ -1457,19 +1543,20 @@ static int proc_gen_status(char *buf, int max)
 	for (int i = 0; i < MAX_VMAS; i++) {
 		if (!vma_table[i].in_use || !vma_owned_by_current(&vma_table[i]))
 			continue;
-		virtual_bytes += vma_table[i].pages * 4096;
-		for (uint64_t page = 0; page < vma_table[i].pages; page++) {
+		uint64_t visible_bytes = vma_table[i].pages * 4096ULL;
+		uint64_t resident_pages = vma_table[i].pages;
+		if (vma_table[i].type == VMA_BRK) {
+			visible_bytes = vma_table[i].file_size;
+			resident_pages = (visible_bytes + 4095ULL) / 4096ULL;
+		}
+		virtual_bytes += visible_bytes;
+		for (uint64_t page = 0; page < resident_pages; page++) {
 			uint64_t address = vma_table[i].base + page * 4096;
 			uint64_t *pte = cr3 ? paging_get_pte_in_cr3(cr3, address)
 				: paging_get_pte(address);
 			if (pte && (*pte & PTE_PRESENT))
 				resident_bytes += 4096;
 		}
-	}
-	if (brk_base && brk_current > brk_base) {
-		uint64_t brk_bytes = (uint64_t)(brk_current - brk_base);
-		virtual_bytes += brk_bytes;
-		resident_bytes += brk_bytes;
 	}
 
 	const char *labels[2] = { "VmSize:\t", "VmRSS:\t" };
@@ -2125,54 +2212,78 @@ static int64_t sys_exit(uint64_t status)
     return 0;
 }
 
-/* brk — manage per-process heap region.
- * brk(0) returns current break.
- * brk(addr) sets break to addr if within region. */
+static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
+                        uint64_t flags, uint64_t fd, uint64_t offset);
+
+/* brk uses a TGID-owned VMA. The full range is only a virtual reservation;
+ * physical pages are committed by demand_page_fault when userspace touches
+ * an address below the current break. */
 int64_t sys_brk(uint64_t addr)
 {
-    /* Lazy init: allocate brk region on first call */
-    if (!brk_base) {
-        brk_base = (uint8_t *)kmalloc(BRK_HEAP_SIZE);
-        if (!brk_base) {
-            serial_puts("[BRK] init failed size=");
+    vma_t *vma = brk_vma_current();
+
+    if (!vma) {
+        int64_t base = sys_mmap(0, BRK_HEAP_SIZE, PROT_NONE,
+                                MAP_PRIVATE | MAP_ANONYMOUS,
+                                (uint64_t)-1, 0);
+        if (base < 0) {
+            serial_puts("[BRK] reserve failed size=");
             serial_putdec(BRK_HEAP_SIZE / (1024 * 1024));
-            serial_puts("MB\n");
+            serial_puts("MB rc=");
+            serial_putdec((uint64_t)(-base));
+            serial_puts("\n");
             return 0;
         }
-        brk_current = brk_base;
-        brk_max = brk_base + BRK_HEAP_SIZE;
-        serial_puts("[BRK] init base=0x");
-        serial_puthex((uint64_t)(uintptr_t)brk_base, 16);
-        serial_puts(" size=");
-        serial_putdec(BRK_HEAP_SIZE / (1024 * 1024));
-        serial_puts("MB max=0x");
-        serial_puthex((uint64_t)(uintptr_t)brk_max, 16);
+
+        for (int i = 0; i < MAX_VMAS; i++) {
+            if (!vma_table[i].in_use ||
+                vma_table[i].base != (uint64_t)base ||
+                vma_table[i].type != VMA_ANON ||
+                !vma_owned_by_current(&vma_table[i]))
+                continue;
+            vma = &vma_table[i];
+            break;
+        }
+        if (!vma) {
+            serial_puts("[BRK] reserved range missing VMA\n");
+            return 0;
+        }
+
+        vma->type = VMA_BRK;
+        vma->prot = PROT_READ | PROT_WRITE;
+        vma->file_size = 0; /* Current break offset from base. */
+
+        serial_puts("[BRK] reserve base=0x");
+        serial_puthex(vma->base, 16);
+        serial_puts(" virtual=");
+        serial_putdec(vma->pages * 4);
+        serial_puts("KB resident=0KB tgid=");
+        serial_putdec((uint64_t)(uint32_t)proc_current_tgid());
         serial_puts("\n");
     }
 
+    uint64_t current = vma->base + vma->file_size;
+    uint64_t limit = vma->base + vma->pages * 4096ULL;
     if (addr == 0)
-        return (int64_t)(uint64_t)brk_current;
+        return (int64_t)current;
 
-    uint8_t *new_brk = (uint8_t *)addr;
-
-    if (new_brk >= brk_base && new_brk <= brk_max) {
-        /* Zero newly exposed memory */
-        if (new_brk > brk_current)
-            memset(brk_current, 0, (uint64_t)(new_brk - brk_current));
-        brk_current = new_brk;
-    } else {
+    if (addr < vma->base || addr > limit) {
         serial_puts("[BRK] reject addr=0x");
         serial_puthex(addr, 16);
         serial_puts(" cur=0x");
-        serial_puthex((uint64_t)(uintptr_t)brk_current, 16);
+        serial_puthex(current, 16);
         serial_puts(" base=0x");
-        serial_puthex((uint64_t)(uintptr_t)brk_base, 16);
+        serial_puthex(vma->base, 16);
         serial_puts(" max=0x");
-        serial_puthex((uint64_t)(uintptr_t)brk_max, 16);
+        serial_puthex(limit, 16);
         serial_puts("\n");
+        return (int64_t)current;
     }
 
-    return (int64_t)(uint64_t)brk_current;
+    if (addr < current)
+        brk_decommit_tail(vma, addr - vma->base, vma->file_size);
+    vma->file_size = addr - vma->base;
+    return (int64_t)addr;
 }
 
 /* ── mmap/munmap/mprotect (X-MMAP) ────────────────────────────── */
@@ -2212,6 +2323,76 @@ static int mmap_commit_anon_first_page(uint64_t va, uint32_t prot)
         return -ENOMEM;
     }
 
+    return 0;
+}
+
+/* mmap/brk, Win32 VirtualAlloc and PE images maintain distinct ownership and
+ * teardown metadata, but they share one process page table. Consult all three
+ * before selecting an automatic address so a reservation cannot cover a DLL
+ * that is already mapped (or vice versa). */
+extern uint64_t nt_vm_range_conflict_end(uint64_t base, uint64_t size)
+    __attribute__((weak));
+extern uint64_t pe_va_range_conflict_end(uint64_t base, uint64_t size)
+    __attribute__((weak));
+
+static uint64_t mmap_range_conflict_end_current(uint64_t base, uint64_t size)
+{
+    uint64_t conflict_end = syscall_vma_range_conflict_end(base, size);
+    if (conflict_end == UINT64_MAX)
+        return UINT64_MAX;
+
+    if (nt_vm_range_conflict_end) {
+        uint64_t nt_end = nt_vm_range_conflict_end(base, size);
+        if (nt_end == UINT64_MAX)
+            return UINT64_MAX;
+        if (nt_end > conflict_end)
+            conflict_end = nt_end;
+    }
+
+    if (pe_va_range_conflict_end) {
+        uint64_t pe_end = pe_va_range_conflict_end(base, size);
+        if (pe_end == UINT64_MAX)
+            return UINT64_MAX;
+        if (pe_end > conflict_end)
+            conflict_end = pe_end;
+    }
+
+    uint64_t cr3 = proc_current_cr3();
+    /* The kernel CR3 identity-maps low physical memory. Those PTEs are not
+     * user allocations; the explicit VMA/NT/PE registries above are the
+     * authoritative occupancy source in that legacy address space. */
+    if (cr3 && cr3 != paging_get_kernel_cr3()) {
+        uint64_t mapped_end =
+            paging_first_mapped_end_in_cr3(cr3, base, size);
+        if (mapped_end == UINT64_MAX)
+            return UINT64_MAX;
+        if (mapped_end > conflict_end)
+            conflict_end = mapped_end;
+    }
+
+    return conflict_end;
+}
+
+static uint64_t mmap_find_free_range(uint64_t base, uint64_t limit,
+                                     uint64_t size)
+{
+    uint64_t cursor = base;
+    while (cursor < limit) {
+        if (size > limit - cursor)
+            return 0;
+
+        uint64_t conflict_end =
+            mmap_range_conflict_end_current(cursor, size);
+        if (!conflict_end)
+            return cursor;
+        if (conflict_end == UINT64_MAX)
+            return 0;
+
+        uint64_t next = (conflict_end + 4095ULL) & ~4095ULL;
+        if (next <= cursor)
+            return 0;
+        cursor = next;
+    }
     return 0;
 }
 
@@ -2331,62 +2512,33 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return (int64_t)result;
     }
 
-    /* Allocate a user-space VA from the 32-bit-clean anonymous pool. Callers
-     * that pass an aligned addr hint (e.g. musl mallocng guard-page patching)
-     * get that exact VA back, just like the legacy PROT_NONE path. */
-    static uint64_t mmap_anon_base = MMAP_ANON_LOW_BASE;
-    static uint64_t mmap_anon_high_base = MMAP_ANON_HIGH_BASE;
+    /* Allocate a user-space VA from the 32-bit-clean anonymous pool. Address
+     * spaces are process-private, so scan each process from the pool floor;
+     * a global monotonic cursor needlessly fragmented later processes. */
     uint64_t result;
     if (fixed) {
         result = addr;
-    } else if (addr && (addr & 0xFFF) == 0) {
+    } else if (addr && (addr & 0xFFF) == 0 &&
+               !mmap_range_conflict_end_current(addr, npages * 4096ULL)) {
         result = addr;
     } else {
         uint64_t bytes = npages * 4096ULL;
-        uint64_t cursor = mmap_anon_base;
-        bool high_pool = false;
-        if (cursor < MMAP_ANON_LOW_BASE)
-            cursor = MMAP_ANON_LOW_BASE;
-
-        for (;;) {
-            if (cursor + bytes < cursor ||
-                cursor + bytes > MMAP_ANON_LOW_LIMIT) {
-                high_pool = true;
-                cursor = mmap_anon_high_base;
-                if (cursor < MMAP_ANON_HIGH_BASE)
-                    cursor = MMAP_ANON_HIGH_BASE;
-                break;
-            }
-            if (!vma_range_overlaps_current(cursor, npages))
-                break;
-            cursor += bytes;
-        }
-
-        while (high_pool) {
-            if (cursor + bytes < cursor ||
-                cursor + bytes > MMAP_ANON_HIGH_LIMIT) {
-                serial_puts("[MMAP] fail anon high-limit bytes=");
+        result = mmap_find_free_range(MMAP_ANON_LOW_BASE,
+                                      MMAP_ANON_LOW_LIMIT, bytes);
+        if (!result) {
+            result = mmap_find_free_range(MMAP_ANON_HIGH_BASE,
+                                          MMAP_ANON_HIGH_LIMIT, bytes);
+            if (!result) {
+                serial_puts("[MMAP] fail anon no-range bytes=");
                 serial_putdec(bytes);
-                serial_puts(" cursor=0x");
-                serial_puthex(cursor, 16);
                 serial_puts("\n");
                 return -ENOMEM;
             }
-            if (!vma_range_overlaps_current(cursor, npages))
-                break;
-            cursor += bytes;
-        }
-
-        result = cursor;
-        if (high_pool) {
-            mmap_anon_high_base = cursor + bytes;
             serial_puts("[MMAP] anon high base=0x");
             serial_puthex(result, 16);
             serial_puts(" bytes=");
             serial_putdec(bytes);
             serial_puts("\n");
-        } else {
-            mmap_anon_base = cursor + bytes;
         }
     }
 
@@ -2670,6 +2822,18 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
         extern int32_t proc_current_pid(void);
         quarantine_check_uaf(addr, (uint32_t)proc_current_pid());
         return -1;  /* No VMA → SIGSEGV (quarantine_check_uaf logged if UAF) */
+    }
+    if (vma->type == VMA_BRK &&
+        addr >= vma->base + vma->file_size) {
+        if (dpf_fail_logs < 16) {
+            serial_puts("[DPF] above brk addr=0x");
+            serial_puthex(addr, 16);
+            serial_puts(" break=0x");
+            serial_puthex(vma->base + vma->file_size, 16);
+            serial_puts("\n");
+            dpf_fail_logs++;
+        }
+        return -1;
     }
     if (vma->prot == PROT_NONE) {
         if (dpf_fail_logs < 16) {
@@ -3490,12 +3654,10 @@ static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_addr)
     if (!tp_addr) return -EFAULT;
     timespec_t *tp = (timespec_t *)tp_addr;
 
-    /* Use APIC ticks (100Hz) for time base */
-    uint64_t ticks = idt_get_ticks();
-    uint64_t ms = ticks * 10;  /* 100Hz → 10ms per tick */
+    uint64_t ns = idt_get_monotonic_ns();
 
-    tp->tv_sec  = (int64_t)(ms / 1000);
-    tp->tv_nsec = (int64_t)((ms % 1000) * 1000000);
+    tp->tv_sec  = (int64_t)(ns / 1000000000ULL);
+    tp->tv_nsec = (int64_t)(ns % 1000000000ULL);
 
     (void)clk_id;  /* Same time for REALTIME and MONOTONIC */
     return 0;
@@ -3507,18 +3669,21 @@ static int64_t sys_nanosleep(uint64_t req_addr, uint64_t rem_addr)
     if (!req_addr) return -EFAULT;
     const timespec_t *req = (const timespec_t *)req_addr;
 
-    /* Convert to APIC ticks (100Hz = 10ms per tick) */
-    uint64_t ms = (uint64_t)(req->tv_sec * 1000 + req->tv_nsec / 1000000);
-    uint64_t sleep_ticks = (ms + 9) / 10;  /* round up */
-    if (sleep_ticks == 0) sleep_ticks = 1;
+    int64_t seconds = req->tv_sec;
+    int64_t nanoseconds = req->tv_nsec;
+    if (seconds < 0 || nanoseconds < 0 || nanoseconds >= 1000000000LL)
+        return -EINVAL;
+    if ((uint64_t)seconds >
+        (~0ULL - (uint64_t)nanoseconds) / 1000000000ULL)
+        return -EINVAL;
 
-    uint64_t deadline = idt_get_ticks() + sleep_ticks;
-    while (idt_get_ticks() < deadline) {
+    uint64_t duration_ns = (uint64_t)seconds * 1000000000ULL +
+                           (uint64_t)nanoseconds;
+    uint64_t start_ns = idt_get_monotonic_ns();
+    while (idt_get_monotonic_ns() - start_ns < duration_ns) {
         /*
-         * SYSCALL entry clears IF. HLT is unsafe here on SMP/HVF because CPU0
-         * can sleep with its local APIC timer masked while other CPUs keep
-         * advancing the global tick. Poll with IF briefly enabled instead of
-         * depending on a local HLT wakeup interrupt.
+         * SYSCALL entry clears IF. The compat32 callback path may mask this
+         * CPU's APIC timer, so use the invariant TSC clocksource and avoid HLT.
          */
         __asm__ volatile ("sti; pause; cli" ::: "memory");
     }
@@ -4255,12 +4420,10 @@ static int64_t sys_gettimeofday(uint64_t tv_addr, uint64_t tz_addr)
 {
     (void)tz_addr;
     if (tv_addr) {
-        uint64_t ticks = idt_get_ticks();
-        uint64_t secs = ticks / 100;
-        uint64_t usecs = (ticks % 100) * 10000;
+        uint64_t ns = idt_get_monotonic_ns();
         uint64_t *tv = (uint64_t *)tv_addr;
-        tv[0] = secs;    /* tv_sec */
-        tv[1] = usecs;   /* tv_usec */
+        tv[0] = ns / 1000000000ULL;          /* tv_sec */
+        tv[1] = (ns % 1000000000ULL) / 1000; /* tv_usec */
     }
     return 0;
 }
@@ -4602,15 +4765,8 @@ void vdso_init(void)
     vdso_page->page_size    = 4096;
     vdso_page->total_memory = mem_get_total();
 
-    /* Calibrate TSC: wait for one APIC tick, measure TSC elapsed */
-    extern uint64_t idt_get_ticks(void);
-    uint64_t t0 = idt_get_ticks();
-    while (idt_get_ticks() == t0) __asm__ volatile ("pause");
-    uint64_t tick_start = idt_get_ticks();
-    uint64_t tsc_start  = vdso_rdtsc();
-    while (idt_get_ticks() - tick_start < 10) __asm__ volatile ("pause");
-    uint64_t tsc_end = vdso_rdtsc();
-    vdso_page->tsc_per_sec = (tsc_end - tsc_start) * 10;  /* 10 ticks = 100ms */
+    /* Reuse the PIT-calibrated kernel clocksource. */
+    vdso_page->tsc_per_sec = idt_get_tsc_freq();
     vdso_page->seq = 0;
 
     serial_puts("[VDSO] Initialized, TSC ");
@@ -4626,9 +4782,8 @@ void vdso_update(void)
     vdso_page->seq = s + 1;  /* odd = updating */
     __asm__ volatile ("" ::: "memory");
 
-    extern uint64_t idt_get_ticks(void);
     vdso_page->boot_ticks   = idt_get_ticks();
-    vdso_page->monotonic_ns = idt_get_ticks() * 10000000ULL;
+    vdso_page->monotonic_ns = idt_get_monotonic_ns();
     vdso_page->tsc_at_update = vdso_rdtsc();
 
     extern uint32_t ntp_get_utc(void);
@@ -5267,9 +5422,6 @@ enum {
 /* Saved parent state — globals that syscall_reset_process would destroy
  * when the forked child calls execve. */
 static struct {
-    uint8_t  *brk_base;
-    uint8_t  *brk_current;
-    uint8_t  *brk_max;
     uint64_t  fs_base;
     uint64_t  sigs[NSIG];
     uint32_t  sig_pend;
@@ -5279,9 +5431,6 @@ static struct {
 
 void syscall_save_brk(void)
 {
-    saved_parent.brk_base    = brk_base;
-    saved_parent.brk_current = brk_current;
-    saved_parent.brk_max     = brk_max;
     saved_parent.fs_base     = rdmsr(MSR_FS_BASE);
     memcpy(saved_parent.sigs, sig_handlers, sizeof(sig_handlers));
     saved_parent.sig_pend = sig_pending;
@@ -5302,14 +5451,6 @@ bool syscall_in_fork_exec(void)
 void syscall_restore_brk(void)
 {
     if (!saved_parent.valid) return;
-
-    /* Free the child's brk region if it allocated a different one */
-    if (brk_base && brk_base != saved_parent.brk_base)
-        kfree(brk_base);
-
-    brk_base    = saved_parent.brk_base;
-    brk_current = saved_parent.brk_current;
-    brk_max     = saved_parent.brk_max;
 
     /* Restore FS_BASE (TLS segment register) — the child's musl init
      * overwrites this via arch_prctl(ARCH_SET_FS). Without restoring,
@@ -5356,9 +5497,20 @@ void syscall_cleanup_process(void *owner, uint64_t cr3,
             vma_table[i].type != VMA_DEFERRED_STACK &&
             vma_table[i].type != VMA_DEFERRED_SHARED_STACK)
             continue;
-        vma_free_pages_in_cr3(&vma_table[i], cr3, pid);
-        vma_table[i].in_use = false;
-        vma_table[i].owner = NULL;
+        uint8_t type = vma_table[i].type;
+        uint32_t owner_tgid = vma_table[i].owner_tgid;
+        uint64_t freed_pages =
+            vma_free_pages_in_cr3(&vma_table[i], cr3, pid);
+        if (type == VMA_BRK) {
+            serial_puts("[BRK] release pid=");
+            serial_putdec(pid);
+            serial_puts(" tgid=");
+            serial_putdec(owner_tgid);
+            serial_puts(" committed=");
+            serial_putdec(freed_pages * 4);
+            serial_puts("KB\n");
+        }
+        vma_clear_slot(&vma_table[i]);
     }
 }
 
@@ -5387,15 +5539,6 @@ void syscall_reset_process(void)
     cur_c_lflag = 0x8A3B;
     cur_c_iflag = 0x0500;
     cur_c_oflag = 0x0005;
-
-    /* Free brk heap — but NOT if it's the parent's saved brk.
-     * saved_parent.valid is true when a forked child is doing execve. */
-    if (brk_base && (!saved_parent.valid || brk_base != saved_parent.brk_base)) {
-        kfree(brk_base);
-    }
-    brk_base = NULL;
-    brk_current = NULL;
-    brk_max = NULL;
 
     /* Free mmap regions belonging to the current process — walk PTEs
      * for demand-paged VMAs. The owner filter keeps sibling processes'
@@ -5468,11 +5611,6 @@ void syscall_init(void)
     /* FD table is now per-process (inline in process_t). The kernel
      * process's stdio fds are seeded by proc_init() after it calls
      * proc_alloc("kernel"). */
-
-    /* Reset brk state */
-    brk_base = NULL;
-    brk_current = NULL;
-    brk_max = NULL;
 
     serial_puts("[SYSCALL] Ready (LSTAR=0x");
     serial_puthex((uint64_t)syscall_entry, 16);

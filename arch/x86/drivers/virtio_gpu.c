@@ -22,6 +22,7 @@ extern uint32_t *fb_get_base(void)   __attribute__((weak));
 extern uint32_t  fb_get_width(void)  __attribute__((weak));
 extern uint32_t  fb_get_height(void) __attribute__((weak));
 extern uint32_t  fb_get_pitch(void)  __attribute__((weak));
+extern void sched_yield(void);
 
 void virtio_gpu_flush(void);
 
@@ -210,6 +211,7 @@ static struct {
     bool initialized;
     bool scanout_active;
     bool queue_broken;
+    bool vga_compatible;
 
     /* Negotiated device feature vector (64-bit). Populated before FEATURES_OK
      * so the 3D driver can probe VIRTIO_GPU_F_VIRGL. */
@@ -217,6 +219,20 @@ static struct {
 } gpu;
 
 static spinlock_t gpu_cmd_lock = SPINLOCK_INIT;
+
+static void gpu_cmd_lock_acquire(void)
+{
+    while (!spin_trylock(&gpu_cmd_lock)) {
+        uint64_t flags;
+        __asm__ volatile ("pushfq; popq %0" : "=r"(flags));
+        if (flags & (1ULL << 9)) {
+            sched_yield();
+        } else {
+            for (uint32_t i = 0; i < 64; i++)
+                __asm__ volatile ("pause" ::: "memory");
+        }
+    }
+}
 
 static void virtio_gpu_seed_from_boot_fb(void)
 {
@@ -604,7 +620,7 @@ static int gpu_send_cmd_unlocked(void *cmd, uint32_t cmd_len, void *resp, uint32
 }
 
 static int gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_len) {
-    spin_lock(&gpu_cmd_lock);
+    gpu_cmd_lock_acquire();
     int rc = gpu_send_cmd_unlocked(cmd, cmd_len, resp, resp_len);
     spin_unlock(&gpu_cmd_lock);
     return rc;
@@ -781,6 +797,18 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
 
     /* Need ECAM page for this BDF mapped */
     paging_map_mmio(gpu.ecam_base | ((uint64_t)bus << 20) | ((uint64_t)dev << 15) | ((uint64_t)func << 12), 4096);
+
+    /* virtio-vga is class 03:00 and owns the firmware-visible scanout.
+     * virtio-gpu-pci is class 03:80 and remains a secondary controller. */
+    {
+        uint32_t class_reg = ecam_read32(0x08);
+        uint8_t class_code = (uint8_t)(class_reg >> 24);
+        uint8_t subclass = (uint8_t)(class_reg >> 16);
+        gpu.vga_compatible = class_code == 0x03 && subclass == 0x00;
+        serial_puts("[VIRTIO-GPU] PCI display role: ");
+        serial_puts(gpu.vga_compatible ? "VGA-compatible\n"
+                                       : "secondary controller\n");
+    }
 
     /* Enable PCI memory space + bus master if not already */
     uint16_t pci_cmd = (uint16_t)ecam_read32(0x04);
@@ -1033,6 +1061,7 @@ uint32_t *virtio_gpu_get_fb(void)   { return gpu.framebuffer; }
 uint32_t  virtio_gpu_get_width(void) { return gpu.width; }
 uint32_t  virtio_gpu_get_height(void){ return gpu.height; }
 bool      virtio_gpu_ready(void)     { return gpu.initialized; }
+bool      virtio_gpu_is_vga_compatible(void) { return gpu.vga_compatible; }
 
 bool virtio_gpu_get_native_mode(uint32_t *width, uint32_t *height)
 {
@@ -1068,7 +1097,7 @@ int virtio_gpu_resize(uint32_t width, uint32_t height)
     uint64_t old_size = 0;
     bool old_released = false;
 
-    spin_lock(&gpu_cmd_lock);
+    gpu_cmd_lock_acquire();
 
     int rc = virtio_gpu_create_resource_locked(new_resource, width, height);
     if (rc == 0)
@@ -1133,7 +1162,11 @@ int virtio_gpu_resize(uint32_t width, uint32_t height)
 void virtio_gpu_flush(void) {
     if (!gpu.initialized) return;
 
-    spin_lock(&gpu_cmd_lock);
+    /* A refresh is disposable: never pin the scheduler behind a process that
+     * was preempted while waiting for a host 3D command.  A later flush sends
+     * the complete framebuffer and catches up automatically. */
+    if (!spin_trylock(&gpu_cmd_lock))
+        return;
 
     /* Lazy SET_SCANOUT: activate on first flush so VGA stays visible during boot */
     if (!gpu.scanout_active) {
