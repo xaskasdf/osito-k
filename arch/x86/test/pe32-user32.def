@@ -1,10 +1,22 @@
 LIBRARY USER32.dll
 EXPORTS
+    CallNextHookEx@16
+    CallWindowProcA@20
+    CallWindowProcW@20
     CreateWindowExA@48
     DefWindowProcA@16
     DestroyWindow@4
+    DispatchMessageA@4
     GetProcessWindowStation@0
+    GetFocus@0
+    GetWindowLongA@8
     GetUserObjectInformationA@20
     GetUserObjectInformationW@20
+    IsWindow@4
+    PeekMessageA@20
     RegisterClassExA@4
     SendMessageA@16
+    SetFocus@4
+    SetWindowLongA@12
+    SetWindowsHookExA@16
+    UnhookWindowsHookEx@4

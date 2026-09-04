@@ -77,6 +77,7 @@ typedef LRESULT (WINAPI *HOOKPROC)(int, WPARAM, LPARAM);
 #define WM_CHAR             0x0102
 #define WM_SYSKEYDOWN       0x0104
 #define WM_SYSKEYUP         0x0105
+#define WM_SYSCHAR          0x0106
 #define WM_INITDIALOG       0x0110
 #define WM_COMMAND          0x0111
 #define WM_SYSCOMMAND       0x0112

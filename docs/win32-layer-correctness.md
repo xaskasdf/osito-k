@@ -405,7 +405,55 @@ image and continued receiving newly pressed Escape keys; the BSP timer stayed
 unmasked. This was a menu-level smoke test, not a gameplay/performance benchmark.
 PE32 `CallWindowProcA` subclass dispatch, Alt+F4/system-key semantics, and the
 UT99 menu-click workflow remain unverified or incomplete; they are not covered
-by the fullscreen/preemption result.
+by the fullscreen/preemption result. Section 4.7 records the subsequent
+subclass and keyboard contract work.
+
+## 4.7 PE32 subclassing and system-key contracts (2026-09-04)
+
+`CallWindowProcA` now invokes the previous PE32 procedure instead of silently
+falling back to `DefWindowProcA`. Callback invocation is separate from message
+delivery, so a subclass link does not generate another `WH_CALLWNDPROC` or
+return-hook notification. PE32 `LRESULT` values are sign-extended at the
+callback boundary, including the `WM_CREATE` return value of -1 that rejects
+window creation.
+
+Physical keyboard input and `SendInput` share message classification and
+`lParam` construction. Window messages use generic modifier virtual keys while
+key state retains left/right identity. Tests cover repeat, extended keys,
+Alt/Ctrl release ordering, F10, and an active window without keyboard focus.
+`TranslateMessage` generates `WM_SYSCHAR` for system keystrokes. The default
+Alt+F4 path posts `WM_SYSCOMMAND/SC_CLOSE` to the root window, respects
+`CS_NOCLOSE`, and permits the application to consume the command or `WM_CLOSE`.
+
+Validation commands:
+```sh
+make -C arch/x86 CLANG=1 -j4
+sh arch/x86/scripts/build-subclass-test.sh
+```
+
+The generated `arch/x86/build/test-pe32/subclass_pe32.exe` runs unchanged on
+Windows and OsitoK. It creates hidden, process-owned windows and installs only
+a calling-thread hook. It checks two subclass links, nested sends, high-bit
+arguments, signed results, per-window isolation, procedure restoration, native
+BUTTON forwarding, hook counts, rejected creation, and the default close path.
+The initial subclass probe failed with exit 3 on the previous kernel and passed
+on Windows; the final expanded probe passes with exit 0 on both systems. The
+`CallWindowProcW` case covers a numeric message, not ANSI/Unicode conversion.
+
+For guest execution, copy the probe to `probes/subclass_pe32.exe` and use
+`arch/x86/test/subclass.autoload` on a disposable disk. The final QEMU serial log
+at `/root/osito-subclass-20260904-r4/serial.log` records input 147/147, window
+model 95/95, dialog 10/10, DirectDraw, DOS API, and DirectSound passes. Callback
+preemption, SEH3, and legacy WinMM timer probes also exit with code 0. The SEH3
+page fault is intentional and handled by its regression fixture.
+
+UT99 smoke-test artifacts are under `/root/osito-ut99-subclass-20260904-r1/`.
+Repeated Alt+Enter transitions preserved the full image and kept the timer and
+compositor progressing without an unexpected CPU fault. This does not establish
+complete game input compatibility: clicking Options did not open its menu, and
+Alt+F4 did not exit UT99 despite delivery of system-key messages. Both remain
+open investigations. ANSI/Unicode subclass text conversion, full menu-loop
+semantics, and the broader message-hook contract also remain incomplete.
 
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only

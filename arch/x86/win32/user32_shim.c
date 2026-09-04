@@ -1289,6 +1289,7 @@ static BOOL place_window_in_z_order(WINDOW *w, HWND insert_after)
  * async_pressed[vk]: set when key goes down, cleared by GetAsyncKeyState.
  */
 static BYTE key_state[256];
+static BOOL keyboard_alt_pending;
 static BYTE async_pressed[256];
 static BYTE key_state_at_msg[256]; /* snapshot at last PeekMessage/GetMessage retrieval */
 static DWORD mouse_buttons = 0; /* bits 0-4: left, right, middle, X1, X2 */
@@ -5553,17 +5554,18 @@ BOOL WINAPI TranslateMessage(const MSG *lpMsg)
     MSG m;
     msg_read_from(lpMsg, &m);
 
-    /* Generate WM_CHAR from WM_KEYDOWN. KEYEVENTF_UNICODE uses VK_PACKET and
-     * carries the UTF-16 code unit in the scan-code word. */
+    /* System keystrokes translate to WM_SYSCHAR, not ordinary text input.
+     * VK_PACKET carries a UTF-16 code unit in the scan-code word. */
     BOOL queued = FALSE;
     WORD translated = 0;
     if (m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN) {
+        DWORD char_message = m.message == WM_SYSKEYDOWN ? WM_SYSCHAR : WM_CHAR;
         DWORD vk = (DWORD)m.wParam;
         if (vk == VK_PACKET) {
             WORD ch = (WORD)(((ULONG_PTR)m.lParam >> 16) & 0xFFFF);
             if (ch) {
                 translated = ch;
-                queued = msg_enqueue(m.hwnd, WM_CHAR,
+                queued = msg_enqueue(m.hwnd, char_message,
                                      (WPARAM)ch, m.lParam);
             }
         } else {
@@ -5573,7 +5575,7 @@ BOOL WINAPI TranslateMessage(const MSG *lpMsg)
             if (ToAscii(vk, (DWORD)((m.lParam >> 16) & 0xFF),
                         state, &ch, 0) > 0) {
                 translated = ch;
-                queued = msg_enqueue(m.hwnd, WM_CHAR,
+                queued = msg_enqueue(m.hwnd, char_message,
                                      (WPARAM)ch, m.lParam);
             }
         }
@@ -5596,12 +5598,9 @@ BOOL WINAPI TranslateMessage(const MSG *lpMsg)
     return TRUE;
 }
 
-static LRESULT dispatch_wndproc(WNDPROC wndproc, HWND hWnd, DWORD Msg,
-                                WPARAM wParam, LPARAM lParam)
+static LRESULT invoke_wndproc(WNDPROC wndproc, HWND hWnd, DWORD Msg,
+                              WPARAM wParam, LPARAM lParam)
 {
-    dispatch_depth++;
-    user_hook_notify_callwndproc(hWnd, Msg, wParam, lParam);
-    LRESULT ret;
     if (g_compat32_mode) {
         uint32_t args[4] = {
             (uint32_t)(uintptr_t)hWnd,
@@ -5610,14 +5609,23 @@ static LRESULT dispatch_wndproc(WNDPROC wndproc, HWND hWnd, DWORD Msg,
             (uint32_t)lParam
         };
         uint32_t stack_top = compat32_current_user_stack_top();
-        ret = stack_top
-            ? (LRESULT)compat32_callback_args_on_stack(
+        uint32_t result = stack_top
+            ? compat32_callback_args_on_stack(
                 (uint32_t)(uintptr_t)wndproc, 4, args, stack_top)
-            : (LRESULT)compat32_callback_args(
+            : compat32_callback_args(
                 (uint32_t)(uintptr_t)wndproc, 4, args);
-    } else {
-        ret = wndproc(hWnd, Msg, wParam, lParam);
+        /* LRESULT is signed and pointer-sized in the calling application. */
+        return (LRESULT)(int32_t)result;
     }
+    return wndproc(hWnd, Msg, wParam, lParam);
+}
+
+static LRESULT dispatch_wndproc(WNDPROC wndproc, HWND hWnd, DWORD Msg,
+                                WPARAM wParam, LPARAM lParam)
+{
+    dispatch_depth++;
+    user_hook_notify_callwndproc(hWnd, Msg, wParam, lParam);
+    LRESULT ret = invoke_wndproc(wndproc, hWnd, Msg, wParam, lParam);
     user_hook_notify_callwndprocret(ret, hWnd, Msg, wParam, lParam);
     dispatch_depth--;
     return ret;
@@ -6033,6 +6041,18 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
     case WM_NCACTIVATE: return 1;
     case WM_SETCURSOR:  return 1;
     case WM_ACTIVATE:   return 0;
+    case WM_SYSKEYDOWN:
+        if (wParam == VK_F4 && ((ULONG_PTR)lParam & (1UL << 29))) {
+            HWND root = GetAncestor(hWnd, GA_ROOT);
+            WINDOW *window = find_window(root);
+            WNDCLASS_ENTRY *window_class = window
+                ? lookup_class_for_pid(window->class_name, window->owner_pid)
+                : NULL;
+            if (window &&
+                (!window_class || !(window_class->style & CS_NOCLOSE)))
+                PostMessageA(root, WM_SYSCOMMAND, SC_CLOSE, 0);
+        }
+        return 0;
     case WM_WINDOWPOSCHANGED: {
         WINDOW *w = find_window(hWnd);
         if (!w || !lParam)
@@ -9784,6 +9804,10 @@ static BYTE sendinput_vk_to_scan(BYTE vk, BOOL *extended)
 {
     *extended = FALSE;
     switch (vk) {
+    case VK_SHIFT:   case VK_LSHIFT:   return 0x2A;
+    case VK_RSHIFT:                    return 0x36;
+    case VK_CONTROL: case VK_LCONTROL: return 0x1D;
+    case VK_MENU:    case VK_LMENU:    return 0x38;
     case VK_RCONTROL: *extended = TRUE; return 0x1D;
     case VK_RMENU:    *extended = TRUE; return 0x38;
     case VK_DIVIDE:   *extended = TRUE; return 0x35;
@@ -9839,6 +9863,56 @@ static void sendinput_update_key_state(BYTE vk, BOOL key_up)
         sendinput_refresh_modifier(VK_MENU, VK_LMENU, VK_RMENU);
         if (!key_up) async_pressed[VK_MENU] = 1;
     }
+}
+
+/* Shared by physical and injected input. Modifier state retains the side,
+ * while window messages carry the generic VK and the physical scan code. */
+static void keyboard_prepare_message(BYTE vk, WORD scan, BOOL extended,
+                                      BOOL key_up, BOOL unicode, MSG *message)
+{
+    if (vk == VK_SHIFT) vk = scan == 0x36 ? VK_RSHIFT : VK_LSHIFT;
+    if (vk == VK_CONTROL) vk = extended ? VK_RCONTROL : VK_LCONTROL;
+    if (vk == VK_MENU) vk = extended ? VK_RMENU : VK_LMENU;
+    BYTE window_vk = vk;
+    if (vk == VK_LSHIFT || vk == VK_RSHIFT) {
+        window_vk = VK_SHIFT;
+        extended = FALSE;
+    } else if (vk == VK_LCONTROL || vk == VK_RCONTROL) {
+        window_vk = VK_CONTROL;
+    } else if (vk == VK_LMENU || vk == VK_RMENU) {
+        window_vk = VK_MENU;
+    }
+
+    BOOL was_down = (key_state[vk] & 0x80) != 0;
+    BOOL alt_before = (key_state[VK_MENU] & 0x80) != 0;
+    BOOL control_before = (key_state[VK_CONTROL] & 0x80) != 0;
+    BOOL system_key = FALSE;
+    if (!unicode) {
+        if (window_vk == VK_MENU) {
+            system_key = key_up ? alt_before && keyboard_alt_pending
+                                : !control_before;
+            keyboard_alt_pending = !key_up && system_key;
+        } else if (window_vk == VK_CONTROL) {
+            system_key = key_up && alt_before;
+            if (system_key) keyboard_alt_pending = FALSE;
+        } else if (vk == VK_F10 || (alt_before && !control_before)) {
+            system_key = TRUE;
+            keyboard_alt_pending = FALSE;
+        }
+        if (!focus_hwnd) system_key = TRUE;
+    }
+    sendinput_update_key_state(vk, key_up);
+
+    ULONG_PTR bits = 1 | ((ULONG_PTR)(unicode ? scan : scan & 0xFF) << 16);
+    if (extended) bits |= 1UL << 24;
+    if (!unicode && (key_state[VK_MENU] & 0x80)) bits |= 1UL << 29;
+    if (was_down || key_up) bits |= 1UL << 30;
+    if (key_up) bits |= 1UL << 31;
+    message->message = key_up
+        ? (system_key ? WM_SYSKEYUP : WM_KEYUP)
+        : (system_key ? WM_SYSKEYDOWN : WM_KEYDOWN);
+    message->wParam = window_vk;
+    message->lParam = (LPARAM)bits;
 }
 
 static WORD sendinput_mouse_key_state(void)
@@ -10011,31 +10085,15 @@ UINT WINAPI SendInput(UINT cInputs, const INPUT *pInputs, int cbSize)
                 }
             }
 
-            BOOL was_down = vk && (key_state[vk] & 0x80) != 0;
-            BOOL alt_before = (key_state[VK_MENU] & 0x80) != 0;
-            sendinput_update_key_state(vk, key_up);
-            BOOL alt_after = (key_state[VK_MENU] & 0x80) != 0;
-            BOOL system_key = !unicode &&
-                (vk == VK_MENU || alt_before || alt_after);
-
-            ULONG_PTR lparam_bits = 1;
-            if (unicode)
-                lparam_bits |= (ULONG_PTR)scan << 16;
-            else
-                lparam_bits |= (ULONG_PTR)(scan & 0xFF) << 16;
-            if (extended) lparam_bits |= 1UL << 24;
-            if (alt_before) lparam_bits |= 1UL << 29;
-            if (was_down || key_up) lparam_bits |= 1UL << 30;
-            if (key_up) lparam_bits |= 1UL << 31;
-
-            DWORD message = key_up
-                ? (system_key ? WM_SYSKEYUP : WM_KEYUP)
-                : (system_key ? WM_SYSKEYDOWN : WM_KEYDOWN);
+            MSG key_message = { 0 };
+            keyboard_prepare_message(vk, scan, extended, key_up, unicode,
+                                      &key_message);
             POINT screen_point = cursor_pos;
             DWORD event_time = record.value.keyboard.time
                 ? record.value.keyboard.time : timestamp;
             record_ok = sendinput_queue_locked(
-                target, message, vk, (LPARAM)lparam_bits,
+                target, key_message.message, key_message.wParam,
+                key_message.lParam,
                 target_pid, target_tid,
                 (LPARAM)record.value.keyboard.extra_info, event_time,
                 screen_point, FALSE, &changed_status);
@@ -11788,7 +11846,9 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
 
     if (vk == 0) return;
 
-    sendinput_update_key_state(vk, key_up);
+    MSG key_message = { 0 };
+    keyboard_prepare_message(vk, scancode, extended, key_up, FALSE,
+                              &key_message);
 
     /* Find active window for message target. MUST use the window's real handle
      * (windows[i].handle) — find_window() matches by handle, and Window.dll's
@@ -11804,17 +11864,8 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
     HWND target = input_target();
     if (!target) return;
 
-    /* Build lParam: scancode in bits 16-23, extended flag in bit 24,
-     * previous state in bit 30, transition state in bit 31 */
-    LPARAM lp = ((LPARAM)scancode << 16) | 1; /* repeat count = 1 */
-    if (extended) lp |= (1 << 24);
-    if (key_up) {
-        lp |= ((LPARAM)1 << 30); /* was down */
-        lp |= ((LPARAM)1 << 31); /* transition: going up */
-    }
-
-    DWORD msg = key_up ? WM_KEYUP : WM_KEYDOWN;
-    msg_enqueue_input(target, msg, (WPARAM)vk, lp);
+    msg_enqueue_input(target, key_message.message, key_message.wParam,
+                       key_message.lParam);
 }
 
 /*
@@ -12468,14 +12519,6 @@ LRESULT WINAPI CallWindowProcA(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
     if (!lpPrevWndFunc)
         return DefWindowProcA(hWnd, Msg, wParam, lParam);
 
-    /* Native Win64 applications rely on this chain after subclassing a
-     * window with SetWindowLongPtr. Steam wraps Chromium's HWNDs; dropping the
-     * previous procedure here prevents the render host from receiving focus,
-     * keyboard, IME, and accessibility messages. PE32 nested callbacks still
-     * use the conservative fallback until their callback stack is reentrant. */
-    if (g_compat32_mode)
-        return DefWindowProcA(hWnd, Msg, wParam, lParam);
-
     if (Msg >= WM_KEYDOWN && Msg <= WM_SYSKEYUP) {
         static unsigned trace_count;
         if (trace_count++ < 96) {
@@ -12488,8 +12531,13 @@ LRESULT WINAPI CallWindowProcA(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
             serial_puts("\n");
         }
     }
-    return dispatch_wndproc((WNDPROC)lpPrevWndFunc, hWnd, Msg,
-                            wParam, lParam);
+    /* A subclass calls an earlier procedure, not a second message delivery.
+     * Native class procedures already have callable PE32 thunks. */
+    dispatch_depth++;
+    LRESULT result = invoke_wndproc((WNDPROC)lpPrevWndFunc, hWnd, Msg,
+                                    wParam, lParam);
+    dispatch_depth--;
+    return result;
 }
 
 LRESULT WINAPI CallWindowProcW(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
@@ -15799,6 +15847,115 @@ static void input_test_write_u32(BYTE *output, DWORD value)
     output[3] = (BYTE)(value >> 24);
 }
 
+static void input_test_keyboard_messages(HWND window, int *checks, int *failures)
+{
+    static const struct {
+        BYTE scan, extended, up;
+        DWORD message, vk, bits;
+    } steps[] = {
+        {0x1E, 0, 0, WM_KEYDOWN, 'A',        0x001E0001},
+        {0x1E, 0, 0, WM_KEYDOWN, 'A',        0x401E0001},
+        {0x1E, 0, 1, WM_KEYUP,   'A',        0xC01E0001},
+        {0x38, 0, 0, WM_SYSKEYDOWN, VK_MENU, 0x20380001},
+        {0x3E, 0, 0, WM_SYSKEYDOWN, VK_F4,   0x203E0001},
+        {0x3E, 0, 0, WM_SYSKEYDOWN, VK_F4,   0x603E0001},
+        {0x3E, 0, 1, WM_SYSKEYUP, VK_F4,     0xE03E0001},
+        {0x38, 0, 1, WM_KEYUP, VK_MENU,      0xC0380001},
+        {0x38, 1, 0, WM_SYSKEYDOWN, VK_MENU, 0x21380001},
+        {0x38, 1, 1, WM_SYSKEYUP, VK_MENU,   0xC1380001},
+        {0x1D, 0, 0, WM_KEYDOWN, VK_CONTROL, 0x001D0001},
+        {0x38, 0, 0, WM_KEYDOWN, VK_MENU,    0x20380001},
+        {0x12, 0, 0, WM_KEYDOWN, 'E',        0x20120001},
+        {0x12, 0, 1, WM_KEYUP,   'E',        0xE0120001},
+        {0x1D, 0, 1, WM_SYSKEYUP, VK_CONTROL,0xE01D0001},
+        {0x38, 0, 1, WM_KEYUP, VK_MENU,      0xC0380001},
+        {0x44, 0, 0, WM_SYSKEYDOWN, VK_F10,  0x00440001},
+        {0x44, 0, 1, WM_SYSKEYUP, VK_F10,    0xC0440001},
+        {0x2A, 0, 0, WM_KEYDOWN, VK_SHIFT,   0x002A0001},
+        {0x36, 0, 0, WM_KEYDOWN, VK_SHIFT,   0x00360001},
+        {0x2A, 0, 1, WM_KEYUP, VK_SHIFT,     0xC02A0001},
+        {0x36, 0, 1, WM_KEYUP, VK_SHIFT,     0xC0360001},
+        {0x1D, 1, 0, WM_KEYDOWN, VK_CONTROL, 0x011D0001},
+        {0x1D, 1, 1, WM_KEYUP, VK_CONTROL,   0xC11D0001},
+    };
+    for (int injected = 0; injected < 2; injected++) {
+        keyboard_alt_pending = FALSE;
+        for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+            if (injected) {
+                INPUT input = { .type = INPUT_KEYBOARD };
+                input.data.ki.wScan = steps[i].scan;
+                input.data.ki.dwFlags = KEYEVENTF_SCANCODE |
+                    (steps[i].extended ? KEYEVENTF_EXTENDEDKEY : 0) |
+                    (steps[i].up ? KEYEVENTF_KEYUP : 0);
+                input_test_expect(SendInput(1, &input, sizeof(input)) == 1,
+                                  "inject keyboard sequence", checks, failures);
+            } else {
+                if (steps[i].extended)
+                    win32_post_keyboard_event(0xE0, steps[i].up);
+                win32_post_keyboard_event(steps[i].scan, steps[i].up);
+            }
+            MSG message = { 0 };
+            BOOL found = input_test_take(window, WM_KEYDOWN, WM_SYSKEYUP,
+                                          &message);
+            input_test_expect(found && message.message == steps[i].message &&
+                              message.wParam == steps[i].vk &&
+                              (DWORD)message.lParam == steps[i].bits,
+                              injected ? "injected key message contract"
+                                       : "physical key message contract",
+                              checks, failures);
+            if (i == 20)
+                input_test_expect((GetKeyState(VK_SHIFT) & 0x8000) &&
+                                  !(GetKeyState(VK_LSHIFT) & 0x8000) &&
+                                  (GetKeyState(VK_RSHIFT) & 0x8000),
+                                  "releasing left Shift preserves right Shift",
+                                  checks, failures);
+        }
+    }
+    INPUT alt = { .type = INPUT_KEYBOARD };
+    alt.data.ki.wVk = VK_MENU;
+    MSG message = { 0 };
+    input_test_expect(SendInput(1, &alt, sizeof(alt)) == 1 &&
+                      input_test_take(window, WM_SYSKEYDOWN, WM_SYSKEYDOWN,
+                                      &message) &&
+                      message.wParam == VK_MENU &&
+                      (DWORD)message.lParam == 0x20380001,
+                      "generic injected Alt maps to its physical key",
+                      checks, failures);
+    alt.data.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &alt, sizeof(alt));
+    input_test_expect(input_test_take(window, WM_SYSKEYUP, WM_SYSKEYUP,
+                                      &message) &&
+                      (DWORD)message.lParam == 0xC0380001,
+                      "standalone Alt release has no down context",
+                      checks, failures);
+    message.hwnd = window;
+    message.message = WM_SYSKEYDOWN;
+    message.wParam = 'A';
+    message.lParam = 0x201E0001;
+    input_test_expect(TranslateMessage(&message) &&
+                      input_test_take(window, WM_SYSCHAR, WM_SYSCHAR, &message) &&
+                      message.wParam == 'a' && message.lParam == 0x201E0001,
+                      "system character keeps its message type and context",
+                      checks, failures);
+    input_test_expect(!input_test_take(window, WM_CHAR, WM_CHAR, &message),
+                      "system character does not leak into ordinary text",
+                      checks, failures);
+    HWND saved_focus = focus_hwnd;
+    focus_hwnd = NULL;
+    win32_post_keyboard_event(0x30, FALSE);
+    win32_post_keyboard_event(0x30, TRUE);
+    focus_hwnd = saved_focus;
+    input_test_expect(input_test_take(window, WM_SYSKEYDOWN, WM_SYSKEYDOWN,
+                                      &message) && message.wParam == 'B' &&
+                      (DWORD)message.lParam == 0x00300001,
+                      "unfocused active window receives system keydown",
+                      checks, failures);
+    input_test_expect(input_test_take(window, WM_SYSKEYUP, WM_SYSKEYUP,
+                                      &message) && message.wParam == 'B',
+                      "unfocused active window receives system keyup",
+                      checks, failures);
+}
+
 int user32_input_selftest(void)
 {
     static const char class_name[] = "OsitoInputTest";
@@ -15808,6 +15965,7 @@ int user32_input_selftest(void)
     };
     BYTE saved_keys[256];
     BYTE saved_async[256];
+    BOOL saved_alt_pending = keyboard_alt_pending;
     DWORD saved_buttons = mouse_buttons;
     POINT saved_cursor = cursor_pos;
     HWND saved_capture = capture_hwnd;
@@ -15868,7 +16026,8 @@ int user32_input_selftest(void)
     input_test_expect(atom != 0, "RegisterClassA", &checks, &failures);
     if (!atom)
         goto cleanup;
-    window = CreateWindowExA(0, class_name, "input-test", WS_OVERLAPPED,
+    window = CreateWindowExA(0, class_name, "input-test",
+                             WS_OVERLAPPED | WS_VISIBLE,
                              0, 0, current_mode_cx(), current_mode_cy(),
                              NULL, NULL, NULL, NULL);
     input_test_expect(window != NULL, "CreateWindowExA", &checks, &failures);
@@ -15978,6 +16137,7 @@ int user32_input_selftest(void)
     msg_purge_process(GetCurrentProcessId());
 
     INPUT unicode = { 0 };
+    input_test_keyboard_messages(window, &checks, &failures);
     unicode.type = INPUT_KEYBOARD;
     unicode.data.ki.wScan = 0x03A9;
     unicode.data.ki.dwFlags = KEYEVENTF_UNICODE;
@@ -16350,6 +16510,7 @@ cleanup:
         async_pressed[i] = saved_async[i];
     }
     mouse_buttons = saved_buttons;
+    keyboard_alt_pending = saved_alt_pending;
     cursor_pos = saved_cursor;
     capture_hwnd = saved_capture;
     native_move = saved_native_move;
@@ -17149,6 +17310,7 @@ PVOID user32_shim_init(void)
     mouse_buttons = 0;
     message_extra_info = 0;
     prev_was_e0 = 0;
+    keyboard_alt_pending = FALSE;
     /* Re-exec resets input and activation state. */
     focus_hwnd = NULL;
     active_hwnd = NULL;
