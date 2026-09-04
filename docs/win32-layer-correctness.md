@@ -455,6 +455,58 @@ Alt+F4 did not exit UT99 despite delivery of system-key messages. Both remain
 open investigations. ANSI/Unicode subclass text conversion, full menu-loop
 semantics, and the broader message-hook contract also remain incomplete.
 
+## 4.8 Thread-owned cursor visibility (2026-09-04)
+
+`ShowCursor` now maintains independent display counts per process/thread instead
+of one global counter. Only nonzero counts allocate kernel-owned state; balancing
+the count, releasing a thread, and releasing a process reclaim that state without
+resetting another thread's count. Allocation and freeing occur outside the cursor
+spinlock. Relative-pointer translation consults the calling owner's count.
+
+The compositor respects the managed surface owner's count in both ordinary and
+fullscreen rendering. Native desktop chrome keeps its pointer. `GetCursorInfo`
+reports the pointer target's visibility in both native and PE32 layouts. This
+removes the extra native arrow over games that hide it and draw their own cursor;
+it does not complete cursor shapes, `SetCursor(NULL)`, `WM_SETCURSOR`, or attached
+input-queue semantics.
+
+Validation commands:
+```sh
+make -C arch/x86 CLANG=1 -j4
+bash arch/x86/scripts/test-compositor-cursor.sh
+CC=clang bash arch/x86/scripts/test-compositor-cursor.sh
+bash arch/x86/scripts/test-compositor-bands.sh
+sh arch/x86/scripts/build-subclass-test.sh
+```
+
+The production-overlay host test passes 22 checks with GCC, clang, and
+ASan/UBSan; the band test passes 880 cases. The expanded `subclass_pe32.exe`
+checks independent worker counts and cleanup when a worker exits hidden. It
+passes unchanged on Windows. QEMU logs under `/root/osito-cursor-20260904-r1/`
+and `r2/` record the same probe failing on the preceding kernel with exit 3 and
+passing on the fixed kernel with exit 0. The clean contract run also passes
+window, dialog, DirectDraw, DirectSound, DOS API, callback-preemption, SEH3, and
+legacy WinMM timer tests. The SEH3 fault is intentional and handled.
+
+UT99 artifacts are under `/root/osito-ut99-input-20260904-r2/`. Options and
+Multiplayer menus respond using the game's cursor; fullscreen/windowed switches
+preserve the image and restore the appropriate pointer. Console `quit` exits
+with code 0 and leaves the cursor-count list empty. The final kernel passes
+input 156/156 and window-model 95/95 checks after that exit. UT99 still consumes
+Alt+F4 without reaching `DefWindowProcA`; its shutdown behavior, the initial
+setup wizard's painting, and the first absolute-to-relative sample remain open.
+
+The subsequent `dos-api-test` did not pass: `dos_vcpi_selftest` faulted while
+zeroing a 16 MiB allocation using its physical address as a pointer. The fault
+at RIP `0xFFFF800002417740` writes to unmapped `0x10B00000` from allocation
+base `0x10991000`. This points to DOS relying on low identity aliases that Win32
+image teardown can remove. No baseline UT99-exit/DOS A/B comparison has yet
+established whether the cursor changes affect reproduction. The DOS allocation
+boundary needs stable kernel virtual mappings while retaining physical addresses
+for freeing and guest mappings; no DOS mapping fix is included here. The later
+DirectSound command could not run after the halt, so the clean-boot contract
+passes must not be read as a passing post-UT99 sequence.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of

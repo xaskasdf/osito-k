@@ -34,6 +34,12 @@ IMPORT HANDLE WINAPI GetStdHandle(DWORD);
 IMPORT DWORD WINAPI GetCurrentThreadId(void);
 IMPORT int WINAPI WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 IMPORT void WINAPI ExitProcess(UINT);
+IMPORT HANDLE WINAPI CreateThread(void *, DWORD,
+                                  DWORD (WINAPI *)(void *), void *, DWORD,
+                                  DWORD *);
+IMPORT DWORD WINAPI WaitForSingleObject(HANDLE, DWORD);
+IMPORT int WINAPI CloseHandle(HANDLE);
+IMPORT int WINAPI ShowCursor(int);
 IMPORT unsigned short WINAPI RegisterClassExA(const WNDCLASSEXA *);
 IMPORT HWND WINAPI CreateWindowExA(DWORD, const char *, const char *, DWORD,
                                    int, int, int, int, HWND, HANDLE, HANDLE, void *);
@@ -159,6 +165,36 @@ static HWND create_window(void)
                            (HWND)0, (HANDLE)0, instance, (void *)0);
 }
 
+static DWORD WINAPI cursor_worker(void *unused)
+{
+    (void)unused;
+    CHECK(ShowCursor(0) == -1, "worker starts with an independent cursor count");
+    CHECK(ShowCursor(1) == 0, "worker restores its own cursor count");
+    CHECK(ShowCursor(0) == -1, "worker can exit with its cursor hidden");
+    return 0;
+}
+
+static void check_cursor_counts(void)
+{
+    CHECK(ShowCursor(0) == -1, "initial cursor hide count");
+    CHECK(ShowCursor(0) == -2, "nested cursor hide count");
+    CHECK(ShowCursor(1) == -1, "one show does not undo two hides");
+    for (unsigned i = 0; i < 2; i++) {
+        HANDLE thread = CreateThread(0, 0, cursor_worker, 0, 0, 0);
+        CHECK(thread != (HANDLE)0, "create cursor-count worker");
+        if (thread) {
+            if (WaitForSingleObject(thread, 10000) != 0) {
+                report("[SUBCLASS] FAIL: cursor-count worker did not finish\n");
+                ExitProcess(4);
+            }
+            CloseHandle(thread);
+        }
+        CHECK(ShowCursor(1) == 0, "worker exit preserves the parent's hide");
+        CHECK(ShowCursor(0) == -1, "parent can hide after worker exit");
+    }
+    CHECK(ShowCursor(1) == 0, "restore cursor after thread-isolation test");
+}
+
 static void check_close_shortcut(HWND target, HWND root)
 {
     MSG message = { 0 };
@@ -196,6 +232,7 @@ static void check_close_shortcut(HWND target, HWND root)
 void mainCRTStartup(void)
 {
     report("[SUBCLASS] begin\n");
+    check_cursor_counts();
     instance = GetModuleHandleA((void *)0);
     WNDCLASSEXA cls = {sizeof(cls), 0, base_proc, 0, 0, 0, 0, 0, 0,
                        0, class_name, 0};

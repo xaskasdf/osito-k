@@ -42,6 +42,7 @@ extern BOOL WINAPI CloseHandle(HANDLE handle);
 extern PVOID WINAPI VirtualAlloc(PVOID address, SIZE_T size,
                                  DWORD allocation_type, DWORD protection);
 extern void *kcalloc(uint64_t count, uint64_t size);
+extern void kfree(void *pointer);
 extern NTSTATUS ntsync_set_event_for_process(HANDLE event, ULONG owner_pid,
                                               LONG *previous_state);
 extern NTSTATUS nt_close_handle_for_process(HANDLE handle, ULONG owner_pid);
@@ -85,6 +86,7 @@ extern uint32_t compositor_create_window_inactive(uint32_t shm_handle,
     uint32_t pid, const char *title) __attribute__((weak));
 extern void compositor_destroy_window(uint32_t window_id) __attribute__((weak));
 extern void compositor_signal_dirty(uint32_t window_id)   __attribute__((weak));
+extern void compositor_request_frame(void) __attribute__((weak));
 extern void compositor_set_visible(uint32_t window_id, bool visible)
     __attribute__((weak));
 extern void compositor_set_position(uint32_t window_id, int16_t x, int16_t y)
@@ -3486,10 +3488,112 @@ static void icon_release_all(void)
 
 static HWND  caret_hwnd = NULL;
 static POINT caret_pos = { 0, 0 };
-/* NT starts the cursor display count at zero when a mouse is installed. */
-static int   cursor_visible = 0;
-static DWORD cursor_visibility_owner_pid;
-static DWORD cursor_visibility_owner_tid;
+/* Zero is the implicit initial count. Retain only nonzero per-thread counts,
+ * in kernel memory that remains readable by the compositor across CR3s. */
+typedef struct USER_CURSOR_COUNT {
+    struct USER_CURSOR_COUNT *next;
+    DWORD pid, tid;
+    int count;
+} USER_CURSOR_COUNT;
+static USER_CURSOR_COUNT *cursor_counts;
+static spinlock_t cursor_count_lock = SPINLOCK_INIT;
+
+static uint64_t cursor_count_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&cursor_count_lock);
+    return flags;
+}
+
+static void cursor_count_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&cursor_count_lock);
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
+
+static int cursor_display_count(DWORD pid, DWORD tid)
+{
+    int count = 0;
+    uint64_t flags = cursor_count_lock_irqsave();
+    for (USER_CURSOR_COUNT *entry = cursor_counts; entry; entry = entry->next)
+        if (entry->pid == pid && entry->tid == tid) {
+            count = entry->count;
+            break;
+        }
+    cursor_count_unlock_irqrestore(flags);
+    return count;
+}
+
+static int cursor_change_count(DWORD pid, DWORD tid, int value, BOOL add)
+{
+    USER_CURSOR_COUNT *spare = NULL;
+    for (;;) {
+        uint64_t flags = cursor_count_lock_irqsave();
+        USER_CURSOR_COUNT **link = &cursor_counts;
+        while (*link && ((*link)->pid != pid || (*link)->tid != tid))
+            link = &(*link)->next;
+        if (!*link && value && !spare) {
+            cursor_count_unlock_irqrestore(flags);
+            spare = kcalloc(1, sizeof(*spare));
+            if (!spare) {
+                SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+                return 0;
+            }
+            spare->pid = pid;
+            spare->tid = tid;
+            continue;
+        }
+        if (!*link && spare) {
+            *link = spare;
+            spare = NULL;
+        }
+        USER_CURSOR_COUNT *entry = *link;
+        int previous = entry ? entry->count : 0;
+        int count = add
+            ? (int)((DWORD)previous + (DWORD)value)
+            : value;
+        USER_CURSOR_COUNT *retired = NULL;
+        if (entry) {
+            entry->count = count;
+            if (!count) {
+                *link = entry->next;
+                retired = entry;
+            }
+        }
+        cursor_count_unlock_irqrestore(flags);
+        if (retired) kfree(retired);
+        if (spare) kfree(spare);
+        if ((previous < 0) != (count < 0) && compositor_request_frame)
+            compositor_request_frame();
+        return count;
+    }
+}
+
+static void cursor_release_counts(DWORD pid, DWORD tid)
+{
+    USER_CURSOR_COUNT *retired = NULL;
+    uint64_t flags = cursor_count_lock_irqsave();
+    USER_CURSOR_COUNT **link = &cursor_counts;
+    while (*link) {
+        USER_CURSOR_COUNT *entry = *link;
+        if ((!pid || entry->pid == pid) && (!tid || entry->tid == tid)) {
+            *link = entry->next;
+            entry->next = retired;
+            retired = entry;
+        } else {
+            link = &entry->next;
+        }
+    }
+    cursor_count_unlock_irqrestore(flags);
+    while (retired) {
+        USER_CURSOR_COUNT *next = retired->next;
+        kfree(retired);
+        retired = next;
+    }
+    if (compositor_request_frame) compositor_request_frame();
+}
 static HWND  capture_hwnd = NULL;
 static HWND  focus_hwnd   = NULL;   /* SetFocus / WM_SETFOCUS target */
 static HWND  active_hwnd  = NULL;   /* active/foreground top-level window */
@@ -3563,6 +3667,7 @@ static void update_mouse_tracking(HWND target, LPARAM pos_lp, int moved)
 }
 
 static HWND input_target(void);
+static HWND mouse_input_target(void);
 
 static int point_near(POINT point, POINT target, int tolerance)
 {
@@ -3602,7 +3707,8 @@ static void log_input_prefix(const char *tag)
     serial_puts(" active=0x"); serial_puthex((uint64_t)(ULONG_PTR)active_hwnd, 8);
     serial_puts(" target=0x"); serial_puthex((uint64_t)(ULONG_PTR)input_target(), 8);
     serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
-    serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)cursor_visible);
+    serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)
+        cursor_display_count(GetCurrentProcessId(), GetCurrentThreadId()));
     serial_puts(" clip="); serial_putdec((uint64_t)(int64_t)clip_active);
 }
 
@@ -3616,9 +3722,8 @@ static int relative_pointer_mode_active(void)
 
     BOOL owns_clip = clip_active &&
         clip_owner_pid == relative_pointer.owner_pid;
-    BOOL owns_hidden_cursor = cursor_visible < 0 &&
-        cursor_visibility_owner_pid == relative_pointer.owner_pid &&
-        cursor_visibility_owner_tid == relative_pointer.owner_tid;
+    BOOL owns_hidden_cursor = cursor_display_count(
+        relative_pointer.owner_pid, relative_pointer.owner_tid) < 0;
     if (!owns_clip && !owns_hidden_cursor)
         return 0;
 
@@ -3646,9 +3751,7 @@ static void relative_pointer_note_warp(POINT point)
     WINDOW *target = find_window(input_target());
     BOOL owns_target = !target || target->owner_pid == pid;
     BOOL owns_clip = clip_active && clip_owner_pid == pid;
-    BOOL owns_hidden_cursor = cursor_visible < 0 &&
-        cursor_visibility_owner_pid == pid &&
-        cursor_visibility_owner_tid == tid;
+    BOOL owns_hidden_cursor = cursor_display_count(pid, tid) < 0;
     BOOL centered = FALSE;
 
     if (owns_clip) {
@@ -4881,12 +4984,7 @@ void user32_release_thread(DWORD pid, DWORD tid)
         clip_owner_pid = 0;
         clip_owner_tid = 0;
     }
-    if (cursor_visibility_owner_pid == pid &&
-        cursor_visibility_owner_tid == tid) {
-        cursor_visible = 0;
-        cursor_visibility_owner_pid = 0;
-        cursor_visibility_owner_tid = 0;
-    }
+    cursor_release_counts(pid, tid);
     if (relative_pointer.owner_pid == pid &&
         relative_pointer.owner_tid == tid)
         relative_pointer_reset();
@@ -4937,11 +5035,7 @@ void user32_release_process(DWORD pid)
         clip_owner_pid = 0;
         clip_owner_tid = 0;
     }
-    if (cursor_visibility_owner_pid == pid) {
-        cursor_visible = 0;
-        cursor_visibility_owner_pid = 0;
-        cursor_visibility_owner_tid = 0;
-    }
+    cursor_release_counts(pid, 0);
     if (relative_pointer.owner_pid == pid)
         relative_pointer_reset();
     WINDOW *captured = capture_hwnd ? find_window(capture_hwnd) : NULL;
@@ -9134,13 +9228,16 @@ BOOL WINAPI GetCursorInfo(PVOID cursor_info)
         return FALSE;
     }
 
+    WINDOW *target = find_window(mouse_input_target());
+    BOOL visible = !target ||
+        cursor_display_count(target->owner_pid, target->owner_tid) >= 0;
     if (g_compat32_mode) {
         uint32_t *info = (uint32_t *)cursor_info;
         if (info[0] != 20) {
             SetLastError(87);
             return FALSE;
         }
-        info[1] = cursor_visible >= 0 ? 1U : 0U; /* CURSOR_SHOWING */
+        info[1] = visible ? 1U : 0U; /* CURSOR_SHOWING */
         info[2] = (uint32_t)(ULONG_PTR)current_cursor;
         info[3] = (uint32_t)cursor_pos.x;
         info[4] = (uint32_t)cursor_pos.y;
@@ -9156,7 +9253,7 @@ BOOL WINAPI GetCursorInfo(PVOID cursor_info)
             SetLastError(87);
             return FALSE;
         }
-        info->flags = cursor_visible >= 0 ? 1U : 0U;
+        info->flags = visible ? 1U : 0U;
         info->cursor = current_cursor;
         info->position = cursor_pos;
     }
@@ -9178,16 +9275,29 @@ int WINAPI ShowCursor(BOOL bShow)
 {
     DWORD pid = GetCurrentProcessId();
     DWORD tid = GetCurrentThreadId();
-    cursor_visibility_owner_pid = pid;
-    cursor_visibility_owner_tid = tid;
-    if (bShow) cursor_visible++;
-    else       cursor_visible--;
-    if (bShow && cursor_visible >= 0 &&
+    int count = cursor_change_count(pid, tid, bShow ? 1 : -1, TRUE);
+    if (bShow && count >= 0 &&
         relative_pointer.owner_pid == pid &&
         relative_pointer.owner_tid == tid &&
         !(clip_active && clip_owner_pid == pid))
         relative_pointer_reset();
-    return cursor_visible;
+    return count;
+}
+
+bool user32_cursor_overlay_visible(uint32_t compositor_id)
+{
+    if (!compositor_id)
+        return true;
+    for (int i = 0; i < window_count; i++) {
+        WINDOW *window = &windows[i];
+        if (!window->used || window->compositor_id != compositor_id)
+            continue;
+        WINDOW *captured = find_window(capture_hwnd);
+        if (captured && window_root(captured, NULL) == window)
+            window = captured;
+        return cursor_display_count(window->owner_pid, window->owner_tid) >= 0;
+    }
+    return true;
 }
 
 BOOL WINAPI ClipCursor(const RECT *lpRect)
@@ -11910,7 +12020,8 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
             serial_puts(" y="); serial_putdec((uint64_t)cursor_pos.y);
             serial_puts(" target=0x"); serial_puthex((uint64_t)(ULONG_PTR)target, 8);
             serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
-            serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)cursor_visible);
+            serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)
+                cursor_display_count(GetCurrentProcessId(), GetCurrentThreadId()));
             serial_puts(" ml="); serial_putdec((uint64_t)(int64_t)ml);
             serial_puts("\n");
             diag_n++;
@@ -12143,7 +12254,8 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
             serial_puts(" target=0x"); serial_puthex((uint64_t)(ULONG_PTR)target, 8);
             serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
             serial_puts(" moved="); serial_putdec((uint64_t)(int64_t)moved);
-            serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)cursor_visible);
+            serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)
+                cursor_display_count(GetCurrentProcessId(), GetCurrentThreadId()));
             serial_puts("\n");
             diag_n++;
         }
@@ -15976,9 +16088,7 @@ int user32_input_selftest(void)
         msg_last_retrieved_source(test_pid, test_tid);
     uint64_t saved_input_sequence =
         msg_last_input_sequence(test_pid, test_tid);
-    int saved_cursor_visible = cursor_visible;
-    DWORD saved_cursor_visibility_owner_pid = cursor_visibility_owner_pid;
-    DWORD saved_cursor_visibility_owner_tid = cursor_visibility_owner_tid;
+    int saved_cursor_visible = cursor_display_count(test_pid, test_tid);
     int saved_abs_prev_valid = g_abs_prev_valid;
     int saved_abs_prev_sx = g_abs_prev_sx;
     int saved_abs_prev_sy = g_abs_prev_sy;
@@ -16043,9 +16153,7 @@ int user32_input_selftest(void)
         goto cleanup;
     SetFocus(window);
     capture_hwnd = NULL;
-    cursor_visible = 0;
-    cursor_visibility_owner_pid = 0;
-    cursor_visibility_owner_tid = 0;
+    cursor_change_count(test_pid, test_tid, 0, FALSE);
     clip_active = 0;
     clip_owner_pid = 0;
     clip_owner_tid = 0;
@@ -16224,6 +16332,39 @@ int user32_input_selftest(void)
                       !relative_pointer_mode_active(),
                       "hidden cursor alone keeps absolute input",
                       &checks, &failures);
+    struct {
+        DWORD size, flags;
+        HCURSOR cursor;
+        POINT position;
+    } cursor_info = { .size = sizeof(cursor_info) };
+    input_test_expect(GetCursorInfo(&cursor_info) && cursor_info.flags == 0,
+                      "native GetCursorInfo reports the hidden pointer owner",
+                      &checks, &failures);
+    DWORD cursor_info32[5] = { 20, 0xFFFFFFFFU, 0, 0, 0 };
+    g_compat32_mode = 1;
+    BOOL cursor_info32_ok = GetCursorInfo(cursor_info32);
+    g_compat32_mode = 0;
+    input_test_expect(cursor_info32_ok && cursor_info32[1] == 0,
+                      "PE32 GetCursorInfo reports the same hidden owner",
+                      &checks, &failures);
+    WINDOW *cursor_window = find_window(window);
+    if (cursor_window && cursor_window->compositor_id) {
+        input_test_expect(!user32_cursor_overlay_visible(
+                              cursor_window->compositor_id),
+                          "hidden owner suppresses the compositor cursor",
+                          &checks, &failures);
+        DWORD owner_tid = cursor_window->owner_tid;
+        cursor_window->owner_tid = ~owner_tid;
+        input_test_expect(user32_cursor_overlay_visible(
+                              cursor_window->compositor_id),
+                          "another thread does not inherit a hidden cursor",
+                          &checks, &failures);
+        cursor_window->owner_tid = owner_tid;
+    }
+    input_test_expect(user32_cursor_overlay_visible(0) &&
+                      user32_cursor_overlay_visible(0xFFFFFFFFU),
+                      "desktop and stale surface IDs retain a cursor",
+                      &checks, &failures);
     SetCursorPos(current_mode_cx() / 2, current_mode_cy() / 2);
     input_test_expect(relative_pointer_mode_active(),
                       "hidden center warp enables relative translation",
@@ -16231,6 +16372,25 @@ int user32_input_selftest(void)
     input_test_expect(ShowCursor(TRUE) == 0 &&
                       !relative_pointer_mode_active(),
                       "restored cursor disables relative translation",
+                      &checks, &failures);
+    input_test_expect(GetCursorInfo(&cursor_info) && cursor_info.flags == 1,
+                      "GetCursorInfo reports restored visibility",
+                      &checks, &failures);
+    if (cursor_window && cursor_window->compositor_id)
+        input_test_expect(user32_cursor_overlay_visible(
+                              cursor_window->compositor_id),
+                          "balanced ShowCursor restores the compositor cursor",
+                          &checks, &failures);
+    cursor_change_count(~test_pid, 1, -2, FALSE);
+    cursor_change_count(~test_pid, 2, -1, FALSE);
+    cursor_release_counts(~test_pid, 1);
+    input_test_expect(cursor_display_count(~test_pid, 1) == 0 &&
+                      cursor_display_count(~test_pid, 2) == -1,
+                      "thread cursor cleanup preserves its sibling",
+                      &checks, &failures);
+    cursor_release_counts(~test_pid, 0);
+    input_test_expect(cursor_display_count(~test_pid, 2) == 0,
+                      "process cursor cleanup releases remaining counts",
                       &checks, &failures);
     ShowWindow(window, SW_SHOWNA);
     SetFocus(window);
@@ -16516,9 +16676,7 @@ cleanup:
     native_move = saved_native_move;
     msg_note_retrieval(test_pid, test_tid, saved_retrieved_source,
                        saved_input_sequence);
-    cursor_visible = saved_cursor_visible;
-    cursor_visibility_owner_pid = saved_cursor_visibility_owner_pid;
-    cursor_visibility_owner_tid = saved_cursor_visibility_owner_tid;
+    cursor_change_count(test_pid, test_tid, saved_cursor_visible, FALSE);
     g_abs_prev_valid = saved_abs_prev_valid;
     g_abs_prev_sx = saved_abs_prev_sx;
     g_abs_prev_sy = saved_abs_prev_sy;
@@ -17323,9 +17481,7 @@ PVOID user32_shim_init(void)
     clip_owner_pid = 0;
     clip_owner_tid = 0;
     relative_pointer_reset();
-    cursor_visible = 0;
-    cursor_visibility_owner_pid = 0;
-    cursor_visibility_owner_tid = 0;
+    cursor_release_counts(0, 0);
     current_cursor = NULL;
     int cursor_width = current_mode_cx();
     int cursor_height = current_mode_cy();

@@ -59,6 +59,8 @@ extern bool user32_activate_compositor_window(uint32_t window_id)
     __attribute__((weak));
 extern void user32_deactivate_compositor_windows(void)
     __attribute__((weak));
+extern bool user32_cursor_overlay_visible(uint32_t window_id)
+    __attribute__((weak));
 
 
 /* ── CMOS RTC helpers ──────────────────────────────────────── */
@@ -961,9 +963,14 @@ static void draw_cursor(uint32_t *dst, uint32_t pitch,
 }
 
 static inline void draw_cursor_overlay(uint32_t *dst, uint32_t pitch,
-                                       uint32_t scr_w, uint32_t scr_h)
+                                       uint32_t scr_w, uint32_t scr_h,
+                                       const window_t *owner)
 {
 #ifndef __EMSCRIPTEN__
+    if (owner && (owner->flags & WND_USER32) &&
+        user32_cursor_overlay_visible &&
+        !user32_cursor_overlay_visible(owner->id))
+        return;
     int32_t cx, cy;
     input_get_cursor(&cx, &cy);
     draw_cursor(dst, pitch, scr_w, scr_h, cx, cy);
@@ -972,6 +979,7 @@ static inline void draw_cursor_overlay(uint32_t *dst, uint32_t pitch,
     (void)pitch;
     (void)scr_w;
     (void)scr_h;
+    (void)owner;
 #endif
 }
 
@@ -1546,7 +1554,7 @@ static bool __hot compositor_render_frame(void)
                     memcpy(back + _y * p, win->pixels + _y * _sp,
                            (uint64_t)w * 4);
             }
-            draw_cursor_overlay(back, p, w, h);
+            draw_cursor_overlay(back, p, w, h, win);
             display_mark_dirty();
             comp_direct_scanout++;
             return true;
@@ -1583,7 +1591,7 @@ static bool __hot compositor_render_frame(void)
                 }
             }
 
-            draw_cursor_overlay(back, p, w, h);
+            draw_cursor_overlay(back, p, w, h, win);
             display_mark_dirty();
             comp_direct_scanout++;
             return true;
@@ -1597,7 +1605,7 @@ static bool __hot compositor_render_frame(void)
          * Parallel path partitions source rows into bands across APs. */
         blit_scaled_integer(back, p, win, &_layout);
 
-        draw_cursor_overlay(back, p, w, h);
+        draw_cursor_overlay(back, p, w, h, win);
         display_mark_dirty();
         comp_direct_scanout++;
         return true;
@@ -1653,8 +1661,14 @@ static bool __hot compositor_render_frame(void)
         gui_desktop_render_dock(&screen);
     }
 
-    /* Keep the pointer above both managed windows and direct scanout. */
-    draw_cursor_overlay(back, p, w, h);
+    /* Cursor visibility belongs to the surface under it, not whichever app
+     * most recently called ShowCursor. Desktop chrome retains its pointer. */
+    int32_t cursor_x, cursor_y;
+    input_get_cursor(&cursor_x, &cursor_y);
+    int cursor_owner = hit_test_dock(cursor_x, cursor_y) == -1
+        ? hit_test_managed_window(cursor_x, cursor_y) : -1;
+    draw_cursor_overlay(back, p, w, h,
+                         cursor_owner >= 0 ? &windows[cursor_owner] : NULL);
 
     display_mark_dirty();
     return true;

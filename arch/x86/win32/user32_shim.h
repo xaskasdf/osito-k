@@ -795,6 +795,7 @@ BOOL    WINAPI RedrawWindow(HWND hWnd, const RECT *lprcUpdate,
 BOOL    WINAPI SetForegroundWindow(HWND hWnd);
 BOOL    WINAPI AllowSetForegroundWindow(DWORD dwProcessId);
 BOOL    user32_activate_compositor_window(uint32_t compositor_id);
+bool    user32_cursor_overlay_visible(uint32_t compositor_id);
 void    user32_deactivate_compositor_windows(void);
 
 /* Dialog */
