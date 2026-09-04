@@ -64,6 +64,7 @@ QEMU_TCP_PORT="${QEMU_TCP_PORT:-}"
 QEMU_TCP_GUEST_PORT="${QEMU_TCP_GUEST_PORT:-$QEMU_TCP_PORT}"
 QEMU_MONITOR_SOCKET="${QEMU_MONITOR_SOCKET:-/tmp/qemu-monitor.sock}"
 QEMU_AUDIO_PATH="${QEMU_AUDIO_PATH:-$BUILD_DIR/audio.wav}"
+QEMU_AUDIO_RATE="${QEMU_AUDIO_RATE:-48000}"
 QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 QEMU_NVME_CACHE="${QEMU_NVME_CACHE:-writeback}"
 QEMU_EXTRA_ARGS="${QEMU_EXTRA_ARGS:-}"
@@ -316,9 +317,9 @@ fi
     -device qemu-xhci,id=usb \
     -device usb-kbd,bus=usb.0 \
     -device "usb-$QEMU_USB_POINTER,bus=usb.0" \
-    -audiodev wav,id=wav0,path="$QEMU_AUDIO_PATH" \
+    -audiodev wav,id=wav0,path="$QEMU_AUDIO_PATH",out.fixed-settings=on,out.frequency="$QEMU_AUDIO_RATE",out.channels=2,out.format=s16 \
     -device intel-hda,id=hda0 \
-    -device hda-duplex,id=snd0,audiodev=wav0 \
+    -device hda-output,id=snd0,audiodev=wav0 \
     $GPU_DEVICE \
     $DISPLAY_ARGS \
     "${SERIAL_ARGS[@]}" \

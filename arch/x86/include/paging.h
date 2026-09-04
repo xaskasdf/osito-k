@@ -59,6 +59,10 @@ static inline uint64_t kvirt_to_phys(const void *v)
 /* Translate a virtual address through an explicit CR3. Returns UINT64_MAX
  * when the address is not mapped. Handles both 4 KB and 2 MB mappings. */
 uint64_t paging_translate_in_cr3(uint64_t cr3, uint64_t virt);
+/* Query the effective leaf permissions and mapping granularity for a VA.
+ * Unlike paging_get_pte_in_cr3(), this accepts 1 GiB and 2 MiB leaves. */
+int paging_query_mapping_in_cr3(uint64_t cr3, uint64_t virt,
+                                uint64_t *flags, uint64_t *page_size);
 void paging_debug_dump_walk_in_cr3(uint64_t cr3, uint64_t virt);
 /* Return the end of the first mapped page intersecting the range, zero when
  * the complete range is unmapped, or UINT64_MAX for an invalid range. */

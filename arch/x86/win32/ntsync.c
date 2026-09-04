@@ -19,6 +19,10 @@
 #include "kernel32_shim.h"
 #include "../kernel/smp.h"
 
+#ifndef NTSYNC_TRACE_DIAGNOSTICS
+#define NTSYNC_TRACE_DIAGNOSTICS 0
+#endif
+
 /* ── External ───────────────────────────────────────────────── */
 
 extern void     serial_puts(const char *s);
@@ -35,6 +39,7 @@ extern HANDLE_TABLE g_handle_table;
 extern int32_t  proc_current_pid(void);
 extern DWORD    win32_current_process_id(void);
 extern NTSTATUS nt_close_handle_for_process(HANDLE handle, ULONG owner_pid);
+extern uint32_t compat32_get_last_caller_eip(void);
 
 #define STATUS_TIMEOUT              ((NTSTATUS)0x00000102)
 #define STATUS_WAIT_0               ((NTSTATUS)0x00000000)
@@ -67,6 +72,7 @@ typedef struct _MUTANT_OBJECT {
     BOOL    owned;
     ULONG   owner_tid;      /* owning thread ID (0 = unowned) */
     ULONG   recursion_count;
+    uint64_t identity;
 } MUTANT_OBJECT;
 
 #define MAX_MUTANTS MAX_HANDLES
@@ -78,6 +84,7 @@ typedef struct _SEMAPHORE_OBJECT {
     BOOL    allocated;
     LONG    count;          /* current count (signaled if > 0) */
     LONG    max_count;
+    uint64_t identity;
 } SEMAPHORE_OBJECT;
 
 #define MAX_SEMAPHORES MAX_HANDLES
@@ -102,14 +109,22 @@ typedef struct _NTSYNC_WAITER {
 static NTSYNC_WAITER *g_waiters;
 static int g_waiter_capacity;
 static volatile ULONG g_waiter_count;
+#if NTSYNC_TRACE_DIAGNOSTICS
 static volatile ULONG g_waiter_trace_count;
+#endif
 static volatile ULONG g_wait_irq_trace_count;
+#if NTSYNC_TRACE_DIAGNOSTICS
+static volatile ULONG g_event_lifecycle_trace_count;
+#endif
 static spinlock_t g_ntsync_lock = SPINLOCK_INIT;
+static volatile uint64_t g_sync_object_identity;
 
 __attribute__((noinline)) static void ntsync_if0_probe(void)
 {
     __asm__ volatile ("" ::: "memory");
 }
+
+#if NTSYNC_TRACE_DIAGNOSTICS
 
 #define NTSYNC_EVENT_TRACE_SLOTS 1024
 
@@ -133,13 +148,14 @@ typedef struct {
 } NTSYNC_EVENT_TRACE;
 
 static NTSYNC_EVENT_TRACE g_event_traces[NTSYNC_EVENT_TRACE_SLOTS];
-static volatile uint64_t g_event_trace_id;
 
 static NTSYNC_EVENT_TRACE *ntsync_event_trace_find(ULONG owner_pid,
                                                     EVENT_OBJECT *event)
 {
-    if (owner_pid < 4 || !event)
+    if (!event)
         return NULL;
+    if (!owner_pid)
+        owner_pid = 1;
     for (int i = 0; i < NTSYNC_EVENT_TRACE_SLOTS; i++) {
         NTSYNC_EVENT_TRACE *trace = &g_event_traces[i];
         if (trace->used && trace->owner_pid == owner_pid &&
@@ -155,31 +171,40 @@ static NTSYNC_EVENT_TRACE *ntsync_event_trace_get(ULONG owner_pid,
     NTSYNC_EVENT_TRACE *trace = ntsync_event_trace_find(owner_pid, event);
     if (trace)
         return trace;
-    if (owner_pid < 4 || !event)
+    if (!event)
         return NULL;
+    if (!owner_pid)
+        owner_pid = 1;
+
+    NTSYNC_EVENT_TRACE *available = NULL;
     for (int i = 0; i < NTSYNC_EVENT_TRACE_SLOTS; i++) {
         trace = &g_event_traces[i];
-        if (trace->used)
+        if (trace->used && trace->event && trace->event->allocated &&
+            trace->event->trace_id == trace->event_id)
             continue;
-        trace->used = TRUE;
-        trace->owner_pid = owner_pid;
-        trace->event = event;
-        trace->event_id = event->trace_id;
-        trace->first_tick = idt_get_ticks();
-        trace->last_tick = trace->first_tick;
-        trace->last_deadline = 0;
-        trace->wait_blocks = 0;
-        trace->wait_hits = 0;
-        trace->wait_timeouts = 0;
-        trace->sets = 0;
-        trace->wakes = 0;
-        trace->resets = 0;
-        trace->acquires = 0;
-        trace->last_actor_pid = owner_pid;
-        trace->last_waiter_slot = -1;
-        return trace;
+        available = trace;
+        break;
     }
-    return NULL;
+    if (!available)
+        return NULL;
+
+    available->used = TRUE;
+    available->owner_pid = owner_pid;
+    available->event = event;
+    available->event_id = event->trace_id;
+    available->first_tick = idt_get_ticks();
+    available->last_tick = available->first_tick;
+    available->last_deadline = 0;
+    available->wait_blocks = 0;
+    available->wait_hits = 0;
+    available->wait_timeouts = 0;
+    available->sets = 0;
+    available->wakes = 0;
+    available->resets = 0;
+    available->acquires = 0;
+    available->last_actor_pid = owner_pid;
+    available->last_waiter_slot = -1;
+    return available;
 }
 
 static void ntsync_event_trace_signal(EVENT_OBJECT *event, ULONG actor_pid,
@@ -218,6 +243,29 @@ static void ntsync_event_trace_wait(ULONG owner_pid, EVENT_OBJECT *event,
     trace->last_waiter_slot = proc_idx;
     trace->last_deadline = deadline;
     trace->last_tick = idt_get_ticks();
+}
+
+static void ntsync_event_trace_acquire(ULONG owner_pid, EVENT_OBJECT *event)
+{
+    NTSYNC_EVENT_TRACE *trace = ntsync_event_trace_find(owner_pid, event);
+    if (!trace)
+        return;
+    trace->acquires++;
+    trace->last_tick = idt_get_ticks();
+}
+
+static void ntsync_event_trace_reset(EVENT_OBJECT *event, ULONG actor_pid)
+{
+    uint64_t now = idt_get_ticks();
+    for (int i = 0; i < NTSYNC_EVENT_TRACE_SLOTS; i++) {
+        NTSYNC_EVENT_TRACE *trace = &g_event_traces[i];
+        if (!trace->used || trace->event != event ||
+            trace->event_id != event->trace_id)
+            continue;
+        trace->resets++;
+        trace->last_actor_pid = actor_pid;
+        trace->last_tick = now;
+    }
 }
 
 void ntsync_debug_dump_process_events(ULONG owner_pid)
@@ -267,6 +315,49 @@ void ntsync_debug_dump_process_events(ULONG owner_pid)
         serial_puts("\n");
     }
 }
+
+#else
+
+static inline void ntsync_event_trace_signal(EVENT_OBJECT *event,
+                                              ULONG actor_pid, BOOL wake)
+{
+    (void)event;
+    (void)actor_pid;
+    (void)wake;
+}
+
+static inline void ntsync_event_trace_wait(ULONG owner_pid,
+                                            EVENT_OBJECT *event,
+                                            int proc_idx, uint64_t deadline,
+                                            ULONG operation)
+{
+    (void)owner_pid;
+    (void)event;
+    (void)proc_idx;
+    (void)deadline;
+    (void)operation;
+}
+
+static inline void ntsync_event_trace_acquire(ULONG owner_pid,
+                                               EVENT_OBJECT *event)
+{
+    (void)owner_pid;
+    (void)event;
+}
+
+static inline void ntsync_event_trace_reset(EVENT_OBJECT *event,
+                                             ULONG actor_pid)
+{
+    (void)event;
+    (void)actor_pid;
+}
+
+void ntsync_debug_dump_process_events(ULONG owner_pid)
+{
+    (void)owner_pid;
+}
+
+#endif
 
 void ntsync_debug_dump_waiter(int proc_idx)
 {
@@ -324,6 +415,79 @@ static inline void ntsync_irq_restore(uint64_t flags)
     spin_unlock(&g_ntsync_lock);
     if (flags & (1ULL << 9))
         __asm__ volatile ("sti" ::: "memory");
+}
+
+static void ntsync_trace_event_operation(const char *operation, HANDLE handle,
+                                         const EVENT_OBJECT *event,
+                                         LONG previous_state,
+                                         ULONG owner_pid)
+{
+#if !NTSYNC_TRACE_DIAGNOSTICS || (defined(OK_QUIET) && OK_QUIET)
+    (void)operation;
+    (void)handle;
+    (void)event;
+    (void)previous_state;
+    (void)owner_pid;
+#else
+    ULONG trace_index = __atomic_fetch_add(&g_event_lifecycle_trace_count, 1,
+                                           __ATOMIC_RELAXED);
+    if (trace_index >= 128 || !event)
+        return;
+
+    serial_puts("[NTSYNC-EVENT] op=");
+    serial_puts(operation);
+    serial_puts(" handle=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)handle, 8);
+    serial_puts(" id=");
+    serial_putdec(event->trace_id);
+    serial_puts(" type=");
+    serial_putdec(event->type);
+    serial_puts(" state=");
+    serial_putdec(event->signaled);
+    serial_puts(" previous=");
+    serial_putdec((uint32_t)previous_state);
+    serial_puts(" actor=");
+    serial_putdec(win32_current_process_id());
+    serial_puts(" owner=");
+    serial_putdec(owner_pid);
+    serial_puts(" caller=0x");
+    serial_puthex(compat32_get_last_caller_eip(), 8);
+    serial_puts(" object=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)event, 16);
+    serial_puts("\n");
+#endif
+}
+
+static uint64_t ntsync_next_object_identity_locked(void)
+{
+    uint64_t identity = ++g_sync_object_identity;
+    if (!identity)
+        identity = ++g_sync_object_identity;
+    return identity;
+}
+
+uint64_t ntsync_object_identity(OBJECT_TYPE_ID type, PVOID object)
+{
+    if (!object)
+        return 0;
+
+    uint64_t flags = ntsync_irq_save();
+    uint64_t identity = 0;
+    if (type == OBJ_TYPE_EVENT) {
+        EVENT_OBJECT *event = (EVENT_OBJECT *)object;
+        if (event->allocated)
+            identity = event->trace_id;
+    } else if (type == OBJ_TYPE_MUTANT) {
+        MUTANT_OBJECT *mutant = (MUTANT_OBJECT *)object;
+        if (mutant->allocated)
+            identity = mutant->identity;
+    } else if (type == OBJ_TYPE_SEMAPHORE) {
+        SEMAPHORE_OBJECT *semaphore = (SEMAPHORE_OBJECT *)object;
+        if (semaphore->allocated)
+            identity = semaphore->identity;
+    }
+    ntsync_irq_restore(flags);
+    return identity;
 }
 
 void ntsync_cancel_waiter(int proc_idx)
@@ -386,11 +550,7 @@ static void ntsync_acquire_raw_locked(OBJECT_TYPE_ID type, PVOID object,
     switch (type) {
     case OBJ_TYPE_EVENT: {
         EVENT_OBJECT *evt = (EVENT_OBJECT *)object;
-        NTSYNC_EVENT_TRACE *trace = ntsync_event_trace_find(owner_pid, evt);
-        if (trace) {
-            trace->acquires++;
-            trace->last_tick = idt_get_ticks();
-        }
+        ntsync_event_trace_acquire(owner_pid, evt);
         if (evt->type == EVENT_TYPE_SYNCHRONIZATION)
             evt->signaled = FALSE;
         break;
@@ -536,8 +696,7 @@ NTSTATUS sys_NtCreateEvent(ULONG_PTR *args)
     evt->timer_active = FALSE;
     evt->timer_due_tick = 0;
     evt->timer_period_ticks = 0;
-    evt->trace_id = __atomic_add_fetch(&g_event_trace_id, 1,
-                                       __ATOMIC_RELAXED);
+    evt->trace_id = ntsync_next_object_identity_locked();
     ntsync_irq_restore(flags);
 
     NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_EVENT,
@@ -567,14 +726,11 @@ NTSTATUS sys_NtCreateEvent(ULONG_PTR *args)
         if (already_exists)
             return STATUS_OBJECT_NAME_EXISTS;
     }
-    if (NT_SUCCESS(status) && (ULONG_PTR)*EventHandle == 0x54) {
-        serial_puts("[NTSYNC-54] create obj=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)evt, 16);
-        serial_puts(" type=");
-        serial_puthex(evt->type, 1);
-        serial_puts(" state=");
-        serial_puthex(evt->signaled, 1);
-        serial_puts("\n");
+    if (NT_SUCCESS(status)) {
+        ULONG owner_pid = win32_current_process_id();
+        if (!owner_pid) owner_pid = 1;
+        ntsync_trace_event_operation("create", *EventHandle, evt,
+                                     InitialState, owner_pid);
     }
     return status;
 }
@@ -598,13 +754,7 @@ NTSTATUS ntsync_set_event_for_process(HANDLE EventHandle, ULONG owner_pid,
     ntsync_wake_object_locked(OBJ_TYPE_EVENT, evt);
     ntsync_irq_restore(flags);
 
-    if ((ULONG_PTR)EventHandle == 0x54) {
-        serial_puts("[NTSYNC-54] set obj=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)evt, 16);
-        serial_puts(" prev=");
-        serial_puthex(prev, 1);
-        serial_puts("\n");
-    }
+    ntsync_trace_event_operation("set", EventHandle, evt, prev, owner_pid);
 
     if (PreviousState)
         *PreviousState = prev;
@@ -638,17 +788,12 @@ NTSTATUS sys_NtResetEvent(ULONG_PTR *args)
     uint64_t flags = ntsync_irq_save();
     LONG prev = evt->signaled;
     evt->signaled = FALSE;
-    uint64_t now = idt_get_ticks();
-    for (int i = 0; i < NTSYNC_EVENT_TRACE_SLOTS; i++) {
-        NTSYNC_EVENT_TRACE *trace = &g_event_traces[i];
-        if (!trace->used || trace->event != evt ||
-            trace->event_id != evt->trace_id)
-            continue;
-        trace->resets++;
-        trace->last_actor_pid = win32_current_process_id();
-        trace->last_tick = now;
-    }
+    ntsync_event_trace_reset(evt, win32_current_process_id());
     ntsync_irq_restore(flags);
+
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    ntsync_trace_event_operation("reset", EventHandle, evt, prev, owner_pid);
 
     if (PreviousState)
         *PreviousState = prev;
@@ -676,6 +821,10 @@ NTSTATUS sys_NtPulseEvent(ULONG_PTR *args)
     ntsync_wake_object_locked(OBJ_TYPE_EVENT, evt);
     evt->signaled = FALSE;
     ntsync_irq_restore(flags);
+
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    ntsync_trace_event_operation("pulse", EventHandle, evt, prev, owner_pid);
 
     if (PreviousState)
         *PreviousState = prev;
@@ -712,6 +861,7 @@ NTSTATUS sys_NtCreateMutant(ULONG_PTR *args)
     mut->owned = InitialOwner;
     mut->owner_tid = InitialOwner ? (ULONG)proc_current_pid() : 0;
     mut->recursion_count = InitialOwner ? 1 : 0;
+    mut->identity = ntsync_next_object_identity_locked();
     ntsync_irq_restore(flags);
 
     NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_MUTANT,
@@ -787,6 +937,7 @@ NTSTATUS sys_NtCreateSemaphore(ULONG_PTR *args)
 
     sem->count = InitialCount;
     sem->max_count = MaximumCount;
+    sem->identity = ntsync_next_object_identity_locked();
     ntsync_irq_restore(flags);
 
     NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_SEMAPHORE,
@@ -958,12 +1109,7 @@ void ntsync_acquire_object(HANDLE_ENTRY *entry)
     switch (entry->type) {
     case OBJ_TYPE_EVENT: {
         EVENT_OBJECT *evt = (EVENT_OBJECT *)entry->object;
-        NTSYNC_EVENT_TRACE *trace = ntsync_event_trace_find(
-            win32_current_process_id(), evt);
-        if (trace) {
-            trace->acquires++;
-            trace->last_tick = idt_get_ticks();
-        }
+        ntsync_event_trace_acquire(win32_current_process_id(), evt);
         if (evt->type == EVENT_TYPE_SYNCHRONIZATION)
             evt->signaled = FALSE;  /* auto-reset */
         break;
@@ -1060,15 +1206,6 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
         }
     }
 
-    BOOL trace_event = Count == 1 && (ULONG_PTR)Handles[0] == 0x54;
-    if (trace_event) {
-        serial_puts("[NTWAIT-54] enter obj=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)entries[0]->object, 16);
-        serial_puts(" state=");
-        serial_puthex(ntsync_is_signaled(entries[0]), 1);
-        serial_puts("\n");
-    }
-
     uint64_t now = idt_get_ticks();
     BOOL has_deadline = Timeout != NULL;
     uint64_t deadline = has_deadline
@@ -1108,10 +1245,10 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
                 completed->completed = FALSE;
                 completed->timed_out = FALSE;
                 ntsync_irq_restore(flags);
-                if (trace_event) {
-                    serial_puts(completion_status == STATUS_TIMEOUT
-                        ? "[NTWAIT-54] timeout\n"
-                        : "[NTWAIT-54] signaled\n");
+                if (entries[0]->type == OBJ_TYPE_EVENT) {
+                    ntsync_trace_event_operation(
+                        "wait-complete", Handles[0],
+                        (EVENT_OBJECT *)entries[0]->object, 0, owner_pid);
                 }
                 ntsync_release_wait_handles(Handles, retained_count);
                 return completion_status;
@@ -1156,8 +1293,12 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
                     (EVENT_OBJECT *)entries[satisfied_index]->object,
                     sched_current_get(), deadline, 1);
             ntsync_irq_restore(flags);
-            if (trace_event)
-                serial_puts("[NTWAIT-54] signaled\n");
+            if (entries[satisfied_index]->type == OBJ_TYPE_EVENT) {
+                ntsync_trace_event_operation(
+                    "wait-hit", Handles[satisfied_index],
+                    (EVENT_OBJECT *)entries[satisfied_index]->object,
+                    1, owner_pid);
+            }
             ntsync_release_wait_handles(Handles, retained_count);
             return wait_status;
         }
@@ -1171,17 +1312,23 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
                         sched_current_get(), deadline, 2);
             }
             ntsync_irq_restore(flags);
-            if (trace_event)
-                serial_puts("[NTWAIT-54] timeout\n");
+            if (entries[0]->type == OBJ_TYPE_EVENT) {
+                ntsync_trace_event_operation(
+                    "wait-timeout", Handles[0],
+                    (EVENT_OBJECT *)entries[0]->object, 0, owner_pid);
+            }
             ntsync_release_wait_handles(Handles, retained_count);
             return STATUS_TIMEOUT;
         }
 
         int proc_idx = sched_current_get();
         if (!g_waiters || proc_idx < 0 || proc_idx >= g_waiter_capacity) {
+            /* The bootstrap shell is not represented by a scheduler slot.
+             * It can still wait correctly by polling object state and the
+             * absolute deadline while yielding to managed tasks. */
             ntsync_irq_restore(flags);
-            ntsync_release_wait_handles(Handles, retained_count);
-            return STATUS_INSUFFICIENT_RESOURCES;
+            sched_yield();
+            continue;
         }
 
         NTSYNC_WAITER *waiter = &g_waiters[proc_idx];
@@ -1219,6 +1366,11 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
          * take IOCP locks. Drop the sync lock first, then reconcile a signal
          * that raced between waiter registration and the state transition. */
         ntsync_irq_restore(flags);
+        if (entries[0]->type == OBJ_TYPE_EVENT) {
+            ntsync_trace_event_operation(
+                "wait-block", Handles[0],
+                (EVENT_OBJECT *)entries[0]->object, 0, owner_pid);
+        }
         int blocked_idx = sched_block_current();
 
         flags = ntsync_irq_save();
@@ -1244,24 +1396,47 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
         } else if (!waiter->active) {
             sched_unblock(proc_idx);
         }
-        BOOL still_waiting = blocked_idx == proc_idx && waiter->active;
-        BOOL trace_block = still_waiting && g_waiter_trace_count++ < 48;
+#if NTSYNC_TRACE_DIAGNOSTICS
+        BOOL trace_block = blocked_idx == proc_idx && waiter->active &&
+                           g_waiter_trace_count++ < 48;
         ULONG active_waiters = g_waiter_count;
+#endif
         ntsync_irq_restore(flags);
 
+#if NTSYNC_TRACE_DIAGNOSTICS
         if (trace_block) {
-#ifndef OK_QUIET
+#if !defined(OK_QUIET) || !OK_QUIET
             serial_puts("[NTWAIT-BLOCK] proc=");
             serial_putdec((uint64_t)proc_idx);
             serial_puts(" objects=");
             serial_putdec(Count);
             serial_puts(" active=");
             serial_putdec(active_waiters);
+            serial_puts(" first_handle=0x");
+            serial_puthex((uint64_t)(ULONG_PTR)Handles[0], 8);
+            serial_puts(" first_type=");
+            serial_putdec(entries[0]->type);
+            serial_puts(" first_object=0x");
+            serial_puthex((uint64_t)(ULONG_PTR)entries[0]->object, 16);
+            if (entries[0]->type == OBJ_TYPE_EVENT) {
+                EVENT_OBJECT *event = (EVENT_OBJECT *)entries[0]->object;
+                serial_puts(" event_id=");
+                serial_putdec(event->trace_id);
+                serial_puts(" event_type=");
+                serial_putdec(event->type);
+                serial_puts(" event_state=");
+                serial_putdec(event->signaled);
+                serial_puts(" event_timer=");
+                serial_putdec(event->timer_active);
+            }
+            serial_puts(" caller=0x");
+            serial_puthex(compat32_get_last_caller_eip(), 8);
             serial_puts("\n");
 #else
             (void)active_waiters;
 #endif
         }
+#endif
 
         sched_yield();
     }
@@ -1283,8 +1458,10 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
 void nt_sync_register_syscalls(NT_SERVICE_TABLE *table)
 {
     g_waiter_count = 0;
+#if NTSYNC_TRACE_DIAGNOSTICS
     g_waiter_trace_count = 0;
-    g_event_trace_id = 0;
+    g_event_lifecycle_trace_count = 0;
+#endif
 
     if (!g_waiters) {
         g_waiter_capacity = (int)sched_capacity_get();
@@ -1306,8 +1483,10 @@ void nt_sync_register_syscalls(NT_SERVICE_TABLE *table)
     }
     for (int i = 0; i < MAX_EVENTS; i++)
         g_events[i].allocated = FALSE;
+#if NTSYNC_TRACE_DIAGNOSTICS
     for (int i = 0; i < NTSYNC_EVENT_TRACE_SLOTS; i++)
         g_event_traces[i].used = FALSE;
+#endif
     for (int i = 0; i < MAX_MUTANTS; i++)
         g_mutants[i].allocated = FALSE;
     for (int i = 0; i < MAX_SEMAPHORES; i++)

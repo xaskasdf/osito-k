@@ -26,6 +26,20 @@ typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
 
 typedef struct {
+    ssize_t (*read)(void *context, void *buf, size_t count,
+                    uint32_t oflags);
+    ssize_t (*write)(void *context, const void *buf, size_t count,
+                     uint32_t oflags);
+    int64_t (*ioctl)(void *context, uint64_t request, uint64_t arg,
+                     uint32_t *oflags);
+    bool (*read_ready)(void *context);
+    bool (*write_ready)(void *context);
+    void (*retain)(void *context);
+    void (*release)(void *context, uint32_t oflags);
+    uint64_t rdev;
+} fd_device_ops_t;
+
+typedef struct {
     bool        open;
     uint8_t     type;       /* FD_TYPE_* */
     uint32_t    oflags;     /* Linux O_* flags */
@@ -35,8 +49,28 @@ typedef struct {
     void       *pipe;       /* pipe_buf_t *, or NULL */
     int32_t     socket_idx; /* index in kernel socket table */
     uint64_t    offset;     /* file position */
+    const fd_device_ops_t *device_ops;
+    void       *device_data;
     char        dir_path[64]; /* normalized prefix for FD_TYPE_DIR */
 } fd_entry_t;
+
+static inline void fd_device_retain(fd_entry_t *entry)
+{
+    if (entry && entry->device_ops && entry->device_ops->retain &&
+        entry->device_data)
+        entry->device_ops->retain(entry->device_data);
+}
+
+static inline void fd_device_release(fd_entry_t *entry)
+{
+    if (entry && entry->device_ops && entry->device_ops->release &&
+        entry->device_data)
+        entry->device_ops->release(entry->device_data, entry->oflags);
+    if (entry) {
+        entry->device_ops = NULL;
+        entry->device_data = NULL;
+    }
+}
 
 /* Refcounted fd table: shared between threads (CLONE_FILES),
  * separate copies for fork. */

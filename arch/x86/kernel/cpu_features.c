@@ -12,6 +12,7 @@ extern void serial_putdec(uint64_t v);
 extern void serial_puthex(uint64_t v, int d);
 
 cpu_features_t cpu_features;
+uint32_t cpu_xsave_active;
 
 static inline void cpuid(uint32_t leaf,
                          uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d)
@@ -39,6 +40,8 @@ static inline uint64_t rdtsc_raw(void)
 void cpu_features_detect(void)
 {
     uint32_t a, b, c, d;
+
+    cpu_xsave_active = 0;
 
     /* ── Leaf 0: vendor string + max standard leaf ── */
     cpuid(0, &a, &b, &c, &d);
@@ -165,6 +168,7 @@ void cpu_features_detect(void)
          * Do not inherit firmware-enabled AVX-512 or AMX components. */
         if (xcr0_lo != 0x7 || xcr0_hi != 0)
             __asm__ volatile("xsetbv" :: "a"(0x7), "d"(0), "c"(0));
+        cpu_xsave_active = 1;
     }
 }
 

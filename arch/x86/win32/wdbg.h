@@ -1,9 +1,8 @@
 /*
  * wdbg.h — Win32 binary-debugging toolkit for compat32 layer.
  *
- * Reusable primitives for "who called X, what was the engine state,
- * which FName/UObject was the argument?" — questions that keep
- * recurring while debugging UT99/GTAV/etc. PE32 binaries on OsitoK.
+ * Reusable primitives for inspecting callers, stacks, and application-owned
+ * object layouts while debugging PE32 binaries on OsitoK.
  *
  * All primitives are safe to call from INT 0x2E context (no heap, no
  * locks, fixed-size static state, output via serial_puts).
@@ -19,9 +18,8 @@
  * Register a callback to fire when a PE32 instruction at `va` is
  * about to be entered (detected via ret_addr == va on the next INT2E).
  *
- * Use-case: "every time the throw helper @0x1014BD10 fires, dump the
- * caller frame + the FFileException argument". One add_hook call,
- * persistent across the run, output prefixed [WDBG/<name>].
+ * Hooks are opt-in and accept runtime-discovered address ranges. One
+ * registration persists for the current boot and is prefixed [WDBG/<name>].
  *
  * Caveat: relies on the target being called from a thunk path, so the
  * next INT2E observes ret_addr ∈ target's basic block. For functions
@@ -44,53 +42,20 @@ int wdbg_addr_hook(uint32_t va_start,
  * hooks. No-op when no hooks registered. */
 void wdbg_check_caller(uint32_t ret_addr, uint32_t *stack_args);
 
-/* ── FName resolver ─────────────────────────────────────────────
- *
- * Given an FName index, returns the engine-side ANSI string name.
- * Walks FName::Names TArray @ WDBG_FNAME_NAMES_VA.
- *
- * Returns "<null>" if Data == NULL, "<oob>" if idx >= Num,
- * "<bad>" if the entry pointer is unreadable. */
-const char *wdbg_fname_resolve(uint32_t idx);
-
-/* Override the TArray VA (default 0x10295D30 = UT99 Core.dll). */
-void wdbg_fname_set_array(uint32_t tarray_va);
-
-/* ── UObject inspector ──────────────────────────────────────────
- *
- * Given a 32-bit UObject*, dump one line to serial:
- *   [WDBG/UObj] <label> va=0x... cls=ClassName name=NameStr outer=...
- *
- * UE1 UObject layout assumed (override via wdbg_uobject_set_offsets):
- *   +0   vtbl
- *   +4   Index
- *   +8   HashNext
- *   +12  StateFrame
- *   +16  Outer
- *   +20  Name (FName index)
- *   +24  Class
- *   +28  ObjectFlags
- */
-void wdbg_uobject_dump(uint32_t obj_va, const char *label);
-
-/* Override UObject member offsets if engine differs from UE1 default. */
-void wdbg_uobject_set_offsets(int outer, int name, int klass);
-
 /* ── Stack walker ───────────────────────────────────────────────
  *
  * Walk EBP frame chain `depth` levels deep, print each return
  * address symbolized via wdbg_symbolize. Output prefix [WDBG/stk].
  *
- * Caveat: requires the PE32 binary to compile with frame pointers.
- * Epic/UE1 typically omits frame pointers in Release builds — use
- * wdbg_stack_scan instead in that case.
+ * Caveat: requires the PE32 binary to compile with frame pointers. Use
+ * wdbg_stack_scan for optimized binaries that omit them.
  */
 void wdbg_stack_walk(uint32_t ebp, int depth, const char *label);
 
 /* ── Stack scanner (no frame pointer required) ──────────────────
  *
  * Walks `depth` dwords up from `esp`. For each dword that looks
- * like a return address (i.e., falls inside a registered module
+ * like a return address (i.e., falls inside a loaded or registered module
  * range AND the 5 bytes before it look like `E8 ?? ?? ?? ??` —
  * a CALL rel32), print it symbolized.
  *
@@ -102,22 +67,22 @@ void wdbg_stack_scan(uint32_t esp, int depth, const char *label);
 
 /* ── Module + symbolization ─────────────────────────────────────
  *
- * Register a PE32 module's load range so wdbg_symbolize can print
- * "Core.dll+0x4BD3F" instead of just "0x1014BD3F". Auto-called by
- * pe.c after each pe_load(). Manual registration also possible.
+ * The process loader is queried automatically so wdbg_symbolize can print a
+ * module-relative address. Manual registration remains available for mapped
+ * executable ranges that are not represented by the PE loader.
  *
- * Module table has fixed capacity (16 entries — UT99 loads 8-10).
+ * The manual module table has a fixed capacity of 16 entries.
  */
 int wdbg_register_module(const char *name, uint32_t base, uint32_t size);
 
-/* Returns module-relative string ("Core.dll+0x4BD3F") for `va`, or
- * the raw "0x10141234" if no module matches. Writes into `buf`. */
+/* Returns a module-relative string for `va`, or the raw hexadecimal address
+ * if no module matches. Writes into `buf`. */
 const char *wdbg_symbolize(uint32_t va, char *buf, int bufsz);
 
 /* ── Init ───────────────────────────────────────────────────────
  *
- * Called once from win32_init(). Sets up default hooks (currently:
- * the Core.dll throw helper @0x1014BD10 with caller-logging callback).
+ * Called once from win32_init(). Resets the toolkit. It installs no hooks or
+ * application addresses unless an explicit diagnostic profile is selected.
  */
 void wdbg_init(void);
 

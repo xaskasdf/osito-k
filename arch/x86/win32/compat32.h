@@ -40,12 +40,20 @@
  * appends a uint32_t pointer to that area when calling the registered bridge. */
 #define CC_VARIADIC 0x40
 
+/* RtlCaptureContext needs the i386 EAX value from before the gateway replaced
+ * it with the thunk index. This flag selects the preserving stub and asks the
+ * dispatcher to build a CONTEXT32 instead of entering the AMD64 implementation. */
+#define CC_CONTEXT_CAPTURE 0x20
+
 /* Thunk entry: maps a 32-bit callable address to a 64-bit shim */
 typedef struct {
     uint32_t thunk_addr;    /* 32-bit address of the thunk stub */
     uint64_t target_addr;   /* 64-bit address of the real shim function */
     uint8_t  num_args;      /* number of DWORD stack arguments (for dispatch) */
     uint8_t  callconv;      /* CC_* convention plus optional ABI flags */
+    uint8_t  logical_args;  /* stack slots plus register-passed arguments */
+    uint8_t  ecx_arg;       /* logical argument sourced from ECX, or 0xFF */
+    uint8_t  edx_arg;       /* logical argument sourced from EDX, or 0xFF */
     const char *name;       /* function name (for debug) */
 } compat32_thunk_t;
 
@@ -83,6 +91,8 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info);
  */
 void compat32_setup_teb(void *teb_addr);
 TEB32 *compat32_current_teb(void);
+int compat32_teb_selftest(void);
+int compat32_thunk_contract_selftest(void);
 
 /*
  * Enter 32-bit compatibility mode and jump to the PE32 entry point.
@@ -116,6 +126,10 @@ uint32_t compat32_callback_args_on_stack(uint32_t func_addr, int nargs,
 uint32_t compat32_thread_entry_on_stack(uint32_t func_addr, int nargs,
                                         const uint32_t *args,
                                         uint32_t stack_top);
+
+/* Release callback/SEH scratch owned by the current PE32 scheduler thread.
+ * Call only after its final transition back to the kernel stack. */
+void compat32_release_thread_state(void);
 
 /* Return the active PE32 API caller's ESP for callbacks on this scheduler
  * thread. Zero means there is no validated user-stack context. */
@@ -152,11 +166,35 @@ typedef struct {
 
 int compat32_seh_dispatch_cpu(PEXCEPTION_RECORD ExceptionRecord,
                               compat32_cpu_context_t *Context);
+int compat32_apply_pending_unwind(compat32_cpu_context_t *Context);
 int compat32_seh_dispatch_active(void);
 int compat32_range_readable(uint32_t address, uint32_t size);
+int compat32_range_executable(uint32_t address, uint32_t size);
+int win32_user_range_readable(const void *pointer, SIZE_T size,
+                              BOOL compat32);
+int win32_user_range_writable(void *pointer, SIZE_T size, BOOL compat32);
+int win32_user_range_executable(const void *pointer, SIZE_T size,
+                                BOOL compat32);
+int compat32_eh3_local_unwind(uint32_t frame_address,
+                              uint32_t scope_table,
+                              int32_t stop_level);
+int compat32_eh3_schedule_handler(uint32_t frame_address,
+                                  uint32_t handler_address);
+int compat32_eh4_schedule_handler(uint32_t frame_address,
+                                  uint32_t handler_address);
+NTSTATUS compat32_rtl_unwind(uint32_t target_frame, uint32_t target_ip,
+                             uint32_t exception_record,
+                             uint32_t return_value,
+                             NTSTATUS *exit_status);
+NTSTATUS compat32_rtl_restore_context(uint32_t context,
+                                      uint32_t exception_record);
+uint32_t compat32_get_last_caller_eip(void);
+uint32_t compat32_get_last_stack_args(void);
+uint32_t compat32_get_last_user_ebp(void);
+void compat32_dump_recent_calls(void);
 
 /*
- * Global flag: set to 1 when running a PE32 (i386) executable.
+ * Per-scheduler-slot flag: set to 1 when running a PE32 (i386) executable.
  * Shim functions that write to output structs MUST check this flag
  * and use 32-bit struct layouts when set.
  *
@@ -165,11 +203,5 @@ int compat32_range_readable(uint32_t address, uint32_t size);
  * Writing a 64-bit struct to a 32-bit buffer overflows, corrupting
  * the stack (most commonly: SEH ExceptionList on the 32-bit stack).
  */
-
-/*
- * Create a stub UObject with a valid vtable (all entries return 0).
- * Returns 32-bit address of the object, or 0 on failure.
- */
-uint32_t create_stub_uobject(const char *name);
 
 #endif /* COMPAT32_H */

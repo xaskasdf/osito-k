@@ -1,8 +1,7 @@
 /*
  * OsitoK Windows Compatibility Layer — shell32.dll Shim
  *
- * Minimal shell API stubs for UT99 compatibility.
- * ShellExecuteA/W are stubbed — no actual process launching.
+ * Shell services backed by the generic Win32 process and filesystem layers.
  */
 
 #ifndef SHELL32_SHIM_H

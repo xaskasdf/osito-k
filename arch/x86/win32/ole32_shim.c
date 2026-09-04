@@ -1,6 +1,6 @@
 /*
  * OsitoK Windows Compatibility Layer — ole32.dll Shim
- * OLE/COM stubs. CoCreateInstance returns CLASS_E_CLASSNOTAVAILABLE.
+ * OLE/COM infrastructure and built-in class activation registry.
  */
 
 #include "ole32_shim.h"
@@ -8,6 +8,9 @@
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
+extern DWORD WINAPI GetCurrentProcessId(void);
+extern DWORD WINAPI GetCurrentThreadId(void);
 
 /* Use crt_malloc from msvcrt shim for CoTaskMemAlloc */
 extern PVOID WINAPI crt_malloc(SIZE_T size);
@@ -15,25 +18,218 @@ extern PVOID WINAPI crt_realloc(PVOID ptr, SIZE_T size);
 extern void  WINAPI crt_free(PVOID ptr);
 extern SIZE_T WINAPI crt_msize(PVOID ptr);
 
+#define OLE32_CLASS_SLOTS 32
+#define OLE32_APARTMENT_SLOTS 1024
+
+#define OLE32_S_FALSE                 ((HRESULT)0x00000001)
+#define OLE32_E_INVALIDARG            ((HRESULT)0x80070057)
+#define OLE32_E_OUTOFMEMORY           ((HRESULT)0x8007000E)
+#define OLE32_RPC_E_CHANGED_MODE      ((HRESULT)0x80010106)
+#define OLE32_COINIT_APARTMENTTHREADED 0x2u
+#define OLE32_COINIT_VALID_FLAGS       0xEu
+
+typedef struct {
+    GUID clsid;
+    OLE32_CLASS_ACTIVATOR activate;
+} OLE32_CLASS_ENTRY;
+
+static OLE32_CLASS_ENTRY ole32_classes[OLE32_CLASS_SLOTS];
+static volatile uint32_t ole32_class_lock;
+
+typedef struct {
+    DWORD process_id;
+    DWORD thread_id;
+    DWORD model;
+    DWORD references;
+} OLE32_APARTMENT_ENTRY;
+
+static OLE32_APARTMENT_ENTRY ole32_apartments[OLE32_APARTMENT_SLOTS];
+static volatile uint32_t ole32_apartment_lock;
+
+static void ole32_class_lock_acquire(void)
+{
+    while (__sync_lock_test_and_set(&ole32_class_lock, 1U))
+        __asm__ volatile ("pause" ::: "memory");
+}
+
+static void ole32_class_lock_release(void)
+{
+    __sync_lock_release(&ole32_class_lock);
+}
+
+static void ole32_apartment_lock_acquire(void)
+{
+    while (__sync_lock_test_and_set(&ole32_apartment_lock, 1U))
+        __asm__ volatile ("pause" ::: "memory");
+}
+
+static void ole32_apartment_lock_release(void)
+{
+    __sync_lock_release(&ole32_apartment_lock);
+}
+
+static BOOL ole32_guid_equal(LPCGUID left, LPCGUID right)
+{
+    if (!left || !right || left->Data1 != right->Data1 ||
+        left->Data2 != right->Data2 || left->Data3 != right->Data3)
+        return FALSE;
+    for (int i = 0; i < 8; i++) {
+        if (left->Data4[i] != right->Data4[i])
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static void ole32_store_pointer(PVOID output, PVOID value)
+{
+    if (g_compat32_mode)
+        *(uint32_t *)output = (uint32_t)(ULONG_PTR)value;
+    else
+        *(PVOID *)output = value;
+}
+
+HRESULT ole32_register_class(LPCGUID clsid, OLE32_CLASS_ACTIVATOR activate)
+{
+    if (!clsid || !activate)
+        return (HRESULT)0x80070057; /* E_INVALIDARG */
+
+    ole32_class_lock_acquire();
+    OLE32_CLASS_ENTRY *free_entry = NULL;
+    for (int i = 0; i < OLE32_CLASS_SLOTS; i++) {
+        OLE32_CLASS_ENTRY *entry = &ole32_classes[i];
+        if (entry->activate && ole32_guid_equal(&entry->clsid, clsid)) {
+            entry->activate = activate;
+            ole32_class_lock_release();
+            return S_OK;
+        }
+        if (!entry->activate && !free_entry)
+            free_entry = entry;
+    }
+    if (!free_entry) {
+        ole32_class_lock_release();
+        return (HRESULT)0x8007000E; /* E_OUTOFMEMORY */
+    }
+    free_entry->clsid = *clsid;
+    free_entry->activate = activate;
+    ole32_class_lock_release();
+    return S_OK;
+}
+
 /* ── COM initialization ────────────────────────────────────── */
 
 HRESULT WINAPI shim_CoInitialize(PVOID reserved)
 {
-    (void)reserved;
-    serial_puts("[OLE32] CoInitialize (stub)\n");
-    return S_OK;
+    return shim_CoInitializeEx(reserved,
+                               OLE32_COINIT_APARTMENTTHREADED);
 }
 
 HRESULT WINAPI shim_CoInitializeEx(PVOID reserved, DWORD coinit)
 {
-    (void)reserved; (void)coinit;
-    serial_puts("[OLE32] CoInitializeEx (stub)\n");
+    if (reserved || (coinit & ~OLE32_COINIT_VALID_FLAGS))
+        return OLE32_E_INVALIDARG;
+
+    DWORD process_id = GetCurrentProcessId();
+    DWORD thread_id = GetCurrentThreadId();
+    if (!process_id) process_id = 1;
+    if (!thread_id) thread_id = 1;
+    DWORD model = coinit & OLE32_COINIT_APARTMENTTHREADED;
+
+    OLE32_APARTMENT_ENTRY *free_entry = NULL;
+    ole32_apartment_lock_acquire();
+    for (int i = 0; i < OLE32_APARTMENT_SLOTS; i++) {
+        OLE32_APARTMENT_ENTRY *entry = &ole32_apartments[i];
+        if (entry->process_id == process_id &&
+            entry->thread_id == thread_id) {
+            if (entry->model != model) {
+                ole32_apartment_lock_release();
+                serial_puts("[OLE32] apartment mode mismatch pid=");
+                serial_putdec(process_id);
+                serial_puts(" tid=");
+                serial_putdec(thread_id);
+                serial_puts("\n");
+                return OLE32_RPC_E_CHANGED_MODE;
+            }
+            if (entry->references == UINT32_MAX) {
+                ole32_apartment_lock_release();
+                return OLE32_E_OUTOFMEMORY;
+            }
+            entry->references++;
+            ole32_apartment_lock_release();
+            return OLE32_S_FALSE;
+        }
+        if (!entry->process_id && !free_entry)
+            free_entry = entry;
+    }
+
+    if (!free_entry) {
+        ole32_apartment_lock_release();
+        return OLE32_E_OUTOFMEMORY;
+    }
+    free_entry->process_id = process_id;
+    free_entry->thread_id = thread_id;
+    free_entry->model = model;
+    free_entry->references = 1;
+    ole32_apartment_lock_release();
+
+    serial_puts("[OLE32] apartment initialized pid=");
+    serial_putdec(process_id);
+    serial_puts(" tid=");
+    serial_putdec(thread_id);
+    serial_puts(model ? " model=STA\n" : " model=MTA\n");
     return S_OK;
 }
 
 void WINAPI shim_CoUninitialize(void)
 {
-    /* no-op */
+    DWORD process_id = GetCurrentProcessId();
+    DWORD thread_id = GetCurrentThreadId();
+    if (!process_id) process_id = 1;
+    if (!thread_id) thread_id = 1;
+
+    ole32_apartment_lock_acquire();
+    for (int i = 0; i < OLE32_APARTMENT_SLOTS; i++) {
+        OLE32_APARTMENT_ENTRY *entry = &ole32_apartments[i];
+        if (entry->process_id != process_id ||
+            entry->thread_id != thread_id)
+            continue;
+        if (entry->references > 1) {
+            entry->references--;
+        } else {
+            entry->process_id = 0;
+            entry->thread_id = 0;
+            entry->model = 0;
+            entry->references = 0;
+        }
+        break;
+    }
+    ole32_apartment_lock_release();
+}
+
+void ole32_release_process(DWORD process_id)
+{
+    if (!process_id) return;
+
+    DWORD released = 0;
+    ole32_apartment_lock_acquire();
+    for (int i = 0; i < OLE32_APARTMENT_SLOTS; i++) {
+        OLE32_APARTMENT_ENTRY *entry = &ole32_apartments[i];
+        if (entry->process_id != process_id)
+            continue;
+        entry->process_id = 0;
+        entry->thread_id = 0;
+        entry->model = 0;
+        entry->references = 0;
+        released++;
+    }
+    ole32_apartment_lock_release();
+
+    if (released) {
+        serial_puts("[OLE32] released process apartments pid=");
+        serial_putdec(process_id);
+        serial_puts(" count=");
+        serial_putdec(released);
+        serial_puts("\n");
+    }
 }
 
 /* ── CoCreateInstance ──────────────────────────────────────── */
@@ -61,8 +257,12 @@ static void ole32_log_guid(const char *label, const GUID *guid)
 
 HRESULT WINAPI shim_CoCreateInstance(PVOID rclsid, PVOID pUnkOuter,
                                      DWORD dwClsContext, PVOID riid,
-                                     PVOID *ppv)
+                                     PVOID output)
 {
+    if (!output)
+        return (HRESULT)0x80004003; /* E_POINTER */
+    ole32_store_pointer(output, NULL);
+
     serial_puts("[OLE32] CoCreateInstance ");
     ole32_log_guid("CLSID=", (const GUID *)rclsid);
     serial_puts(" ");
@@ -71,9 +271,33 @@ HRESULT WINAPI shim_CoCreateInstance(PVOID rclsid, PVOID pUnkOuter,
     serial_puthex(dwClsContext, 8);
     serial_puts(" outer=0x");
     serial_puthex((ULONG_PTR)pUnkOuter, 16);
-    serial_puts(" -> CLASS_E_CLASSNOTAVAILABLE\n");
-    if (ppv) *ppv = NULL;
-    return CLASS_E_CLASSNOTAVAILABLE;
+
+    if (!rclsid || !riid || !(dwClsContext & 0x1U)) {
+        serial_puts(" -> CLASS_E_CLASSNOTAVAILABLE\n");
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
+
+    OLE32_CLASS_ACTIVATOR activate = NULL;
+    ole32_class_lock_acquire();
+    for (int i = 0; i < OLE32_CLASS_SLOTS; i++) {
+        if (ole32_classes[i].activate &&
+            ole32_guid_equal(&ole32_classes[i].clsid,
+                             (const GUID *)rclsid)) {
+            activate = ole32_classes[i].activate;
+            break;
+        }
+    }
+    ole32_class_lock_release();
+    if (!activate) {
+        serial_puts(" -> CLASS_E_CLASSNOTAVAILABLE\n");
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
+
+    HRESULT result = activate((const GUID *)riid, pUnkOuter, output);
+    serial_puts(" -> 0x");
+    serial_puthex((uint32_t)result, 8);
+    serial_puts("\n");
+    return result;
 }
 
 /* ── Task memory ───────────────────────────────────────────── */
@@ -187,14 +411,13 @@ HRESULT WINAPI shim_CoGetMalloc(DWORD context, PVOID *allocator)
 
 HRESULT WINAPI shim_OleInitialize(PVOID reserved)
 {
-    (void)reserved;
-    serial_puts("[OLE32] OleInitialize (stub)\n");
-    return S_OK;
+    return shim_CoInitializeEx(reserved,
+                               OLE32_COINIT_APARTMENTTHREADED);
 }
 
 void WINAPI shim_OleUninitialize(void)
 {
-    /* no-op */
+    shim_CoUninitialize();
 }
 
 HRESULT WINAPI shim_RegisterDragDrop(HANDLE hwnd, PVOID drop_target)
@@ -481,6 +704,77 @@ static HRESULT WINAPI shim_PropVariantClear(PVOID prop_variant)
 }
 
 /* ── Export table ──────────────────────────────────────────── */
+
+static void ole32_test_expect(BOOL condition, const char *name,
+                              int *checks, int *failures)
+{
+    (*checks)++;
+    if (condition) return;
+    (*failures)++;
+    serial_puts("[OLE32-TEST] FAIL: ");
+    serial_puts(name);
+    serial_puts("\n");
+}
+
+int ole32_apartment_selftest(void)
+{
+    int checks = 0;
+    int failures = 0;
+    DWORD process_id = GetCurrentProcessId();
+    if (!process_id) process_id = 1;
+
+    ole32_release_process(process_id);
+    ole32_test_expect(
+        shim_CoInitializeEx((PVOID)(ULONG_PTR)1,
+                            OLE32_COINIT_APARTMENTTHREADED) ==
+            OLE32_E_INVALIDARG,
+        "reserved pointer rejected", &checks, &failures);
+    ole32_test_expect(shim_CoInitializeEx(NULL, 1) ==
+                          OLE32_E_INVALIDARG,
+                      "unknown COINIT flag rejected", &checks, &failures);
+    ole32_test_expect(shim_CoInitialize(NULL) == S_OK,
+                      "first STA initialization", &checks, &failures);
+    ole32_test_expect(
+        shim_CoInitializeEx(NULL,
+                            OLE32_COINIT_APARTMENTTHREADED | 0x4U) ==
+            OLE32_S_FALSE,
+        "balanced repeated STA initialization", &checks, &failures);
+    ole32_test_expect(shim_CoInitializeEx(NULL, 0) ==
+                          OLE32_RPC_E_CHANGED_MODE,
+                      "STA to MTA mismatch", &checks, &failures);
+    shim_CoUninitialize();
+    ole32_test_expect(shim_CoInitializeEx(NULL, 0) ==
+                          OLE32_RPC_E_CHANGED_MODE,
+                      "one STA reference remains", &checks, &failures);
+    shim_CoUninitialize();
+    ole32_test_expect(shim_CoInitializeEx(NULL, 0) == S_OK,
+                      "MTA allowed after balanced teardown",
+                      &checks, &failures);
+    ole32_test_expect(shim_OleInitialize(NULL) ==
+                          OLE32_RPC_E_CHANGED_MODE,
+                      "OLE requires STA", &checks, &failures);
+    shim_CoUninitialize();
+    ole32_test_expect(shim_OleInitialize(NULL) == S_OK,
+                      "OLE initializes STA", &checks, &failures);
+    ole32_test_expect(shim_CoInitialize(NULL) == OLE32_S_FALSE,
+                      "OLE and COM share the apartment count",
+                      &checks, &failures);
+    shim_OleUninitialize();
+    shim_CoUninitialize();
+    shim_CoUninitialize();
+    ole32_test_expect(shim_CoInitializeEx(NULL, 0) == S_OK,
+                      "unmatched teardown does not poison state",
+                      &checks, &failures);
+    shim_CoUninitialize();
+    ole32_release_process(process_id);
+
+    serial_puts("[OLE32-TEST] checks=");
+    serial_putdec((uint64_t)checks);
+    serial_puts(" failures=");
+    serial_putdec((uint64_t)failures);
+    serial_puts("\n");
+    return failures;
+}
 
 typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 

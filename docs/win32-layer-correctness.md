@@ -4,7 +4,7 @@
 > using the NT/Win32 sources as the spec — **not** patch the layer/binary for one
 > executable (UT99). See memory `feedback-win32-fix-layer-not-binary`.
 >
-> This doc is the living inventory we iterate on. Last update: 2026-06-04.
+> This doc is the living inventory we iterate on. Last update: 2026-09-01.
 
 ---
 
@@ -241,17 +241,27 @@ sendto=6, select/getsockopt/setsockopt=5; **ole32** CoCreateInstance=5;
   - [x] 1b. MSVC demangler (`msvc_demangle_abi` in win32_abi.c) — decodes
     callconv (`A`=cdecl/`G`=stdcall/`E`=thiscall/`I`=fastcall) + counts arg
     DWORDs from `?…@@YA…@Z`; conservative (bails → miss on by-value user types).
-  - [~] 1c. `guess_num_args` default-4 is now **dead for every import UT99 uses**
-    (measured `[ARGCOUNT-DEFAULT4]` = 0 in a full run). Still present as a
-    last-resort fallback that logs loudly; formal removal of the dead `known[]`
-    table is a cleanup TODO.
-  - **RESULT:** zero default-4 fallbacks; **no regression** — UT99 reaches the
-    same Browse(Entry.unr?Name=Player?Class=Botpack.TMale2) + LoadMap + "Can't
-    find file 'Entry.unr'" frontier (band-aids still ON). Spec citations: §1.5.
-  - ⚠️ As predicted, Phase 1 alone does **not** delete the surviving band-aids —
-    their root is elsewhere (Phase 2).
-- [~] **Phase 2 — Remove band-aids, confirming each is dead / root-causing the
-  rest. IN PROGRESS 2026-06-04.**
+  - [x] 1c. Removed `guess_num_args`, its `known[]` table, DLL-level calling-
+    convention guessing, and the default-4 fallback. IAT patching and compat32
+    `GetProcAddress` resolve the contract by export target first, then by name or
+    MSVC demangling. An unknown contract now fails closed with `[ABI-MISS]` and
+    `STATUS_PROCEDURE_NOT_FOUND`/`ERROR_PROC_NOT_FOUND`.
+  - **RESULT:** no guessed stack cleanup remains. `win32_abi_selftest` covers
+    exact, target-alias, mangled-name, and miss behavior; the module-image test
+    passes 41/41. UT99 reaches DirectDraw exclusive 640x480x16 surface creation
+    and the first present with no ABI miss or CPU fault.
+  - Phase 1 exposed the remaining historical workarounds for removal in Phase 2.
+- [x] **Phase 2 — Remove address-specific UT99 band-aids. COMPLETED.**
+  - The runtime no longer contains fixed Core/Engine/UT image ranges, absolute
+    instruction probes, default UT99 hooks, or mutation callbacks. `hwbp.c`
+    retains only the generic four-slot hardware-breakpoint dispatcher; `wdbg.c`
+    retains loader-backed symbol lookup and explicit hook registration.
+  - The final audit removed the UE1-specific FName/UObject inspectors, the
+    no-op base-SEH frame, exact-size `HeapAlloc(0x54)`/FName reallocation traces,
+    and application-conditioned exit diagnostics. Normal SEH dispatch, ABI
+    metadata, loader-backed symbols, and the recent-call crash ring remain.
+  - The historical steps below document how the original faults were isolated;
+    they are not active runtime behavior.
   - **Step 1 (done):** removed the HWBP-bisect arming (winexec.c) + FNDIFF FName
     tracer (compat32.c) — pure instrumentation that flooded runs. A full run to
     the LoadMap frontier dropped 252k→115k lines, frontier intact. Runs are now
@@ -264,23 +274,25 @@ sendto=6, select/getsockopt/setsockopt=5; **ole32** CoCreateInstance=5;
     | BROWSE-FIX | **0** | dead → **removed** |
     | NULL-REDIRECT | **0** | dead → **removed** |
     | FMW-REPAIR | **0** | dead → **removed** |
-    | ENGINE-PATCH | 1 (preventive) | **load-bearing** — disabling it crashed at 15.8k lines, heap-exec 0x4020C870 (the `call ebx`/EBX-clobber). Phase 1 did NOT fix its root (corrupt vtable at `call [edx+0x54]` @0x1038887A). KEPT. |
-    | FMW-POOL-SKIP | 6 | active → kept (Phase 3) |
-    | GOBJREG-FORCE | 2 | active → kept (Phase 3) |
-    | FNAME-NULL-FILL / FNAME-RESCUE | 151 / 3 | active → kept (Phase 3) |
+    | ENGINE-PATCH | 1 (preventive) | load-bearing at this checkpoint; later root-caused and removed |
+    | FMW-POOL-SKIP | 6 | active at this checkpoint; later removed |
+    | GOBJREG-FORCE | 2 | active at this checkpoint; later removed |
+    | FNAME-NULL-FILL / FNAME-RESCUE | 151 / 3 | active at this checkpoint; later removed |
 
     Removing the 3 zero-fire band-aids (212 lines) was byte-for-byte neutral —
     re-ran to 115082 lines, same Browse + LoadMap + "Can't find Entry.unr"
     frontier, crash 0.
-  - **Step 3 (TODO):** root-cause the still-live band-aids as layer bugs:
-    ENGINE-PATCH (why is the `[edx+0x54]` vtable corrupt? — likely an
-    uninitialized/wrong-object vtable, not arg-count); FMW-POOL-SKIP (NULL pool
-    writes); GOBJREG-FORCE (ProcessRegistrants not self-firing). Fix → remove.
-  - ⚠️ Earlier measurement (pre-Phase-1, all 5 off) regressed to ~19k. The
-    refined bisect shows that was ENGINE-PATCH alone; the other 3 are dead.
-- [ ] **Phase 3 — Init-ordering semantics.** Replace GMalloc stub / FNAME-RESCUE
-  with correct NT loader init ordering (`FMallocWindows::Init` before any
-  appMalloc; FName table init as the engine expects), per UE1 + NT loader spec.
+  - **Step 3 (done):** the load-bearing ENGINE-PATCH was traced to the
+    `GetProcAddress` ABI path and removed after fixing its stack-cleanup metadata.
+    The remaining initialization overrides were retired; the runtime contains no
+    FMW/GOBJ/FNAME mutation path.
+  - Verification on 2026-09-01: module-image test 41/41, then UT99 reached
+    DirectDraw exclusive 640x480x16, primary/offscreen surfaces, and first
+    present with no ABI miss, CPU fault, or unhandled exception.
+- [x] **Phase 3 — Init-ordering cleanup.** Application-state injection has been
+  removed. Future initialization defects are handled through PE loader, CRT,
+  process-state, and memory-manager contracts rather than executable-specific
+  recovery.
 
 ## 4.5 ENGINE-PATCH root-cause — FOUND & FIXED (Phase 2 step 3, 2026-06-04)
 
@@ -329,15 +341,29 @@ cpu/amd64/simulate.asm`): `CpupRunSimulatedCode` (64→32) saves 64-bit non-vola
 per-thread struct. Discipline = full register set preserved, per-thread, every
 transition.
 
-**Our audit vs NT.** `int2e_stub.S` already saves all 15 GPRs on the IST1 stack and
-restores them — preserves the 32-bit caller's EBX/ESI/EDI/EBP across a shim call;
-lighter than NT's per-thread CONTEXT and **works (keep)**. Gaps to fix (real but
-likely NOT this user-side root): `compat32_callback`/`compat32_callback_args`
-inline-asm **clobber lists incomplete** (omit rsi/rdi etc.), and callback/int2e
-state is **global** (`callback_depth`, `callback_jmpbufs[]`, `callback_stacks_ptr[]`,
-`g_int2e_rsp_depth`) where NT keeps it per-thread (latent multi-thread bug; APIC
-timer is masked for UT99's lifetime so preemption is largely off today). See memory
-`project-ut99-enginepatch-root` for exact addresses.
+**Our audit vs NT.** `int2e_stub.S` saves all 15 GPRs on the IST1 stack and passes
+the exact saved frame to `compat32_dispatch`; normal return and non-local unwind
+are applied to that same frame. Callback depth, jump buffers, low callback stacks,
+captured INT2E registers, pending unwind, SEH scratch, and call diagnostics are now
+owned by the scheduler slot rather than mutable process-wide globals. Process
+scheduling is BSP-only: AP LAPIC timers remain masked and an unexpected timer
+vector on an AP is acknowledged without entering the global scheduler.
+
+MSVC i386 EH3 filters and handlers now enter with `EBP = EstablisherFrame + 16`,
+and the dispatcher publishes `EXCEPTION_POINTERS` at `[EBP-0x14]`, matching the
+compiler funclet ABI. This fixes the recursive `_except_handler3` fault where a
+filter inherited a kernel RBP. Both callback transition blocks end in
+`__builtin_unreachable()` and `kern_longjmp` is declared `noreturn`, so the
+compiler no longer models `lretq` as a fall-through path with preserved registers.
+
+`arch/x86/test/seh3_pe32.c` is the deterministic PE32 regression for this
+boundary. It allocates a page, changes it to `PAGE_NOACCESS`, and faults inside
+nested MSVC `__try` scopes whose outer filter captures an establishing-frame
+local and whose inner scope has a `__finally`. A passing run observes one access-
+violation page fault, returns `EXCEPTION_EXECUTE_HANDLER`, executes the termination
+funclet, transfers to the handler using the establishing ESP/EBP, continues after
+the guarded block, returns to its caller, and exits with code 0 without nested
+dispatch, `#GP`, or `#UD`.
 
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only

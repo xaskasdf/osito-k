@@ -23,6 +23,7 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* Interrupt dispatch (dos_int.c) */
 extern void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num);
+extern void dos_transfer_to_native(dos_vm_t *vm);
 
 /* ── cpu8086_state_t struct offsets (little-endian x86-64) ─────────
  *
@@ -131,6 +132,18 @@ void jit_init(jit_state_t *jit)
     serial_puts("KB at 0x");
     serial_puthex((uint64_t)jit->code_buf, 16);
     serial_puts("\n");
+}
+
+void jit_destroy(jit_state_t *jit)
+{
+    if (!jit) return;
+    if (jit->code_buf) {
+        mem_free_pages(jit->code_buf,
+                       (JIT_CACHE_SIZE + 4095u) / 4096u);
+        jit->code_buf = NULL;
+    }
+    jit->code_used = 0;
+    jit->block_count = 0;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -923,7 +936,45 @@ void jit_exec_block(dos_vm_t *vm, jit_block_t *block)
 
     if (result > 0) {
         /* result is an INT number — dispatch it */
+        cpu8086_state_t *cpu = vm->cpu;
+        uint16_t saved_cs = cpu->cs;
+        uint32_t saved_eip = cpu->eip;
+        uint32_t saved_eflags = cpu->eflags;
+
+        if (cpu_deliver_pm_software_interrupt(vm, (uint8_t)result,
+                                              saved_eip)) {
+            if (cpu->op_size_32)
+                dos_transfer_to_native(vm);
+            return;
+        }
+
+        /* Mirror the real-mode CPU frame built by the interpreter. */
+        cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+        cpu_push16(cpu, cpu->cs);
+        cpu_push16(cpu, cpu->ip);
+        cpu->flags &= ~(FLAG_IF | FLAG_TF);
+
+        uint8_t previous_frame_bytes = vm->software_int_frame_bytes;
+        uint32_t previous_return_flags = vm->software_int_return_flags;
+        vm->software_int_frame_bytes = 6;
+        vm->software_int_return_flags = saved_eflags;
         dos_int_dispatch(vm, (uint8_t)result);
+        vm->software_int_frame_bytes = previous_frame_bytes;
+        vm->software_int_return_flags = previous_return_flags;
+
+        if (cpu->cs == saved_cs && cpu->eip == saved_eip) {
+            cpu_stack_adjust(cpu, 6);
+            const uint32_t status_flags = FLAG_CF | FLAG_PF | FLAG_AF |
+                                          FLAG_ZF | FLAG_SF | FLAG_OF;
+            cpu->eflags = (saved_eflags & ~status_flags) |
+                          (cpu->eflags & status_flags) | FLAGS_FIXED;
+            if (cpu->protected_mode && vm->dpmi.active)
+                cpu->flags |= FLAG_IF;
+        } else {
+            cpu8086_sync_cs(cpu);
+            if (cpu->protected_mode && cpu->op_size_32)
+                dos_transfer_to_native(vm);
+        }
     }
 }
 

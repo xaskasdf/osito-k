@@ -139,6 +139,7 @@ void  gdi32_free_screen_dc(HDC hdc);
 /* Shim */
 PVOID gdi32_shim_init(void);
 PVOID gdi32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);
+void  gdi32_release_process(DWORD process_id);
 int   gdi32_dwrite_selftest(void);
 int   gdi32_dib_selftest(void);
 int   gdi32_region_selftest(void);

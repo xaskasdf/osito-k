@@ -27,9 +27,10 @@ extern void  fb_puts_color(const char *s, uint32_t color);
 
 /* OsitoFS */
 extern int   osfs2_is_mounted(void);
-extern void *osfs2_find(const char *name);
+extern void *osfs2_find_ci(const char *name);
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern uint64_t osfs2_file_size(void *file);
+extern const char *osfs2_file_name(void *file);
 
 /* Memory */
 extern void *mem_alloc_pages(uint64_t count);
@@ -161,6 +162,8 @@ void win32_init(void)
 {
     if (win32_initialized) return;
 
+    extern void win64_initialize_bootstrap_thread(void);
+
     serial_puts("\n[WIN32] Initializing Windows compatibility layer...\n");
 
     /* Step 1: Add 32-bit GDT segments for compat mode */
@@ -169,7 +172,11 @@ void win32_init(void)
     /* Step 2: Install INT 0x2E handler for compat32 dispatch */
     idt_install_int2e();
 
-    /* Step 3: Initialize Win32 debug toolkit (modules, default hooks) */
+    /* Step 3: Give native Win32 services a valid primary TEB/PEB even before
+     * the first PE image replaces the bootstrap process environment. */
+    win64_initialize_bootstrap_thread();
+
+    /* Step 4: Initialize the opt-in Win32 debug toolkit. */
     wdbg_init();
 
     win32_initialized = 1;
@@ -184,45 +191,6 @@ char win32_exe_name[64] = "program.exe";
 char win32_image_path[260] = "program.exe";
 #define WIN32_COMMAND_LINE_CAP 4096
 char win32_command_line[WIN32_COMMAND_LINE_CAP] = "program.exe";
-static char win32_relaunch_command_line[WIN32_COMMAND_LINE_CAP];
-
-/* Set by ShellExecuteA/CreateProcessA when the guest launches an .exe (UT99
- * re-launches itself to apply a video-mode/color-depth change). win32_exec
- * loops: when the current PE exits with this set, it reloads + re-runs the
- * same EXE — a minimal "process re-exec" so the relaunch isn't a dead exit. */
-int  g_win32_relaunch = 0;
-
-BOOL win32_request_relaunch(const char *application,
-                            const char *command_line)
-{
-    const char *source = command_line && command_line[0]
-                       ? command_line : application;
-    if (!source || !source[0]) return FALSE;
-
-    int out = 0;
-    BOOL quote_application = (!command_line || !command_line[0]);
-    if (quote_application) {
-        for (int i = 0; source[i]; i++) {
-            if (source[i] == ' ' || source[i] == '\t') {
-                if (out >= WIN32_COMMAND_LINE_CAP - 1) return FALSE;
-                win32_relaunch_command_line[out++] = '"';
-                break;
-            }
-        }
-    }
-
-    for (int i = 0; source[i]; i++) {
-        if (out >= WIN32_COMMAND_LINE_CAP - 1) return FALSE;
-        win32_relaunch_command_line[out++] = source[i];
-    }
-    if (quote_application && out && win32_relaunch_command_line[0] == '"') {
-        if (out >= WIN32_COMMAND_LINE_CAP - 1) return FALSE;
-        win32_relaunch_command_line[out++] = '"';
-    }
-    win32_relaunch_command_line[out] = 0;
-    __atomic_store_n(&g_win32_relaunch, 1, __ATOMIC_RELEASE);
-    return TRUE;
-}
 
 /* ── Load and execute a PE from OsitoFS ──────────────────────── */
 
@@ -263,12 +231,9 @@ int win32_exec_args(const char *filename, int argc, const char **argv)
     serial_puts("\n");
 
     int result = -1;
-  relaunch:
-    __atomic_store_n(&g_win32_relaunch, 0, __ATOMIC_RELEASE);
-    win32_relaunch_command_line[0] = 0;
 
     /* Find file on OsitoFS */
-    void *file = osfs2_find(filename);
+    void *file = osfs2_find_ci(filename);
     if (!file) {
         serial_puts("[WIN32] File not found: ");
         serial_puts(filename);
@@ -305,15 +270,20 @@ int win32_exec_args(const char *filename, int argc, const char **argv)
 
     /* Set the PE name for GetModuleFileName */
     {
+        const char *resolved_path = osfs2_file_name(file);
+        if (!resolved_path || !resolved_path[0]) resolved_path = filename;
+
         int path_len = 0;
-        while (filename[path_len] && path_len < 259) {
-            win32_image_path[path_len] = filename[path_len];
+        while (resolved_path[path_len] && path_len < 259) {
+            char value = resolved_path[path_len];
+            win32_image_path[path_len] = value == '/' ? '\\' : value;
             path_len++;
         }
         win32_image_path[path_len] = 0;
 
-        const char *exe_name = filename;
-        if (strncmp(exe_name, "System\\", 7) == 0) exe_name += 7;
+        const char *exe_name = win32_image_path;
+        for (const char *p = win32_image_path; *p; p++)
+            if (*p == '\\' || *p == '/') exe_name = p + 1;
         int i;
         for (i = 0; exe_name[i] && i < 63; i++)
             win32_exe_name[i] = exe_name[i];
@@ -329,28 +299,6 @@ int win32_exec_args(const char *filename, int argc, const char **argv)
     serial_puts("[WIN32] Execution finished, exit code = ");
     serial_putdec((uint64_t)(uint32_t)result);
     serial_puts("\n");
-
-    /* Minimal process re-exec: UT99 relaunches itself (ShellExecute/CreateProcess
-     * of its own .exe) to apply a video-mode/color-depth change, then ExitProcess.
-     * Without this the relaunch is a dead exit to the shell. Reload + re-run the
-     * same EXE. NOTE: win32 global state (PE/DLL VA mappings, FName, GMalloc,
-     * surfaces) is only partially reset by winexec_run's *_shim_init — this is a
-     * debug attempt to see how far a naive re-exec gets. */
-    if (__atomic_load_n(&g_win32_relaunch, __ATOMIC_ACQUIRE)) {
-        if (win32_relaunch_command_line[0]) {
-            int i = 0;
-            while (win32_relaunch_command_line[i] &&
-                   i < WIN32_COMMAND_LINE_CAP - 1) {
-                win32_command_line[i] = win32_relaunch_command_line[i];
-                i++;
-            }
-            win32_command_line[i] = 0;
-        }
-        serial_puts("[WIN32] === RE-EXEC requested — relaunching ");
-        serial_puts(filename);
-        serial_puts(" ===\n");
-        goto relaunch;
-    }
 
     return result;
 }
@@ -375,7 +323,7 @@ int win32_install(const char *filename)
         return -1;
     }
 
-    void *file = osfs2_find(filename);
+    void *file = osfs2_find_ci(filename);
     if (!file) {
         serial_puts("[WIN32] File not found: ");
         serial_puts(filename);

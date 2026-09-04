@@ -9,8 +9,11 @@
 #include "kernel32_shim.h"
 #include "ntdll_shim.h"
 #include "compat32.h"
+#include "unwind64.h"
 #include "win32_abi.h"
 #include "wintime.h"
+#include "../fs/vfs.h"
+#include "../include/paging.h"
 
 #ifdef TEST_HARNESS
 #include <math.h>
@@ -37,26 +40,9 @@ extern void proc_exit(int32_t code);
 extern void compat32_callback(uint32_t func_addr);
 extern void sched_yield(void);
 extern DWORD win32_current_process_id(void);
-extern const char *win32_current_exe_name(void);
-
-static int msvcrt_running_ut99(void)
-{
-    const char *name = win32_current_exe_name();
-    const char *expected = "UnrealTournament.exe";
-    if (!name) return 0;
-
-    for (const char *p = name; *p; p++)
-        if (*p == '\\' || *p == '/') name = p + 1;
-
-    while (*name && *expected) {
-        char a = *name++;
-        char b = *expected++;
-        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
-        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
-        if (a != b) return 0;
-    }
-    return *name == 0 && *expected == 0;
-}
+extern const char *win32_current_command_line(void);
+extern void *kmalloc(uint64_t size);
+extern void kfree(void *ptr);
 
 /* ── CRT Initialization ────────────────────────────────────── */
 
@@ -71,263 +57,6 @@ static int msvcrt_running_ut99(void)
  * cannot be called directly from 64-bit. We use compat32_callback() which
  * switches to compat mode, calls the function, and returns.
  */
-/* ── Stub FMalloc for early _initterm (before appInit sets up GMalloc) ── */
-
-extern void *kmalloc(uint64_t size);
-extern void kfree(void *ptr);
-
-/* Stub FMalloc implementations using Win32 HeapAlloc (NOT kmalloc).
- * CRITICAL: FMallocWindows uses HeapReAlloc/HeapFree on these pointers
- * after it takes over from the stub. If the stub used kmalloc (different
- * pool), HeapReAlloc would fail → "FMallocWindows::Realloc" error.
- * Using HeapAlloc ensures all allocations are on the same Win32 heap. */
-extern PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes);
-extern BOOL  WINAPI HeapFree(HANDLE hHeap, DWORD dwFlags, PVOID lpMem);
-extern PVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, PVOID lpMem, SIZE_T dwBytes);
-extern SIZE_T WINAPI HeapSize(HANDLE hHeap, DWORD dwFlags, PCVOID lpMem);
-extern HANDLE WINAPI GetProcessHeap(void);
-
-static int fmalloc_log_count = 0;
-static uint64_t WINAPI stub_fmalloc_malloc(uint64_t _this, uint64_t count, uint64_t tag)
-{
-    (void)_this; (void)tag;
-    HANDLE heap = GetProcessHeap();
-    PVOID result = HeapAlloc(heap, 0, count ? count : 1);
-    if (fmalloc_log_count < 20 || (count > 4096 && fmalloc_log_count < 200)) {
-        fmalloc_log_count++;
-        serial_puts("[FMALLOC] size=");
-        serial_putdec(count);
-        serial_puts(" -> 0x");
-        serial_puthex((uint64_t)(uintptr_t)result, 8);
-        serial_puts("\n");
-    }
-    return (uint64_t)(uintptr_t)result;
-}
-
-static uint64_t WINAPI stub_fmalloc_realloc(uint64_t _this, uint64_t orig,
-                                              uint64_t count, uint64_t tag)
-{
-    (void)_this; (void)tag;
-    HANDLE heap = GetProcessHeap();
-    if (!orig) return (uint64_t)(uintptr_t)HeapAlloc(heap, 0, count ? count : 1);
-    return (uint64_t)(uintptr_t)HeapReAlloc(heap, 0,
-        (PVOID)(uintptr_t)(uint32_t)orig, count ? count : 1);
-}
-
-static uint64_t WINAPI stub_fmalloc_free(uint64_t _this, uint64_t ptr)
-{
-    (void)_this;
-    if (ptr) HeapFree(GetProcessHeap(), 0, (PVOID)(uintptr_t)(uint32_t)ptr);
-    return 0;
-}
-
-static uint64_t WINAPI stub_fmalloc_nop(uint64_t _this)
-{
-    (void)_this;
-    return 1; /* HeapCheck returns TRUE, others return 0/void */
-}
-
-/* Static stub object: [0]=vtable_ptr. Vtable: [Malloc,Realloc,Free,nop×4] */
-static uint32_t stub_fmalloc_vtbl[8];
-static uint32_t stub_fmalloc_obj[4]; /* [0]=vtbl ptr, [1-3]=padding */
-static int stub_gmalloc_installed = 0;
-
-/* Set by winexec around winexec_preload_dlls(). During preload, the UE1
- * native-class _initterm constructors (IMPLEMENT_CLASS) run and may call
- * appMalloc — but the EXE's appInit (which calls FMallocWindows::Init to
- * create the HeapAlloc heap) has NOT run yet. On Windows the file order of
- * the OsitoFS image makes Core.dll's FMallocWindows global constructor run
- * BEFORE OpenGlDrv's _initterm, so the real vtable is already installed but
- * its Heap is still NULL → appMalloc hits "Called appMalloc before memory
- * init" and faults. While this flag is set we force our stub vtable even
- * over an already-installed real vtable; the stub routes Malloc/Realloc/Free
- * to HeapAlloc/HeapReAlloc/HeapFree, the SAME pool the real FMallocWindows
- * uses (HeapAlloc ignores the heap handle), so the handoff is transparent. */
-int g_gmalloc_preload_phase = 0;
-
-static void ensure_gmalloc_stub(void)
-{
-    if (!msvcrt_running_ut99()) return;
-
-    /* GMalloc is at Core.dll + RVA 0xA7B90 (VA 0x101A7B90 when base=0x10100000).
-     * It's a FMalloc* pointer. On disk, it points to a BSS object (0x101E3450)
-     * whose vtable starts as 0 (zero-initialized). The pointer is NON-NULL but
-     * the vtable is NULL — so we check the vtable, not the pointer. */
-    volatile uint32_t *gmalloc = (volatile uint32_t *)(uintptr_t)0x101A7B90;
-
-    /* Diagnostic: trace the GMalloc/vtbl state across calls.  Log only
-     * every Nth call to avoid spam, plus always-log when state changes. */
-    static uint32_t last_obj  = 0xFFFFFFFF;
-    static uint32_t last_vtbl = 0xFFFFFFFF;
-    static int call_n = 0;
-    call_n++;
-    uint32_t cur_obj  = *gmalloc;
-    uint32_t cur_vtbl = (cur_obj && cur_obj < 0x80000000)
-                       ? *(volatile uint32_t *)(uintptr_t)cur_obj : 0;
-    int changed = (cur_obj != last_obj) || (cur_vtbl != last_vtbl);
-    if (changed || call_n < 10 || (call_n % 25) == 0) {
-        serial_puts("[GMSTATE#");
-        serial_putdec((uint64_t)call_n);
-        serial_puts("] *0x101A7B90=0x");
-        serial_puthex(cur_obj, 8);
-        serial_puts(" *obj=0x");
-        serial_puthex(cur_vtbl, 8);
-        if (changed && call_n > 1) serial_puts(" CHANGED");
-        serial_puts("\n");
-        last_obj  = cur_obj;
-        last_vtbl = cur_vtbl;
-    }
-
-    /* Check if Core.dll is loaded */
-    uint32_t obj_addr = cur_obj;
-    if (obj_addr < 0x10000000 || obj_addr >= 0x20000000) {
-        serial_puts("[CRT] GMalloc not in DLL range: 0x");
-        serial_puthex(obj_addr, 8);
-        serial_puts("\n");
-        return;
-    }
-
-    /* Build the stub vtable thunks once (lazily). */
-    if (!stub_gmalloc_installed) {
-        extern uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
-                                                 uint8_t num_args, uint8_t callconv);
-        uint32_t t_malloc  = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_malloc,
-                                                      "GMalloc_Malloc", 2, 0);
-        uint32_t t_realloc = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_realloc,
-                                                      "GMalloc_Realloc", 3, 0);
-        uint32_t t_free    = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_free,
-                                                      "GMalloc_Free", 1, 0);
-        uint32_t t_nop     = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_nop,
-                                                      "GMalloc_nop", 0, 0);
-        /* FMalloc vtable: [Malloc, Realloc, Free, DumpAllocs, HeapCheck, Init, Exit] */
-        stub_fmalloc_vtbl[0] = t_malloc;
-        stub_fmalloc_vtbl[1] = t_realloc;
-        stub_fmalloc_vtbl[2] = t_free;
-        stub_fmalloc_vtbl[3] = t_nop;
-        stub_fmalloc_vtbl[4] = t_nop;
-        stub_fmalloc_vtbl[5] = t_nop;
-        stub_fmalloc_vtbl[6] = t_nop;
-        stub_fmalloc_vtbl[7] = t_nop;  /* no NULL entries — causes crash if called */
-        stub_gmalloc_installed = 1;
-    }
-
-    volatile uint32_t *obj_vtbl  = (volatile uint32_t *)(uintptr_t)obj_addr;
-    uint32_t stub_vtbl_addr      = (uint32_t)(uintptr_t)stub_fmalloc_vtbl;
-
-    /* Already routed through our stub — nothing to do. */
-    if (*obj_vtbl == stub_vtbl_addr)
-        return;
-
-    /* A real (Core.dll-resident) FMallocWindows vtable is installed. Outside
-     * the preload window we trust it: appInit has run FMallocWindows::Init so
-     * its Heap is live. */
-    if (*obj_vtbl != 0 && !g_gmalloc_preload_phase) {
-        if (changed) {
-            serial_puts("[CRT] GMalloc vtable already set: 0x");
-            serial_puthex(*obj_vtbl, 8);
-            serial_puts("\n");
-        }
-        return;  /* Already constructed AND initialized by appInit */
-    }
-
-    /* Install our stub vtable. Two cases reach here:
-     *   (a) *obj_vtbl == 0  — object in BSS, real ctor hasn't run yet.
-     *   (b) *obj_vtbl != 0 AND preload phase — real ctor ran but Heap is still
-     *       NULL (appInit hasn't run); the real Malloc would fault with
-     *       "Called appMalloc before memory init". We override it so preload
-     *       allocations succeed via HeapAlloc (same pool the real allocator
-     *       uses once it takes over). */
-    if (*obj_vtbl != 0) {
-        serial_puts("[CRT] preload: overriding real GMalloc vtbl 0x");
-        serial_puthex(*obj_vtbl, 8);
-        serial_puts(" with stub (Heap not yet init)\n");
-    }
-    *obj_vtbl = stub_vtbl_addr;
-    serial_puts("[CRT] Stub GMalloc vtable at 0x");
-    serial_puthex(obj_addr, 8);
-    serial_puts(" -> vtbl 0x");
-    serial_puthex(*obj_vtbl, 8);
-    serial_puts("\n");
-}
-
-/* ── B8 fix: FMallocWindows Free router (allocator-mismatch) ────────
- * This build's FMallocWindows is a custom pool allocator: it frees by
- * PoolIndirect[ptr>>24][(ptr>>16)&0xff]. Blocks our stub/Heap/CRT
- * allocators hand out during preload live in LOW memory (< 0x40000000,
- * the kmalloc pool) which FMallocWindows never registered -> the lookup
- * returns an empty FPoolInfo -> wild NULL/garbage writes (what the
- * FMW-POOL-SKIP band-aid masks). Fix: replace the FMallocWindows vtable's
- * Free slot (vtbl[2]) with a 32-bit router that no-op-LEAKS foreign (low)
- * pointers (they were bump-pool allocated; leaking the bounded preload set
- * is harmless) and tail-calls the REAL Free for native (>= 0x40000000)
- * pointers. FMalloc::Free is __thiscall (ecx=this, [esp+4]=ptr, ret 4).
- * Native blocks are always >= 0x40000000 (win32_va_alloc base), foreign
- * always < 0x40000000, so the threshold cleanly separates them. */
-extern void *mem_alloc_pages(uint64_t count);
-static uint8_t *fmw_router_pool = NULL;
-static uint32_t fmw_router_used = 0;
-
-static uint32_t fmw_build_free_router(uint32_t real_free)
-{
-    if (!fmw_router_pool) {
-        fmw_router_pool = (uint8_t *)mem_alloc_pages(1);
-        if (!fmw_router_pool) return 0;
-    }
-    if (fmw_router_used + 32 > 4096) return 0;
-    uint8_t *p = fmw_router_pool + fmw_router_used;
-    int o = 0;
-    p[o++]=0x8B; p[o++]=0x44; p[o++]=0x24; p[o++]=0x04;              /* mov eax,[esp+4]   ; ptr */
-    p[o++]=0x3D; p[o++]=0x00; p[o++]=0x00; p[o++]=0x00; p[o++]=0x40; /* cmp eax,0x40000000     */
-    p[o++]=0x73; p[o++]=0x05;                                        /* jae +5 (native)        */
-    p[o++]=0x31; p[o++]=0xC0;                                        /* xor eax,eax            */
-    p[o++]=0xC2; p[o++]=0x04; p[o++]=0x00;                           /* ret 4   (foreign no-op)*/
-    uint32_t site = (uint32_t)(uintptr_t)(p + o);
-    int32_t rel = (int32_t)(real_free - (site + 5));
-    p[o++]=0xE9; p[o++]=rel & 0xff; p[o++]=(rel>>8)&0xff;
-    p[o++]=(rel>>16)&0xff; p[o++]=(rel>>24)&0xff;                    /* jmp real_free          */
-    fmw_router_used += (uint32_t)((o + 15) & ~15);
-    return (uint32_t)(uintptr_t)p;
-}
-
-static void fmw_install_router(uint32_t obj_addr)
-{
-    if (obj_addr < 0x10000 || obj_addr >= 0x80000000) return;
-    volatile uint32_t *obj = (volatile uint32_t *)(uintptr_t)obj_addr;
-    uint32_t vtbl = *obj;
-    if (vtbl < 0x10000 || vtbl >= 0x80000000) return;
-    /* Never router our own stub vtable (its HeapFree path is correct). */
-    if (vtbl == (uint32_t)(uintptr_t)stub_fmalloc_vtbl) return;
-    volatile uint32_t *vt = (volatile uint32_t *)(uintptr_t)vtbl;
-    uint32_t real_free = vt[2];
-    /* Already routed? (vtbl[2] points into our router pool) */
-    if (fmw_router_pool) {
-        uint32_t lo = (uint32_t)(uintptr_t)fmw_router_pool;
-        if (real_free >= lo && real_free < lo + 4096) return;
-    }
-    /* Sanity: the real Free must be PE code (Core.dll/UT.exe range). */
-    if (real_free < 0x10100000 || real_free >= 0x11000000) return;
-    uint32_t router = fmw_build_free_router(real_free);
-    if (!router) return;
-    vt[2] = router;
-    serial_puts("[FMW-ROUTER] obj=0x"); serial_puthex(obj_addr, 8);
-    serial_puts(" vtbl=0x"); serial_puthex(vtbl, 8);
-    serial_puts(" realFree=0x"); serial_puthex(real_free, 8);
-    serial_puts(" router=0x"); serial_puthex(router, 8);
-    serial_puts("\n");
-}
-
-/* Install the Free router on every live FMallocWindows object we know of:
- * the UT.exe instance (0x1092F738, the one the probe caught corrupting) and
- * the Core.dll GMalloc object (*0x101A7B90). Idempotent + cheap; called from
- * ensure_gmalloc_stub so it fires as soon as each real vtable is set. */
-static void fmw_install_routers(void)
-{
-    if (!msvcrt_running_ut99()) return;
-
-    fmw_install_router(0x1092F738);
-    volatile uint32_t *gmalloc = (volatile uint32_t *)(uintptr_t)0x101A7B90;
-    fmw_install_router(*gmalloc);
-}
 
 void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
 {
@@ -350,12 +79,6 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
         return;
     }
 
-    /* Ensure GMalloc is valid before any callback can call appMalloc.
-     * Core.dll's global constructors and DLL _initterm callbacks may
-     * use appMalloc BEFORE the EXE's appInit() sets up FMallocWindows. */
-    ensure_gmalloc_stub();
-    fmw_install_routers();   /* B8: route foreign frees away from FMallocWindows */
-
     /* PE32 mode: treat as array of uint32_t function pointers */
     uint32_t *begin32 = (uint32_t *)(ULONG_PTR)pfbegin;
     uint32_t *end32   = (uint32_t *)(ULONG_PTR)pfend;
@@ -373,8 +96,6 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
     int audit_mode = (end32 - begin32 < 200);
     for (uint32_t *p = begin32; p < end32; p++, idx++) {
         if (*p) {
-            ensure_gmalloc_stub();  /* re-check before EACH callback */
-            fmw_install_routers();  /* B8: (re)install Free router once vtable is live */
             if (audit_mode) {
                 serial_puts("[INIT] [");
                 serial_putdec((uint64_t)idx);
@@ -395,30 +116,6 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
     serial_putdec(cb_count);
     serial_puts(" callbacks executed\n");
 
-    /* Clear GErrorHist after each _initterm batch. Null-pointer faults
-     * during global constructors (handled by our write-through handler)
-     * cause the engine's error handler to set GErrorHist="General
-     * protection fault!". If GErrorHist is set when WinMain's Browse()
-     * runs, the engine skips rendering → error exit. Clear it so the
-     * engine starts WinMain with clean error state. */
-    if (msvcrt_running_ut99()) {
-        volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
-        volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
-        if (*gerr != 0) {
-            *gerr = 0;
-            *gcrit = 0;
-            serial_puts("[CRT] Cleared GErrorHist after _initterm\n");
-        }
-    }
-
-    /* Diagnostic: check FMallocWindows vtable after EXE _initterm */
-    if ((uint64_t)(ULONG_PTR)begin32 >= 0x10920000 &&
-        (uint64_t)(ULONG_PTR)begin32 <= 0x10930000) {
-        volatile uint32_t *vtable = (volatile uint32_t *)(uintptr_t)0x1092F738;
-        serial_puts("[DIAG] FMallocWindows vtable = 0x");
-        serial_puthex(*vtable, 8);
-        serial_puts("\n");
-    }
 #else
     for (_PVFV *pfn = pfbegin; pfn < pfend; pfn++) {
         if (*pfn)
@@ -693,6 +390,8 @@ static BOOL crt_char_is_delimiter(char c, const char *delimiters)
     return FALSE;
 }
 
+static char **crt_strtok_context(void);
+
 char* WINAPI crt_strtok_s(char *str, const char *delimiters, char **context)
 {
     if (!delimiters || !context || (!str && !*context)) {
@@ -714,30 +413,18 @@ char* WINAPI crt_strtok_s(char *str, const char *delimiters, char **context)
     return token;
 }
 
+char* WINAPI crt_strtok(char *str, const char *delimiters)
+{
+    char **context = crt_strtok_context();
+    if (!context) {
+        *crt_errno() = 12; /* ENOMEM */
+        return NULL;
+    }
+    return crt_strtok_s(str, delimiters, context);
+}
+
 PVOID WINAPI crt_memcpy(PVOID dst, PCVOID src, SIZE_T n)
 {
-    /* Defensive: NULL dst/src after FCriticalError suppression */
-    if (n == 0 || !dst || !src) return dst;
-
-    /* Log copies involving VirtualAlloc range (0x40000000+) for TArray debug */
-    {
-        uint64_t d64 = (uint64_t)(ULONG_PTR)dst;
-        uint64_t s64 = (uint64_t)(ULONG_PTR)src;
-        static int mc_log = 0;
-        if ((d64 >= 0x40000000 && d64 < 0x50000000) ||
-            (s64 >= 0x40000000 && s64 < 0x50000000)) {
-            if (mc_log < 50) {
-                mc_log++;
-                serial_puts("[MC] dst=0x");
-                serial_puthex(d64, 8);
-                serial_puts(" src=0x");
-                serial_puthex(s64, 8);
-                serial_puts(" n=");
-                serial_putdec(n);
-                serial_puts("\n");
-            }
-        }
-    }
     BYTE *d = (BYTE *)dst;
     const BYTE *s = (const BYTE *)src;
     while (n--) *d++ = *s++;
@@ -754,61 +441,10 @@ PVOID WINAPI crt_memset(PVOID dst, int c, SIZE_T n)
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
-extern uint32_t g_fname_names_addr;
 
 PVOID WINAPI crt_memmove(PVOID dst, PCVOID src, SIZE_T n)
 {
-    /* Defensive: post-suppression code paths can call memmove with
-     * NULL dst or src (e.g., FArray::Realloc returned 0, but caller
-     * proceeds anyway after FCriticalError was suppressed). Avoid the
-     * NULL-deref kernel #PF — return early. */
-    if (n == 0 || !dst || !src) return dst;
-
-    /* Log memmove calls with src/dst/size for debugging FName issue */
-    static int mm_log = 0;
-    if (mm_log < 20) {
-        mm_log++;
-        serial_puts("[MM] dst=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)dst, 8);
-        serial_puts(" src=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)src, 8);
-        serial_puts(" n=0x");
-        serial_puthex(n, 8);
-        serial_puts("\n");
-    }
-    /* Check if this memmove touches the FName::Names Data buffer */
-    if (g_fname_names_addr) {
-        uint32_t *tarray = (uint32_t *)(uintptr_t)g_fname_names_addr;
-        uint32_t data_ptr = tarray[0];
-        if (data_ptr >= 0x10000 && data_ptr < 0x20000000) {
-            uint32_t num = tarray[1];
-            uint32_t buf_size = num * 4;
-            uint64_t d = (uint64_t)(ULONG_PTR)dst;
-            uint64_t s = (uint64_t)(ULONG_PTR)src;
-            /* Check if src or dst overlaps with Data buffer */
-            if ((d >= data_ptr && d < data_ptr + buf_size) ||
-                (d + n > data_ptr && d < data_ptr + buf_size) ||
-                (s >= data_ptr && s < data_ptr + buf_size) ||
-                (s + n > data_ptr && s < data_ptr + buf_size)) {
-                serial_puts("[MM-FNAME!] TOUCHES FName Data=0x");
-                serial_puthex(data_ptr, 8);
-                serial_puts(" Num=");
-                serial_putdec(num);
-                serial_puts("\n");
-                /* Dump entries[0..3] before copy */
-                uint32_t *entries = (uint32_t *)(uintptr_t)data_ptr;
-                serial_puts("  PRE: [0]=0x");
-                serial_puthex(entries[0], 8);
-                serial_puts(" [1]=0x");
-                serial_puthex(entries[1], 8);
-                serial_puts(" [2]=0x");
-                serial_puthex(entries[2], 8);
-                serial_puts(" [3]=0x");
-                serial_puthex(entries[3], 8);
-                serial_puts("\n");
-            }
-        }
-    }
+    if (n == 0 || dst == src) return dst;
 
     BYTE *d = (BYTE *)dst;
     const BYTE *s = (const BYTE *)src;
@@ -1885,10 +1521,12 @@ typedef struct {
 
 #define CRT_EBADF       9
 #define CRT_ENOMEM     12
+#define CRT_EACCES     13
 #define CRT_EINVAL     22
 #define CRT_EMFILE     24
 #define CRT_ENOENT      2
 #define CRT_ENAMETOOLONG 38
+#define CRT_EILSEQ      42
 #define CRT_EOVERFLOW 132
 #define CRT_ERANGE     34
 #define CRT_STRUNCATE  80
@@ -2162,37 +1800,112 @@ CRT_FILE* WINAPI crt_acrt_iob_func(unsigned int index)
     return crt_file_for_caller((int)index);
 }
 
+static int crt_parse_stdio_mode(const char *mode, int *open_flags)
+{
+    if (!mode || !mode[0] || !open_flags) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    int flags;
+    if (mode[0] == 'r') flags = 0;
+    else if (mode[0] == 'w')
+        flags = CRT_O_WRONLY | CRT_O_CREAT | CRT_O_TRUNC;
+    else if (mode[0] == 'a')
+        flags = CRT_O_WRONLY | CRT_O_CREAT | CRT_O_APPEND;
+    else {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    flags |= CRT_O_TEXT;
+    for (const char *option = mode + 1; *option; option++) {
+        switch (*option) {
+        case '+':
+            flags &= ~CRT_O_WRONLY;
+            flags |= CRT_O_RDWR;
+            break;
+        case 'b':
+            flags &= ~CRT_O_TEXT;
+            flags |= CRT_O_BINARY;
+            break;
+        case 't':
+            flags &= ~CRT_O_BINARY;
+            flags |= CRT_O_TEXT;
+            break;
+        case 'x':
+            flags |= CRT_O_EXCL;
+            break;
+        case 'c': /* commit-on-flush policy; writes are already synchronous */
+        case 'n': /* inherited CRT commit policy */
+            break;
+        case ',':
+            /* Encoding suffixes affect transcoding, which this unbuffered
+             * narrow stream does not perform. Accept the documented syntax. */
+            *open_flags = flags;
+            return 0;
+        default:
+            *crt_errno() = CRT_EINVAL;
+            return -1;
+        }
+    }
+
+    *open_flags = flags;
+    return 0;
+}
+
+static int crt_stdio_access_flags(int open_flags)
+{
+    if (open_flags & CRT_O_RDWR) return 3;
+    if (open_flags & CRT_O_WRONLY) return 2;
+    return 1;
+}
+
 CRT_FILE* WINAPI crt_fopen(const char *path, const char *mode)
 {
-    if (!path || !mode || !mode[0]) {
+    if (!path) {
         *crt_errno() = CRT_EINVAL;
         return NULL;
     }
 
     int open_flags;
-    if (mode[0] == 'r') open_flags = 0;
-    else if (mode[0] == 'w')
-        open_flags = CRT_O_WRONLY | CRT_O_CREAT | CRT_O_TRUNC;
-    else if (mode[0] == 'a')
-        open_flags = CRT_O_WRONLY | CRT_O_CREAT | CRT_O_APPEND;
-    else {
+    if (crt_parse_stdio_mode(mode, &open_flags) != 0)
+        return NULL;
+
+    int fd = crt_open(path, open_flags, 0666);
+    return fd >= 0 ? crt_file_for_caller(fd) : NULL;
+}
+
+CRT_FILE* WINAPI crt_fdopen(int fd, const char *mode)
+{
+    CRT_FILE *file = crt_file_from_fd(fd);
+    int stream_open_flags;
+    if (!file) {
+        *crt_errno() = CRT_EBADF;
+        return NULL;
+    }
+    if (crt_parse_stdio_mode(mode, &stream_open_flags) != 0)
+        return NULL;
+
+    int stream_access = crt_stdio_access_flags(stream_open_flags);
+    int descriptor_access = crt_stdio_access_flags(file->open_flags);
+    if ((stream_access & descriptor_access) != stream_access) {
         *crt_errno() = CRT_EINVAL;
         return NULL;
     }
 
-    open_flags |= CRT_O_TEXT;
-    for (const char *option = mode + 1; *option; option++) {
-        if (*option == '+') {
-            open_flags &= ~CRT_O_WRONLY;
-            open_flags |= CRT_O_RDWR;
-        } else if (*option == 'b') {
-            open_flags &= ~CRT_O_TEXT;
-            open_flags |= CRT_O_BINARY;
-        }
-    }
+    if ((stream_open_flags & CRT_O_APPEND) &&
+        crt_lseeki64(fd, 0, CRT_FILE_END) < 0)
+        return NULL;
 
-    int fd = crt_open(path, open_flags, 0666);
-    return fd >= 0 ? crt_file_for_caller(fd) : NULL;
+    file->flags = stream_access;
+    file->ungetc_ch = -1;
+    file->open_flags =
+        (file->open_flags & ~(CRT_O_TEXT | CRT_O_BINARY | CRT_O_APPEND)) |
+        (stream_open_flags & (CRT_O_TEXT | CRT_O_BINARY | CRT_O_APPEND));
+    crt_file_proxy_sync(fd);
+    *crt_errno() = 0;
+    return crt_file_for_caller(fd);
 }
 
 CRT_FILE* WINAPI crt_wfopen(const uint16_t *wpath, const uint16_t *wmode)
@@ -2540,6 +2253,79 @@ int WINAPI crt_wopen(const WCHAR *path, int flags, int mode)
                                     FILE_SHARE_DELETE,
                                 NULL, crt_open_disposition(flags), 0, NULL);
     return crt_open_handle(handle, flags);
+}
+
+static int crt_unlink_result(BOOL deleted)
+{
+    if (deleted) return 0;
+
+    DWORD error = GetLastError();
+    *crt_doserrno() = error;
+    *crt_errno() = (error == 2 || error == 3) ? CRT_ENOENT : CRT_EACCES;
+    return -1;
+}
+
+int WINAPI crt_unlink(const char *path)
+{
+    return crt_unlink_result(DeleteFileA(path));
+}
+
+int WINAPI crt_wunlink(const WCHAR *path)
+{
+    return crt_unlink_result(DeleteFileW(path));
+}
+
+static int crt_rename_result(BOOL renamed)
+{
+    if (renamed) return 0;
+
+    DWORD error = GetLastError();
+    int crt_error;
+    switch (error) {
+    case 2:  /* ERROR_FILE_NOT_FOUND */
+    case 3:  /* ERROR_PATH_NOT_FOUND */
+        crt_error = CRT_ENOENT;
+        break;
+    case 87:  /* ERROR_INVALID_PARAMETER */
+    case 123: /* ERROR_INVALID_NAME */
+        crt_error = CRT_EINVAL;
+        break;
+    case 206: /* ERROR_FILENAME_EXCED_RANGE */
+        crt_error = CRT_ENAMETOOLONG;
+        break;
+    default:
+        crt_error = CRT_EACCES;
+        break;
+    }
+    *crt_doserrno() = error;
+    *crt_errno() = crt_error;
+    return -1;
+}
+
+int WINAPI crt_rename(const char *old_path, const char *new_path)
+{
+    return crt_rename_result(MoveFileA(old_path, new_path));
+}
+
+int WINAPI crt_wrename(const WCHAR *old_path, const WCHAR *new_path)
+{
+    return crt_rename_result(MoveFileW(old_path, new_path));
+}
+
+int WINAPI crt_getdrive(void)
+{
+    char current_directory[260];
+    DWORD length = GetCurrentDirectoryA(sizeof(current_directory),
+                                        current_directory);
+    if (!length || length >= sizeof(current_directory)) {
+        *crt_errno() = CRT_ENOMEM;
+        return 0;
+    }
+    if (current_directory[1] != ':') return 0;
+
+    unsigned char drive = (unsigned char)current_directory[0];
+    if (drive >= 'a' && drive <= 'z') drive -= (unsigned char)('a' - 'A');
+    return drive >= 'A' && drive <= 'Z' ? drive - 'A' + 1 : 0;
 }
 
 LONG_PTR WINAPI crt_get_osfhandle(int fd)
@@ -2954,6 +2740,238 @@ double WINAPI crt_atof(const char *s)
     return sign * result;
 }
 
+typedef struct {
+    double value;
+    const char *end;
+} CRT_STRTOD_RESULT;
+
+static int crt_ascii_space(unsigned char c)
+{
+    return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
+static unsigned char crt_ascii_lower(unsigned char c)
+{
+    return c >= 'A' && c <= 'Z' ? (unsigned char)(c + ('a' - 'A')) : c;
+}
+
+static int crt_ascii_word(const char *s, const char *word)
+{
+    while (*word) {
+        if (crt_ascii_lower((unsigned char)*s) !=
+            (unsigned char)*word)
+            return 0;
+        s++;
+        word++;
+    }
+    return 1;
+}
+
+static double crt_double_from_bits(uint64_t bits)
+{
+    double value;
+    __builtin_memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static double crt_scale_decimal(uint64_t mantissa, int decimal_exponent)
+{
+    if (decimal_exponent > 400)
+        return crt_double_from_bits(0x7FF0000000000000ULL);
+    if (decimal_exponent < -400)
+        return 0.0;
+
+    long double value = (long double)mantissa;
+    long double factor = 10.0L;
+    unsigned int power = decimal_exponent < 0
+        ? (unsigned int)(-decimal_exponent)
+        : (unsigned int)decimal_exponent;
+
+    while (power) {
+        if (power & 1U) {
+            if (decimal_exponent < 0)
+                value /= factor;
+            else
+                value *= factor;
+        }
+        power >>= 1;
+        if (power) factor *= factor;
+    }
+    return (double)value;
+}
+
+static CRT_STRTOD_RESULT crt_parse_strtod(const char *input)
+{
+    CRT_STRTOD_RESULT result = { 0.0, input };
+    if (!input) return result;
+
+    const char *p = input;
+    while (crt_ascii_space((unsigned char)*p)) p++;
+
+    int negative = 0;
+    if (*p == '-' || *p == '+') {
+        negative = *p == '-';
+        p++;
+    }
+
+    if (crt_ascii_word(p, "inf")) {
+        p += 3;
+        if (crt_ascii_word(p, "inity")) p += 5;
+        uint64_t bits = 0x7FF0000000000000ULL;
+        if (negative) bits |= 0x8000000000000000ULL;
+        result.value = crt_double_from_bits(bits);
+        result.end = p;
+        return result;
+    }
+
+    if (crt_ascii_word(p, "nan")) {
+        p += 3;
+        if (*p == '(') {
+            const char *payload = p + 1;
+            const char *q = payload;
+            while ((*q >= '0' && *q <= '9') ||
+                   (*q >= 'A' && *q <= 'Z') ||
+                   (*q >= 'a' && *q <= 'z') || *q == '_') {
+                q++;
+            }
+            if (*q == ')') p = q + 1;
+        }
+        uint64_t bits = 0x7FF8000000000000ULL;
+        if (negative) bits |= 0x8000000000000000ULL;
+        result.value = crt_double_from_bits(bits);
+        result.end = p;
+        return result;
+    }
+
+    uint64_t mantissa = 0;
+    uint32_t kept_digits = 0;
+    int discarded_digits = 0;
+    int fractional_digits = 0;
+    int first_discarded = -1;
+    int discarded_nonzero = 0;
+    int saw_digit = 0;
+    int saw_nonzero = 0;
+
+    while (*p >= '0' && *p <= '9') {
+        unsigned int digit = (unsigned int)(*p - '0');
+        saw_digit = 1;
+        if (digit || saw_nonzero) {
+            saw_nonzero = 1;
+            if (kept_digits < 19) {
+                mantissa = mantissa * 10U + digit;
+                kept_digits++;
+            } else {
+                if (discarded_digits < 1000000) discarded_digits++;
+                if (first_discarded < 0)
+                    first_discarded = (int)digit;
+                else if (digit)
+                    discarded_nonzero = 1;
+            }
+        }
+        p++;
+    }
+
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') {
+            unsigned int digit = (unsigned int)(*p - '0');
+            saw_digit = 1;
+            if (fractional_digits < 1000000) fractional_digits++;
+            if (digit || saw_nonzero) {
+                saw_nonzero = 1;
+                if (kept_digits < 19) {
+                    mantissa = mantissa * 10U + digit;
+                    kept_digits++;
+                } else {
+                    if (discarded_digits < 1000000) discarded_digits++;
+                    if (first_discarded < 0)
+                        first_discarded = (int)digit;
+                    else if (digit)
+                        discarded_nonzero = 1;
+                }
+            }
+            p++;
+        }
+    }
+
+    if (!saw_digit) return result;
+
+    int explicit_exponent = 0;
+    const char *exponent_mark = p;
+    if (*p == 'e' || *p == 'E') {
+        const char *q = p + 1;
+        int exponent_negative = 0;
+        if (*q == '-' || *q == '+') {
+            exponent_negative = *q == '-';
+            q++;
+        }
+        if (*q >= '0' && *q <= '9') {
+            while (*q >= '0' && *q <= '9') {
+                if (explicit_exponent < 1000000)
+                    explicit_exponent = explicit_exponent * 10 + (*q - '0');
+                if (explicit_exponent > 1000000)
+                    explicit_exponent = 1000000;
+                q++;
+            }
+            if (exponent_negative) explicit_exponent = -explicit_exponent;
+            p = q;
+        } else {
+            p = exponent_mark;
+        }
+    }
+
+    if (first_discarded > 5 ||
+        (first_discarded == 5 &&
+         (discarded_nonzero || (mantissa & 1U)))) {
+        mantissa++;
+        if (mantissa == 10000000000000000000ULL) {
+            mantissa = 1000000000000000000ULL;
+            if (discarded_digits < 1000000) discarded_digits++;
+        }
+    }
+
+    int64_t decimal_exponent = (int64_t)explicit_exponent +
+                               discarded_digits - fractional_digits;
+    int scale = decimal_exponent > 1000000 ? 1000000 :
+                decimal_exponent < -1000000 ? -1000000 :
+                (int)decimal_exponent;
+    double value = mantissa ? crt_scale_decimal(mantissa, scale) : 0.0;
+    if (negative) value = -value;
+
+    if (mantissa) {
+        uint64_t bits;
+        __builtin_memcpy(&bits, &value, sizeof(bits));
+        uint64_t exponent = bits & 0x7FF0000000000000ULL;
+        if (exponent == 0 || exponent == 0x7FF0000000000000ULL)
+            *crt_errno() = CRT_ERANGE;
+    }
+
+    result.value = value;
+    result.end = p;
+    return result;
+}
+
+double WINAPI crt_strtod(const char *s, char **endptr)
+{
+    CRT_STRTOD_RESULT result = crt_parse_strtod(s);
+    if (endptr) *endptr = (char *)result.end;
+    return result.value;
+}
+
+uint64_t WINAPI crt_strtod_compat32(uint64_t s_arg, uint64_t endptr_arg)
+{
+    const char *s = (const char *)(ULONG_PTR)(uint32_t)s_arg;
+    CRT_STRTOD_RESULT result = crt_parse_strtod(s);
+    if ((uint32_t)endptr_arg) {
+        uint32_t *endptr = (uint32_t *)(ULONG_PTR)(uint32_t)endptr_arg;
+        *endptr = (uint32_t)(ULONG_PTR)result.end;
+    }
+
+    uint64_t bits;
+    __builtin_memcpy(&bits, &result.value, sizeof(bits));
+    return bits;
+}
+
 int WINAPI crt_abs(int value)
 {
     return value < 0 ? -value : value;
@@ -2998,6 +3016,68 @@ unsigned long WINAPI crt_strtoul(const char *s, char **endptr, int base)
     return (unsigned long)crt_strtol(s, endptr, base);
 }
 
+SIZE_T WINAPI crt_mbstowcs(WCHAR *destination, const char *source,
+                           SIZE_T count)
+{
+    if (!source) {
+        *crt_errno() = CRT_EINVAL;
+        return (SIZE_T)-1;
+    }
+
+    if (!destination) {
+        SIZE_T required = 0;
+        while (source[required]) required++;
+        return required;
+    }
+
+    SIZE_T converted = 0;
+    while (converted < count) {
+        unsigned char value = (unsigned char)source[converted];
+        if (!value) {
+            destination[converted] = 0;
+            break;
+        }
+        destination[converted++] = (WCHAR)value;
+    }
+    return converted;
+}
+
+SIZE_T WINAPI crt_wcstombs(char *destination, const WCHAR *source,
+                           SIZE_T count)
+{
+    if (!source) {
+        *crt_errno() = CRT_EINVAL;
+        return (SIZE_T)-1;
+    }
+
+    if (!destination) {
+        SIZE_T required = 0;
+        while (source[required]) {
+            if (source[required] > 0xFF) {
+                *crt_errno() = CRT_EILSEQ;
+                return (SIZE_T)-1;
+            }
+            required++;
+        }
+        return required;
+    }
+
+    SIZE_T converted = 0;
+    while (converted < count) {
+        WCHAR value = source[converted];
+        if (!value) {
+            destination[converted] = 0;
+            break;
+        }
+        if (value > 0xFF) {
+            *crt_errno() = CRT_EILSEQ;
+            return (SIZE_T)-1;
+        }
+        destination[converted++] = (char)value;
+    }
+    return converted;
+}
+
 /* ── Process ───────────────────────────────────────────────── */
 
 #define ATEXIT_MAX 32
@@ -3020,7 +3100,8 @@ void WINAPI crt_exit(int code)
 void WINAPI crt_abort(void)
 {
     serial_puts("[MSVCRT] abort() called\n");
-    ExitProcess(3); /* SIGABRT-like */
+    (void)crt_raise(22); /* SIGABRT */
+    ExitProcess(3);      /* A returning/ignored handler cannot cancel abort. */
 }
 
 void WINAPI crt__exit(int code)
@@ -3103,6 +3184,16 @@ typedef struct {
     int new_mode;
     PVOID new_handler;
     struct crt_tm time_buffer;
+    char ctime_buffer[26];
+    LONG timezone;
+    int daylight;
+    int adjust_fdiv;
+    int mb_cur_max;
+    ULONG_PTR acmdln_value;
+    ULONG_PTR initenv_value;
+    ULONG_PTR initenv_entries[1];
+    ULONG_PTR signal_handlers[7];
+    char command_line[4096];
 } UCRT_PROCESS_MODE_VALUES;
 
 typedef struct {
@@ -3113,6 +3204,8 @@ typedef struct {
 typedef struct {
     int errno_value;
     ULONG doserrno_value;
+    WCHAR wcserror_buffer[64];
+    char *strtok_context;
 } UCRT_THREAD_VALUES;
 
 typedef struct _UCRT_THREAD_STATE {
@@ -3175,6 +3268,7 @@ static UCRT_THREAD_VALUES *ucrt_thread_state(BOOL create)
         } else {
             values->errno_value = 0;
             values->doserrno_value = 0;
+            values->strtok_context = NULL;
             state->owner_pid = owner_pid;
             state->owner_tid = owner_tid;
             state->values = values;
@@ -3193,6 +3287,12 @@ static UCRT_THREAD_VALUES *ucrt_thread_state(BOOL create)
     }
     ucrt_state_lock_release();
     return values;
+}
+
+static char **crt_strtok_context(void)
+{
+    UCRT_THREAD_VALUES *values = ucrt_thread_state(TRUE);
+    return values ? &values->strtok_context : NULL;
 }
 
 static UCRT_PROCESS_MODE_VALUES *ucrt_process_mode_state(BOOL create)
@@ -3222,6 +3322,24 @@ static UCRT_PROCESS_MODE_VALUES *ucrt_process_mode_state(BOOL create)
             values->fmode = 0x4000; /* _O_TEXT */
             values->new_mode = 0;
             values->new_handler = NULL;
+            values->timezone = 0;
+            values->daylight = 0;
+            values->adjust_fdiv = 0;
+            values->mb_cur_max = 1;
+            values->acmdln_value = (ULONG_PTR)values->command_line;
+            values->initenv_value = (ULONG_PTR)values->initenv_entries;
+            values->initenv_entries[0] = 0;
+            const char *command_line = win32_current_command_line();
+            SIZE_T command_length = 0;
+            if (command_line) {
+                while (command_line[command_length] &&
+                       command_length + 1 < sizeof(values->command_line)) {
+                    values->command_line[command_length] =
+                        command_line[command_length];
+                    command_length++;
+                }
+            }
+            values->command_line[command_length] = 0;
             free_slot->owner_pid = owner_pid;
             free_slot->values = values;
             serial_puts("[CRT] process mode state pid=");
@@ -3230,6 +3348,7 @@ static UCRT_PROCESS_MODE_VALUES *ucrt_process_mode_state(BOOL create)
             serial_puthex((ULONG_PTR)values, g_compat32_mode ? 8 : 16);
             serial_puts("\n");
         } else {
+            if (values) VirtualFree(values, 0, MEM_RELEASE);
             values = NULL;
         }
     }
@@ -3992,6 +4111,7 @@ PVOID WINAPI crt_bsearch(PCVOID key, PCVOID base, SIZE_T nmemb,
 
 static int crt_errno_fallback;
 static ULONG crt_doserrno_fallback;
+static WCHAR crt_wcserror_fallback[64];
 
 static char *crt_error_messages[] = {
     "No error",
@@ -4065,6 +4185,22 @@ char* WINAPI crt_strerror(int error)
     return "Unknown error";
 }
 
+WCHAR* WINAPI crt_wcserror(int error)
+{
+    UCRT_THREAD_VALUES *values = ucrt_thread_state(TRUE);
+    WCHAR *buffer = values ? values->wcserror_buffer
+                           : crt_wcserror_fallback;
+    const char *message = crt_strerror(error);
+    SIZE_T index = 0;
+
+    while (message[index] && index + 1 < 64) {
+        buffer[index] = (WCHAR)(unsigned char)message[index];
+        index++;
+    }
+    buffer[index] = 0;
+    return buffer;
+}
+
 int WINAPI crt_fpe_flt_rounds(void)
 {
     unsigned int mxcsr;
@@ -4082,19 +4218,89 @@ int WINAPI crt_fpe_flt_rounds(void)
 
 extern uint64_t idt_get_ticks(void);
 
-/* The Win32 time-zone APIs expose UTC until Osito gains configurable zones. */
-static LONG crt_timezone_val;
-static int crt_daylight_val;
-
 void WINAPI crt_tzset(void)
 {
-    crt_timezone_val = 0;
-    crt_daylight_val = 0;
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) return;
+    values->timezone = 0;
+    values->daylight = 0;
 }
 
-LONG* WINAPI crt_timezone(void) { return &crt_timezone_val; }
+LONG* WINAPI crt_timezone(void)
+{
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    return values ? &values->timezone : NULL;
+}
 
-int* WINAPI crt_daylight(void) { return &crt_daylight_val; }
+int* WINAPI crt_daylight(void)
+{
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    return values ? &values->daylight : NULL;
+}
+
+typedef struct {
+    int32_t  time;
+    uint16_t millitm;
+    int16_t  timezone;
+    int16_t  dstflag;
+} CRT_TIMEB32;
+
+typedef struct {
+    int64_t  time;
+    uint16_t millitm;
+    int16_t  timezone;
+    int16_t  dstflag;
+} CRT_TIMEB64;
+
+_Static_assert(sizeof(CRT_TIMEB32) == 12, "PE32 _timeb layout changed");
+_Static_assert(sizeof(CRT_TIMEB64) == 16, "PE64 _timeb layout changed");
+
+static void crt_ftime_snapshot(int64_t *seconds, uint16_t *milliseconds)
+{
+    uint64_t filetime = wintime_now_filetime();
+    *seconds = filetime >= WINTIME_UNIX_EPOCH_FILETIME
+        ? (int64_t)((filetime - WINTIME_UNIX_EPOCH_FILETIME) /
+                    WINTIME_TICKS_PER_SECOND)
+        : -1;
+    *milliseconds = (uint16_t)(
+        (filetime % WINTIME_TICKS_PER_SECOND) / 10000ULL);
+}
+
+static void WINAPI crt_ftime32(CRT_TIMEB32 *result)
+{
+    if (!result) {
+        *crt_errno() = CRT_EINVAL;
+        return;
+    }
+
+    int64_t seconds;
+    uint16_t milliseconds;
+    crt_ftime_snapshot(&seconds, &milliseconds);
+    result->time = (int32_t)seconds;
+    result->millitm = milliseconds;
+    result->timezone = 0;
+    result->dstflag = 0;
+}
+
+static void WINAPI crt_ftime64(CRT_TIMEB64 *result)
+{
+    if (!result) {
+        *crt_errno() = CRT_EINVAL;
+        return;
+    }
+
+    crt_ftime_snapshot(&result->time, &result->millitm);
+    result->timezone = 0;
+    result->dstflag = 0;
+}
+
+void WINAPI crt_ftime(PVOID result)
+{
+    if (g_compat32_mode)
+        crt_ftime32((CRT_TIMEB32 *)result);
+    else
+        crt_ftime64((CRT_TIMEB64 *)result);
+}
 
 crt_time_t WINAPI crt_time(crt_time_t *timer)
 {
@@ -4146,8 +4352,8 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
     DWORD code  = ExceptionRecord->ExceptionCode;
     DWORD flags = ExceptionRecord->ExceptionFlags;
 
-    /* During unwind, just return — _except_handler3 doesn't do unwind cleanup */
-    if (flags & EXCEPTION_UNWIND) {
+    /* PE32 unwind runs termination funclets after validating its frame. */
+    if ((flags & EXCEPTION_UNWIND) && !g_compat32_mode) {
         return ExceptionContinueSearch;
     }
 
@@ -4174,9 +4380,37 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
      *   +8: uint32_t HandlerFunc   ← 32-bit code pointer
      */
     if (g_compat32_mode) {
-        uint32_t *frame32 = (uint32_t *)(ULONG_PTR)EstablisherFrame;
+        uint32_t frame_address = (uint32_t)(ULONG_PTR)EstablisherFrame;
+        if (frame_address > UINT32_MAX - 16U ||
+            !compat32_range_readable(frame_address,
+                                     4U * sizeof(uint32_t))) {
+            serial_puts("[SEH] invalid EH3 registration frame\n");
+            return ExceptionContinueSearch;
+        }
+
+        uint32_t *frame32 = (uint32_t *)(ULONG_PTR)frame_address;
         uint32_t scope32  = frame32[2];   /* offset +8 */
         uint32_t level    = frame32[3];   /* offset +12 */
+        uint32_t frame_ebp = frame_address + 16U;
+
+        if (flags & EXCEPTION_UNWIND) {
+            if (!compat32_eh3_local_unwind(frame_address, scope32, -1))
+                serial_puts("[SEH] malformed EH3 unwind metadata\n");
+            return ExceptionContinueSearch;
+        }
+
+        extern PVOID seh32_ep_addr_for_filter(void);
+        uint32_t ep_addr =
+            (uint32_t)(ULONG_PTR)seh32_ep_addr_for_filter();
+        if (!ep_addr || frame_address < sizeof(uint32_t) ||
+            !compat32_range_readable(frame_address - sizeof(uint32_t),
+                                     sizeof(uint32_t))) {
+            serial_puts("[SEH] invalid EH3 exception-pointers slot\n");
+            return ExceptionContinueSearch;
+        }
+
+        /* MSVC EH3 funclets read _exception_info from [EBP-0x14]. */
+        *(uint32_t *)(ULONG_PTR)(frame_address - sizeof(uint32_t)) = ep_addr;
 
         serial_puts("[SEH] scope32=0x");
         serial_puthex(scope32, 8);
@@ -4184,14 +4418,29 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
         serial_putdec(level);
         serial_puts("\n");
 
-        while (level != (uint32_t)-1 && scope32 != 0) {
+        int scope_steps = 0;
+        while (level != (uint32_t)-1 && scope32 != 0 &&
+               scope_steps++ < 64) {
             /* 32-bit SCOPETABLE_ENTRY: 12 bytes each */
-            uint32_t *se = (uint32_t *)(ULONG_PTR)(scope32 + level * 12);
+            uint64_t entry_address = (uint64_t)scope32 +
+                                     (uint64_t)level * 12ULL;
+            if (level > 4096U || entry_address > UINT32_MAX ||
+                !compat32_range_readable((uint32_t)entry_address,
+                                         3U * sizeof(uint32_t))) {
+                serial_puts("[SEH] invalid EH3 scope-table entry\n");
+                return ExceptionContinueSearch;
+            }
+
+            uint32_t *se = (uint32_t *)(ULONG_PTR)(uint32_t)entry_address;
             uint32_t enclosing = se[0];
             uint32_t filter32  = se[1];
             uint32_t handler32 = se[2];
 
             if (filter32) {
+                if (!compat32_range_executable(filter32, 1)) {
+                    serial_puts("[SEH] non-executable EH3 filter\n");
+                    return ExceptionContinueSearch;
+                }
                 serial_puts("[SEH] filter32 @0x");
                 serial_puthex(filter32, 8);
                 serial_puts("\n");
@@ -4200,28 +4449,36 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
                  * Call 32-bit filter: int __cdecl filter(EXCEPTION_POINTERS32 *)
                  * We already have seh32_exception_pointers set up by the caller.
                  */
-                extern PVOID seh32_ep_addr_for_filter(void);
-                uint32_t ep_addr = (uint32_t)(ULONG_PTR)seh32_ep_addr_for_filter();
                 uint32_t fargs[1] = { ep_addr };
-                uint32_t result = compat32_callback_args(filter32, 1, fargs);
+                uint32_t result = compat32_callback_args_with_ebp(
+                    filter32, 1, fargs, frame_ebp);
 
                 serial_puts("[SEH] filter returned ");
                 serial_putdec(result);
                 serial_puts("\n");
 
                 if ((int32_t)result == 1 /* EXCEPTION_EXECUTE_HANDLER */) {
+                    if (!compat32_range_executable(handler32, 1)) {
+                        serial_puts("[SEH] non-executable EH3 handler\n");
+                        return ExceptionContinueSearch;
+                    }
                     serial_puts("[SEH] EXECUTE_HANDLER @0x");
                     serial_puthex(handler32, 8);
                     serial_puts("\n");
 
-                    /* Update TryLevel to enclosing scope */
+                    if (!compat32_eh3_local_unwind(
+                            frame_address, scope32, (int32_t)level)) {
+                        serial_puts("[SEH] malformed EH3 local unwind\n");
+                        return ExceptionContinueSearch;
+                    }
                     frame32[3] = enclosing;
 
-                    /* Call the 32-bit handler (longjmp-style, may not return) */
-                    compat32_callback(handler32);
-
-                    serial_puts("[SEH] handler returned\n");
-                    return ExceptionContinueSearch;
+                    if (!compat32_eh3_schedule_handler(frame_address,
+                                                       handler32)) {
+                        serial_puts("[SEH] invalid EH3 transfer state\n");
+                        return ExceptionContinueSearch;
+                    }
+                    return ExceptionContinueExecution;
                 }
                 else if ((int32_t)result == -1 /* EXCEPTION_CONTINUE_EXECUTION */) {
                     return ExceptionContinueExecution;
@@ -4229,8 +4486,15 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
                 /* EXCEPTION_CONTINUE_SEARCH → try enclosing scope */
             }
 
+            if (enclosing != (uint32_t)-1 && enclosing >= level) {
+                serial_puts("[SEH] cyclic EH3 scope-table chain\n");
+                return ExceptionContinueSearch;
+            }
             level = enclosing;
         }
+
+        if (level != (uint32_t)-1 && scope32 != 0 && scope_steps >= 64)
+            serial_puts("[SEH] EH3 scope-table depth limit reached\n");
 
         return ExceptionContinueSearch;
     }
@@ -4283,6 +4547,80 @@ typedef struct __attribute__((packed)) {
     uint32_t handler;
 } CRT_EH4_SCOPE_ENTRY32;
 
+typedef struct __attribute__((packed)) {
+    int32_t gs_cookie_offset;
+    int32_t gs_cookie_xor_offset;
+    int32_t eh_cookie_offset;
+    int32_t eh_cookie_xor_offset;
+} CRT_EH4_SCOPE_HEADER32;
+
+static int crt_eh4_cookie_slot32(uint32_t frame_ebp, int32_t offset,
+                                 uint32_t *value)
+{
+    int64_t address = (int64_t)(uint64_t)frame_ebp + (int64_t)offset;
+    if (!value || offset < -0x100000 || offset > 0x100000 ||
+        address < 0 || address > UINT32_MAX ||
+        !compat32_range_readable((uint32_t)address, sizeof(uint32_t)))
+        return 0;
+
+    *value = *(const uint32_t *)(ULONG_PTR)(uint32_t)address;
+    return 1;
+}
+
+static int crt_eh4_cookie_xor_address32(uint32_t frame_ebp, int32_t offset,
+                                        uint32_t *address_out)
+{
+    int64_t address = (int64_t)(uint64_t)frame_ebp + (int64_t)offset;
+    if (!address_out || offset < -0x100000 || offset > 0x100000 ||
+        address < 0 || address > UINT32_MAX)
+        return 0;
+
+    *address_out = (uint32_t)address;
+    return 1;
+}
+
+static int crt_eh4_validate_cookie32(uint32_t cookie_address,
+                                     uint32_t check_cookie,
+                                     uint32_t scope_table,
+                                     uint32_t frame_ebp)
+{
+    if (!compat32_range_executable(check_cookie, 1) ||
+        !compat32_range_readable(scope_table,
+                                 sizeof(CRT_EH4_SCOPE_HEADER32))) {
+        serial_puts("[SEH4] invalid cookie metadata\n");
+        return 0;
+    }
+
+    const CRT_EH4_SCOPE_HEADER32 *header =
+        (const CRT_EH4_SCOPE_HEADER32 *)(ULONG_PTR)scope_table;
+    uint32_t expected = *(const uint32_t *)(ULONG_PTR)cookie_address;
+    uint32_t cookie_part;
+    uint32_t xor_address;
+
+    if (header->gs_cookie_offset != -2) {
+        if (!crt_eh4_cookie_slot32(frame_ebp, header->gs_cookie_offset,
+                                   &cookie_part) ||
+            !crt_eh4_cookie_xor_address32(
+                frame_ebp, header->gs_cookie_xor_offset, &xor_address) ||
+            (cookie_part ^ xor_address) != expected) {
+            serial_puts("[SEH4] GS cookie mismatch\n");
+            return 0;
+        }
+    }
+
+    if (header->eh_cookie_offset == -2 ||
+        !crt_eh4_cookie_slot32(frame_ebp, header->eh_cookie_offset,
+                               &cookie_part) ||
+        !crt_eh4_cookie_xor_address32(
+            frame_ebp, header->eh_cookie_xor_offset, &xor_address) ||
+        (cookie_part ^ xor_address) != expected) {
+        serial_puts("[SEH4] EH cookie mismatch\n");
+        return 0;
+    }
+
+    return 1;
+}
+
 static int crt_eh4_read_entry32(uint32_t scope_table, int32_t level,
                                 CRT_EH4_SCOPE_ENTRY32 *entry)
 {
@@ -4316,7 +4654,7 @@ static int crt_eh4_local_unwind32(uint32_t scope_table,
 
         frame[3] = (uint32_t)entry.previous_try_level;
         if (!entry.filter && entry.handler) {
-            if (!compat32_range_readable(entry.handler, 1))
+            if (!compat32_range_executable(entry.handler, 1))
                 return 0;
             (void)compat32_callback_args_with_ebp(entry.handler, 0, NULL,
                                                    frame_ebp);
@@ -4334,7 +4672,6 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
     PCONTEXT ContextRecord,
     PVOID DispatcherContext)
 {
-    (void)check_cookie;
     (void)ContextRecord;
     (void)DispatcherContext;
 
@@ -4342,9 +4679,11 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
         return ExceptionContinueSearch;
 
     uint32_t cookie_address = (uint32_t)(ULONG_PTR)cookie;
+    uint32_t check_cookie_address = (uint32_t)(ULONG_PTR)check_cookie;
     uint32_t frame_address = (uint32_t)(ULONG_PTR)EstablisherFrame;
     uint32_t record_address = (uint32_t)(ULONG_PTR)ExceptionRecord;
     if (!compat32_range_readable(cookie_address, sizeof(uint32_t)) ||
+        frame_address > UINT32_MAX - 16U ||
         !compat32_range_readable(frame_address, 6U * sizeof(uint32_t)) ||
         !compat32_range_readable(record_address, 2U * sizeof(uint32_t))) {
         serial_puts("[SEH4] invalid handler arguments\n");
@@ -4361,6 +4700,11 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
         return ExceptionContinueSearch;
     }
 
+    uint32_t frame_ebp = frame_address + 16U;
+    if (!crt_eh4_validate_cookie32(cookie_address, check_cookie_address,
+                                   scope_table, frame_ebp))
+        return ExceptionContinueSearch;
+
     DWORD flags = *(const uint32_t *)(ULONG_PTR)(record_address + 4U);
     if (flags & EXCEPTION_UNWIND) {
         if (!crt_eh4_local_unwind32(scope_table, frame_address, -2))
@@ -4376,7 +4720,6 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
         *(uint32_t *)(ULONG_PTR)(frame_address - sizeof(uint32_t)) = ep_address;
 
     int32_t level = (int32_t)frame[3];
-    uint32_t frame_ebp = frame_address + 16U;
     for (int guard = 0; level != -2; guard++) {
         CRT_EH4_SCOPE_ENTRY32 entry;
         if (guard >= 1024 ||
@@ -4387,7 +4730,7 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
         }
 
         if (entry.filter) {
-            if (!compat32_range_readable(entry.filter, 1)) {
+            if (!compat32_range_executable(entry.filter, 1)) {
                 serial_puts("[SEH4] invalid filter address\n");
                 return ExceptionContinueSearch;
             }
@@ -4400,7 +4743,7 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
 
             if (result == EXCEPTION_EXECUTE_HANDLER) {
                 if (!entry.handler ||
-                    !compat32_range_readable(entry.handler, 1) ||
+                    !compat32_range_executable(entry.handler, 1) ||
                     !crt_eh4_local_unwind32(scope_table, frame_address,
                                              level)) {
                     serial_puts("[SEH4] invalid execute-handler metadata\n");
@@ -4408,11 +4751,12 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
                 }
 
                 frame[3] = (uint32_t)entry.previous_try_level;
-                TEB32 *teb = compat32_current_teb();
-                if (teb) teb->ExceptionList = frame_address;
-                (void)compat32_callback_args_with_ebp(entry.handler, 0, NULL,
-                                                       frame_ebp);
-                return ExceptionContinueSearch;
+                if (!compat32_eh4_schedule_handler(frame_address,
+                                                    entry.handler)) {
+                    serial_puts("[SEH4] invalid transfer state\n");
+                    return ExceptionContinueSearch;
+                }
+                return ExceptionContinueExecution;
             }
         }
 
@@ -4439,6 +4783,13 @@ int WINAPI crt_XcptFilter(int code, PVOID pointers)
     (void)pointers;
     /* Default: continue search (let next handler try) */
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+int WINAPI crt_CppXcptFilter(int code, PVOID pointers)
+{
+    if ((uint32_t)code != 0xE06D7363U)
+        return EXCEPTION_CONTINUE_SEARCH;
+    return crt_XcptFilter(code, pointers);
 }
 
 /* compat32_dispatch intercepts these targets before the generic ABI bridge.
@@ -4479,10 +4830,161 @@ PVOID WINAPI crt_amsg_exit(int errnum) { (void)errnum; crt_abort(); return NULL;
 
 /* ── C++ EH / UT99 required stubs ─────────────────────────── */
 
-/* ??1type_info@@UAE@XZ — type_info destructor (no-op) */
+typedef struct _CRT_TYPE_INFO_NODE32 {
+    uint32_t mem_ptr;
+    uint32_t next;
+} CRT_TYPE_INFO_NODE32;
+
+typedef struct _CRT_TYPE_INFO_NODE64 {
+    PVOID mem_ptr;
+    struct _CRT_TYPE_INFO_NODE64 *next;
+} CRT_TYPE_INFO_NODE64;
+
+#define CRT_TYPE_INFO_CHAIN_LIMIT 65536U
+
+static volatile uint32_t crt_type_info_lock;
+
+static void crt_type_info_lock_acquire(void)
+{
+    while (__sync_lock_test_and_set(&crt_type_info_lock, 1U))
+        sched_yield();
+}
+
+static void crt_type_info_lock_release(void)
+{
+    __sync_lock_release(&crt_type_info_lock);
+}
+
+static BOOL crt_type_info_next32(uint32_t address, uint32_t *next)
+{
+    if (!address) {
+        *next = 0;
+        return TRUE;
+    }
+    if (!compat32_range_readable(address, sizeof(CRT_TYPE_INFO_NODE32)))
+        return FALSE;
+    *next = ((const CRT_TYPE_INFO_NODE32 *)(ULONG_PTR)address)->next;
+    return TRUE;
+}
+
+static BOOL crt_type_info_chain_valid32(uint32_t first)
+{
+    uint32_t slow = first;
+    uint32_t fast = first;
+
+    for (uint32_t steps = 0; fast; steps++) {
+        uint32_t fast_next;
+        uint32_t fast_next_next;
+        uint32_t slow_next;
+
+        if (steps >= CRT_TYPE_INFO_CHAIN_LIMIT ||
+            !crt_type_info_next32(fast, &fast_next))
+            return FALSE;
+        if (!fast_next)
+            return TRUE;
+        if (!crt_type_info_next32(fast_next, &fast_next_next) ||
+            !crt_type_info_next32(slow, &slow_next))
+            return FALSE;
+        slow = slow_next;
+        fast = fast_next_next;
+        if (fast && fast == slow)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static PVOID crt_type_info_detach_name(PVOID object)
+{
+    if (!object)
+        return NULL;
+
+    if (g_compat32_mode) {
+        ULONG_PTR address = (ULONG_PTR)object;
+        if (address > UINT32_MAX ||
+            !compat32_range_readable((uint32_t)address,
+                                     2U * sizeof(uint32_t))) {
+            serial_puts("[MSVCRT-RTTI] invalid PE32 type_info object\n");
+            return NULL;
+        }
+        uint32_t *fields = (uint32_t *)object;
+        return (PVOID)(ULONG_PTR)__atomic_exchange_n(
+            &fields[1], 0U, __ATOMIC_ACQ_REL);
+    }
+
+    PVOID *fields = (PVOID *)object;
+    return __atomic_exchange_n(&fields[1], NULL, __ATOMIC_ACQ_REL);
+}
+
+/* MSVC stores the lazily demangled name immediately after the vtable slot. */
 void WINAPI crt_type_info_dtor(PVOID _this)
 {
-    (void)_this;
+    crt_type_info_lock_acquire();
+    PVOID name = crt_type_info_detach_name(_this);
+    if (name)
+        crt_free(name);
+    crt_type_info_lock_release();
+}
+
+void WINAPI crt_type_info_dtor_internal(PVOID _this)
+{
+    crt_type_info_dtor(_this);
+}
+
+/*
+ * MSVCR80+ keeps one __type_info_node root in each image that asks for a
+ * demangled RTTI name. Each heap node owns both its mem_ptr and itself.
+ */
+void WINAPI crt_clean_type_info_names_internal(PVOID root_node)
+{
+    if (!root_node)
+        return;
+
+    crt_type_info_lock_acquire();
+    if (g_compat32_mode) {
+        ULONG_PTR root_address = (ULONG_PTR)root_node;
+        if (root_address > UINT32_MAX ||
+            !compat32_range_readable((uint32_t)root_address,
+                                     sizeof(CRT_TYPE_INFO_NODE32))) {
+            serial_puts("[MSVCRT-RTTI] invalid PE32 type_info root\n");
+            crt_type_info_lock_release();
+            return;
+        }
+
+        CRT_TYPE_INFO_NODE32 *root = (CRT_TYPE_INFO_NODE32 *)root_node;
+        uint32_t current = __atomic_exchange_n(&root->next, 0U,
+                                                __ATOMIC_ACQ_REL);
+        if (!crt_type_info_chain_valid32(current)) {
+            serial_puts("[MSVCRT-RTTI] malformed PE32 type_info chain\n");
+            crt_type_info_lock_release();
+            return;
+        }
+
+        while (current) {
+            CRT_TYPE_INFO_NODE32 *node =
+                (CRT_TYPE_INFO_NODE32 *)(ULONG_PTR)current;
+            uint32_t next = node->next;
+            uint32_t mem_ptr = node->mem_ptr;
+            if (mem_ptr)
+                crt_free((PVOID)(ULONG_PTR)mem_ptr);
+            crt_free(node);
+            current = next;
+        }
+    } else {
+        CRT_TYPE_INFO_NODE64 *root = (CRT_TYPE_INFO_NODE64 *)root_node;
+        CRT_TYPE_INFO_NODE64 *node = __atomic_exchange_n(
+            &root->next, NULL, __ATOMIC_ACQ_REL);
+        uint32_t count = 0;
+        while (node && count++ < CRT_TYPE_INFO_CHAIN_LIMIT) {
+            CRT_TYPE_INFO_NODE64 *next = node->next;
+            if (node->mem_ptr)
+                crt_free(node->mem_ptr);
+            crt_free(node);
+            node = next;
+        }
+        if (node)
+            serial_puts("[MSVCRT-RTTI] malformed PE64 type_info chain\n");
+    }
+    crt_type_info_lock_release();
 }
 
 typedef struct _CRT_TYPE_INFO_ENTRY {
@@ -4504,8 +5006,7 @@ void WINAPI crt_std_type_info_destroy_list(PVOID list_head)
  * _CxxThrowException — C++ throw.
  *
  * Builds an EXCEPTION_RECORD with MSVC C++ exception code (0xE06D7363)
- * and dispatches through the 32-bit SEH chain. This allows __try/__except
- * catch-all handlers (common in Unreal Engine) to intercept the exception.
+ * and dispatches through the current thread's 32-bit SEH chain.
  *
  * If no handler catches it, terminates the process.
  */
@@ -4518,570 +5019,45 @@ extern int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord);
  */
 static EXCEPTION_RECORD cxx_current_exception;
 static int cxx_exception_active = 0;
-uint32_t crt_get_base_seh_thunk(void); /* forward decl */
 
-void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
+void WINAPI crt_CxxThrowException(PVOID exception_object, PVOID throw_info)
 {
-    TEB32 *teb = compat32_current_teb();
-    extern uint32_t compat32_get_last_caller_eip(void);
-    uint32_t throw_eip = compat32_get_last_caller_eip();
-    serial_puts("[MSVCRT] _CxxThrowException: obj=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)pExceptionObject, 8);
-    serial_puts(" throwInfo=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)pThrowInfo, 8);
-    serial_puts(" thrown_from=0x");
-    serial_puthex(throw_eip, 8);
-    serial_puts("\n");
+    EXCEPTION_RECORD record;
 
-    /* OpenJDK AWT keeps JNIEnv* in ESI while creating a frame.  If its
-     * AwtFrame::Create path throws because FindClass returned NULL, describe
-     * the already-pending Java exception before the C++ unwind hides it on
-     * the toolkit thread.  ExceptionDescribe clears the pending exception,
-     * so restore the same throwable immediately afterwards. */
-    if (throw_eip == 0x6D0894C4U &&
-        (uint32_t)(ULONG_PTR)pThrowInfo == 0x6D0D93A8U) {
-        extern uint32_t compat32_get_last_user_esi(void);
-        uint32_t env32 = compat32_get_last_user_esi();
-
-        serial_puts("[AWT-JNI] env=0x");
-        serial_puthex(env32, 8);
-        if (env32 >= 0x10000U && env32 < 0x80000000U) {
-            uint32_t functions = *(volatile uint32_t *)(uintptr_t)env32;
-            serial_puts(" functions=0x");
-            serial_puthex(functions, 8);
-            serial_puts("\n");
-
-            if (functions >= 0x10000U && functions < 0x80000000U) {
-                uint32_t exception_occurred =
-                    *(volatile uint32_t *)(uintptr_t)(functions + 15U * 4U);
-                uint32_t throw_exception =
-                    *(volatile uint32_t *)(uintptr_t)(functions + 13U * 4U);
-                uint32_t exception_clear =
-                    *(volatile uint32_t *)(uintptr_t)(functions + 17U * 4U);
-                uint32_t find_class =
-                    *(volatile uint32_t *)(uintptr_t)(functions + 6U * 4U);
-                uint32_t delete_local_ref =
-                    *(volatile uint32_t *)(uintptr_t)(functions + 23U * 4U);
-                uint32_t is_instance_of =
-                    *(volatile uint32_t *)(uintptr_t)(functions + 32U * 4U);
-                uint32_t env_args[1] = { env32 };
-                uint32_t pending = compat32_callback_args(
-                    exception_occurred, 1, env_args);
-
-                serial_puts("[AWT-JNI] pending=0x");
-                serial_puthex(pending, 8);
-                serial_puts("\n");
-
-                if (pending != 0 && exception_clear != 0 &&
-                    find_class != 0 && delete_local_ref != 0 &&
-                    is_instance_of != 0 && throw_exception != 0) {
-                    static const struct {
-                        uint32_t name32;
-                        const char *label;
-                    } exception_types[] = {
-                        { 0x6D427C48U, "ClassNotFoundException" },
-                        { 0x6D427CF2U, "IllegalMonitorStateException" },
-                        { 0x6D427DDFU, "LinkageError" },
-                        { 0x6D427E5AU, "NullPointerException" },
-                        { 0x6D427F2BU, "RuntimeException" },
-                        { 0x6D428012U, "ExceptionInInitializerError" },
-                        { 0x6D42807CU, "InternalError" },
-                        { 0x6D428094U, "NoClassDefFoundError" },
-                        { 0x6D4280EAU, "OutOfMemoryError" },
-                    };
-                    uint32_t throw_args[2] = { env32, pending };
-
-                    compat32_callback_args(exception_clear, 1, env_args);
-                    serial_puts("[AWT-JNI] exception=");
-                    int identified = 0;
-                    for (uint32_t i = 0;
-                         i < sizeof(exception_types) / sizeof(exception_types[0]);
-                         i++) {
-                        uint32_t find_args[2] = {
-                            env32, exception_types[i].name32
-                        };
-                        uint32_t cls = compat32_callback_args(
-                            find_class, 2, find_args);
-                        if (cls != 0) {
-                            uint32_t instance_args[3] = {
-                                env32, pending, cls
-                            };
-                            uint32_t match = compat32_callback_args(
-                                is_instance_of, 3, instance_args);
-                            uint32_t delete_args[2] = { env32, cls };
-                            compat32_callback_args(
-                                delete_local_ref, 2, delete_args);
-                            if (match) {
-                                serial_puts(exception_types[i].label);
-                                identified = 1;
-                                break;
-                            }
-                        }
-                    }
-                    if (!identified)
-                        serial_puts("<other>");
-                    serial_puts("\n");
-
-                    compat32_callback_args(throw_exception, 2, throw_args);
-                }
-            }
-        } else {
-            serial_puts(" (invalid)\n");
-        }
-    }
-
-    /* [THROWMSG] diagnostic: UT99's New-Game crash is preceded by a recoverable
-     * `throw (TCHAR*)errmsg` (throwInfo 0x1017D4B0, type wchar_t*) from a failed
-     * map load. The thrown object is the TCHAR* pointer; dump the message it
-     * points to (first few) to learn WHY the load fails (the crash trigger). */
-    {
-        static int throwmsg_n = 0;
-        if (pThrowInfo == (PVOID)(uintptr_t)0x1017D4B0ULL && throwmsg_n < 6 && pExceptionObject) {
-            throwmsg_n++;
-            uint32_t pstr = *(volatile uint32_t *)pExceptionObject;  /* TCHAR* */
-            serial_puts("[THROWMSG] \"");
-            if (pstr >= 0x10000 && pstr < 0x80000000) {
-                const uint16_t *w = (const uint16_t *)(uintptr_t)pstr;
-                for (int k = 0; k < 160 && w[k]; k++) {
-                    char c = (w[k] >= 0x20 && w[k] < 0x7F) ? (char)w[k] : '?';
-                    char s[2] = { c, 0 }; serial_puts(s);
-                }
-            }
-            serial_puts("\"\n");
-        }
-    }
-
-    /* [GERRHIST DIAGNOSTIC — uncommitted] For appError `throw 1` (funclet rethrow
-     * @0x10903EE4), the message is in GErrorHist (Core.dll buffer @0x101E3474, UTF-16),
-     * not the throw object. Dump it once-per-cascade to learn the real fatal reason
-     * (e.g. render/audio device init failure) behind the render-frontier exit. */
-    {
-        static int gerr_n = 0;
-        const volatile uint16_t *gh = (const volatile uint16_t *)(uintptr_t)0x101E3474ULL;
-        if (gerr_n < 4 && gh[0] != 0) {
-            gerr_n++;
-            serial_puts("[GERRHIST] \"");
-            for (int k = 0; k < 240 && gh[k]; k++) {
-                char c = (gh[k] >= 0x20 && gh[k] < 0x7F) ? (char)gh[k] : '?';
-                char s[2] = { c, 0 }; serial_puts(s);
-            }
-            serial_puts("\"\n");
-        }
-    }
-
-    /* Dump thrown object to identify the error message.
-     * Try reading the first few fields and interpret as string pointers. */
-    if (pExceptionObject) {
-        uint32_t obj32 = (uint32_t)(ULONG_PTR)pExceptionObject;
-        if (obj32 > 0x10000 && obj32 < 0x7FFFFFFF) {
-            uint32_t *f = (uint32_t *)(ULONG_PTR)obj32;
-            serial_puts("[CXX-OBJ] ");
-            for (int i = 0; i < 4; i++) {
-                serial_puthex(f[i], 8);
-                serial_puts(" ");
-            }
-            serial_puts("\n");
-            /* Try ALL fields as wide and narrow strings */
-            for (int fi = 0; fi < 4; fi++) {
-                if (f[fi] > 0x10000 && f[fi] < 0x7FFFFFFF) {
-                    uint16_t *ws = (uint16_t *)(ULONG_PTR)f[fi];
-                    char *ns = (char *)(ULONG_PTR)f[fi];
-                    if (ws[0] > 0x20 && ws[0] < 0x7F) {
-                        serial_puts("[CXX-F");
-                        serial_putdec(fi);
-                        serial_puts("] W\"");
-                        for (int i = 0; i < 200 && ws[i] > 0 && ws[i] < 0x7F; i++)
-                            serial_putchar((char)ws[i]);
-                        serial_puts("\"\n");
-                    } else if (ns[0] > 0x20 && ns[0] < 0x7F) {
-                        serial_puts("[CXX-F");
-                        serial_putdec(fi);
-                        serial_puts("] A\"");
-                        for (int i = 0; i < 200 && ns[i] >= 0x20 && ns[i] < 0x7F; i++)
-                            serial_putchar(ns[i]);
-                        serial_puts("\"\n");
-                    }
-                }
-            }
-        }
-    }
-
-    /*
-     * WORKAROUND: Full C++ EH (SEH unwind + __CxxFrameHandler dispatch)
-     * is not yet implemented. Calling RaiseException without proper CONTEXT
-     * and DispatcherContext causes all handlers to return ContinueSearch,
-     * leaving the C++ runtime corrupted (_CxxThrowException returns when
-     * it should never return → undefined behavior → vtable=0 crashes).
-     *
-     * For now: suppress real throws and rethrows. Return immediately.
-     * The engine code after throw is technically unreachable, but MSVC
-     * often generates fall-through code that works as error cleanup.
-     * This is NOT correct C++ semantics but lets the engine survive
-     * past localization failures and similar non-fatal errors.
-     */
-    /* Rethrow (throw;) — re-dispatch the current exception.
-     * This happens inside catch handlers that do: throw;
-     * Re-use the saved exception record from the original throw. */
-    if (!pExceptionObject && !pThrowInfo) {
-        serial_puts("[CXX] rethrow → re-dispatching current exception\n");
-        if (cxx_exception_active) {
-            /* Dispatch the saved exception to the next handler.
-             * Return 1 = handled (compat32 longjmped, this RET path
-             * is the post-handler unwind).  Return 0 = UNHANDLED, in
-             * which case _CxxThrowException MUST NOT RETURN — the
-             * engine compiler emitted padding bytes after the throw
-             * call assuming it never comes back.  Returning normally
-             * lands the engine in 0xCC INT3 padding.  Force exit. */
-            int handled = compat32_seh_dispatch(&cxx_current_exception);
-            if (!handled) {
-                extern void proc_exit(int32_t code);
-                serial_puts("[CXX] rethrow UNHANDLED — proc_exit\n");
-                proc_exit(0xE06D7363);
-                /* unreachable */
-            }
+    if (!exception_object && !throw_info) {
+        if (!cxx_exception_active) {
+            serial_puts("[MSVCRT] rethrow without an active exception\n");
+            crt_abort();
             return;
         }
-        /* No active exception — just suppress */
-        serial_puts("[CXX] WARNING: rethrow without active exception\n");
-        return;
-    }
-
-    /*
-     * ORIGINAL CODE (disabled):
-     * _CxxThrowException MUST NOT RETURN. The MSVC implementation calls
-     * RaiseException(0xE06D7363, EXCEPTION_NONCONTINUABLE, 3, args)
-     * which triggers SEH dispatch → __CxxFrameHandler → catch block.
-     *
-     * We implement a minimal SEH dispatch: walk the chain from
-     * the current TEB's ExceptionList, call each handler via compat32_callback,
-     * looking for EXCEPTION_EXECUTE_HANDLER. If found, restore the
-     * handler's stack frame and longjmp to the catch block.
-     *
-     * For now: call RaiseException which walks the SEH chain from
-     * that TEB and dispatches to registered handlers.
-     */
-    {
-        uint32_t seh_head = teb->ExceptionList;
-        serial_puts("[CXX] SEH chain head: 0x");
-        serial_puthex(seh_head, 8);
-        serial_puts("\n");
-
-        if (seh_head != 0xFFFFFFFF && seh_head != 0) {
-            /* Walk the SEH chain and dump handlers */
-            uint32_t *frame = (uint32_t *)(ULONG_PTR)seh_head;
-            for (int i = 0; i < 5 && frame && (uint32_t)(ULONG_PTR)frame != 0xFFFFFFFF; i++) {
-                uint32_t next = frame[0];
-                uint32_t handler = frame[1];
-                serial_puts("[CXX]  frame[");
-                serial_putdec(i);
-                serial_puts("] at 0x");
-                serial_puthex((uint64_t)(ULONG_PTR)frame, 8);
-                serial_puts(" handler=0x");
-                serial_puthex(handler, 8);
-                serial_puts(" next=0x");
-                serial_puthex(next, 8);
-                serial_puts("\n");
-                frame = (next == 0xFFFFFFFF) ? NULL : (uint32_t *)(ULONG_PTR)next;
-            }
-        }
-    }
-
-    /* Build and save the exception record for re-throw support */
-    {
-        BYTE *p = (BYTE *)&cxx_current_exception;
-        for (SIZE_T i = 0; i < sizeof(cxx_current_exception); i++) p[i] = 0;
-        cxx_current_exception.ExceptionCode = 0xE06D7363;
-        cxx_current_exception.ExceptionFlags = 1; /* NONCONTINUABLE */
-        cxx_current_exception.NumberParameters = 3;
-        cxx_current_exception.ExceptionInformation[0] = 0x19930520;
-        cxx_current_exception.ExceptionInformation[1] = (ULONG_PTR)pExceptionObject;
-        cxx_current_exception.ExceptionInformation[2] = (ULONG_PTR)pThrowInfo;
-        cxx_exception_active = 1;
-    }
-
-    /* Pre-check: if SEH chain head is in PE-image .text range
-     * (DLL CODE, not stack), try to repair. UT99's PE32 stack is
-     * around 0x13E0xxxx-0x13F0xxxx — NOT corrupt, just user stack.
-     * Engine.dll/Core.dll text is 0x10000000-0x10A00000 typically;
-     * the data/import area extends past that. Tighten the range to
-     * only DLL code regions where SEH frames CAN'T live. */
-    {
-        uint32_t head = teb->ExceptionList;
-        /* PE image .text range: 0x10000000-0x12000000 (Engine + Core
-         * + Render + a few smaller DLLs). UT99 stack is 0x13xxxxxx,
-         * so 0x12000000 is a safe upper bound — anything above is
-         * either stack (valid SEH frame) or NULL/end-sentinel. */
-        if (head >= 0x10000000 && head < 0x12000000) {
-            /* Try to repair: follow Next pointers past corrupt entries */
-            uint32_t *corrupt = (uint32_t *)(uintptr_t)head;
-            uint32_t next = corrupt[0];
-            serial_puts("[CXX] SEH chain head corrupt (0x");
-            serial_puthex(head, 8);
-            serial_puts("), next=0x");
-            serial_puthex(next, 8);
-            serial_puts("\n");
-
-            if (next != 0 && next != 0xFFFFFFFF &&
-                (next < 0x10000000 || next >= 0x12000000)) {
-                /* Next is a valid non-PE address — repair chain.
-                 * Also insert our base SEH handler so there's at least
-                 * one handler to dispatch to (the original chain may only
-                 * have end sentinels after the corrupt entry). */
-                static uint32_t emergency_frame[3];
-                uint32_t base_handler = crt_get_base_seh_thunk();
-                if (base_handler) {
-                    emergency_frame[0] = next; /* chain to remaining frames */
-                    emergency_frame[1] = base_handler;
-                    emergency_frame[2] = 0;
-                    teb->ExceptionList =
-                        (uint32_t)(uintptr_t)emergency_frame;
-                    serial_puts("[CXX] Repaired: emergency frame at 0x");
-                    serial_puthex((uint32_t)(uintptr_t)emergency_frame, 8);
-                    serial_puts(" -> 0x");
-                    serial_puthex(next, 8);
-                    serial_puts("\n");
-                } else {
-                    teb->ExceptionList = next;
-                    serial_puts("[CXX] Repaired: chain head -> 0x");
-                    serial_puthex(next, 8);
-                    serial_puts("\n");
-                }
-                /* Fall through to RaiseException with repaired chain */
-            } else {
-                /* Can't repair — suppress throw */
-                serial_puts("[CXX] Cannot repair chain — suppressing throw\n");
-                cxx_exception_active = 0;
-                return;
-            }
-        }
-    }
-
-    /* Call RaiseException with the C++ exception code.
-     * This will dispatch through the SEH chain. */
-    {
-        ULONG_PTR args[3];
-        args[0] = 0x19930520;  /* EH_MAGIC_NUMBER1 */
-        args[1] = (ULONG_PTR)pExceptionObject;
-        args[2] = (ULONG_PTR)pThrowInfo;
-        RaiseException(0xE06D7363, 1 /* EXCEPTION_NONCONTINUABLE */, 3, args);
-    }
-
-    /* RaiseException returned — check if the dispatch handled it.
-     * If unwind globals are set, the INT2E handler will redirect to the
-     * catch handler. The exception IS handled — keep cxx_exception_active
-     * so re-throws from the catch handler can propagate. */
-    {
-        extern uint32_t g_compat32_unwind_eip;
-        if (g_compat32_unwind_eip != 0) {
-            /* Dispatch handled it — INT2E will redirect to catch.
-             * Keep cxx_exception_active for re-throw support. */
-            return;
-        }
-    }
-    serial_puts("[CXX] WARNING: _CxxThrowException unhandled — suppressing\n");
-    cxx_exception_active = 0;
-
-    /* Clear GErrorHist + GIsCriticalError so Browse() doesn't see stale
-     * error state from suppressed exceptions during init. */
-    {
-        volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
-        volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
-        *gerr = 0;
-        *gcrit = 0;
-        serial_puts("[CXX] cleared GErrorHist+GIsCriticalError\n");
-    }
-
-    /* Instead of proc_exit(1), just return and let the 32-bit code continue.
-     * _CxxThrowException "should never return" but the engine's code after
-     * throw often has fall-through error cleanup that's reachable.
-     * With NULL-REDIRECT and page 0 cleanup, post-throw crashes are handled.
-     * The engine may enter its game loop in error state — better than exiting. */
-    return;
-
-    /* ── Diagnostic: dump GObjRegistrants state ────────────── */
-    {
-        /* GObjRegistrants@UObject is a TArray<UObject*> at Core.dll export RVA 0x1A0360
-         * Core.dll base = 0x10100000, so VA = 0x102A0360
-         * TArray layout: { T* Data (+0), INT Num (+4), INT Max (+8) } */
-        uint32_t *gobjreg = (uint32_t *)(ULONG_PTR)0x102A0360;
-        uint32_t data_ptr = gobjreg[0];
-        int32_t  num      = (int32_t)gobjreg[1];
-        int32_t  max      = (int32_t)gobjreg[2];
-
-        serial_puts("[CXX-DIAG] GObjRegistrants: Data=0x");
-        serial_puthex(data_ptr, 8);
-        serial_puts(" Num=");
-        serial_putdec(num);
-        serial_puts(" Max=");
-        serial_putdec(max);
-        serial_puts("\n");
-
-        /* UObject::PrivateStaticClass at VA 0x102A1768 */
-        uint32_t *uobj = (uint32_t *)(ULONG_PTR)0x102A1768;
-        serial_puts("[CXX-DIAG] UObject.Index=0x");
-        serial_puthex(uobj[1], 8);  /* +0x04 = Index */
-        serial_puts("\n");
-
-        /* Dump first 16 bytes of UObject to check if registration changed anything */
-        serial_puts("[CXX-DIAG] UObject @0x102A1768 raw: ");
-        for (int i = 0; i < 16; i++) {
-            serial_puthex(uobj[i], 8);
-            serial_puts(" ");
-        }
-        serial_puts("\n");
-
-        /* Scan GObjRegistrants array: count zeros vs non-zero */
-        if (data_ptr && num > 0 && num < 10000) {
-            uint32_t *arr = (uint32_t *)(ULONG_PTR)data_ptr;
-            int zeros = 0, nonzeros = 0;
-            int first_nz = -1, last_nz = -1;
-            int uobj_idx = -1;
-            for (int i = 0; i < num && i < 300; i++) {
-                if (arr[i] == 0) {
-                    zeros++;
-                } else {
-                    nonzeros++;
-                    if (first_nz < 0) first_nz = i;
-                    last_nz = i;
-                }
-                if (arr[i] == 0x102A1768) uobj_idx = i;
-            }
-            serial_puts("[CXX-DIAG] zeros=");
-            serial_putdec(zeros);
-            serial_puts(" nonzeros=");
-            serial_putdec(nonzeros);
-            serial_puts(" first_nz=");
-            serial_putdec(first_nz >= 0 ? first_nz : -1);
-            serial_puts(" last_nz=");
-            serial_putdec(last_nz >= 0 ? last_nz : -1);
-            serial_puts(" UObject_idx=");
-            serial_putdec(uobj_idx >= 0 ? uobj_idx : -1);
-            serial_puts("\n");
-
-            /* Dump ALL non-zero entries (max 20) */
-            int shown = 0;
-            for (int i = 0; i < num && i < 300 && shown < 20; i++) {
-                if (arr[i] == 0) continue;
-                uint32_t ea = arr[i];
-                uint32_t *e = (uint32_t *)(ULONG_PTR)ea;
-                serial_puts("[CXX-DIAG] nz[");
-                serial_putdec(i);
-                serial_puts("] @0x");
-                serial_puthex(ea, 8);
-                serial_puts(": idx=");
-                serial_puthex(e[1], 8);
-                serial_puts(" flags=");
-                serial_puthex(e[7], 8);
-                serial_puts(" super=");
-                serial_puthex(e[10], 8);
-                serial_puts(" propSz=");
-                serial_puthex(*(uint32_t *)((uint8_t *)(ULONG_PTR)ea + 0x3C), 8);
-                serial_puts("\n");
-                shown++;
-            }
-
-            /* Also dump raw 32 bytes around the Data pointer to check alignment */
-            serial_puts("[CXX-DIAG] raw @Data+0x000:");
-            for (int i = 0; i < 8; i++) {
-                serial_puts(" ");
-                serial_puthex(arr[i], 8);
-            }
-            serial_puts("\n");
-            /* And at the end */
-            serial_puts("[CXX-DIAG] raw @Data+");
-            serial_puthex((num - 4) * 4, 4);
-            serial_puts(":");
-            for (int i = num - 4; i < num; i++) {
-                serial_puts(" ");
-                serial_puthex(arr[i < 0 ? 0 : i], 8);
-            }
-            serial_puts("\n");
-
-            /* Check the physical memory at the GObjRegistrants.Data address */
-            /* Read GObjNoRegister (at Core.dll RVA 0x1A21A0 → VA 0x102A21A0) */
-            uint32_t *noregister = (uint32_t *)(ULONG_PTR)0x102A21A0;
-            serial_puts("[CXX-DIAG] GObjNoRegister = ");
-            serial_putdec(*noregister);
-            serial_puts("\n");
-        }
-
-        /* Dump FName table: FName::Names is a TArray at 0x10295D30 (IAT resolved) */
-        /* Actually read the pointer from 0x10295D30 which is the Names TArray address */
-        uint32_t *fname_names = (uint32_t *)(ULONG_PTR)0x10295D30;
-        serial_puts("[CXX-DIAG] FName::Names: Data=0x");
-        serial_puthex(fname_names[0], 8);
-        serial_puts(" Num=");
-        serial_putdec((int32_t)fname_names[1]);
-        serial_puts(" Max=");
-        serial_putdec((int32_t)fname_names[2]);
-        serial_puts("\n");
-
-        /* Follow GetSuperClass JMP thunk to get actual implementation */
-        /* GetSuperClass VA=0x10103341, starts with E9 xx xx xx xx (JMP rel32) */
-        uint8_t *gsc = (uint8_t *)(ULONG_PTR)0x10103341;
-        if (gsc[0] == 0xE9) {
-            int32_t rel = *(int32_t *)(gsc + 1);
-            uint32_t target = 0x10103341 + 5 + rel;
-            uint8_t *impl = (uint8_t *)(ULONG_PTR)target;
-            serial_puts("[CXX-DIAG] GetSuperClass @0x");
-            serial_puthex(target, 8);
-            serial_puts(" bytes: ");
-            for (int i = 0; i < 8; i++) {
-                serial_puthex(impl[i], 2);
-                serial_puts(" ");
-            }
-            serial_puts("\n");
-            /* If mov eax,[ecx+XX]; ret → 8B 41 XX C3 */
-            if (impl[0] == 0x8B && impl[1] == 0x41) {
-                serial_puts("[CXX-DIAG] SuperField offset = +0x");
-                serial_puthex(impl[2], 2);
-                serial_puts("\n");
-            } else if (impl[0] == 0x8B && impl[1] == 0x81) {
-                int32_t off = *(int32_t *)(impl + 2);
-                serial_puts("[CXX-DIAG] SuperField offset = +0x");
-                serial_puthex(off, 8);
-                serial_puts("\n");
-            }
-        }
-    }
-    /* ── End diagnostic ────────────────────────────────────── */
-
-    EXCEPTION_RECORD rec;
-    BYTE *p = (BYTE *)&rec;
-
-    if (pExceptionObject == NULL && pThrowInfo == NULL && cxx_exception_active) {
-        /* Re-throw (C++ "throw;") — reuse the saved exception */
-        serial_puts("[MSVCRT] re-throw — using saved exception\n");
-        for (SIZE_T i = 0; i < sizeof(rec); i++) p[i] = ((BYTE *)&cxx_current_exception)[i];
+        record = cxx_current_exception;
     } else {
-        /* New throw — build MSVC C++ exception record */
-        for (SIZE_T i = 0; i < sizeof(rec); i++) p[i] = 0;
-        rec.ExceptionCode  = 0xE06D7363;  /* MSVC C++ exception 'msc' */
-        rec.ExceptionFlags = 0;           /* continuable */
-        rec.NumberParameters = 3;
-        rec.ExceptionInformation[0] = 0x19930520;  /* MSVC EH magic */
-        rec.ExceptionInformation[1] = (ULONG_PTR)pExceptionObject;
-        rec.ExceptionInformation[2] = (ULONG_PTR)pThrowInfo;
+        BYTE *bytes = (BYTE *)&record;
+        for (SIZE_T i = 0; i < sizeof(record); i++)
+            bytes[i] = 0;
 
-        /* Save for potential re-throw */
-        for (SIZE_T i = 0; i < sizeof(rec); i++) ((BYTE *)&cxx_current_exception)[i] = p[i];
+        extern uint32_t compat32_get_last_caller_eip(void);
+        record.ExceptionCode = 0xE06D7363;
+        record.ExceptionFlags = 1; /* EXCEPTION_NONCONTINUABLE */
+        record.ExceptionAddress =
+            (PVOID)(ULONG_PTR)compat32_get_last_caller_eip();
+        record.NumberParameters = 3;
+        record.ExceptionInformation[0] = 0x19930520;
+        record.ExceptionInformation[1] = (ULONG_PTR)exception_object;
+        record.ExceptionInformation[2] = (ULONG_PTR)throw_info;
+
+        cxx_current_exception = record;
         cxx_exception_active = 1;
     }
 
-    /* Dispatch through the 32-bit SEH chain */
-    int handled = compat32_seh_dispatch(&rec);
-
-    if (handled) {
-        serial_puts("[MSVCRT] _CxxThrowException: handled by SEH\n");
-        cxx_exception_active = 0;
+    if (compat32_seh_dispatch(&record))
         return;
-    }
 
-    /* Unhandled — terminate */
-    serial_puts("[MSVCRT] _CxxThrowException: UNHANDLED — aborting\n");
     cxx_exception_active = 0;
+    serial_puts("[MSVCRT] unhandled C++ exception\n");
     crt_abort();
 }
+
 
 /*
  * __CxxFrameHandler — MSVC 6 C++ exception frame handler.
@@ -5118,16 +5094,18 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
  */
 uint32_t crt_find_cxx_func_info(uint32_t handler_addr)
 {
-    if (handler_addr < 0x10000 || handler_addr >= 0x80000000)
+    if (!compat32_range_executable(handler_addr, 1))
         return 0;
 
     const uint8_t *stub = (const uint8_t *)(ULONG_PTR)handler_addr;
     for (uint32_t i = 0; i + 10 <= 64; i++) {
+        if (!compat32_range_executable(handler_addr + i, 10))
+            break;
         if (stub[i] != 0xB8 || stub[i + 5] != 0xE9)
             continue;
 
         uint32_t candidate = *(const uint32_t *)(stub + i + 1);
-        if (candidate < 0x10000 || candidate >= 0x80000000)
+        if (!compat32_range_readable(candidate, 5U * sizeof(uint32_t)))
             continue;
 
         uint32_t magic = *(const uint32_t *)(ULONG_PTR)candidate;
@@ -5337,22 +5315,95 @@ EXCEPTION_DISPOSITION WINAPI crt_C_specific_handler(
     PCONTEXT ContextRecord,
     PVOID DispatcherContext)
 {
-    (void)ExceptionRecord; (void)EstablisherFrame;
-    (void)ContextRecord; (void)DispatcherContext;
-    return 1; /* ExceptionContinueSearch */
+    return win32_unwind64_c_specific_handler(
+        ExceptionRecord, EstablisherFrame, ContextRecord,
+        (PDISPATCHER_CONTEXT)DispatcherContext);
 }
 
-/* __initenv — pointer to initial environment (char **) */
-static char *crt_initenv_data[] = { NULL };
-static char **crt_initenv_val = crt_initenv_data;
-
-/* signal — install signal handler (stub, returns SIG_DFL) */
-typedef void (*crt_sighandler_t)(int);
+/* The Microsoft CRT supports this fixed signal set. Handler state belongs to
+ * the process; delivery by raise() is synchronous on the calling thread. */
 #define CRT_SIG_DFL ((crt_sighandler_t)0)
+#define CRT_SIG_IGN ((crt_sighandler_t)1)
+#define CRT_SIG_ERR ((crt_sighandler_t)(LONG_PTR)-1)
+
+static int crt_signal_index(int sig)
+{
+    switch (sig) {
+    case 2:  return 0; /* SIGINT */
+    case 4:  return 1; /* SIGILL */
+    case 8:  return 2; /* SIGFPE */
+    case 11: return 3; /* SIGSEGV */
+    case 15: return 4; /* SIGTERM */
+    case 21: return 5; /* SIGBREAK */
+    case 22: return 6; /* SIGABRT */
+    default: return -1;
+    }
+}
+
 crt_sighandler_t WINAPI crt_signal(int sig, crt_sighandler_t handler)
 {
-    (void)sig; (void)handler;
-    return CRT_SIG_DFL;
+    int index = crt_signal_index(sig);
+    if (index < 0 || handler == CRT_SIG_ERR) {
+        *crt_errno() = CRT_EINVAL;
+        return CRT_SIG_ERR;
+    }
+
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) {
+        *crt_errno() = CRT_ENOMEM;
+        return CRT_SIG_ERR;
+    }
+
+    ucrt_state_lock_acquire();
+    crt_sighandler_t previous =
+        (crt_sighandler_t)(ULONG_PTR)values->signal_handlers[index];
+    values->signal_handlers[index] = (ULONG_PTR)handler;
+    ucrt_state_lock_release();
+    *crt_errno() = 0;
+    return previous;
+}
+
+int WINAPI crt_raise(int sig)
+{
+    int index = crt_signal_index(sig);
+    if (index < 0) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) {
+        *crt_errno() = CRT_ENOMEM;
+        return -1;
+    }
+
+    ucrt_state_lock_acquire();
+    crt_sighandler_t handler =
+        (crt_sighandler_t)(ULONG_PTR)values->signal_handlers[index];
+    if (handler != CRT_SIG_DFL && handler != CRT_SIG_IGN)
+        values->signal_handlers[index] = (ULONG_PTR)CRT_SIG_DFL;
+    ucrt_state_lock_release();
+
+    if (handler == CRT_SIG_IGN) {
+        *crt_errno() = 0;
+        return 0;
+    }
+    if (handler == CRT_SIG_DFL) {
+        serial_puts("[MSVCRT] unhandled signal ");
+        serial_putdec((uint64_t)(uint32_t)sig);
+        serial_puts("\n");
+        ExitProcess(3);
+        return 0;
+    }
+
+    if (g_compat32_mode) {
+        uint32_t args[1] = { (uint32_t)sig };
+        (void)compat32_callback_args((uint32_t)(ULONG_PTR)handler, 1, args);
+    } else {
+        handler(sig);
+    }
+    *crt_errno() = 0;
+    return 0;
 }
 
 /* __setusermatherr — set math error handler (store, ignore) */
@@ -5362,18 +5413,19 @@ void WINAPI crt_setusermatherr(_UserMathErrFunc handler)
     crt_usermatherr_handler = handler;
 }
 
-/* _acmdln — pointer to command line string */
-static char *crt_acmdln_val = "";
+/* _acmdln accessor used by native shim code. The exported symbol itself is
+ * process-local writable storage returned by msvcrt_resolve(). */
 char* WINAPI crt_acmdln(void)
 {
-    return crt_acmdln_val;
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    return values ? values->command_line : NULL;
 }
 
 /* _adjust_fdiv — FDIV adjustment flag (always 0, no bug) */
-static int crt_adjust_fdiv_val = 0;
 int* WINAPI crt_adjust_fdiv(void)
 {
-    return &crt_adjust_fdiv_val;
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    return values ? &values->adjust_fdiv : NULL;
 }
 
 /* _controlfp — control floating point
@@ -5596,7 +5648,8 @@ enum {
     WLEN_Z,
     WLEN_T,
     WLEN_I32,
-    WLEN_I64
+    WLEN_I64,
+    WLEN_CAPITAL_L
 };
 
 static void wfmt_integer(WFMT_CTX *ctx, unsigned long long value, int negative,
@@ -5867,6 +5920,418 @@ static int do_vformat_wide64(WFMT_CTX *ctx, const WCHAR *fmt, ms_va_list ap)
     return (int)ctx->pos;
 }
 
+static uint32_t wfmt_arg32_u32(uint32_t **args)
+{
+    uint32_t value = **args;
+    (*args)++;
+    return value;
+}
+
+static uint64_t wfmt_arg32_u64(uint32_t **args)
+{
+    uint64_t value = (uint64_t)(*args)[0] |
+                     ((uint64_t)(*args)[1] << 32);
+    *args += 2;
+    return value;
+}
+
+static double wfmt_arg32_double(uint32_t **args)
+{
+    uint64_t bits = wfmt_arg32_u64(args);
+    double value;
+    crt_memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+/* PE32 cdecl va_list values are packed in 4-byte stack slots. Keep this
+ * parser separate from do_vformat_wide64: using ms_va_arg here would advance
+ * by Microsoft x64 argument homes and merge adjacent i386 arguments. */
+static SIZE_T do_vformat_wide32(WFMT_CTX *ctx, const WCHAR *fmt,
+                                uint32_t *args)
+{
+    static const WCHAR null_wide[] = {'(','n','u','l','l',')',0};
+    static const char null_narrow[] = "(null)";
+
+    while (*fmt) {
+        if (*fmt != '%') {
+            wfmt_putc(ctx, *fmt++);
+            continue;
+        }
+        fmt++;
+
+        int left = 0, zero = 0, plus = 0, space = 0, alternate = 0;
+        for (;;) {
+            if (*fmt == '-') { left = 1; fmt++; }
+            else if (*fmt == '0') { zero = 1; fmt++; }
+            else if (*fmt == '+') { plus = 1; fmt++; }
+            else if (*fmt == ' ') { space = 1; fmt++; }
+            else if (*fmt == '#') { alternate = 1; fmt++; }
+            else break;
+        }
+
+        int width = 0;
+        if (*fmt == '*') {
+            width = (int32_t)wfmt_arg32_u32(&args);
+            fmt++;
+            if (width < 0) { left = 1; width = -width; }
+        } else {
+            while (*fmt >= '0' && *fmt <= '9')
+                width = width * 10 + (*fmt++ - '0');
+        }
+
+        int precision = -1;
+        if (*fmt == '.') {
+            fmt++;
+            precision = 0;
+            if (*fmt == '*') {
+                precision = (int32_t)wfmt_arg32_u32(&args);
+                fmt++;
+                if (precision < 0) precision = -1;
+            } else {
+                while (*fmt >= '0' && *fmt <= '9')
+                    precision = precision * 10 + (*fmt++ - '0');
+            }
+        }
+
+        int length = WLEN_DEFAULT;
+        if (*fmt == 'h') {
+            fmt++;
+            length = WLEN_H;
+            if (*fmt == 'h') { fmt++; length = WLEN_HH; }
+        } else if (*fmt == 'l') {
+            fmt++;
+            length = WLEN_L;
+            if (*fmt == 'l') { fmt++; length = WLEN_LL; }
+        } else if (*fmt == 'j') { fmt++; length = WLEN_J; }
+        else if (*fmt == 'z') { fmt++; length = WLEN_Z; }
+        else if (*fmt == 't') { fmt++; length = WLEN_T; }
+        else if (*fmt == 'L') { fmt++; length = WLEN_CAPITAL_L; }
+        else if (*fmt == 'I') {
+            if (fmt[1] == '6' && fmt[2] == '4') { fmt += 3; length = WLEN_I64; }
+            else if (fmt[1] == '3' && fmt[2] == '2') { fmt += 3; length = WLEN_I32; }
+            else { fmt++; length = WLEN_Z; }
+        }
+
+        WCHAR conversion = *fmt;
+        if (!conversion) break;
+        fmt++;
+
+        switch (conversion) {
+        case 'd': case 'i': {
+            long long signed_value;
+            if (length == WLEN_LL || length == WLEN_I64 ||
+                length == WLEN_J) {
+                signed_value = (long long)(int64_t)wfmt_arg32_u64(&args);
+            } else {
+                int32_t value = (int32_t)wfmt_arg32_u32(&args);
+                if (length == WLEN_H) value = (short)value;
+                else if (length == WLEN_HH) value = (signed char)value;
+                signed_value = (long long)value;
+            }
+            int negative = signed_value < 0;
+            unsigned long long magnitude = negative
+                ? 0ULL - (unsigned long long)signed_value
+                : (unsigned long long)signed_value;
+            wfmt_integer(ctx, magnitude, negative, 10, 0, width, precision,
+                         left, zero, plus, space, 0);
+            break;
+        }
+        case 'u': case 'o': case 'x': case 'X': {
+            unsigned long long value;
+            if (length == WLEN_LL || length == WLEN_I64 ||
+                length == WLEN_J) {
+                value = (unsigned long long)wfmt_arg32_u64(&args);
+            } else {
+                uint32_t value32 = wfmt_arg32_u32(&args);
+                if (length == WLEN_H) value32 = (unsigned short)value32;
+                else if (length == WLEN_HH)
+                    value32 = (unsigned char)value32;
+                value = (unsigned long long)value32;
+            }
+            int base = conversion == 'o' ? 8 :
+                       (conversion == 'x' || conversion == 'X') ? 16 : 10;
+            wfmt_integer(ctx, value, 0, base, conversion == 'X', width,
+                         precision, left, zero, 0, 0, alternate);
+            break;
+        }
+        case 'p': {
+            unsigned long long value =
+                (unsigned long long)wfmt_arg32_u32(&args);
+            wfmt_integer(ctx, value, 0, 16, 0, width, precision,
+                         left, zero, 0, 0, 1);
+            break;
+        }
+        case 's': {
+            uint32_t raw_pointer = wfmt_arg32_u32(&args);
+            if (length == WLEN_H || length == WLEN_HH) {
+                const char *s = (const char *)(uintptr_t)raw_pointer;
+                if (!s) s = null_narrow;
+                SIZE_T len = 0;
+                while (s[len] &&
+                       (precision < 0 || len < (SIZE_T)precision)) len++;
+                if (!left) wfmt_pad(ctx, width - (int)len, ' ');
+                wfmt_put_ascii(ctx, s, len);
+                if (left) wfmt_pad(ctx, width - (int)len, ' ');
+            } else {
+                const WCHAR *s = (const WCHAR *)(uintptr_t)raw_pointer;
+                if (!s) s = null_wide;
+                SIZE_T len = wfmt_wcsnlen(s, precision);
+                if (!left) wfmt_pad(ctx, width - (int)len, ' ');
+                wfmt_put_wide(ctx, s, len);
+                if (left) wfmt_pad(ctx, width - (int)len, ' ');
+            }
+            break;
+        }
+        case 'S': {
+            uint32_t raw_pointer = wfmt_arg32_u32(&args);
+            if (length == WLEN_L || length == WLEN_LL) {
+                const WCHAR *s = (const WCHAR *)(uintptr_t)raw_pointer;
+                if (!s) s = null_wide;
+                SIZE_T len = wfmt_wcsnlen(s, precision);
+                if (!left) wfmt_pad(ctx, width - (int)len, ' ');
+                wfmt_put_wide(ctx, s, len);
+                if (left) wfmt_pad(ctx, width - (int)len, ' ');
+            } else {
+                const char *s = (const char *)(uintptr_t)raw_pointer;
+                if (!s) s = null_narrow;
+                SIZE_T len = 0;
+                while (s[len] &&
+                       (precision < 0 || len < (SIZE_T)precision)) len++;
+                if (!left) wfmt_pad(ctx, width - (int)len, ' ');
+                wfmt_put_ascii(ctx, s, len);
+                if (left) wfmt_pad(ctx, width - (int)len, ' ');
+            }
+            break;
+        }
+        case 'c': {
+            uint32_t value = wfmt_arg32_u32(&args);
+            WCHAR c = length == WLEN_H || length == WLEN_HH
+                    ? (WCHAR)(unsigned char)value : (WCHAR)value;
+            if (!left) wfmt_pad(ctx, width - 1, ' ');
+            wfmt_putc(ctx, c);
+            if (left) wfmt_pad(ctx, width - 1, ' ');
+            break;
+        }
+        case 'C': {
+            uint32_t value = wfmt_arg32_u32(&args);
+            WCHAR c = length == WLEN_L || length == WLEN_LL
+                    ? (WCHAR)value : (WCHAR)(unsigned char)value;
+            if (!left) wfmt_pad(ctx, width - 1, ' ');
+            wfmt_putc(ctx, c);
+            if (left) wfmt_pad(ctx, width - 1, ' ');
+            break;
+        }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G':
+            wfmt_float(ctx, wfmt_arg32_double(&args), width, precision,
+                       left, zero, plus, space);
+            break;
+        case 'n': {
+            PVOID out = (PVOID)(uintptr_t)wfmt_arg32_u32(&args);
+            if (!out) break;
+            if (length == WLEN_HH) *(signed char *)out = (signed char)ctx->pos;
+            else if (length == WLEN_H) *(short *)out = (short)ctx->pos;
+            else if (length == WLEN_LL || length == WLEN_I64 ||
+                     length == WLEN_J)
+                *(long long *)out = (long long)ctx->pos;
+            else
+                *(int *)out = (int)ctx->pos;
+            break;
+        }
+        case '%':
+            wfmt_putc(ctx, '%');
+            break;
+        default:
+            wfmt_putc(ctx, '%');
+            wfmt_putc(ctx, conversion);
+            break;
+        }
+    }
+
+    if (ctx->buf && ctx->size > 0) {
+        SIZE_T end = ctx->pos < ctx->size - 1 ? ctx->pos : ctx->size - 1;
+        ctx->buf[end] = 0;
+    }
+    return ctx->pos;
+}
+
+int WINAPI crt_vswprintf_c_l(WCHAR *buffer, SIZE_T buffer_count,
+                              const WCHAR *format, PVOID locale,
+                              PVOID arg_list)
+{
+    (void)locale; /* The locale shim currently exposes the invariant C locale. */
+
+    if (!format || !arg_list || (!buffer && buffer_count != 0)) {
+        if (buffer && buffer_count) buffer[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    if (buffer && buffer_count == 0)
+        return -1;
+
+    WFMT_CTX ctx = { buffer, buffer_count, 0 };
+    SIZE_T required;
+    if (g_compat32_mode) {
+        required = do_vformat_wide32(
+            &ctx, format, (uint32_t *)(uintptr_t)arg_list);
+    } else {
+        int native_required = do_vformat_wide64(
+            &ctx, format, (ms_va_list)arg_list);
+        if (native_required < 0)
+            return -1;
+        required = (SIZE_T)native_required;
+    }
+
+    if (required > 0x7fffffffU) {
+        *crt_errno() = CRT_EOVERFLOW;
+        return -1;
+    }
+    if (buffer_count != 0 && required >= buffer_count)
+        return -1;
+    return (int)required;
+}
+
+static int crt_wformat_bounded_result(SIZE_T required, SIZE_T buffer_count)
+{
+    if (required > 0x7fffffffU) {
+        *crt_errno() = CRT_EOVERFLOW;
+        return -1;
+    }
+    return buffer_count != 0 && required >= buffer_count
+        ? -1 : (int)required;
+}
+
+static int WINAPI crt_snwprintf_compat32(WCHAR *buffer, SIZE_T buffer_count,
+                                          const WCHAR *format,
+                                          uint32_t *args)
+{
+    if (!format || (!buffer && buffer_count != 0) ||
+        (buffer && buffer_count == 0)) {
+        if (buffer && buffer_count) buffer[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    WFMT_CTX ctx = { buffer, buffer_count, 0 };
+    SIZE_T required = do_vformat_wide32(&ctx, format, args);
+    return crt_wformat_bounded_result(required, buffer_count);
+}
+
+int WINAPI crt_snwprintf(WCHAR *buffer, SIZE_T buffer_count,
+                         const WCHAR *format, ...)
+{
+    if (!format || (!buffer && buffer_count != 0) ||
+        (buffer && buffer_count == 0)) {
+        if (buffer && buffer_count) buffer[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    ms_va_list ap;
+    ms_va_start(ap, format);
+    WFMT_CTX ctx = { buffer, buffer_count, 0 };
+    int required = do_vformat_wide64(&ctx, format, ap);
+    ms_va_end(ap);
+    if (required < 0)
+        return -1;
+    return crt_wformat_bounded_result((SIZE_T)required, buffer_count);
+}
+
+static int crt_fwprintf_write(PVOID stream, WCHAR *wide, SIZE_T count)
+{
+    if (!stream || !crt_file_resolve((CRT_FILE *)stream, NULL)) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+    if (!count)
+        return 0;
+
+    char *narrow = (char *)crt_malloc(count + 1);
+    if (!narrow) {
+        *crt_errno() = CRT_ENOMEM;
+        return -1;
+    }
+    SIZE_T converted = crt_wcstombs(narrow, wide, count + 1);
+    if (converted == (SIZE_T)-1) {
+        crt_free(narrow);
+        return -1;
+    }
+    SIZE_T written = crt_fwrite(narrow, 1, converted, (CRT_FILE *)stream);
+    crt_free(narrow);
+    return written == converted ? (int)count : -1;
+}
+
+static WCHAR *crt_fwprintf_allocate(SIZE_T required)
+{
+    if (required > 0x7fffffffU ||
+        required >= (SIZE_T)-1 / sizeof(WCHAR)) {
+        *crt_errno() = CRT_EOVERFLOW;
+        return NULL;
+    }
+    WCHAR *buffer = (WCHAR *)crt_malloc((required + 1) * sizeof(WCHAR));
+    if (!buffer)
+        *crt_errno() = CRT_ENOMEM;
+    return buffer;
+}
+
+static int WINAPI crt_fwprintf_compat32(PVOID stream, const WCHAR *format,
+                                         uint32_t *args)
+{
+    if (!stream || !format) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    WFMT_CTX measure = { NULL, 0, 0 };
+    SIZE_T required = do_vformat_wide32(&measure, format, args);
+    WCHAR *buffer = crt_fwprintf_allocate(required);
+    if (!buffer)
+        return -1;
+
+    WFMT_CTX output = { buffer, required + 1, 0 };
+    do_vformat_wide32(&output, format, args);
+    int result = crt_fwprintf_write(stream, buffer, required);
+    crt_free(buffer);
+    return result;
+}
+
+int WINAPI crt_fwprintf(PVOID stream, const WCHAR *format, ...)
+{
+    if (!stream || !format) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    ms_va_list ap;
+    ms_va_start(ap, format);
+    ms_va_list measure_args;
+    ms_va_copy(measure_args, ap);
+    WFMT_CTX measure = { NULL, 0, 0 };
+    int native_required = do_vformat_wide64(&measure, format, measure_args);
+    ms_va_end(measure_args);
+    if (native_required < 0) {
+        ms_va_end(ap);
+        return -1;
+    }
+
+    SIZE_T required = (SIZE_T)native_required;
+    WCHAR *buffer = crt_fwprintf_allocate(required);
+    if (!buffer) {
+        ms_va_end(ap);
+        return -1;
+    }
+
+    ms_va_list output_args;
+    ms_va_copy(output_args, ap);
+    WFMT_CTX output = { buffer, required + 1, 0 };
+    do_vformat_wide64(&output, format, output_args);
+    ms_va_end(output_args);
+    ms_va_end(ap);
+
+    int result = crt_fwprintf_write(stream, buffer, required);
+    crt_free(buffer);
+    return result;
+}
+
 int WINAPI crt_stdio_common_vswprintf(uint64_t options, WCHAR *buffer,
                                       SIZE_T buffer_count,
                                       const WCHAR *format, PVOID locale,
@@ -5903,7 +6368,7 @@ int WINAPI crt_stdio_common_vswprintf(uint64_t options, WCHAR *buffer,
     return required;
 }
 
-/* ── UT99 Core.dll / Engine.dll missing exports ────────────── */
+/* ── MSVC C++ runtime and compiler-intrinsic exports ───────── */
 
 /* ?terminate@@YAXXZ — C++ terminate() handler */
 void WINAPI crt_terminate(void)
@@ -5912,44 +6377,97 @@ void WINAPI crt_terminate(void)
     ExitProcess(3);
 }
 
+static double crt_math_qnan(void)
+{
+    union { uint64_t bits; double value; } result;
+    result.bits = 0x7FF8000000000000ULL;
+    return result.value;
+}
+
+static double crt_math_positive_infinity(void)
+{
+    union { uint64_t bits; double value; } result;
+    result.bits = 0x7FF0000000000000ULL;
+    return result.value;
+}
+
+static int crt_math_is_nan(double value)
+{
+    union { double value; uint64_t bits; } number = { value };
+    return (number.bits & 0x7FF0000000000000ULL) ==
+               0x7FF0000000000000ULL &&
+           (number.bits & 0x000FFFFFFFFFFFFFULL) != 0;
+}
+
+static int crt_math_is_infinite(double value)
+{
+    union { double value; uint64_t bits; } number = { value };
+    return (number.bits & 0x7FFFFFFFFFFFFFFFULL) ==
+           0x7FF0000000000000ULL;
+}
+
 /* _CIacos — compiler intrinsic wrapper for acos */
 double WINAPI crt_CIacos(double x)
 {
 #ifdef TEST_HARNESS
     return acos(x);
 #else
-    /* Stub: Bhaskara I approximation for acos(x) */
-    /* acos(x) ≈ pi/2 - asin(x), asin(x) ≈ x for small x */
-    /* For UT99, a rough approximation is acceptable */
-    if (x >= 1.0)  return 0.0;
-    if (x <= -1.0) return 3.14159265358979323846;
-    /* Use identity: acos(x) = pi/2 - x - x^3/6 - 3*x^5/40 */
-    double x2 = x * x;
-    double x3 = x2 * x;
-    double x5 = x3 * x2;
-    return 1.5707963267948966 - x - x3 / 6.0 - 3.0 * x5 / 40.0;
+    if (crt_math_is_nan(x)) return x;
+    if (x > 1.0 || x < -1.0) return crt_math_qnan();
+    if (x == 1.0) return 0.0;
+    if (x == -1.0) return 3.14159265358979323846;
+
+    double radicand = 1.0 - x * x;
+    if (radicand < 0.0) radicand = 0.0;
+    double ordinate = crt_sqrt(radicand);
+    double result;
+    __asm__ volatile (
+        "fldl %2\n\t"
+        "fldl %1\n\t"
+        "fpatan\n\t"
+        "fstpl %0"
+        : "=m"(result)
+        : "m"(x), "m"(ordinate));
+    return result;
 #endif
 }
 
 /* _CIfmod — compiler intrinsic wrapper for fmod */
 double WINAPI crt_CIfmod(double x, double y)
 {
-    if (y == 0.0) return 0.0;
-    /* fmod(x, y) = x - trunc(x/y) * y */
-    double quotient = x / y;
-    long trunc_q = (long)quotient;
-    return x - (double)trunc_q * y;
+    if (crt_math_is_nan(x) || crt_math_is_nan(y)) return x + y;
+    if (y == 0.0 || crt_math_is_infinite(x)) return crt_math_qnan();
+    if (crt_math_is_infinite(y)) return x;
+
+    double result;
+    __asm__ volatile (
+        "fldl %2\n\t"
+        "fldl %1\n\t"
+        "1:\n\t"
+        "fprem\n\t"
+        "fnstsw %%ax\n\t"
+        "testw $0x0400, %%ax\n\t"
+        "jnz 1b\n\t"
+        "fstp %%st(1)\n\t"
+        "fstpl %0"
+        : "=m"(result)
+        : "m"(x), "m"(y)
+        : "ax", "cc");
+    return result;
 }
 
 /* ── Fast 32-bit x87 math (no INT 0x2E overhead) ──────────────
  *
- * _CIpow, _CIfmod, _CIacos use the MSVC _CI calling convention:
+ * _CIpow, _CIfmod, _CIacos, _CIexp, and _CIlog10 use the MSVC _CI calling convention:
  * arguments on the x87 FPU stack, result in ST(0).
  * These run as native 32-bit code in compat mode — no mode switch. */
 
 uint32_t g_fast_CIpow_addr = 0;
 uint32_t g_fast_CIfmod_addr = 0;
 uint32_t g_fast_CIacos_addr = 0;
+uint32_t g_fast_CIexp_addr = 0;
+uint32_t g_fast_CIlog10_addr = 0;
+uint32_t g_fast_CIsqrt_addr = 0;
 uint32_t g_fast_fabs_addr = 0;
 uint32_t g_fast_sqrt_addr = 0;
 
@@ -6031,6 +6549,39 @@ void compat32_init_fast_math(uint8_t *page, uint32_t user_base)
     /* fsqrt */               page[p++] = 0xD9; page[p++] = 0xFA;
     /* ret */                 page[p++] = 0xC3;
 
+    p = (p + 15) & ~15;
+
+    /* _CIexp: ST(0)=x -> result in ST(0) = e^x. */
+    g_fast_CIexp_addr = user_base + (uint32_t)p;
+    /* fldl2e */              page[p++] = 0xD9; page[p++] = 0xEA;
+    /* fmulp st(1), st(0) */ page[p++] = 0xDE; page[p++] = 0xC9;
+    /* fld st(0) */          page[p++] = 0xD9; page[p++] = 0xC0;
+    /* frndint */            page[p++] = 0xD9; page[p++] = 0xFC;
+    /* fxch st(1) */         page[p++] = 0xD9; page[p++] = 0xC9;
+    /* fsub st(0), st(1) */  page[p++] = 0xD8; page[p++] = 0xE1;
+    /* f2xm1 */              page[p++] = 0xD9; page[p++] = 0xF0;
+    /* fld1 */               page[p++] = 0xD9; page[p++] = 0xE8;
+    /* faddp st(1), st(0) */ page[p++] = 0xDE; page[p++] = 0xC1;
+    /* fscale */             page[p++] = 0xD9; page[p++] = 0xFD;
+    /* fstp st(1) */         page[p++] = 0xDD; page[p++] = 0xD9;
+    /* ret */                page[p++] = 0xC3;
+
+    p = (p + 15) & ~15;
+
+    /* _CIlog10: ST(0)=x -> result in ST(0) = log10(x). */
+    g_fast_CIlog10_addr = user_base + (uint32_t)p;
+    /* fldlg2 */             page[p++] = 0xD9; page[p++] = 0xEC;
+    /* fxch st(1) */         page[p++] = 0xD9; page[p++] = 0xC9;
+    /* fyl2x */              page[p++] = 0xD9; page[p++] = 0xF1;
+    /* ret */                page[p++] = 0xC3;
+
+    p = (p + 15) & ~15;
+
+    /* _CIsqrt: ST(0)=x -> result in ST(0). */
+    g_fast_CIsqrt_addr = user_base + (uint32_t)p;
+    /* fsqrt */              page[p++] = 0xD9; page[p++] = 0xFA;
+    /* ret */                page[p++] = 0xC3;
+
     serial_puts("[FAST-MATH] pow=0x");
     serial_puthex(g_fast_CIpow_addr, 8);
     serial_puts(" fmod=0x");
@@ -6041,6 +6592,12 @@ void compat32_init_fast_math(uint8_t *page, uint32_t user_base)
     serial_puthex(g_fast_fabs_addr, 8);
     serial_puts(" sqrt=0x");
     serial_puthex(g_fast_sqrt_addr, 8);
+    serial_puts(" exp=0x");
+    serial_puthex(g_fast_CIexp_addr, 8);
+    serial_puts(" log10=0x");
+    serial_puthex(g_fast_CIlog10_addr, 8);
+    serial_puts(" CIsqrt=0x");
+    serial_puthex(g_fast_CIsqrt_addr, 8);
     serial_puts("\n");
 }
 
@@ -6050,30 +6607,105 @@ double WINAPI crt_CIpow(double base, double exp)
 #ifdef TEST_HARNESS
     return pow(base, exp);
 #else
-    /* Simple integer-exponent pow for common UT99 cases */
     if (exp == 0.0) return 1.0;
-    if (base == 0.0) return 0.0;
     if (base == 1.0) return 1.0;
+    if (crt_math_is_nan(base) || crt_math_is_nan(exp)) return base + exp;
+    if (base == 0.0)
+        return exp < 0.0 ? crt_math_positive_infinity() : 0.0;
 
-    /* Handle integer exponents exactly */
-    int iexp = (int)exp;
-    if ((double)iexp == exp && iexp >= 0) {
+    /* Integer exponents preserve the sign of negative bases and avoid the
+     * logarithm domain restriction. */
+    if (exp >= -2147483648.0 && exp <= 2147483647.0) {
+        int iexp = (int)exp;
+        if ((double)iexp != exp) goto fractional_exponent;
+        unsigned int magnitude = iexp < 0
+            ? (unsigned int)(-(int64_t)iexp) : (unsigned int)iexp;
         double result = 1.0;
         double b = base;
-        int e = iexp;
-        while (e > 0) {
-            if (e & 1) result *= b;
+        while (magnitude) {
+            if (magnitude & 1U) result *= b;
             b *= b;
-            e >>= 1;
+            magnitude >>= 1;
         }
-        return result;
+        return iexp < 0 ? 1.0 / result : result;
     }
 
-    /* For non-integer exponents, use repeated squaring approximation */
-    /* This is a rough fallback — UT99 mostly uses integer powers */
-    if (exp < 0.0) return 1.0 / crt_CIpow(base, -exp);
-    return base; /* fallback for fractional exponents */
+fractional_exponent:
+    if (base < 0.0) return crt_math_qnan();
+
+    double result;
+    __asm__ volatile (
+        "fldl %2\n\t"
+        "fldl %1\n\t"
+        "fyl2x\n\t"
+        "fld %%st(0)\n\t"
+        "frndint\n\t"
+        "fxch %%st(1)\n\t"
+        "fsub %%st(1), %%st(0)\n\t"
+        "f2xm1\n\t"
+        "fld1\n\t"
+        "faddp\n\t"
+        "fscale\n\t"
+        "fstp %%st(1)\n\t"
+        "fstpl %0"
+        : "=m"(result)
+        : "m"(base), "m"(exp));
+    return result;
 #endif
+}
+
+/* Resolver identity and non-PE32 fallback for the x87 _CIexp intrinsic. */
+double WINAPI crt_CIexp(double x)
+{
+#ifdef TEST_HARNESS
+    return exp(x);
+#else
+    return crt_CIpow(2.71828182845904523536, x);
+#endif
+}
+
+/* Resolver identity and non-PE32 fallback for the x87 _CIlog10 intrinsic. */
+double WINAPI crt_CIlog10(double x)
+{
+#ifdef TEST_HARNESS
+    return log10(x);
+#else
+    double result;
+    __asm__ volatile(
+        "fldlg2\n\t"
+        "fldl %1\n\t"
+        "fyl2x\n\t"
+        "fstpl %0"
+        : "=m"(result)
+        : "m"(x));
+    return result;
+#endif
+}
+
+/* Resolver identity and non-PE32 fallback for the x87 _CIsqrt intrinsic. */
+double WINAPI crt_CIsqrt(double x)
+{
+    return crt_sqrt(x);
+}
+
+static int crt_double_bits_finite(uint64_t bits)
+{
+    return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
+}
+
+int WINAPI crt_finite(double x)
+{
+    uint64_t bits;
+    __builtin_memcpy(&bits, &x, sizeof(bits));
+    return crt_double_bits_finite(bits);
+}
+
+/* The PE32 gateway marshals stack DWORDs as integer arguments. Reassemble the
+ * IEEE-754 payload here instead of relying on the native XMM argument ABI. */
+static uint64_t WINAPI crt_finite_compat32(uint64_t low, uint64_t high)
+{
+    uint64_t bits = (uint32_t)low | ((uint64_t)(uint32_t)high << 32);
+    return (uint64_t)crt_double_bits_finite(bits);
 }
 
 /* _isnan — check for NaN (IEEE 754: exponent all 1s, mantissa non-zero) */
@@ -6191,6 +6823,8 @@ typedef struct {
 
 #define CRT_S_IFDIR  0x4000
 #define CRT_S_IFREG  0x8000
+#define CRT_S_IFCHR  0x2000
+#define CRT_S_IFIFO  0x1000
 #define CRT_S_IEXEC  0x0040
 #define CRT_S_IWRITE 0x0080
 #define CRT_S_IREAD  0x0100
@@ -6200,6 +6834,60 @@ extern void *osfs2_find(const char *name);
 extern uint64_t osfs2_file_size(void *file);
 extern uint32_t osfs2_file_ctime(void *file);
 extern uint32_t osfs2_file_mtime(void *file);
+
+int WINAPI crt_chmod(const char *path, int mode)
+{
+    if (!path || !path[0] || !(mode & (CRT_S_IREAD | CRT_S_IWRITE))) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    char normalized[260];
+    if (!win32_normalize_path(path, normalized)) {
+        *crt_errno() = CRT_ENAMETOOLONG;
+        return -1;
+    }
+
+    vfs_node_t node;
+    if (!vfs_find(normalized, VFS_MODE_WIN32, &node)) {
+        *crt_errno() = CRT_ENOENT;
+        return -1;
+    }
+
+    uint16_t current_mode;
+    if (vfs_get_mode(&node, &current_mode) != VFS_STATUS_OK) {
+        *crt_errno() = CRT_EACCES;
+        return -1;
+    }
+
+    /* The Microsoft CRT models the Win32 read-only attribute: files remain
+     * readable, while _S_IWRITE toggles write access for every class. */
+    uint16_t updated_mode = (uint16_t)((current_mode & 07111U) | 0444U);
+    if (mode & CRT_S_IWRITE)
+        updated_mode |= 0222U;
+    if (vfs_set_mode(&node, updated_mode) != VFS_STATUS_OK) {
+        *crt_errno() = CRT_EACCES;
+        return -1;
+    }
+
+    *crt_errno() = 0;
+    return 0;
+}
+
+int WINAPI crt_wchmod(const WCHAR *path, int mode)
+{
+    if (!path) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    char narrow[260];
+    if (!WideCharToMultiByte(0 /* CP_ACP */, 0, path, -1, narrow,
+                             sizeof(narrow), NULL, NULL)) {
+        *crt_errno() = CRT_ENAMETOOLONG;
+        return -1;
+    }
+    return crt_chmod(narrow, mode);
+}
 
 static int crt_path_has_executable_suffix(const char *path)
 {
@@ -6239,8 +6927,17 @@ static int crt_stat_query(const char *path, CRT_STAT_META *meta)
     void *file = osfs2_find_exact_ci(normalized);
     if (file) {
         meta->mode = CRT_S_IFREG | CRT_S_IREAD | CRT_S_IWRITE;
-        if (crt_path_has_executable_suffix(normalized))
+        vfs_node_t node;
+        uint16_t stored_mode;
+        if (vfs_find(normalized, VFS_MODE_WIN32, &node) &&
+            vfs_get_mode(&node, &stored_mode) == VFS_STATUS_OK) {
+            meta->mode = CRT_S_IFREG;
+            if (stored_mode & 0444U) meta->mode |= CRT_S_IREAD;
+            if (stored_mode & 0222U) meta->mode |= CRT_S_IWRITE;
+            if (stored_mode & 0111U) meta->mode |= CRT_S_IEXEC;
+        } else if (crt_path_has_executable_suffix(normalized)) {
             meta->mode |= CRT_S_IEXEC;
+        }
         meta->size = osfs2_file_size(file);
         meta->ctime = (int64_t)osfs2_file_ctime(file);
         meta->mtime = (int64_t)osfs2_file_mtime(file);
@@ -6391,6 +7088,88 @@ int WINAPI crt_stat64(const char *path, PVOID buf)
     return crt_stat64_impl(path, buf);
 }
 
+static int64_t crt_filetime_to_unix_seconds(LONGLONG filetime)
+{
+    if (filetime <= 0 ||
+        (uint64_t)filetime < WINTIME_UNIX_EPOCH_FILETIME)
+        return 0;
+    return (int64_t)(((uint64_t)filetime - WINTIME_UNIX_EPOCH_FILETIME) /
+                     WINTIME_TICKS_PER_SECOND);
+}
+
+int WINAPI crt_fstat64(int fd, PVOID buf)
+{
+    CRT_FILE *file = crt_file_from_fd(fd);
+    if (!file) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+    if (!buf) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    DWORD file_type = GetFileType(file->nt_handle);
+    if (!file_type && GetLastError() != 0) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+
+    IO_STATUS_BLOCK iosb;
+    FILE_STANDARD_INFORMATION standard;
+    FILE_BASIC_INFORMATION basic;
+    NTSTATUS status = NtQueryInformationFile(
+        file->nt_handle, &iosb, &standard, sizeof(standard),
+        FileStandardInformation);
+    if (NT_SUCCESS(status)) {
+        status = NtQueryInformationFile(
+            file->nt_handle, &iosb, &basic, sizeof(basic),
+            FileBasicInformation);
+    }
+    if (!NT_SUCCESS(status)) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+
+    CRT_STAT_META meta;
+    crt_memset(&meta, 0, sizeof(meta));
+    if (file_type == 1) { /* FILE_TYPE_DISK */
+        meta.mode = standard.Directory ? CRT_S_IFDIR : CRT_S_IFREG;
+        meta.mode |= CRT_S_IREAD;
+        if (!(basic.FileAttributes & FILE_ATTRIBUTE_READONLY))
+            meta.mode |= CRT_S_IWRITE;
+        if (standard.Directory) meta.mode |= CRT_S_IEXEC;
+        meta.size = standard.Directory ? 0 :
+                    (uint64_t)standard.EndOfFile.QuadPart;
+        meta.atime = crt_filetime_to_unix_seconds(
+            basic.LastAccessTime.QuadPart);
+        meta.mtime = crt_filetime_to_unix_seconds(
+            basic.LastWriteTime.QuadPart);
+        meta.ctime = crt_filetime_to_unix_seconds(
+            basic.CreationTime.QuadPart);
+    } else {
+        meta.mode = file_type == 3 ? CRT_S_IFIFO : CRT_S_IFCHR;
+        if (file->flags & 1) meta.mode |= CRT_S_IREAD;
+        if (file->flags & 2) meta.mode |= CRT_S_IWRITE;
+    }
+
+    CRT_STAT64 *stat = (CRT_STAT64 *)buf;
+    crt_memset(stat, 0, sizeof(*stat));
+    CRT_STAT_FILL_COMMON(stat, &meta);
+    if (file_type != 1) {
+        stat->st_dev = 0;
+        stat->st_rdev = 0;
+    }
+    stat->st_nlink = standard.NumberOfLinks > 32767U
+                   ? 32767 : (int16_t)standard.NumberOfLinks;
+    stat->st_size = (int64_t)meta.size;
+    stat->st_atime = meta.atime;
+    stat->st_mtime = meta.mtime;
+    stat->st_ctime = meta.ctime;
+    *crt_errno() = 0;
+    return 0;
+}
+
 typedef int (*CRT_STAT_IMPL)(const char *, PVOID);
 
 static int crt_wstat_impl(const WCHAR *path, PVOID buf, CRT_STAT_IMPL impl)
@@ -6481,8 +7260,6 @@ WCHAR* WINAPI crt_wstrtime(WCHAR *buf)
  * is WRONG — it combines two 4-byte args into one garbage value.
  * We must manually walk 4-byte slots using a uint32_t pointer.
  */
-static int vsnw_trace_count = 0;
-
 int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list ap)
 {
     if (!buf || count == 0) return 0;
@@ -6491,175 +7268,6 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
     /* Walk the 32-bit va_list manually — 4 bytes per arg */
     uint32_t *vp = (uint32_t *)(void *)ap;
 
-    /* Diagnostic: print caller_eip + first 4 args when fmt starts with
-     * "Failed to load" — this is the appSprintf that builds the cascade
-     * we're hunting. */
-    if (fmt[0] == L'F' && fmt[1] == L'a' && fmt[2] == L'i' && fmt[3] == L'l') {
-        extern uint32_t compat32_get_last_caller_eip(void);
-        extern void serial_puthex(uint64_t v, int d);
-        uint32_t ceip = compat32_get_last_caller_eip();
-        serial_puts("[FAIL-FMT] caller_eip=0x");
-        serial_puthex((uint64_t)ceip, 8);
-        serial_puts(" fmt=\"");
-        for (int k = 0; k < 50 && fmt[k]; k++)
-            serial_putchar((char)(fmt[k] & 0x7F));
-        serial_puts("\" args=");
-        for (int k = 0; k < 6; k++) {
-            serial_puts(" [");
-            serial_putdec((uint64_t)k);
-            serial_puts("]=0x");
-            serial_puthex((uint64_t)vp[k], 8);
-        }
-        serial_puts("\n");
-        for (int k = 0; k < 6; k++) {
-            uint32_t a = vp[k];
-            if (a < 0x10000 || a >= 0x80000000u) continue;
-            const WCHAR *p = (const WCHAR *)(uintptr_t)a;
-            uint16_t w0 = *(volatile uint16_t *)p;
-            uint8_t lo = (uint8_t)(w0 & 0xFF), hi = (uint8_t)(w0 >> 8);
-            if (lo < 0x20 || lo >= 0x7F || hi != 0) continue;
-            serial_puts("  arg[");
-            serial_putdec((uint64_t)k);
-            serial_puts("]=L\"");
-            for (int j = 0; j < 60 && p[j]; j++)
-                serial_putchar((char)(p[j] & 0x7F));
-            serial_puts("\"\n");
-        }
-    }
-
-#ifndef OK_QUIET
-    /* Debug: trace first 30 calls to see what's going on */
-    if (vsnw_trace_count < 30) {
-        vsnw_trace_count++;
-        /* Dump narrow version of the wide format string */
-        serial_puts("[VSNW#");
-        serial_putdec(vsnw_trace_count);
-        serial_puts("] fmt=\"");
-        for (int k = 0; k < 40 && fmt[k]; k++)
-            serial_putchar((char)(fmt[k] & 0x7F));
-        serial_puts("\" ap=0x");
-        serial_puthex((uint64_t)(uintptr_t)vp, 8);
-        serial_puts(" vp[0..11]=");
-        for (int k = 0; k < 12; k++) {
-            serial_puts(" 0x");
-            serial_puthex((uint64_t)vp[k], 8);
-        }
-        serial_puts("\n");
-        /* If vp[1] looks like a small number (FString.Num?) check vp[3] as WCHAR* */
-        if (vp[1] < 0x100 && vp[3] >= 0x10000 && vp[3] < 0x20000000) {
-            const WCHAR *probe = (const WCHAR *)(uintptr_t)vp[3];
-            serial_puts("  [PROBE vp[3] as WCHAR*] -> \"");
-            for (int k = 0; k < 30 && probe[k]; k++)
-                serial_putchar((char)(probe[k] & 0x7F));
-            serial_puts("\"\n");
-        }
-    }
-
-    /* ── FName::Names diagnostic ── */
-    {
-        extern uint32_t g_fname_names_addr;
-        extern uint32_t g_gmalloc_addr;
-        static int fname_diag_count = 0;
-        int has_0c = 0;
-        for (int k = 0; k < 8; k++) {
-            if (vp[k] == 0x0000000C) { has_0c = 1; break; }
-        }
-        /* Also dump when "Name subsystem" message appears */
-        int is_namesys = 0;
-        {
-            const WCHAR *f = fmt;
-            if (f[0]=='N' && f[1]=='a' && f[2]=='m' && f[3]=='e' && f[4]==' ') is_namesys = 1;
-        }
-        if ((has_0c || is_namesys) && fname_diag_count < 3 && g_fname_names_addr) {
-            fname_diag_count++;
-            /*
-             * FName::Names is TArray<FNameEntry*>:
-             *   +0x00: FNameEntry** Data  (4 bytes)
-             *   +0x04: INT Num            (4 bytes)
-             *   +0x08: INT Max            (4 bytes)
-             */
-            uint32_t *tarray = (uint32_t *)(uintptr_t)g_fname_names_addr;
-            uint32_t data_ptr = tarray[0];
-            uint32_t num      = tarray[1];
-            uint32_t max      = tarray[2];
-            serial_puts("[FNAME-DIAG] FName::Names @ 0x");
-            serial_puthex(g_fname_names_addr, 8);
-            serial_puts(" Data=0x");
-            serial_puthex(data_ptr, 8);
-            serial_puts(" Num=");
-            serial_putdec(num);
-            serial_puts(" Max=");
-            serial_putdec(num > 0x10000 ? 0xBAD : max);
-            serial_puts("\n");
-            /* Dump entries 0-7 and scan for first 8 non-null entries */
-            if (data_ptr >= 0x10000 && data_ptr < 0x20000000 && num > 0 && num < 0x10000) {
-                uint32_t *entries = (uint32_t *)(uintptr_t)data_ptr;
-                /* First dump indices 0-7 */
-                int show = num < 8 ? (int)num : 8;
-                for (int k = 0; k < show; k++) {
-                    serial_puts("  Names[");
-                    serial_putdec(k);
-                    serial_puts("]=0x");
-                    serial_puthex(entries[k], 8);
-                    if (entries[k] >= 0x10000 && entries[k] < 0x20000000) {
-                        /* FNameEntry: +0x00 Index(4), +0x04 Flags(4), +0x08 HashNext(4), +0x0C Name[] */
-                        uint8_t *entry = (uint8_t *)(uintptr_t)entries[k];
-                        serial_puts(" W=\"");
-                        /* Try WCHAR: read 2 bytes at a time from +0x0C */
-                        const uint16_t *wn = (const uint16_t *)(entry + 0x0C);
-                        for (int j = 0; j < 16 && wn[j] && wn[j] < 128; j++)
-                            serial_putchar((char)wn[j]);
-                        serial_puts("\"");
-                    } else if (entries[k] == 0) {
-                        serial_puts(" (NULL!)");
-                    }
-                    serial_puts("\n");
-                }
-                /* Scan for non-null entries beyond index 7 */
-                int found_nonnull = 0;
-                int limit = (int)(num < 838 ? num : 838);
-                for (int k = 8; k < limit && found_nonnull < 4; k++) {
-                    if (entries[k] != 0) {
-                        serial_puts("  Names[");
-                        serial_putdec(k);
-                        serial_puts("]=0x");
-                        serial_puthex(entries[k], 8);
-                        if (entries[k] >= 0x10000 && entries[k] < 0x20000000) {
-                            uint8_t *entry = (uint8_t *)(uintptr_t)entries[k];
-                            serial_puts(" W=\"");
-                            const uint16_t *wn = (const uint16_t *)(entry + 0x0C);
-                            for (int j = 0; j < 16 && wn[j] && wn[j] < 128; j++)
-                                serial_putchar((char)wn[j]);
-                            serial_puts("\"");
-                        }
-                        serial_puts("\n");
-                        found_nonnull++;
-                    }
-                }
-                if (found_nonnull == 0)
-                    serial_puts("  (all entries 8..838 are NULL!)\n");
-                /* Count total non-null */
-                int total_nonnull = 0;
-                for (int k = 0; k < limit; k++)
-                    if (entries[k] != 0) total_nonnull++;
-                serial_puts("  total non-null: ");
-                serial_putdec(total_nonnull);
-                serial_puts(" / ");
-                serial_putdec(limit);
-                serial_puts("\n");
-            }
-            /* Also dump GMalloc */
-            if (g_gmalloc_addr) {
-                uint32_t *gm = (uint32_t *)(uintptr_t)g_gmalloc_addr;
-                serial_puts("[FNAME-DIAG] GMalloc @ 0x");
-                serial_puthex(g_gmalloc_addr, 8);
-                serial_puts(" -> 0x");
-                serial_puthex(*gm, 8);
-                serial_puts("\n");
-            }
-        }
-    }
-#endif
 
     SIZE_T pos = 0;
     SIZE_T max = count - 1;
@@ -6716,19 +7324,6 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
              * %ls is also wide string. We treat both the same. */
             uint32_t raw_ptr = *vp++;
             const WCHAR *ws = (const WCHAR *)(uintptr_t)raw_ptr;
-#ifndef OK_QUIET
-            if (vsnw_trace_count <= 30) {
-                serial_puts("  %s ptr=0x");
-                serial_puthex((uint64_t)raw_ptr, 8);
-                if (ws && raw_ptr >= 0x1000) {
-                    serial_puts(" -> \"");
-                    for (int k = 0; k < 80 && ws[k]; k++)
-                        serial_putchar((char)(ws[k] & 0x7F));
-                    serial_puts("\"");
-                }
-                serial_puts("\n");
-            }
-#endif
             if (!ws) ws = (const WCHAR[]){'(','n','u','l','l',')',0};
             int n = 0;
             while (ws[n]) n++;
@@ -6837,48 +7432,8 @@ static WCHAR wchar_to_lower(WCHAR c)
     return (c >= 'A' && c <= 'Z') ? c + 32 : c;
 }
 
-static int wcsicmp_trace_count = 0;
-
 int WINAPI crt_wcsicmp(const WCHAR *a, const WCHAR *b)
 {
-    /* Detect infinite loop: if called with same (a,b) pair 1000+ times,
-     * force a match (return 0) to break the loop. This happens when the
-     * engine searches FName hash table for an empty string "" — the hash
-     * bucket is circular and the search never terminates. */
-    {
-        static uintptr_t prev_a, prev_b;
-        static int repeat_count;
-        if ((uintptr_t)a == prev_a && (uintptr_t)b == prev_b) {
-            if (++repeat_count > 1000) return 0;
-        } else {
-            prev_a = (uintptr_t)a;
-            prev_b = (uintptr_t)b;
-            repeat_count = 0;
-        }
-    }
-
-    wcsicmp_trace_count++;
-    if (wcsicmp_trace_count <= 20 || (wcsicmp_trace_count % 500000) == 0) {
-        serial_puts("[WCSICMP#");
-        serial_putdec(wcsicmp_trace_count);
-        serial_puts("] a=0x");
-        serial_puthex((uint64_t)(uintptr_t)a, 8);
-        serial_puts(" b=0x");
-        serial_puthex((uint64_t)(uintptr_t)b, 8);
-        if (a && (uintptr_t)a >= 0x1000) {
-            serial_puts(" a=\"");
-            for (int k = 0; k < 20 && a[k]; k++)
-                serial_putchar((char)(a[k] & 0x7F));
-            serial_puts("\"");
-        }
-        if (b && (uintptr_t)b >= 0x1000) {
-            serial_puts(" b=\"");
-            for (int k = 0; k < 20 && b[k]; k++)
-                serial_putchar((char)(b[k] & 0x7F));
-            serial_puts("\"");
-        }
-        serial_puts("\n");
-    }
     while (*a && *b) {
         WCHAR ca = wchar_to_lower(*a), cb = wchar_to_lower(*b);
         if (ca != cb) return (int)ca - (int)cb;
@@ -7011,6 +7566,35 @@ int64_t WINAPI crt_time64(int64_t *timer)
     int64_t result = wintime_now_unix_seconds();
     if (timer) *timer = result;
     return result;
+}
+
+char* WINAPI crt_ctime64(const int64_t *timer)
+{
+    /* MSVCR100 bounds __time64_t at the final second of year 3000. */
+    if (!timer || *timer < 0 || *timer > 32535215999LL) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+
+    UCRT_PROCESS_MODE_VALUES *state = ucrt_process_mode_state(TRUE);
+    if (!state) {
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    if (crt_tm_from_unix(*timer, &state->time_buffer) != 0) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+
+    SIZE_T length = crt_strftime(state->ctime_buffer,
+                                 sizeof(state->ctime_buffer),
+                                 "%a %b %e %H:%M:%S %Y\n",
+                                 &state->time_buffer);
+    if (length != sizeof(state->ctime_buffer) - 1) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+    return state->ctime_buffer;
 }
 
 int WINAPI crt_gmtime64_s(PVOID result, const int64_t *timer)
@@ -7459,55 +8043,6 @@ WCHAR* WINAPI crt_wcsdup(const WCHAR *s)
 
 WCHAR* WINAPI crt_wcscpy(WCHAR *dst, const WCHAR *src)
 {
-    /* Diagnostic: catch the caller that copies the bad "0" package name.
-     * Renders src as ASCII when it looks like a wstring, then logs caller
-     * EIP via compat32's saved per-thunk return address. */
-    if (src && ((uintptr_t)src >= 0x10000) && ((uintptr_t)src < 0x80000000ULL)) {
-        const WCHAR *s = src;
-        static uint32_t wcs0_log_n = 0;
-        if (s[0] == L'0' && s[1] == 0 && wcs0_log_n++ < 8) {
-            extern uint32_t compat32_get_last_caller_eip(void);
-            extern uint32_t g_last_stack_args;
-            extern void serial_puts(const char *s);
-            extern void serial_puthex(uint64_t v, int d);
-            uint32_t ceip = compat32_get_last_caller_eip();
-            uint32_t outer = 0;
-            /* stack_args[2] for a jmp-thunk wcscpy is the outer caller's
-             * return address (the real user code that wanted to copy "0"). */
-            if (g_last_stack_args) {
-                uint32_t *sa = (uint32_t *)(uintptr_t)g_last_stack_args;
-                outer = sa[2];
-            }
-            serial_puts("[wcscpy] src=L\"0\" dst=0x");
-            serial_puthex((uint64_t)(uintptr_t)dst, 8);
-            serial_puts(" inner_eip=0x");
-            serial_puthex((uint64_t)ceip, 8);
-            serial_puts(" outer_eip=0x");
-            serial_puthex((uint64_t)outer, 8);
-            serial_puts("\n");
-            /* [BT-0 DIAGNOSTIC — uncommitted] First few times only, walk the
-             * guest stack and print PE-code return addresses so we can identify
-             * the iterator that keeps appending the bad "0" name. */
-            {
-                static int bt0_n = 0;
-                if (bt0_n < 4 && g_last_stack_args) {
-                    bt0_n++;
-                    uint32_t *sp = (uint32_t *)(uintptr_t)g_last_stack_args;
-                    serial_puts("[BT-0]");
-                    int printed = 0;
-                    for (int k = 0; k < 64 && printed < 12; k++) {
-                        uint32_t v = sp[k];
-                        if (v >= 0x10100000 && v < 0x11000000) {
-                            serial_puts(" 0x");
-                            serial_puthex((uint64_t)v, 8);
-                            printed++;
-                        }
-                    }
-                    serial_puts("\n");
-                }
-            }
-        }
-    }
     WCHAR *d = dst;
     while ((*d++ = *src++));
     return dst;
@@ -7848,6 +8383,11 @@ typedef struct _CRT_WENV_CACHE {
     struct _CRT_WENV_CACHE *next;
     DWORD pid;
     BOOL is_32bit;
+    char *narrow_block;
+    SIZE_T narrow_block_capacity;
+    PVOID narrow_entries;
+    SIZE_T narrow_entry_capacity;
+    PVOID narrow_view_cell;
     WCHAR *block;
     SIZE_T block_capacity;
     PVOID entries;
@@ -7871,6 +8411,24 @@ static void crt_env_lock_acquire(void)
 static void crt_env_lock_release(void)
 {
     __sync_lock_release(&crt_env_lock);
+}
+
+static CRT_WENV_CACHE *crt_env_array_cache_locked(DWORD pid, BOOL is_32bit)
+{
+    for (CRT_WENV_CACHE *cache = crt_wenv_cache; cache;
+         cache = cache->next) {
+        if (cache->pid == pid)
+            return cache->is_32bit == is_32bit ? cache : NULL;
+    }
+
+    CRT_WENV_CACHE *cache = (CRT_WENV_CACHE *)kmalloc(sizeof(*cache));
+    if (!cache) return NULL;
+    memset(cache, 0, sizeof(*cache));
+    cache->pid = pid;
+    cache->is_32bit = is_32bit;
+    cache->next = crt_wenv_cache;
+    crt_wenv_cache = cache;
+    return cache;
 }
 
 static CRT_ENV_VALUE_CACHE *crt_env_value_cache(void)
@@ -7902,12 +8460,21 @@ static CRT_ENV_VALUE_CACHE *crt_env_value_cache(void)
     return cache;
 }
 
+static PVOID crt_env_user_pointer(PVOID buffer)
+{
+    if (!buffer || !g_compat32_mode) return buffer;
+    ULONG_PTR address = (ULONG_PTR)buffer;
+    if (address >= KERNEL_VBASE)
+        return (PVOID)(ULONG_PTR)VIRT_TO_PHYS(buffer);
+    return buffer;
+}
+
 static BOOL crt_env_user_buffer(PVOID buffer, SIZE_T bytes)
 {
     if (!buffer) return FALSE;
     if (!g_compat32_mode) return TRUE;
 
-    ULONG_PTR address = (ULONG_PTR)buffer;
+    ULONG_PTR address = (ULONG_PTR)crt_env_user_pointer(buffer);
     return address <= UINT32_MAX && bytes - 1 <= UINT32_MAX - address;
 }
 
@@ -7987,6 +8554,10 @@ int WINAPI crt_putenv_s(const char *name, const char *value)
         *crt_errno() = error;
         return error;
     }
+    if (!crt_p_environ() || !crt_p_wenviron()) {
+        *crt_errno() = CRT_ENOMEM;
+        return CRT_ENOMEM;
+    }
     *crt_errno() = 0;
     return 0;
 }
@@ -8001,6 +8572,10 @@ int WINAPI crt_wputenv_s(const WCHAR *name, const WCHAR *value)
         int error = crt_errno_from_last_error();
         *crt_errno() = error;
         return error;
+    }
+    if (!crt_p_environ() || !crt_p_wenviron()) {
+        *crt_errno() = CRT_ENOMEM;
+        return CRT_ENOMEM;
     }
     *crt_errno() = 0;
     return 0;
@@ -8042,36 +8617,117 @@ int WINAPI crt_wputenv(const WCHAR *assignment)
     return crt_wputenv_s(name, assignment + separator + 1) ? -1 : 0;
 }
 
-WCHAR*** WINAPI crt_p_wenviron(void)
+char*** WINAPI crt_p_environ(void)
 {
     DWORD pid = GetCurrentProcessId();
-    CRT_WENV_CACHE *cache = NULL;
     BOOL is_32bit = g_compat32_mode;
-
     crt_env_lock_acquire();
-    for (CRT_WENV_CACHE *candidate = crt_wenv_cache; candidate;
-         candidate = candidate->next) {
-        if (candidate->pid == pid) {
-            cache = candidate;
-            break;
-        }
-    }
+    CRT_WENV_CACHE *cache = crt_env_array_cache_locked(pid, is_32bit);
     if (!cache) {
-        cache = (CRT_WENV_CACHE *)kmalloc(sizeof(*cache));
-        if (!cache) {
+        crt_env_lock_release();
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+
+    SIZE_T chars = kernel32_build_environment_block_w(pid, NULL, 0);
+    if (chars < 2) chars = 2;
+    WCHAR *source = (WCHAR *)kmalloc(chars * sizeof(WCHAR));
+    if (!source) {
+        crt_env_lock_release();
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    SIZE_T actual = kernel32_build_environment_block_w(pid, source, chars);
+    if (actual > chars) {
+        kfree(source);
+        crt_env_lock_release();
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+
+    if (chars > cache->narrow_block_capacity) {
+        char *block = (char *)crt_realloc(cache->narrow_block, chars);
+        if (!crt_env_user_buffer(block, chars)) {
+            if (block) crt_free(block);
+            cache->narrow_block = NULL;
+            cache->narrow_block_capacity = 0;
+            kfree(source);
             crt_env_lock_release();
             *crt_errno() = CRT_ENOMEM;
             return NULL;
         }
-        cache->pid = pid;
-        cache->is_32bit = is_32bit;
-        cache->block = NULL;
-        cache->block_capacity = 0;
-        cache->entries = NULL;
-        cache->entry_capacity = 0;
-        cache->view_cell = NULL;
-        cache->next = crt_wenv_cache;
-        crt_wenv_cache = cache;
+        cache->narrow_block = block;
+        cache->narrow_block_capacity = chars;
+    }
+    for (SIZE_T i = 0; i < chars; i++)
+        cache->narrow_block[i] = (char)(source[i] & 0xFF);
+    kfree(source);
+
+    SIZE_T entries_capacity = chars + 1;
+    if (entries_capacity > cache->narrow_entry_capacity) {
+        SIZE_T entry_size = is_32bit ? sizeof(uint32_t) : sizeof(char *);
+        SIZE_T entries_bytes = entries_capacity * entry_size;
+        PVOID entries = crt_realloc(cache->narrow_entries, entries_bytes);
+        if (!crt_env_user_buffer(entries, entries_bytes)) {
+            if (entries) crt_free(entries);
+            cache->narrow_entries = NULL;
+            cache->narrow_entry_capacity = 0;
+            crt_env_lock_release();
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+        cache->narrow_entries = entries;
+        cache->narrow_entry_capacity = entries_capacity;
+    }
+    if (!cache->narrow_view_cell) {
+        SIZE_T cell_size = is_32bit ? sizeof(uint32_t) : sizeof(char **);
+        cache->narrow_view_cell = crt_malloc(cell_size);
+        if (!crt_env_user_buffer(cache->narrow_view_cell, cell_size)) {
+            if (cache->narrow_view_cell) crt_free(cache->narrow_view_cell);
+            cache->narrow_view_cell = NULL;
+            crt_env_lock_release();
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+    }
+
+    SIZE_T offset = 0;
+    SIZE_T count = 0;
+    while (offset < chars && cache->narrow_block[offset]) {
+        if (is_32bit)
+            ((uint32_t *)cache->narrow_entries)[count++] =
+                (uint32_t)(ULONG_PTR)(cache->narrow_block + offset);
+        else
+            ((char **)cache->narrow_entries)[count++] =
+                cache->narrow_block + offset;
+        while (offset < chars && cache->narrow_block[offset]) offset++;
+        offset++;
+    }
+    if (is_32bit) {
+        ((uint32_t *)cache->narrow_entries)[count] = 0;
+        *(uint32_t *)cache->narrow_view_cell =
+            (uint32_t)(ULONG_PTR)cache->narrow_entries;
+    } else {
+        ((char **)cache->narrow_entries)[count] = NULL;
+        *(char ***)cache->narrow_view_cell = (char **)cache->narrow_entries;
+    }
+    char ***result = (char ***)crt_env_user_pointer(cache->narrow_view_cell);
+    crt_env_lock_release();
+    *crt_errno() = 0;
+    return result;
+}
+
+WCHAR*** WINAPI crt_p_wenviron(void)
+{
+    DWORD pid = GetCurrentProcessId();
+    BOOL is_32bit = g_compat32_mode;
+
+    crt_env_lock_acquire();
+    CRT_WENV_CACHE *cache = crt_env_array_cache_locked(pid, is_32bit);
+    if (!cache) {
+        crt_env_lock_release();
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
     }
 
     SIZE_T chars = kernel32_build_environment_block_w(pid, NULL, 0);
@@ -8138,7 +8794,7 @@ WCHAR*** WINAPI crt_p_wenviron(void)
         ((WCHAR **)cache->entries)[count] = NULL;
         *(WCHAR ***)cache->view_cell = (WCHAR **)cache->entries;
     }
-    WCHAR ***result = (WCHAR ***)cache->view_cell;
+    WCHAR ***result = (WCHAR ***)crt_env_user_pointer(cache->view_cell);
     crt_env_lock_release();
     *crt_errno() = 0;
     return result;
@@ -8234,6 +8890,113 @@ WCHAR* WINAPI crt_wgetcwd(WCHAR *buffer, int max_length)
     return buffer;
 }
 
+static BOOL crt_drive_current_directory(int drive, char directory[260],
+                                        SIZE_T *length_out)
+{
+    char current[260];
+    DWORD current_length = GetCurrentDirectoryA(sizeof(current), current);
+    if (!current_length || current_length >= sizeof(current) ||
+        current[1] != ':') {
+        *crt_errno() = CRT_EINVAL;
+        return FALSE;
+    }
+
+    int current_drive = crt_toupper((unsigned char)current[0]) - 'A' + 1;
+    int selected_drive = drive ? drive : current_drive;
+    if (selected_drive < 1 || selected_drive > 26 ||
+        !(GetLogicalDrives() & (1U << (selected_drive - 1)))) {
+        *crt_errno() = CRT_EINVAL;
+        return FALSE;
+    }
+
+    SIZE_T length;
+    if (selected_drive == current_drive) {
+        memcpy(directory, current, (SIZE_T)current_length + 1);
+        length = current_length;
+    } else {
+        char drive_variable[4] = {
+            '=', (char)('A' + selected_drive - 1), ':', 0
+        };
+        DWORD saved_length =
+            GetEnvironmentVariableA(drive_variable, directory, 260);
+        if (saved_length >= 260) {
+            *crt_errno() = CRT_ENAMETOOLONG;
+            return FALSE;
+        }
+        if (saved_length) {
+            length = saved_length;
+        } else {
+            directory[0] = drive_variable[1];
+            directory[1] = ':';
+            directory[2] = '\\';
+            directory[3] = 0;
+            length = 3;
+        }
+    }
+
+    *length_out = length;
+    return TRUE;
+}
+
+char* WINAPI crt_getdcwd(int drive, char *buffer, int max_length)
+{
+    if (max_length <= 0) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+
+    char directory[260];
+    SIZE_T length;
+    if (!crt_drive_current_directory(drive, directory, &length))
+        return NULL;
+    if (length + 1 > (SIZE_T)max_length) {
+        *crt_errno() = CRT_ERANGE;
+        return NULL;
+    }
+
+    BOOL allocated = buffer == NULL;
+    if (allocated)
+        buffer = (char *)crt_malloc((SIZE_T)max_length);
+    if (!buffer) {
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    memcpy(buffer, directory, length + 1);
+    *crt_errno() = 0;
+    return buffer;
+}
+
+WCHAR* WINAPI crt_wgetdcwd(int drive, WCHAR *buffer, int max_length)
+{
+    if (max_length <= 0) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+
+    char directory[260];
+    SIZE_T length;
+    if (!crt_drive_current_directory(drive, directory, &length))
+        return NULL;
+    if (length + 1 > (SIZE_T)max_length) {
+        *crt_errno() = CRT_ERANGE;
+        return NULL;
+    }
+
+    BOOL allocated = buffer == NULL;
+    if (allocated) {
+        buffer = (WCHAR *)crt_malloc(
+            (SIZE_T)max_length * sizeof(WCHAR));
+    }
+    if (!buffer) {
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    for (SIZE_T index = 0; index <= length; index++)
+        buffer[index] = (WCHAR)(unsigned char)directory[index];
+    *crt_errno() = 0;
+    return buffer;
+}
+
 /* Path resolution */
 
 char* WINAPI crt_fullpath(char *absolute, const char *relative,
@@ -8302,59 +9065,6 @@ WCHAR* WINAPI crt_wfullpath(WCHAR *absolute, const WCHAR *relative,
     return absolute;
 }
 
-/* ── Base SEH handler (catch-all for unhandled exceptions) ── */
-
-/*
- * Installed as the bottom-most SEH frame before WinMain.
- * When all inner handlers have been corrupted/popped, this
- * handler catches the exception and returns EXECUTE_HANDLER
- * so the SEH dispatcher does global unwind + handler execution.
- *
- * For C++ exceptions (0xE06D7363): return CONTINUE_SEARCH (0)
- * because we can't properly unwind C++ catch blocks.
- * For access violations: return CONTINUE_SEARCH so the kernel
- * NULL-CALL handler catches it.
- *
- * The key benefit: this frame's PRESENCE in the chain ensures
- * the chain always has a valid stack-based entry, even when
- * WinDrv.dll's stack corruption overwrites inner frames.
- */
-static uint64_t WINAPI crt_base_seh_handler(
-    uint64_t pExceptionRecord, uint64_t pEstablisherFrame,
-    uint64_t pContextRecord, uint64_t pDispatcherContext)
-{
-    (void)pEstablisherFrame;
-    (void)pContextRecord;
-    (void)pDispatcherContext;
-    uint32_t code = 0;
-    if (pExceptionRecord)
-        code = *(uint32_t *)(uintptr_t)pExceptionRecord;
-    serial_puts("[SEH-BASE] handler called, code=0x");
-    serial_puthex(code, 8);
-    serial_puts("\n");
-    /* Do not absorb access violations. Returning ContinueExecution here
-     * retries the same faulting EIP, which turns NULL calls into #PF loops. */
-    return 1; /* ExceptionContinueSearch */
-}
-
-static uint32_t g_base_seh_thunk = 0;
-
-void crt_install_base_seh_thunk(void)
-{
-    extern uint32_t compat32_make_thunk(uint64_t target, const char *name,
-                                         uint8_t num_args);
-    g_base_seh_thunk = compat32_make_thunk(
-        (uint64_t)(uintptr_t)crt_base_seh_handler,
-        "__base_seh_handler", 4);
-    if (g_base_seh_thunk) {
-        serial_puts("[CRT] Base SEH handler thunk at 0x");
-        serial_puthex(g_base_seh_thunk, 8);
-        serial_puts("\n");
-    }
-}
-
-uint32_t crt_get_base_seh_thunk(void) { return g_base_seh_thunk; }
-
 /* ── Export resolution table ───────────────────────────────── */
 
 typedef struct {
@@ -8414,6 +9124,7 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_strdup",             (PVOID)crt_strdup,       1, CC_CDECL },
     { "strcspn",             (PVOID)crt_strcspn,      2, CC_CDECL },
     { "strpbrk",             (PVOID)crt_strpbrk,      2, CC_CDECL },
+    { "strtok",              (PVOID)crt_strtok,       2, CC_CDECL },
     { "strtok_s",            (PVOID)crt_strtok_s,     3, CC_CDECL },
 
     /* Memory ops */
@@ -8427,9 +9138,11 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "printf",              (PVOID)crt_printf,       1, CC_CDECL | CC_VARIADIC },
     { "sprintf",             (PVOID)crt_sprintf,      2, CC_CDECL | CC_VARIADIC },
     { "_snprintf",           (PVOID)crt_snprintf,     3, CC_CDECL | CC_VARIADIC },
+    { "_snwprintf",          (PVOID)crt_snwprintf,    3, CC_CDECL | CC_VARIADIC },
     { "_snprintf_s",         (PVOID)crt_snprintf_s,   4, CC_CDECL | CC_VARIADIC },
     { "_vsnprintf",          (PVOID)crt_vsnprintf,    4, CC_CDECL },
     { "fprintf",             (PVOID)crt_fprintf,      2, CC_CDECL | CC_VARIADIC },
+    { "fwprintf",            (PVOID)crt_fwprintf,     2, CC_CDECL | CC_VARIADIC },
     { "vprintf",             (PVOID)crt_vprintf,      2, CC_CDECL },
     { "vsprintf",            (PVOID)crt_vsprintf,     3, CC_CDECL },
     { "vfprintf",            (PVOID)crt_vfprintf,     3, CC_CDECL },
@@ -8444,6 +9157,7 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
 
     /* stdio FILE* */
     { "fopen",               (PVOID)crt_fopen,        2, CC_CDECL },
+    { "_fdopen",             (PVOID)crt_fdopen,       2, CC_CDECL },
     { "_wfopen",             (PVOID)crt_wfopen,       2, CC_CDECL },
     { "fread",               (PVOID)crt_fread,        4, CC_CDECL },
     { "fwrite",              (PVOID)crt_fwrite,       4, CC_CDECL },
@@ -8466,6 +9180,7 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "fileno",              (PVOID)crt_fileno,       1, CC_CDECL },
     { "__iob_func",          (PVOID)crt_iob_func,     0, CC_CDECL },
     { "__acrt_iob_func",     (PVOID)crt_acrt_iob_func, 1, CC_CDECL },
+    WX_DATA_DYNAMIC("_iob"),
 
     /* Low-level UCRT descriptors. */
     { "_get_osfhandle",      (PVOID)crt_get_osfhandle, 1, CC_CDECL },
@@ -8473,6 +9188,14 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_open",               (PVOID)crt_open,          3, CC_CDECL },
     { "?_open@@YAHPBDHH@Z",  (PVOID)crt_open,          3, CC_CDECL },
     { "_wopen",              (PVOID)crt_wopen,         3, CC_CDECL },
+    { "_unlink",             (PVOID)crt_unlink,        1, CC_CDECL },
+    { "_wunlink",            (PVOID)crt_wunlink,       1, CC_CDECL },
+    { "unlink",              (PVOID)crt_unlink,        1, CC_CDECL },
+    { "remove",              (PVOID)crt_unlink,        1, CC_CDECL },
+    { "_wremove",            (PVOID)crt_wunlink,       1, CC_CDECL },
+    { "rename",              (PVOID)crt_rename,        2, CC_CDECL },
+    { "_wrename",            (PVOID)crt_wrename,       2, CC_CDECL },
+    { "_getdrive",           (PVOID)crt_getdrive,      0, CC_CDECL },
     { "_close",              (PVOID)crt_close,         1, CC_CDECL },
     { "_read",               (PVOID)crt_read,          3, CC_CDECL },
     { "_write",              (PVOID)crt_write,         3, CC_CDECL },
@@ -8489,6 +9212,9 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "atoi",                (PVOID)crt_atoi,         1, CC_CDECL },
     { "atol",                (PVOID)crt_atol,         1, CC_CDECL },
     { "atof",                (PVOID)crt_atof,         1, CC_CDECL },
+    { "strtod",              (PVOID)crt_strtod,       2, CC_CDECL },
+    { "mbstowcs",            (PVOID)crt_mbstowcs,     3, CC_CDECL },
+    { "wcstombs",            (PVOID)crt_wcstombs,     3, CC_CDECL },
     { "abs",                 (PVOID)crt_abs,          1, CC_CDECL },
     { "strtol",              (PVOID)crt_strtol,       3, CC_CDECL },
     { "strtoul",             (PVOID)crt_strtoul,      3, CC_CDECL },
@@ -8517,7 +9243,10 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_wputenv",            (PVOID)crt_wputenv,      1, CC_CDECL },
     { "_putenv_s",           (PVOID)crt_putenv_s,     2, CC_CDECL },
     { "_wputenv_s",          (PVOID)crt_wputenv_s,    2, CC_CDECL },
+    { "__p__environ",        (PVOID)crt_p_environ,    0, CC_CDECL },
     { "__p__wenviron",       (PVOID)crt_p_wenviron,   0, CC_CDECL },
+    WX_DATA_DYNAMIC("_environ"),
+    WX_DATA_DYNAMIC("_wenviron"),
     { "_initialize_onexit_table",
                             (PVOID)crt_initialize_onexit_table, 1, CC_CDECL },
     { "_register_onexit_function",
@@ -8565,15 +9294,22 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "__sys_errlist",       (PVOID)crt_sys_errlist,  0, CC_CDECL },
     { "__sys_nerr",          (PVOID)crt_sys_nerr,     0, CC_CDECL },
     { "strerror",            (PVOID)crt_strerror,     1, CC_CDECL },
+    { "_wcserror",           (PVOID)crt_wcserror,     1, CC_CDECL },
     { "__fpe_flt_rounds",    (PVOID)crt_fpe_flt_rounds, 0, CC_CDECL },
 
     /* Time */
     { "time",                (PVOID)crt_time,         1, CC_CDECL },
     { "_time64",             (PVOID)crt_time64,       1, CC_CDECL },
+    { "_ctime64",            (PVOID)crt_ctime64,      1, CC_CDECL },
+    { "_ftime",              (PVOID)crt_ftime,        1, CC_CDECL },
+    { "_ftime32",            (PVOID)crt_ftime32,      1, CC_CDECL },
+    { "_ftime64",            (PVOID)crt_ftime64,      1, CC_CDECL },
     { "clock",               (PVOID)crt_clock,        0, CC_CDECL },
     { "_tzset",              (PVOID)crt_tzset,        0, CC_CDECL },
     { "__timezone",          (PVOID)crt_timezone,     0, CC_CDECL },
     { "__daylight",          (PVOID)crt_daylight,     0, CC_CDECL },
+    WX_DATA_DYNAMIC("_timezone"),
+    WX_DATA_DYNAMIC("_daylight"),
     { "_gmtime64_s",         (PVOID)crt_gmtime64_s,   2, CC_CDECL },
     { "_localtime64",        (PVOID)crt_localtime64,  1, CC_CDECL },
     { "_localtime64_s",      (PVOID)crt_localtime64_s, 2, CC_CDECL },
@@ -8587,6 +9323,7 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_except_handler4_common", (PVOID)crt_except_handler4_common,
                                                         6, CC_CDECL },
     { "_XcptFilter",         (PVOID)crt_XcptFilter,   2, CC_CDECL },
+    { "__CppXcptFilter",     (PVOID)crt_CppXcptFilter, 2, CC_CDECL },
     { "_setjmp",             (PVOID)crt_compat32_setjmp_marker,
                                                         1, CC_CDECL },
     { "_setjmp3",            (PVOID)crt_compat32_setjmp3_marker,
@@ -8610,6 +9347,14 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
 
     /* C++ EH / UT99 required stubs */
     { "??1type_info@@UAE@XZ", (PVOID)crt_type_info_dtor, 0, CC_THISCALL },
+    { "?_type_info_dtor_internal_method@type_info@@QAEXXZ",
+                              (PVOID)crt_type_info_dtor_internal, 0, CC_THISCALL },
+    { "?_Type_info_dtor@type_info@@CAXPAV1@@Z",
+                              (PVOID)crt_type_info_dtor_internal, 1, CC_CDECL },
+    { "?_Type_info_dtor_internal@type_info@@CAXPAV1@@Z",
+                              (PVOID)crt_type_info_dtor_internal, 1, CC_CDECL },
+    { "__clean_type_info_names_internal",
+                              (PVOID)crt_clean_type_info_names_internal, 1, CC_CDECL },
     { "__std_type_info_destroy_list", (PVOID)crt_std_type_info_destroy_list, 1, CC_CDECL },
     { "_CxxThrowException",  (PVOID)crt_CxxThrowException, 2, CC_CDECL },
     { "__CxxFrameHandler",   (PVOID)crt_CxxFrameHandler, 4, CC_CDECL },
@@ -8617,11 +9362,15 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "__p__commode",        (PVOID)crt_p_commode,    0, CC_CDECL },
     { "__p__fmode",          (PVOID)crt_p_fmode,      0, CC_CDECL },
     { "__C_specific_handler",(PVOID)crt_C_specific_handler, 4, CC_CDECL },
-    WX_DATA("__initenv",      &crt_initenv_val),
+    WX_DATA_DYNAMIC("__initenv"),
+    WX_DATA_DYNAMIC("__mb_cur_max"),
+    WX_DATA_DYNAMIC("_commode"),
+    WX_DATA_DYNAMIC("_fmode"),
     { "signal",              (PVOID)crt_signal,       2, CC_CDECL },
+    { "raise",               (PVOID)crt_raise,        1, CC_CDECL },
     { "__setusermatherr",    (PVOID)crt_setusermatherr, 1, CC_CDECL },
-    WX_DATA("_acmdln",        &crt_acmdln_val),
-    { "_adjust_fdiv",        (PVOID)crt_adjust_fdiv,  0, CC_CDECL },
+    WX_DATA_DYNAMIC("_acmdln"),
+    WX_DATA_DYNAMIC("_adjust_fdiv"),
     { "_controlfp",          (PVOID)crt_controlfp,    2, CC_CDECL },
     { "_ftol",               (PVOID)crt_ftol,         2, CC_CDECL },  /* double = 2 DWORDs */
     { "_onexit",             (PVOID)crt_onexit,       1, CC_CDECL },
@@ -8630,8 +9379,12 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     /* UT99 Core.dll / Engine.dll required exports */
     { "?terminate@@YAXXZ",   (PVOID)crt_terminate,    0, CC_CDECL },
     { "_CIacos",             (PVOID)crt_CIacos,       2, CC_CDECL },  /* double = 2 DWORDs */
+    { "_CIexp",              (PVOID)crt_CIexp,        0, CC_CDECL },  /* x87 ST(0), direct PE32 target */
+    { "_CIlog10",            (PVOID)crt_CIlog10,      0, CC_CDECL },  /* x87 ST(0), direct PE32 target */
+    { "_CIsqrt",             (PVOID)crt_CIsqrt,       0, CC_CDECL },  /* x87 ST(0), direct PE32 target */
     { "_CIfmod",             (PVOID)crt_CIfmod,       4, CC_CDECL },  /* 2 doubles = 4 DWORDs */
     { "_CIpow",              (PVOID)crt_CIpow,        4, CC_CDECL },  /* 2 doubles = 4 DWORDs */
+    { "_finite",             (PVOID)crt_finite,       2, CC_CDECL },  /* double = 2 DWORDs */
     { "_isnan",              (PVOID)crt_isnan,        2, CC_CDECL },  /* double = 2 DWORDs */
     { "_dclass",             (PVOID)crt_dclass,       2, CC_CDECL },  /* double = 2 DWORDs */
     { "_fdclass",            (PVOID)crt_fdclass,      1, CC_CDECL },
@@ -8640,6 +9393,9 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_stat32i64",          (PVOID)crt_stat32i64,    2, CC_CDECL },
     { "_stat64i32",          (PVOID)crt_stat64i32,    2, CC_CDECL },
     { "_stat64",             (PVOID)crt_stat64,       2, CC_CDECL },
+    { "_fstat64",            (PVOID)crt_fstat64,      2, CC_CDECL },
+    { "_chmod",              (PVOID)crt_chmod,        2, CC_CDECL },
+    { "_wchmod",             (PVOID)crt_wchmod,       2, CC_CDECL },
     { "_wstat",              (PVOID)crt_wstat,        2, CC_CDECL },
     { "_wstat32",            (PVOID)crt_wstat32,      2, CC_CDECL },
     { "_wstat32i64",         (PVOID)crt_wstat32i64,   2, CC_CDECL },
@@ -8650,6 +9406,7 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_wstrdate",           (PVOID)crt_wstrdate,     1, CC_CDECL },
     { "_wstrtime",           (PVOID)crt_wstrtime,     1, CC_CDECL },
     { "_vsnwprintf",         (PVOID)crt_vsnwprintf,   4, CC_CDECL },
+    { "_vswprintf_c_l",      (PVOID)crt_vswprintf_c_l, 5, CC_CDECL },
     { "_wcsicmp",            (PVOID)crt_wcsicmp,      2, CC_CDECL },
     { "_wcsnicmp",           (PVOID)crt_wcsnicmp,     3, CC_CDECL },
     { "_wcsupr",             (PVOID)crt_wcsupr,       1, CC_CDECL },
@@ -8687,6 +9444,8 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_waccess",            (PVOID)crt_waccess,      2, CC_CDECL },
     { "_getcwd",             (PVOID)crt_getcwd,       2, CC_CDECL },
     { "_wgetcwd",            (PVOID)crt_wgetcwd,      2, CC_CDECL },
+    { "_getdcwd",            (PVOID)crt_getdcwd,      3, CC_CDECL },
+    { "_wgetdcwd",           (PVOID)crt_wgetdcwd,     3, CC_CDECL },
     { "_fullpath",           (PVOID)crt_fullpath,     3, CC_CDECL },
     { "_wfullpath",          (PVOID)crt_wfullpath,    3, CC_CDECL },
 
@@ -8715,16 +9474,69 @@ static int msvcrt_strcmp(const char *a, const char *b)
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+static PVOID msvcrt_resolve_data_export(const char *func_name)
+{
+    if (!func_name) return NULL;
+    if (msvcrt_strcmp(func_name, "_environ") == 0)
+        return (PVOID)crt_p_environ();
+    if (msvcrt_strcmp(func_name, "_wenviron") == 0)
+        return (PVOID)crt_p_wenviron();
+    if (msvcrt_strcmp(func_name, "_iob") == 0)
+        return (PVOID)crt_iob_func();
+
+    enum {
+        CRT_DATA_NONE,
+        CRT_DATA_INITENV,
+        CRT_DATA_MB_CUR_MAX,
+        CRT_DATA_ACMDLN,
+        CRT_DATA_ADJUST_FDIV,
+        CRT_DATA_COMMODE,
+        CRT_DATA_FMODE,
+        CRT_DATA_TIMEZONE,
+        CRT_DATA_DAYLIGHT,
+    } data = CRT_DATA_NONE;
+
+    if (msvcrt_strcmp(func_name, "__initenv") == 0)
+        data = CRT_DATA_INITENV;
+    else if (msvcrt_strcmp(func_name, "__mb_cur_max") == 0)
+        data = CRT_DATA_MB_CUR_MAX;
+    else if (msvcrt_strcmp(func_name, "_acmdln") == 0)
+        data = CRT_DATA_ACMDLN;
+    else if (msvcrt_strcmp(func_name, "_adjust_fdiv") == 0)
+        data = CRT_DATA_ADJUST_FDIV;
+    else if (msvcrt_strcmp(func_name, "_commode") == 0)
+        data = CRT_DATA_COMMODE;
+    else if (msvcrt_strcmp(func_name, "_fmode") == 0)
+        data = CRT_DATA_FMODE;
+    else if (msvcrt_strcmp(func_name, "_timezone") == 0)
+        data = CRT_DATA_TIMEZONE;
+    else if (msvcrt_strcmp(func_name, "_daylight") == 0)
+        data = CRT_DATA_DAYLIGHT;
+    if (data == CRT_DATA_NONE) return NULL;
+
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) return NULL;
+
+    switch (data) {
+        case CRT_DATA_INITENV:     return &values->initenv_value;
+        case CRT_DATA_MB_CUR_MAX:  return &values->mb_cur_max;
+        case CRT_DATA_ACMDLN:      return &values->acmdln_value;
+        case CRT_DATA_ADJUST_FDIV: return &values->adjust_fdiv;
+        case CRT_DATA_COMMODE:     return &values->commode;
+        case CRT_DATA_FMODE:       return &values->fmode;
+        case CRT_DATA_TIMEZONE:    return &values->timezone;
+        case CRT_DATA_DAYLIGHT:    return &values->daylight;
+        default:                   return NULL;
+    }
+}
+
 PVOID msvcrt_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 {
     if (by_ordinal) return NULL;
 
-    /* These CRT data exports are process-local writable variables. Resolve
-     * them when each image is loaded instead of exposing kernel .data. */
-    if (msvcrt_strcmp(func_name, "_commode") == 0)
-        return (PVOID)crt_p_commode();
-    if (msvcrt_strcmp(func_name, "_fmode") == 0)
-        return (PVOID)crt_p_fmode();
+    /* CRT data exports are process-local writable variables, not functions. */
+    PVOID data_export = msvcrt_resolve_data_export(func_name);
+    if (data_export) return data_export;
 
     for (int i = 0; msvcrt_exports[i].name; i++) {
         if (msvcrt_strcmp(func_name, msvcrt_exports[i].name) == 0)
@@ -8743,21 +9555,19 @@ PVOID msvcrt_shim_init(void)
                                         (PVOID)crt_sprintf_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_snprintf,
                                         (PVOID)crt_snprintf_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_snwprintf,
+                                        (PVOID)crt_snwprintf_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_snprintf_s,
                                         (PVOID)crt_snprintf_s_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_fprintf,
                                         (PVOID)crt_fprintf_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_fwprintf,
+                                        (PVOID)crt_fwprintf_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_sscanf,
                                         (PVOID)crt_sscanf_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_lseeki64,
                                         (PVOID)crt_lseeki64_compat32);
-    /* Re-exec resets. stub_gmalloc_installed is a one-shot whose stub vtable
-     * holds thunks into the PREVIOUS run's thunk pool (compat32_init re-allocates
-     * it) — must rebuild. The FMW Free router likewise re-installs on the freshly
-     * reloaded Core.dll/UT.exe vtables; drop the old router pool (page leaks,
-     * bounded by relaunch count). */
-    stub_gmalloc_installed = 0;
-    fmw_router_pool = NULL;
-    fmw_router_used = 0;
+    win32_abi_register_compat32_bridge((PVOID)crt_finite,
+                                        (PVOID)crt_finite_compat32);
     return (PVOID)msvcrt_exports;
 }

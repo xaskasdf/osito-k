@@ -28,11 +28,18 @@ typedef struct {
     uint64_t size;
 } vfs_node_t;
 
+#define VFS_STATUS_OK               0
+#define VFS_STATUS_INVALID         -1
+#define VFS_STATUS_NOT_SUPPORTED   -2
+#define VFS_STATUS_IO_ERROR        -3
+
 /* Core VFS API */
 const char *vfs_resolve(const char *path, int mode);
 
 bool        vfs_find(const char *path, int mode, vfs_node_t *out_node);
 int         vfs_read(vfs_node_t *node, uint64_t offset, void *buf, uint64_t len);
+int         vfs_get_mode(const vfs_node_t *node, uint16_t *mode);
+int         vfs_set_mode(vfs_node_t *node, uint16_t mode);
 void        vfs_list(const char *path);
 
 #endif /* VFS_H */

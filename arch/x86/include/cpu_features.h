@@ -55,6 +55,11 @@ typedef struct {
 
 extern cpu_features_t cpu_features;
 
+/* Non-zero only after CR4.OSXSAVE and XCR0 have been configured for the
+ * kernel's x87/SSE/AVX state layout. Assembly interrupt paths use this to
+ * select XSAVE instead of the architectural FXSAVE fallback. */
+extern uint32_t cpu_xsave_active;
+
 /* Call once, early in boot (before paging_init). Populates cpu_features. */
 void cpu_features_detect(void);
 

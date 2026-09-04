@@ -70,6 +70,7 @@
 #define HDA_GCTL_UNSOL  (1 << 8)   /* Accept Unsolicited Responses */
 
 /* SD_CTL (24-bit, read as 32-bit) */
+#define HDA_SD_CTL_SRST (1 << 0)   /* Stream descriptor reset */
 #define HDA_SD_CTL_RUN  (1 << 1)   /* Stream Run */
 #define HDA_SD_CTL_IOCE (1 << 2)   /* IOC Enable */
 
@@ -126,6 +127,8 @@
 /* 12-bit verbs (8-bit payload) */
 #define HDA_VERB_GET_PARAM      0xF00   /* GET_PARAMETER */
 #define HDA_VERB_GET_CONN_LIST  0xF02   /* GET_CONNECTION_LIST_ENTRY */
+#define HDA_VERB_GET_CONFIG     0xF1C   /* GET_CONFIG_DEFAULT */
+#define HDA_VERB_SET_CONN_SEL   0x701   /* SET_CONNECTION_SELECT_CONTROL */
 #define HDA_VERB_SET_CONV_CTRL  0x706   /* SET_CONVERTER_STREAM_CHANNEL */
 #define HDA_VERB_SET_PIN_CTRL   0x707   /* SET_PIN_WIDGET_CONTROL */
 #define HDA_VERB_SET_POWER      0x705   /* SET_POWER_STATE */
@@ -147,6 +150,9 @@
 #define HDA_PARAM_PCM_RATES     0x0A    /* Supported PCM sizes & rates */
 #define HDA_PARAM_STREAM_FMTS   0x0B    /* Supported stream formats */
 #define HDA_PARAM_PIN_CAP       0x0C
+#define HDA_PARAM_AMP_IN_CAP    0x0D
+#define HDA_PARAM_CONN_LIST_LEN 0x0E
+#define HDA_PARAM_AMP_OUT_CAP   0x12
 
 /* PCM Size/Rates parameter (0x0A) bitmask — rates (bits 0-10) */
 #define HDA_RATE_8KHZ     (1 << 0)
@@ -167,8 +173,18 @@
 #define HDA_BITS_20       (1 << 18)
 #define HDA_BITS_24       (1 << 19)
 #define HDA_BITS_32       (1 << 20)
-#define HDA_PARAM_CONN_LIST_LEN 0x0E
-#define HDA_PARAM_AMP_OUT_CAP   0x12
+
+#define HDA_STREAM_FMT_PCM      (1 << 0)
+
+/* Audio Widget Capabilities */
+#define HDA_WCAP_STEREO         (1 << 0)
+#define HDA_WCAP_IN_AMP         (1 << 1)
+#define HDA_WCAP_OUT_AMP        (1 << 2)
+#define HDA_WCAP_AMP_OVRD       (1 << 3)
+#define HDA_WCAP_FORMAT_OVRD    (1 << 4)
+#define HDA_WCAP_CONN_LIST      (1 << 8)
+#define HDA_WCAP_DIGITAL        (1 << 9)
+#define HDA_WCAP_POWER          (1 << 10)
 
 /* ── Widget Types (bits 23:20 of Audio Widget Capabilities) ──── */
 
@@ -187,6 +203,25 @@
 #define HDA_PIN_IN_EN       (1 << 5)
 #define HDA_PIN_HP_EN       (1 << 7)
 
+/* Pin capabilities */
+#define HDA_PINCAP_HP_DRV   (1 << 3)
+#define HDA_PINCAP_OUT      (1 << 4)
+#define HDA_PINCAP_EAPD     (1 << 16)
+
+/* Default pin configuration */
+#define HDA_DEFCFG_DEVICE(config)    (((config) >> 20) & 0x0F)
+#define HDA_DEFCFG_PORT(config)      (((config) >> 30) & 0x03)
+#define HDA_DEFCFG_PORT_NONE         0x01
+#define HDA_DEVICE_LINE_OUT          0x00
+#define HDA_DEVICE_SPEAKER           0x01
+#define HDA_DEVICE_HEADPHONE         0x02
+#define HDA_DEVICE_SPDIF_OUT         0x04
+#define HDA_DEVICE_DIGITAL_OUT       0x05
+
+/* Connection list */
+#define HDA_CONN_LIST_LEN(value)     ((value) & 0x7F)
+#define HDA_CONN_LIST_LONG           (1 << 7)
+
 /* ── Amp Gain/Mute Payload (4-bit verb, 16-bit payload) ───────── */
 
 #define HDA_AMP_SET_OUT     (1 << 15)
@@ -195,6 +230,9 @@
 #define HDA_AMP_SET_RIGHT   (1 << 12)
 #define HDA_AMP_MUTE        (1 << 7)
 #define HDA_AMP_GAIN(x)     ((x) & 0x7F)
+#define HDA_AMP_INDEX(x)    (((x) & 0x0F) << 8)
+
+#define HDA_EAPD_ENABLE     (1 << 1)
 
 /* ── Buffer Descriptor List Entry ──────────────────────────────── */
 
@@ -217,7 +255,8 @@ typedef struct __attribute__((packed)) {
 
 int  hda_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func);
 void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
-void hda_play_buffer(const int16_t *samples, uint32_t num_samples);
+/* Submit interleaved signed 48kHz/16-bit stereo PCM frames. */
+void hda_play_buffer(const int16_t *samples, uint32_t num_frames);
 void hda_stop(void);
 bool hda_is_ready(void);
 

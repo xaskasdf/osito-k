@@ -53,6 +53,12 @@
 #define OSFS3_DT_LNK      10U
 #define OSFS3_DT_SOCK     12U
 
+/* Optional inode fields stored in space that was reserved in v3 images. */
+#define OSFS3_INODE_FLAG_BTIME_VALID (1U << 0)
+#define OSFS3_INODE_FLAG_DOS_HIDDEN  (1U << 1)
+#define OSFS3_INODE_FLAG_DOS_SYSTEM  (1U << 2)
+#define OSFS3_INODE_FLAG_DOS_NOARCH  (1U << 3)
+
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t version;
@@ -95,7 +101,8 @@ typedef struct __attribute__((packed)) {
         uint8_t reserved_ext[64];
     };
     uint32_t crc32;
-    uint8_t  reserved[256 - 216];
+    uint64_t birth_time;             /* Unix epoch seconds (0 = ctime) */
+    uint8_t  reserved[256 - 224];
 } osfs3_inode_t;
 
 _Static_assert(sizeof(osfs3_inode_t) == 256,

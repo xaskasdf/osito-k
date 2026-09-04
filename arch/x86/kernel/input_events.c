@@ -16,7 +16,7 @@
  * (user32_shim.c in exe-reverse) can also consume.
  */
 
-#include "../include/types.h"
+#include "../include/input_events.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
@@ -96,6 +96,14 @@ bool input_game_mode = false;
 static int32_t  mouse_x, mouse_y;     /* absolute cursor position */
 static int32_t  screen_w, screen_h;   /* screen bounds for clamping */
 static uint8_t  mouse_buttons;        /* current button state */
+static int64_t  mouse_motion_x;
+static int64_t  mouse_motion_y;
+static uint64_t mouse_press_count[INPUT_MOUSE_BUTTON_COUNT];
+static uint64_t mouse_release_count[INPUT_MOUSE_BUTTON_COUNT];
+static int32_t  mouse_press_x[INPUT_MOUSE_BUTTON_COUNT];
+static int32_t  mouse_press_y[INPUT_MOUSE_BUTTON_COUNT];
+static int32_t  mouse_release_x[INPUT_MOUSE_BUTTON_COUNT];
+static int32_t  mouse_release_y[INPUT_MOUSE_BUTTON_COUNT];
 
 /* ── Keyboard Modifier State ─────────────────────────────────── */
 
@@ -160,6 +168,9 @@ static int16_t accel(int16_t d)
 
 void input_post_mouse_move(int16_t dx, int16_t dy)
 {
+    mouse_motion_x += dx;
+    mouse_motion_y += dy;
+
     /* Apply acceleration curve then clamp */
     mouse_x += accel(dx);
     mouse_y += accel(dy);
@@ -190,6 +201,8 @@ void input_set_mouse_abs(int32_t abs_x, int32_t abs_y)
 
     int16_t dx = (int16_t)(new_x - mouse_x);
     int16_t dy = (int16_t)(new_y - mouse_y);
+    mouse_motion_x += dx;
+    mouse_motion_y += dy;
     mouse_x = new_x;
     mouse_y = new_y;
 
@@ -210,6 +223,19 @@ void input_post_mouse_button(uint8_t buttons)
     uint8_t changed = buttons ^ mouse_buttons;
     if (!changed) return;
 
+    for (uint32_t i = 0; i < INPUT_MOUSE_BUTTON_COUNT; i++) {
+        uint8_t mask = (uint8_t)(1U << i);
+        if (!(changed & mask)) continue;
+        if (buttons & mask) {
+            mouse_press_count[i]++;
+            mouse_press_x[i] = mouse_x;
+            mouse_press_y[i] = mouse_y;
+        } else {
+            mouse_release_count[i]++;
+            mouse_release_x[i] = mouse_x;
+            mouse_release_y[i] = mouse_y;
+        }
+    }
     mouse_buttons = buttons;
 
     input_event_t evt;
@@ -351,6 +377,36 @@ void input_get_cursor(int32_t *x, int32_t *y)
 uint8_t input_get_buttons(void) { return mouse_buttons; }
 uint8_t input_get_modifiers(void) { return kb_modifiers; }
 
+void input_get_mouse_snapshot(input_mouse_snapshot_t *snapshot)
+{
+    if (!snapshot) return;
+
+#ifndef __EMSCRIPTEN__
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+
+    snapshot->x = mouse_x;
+    snapshot->y = mouse_y;
+    snapshot->buttons = mouse_buttons;
+    memset(snapshot->reserved, 0, sizeof(snapshot->reserved));
+    snapshot->motion_x = mouse_motion_x;
+    snapshot->motion_y = mouse_motion_y;
+    for (uint32_t i = 0; i < INPUT_MOUSE_BUTTON_COUNT; i++) {
+        snapshot->press_count[i] = mouse_press_count[i];
+        snapshot->release_count[i] = mouse_release_count[i];
+        snapshot->press_x[i] = mouse_press_x[i];
+        snapshot->press_y[i] = mouse_press_y[i];
+        snapshot->release_x[i] = mouse_release_x[i];
+        snapshot->release_y[i] = mouse_release_y[i];
+    }
+
+#ifndef __EMSCRIPTEN__
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+#endif
+}
+
 bool input_has_events(void)
 {
     return input_head != input_tail;
@@ -388,6 +444,14 @@ void input_events_init(uint32_t scr_width, uint32_t scr_height)
     screen_w = (int32_t)scr_width;
     screen_h = (int32_t)scr_height;
     mouse_buttons = 0;
+    mouse_motion_x = 0;
+    mouse_motion_y = 0;
+    memset(mouse_press_count, 0, sizeof(mouse_press_count));
+    memset(mouse_release_count, 0, sizeof(mouse_release_count));
+    memset(mouse_press_x, 0, sizeof(mouse_press_x));
+    memset(mouse_press_y, 0, sizeof(mouse_press_y));
+    memset(mouse_release_x, 0, sizeof(mouse_release_x));
+    memset(mouse_release_y, 0, sizeof(mouse_release_y));
     kb_modifiers = 0;
     prev_mouse_x = mouse_x;
     prev_mouse_y = mouse_y;

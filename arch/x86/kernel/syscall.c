@@ -367,6 +367,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 /* ── File descriptor table ───────────────────────────────────── */
 
 #include "../include/fd.h"
+#include "../include/oss_audio.h"
 
 /* osfs2_file_t is opaque here — we get size via osfs2_file_size() */
 extern uint64_t osfs2_file_size(void *file);
@@ -489,23 +490,6 @@ extern bool kb_has_input(void);
 static bool term_canonical = true;   /* ICANON: line-buffered input */
 static bool term_echo      = true;   /* ECHO: echo input chars */
 
-/* xHCI USB polling (weak: works without xHCI driver) */
-extern void xhci_poll(void) __attribute__((weak));
-
-/* Blocking keyboard read with interrupts enabled.
- * SYSCALL entry disables interrupts (FMASK clears IF). We must
- * re-enable them here so keyboard IRQs can actually fire. */
-static char kb_getchar_safe(void)
-{
-    while (!kb_has_input()) {
-        __asm__ volatile ("sti" ::: "memory");
-        if (xhci_poll) xhci_poll();  /* Poll USB HID devices */
-        if (kb_has_input()) { __asm__ volatile ("cli" ::: "memory"); break; }
-        __asm__ volatile ("hlt; cli" ::: "memory");
-    }
-    return kb_getchar();  /* non-blocking now, data is ready */
-}
-
 static ssize_t console_read(void *buf, size_t count)
 {
     if (count == 0) return 0;
@@ -514,7 +498,7 @@ static ssize_t console_read(void *buf, size_t count)
     if (!term_canonical) {
         /* Raw mode: return individual characters, no line buffering.
          * Block for first char, then return as many as available. */
-        dst[0] = (uint8_t)kb_getchar_safe();
+        dst[0] = (uint8_t)kb_getchar();
         ssize_t n = 1;
         while (n < (ssize_t)count && kb_has_input()) {
             dst[n] = (uint8_t)kb_trygetchar();
@@ -525,7 +509,7 @@ static ssize_t console_read(void *buf, size_t count)
     }
 
     /* Canonical mode: block for one character */
-    dst[0] = (uint8_t)kb_getchar_safe();
+    dst[0] = (uint8_t)kb_getchar();
     return 1;
 }
 
@@ -663,6 +647,7 @@ extern void    *proc_current(void);
 extern uint64_t proc_current_cr3(void);
 extern int32_t  proc_current_tgid(void);
 extern int32_t  proc_tgid_of(void *p);
+extern bool     proc_shares_current_address_space(void *p);
 
 /* GPU contexts/resources are process-wide objects.  CLONE_THREAD gives each
  * thread its own TID (proc_current_pid) while sharing the address space and
@@ -725,6 +710,15 @@ static inline bool vma_owned_by_current(const vma_t *v)
      * for diagnostics; do not dereference it here. */
     int32_t ct = proc_current_tgid();
     return ct != 0 && v->owner_tgid != 0 && (uint32_t)ct == v->owner_tgid;
+}
+
+/* Ownership controls mutation and teardown; accessibility additionally lets
+ * a vfork-style child demand-fault pages in the parent's shared CR3 before
+ * execve detaches it. Keep this predicate out of munmap/brk/reset paths. */
+static inline bool vma_accessible_by_current(const vma_t *v)
+{
+    return vma_owned_by_current(v) ||
+           (v->owner && proc_shares_current_address_space(v->owner));
 }
 
 /* Return the furthest end of an owned VMA intersecting [base, base + size).
@@ -946,7 +940,10 @@ static void quarantine_page(uint64_t phys, uint64_t virt, uint32_t pid)
     slot->virt = virt;
     slot->pid = pid;
     slot->freed_tick = idt_get_ticks();
-    slot->freed_rip = (uint64_t)__builtin_return_address(1);
+    /* The immediate call site is safe and identifies the unmap path.
+     * Deeper __builtin_return_address levels require frame pointers and can
+     * fault when this path originates at an optimized syscall boundary. */
+    slot->freed_rip = (uint64_t)__builtin_return_address(0);
     slot->active = true;
     quarantine_head++;
 }
@@ -1155,6 +1152,8 @@ int vma_register_file(uint64_t base, uint64_t pages, uint32_t prot,
 #define DEV_ZERO        1
 #define DEV_URANDOM     2
 #define DEV_CONSOLE     3
+#define DEV_DSP         4
+#define DEV_AUDIO       5
 
 /* PRNG for /dev/urandom — CCP TRNG if available, RDTSC fallback */
 extern uint64_t ccp_random(void) __attribute__((weak));
@@ -1198,6 +1197,13 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
         return sock_send(f->socket_idx, (const void *)buf, (uint32_t)count, 0);
 
     if (f->type == FD_TYPE_DEV) {
+        if (f->device_ops) {
+            if ((f->oflags & O_ACCMODE) == O_RDONLY ||
+                !f->device_ops->write)
+                return -EBADF;
+            return f->device_ops->write(f->device_data, (const void *)buf,
+                                        (size_t)count, f->oflags);
+        }
         int dev_id = (int)f->offset;
         switch (dev_id) {
         case DEV_NULL:
@@ -1268,6 +1274,13 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
         return sock_recv(f->socket_idx, (void *)buf, (uint32_t)count, 0);
 
     if (f->type == FD_TYPE_DEV) {
+        if (f->device_ops) {
+            if ((f->oflags & O_ACCMODE) == O_WRONLY ||
+                !f->device_ops->read)
+                return -EBADF;
+            return f->device_ops->read(f->device_data, (void *)buf,
+                                       (size_t)count, f->oflags);
+        }
         int dev_id = (int)f->offset;
         switch (dev_id) {
         case DEV_NULL:
@@ -1890,7 +1903,18 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         else if (strcmp(devname, "random") == 0)  dev_id = DEV_URANDOM;
         else if (strcmp(devname, "console") == 0) dev_id = DEV_CONSOLE;
         else if (strcmp(devname, "tty") == 0)     dev_id = DEV_CONSOLE;
+        else if (strcmp(devname, "dsp") == 0)     dev_id = DEV_DSP;
+        else if (strcmp(devname, "audio") == 0)   dev_id = DEV_AUDIO;
         else return -ENOENT;
+
+        void *device_data = NULL;
+        if (dev_id == DEV_DSP || dev_id == DEV_AUDIO) {
+            int result = oss_audio_create(dev_id == DEV_AUDIO,
+                                          (uint32_t)flags & O_ACCMODE,
+                                          &device_data);
+            if (result < 0)
+                return result;
+        }
 
         fd_entry_t *f = &fd_table[newfd];
         memset(f, 0, sizeof(*f));
@@ -1898,6 +1922,10 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         f->type   = FD_TYPE_DEV;
         f->oflags = (uint32_t)flags;
         f->offset = (uint64_t)dev_id;  /* store device ID in offset field */
+        if (device_data) {
+            f->device_ops = &oss_audio_device_ops;
+            f->device_data = device_data;
+        }
         return newfd;
     }
 
@@ -2065,6 +2093,9 @@ static int64_t close_fd_in_table(fd_entry_t *table, uint64_t fd)
     if (f->type == FD_TYPE_SOCKET)
         sock_close(f->socket_idx);
 
+    if (f->type == FD_TYPE_DEV)
+        fd_device_release(f);
+
     f->open = false;
     return 0;
 }
@@ -2137,13 +2168,15 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statbuf_addr)
     if (f->type == FD_TYPE_FILE) {
         if (f->node.fs_version == 2)
             f->node.size = osfs2_file_size(f->node.data);
-        st->st_mode = 0100644;  /* S_IFREG | 0644 */
-        if (f->node.fs_version == 3 && osfs3_is_dir(f->node.ino))
-            st->st_mode = 0040755; /* S_IFDIR | 0755 */
+        uint16_t stored_mode;
+        if (vfs_get_mode(&f->node, &stored_mode) == VFS_STATUS_OK)
+            st->st_mode = stored_mode;
+        else
+            st->st_mode = 0100644;  /* S_IFREG | 0644 */
         st->st_size = (int64_t)f->node.size;
         st->st_blksize = 4096;
         st->st_blocks = (st->st_size + 511) / 512;
-        st->st_nlink = 1;
+        st->st_nlink = (st->st_mode & 0170000) == 0040000 ? 2 : 1;
         if (f->node.fs_version == 2) {
             st->st_mtime_sec = osfs2_file_mtime(f->node.data);
             st->st_ctime_sec = osfs2_file_ctime(f->node.data);
@@ -2158,6 +2191,9 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statbuf_addr)
         if (dev_id == DEV_NULL)    st->st_rdev = 0x0103;  /* 1,3 */
         else if (dev_id == DEV_ZERO) st->st_rdev = 0x0105; /* 1,5 */
         else if (dev_id == DEV_URANDOM) st->st_rdev = 0x0109; /* 1,9 */
+        else if (dev_id == DEV_DSP) st->st_rdev = 0x0E03; /* OSS dsp */
+        else if (dev_id == DEV_AUDIO) st->st_rdev = 0x0E04; /* OSS audio */
+        else if (f->device_ops) st->st_rdev = f->device_ops->rdev;
         else st->st_rdev = 0x0501;  /* /dev/console = 5,1 */
         st->st_nlink = 1;
         st->st_blksize = 4096;
@@ -2334,6 +2370,8 @@ extern uint64_t nt_vm_range_conflict_end(uint64_t base, uint64_t size)
     __attribute__((weak));
 extern uint64_t pe_va_range_conflict_end(uint64_t base, uint64_t size)
     __attribute__((weak));
+extern uint64_t mem_identity_reservation_conflict_end(uint64_t base,
+                                                       uint64_t size);
 
 static uint64_t mmap_range_conflict_end_current(uint64_t base, uint64_t size)
 {
@@ -2358,10 +2396,17 @@ static uint64_t mmap_range_conflict_end_current(uint64_t base, uint64_t size)
     }
 
     uint64_t cr3 = proc_current_cr3();
-    /* The kernel CR3 identity-maps low physical memory. Those PTEs are not
-     * user allocations; the explicit VMA/NT/PE registries above are the
-     * authoritative occupancy source in that legacy address space. */
-    if (cr3 && cr3 != paging_get_kernel_cr3()) {
+    /* The kernel CR3 identity-maps low physical memory. Ordinary identity
+     * PTEs are not user allocations, but low aliases still used by the kernel
+     * must remain unavailable to legacy hosted processes. */
+    if (cr3 == paging_get_kernel_cr3()) {
+        uint64_t identity_end =
+            mem_identity_reservation_conflict_end(base, size);
+        if (identity_end == UINT64_MAX)
+            return UINT64_MAX;
+        if (identity_end > conflict_end)
+            conflict_end = identity_end;
+    } else if (cr3) {
         uint64_t mapped_end =
             paging_first_mapped_end_in_cr3(cr3, base, size);
         if (mapped_end == UINT64_MAX)
@@ -2424,6 +2469,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             return -EINVAL;
         if (addr + npages * 4096 < addr)
             return -EINVAL;
+        if (proc_current_cr3() == paging_get_kernel_cr3() &&
+            mem_identity_reservation_conflict_end(addr,
+                                                   npages * 4096ULL))
+            return -ENOMEM;
         /* Linux MAP_FIXED replaces existing mappings in the target range.
          * Keep the behavior simple: remove owned overlapping VMAs if present,
          * then install the new demand-paged VMA below. */
@@ -2783,7 +2832,7 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
         if (!vma_table[i].in_use) continue;
         uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
         if (addr >= vma_table[i].base && addr < vma_end) {
-            if (vma_owned_by_current(&vma_table[i])) {
+            if (vma_accessible_by_current(&vma_table[i])) {
                 vma = &vma_table[i];
                 break;
             }
@@ -3019,6 +3068,15 @@ typedef struct {
 
 static int64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
+    if (fd >= MAX_FDS || !fd_table[fd].open)
+        return -EBADF;
+    if (fd_table[fd].type == FD_TYPE_DEV && fd_table[fd].device_ops) {
+        const fd_device_ops_t *ops = fd_table[fd].device_ops;
+        if (!ops->ioctl)
+            return -ENOTTY;
+        return ops->ioctl(fd_table[fd].device_data, request, arg,
+                          &fd_table[fd].oflags);
+    }
     if (fd < MAX_FDS && fd_table[fd].open &&
         fd_table[fd].type == FD_TYPE_SOCKET) {
         int sock_idx = fd_table[fd].socket_idx;
@@ -3144,6 +3202,14 @@ static int poll_check(struct pollfd *fds, uint64_t nfds)
             if (pending < 0)
                 fds[i].revents |= POLLERR;
         }
+        if (f->type == FD_TYPE_DEV && f->device_ops) {
+            if ((fds[i].events & POLLIN) && f->device_ops->read_ready &&
+                f->device_ops->read_ready(f->device_data))
+                fds[i].revents |= POLLIN;
+            if ((fds[i].events & POLLOUT) && f->device_ops->write_ready &&
+                f->device_ops->write_ready(f->device_data))
+                fds[i].revents |= POLLOUT;
+        }
         if (fds[i].revents) ready++;
     }
     return ready;
@@ -3210,6 +3276,17 @@ static int64_t sys_select(uint64_t nfds, uint64_t readfds_addr,
                 }
                 if (want_except && pending < 0) {
                     except_out[word] |= mask;
+                    fd_ready = true;
+                }
+            } else if (entry->type == FD_TYPE_DEV && entry->device_ops) {
+                if (want_read && entry->device_ops->read_ready &&
+                    entry->device_ops->read_ready(entry->device_data)) {
+                    read_out[word] |= mask;
+                    fd_ready = true;
+                }
+                if (want_write && entry->device_ops->write_ready &&
+                    entry->device_ops->write_ready(entry->device_data)) {
+                    write_out[word] |= mask;
                     fd_ready = true;
                 }
             } else {
@@ -3424,6 +3501,7 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
                fd_table[newfd].node.fs_version == 2) {
         osfs2_file_retain(fd_table[newfd].node.data);
     }
+    fd_device_retain(&fd_table[newfd]);
 
     return (int64_t)newfd;
 }
@@ -3758,6 +3836,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
                            fd_table[i].node.fs_version == 2) {
                     osfs2_file_retain(fd_table[i].node.data);
                 }
+                fd_device_retain(&fd_table[i]);
                 return (int64_t)i;
             }
         }
@@ -3999,6 +4078,7 @@ static int64_t sys_dup(uint64_t oldfd)
                        fd_table[i].node.fs_version == 2) {
                 osfs2_file_retain(fd_table[i].node.data);
             }
+            fd_device_retain(&fd_table[i]);
             return (int64_t)i;
         }
     }
@@ -4386,6 +4466,45 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t dirp_addr, uint64_t count)
 extern uint64_t idt_get_ticks(void);
 
 static uint64_t current_umask = 022;
+
+static int64_t sys_chmod(uint64_t path_addr, uint64_t mode)
+{
+    const char *path = (const char *)path_addr;
+    if (!path) return -EFAULT;
+
+    char normalized[256];
+    const char *lookup = normalized_lookup(path, normalized,
+                                            sizeof(normalized));
+    vfs_node_t node;
+    if (!vfs_find(lookup, VFS_MODE_POSIX, &node)) return -ENOENT;
+    int result = vfs_set_mode(&node, (uint16_t)(mode & 07777U));
+    if (result == VFS_STATUS_OK) return 0;
+    if (result == VFS_STATUS_NOT_SUPPORTED) return -ENOTSUP;
+    if (result == VFS_STATUS_INVALID) return -EINVAL;
+    return -EIO;
+}
+
+static int64_t sys_fchmod(uint64_t fd, uint64_t mode)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    fd_entry_t *file = &fd_table[fd];
+    if (file->type != FD_TYPE_FILE) return -ENOTSUP;
+    int result = vfs_set_mode(&file->node, (uint16_t)(mode & 07777U));
+    if (result == VFS_STATUS_OK) return 0;
+    if (result == VFS_STATUS_NOT_SUPPORTED) return -ENOTSUP;
+    if (result == VFS_STATUS_INVALID) return -EINVAL;
+    return -EIO;
+}
+
+static int64_t sys_fchmodat(uint64_t dirfd, uint64_t path_addr,
+                            uint64_t mode, uint64_t flags)
+{
+    const char *path = (const char *)path_addr;
+    if (!path) return -EFAULT;
+    if ((int32_t)dirfd != AT_FDCWD && path[0] != '/') return -ENOTSUP;
+    if (flags & ~0x100ULL) return -EINVAL; /* AT_SYMLINK_NOFOLLOW */
+    return sys_chmod(path_addr, mode);
+}
 
 static int64_t sys_pause(void)
 {
@@ -5149,8 +5268,8 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_RENAME:     return sys_rename(a1, a2);
     case SYS_MKDIR:      return -ENOSYS;  /* no directories */
     case SYS_RMDIR:      return -ENOSYS;
-    case SYS_CHMOD:      return 0;   /* pretend success */
-    case SYS_FCHMOD:     return 0;
+    case SYS_CHMOD:      return sys_chmod(a1, a2);
+    case SYS_FCHMOD:     return sys_fchmod(a1, a2);
     case SYS_CHOWN:      return 0;
     case SYS_FCHOWN:     return 0;
     case SYS_UMASK:      return sys_umask(a1);
@@ -5193,7 +5312,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_RENAMEAT:   return sys_renameat(a1, a2, a3, a4, 0);
     case SYS_MKDIRAT:    return -ENOSYS;
     case SYS_FCHOWNAT:   return 0;
-    case SYS_FCHMODAT:   return 0;
+    case SYS_FCHMODAT:   return sys_fchmodat(a1, a2, a3, a4);
     case SYS_FACCESSAT:  return sys_access(a2, a3);  /* ignore dirfd */
     case SYS_FACCESSAT2: return sys_access(a2, a3);
     case SYS_PSELECT6:   return sys_poll(0, 0, 0);
@@ -5217,13 +5336,10 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_SHM_GETSIZE:
         return shm_get_size ? (int64_t)shm_get_size((uint32_t)a1) : -ENOSYS;
     case SYS_SHM_MKSURFACE:
-        {
-            /* Set owner PID so compositor_cleanup_process() can find the window */
-            extern uint32_t shm_surface_owner_pid;
-            extern uint32_t proc_exec_pid(void);
-            shm_surface_owner_pid = proc_exec_pid();
-            return shm_create_surface ? (int64_t)shm_create_surface((uint32_t)a1, (uint32_t)a2, (uint32_t)a3) : -ENOSYS;
-        }
+        return shm_create_surface
+            ? (int64_t)shm_create_surface((uint32_t)a1, (uint32_t)a2,
+                                          (uint32_t)a3)
+            : -ENOSYS;
     case SYS_GUI_FLIP:
         if (shm_flush_surface) { shm_flush_surface((uint32_t)a1); return 0; }
         return -ENOSYS;

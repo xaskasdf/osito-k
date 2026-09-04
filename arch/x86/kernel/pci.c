@@ -556,7 +556,8 @@ void __initk pci_scan(void)
                     uint8_t secondary = (busreg >> 8) & 0xFF;
                     uint8_t subordinate = (busreg >> 16) & 0xFF;
                     if (secondary > 0 && secondary <= max_bus) {
-                        for (uint8_t b = secondary; b <= subordinate && b <= max_bus; b++)
+                        for (uint16_t b = secondary;
+                             b <= subordinate && b <= max_bus; b++)
                             bus_active[b] = 1;
                     }
                     serial_puts("  Bridge: bus ");

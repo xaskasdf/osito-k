@@ -17,6 +17,8 @@
 *.inc      text eol=lf
 *.patch    text eol=lf
 *.ld       text eol=lf
+*.autoload text eol=lf
+*.def      text eol=lf
 Makefile   text eol=lf
 *.mk       text eol=lf
 .gitignore text eol=lf

@@ -10,18 +10,29 @@ extern void serial_puts(const char *s);
 
 #define WIN32_ABI_MAX_DLLS 64
 #define WIN32_ABI_COMPAT32_BRIDGE_SLOTS 4096
+#define WIN32_ABI_COMPAT32_DIRECT_SLOTS 128
 
-static struct {
+typedef struct {
     const char         *dll;
     const WIN32_EXPORT *table;
     int                 count;
-} g_abi[WIN32_ABI_MAX_DLLS];
+} WIN32_ABI_REGISTRY_ENTRY;
+
+static WIN32_ABI_REGISTRY_ENTRY g_abi[WIN32_ABI_MAX_DLLS];
 static int g_abi_count;
 
 static struct {
     const void *native_target;
     const void *compat32_target;
 } g_compat32_bridges[WIN32_ABI_COMPAT32_BRIDGE_SLOTS];
+
+typedef struct {
+    const void *native_target;
+    uint32_t compat32_target;
+} WIN32_ABI_COMPAT32_DIRECT_ENTRY;
+
+static WIN32_ABI_COMPAT32_DIRECT_ENTRY
+    g_compat32_direct[WIN32_ABI_COMPAT32_DIRECT_SLOTS];
 
 void win32_abi_reset(void)
 {
@@ -127,6 +138,42 @@ const void *win32_abi_compat32_bridge(const void *native_target)
         slot = (slot + 1) & (WIN32_ABI_COMPAT32_BRIDGE_SLOTS - 1);
     }
     return NULL;
+}
+
+void win32_abi_register_compat32_direct(const void *native_target,
+                                        uint32_t compat32_target)
+{
+    if (!native_target || !compat32_target) return;
+
+    unsigned slot = compat32_bridge_hash(native_target) &
+                    (WIN32_ABI_COMPAT32_DIRECT_SLOTS - 1);
+    for (unsigned probe = 0; probe < WIN32_ABI_COMPAT32_DIRECT_SLOTS;
+         probe++) {
+        if (!g_compat32_direct[slot].native_target ||
+            g_compat32_direct[slot].native_target == native_target) {
+            g_compat32_direct[slot].native_target = native_target;
+            g_compat32_direct[slot].compat32_target = compat32_target;
+            return;
+        }
+        slot = (slot + 1) & (WIN32_ABI_COMPAT32_DIRECT_SLOTS - 1);
+    }
+    serial_puts("[ABI] PE32 direct-target table full\n");
+}
+
+uint32_t win32_abi_compat32_direct(const void *native_target)
+{
+    if (!native_target) return 0;
+
+    unsigned slot = compat32_bridge_hash(native_target) &
+                    (WIN32_ABI_COMPAT32_DIRECT_SLOTS - 1);
+    for (unsigned probe = 0; probe < WIN32_ABI_COMPAT32_DIRECT_SLOTS;
+         probe++) {
+        if (!g_compat32_direct[slot].native_target) return 0;
+        if (g_compat32_direct[slot].native_target == native_target)
+            return g_compat32_direct[slot].compat32_target;
+        slot = (slot + 1) & (WIN32_ABI_COMPAT32_DIRECT_SLOTS - 1);
+    }
+    return 0;
 }
 
 /* ── MSVC name demangler (argc + calling convention only) ───────── */
@@ -242,9 +289,9 @@ static int arg_size(const char **pp, const char *end, int *dw)
     }
 }
 
-int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
+int msvc_demangle_abi_layout(const char *s, WIN32_ABI_LAYOUT *out_layout)
 {
-    if (!s || s[0] != '?') return 0;
+    if (!s || !out_layout || s[0] != '?') return 0;
     int slen = bounded_cstr_len(s, 256);
     if (slen < 0) return 0;
     const char *end = s + slen;
@@ -274,21 +321,12 @@ int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
 
     uint8_t cc;
     if (is_member && !is_static) {
-        /* Non-static member: skip `thistype` prefix (A/B reference + CV
-         * letter, e.g. `AE` in `?Tick@UObject@@UA E X X Z`), then read
-         * the calling-convention character.  If the CC char is not a valid
-         * code (constructor/destructor `@`), default to thiscall. */
+        /* A non-static member has one this-CV code before its calling
+         * convention, for example QAE = public, mutable this, thiscall. */
+        if (p >= end || *p < 'A' || *p > 'Z') return 0;
+        p++;
         if (p >= end) return 0;
-        if (*p == 'A' || *p == 'B') {
-            p++;                                   /* skip reference marker */
-            if (p >= end) return 0;
-            if (*p >= 'A' && *p <= 'Z') p++;       /* skip CV qualifier */
-        }
-        if (p >= end) return 0;
-        if (!cc_from_code(*p, &cc)) {
-            cc = CC_THISCALL;                      /* ctor/dtor @ → fallback */
-            if (*p != '@') return 0;               /* truly unparseable */
-        }
+        if (!cc_from_code(*p, &cc)) return 0;
         p++;
     } else {
         /* Free function or static member: read CC from next char */
@@ -305,25 +343,78 @@ int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
         if (!skip_type(&p, end)) return 0;
     }
 
-    int argc = 0;
+    WIN32_ABI_LAYOUT layout = {
+        .stack_argc = 0,
+        .logical_argc = 0,
+        .callconv = cc,
+        .ecx_arg = WIN32_ABI_ARG_UNUSED,
+        .edx_arg = WIN32_ABI_ARG_UNUSED,
+    };
+    uint8_t register_args = 0;
+    if (is_member && !is_static) {
+        if (cc == CC_THISCALL || cc == CC_FASTCALL) {
+            layout.ecx_arg = layout.logical_argc++;
+            register_args = 1;
+        } else {
+            layout.stack_argc++;
+            layout.logical_argc++;
+        }
+    }
+
+    int variadic = 0;
     if (p >= end) return 0;
     if (*p == 'X') {                              /* (void) */
         p++;
     } else {
-        while (p < end && *p && *p != 'Z') {      /* 'Z' alone = ellipsis/end */
-            if (*p == '@') { p++; break; }        /* end of arg list */
+        while (p < end && *p) {
+            if (*p == '@') {
+                p++;
+                break;
+            }
+            if (*p == 'Z') {
+                variadic = 1;
+                p++;
+                break;
+            }
             int dw;
             if (!arg_size(&p, end, &dw)) return 0;/* ambiguous → bail */
-            argc += dw;
-            if (argc > 64) return 0;              /* sanity */
+            uint8_t position = layout.logical_argc;
+            if (cc == CC_FASTCALL && dw == 1 && register_args < 2) {
+                if (register_args == 0)
+                    layout.ecx_arg = position;
+                else
+                    layout.edx_arg = position;
+                register_args++;
+            } else {
+                if ((uint16_t)layout.stack_argc + (uint16_t)dw > 0xFFU)
+                    return 0;
+                layout.stack_argc = (uint8_t)(layout.stack_argc + dw);
+            }
+            if ((uint16_t)layout.logical_argc + (uint16_t)dw > 0xFFU)
+                return 0;
+            layout.logical_argc = (uint8_t)(layout.logical_argc + dw);
         }
     }
 
-    /* Non-static member functions: `this` pointer counts as 1 DWORD arg */
-    if (is_member && !is_static) argc += 1;
+    if (p >= end || *p != 'Z' || p + 1 != end)
+        return 0;
+    if (variadic) {
+        if (cc != CC_CDECL)
+            return 0;
+        layout.callconv |= CC_VARIADIC;
+    }
 
-    *out_cc   = cc;
-    *out_argc = (uint8_t)argc;
+    *out_layout = layout;
+    return 1;
+}
+
+int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
+{
+    WIN32_ABI_LAYOUT layout;
+    if (!out_argc || !out_cc || !msvc_demangle_abi_layout(s, &layout))
+        return 0;
+    *out_argc = layout.stack_argc;
+    *out_cc = layout.callconv;
     return 1;
 }
 
@@ -332,7 +423,7 @@ int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
 int win32_abi_lookup(const char *dll_name, const char *func_name,
                      uint8_t *out_argc, uint8_t *out_cc)
 {
-    if (!func_name) return 0;
+    if (!func_name || !out_argc || !out_cc) return 0;
 
     /* 1. exact DLL's co-located table */
     if (dll_name) {
@@ -372,7 +463,7 @@ int win32_abi_lookup_target(const char *dll_name, const void *target,
                             const char **out_name, uint8_t *out_argc,
                             uint8_t *out_cc)
 {
-    if (!target) return 0;
+    if (!target || !out_name || !out_argc || !out_cc) return 0;
 
     if (dll_name) {
         for (int i = 0; i < g_abi_count; i++) {
@@ -403,12 +494,31 @@ int win32_abi_lookup_target(const char *dll_name, const void *target,
     return 0;
 }
 
-
-int win32_abi_target_is_data(const char *dll_name, const void *target)
+int win32_abi_lookup_resolved(const char *dll_name, const char *func_name,
+                              const void *target, const char **out_name,
+                              uint8_t *out_argc, uint8_t *out_cc)
 {
-    if (!target) return 0;
+    if (!out_name || !out_argc || !out_cc) return 0;
 
-    if (dll_name) {
+    /* A resolver target identifies the actual provider even when the import
+     * DLL is an API-set alias or a compatibility redirect. */
+    if (target && win32_abi_lookup_target(dll_name, target, out_name,
+                                          out_argc, out_cc))
+        return 1;
+
+    if (func_name && win32_abi_lookup(dll_name, func_name,
+                                      out_argc, out_cc)) {
+        *out_name = func_name;
+        return 1;
+    }
+    return 0;
+}
+
+
+int win32_abi_resolved_is_data(const char *dll_name, const char *func_name,
+                               const void *target)
+{
+    if (target && dll_name) {
         for (int i = 0; i < g_abi_count; i++) {
             if (ci_eq(g_abi[i].dll, dll_name)) {
                 const WIN32_EXPORT *e = find_target_in_table(
@@ -419,10 +529,154 @@ int win32_abi_target_is_data(const char *dll_name, const void *target)
         }
     }
 
-    for (int i = 0; i < g_abi_count; i++) {
-        const WIN32_EXPORT *e = find_target_in_table(
-            g_abi[i].table, g_abi[i].count, target);
-        if (e) return (e->cc & WIN32_EXPORT_DATA_FLAG) != 0;
+    if (target) {
+        for (int i = 0; i < g_abi_count; i++) {
+            const WIN32_EXPORT *e = find_target_in_table(
+                g_abi[i].table, g_abi[i].count, target);
+            if (e) return (e->cc & WIN32_EXPORT_DATA_FLAG) != 0;
+        }
+    }
+
+    if (func_name && dll_name) {
+        for (int i = 0; i < g_abi_count; i++) {
+            if (ci_eq(g_abi[i].dll, dll_name)) {
+                const WIN32_EXPORT *e = find_in_table(
+                    g_abi[i].table, g_abi[i].count, func_name);
+                if (e) return (e->cc & WIN32_EXPORT_DATA_FLAG) != 0;
+                break;
+            }
+        }
+    }
+
+    if (func_name) {
+        for (int i = 0; i < g_abi_count; i++) {
+            const WIN32_EXPORT *e = find_in_table(
+                g_abi[i].table, g_abi[i].count, func_name);
+            if (e) return (e->cc & WIN32_EXPORT_DATA_FLAG) != 0;
+        }
     }
     return 0;
+}
+
+static uint64_t abi_selftest_stdcall(uint64_t value)
+{
+    return value;
+}
+
+static uint64_t abi_selftest_cdecl(uint64_t left, uint64_t right)
+{
+    return left + right;
+}
+
+int win32_abi_selftest(void)
+{
+    static const WIN32_EXPORT test_exports[] = {
+        WX_STD("StdCallOne", abi_selftest_stdcall, 1),
+        WX_CDL("CdeclTwo", abi_selftest_cdecl, 2),
+        WX_DATA_DYNAMIC("DynamicData"),
+    };
+    WIN32_ABI_REGISTRY_ENTRY saved_registry[WIN32_ABI_MAX_DLLS];
+    WIN32_ABI_COMPAT32_DIRECT_ENTRY
+        saved_direct[WIN32_ABI_COMPAT32_DIRECT_SLOTS];
+    int saved_count = g_abi_count;
+    int failures = 0;
+
+    for (int i = 0; i < WIN32_ABI_MAX_DLLS; i++)
+        saved_registry[i] = g_abi[i];
+    for (int i = 0; i < WIN32_ABI_COMPAT32_DIRECT_SLOTS; i++)
+        saved_direct[i] = g_compat32_direct[i];
+
+    win32_abi_register("abi-selftest.dll", test_exports,
+                       (int)(sizeof(test_exports) / sizeof(test_exports[0])));
+
+    uint8_t argc = 0xFF;
+    uint8_t cc = 0xFF;
+    const char *name = NULL;
+    if (!win32_abi_lookup("ABI-SELFTEST.DLL", "stdcallone", &argc, &cc) ||
+        argc != 1 || cc != CC_STDCALL)
+        failures++;
+
+    argc = cc = 0xFF;
+    if (!win32_abi_lookup_resolved(
+            "redirect.dll", NULL, (const void *)abi_selftest_cdecl,
+            &name, &argc, &cc) ||
+        !name || !ci_eq(name, "CdeclTwo") || argc != 2 || cc != CC_CDECL)
+        failures++;
+
+    argc = cc = 0xFF;
+    name = NULL;
+    if (!win32_abi_lookup_resolved(
+            "unknown.dll", "?appUnwindf@@YAXPBGZZ", NULL,
+            &name, &argc, &cc) ||
+        argc != 1 || cc != (CC_CDECL | CC_VARIADIC))
+        failures++;
+
+    WIN32_ABI_LAYOUT layout;
+    if (!msvc_demangle_abi_layout("?normal@Probe@@QAEHHN@Z", &layout) ||
+        layout.stack_argc != 3 || layout.logical_argc != 4 ||
+        layout.callconv != CC_THISCALL || layout.ecx_arg != 0 ||
+        layout.edx_arg != WIN32_ABI_ARG_UNUSED)
+        failures++;
+
+    if (!msvc_demangle_abi_layout("?fast@Probe@@QAIHHH@Z", &layout) ||
+        layout.stack_argc != 1 || layout.logical_argc != 3 ||
+        layout.callconv != CC_FASTCALL || layout.ecx_arg != 0 ||
+        layout.edx_arg != 1)
+        failures++;
+
+    if (!msvc_demangle_abi_layout("?standard@Probe@@QAGHH@Z", &layout) ||
+        layout.stack_argc != 2 || layout.logical_argc != 2 ||
+        layout.callconv != CC_STDCALL ||
+        layout.ecx_arg != WIN32_ABI_ARG_UNUSED ||
+        layout.edx_arg != WIN32_ABI_ARG_UNUSED)
+        failures++;
+
+    if (!msvc_demangle_abi_layout("?caller_clean@Probe@@QAAHH@Z", &layout) ||
+        layout.stack_argc != 2 || layout.logical_argc != 2 ||
+        layout.callconv != CC_CDECL ||
+        layout.ecx_arg != WIN32_ABI_ARG_UNUSED ||
+        layout.edx_arg != WIN32_ABI_ARG_UNUSED)
+        failures++;
+
+    if (!msvc_demangle_abi_layout("?fast_words@@YIHHHH@Z", &layout) ||
+        layout.stack_argc != 1 || layout.logical_argc != 3 ||
+        layout.callconv != CC_FASTCALL || layout.ecx_arg != 0 ||
+        layout.edx_arg != 1)
+        failures++;
+
+    if (!msvc_demangle_abi_layout("?fast_mixed@@YIHNHH@Z", &layout) ||
+        layout.stack_argc != 2 || layout.logical_argc != 4 ||
+        layout.callconv != CC_FASTCALL || layout.ecx_arg != 2 ||
+        layout.edx_arg != 3)
+        failures++;
+
+    argc = cc = 0xA5;
+    name = (const char *)(ULONG_PTR)1;
+    if (win32_abi_lookup_resolved("abi-selftest.dll", "Missing", NULL,
+                                  &name, &argc, &cc) ||
+        name != (const char *)(ULONG_PTR)1 || argc != 0xA5 || cc != 0xA5)
+        failures++;
+
+    if (!win32_abi_resolved_is_data(
+            "abi-selftest.dll", "dynamicdata",
+            (const void *)(ULONG_PTR)0x1234))
+        failures++;
+
+    win32_abi_register_compat32_direct(
+        (const void *)abi_selftest_cdecl, 0x12345000U);
+    if (win32_abi_compat32_direct((const void *)abi_selftest_cdecl) !=
+        0x12345000U)
+        failures++;
+
+    for (int i = 0; i < WIN32_ABI_MAX_DLLS; i++)
+        g_abi[i] = saved_registry[i];
+    for (int i = 0; i < WIN32_ABI_COMPAT32_DIRECT_SLOTS; i++)
+        g_compat32_direct[i] = saved_direct[i];
+    g_abi_count = saved_count;
+
+    if (failures)
+        serial_puts("[ABI-TEST] failed\n");
+    else
+        serial_puts("[ABI-TEST] passed\n");
+    return failures;
 }

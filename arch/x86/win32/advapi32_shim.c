@@ -1,19 +1,23 @@
 /*
  * OsitoK Windows Compatibility Layer — advapi32.dll Shim Implementation
  *
- * In-memory registry backed by a flat key-value store.
- * Pre-populated with UT99-relevant defaults.
+ * Kernel-global registry backed by a flat key-value store and a persistent,
+ * versioned hive on OsitoFS.
  *
- * Registry paths are normalized to lowercase with forward slashes.
- * Keys are stored as "HKLM/software/unreal technology/installed apps/..."
+ * Registry paths are normalized to lowercase with backslashes and retain the
+ * caller's WOW64 view. The persistent image contains no application defaults.
  */
 
 #include "advapi32_shim.h"
 #include "handle.h"
+#include "kernel32_shim.h"
 #include "ntsyscall.h"
 #include "scm.h"
 #include "win32_abi.h"
+#include "../fs/ositofs3.h"
+#include "../fs/vfs.h"
 #include "../kernel/smp.h"
+#include "ositofs3_format.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -33,6 +37,19 @@ extern HANDLE_TABLE g_handle_table;
 extern BOOL nt_process_id(HANDLE handle, DWORD *process_id);
 extern DWORD win32_current_process_id(void);
 extern PVOID win32_current_thread_object(void);
+extern void *kmalloc(uint64_t size);
+extern void kfree(void *ptr);
+extern uint64_t idt_get_ticks(void);
+extern bool osfs2_is_mounted(void);
+extern void *osfs2_find(const char *name);
+extern uint64_t osfs2_file_size(void *file);
+extern int osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
+extern void *osfs2_create(const char *name, uint64_t size);
+extern int osfs2_write(void *file, uint64_t offset, const void *buf,
+                       uint64_t len);
+extern int osfs2_truncate(void *file, uint64_t size);
+extern int osfs2_rename(const char *from, const char *to, bool replace);
+extern int osfs2_delete(const char *name);
 
 /* ── String helpers ────────────────────────────────────────── */
 
@@ -61,6 +78,19 @@ static void reg_memcpy(void *dst, const void *src, SIZE_T n)
     BYTE *d = (BYTE *)dst;
     const BYTE *s = (const BYTE *)src;
     while (n--) *d++ = *s++;
+}
+
+static void reg_memset(void *dst, BYTE value, SIZE_T n)
+{
+    BYTE *d = (BYTE *)dst;
+    while (n--) *d++ = value;
+}
+
+static int reg_string_valid(const char *text, SIZE_T capacity)
+{
+    for (SIZE_T i = 0; i < capacity; i++)
+        if (!text[i]) return 1;
+    return 0;
 }
 
 /* ── Registry store ────────────────────────────────────────── */
@@ -93,8 +123,63 @@ typedef struct {
 
 static REG_KEY   reg_keys[MAX_REG_KEYS];
 static REG_VALUE reg_values[MAX_REG_VALUES];
-static int       reg_initialized = 0;
 static ULONG     next_handle_id  = 0x90000001;
+static spinlock_t reg_lock = SPINLOCK_INIT;
+static spinlock_t reg_store_lock = SPINLOCK_INIT;
+static volatile DWORD reg_init_state;
+static DWORD reg_dirty_generation;
+static DWORD reg_dirty_operations;
+static uint64_t reg_last_flush_ticks;
+
+#define REG_STORE_MAGIC       0x31474552U /* "REG1" */
+#define REG_STORE_VERSION     1U
+#define REG_STORE_PATH        "System\\Registry\\registry.dat"
+#define REG_STORE_TEMP        "System\\Registry\\registry.dat.new"
+#define REG_STORE_FLUSH_OPS   64U
+#define REG_STORE_FLUSH_TICKS 100U
+
+typedef struct __attribute__((packed)) {
+    DWORD magic;
+    DWORD version;
+    DWORD header_size;
+    DWORD key_record_size;
+    DWORD value_record_size;
+    DWORD key_count;
+    DWORD value_count;
+    DWORD image_size;
+    DWORD crc32;
+    DWORD reserved[3];
+} REG_STORE_HEADER;
+
+typedef struct __attribute__((packed)) {
+    BYTE view;
+    BYTE reserved[3];
+    char path[MAX_REG_PATH];
+} REG_STORE_KEY;
+
+typedef struct __attribute__((packed)) {
+    DWORD type;
+    DWORD data_len;
+    BYTE view;
+    BYTE reserved[3];
+    char key_path[MAX_REG_PATH];
+    char name[128];
+    BYTE data[MAX_REG_DATA];
+} REG_STORE_VALUE;
+
+#define REG_STORE_MAX_SIZE \
+    (sizeof(REG_STORE_HEADER) + \
+     MAX_REG_KEYS * sizeof(REG_STORE_KEY) + \
+     MAX_REG_VALUES * sizeof(REG_STORE_VALUE))
+
+_Static_assert(sizeof(REG_STORE_HEADER) == 48, "registry hive header layout");
+
+static void reg_mark_dirty_locked(void)
+{
+    reg_dirty_generation++;
+    if (!reg_dirty_generation) reg_dirty_generation = 1;
+    if (reg_dirty_operations != 0xFFFFFFFFU) reg_dirty_operations++;
+}
 
 static REG_KEY *reg_key_from_handle(HKEY key)
 {
@@ -127,58 +212,6 @@ static int reg_path_has_prefix(const char *path, const char *prefix)
         if (a != b) return 0;
     }
     return *path == 0 || *path == '\\';
-}
-
-static int reg_is_steam_service_path(const char *path)
-{
-    return reg_path_has_prefix(path, "hklm\\software\\valve\\steam");
-}
-
-static int reg_is_steam_pid_name(const char *name)
-{
-    return name && reg_stricmp(name, "SteamPID") == 0;
-}
-
-static void reg_trace_steam_pid(const char *operation, const char *path,
-                                BYTE view, LONG status,
-                                const REG_VALUE *value)
-{
-    serial_puts("[REG-STEAM] ");
-    serial_puts(operation);
-    serial_puts(" pid=");
-    serial_putdec(win32_current_process_id());
-    serial_puts(" path=");
-    serial_puts(path);
-    serial_puts(" view=");
-    serial_puts(view == REG_VIEW_32 ? "32" : "64");
-    serial_puts(" status=");
-    serial_putdec((uint64_t)(uint32_t)status);
-    if (value) {
-        serial_puts(" type=");
-        serial_putdec(value->type);
-        serial_puts(" bytes=");
-        serial_putdec(value->data_len);
-        if (value->type == REG_DWORD && value->data_len >= sizeof(DWORD)) {
-            DWORD data = 0;
-            reg_memcpy(&data, value->data, sizeof(data));
-            serial_puts(" value=");
-            serial_putdec(data);
-        }
-    }
-    serial_puts("\n");
-}
-
-static void reg_trace_invalid_steam_handle(const char *operation, HKEY key)
-{
-    serial_puts("[REG-STEAM] ");
-    serial_puts(operation);
-    serial_puts(" pid=");
-    serial_putdec(win32_current_process_id());
-    serial_puts(" handle=0x");
-    serial_puthex((ULONG_PTR)key, g_compat32_mode ? 8 : 16);
-    serial_puts(" status=");
-    serial_putdec(ERROR_FILE_NOT_FOUND);
-    serial_puts("\n");
 }
 
 /* Windows redirects the software hives according to the caller's ABI. HKCR
@@ -228,6 +261,8 @@ static BYTE reg_storage_view(const char *path, BYTE handle_view)
 
 static REG_KEY *reg_ensure_key(const char *path, BYTE view)
 {
+    if (!path || reg_strlen(path) >= MAX_REG_PATH) return NULL;
+
     for (int i = 0; i < MAX_REG_KEYS; i++) {
         if (reg_keys[i].used && reg_keys[i].view == view &&
             reg_stricmp(reg_keys[i].path, path) == 0)
@@ -287,25 +322,32 @@ static void build_path(char *out, HKEY root, const char *subkey)
     out[pos] = 0;
 }
 
-/* ── Pre-populate UT99-relevant keys ──────────────────────── */
+/* ── Registry values ──────────────────────────────────────── */
 
-static void reg_set_value_view(const char *key_path, const char *name,
+static LONG reg_set_value_view(const char *key_path, const char *name,
                                DWORD type, const void *data, DWORD data_len,
                                BYTE view)
 {
+    const char *value_name = name ? name : "";
+    if (!key_path || reg_strlen(key_path) >= MAX_REG_PATH ||
+        reg_strlen(value_name) >= (int)sizeof(reg_values[0].name) ||
+        data_len > MAX_REG_DATA || (data_len && !data))
+        return ERROR_NOT_ENOUGH_MEMORY;
+
     view = reg_storage_view(key_path, view);
 
     /* A shared value under a redirected path must make the key visible from
-     * both views. This is used for the small set of compatibility defaults. */
+     * both views. */
     if (view == REG_VIEW_SHARED && reg_path_is_redirected(key_path)) {
-        reg_ensure_key(key_path, REG_VIEW_32);
-        reg_ensure_key(key_path, REG_VIEW_64);
+        if (!reg_ensure_key(key_path, REG_VIEW_32) ||
+            !reg_ensure_key(key_path, REG_VIEW_64))
+            return ERROR_NOT_ENOUGH_MEMORY;
     } else {
-        reg_ensure_key(key_path,
-                       view == REG_VIEW_SHARED ? reg_default_view() : view);
+        if (!reg_ensure_key(key_path,
+                            view == REG_VIEW_SHARED ? reg_default_view()
+                                                    : view))
+            return ERROR_NOT_ENOUGH_MEMORY;
     }
-
-    const char *value_name = name ? name : "";
 
     /* Windows replaces an existing value in the selected view. */
     for (int i = 0; i < MAX_REG_VALUES; i++) {
@@ -319,7 +361,7 @@ static void reg_set_value_view(const char *key_path, const char *name,
             data_len < MAX_REG_DATA ? data_len : MAX_REG_DATA;
         if (data && reg_values[i].data_len)
             reg_memcpy(reg_values[i].data, data, reg_values[i].data_len);
-        return;
+        return ERROR_SUCCESS;
     }
 
     /* Find or create value */
@@ -333,64 +375,305 @@ static void reg_set_value_view(const char *key_path, const char *name,
                 reg_memcpy(reg_values[i].data, data, reg_values[i].data_len);
             reg_values[i].view = view;
             reg_values[i].used = 1;
-            return;
+            return ERROR_SUCCESS;
         }
     }
+    return ERROR_NOT_ENOUGH_MEMORY;
 }
 
-static void reg_set_value(const char *key_path, const char *name,
+static LONG reg_set_value(const char *key_path, const char *name,
                           DWORD type, const void *data, DWORD data_len)
 {
-    reg_set_value_view(key_path, name, type, data, data_len,
-                       reg_default_view());
+    return reg_set_value_view(key_path, name, type, data, data_len,
+                              reg_default_view());
 }
 
 static void reg_init(void);
 
+static int reg_store_view_valid(BYTE view)
+{
+    return view == REG_VIEW_SHARED || view == REG_VIEW_32 ||
+           view == REG_VIEW_64;
+}
+
+static int reg_store_path_valid(const char *path, SIZE_T capacity)
+{
+    if (!path || !path[0] || !reg_string_valid(path, capacity)) return 0;
+    return reg_path_has_prefix(path, "hklm") ||
+           reg_path_has_prefix(path, "hkcu") ||
+           reg_path_has_prefix(path, "hkcr") ||
+           reg_path_has_prefix(path, "hku") ||
+           reg_path_has_prefix(path, "hkcc");
+}
+
+static int reg_store_prepare_directories(void)
+{
+    if (!osfs3_is_mounted()) return 1;
+    if (!osfs3_directory_exists_ci("System") &&
+        osfs3_mkdir("System") < 0)
+        return 0;
+    if (!osfs3_directory_exists_ci("System\\Registry") &&
+        osfs3_mkdir("System\\Registry") < 0)
+        return 0;
+    return 1;
+}
+
+static int reg_store_load(void)
+{
+    void *file = osfs2_find(REG_STORE_PATH);
+    if (!file) {
+        serial_puts("[REG-STORE] no registry hive; starting empty\n");
+        return 1;
+    }
+
+    uint64_t size64 = osfs2_file_size(file);
+    if (size64 < sizeof(REG_STORE_HEADER) || size64 > REG_STORE_MAX_SIZE) {
+        serial_puts("[REG-STORE] invalid hive size\n");
+        return 0;
+    }
+
+    SIZE_T size = (SIZE_T)size64;
+    BYTE *image = (BYTE *)kmalloc(size);
+    if (!image || osfs2_read(file, 0, image, size) != (int)size) {
+        if (image) kfree(image);
+        serial_puts("[REG-STORE] hive read failed\n");
+        return 0;
+    }
+
+    REG_STORE_HEADER *header = (REG_STORE_HEADER *)(void *)image;
+    uint64_t expected_size = sizeof(*header) +
+        (uint64_t)header->key_count * sizeof(REG_STORE_KEY) +
+        (uint64_t)header->value_count * sizeof(REG_STORE_VALUE);
+    DWORD stored_crc = header->crc32;
+    header->crc32 = 0;
+    DWORD calculated_crc = osfs3_crc32(image, size);
+    header->crc32 = stored_crc;
+
+    int valid = header->magic == REG_STORE_MAGIC &&
+        header->version == REG_STORE_VERSION &&
+        header->header_size == sizeof(*header) &&
+        header->key_record_size == sizeof(REG_STORE_KEY) &&
+        header->value_record_size == sizeof(REG_STORE_VALUE) &&
+        header->key_count <= MAX_REG_KEYS &&
+        header->value_count <= MAX_REG_VALUES &&
+        header->image_size == size && expected_size == size &&
+        stored_crc == calculated_crc;
+
+    REG_STORE_KEY *keys = NULL;
+    REG_STORE_VALUE *values = NULL;
+    if (valid) {
+        BYTE *cursor = image + sizeof(*header);
+        keys = (REG_STORE_KEY *)(void *)cursor;
+        cursor += (SIZE_T)header->key_count * sizeof(*keys);
+        values = (REG_STORE_VALUE *)(void *)cursor;
+
+        for (DWORD i = 0; i < header->key_count; i++) {
+            if (!reg_store_view_valid(keys[i].view) ||
+                !reg_store_path_valid(keys[i].path, sizeof(keys[i].path))) {
+                valid = 0;
+                break;
+            }
+        }
+    }
+    if (valid) {
+        for (DWORD i = 0; i < header->value_count; i++) {
+            if (!reg_store_view_valid(values[i].view) ||
+                values[i].data_len > MAX_REG_DATA ||
+                !reg_store_path_valid(values[i].key_path,
+                                      sizeof(values[i].key_path)) ||
+                !reg_string_valid(values[i].name,
+                                  sizeof(values[i].name))) {
+                valid = 0;
+                break;
+            }
+        }
+    }
+
+    if (!valid) {
+        kfree(image);
+        serial_puts("[REG-STORE] invalid or corrupt registry hive\n");
+        return 0;
+    }
+
+    reg_memset(reg_keys, 0, sizeof(reg_keys));
+    reg_memset(reg_values, 0, sizeof(reg_values));
+    next_handle_id = 0x90000001;
+    for (DWORD i = 0; i < header->key_count; i++) {
+        reg_strcpy(reg_keys[i].path, keys[i].path);
+        reg_keys[i].view = keys[i].view;
+        reg_keys[i].handle_id = next_handle_id++;
+        reg_keys[i].used = 1;
+    }
+    for (DWORD i = 0; i < header->value_count; i++) {
+        reg_strcpy(reg_values[i].key_path, values[i].key_path);
+        reg_strcpy(reg_values[i].name, values[i].name);
+        reg_values[i].type = values[i].type;
+        reg_values[i].data_len = values[i].data_len;
+        if (values[i].data_len)
+            reg_memcpy(reg_values[i].data, values[i].data,
+                       values[i].data_len);
+        reg_values[i].view = values[i].view;
+        reg_values[i].used = 1;
+    }
+    DWORD key_count = header->key_count;
+    DWORD value_count = header->value_count;
+    kfree(image);
+
+    serial_puts("[REG-STORE] loaded keys=");
+    serial_putdec(key_count);
+    serial_puts(" values=");
+    serial_putdec(value_count);
+    serial_puts("\n");
+    return 1;
+}
+
+static int reg_store_save(void)
+{
+    if (!osfs2_is_mounted() || !reg_store_prepare_directories()) return 0;
+
+    BYTE *image = (BYTE *)kmalloc(REG_STORE_MAX_SIZE);
+    if (!image) return 0;
+
+    spin_lock(&reg_store_lock);
+    spin_lock(&reg_lock);
+    DWORD key_count = 0, value_count = 0;
+    for (int i = 0; i < MAX_REG_KEYS; i++)
+        if (reg_keys[i].used) key_count++;
+    for (int i = 0; i < MAX_REG_VALUES; i++)
+        if (reg_values[i].used) value_count++;
+
+    SIZE_T image_size = sizeof(REG_STORE_HEADER) +
+        (SIZE_T)key_count * sizeof(REG_STORE_KEY) +
+        (SIZE_T)value_count * sizeof(REG_STORE_VALUE);
+    reg_memset(image, 0, image_size);
+    REG_STORE_HEADER *header = (REG_STORE_HEADER *)(void *)image;
+    header->magic = REG_STORE_MAGIC;
+    header->version = REG_STORE_VERSION;
+    header->header_size = sizeof(*header);
+    header->key_record_size = sizeof(REG_STORE_KEY);
+    header->value_record_size = sizeof(REG_STORE_VALUE);
+    header->key_count = key_count;
+    header->value_count = value_count;
+    header->image_size = (DWORD)image_size;
+
+    BYTE *cursor = image + sizeof(*header);
+    REG_STORE_KEY *keys = (REG_STORE_KEY *)(void *)cursor;
+    DWORD key_index = 0;
+    for (int i = 0; i < MAX_REG_KEYS; i++) {
+        if (!reg_keys[i].used) continue;
+        keys[key_index].view = reg_keys[i].view;
+        reg_strcpy(keys[key_index].path, reg_keys[i].path);
+        key_index++;
+    }
+    cursor += (SIZE_T)key_count * sizeof(*keys);
+    REG_STORE_VALUE *values = (REG_STORE_VALUE *)(void *)cursor;
+    DWORD value_index = 0;
+    for (int i = 0; i < MAX_REG_VALUES; i++) {
+        if (!reg_values[i].used) continue;
+        values[value_index].type = reg_values[i].type;
+        values[value_index].data_len = reg_values[i].data_len;
+        values[value_index].view = reg_values[i].view;
+        reg_strcpy(values[value_index].key_path, reg_values[i].key_path);
+        reg_strcpy(values[value_index].name, reg_values[i].name);
+        if (reg_values[i].data_len)
+            reg_memcpy(values[value_index].data, reg_values[i].data,
+                       reg_values[i].data_len);
+        value_index++;
+    }
+    DWORD generation = reg_dirty_generation;
+    spin_unlock(&reg_lock);
+
+    header->crc32 = 0;
+    header->crc32 = osfs3_crc32(image, image_size);
+
+    (void)osfs2_delete(REG_STORE_TEMP);
+    void *file = osfs2_create(REG_STORE_TEMP, image_size);
+    int saved = file &&
+        osfs2_write(file, 0, image, image_size) >= 0 &&
+        osfs2_truncate(file, image_size) >= 0 &&
+        osfs2_rename(REG_STORE_TEMP, REG_STORE_PATH, true) >= 0;
+    if (!saved) (void)osfs2_delete(REG_STORE_TEMP);
+
+    if (saved) {
+        spin_lock(&reg_lock);
+        if (reg_dirty_generation == generation)
+            reg_dirty_operations = 0;
+        reg_last_flush_ticks = idt_get_ticks();
+        spin_unlock(&reg_lock);
+        serial_puts("[REG-STORE] saved keys=");
+        serial_putdec(key_count);
+        serial_puts(" values=");
+        serial_putdec(value_count);
+        serial_puts("\n");
+    } else {
+        serial_puts("[REG-STORE] hive publish failed\n");
+    }
+    spin_unlock(&reg_store_lock);
+    kfree(image);
+    return saved;
+}
+
+static void reg_store_maybe_flush(int force)
+{
+    DWORD dirty, operations;
+    uint64_t last;
+    spin_lock(&reg_lock);
+    dirty = reg_dirty_generation;
+    operations = reg_dirty_operations;
+    last = reg_last_flush_ticks;
+    spin_unlock(&reg_lock);
+    if (!dirty || !operations) return;
+
+    uint64_t now = idt_get_ticks();
+    if (force || operations >= REG_STORE_FLUSH_OPS ||
+        now - last >= REG_STORE_FLUSH_TICKS)
+        (void)reg_store_save();
+}
+
+void advapi32_registry_flush(void)
+{
+    reg_init();
+    reg_store_maybe_flush(1);
+}
+
 /* Public entry for the MSI installer: write a value at an already-normalized
  * lowercase backslash path (e.g. "hklm\\software\\app"). Ensures the store is
- * initialized first so installer-written rows survive alongside UT99 defaults. */
+ * initialized first so installer-written rows are included in the hive. */
 void advapi32_reg_install_set(const char *path_lc_backslash, const char *name,
                              DWORD type, const void *data, DWORD len)
 {
     reg_init();
-    reg_set_value(path_lc_backslash, name, type, data, len);
+    spin_lock(&reg_lock);
+    LONG status = reg_set_value(path_lc_backslash, name, type, data, len);
+    if (status == ERROR_SUCCESS) reg_mark_dirty_locked();
+    spin_unlock(&reg_lock);
+    reg_store_maybe_flush(0);
 }
 
 static void reg_init(void)
 {
-    if (reg_initialized) return;
-    reg_initialized = 1;
+    DWORD state = __atomic_load_n(&reg_init_state, __ATOMIC_ACQUIRE);
+    if (state == 2) return;
 
-    /* Zero everything */
-    for (int i = 0; i < MAX_REG_KEYS; i++) reg_keys[i].used = 0;
-    for (int i = 0; i < MAX_REG_VALUES; i++) reg_values[i].used = 0;
-
-    /* UT99 install path (HKLM\SOFTWARE\Unreal Technology\Installed Apps\UnrealTournament) */
-    {
-        const char *key = "hklm\\software\\unreal technology\\installed apps\\unrealtournament";
-        const char *path = "C:\\UnrealTournament";
-        DWORD path_len = reg_strlen(path) + 1;
-        reg_set_value_view(key, "folder", REG_SZ, path, path_len,
-                           REG_VIEW_32);
+    DWORD expected = 0;
+    if (__atomic_compare_exchange_n(&reg_init_state, &expected, 1, FALSE,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        reg_memset(reg_keys, 0, sizeof(reg_keys));
+        reg_memset(reg_values, 0, sizeof(reg_values));
+        next_handle_id = 0x90000001;
+        reg_dirty_generation = 0;
+        reg_dirty_operations = 0;
+        reg_last_flush_ticks = idt_get_ticks();
+        if (osfs2_is_mounted()) (void)reg_store_load();
+        else
+            serial_puts("[REG-STORE] filesystem unavailable; volatile registry\n");
+        __atomic_store_n(&reg_init_state, 2, __ATOMIC_RELEASE);
+        return;
     }
 
-    /* CD key (empty — not needed for LAN/offline) */
-    {
-        const char *key = "hklm\\software\\unreal technology\\installed apps\\unrealtournament";
-        const char *cdkey = "";
-        reg_set_value_view(key, "cdkey", REG_SZ, cdkey, 1, REG_VIEW_32);
-    }
+    while (__atomic_load_n(&reg_init_state, __ATOMIC_ACQUIRE) == 1)
+        __asm__ volatile ("pause");
 
-    /* DirectX version hint */
-    {
-        const char *key = "hklm\\software\\microsoft\\directx";
-        const char *ver = "4.09.00.0904";
-        reg_set_value_view(key, "version", REG_SZ, ver,
-                           reg_strlen(ver) + 1, REG_VIEW_SHARED);
-    }
-
-    serial_puts("[ADVAPI32] registry initialized with UT99 defaults\n");
 }
 
 /* ── Registry API implementations ──────────────────────────── */
@@ -468,10 +751,14 @@ LONG WINAPI RegOpenKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD ulOptions,
     reg_store_hkey(phkResult, NULL);
 
     char path[MAX_REG_PATH];
+    spin_lock(&reg_lock);
     build_path(path, hKey, lpSubKey);
     BYTE view;
     LONG status = reg_select_view(hKey, path, samDesired, &view);
-    if (status != ERROR_SUCCESS) return status;
+    if (status != ERROR_SUCCESS) {
+        spin_unlock(&reg_lock);
+        return status;
+    }
     reg_trace_view("open", path, view, samDesired);
 
 #ifndef OK_QUIET
@@ -506,15 +793,17 @@ LONG WINAPI RegOpenKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD ulOptions,
 
     if (exists) {
         REG_KEY *entry = reg_ensure_key(path, view);
-        if (!entry) return ERROR_FILE_NOT_FOUND;
-        reg_store_hkey(phkResult, (HKEY)(ULONG_PTR)entry->handle_id);
-        if (reg_is_steam_service_path(path))
-            reg_trace_steam_pid("open", path, view, ERROR_SUCCESS, NULL);
+        if (!entry) {
+            spin_unlock(&reg_lock);
+            return ERROR_NOT_ENOUGH_MEMORY;
+        }
+        HKEY result = (HKEY)(ULONG_PTR)entry->handle_id;
+        spin_unlock(&reg_lock);
+        reg_store_hkey(phkResult, result);
         return ERROR_SUCCESS;
     }
 
-    if (reg_is_steam_service_path(path))
-        reg_trace_steam_pid("open", path, view, ERROR_FILE_NOT_FOUND, NULL);
+    spin_unlock(&reg_lock);
 
 #ifndef OK_QUIET
     serial_puts("[REG]   not found\n");
@@ -540,13 +829,6 @@ LONG WINAPI RegCreateKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD Reserved,
 
     if (!phkResult) return ERROR_FILE_NOT_FOUND;
 
-    char path[MAX_REG_PATH];
-    build_path(path, hKey, lpSubKey);
-    BYTE view;
-    LONG view_status = reg_select_view(hKey, path, samDesired, &view);
-    if (view_status != ERROR_SUCCESS) return view_status;
-    reg_trace_view("create", path, view, samDesired);
-
     /* Try to open first */
     LONG result = RegOpenKeyExA(hKey, lpSubKey, 0, samDesired, phkResult);
     if (result == ERROR_SUCCESS) {
@@ -555,14 +837,29 @@ LONG WINAPI RegCreateKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD Reserved,
     }
 
     /* Create a handle in the selected view. */
+    char path[MAX_REG_PATH];
+    BYTE view;
+    spin_lock(&reg_lock);
+    build_path(path, hKey, lpSubKey);
+    LONG view_status = reg_select_view(hKey, path, samDesired, &view);
+    if (view_status != ERROR_SUCCESS) {
+        spin_unlock(&reg_lock);
+        return view_status;
+    }
     REG_KEY *entry = reg_ensure_key(path, view);
     if (entry) {
-        reg_store_hkey(phkResult, (HKEY)(ULONG_PTR)entry->handle_id);
+        HKEY created = (HKEY)(ULONG_PTR)entry->handle_id;
+        reg_mark_dirty_locked();
+        spin_unlock(&reg_lock);
+        reg_trace_view("create", path, view, samDesired);
+        reg_store_hkey(phkResult, created);
         if (lpdwDisposition) *lpdwDisposition = REG_CREATED_NEW_KEY;
+        reg_store_maybe_flush(0);
         return ERROR_SUCCESS;
     }
 
-    return ERROR_FILE_NOT_FOUND;
+    spin_unlock(&reg_lock);
+    return ERROR_NOT_ENOUGH_MEMORY;
 }
 
 static LONG WINAPI RegCreateKeyA_k32(HKEY hKey, PCSTR lpSubKey,
@@ -579,10 +876,11 @@ LONG WINAPI RegQueryValueExA(HKEY hKey, PCSTR lpValueName, DWORD *lpReserved,
     reg_init();
 
     const char *key_path = NULL;
+    REG_VALUE snapshot;
     BYTE view;
+    spin_lock(&reg_lock);
     if (!reg_key_context(hKey, &key_path, &view)) {
-        if (reg_is_steam_pid_name(lpValueName))
-            reg_trace_invalid_steam_handle("query-invalid-handle", hKey);
+        spin_unlock(&reg_lock);
         return ERROR_FILE_NOT_FOUND;
     }
 
@@ -597,30 +895,23 @@ LONG WINAPI RegQueryValueExA(HKEY hKey, PCSTR lpValueName, DWORD *lpReserved,
 #endif
 
     REG_VALUE *value = reg_find_value(key_path, val_name, view);
+    if (value) snapshot = *value;
+    spin_unlock(&reg_lock);
     if (value) {
-        if (reg_is_steam_service_path(key_path) &&
-            reg_is_steam_pid_name(val_name))
-            reg_trace_steam_pid("query", key_path, view, ERROR_SUCCESS,
-                                value);
-        if (lpType) *lpType = value->type;
+        if (lpType) *lpType = snapshot.type;
 
         if (lpcbData) {
             if (lpData) {
-                if (*lpcbData < value->data_len) {
-                    *lpcbData = value->data_len;
+                if (*lpcbData < snapshot.data_len) {
+                    *lpcbData = snapshot.data_len;
                     return ERROR_MORE_DATA;
                 }
-                reg_memcpy(lpData, value->data, value->data_len);
+                reg_memcpy(lpData, snapshot.data, snapshot.data_len);
             }
-            *lpcbData = value->data_len;
+            *lpcbData = snapshot.data_len;
         }
         return ERROR_SUCCESS;
     }
-
-    if (reg_is_steam_service_path(key_path) &&
-        reg_is_steam_pid_name(val_name))
-        reg_trace_steam_pid("query", key_path, view, ERROR_FILE_NOT_FOUND,
-                            NULL);
 
 #ifndef OK_QUIET
     serial_puts("[REG]   value not found\n");
@@ -636,26 +927,40 @@ LONG WINAPI RegSetValueExA(HKEY hKey, PCSTR lpValueName, DWORD Reserved,
 
     const char *key_path = NULL;
     BYTE view;
-    if (!reg_key_context(hKey, &key_path, &view))
+    spin_lock(&reg_lock);
+    if (!reg_key_context(hKey, &key_path, &view)) {
+        spin_unlock(&reg_lock);
         return ERROR_FILE_NOT_FOUND;
-
-    const char *val_name = lpValueName ? lpValueName : "";
-    reg_set_value_view(key_path, val_name, dwType, lpData, cbData, view);
-    if (reg_is_steam_service_path(key_path) &&
-        reg_is_steam_pid_name(val_name)) {
-        REG_VALUE *stored = reg_find_value(key_path, val_name, view);
-        reg_trace_steam_pid("set", key_path, view,
-                            stored ? ERROR_SUCCESS : 8,
-                            stored);
     }
-    return ERROR_SUCCESS;
+    const char *val_name = lpValueName ? lpValueName : "";
+    LONG status = reg_set_value_view(key_path, val_name, dwType, lpData,
+                                     cbData, view);
+    if (status == ERROR_SUCCESS) reg_mark_dirty_locked();
+    spin_unlock(&reg_lock);
+    if (status == ERROR_SUCCESS) reg_store_maybe_flush(0);
+    return status;
 }
 
 LONG WINAPI RegCloseKey(HKEY hKey)
 {
-    /* We don't free key entries — they persist. Just no-op. */
+    /* Key objects persist; closing releases only the logical handle. */
     (void)hKey;
+    reg_store_maybe_flush(0);
     return ERROR_SUCCESS;
+}
+
+LONG WINAPI RegFlushKey(HKEY hKey)
+{
+    reg_init();
+    spin_lock(&reg_lock);
+    const char *path = NULL;
+    BYTE view = REG_VIEW_SHARED;
+    int valid = reg_key_context(hKey, &path, &view);
+    spin_unlock(&reg_lock);
+    if (!valid) return ERROR_INVALID_HANDLE;
+    (void)path;
+    (void)view;
+    return reg_store_save() ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
 }
 
 LONG WINAPI RegDeleteValueA(HKEY hKey, PCSTR lpValueName)
@@ -664,9 +969,9 @@ LONG WINAPI RegDeleteValueA(HKEY hKey, PCSTR lpValueName)
 
     const char *key_path = NULL;
     BYTE view;
+    spin_lock(&reg_lock);
     if (!reg_key_context(hKey, &key_path, &view)) {
-        if (reg_is_steam_pid_name(lpValueName))
-            reg_trace_invalid_steam_handle("delete-invalid-handle", hKey);
+        spin_unlock(&reg_lock);
         return ERROR_FILE_NOT_FOUND;
     }
 
@@ -674,18 +979,14 @@ LONG WINAPI RegDeleteValueA(HKEY hKey, PCSTR lpValueName)
 
     REG_VALUE *value = reg_find_value(key_path, val_name, view);
     if (value) {
-        if (reg_is_steam_service_path(key_path) &&
-            reg_is_steam_pid_name(val_name))
-            reg_trace_steam_pid("delete", key_path, view, ERROR_SUCCESS,
-                                value);
         value->used = 0;
+        reg_mark_dirty_locked();
+        spin_unlock(&reg_lock);
+        reg_store_maybe_flush(0);
         return ERROR_SUCCESS;
     }
 
-    if (reg_is_steam_service_path(key_path) &&
-        reg_is_steam_pid_name(val_name))
-        reg_trace_steam_pid("delete", key_path, view,
-                            ERROR_FILE_NOT_FOUND, NULL);
+    spin_unlock(&reg_lock);
 
     return ERROR_FILE_NOT_FOUND;
 }
@@ -699,15 +1000,20 @@ LONG WINAPI RegDeleteKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD samDesired,
 
     const char *base = NULL;
     BYTE inherited_view;
-    if (!reg_key_context(hKey, &base, &inherited_view) || !base)
+    spin_lock(&reg_lock);
+    if (!reg_key_context(hKey, &base, &inherited_view) || !base) {
+        spin_unlock(&reg_lock);
         return ERROR_INVALID_HANDLE;
+    }
 
     char target[MAX_REG_PATH];
     build_path(target, hKey, lpSubKey);
     BYTE view;
     LONG view_status = reg_select_view(hKey, target, samDesired, &view);
-    if (view_status != ERROR_SUCCESS)
+    if (view_status != ERROR_SUCCESS) {
+        spin_unlock(&reg_lock);
         return view_status;
+    }
 
     /* RegDeleteKey removes values, but requires callers to remove every
      * subkey first. Descendant values imply a subkey in this flat store. */
@@ -716,8 +1022,10 @@ LONG WINAPI RegDeleteKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD samDesired,
             !reg_view_visible(reg_keys[i].path, reg_keys[i].view, view) ||
             reg_stricmp(reg_keys[i].path, target) == 0)
             continue;
-        if (reg_path_has_prefix(reg_keys[i].path, target))
+        if (reg_path_has_prefix(reg_keys[i].path, target)) {
+            spin_unlock(&reg_lock);
             return ERROR_ACCESS_DENIED;
+        }
     }
     for (int i = 0; i < MAX_REG_VALUES; i++) {
         if (!reg_values[i].used ||
@@ -725,8 +1033,10 @@ LONG WINAPI RegDeleteKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD samDesired,
                               reg_values[i].view, view) ||
             reg_stricmp(reg_values[i].key_path, target) == 0)
             continue;
-        if (reg_path_has_prefix(reg_values[i].key_path, target))
+        if (reg_path_has_prefix(reg_values[i].key_path, target)) {
+            spin_unlock(&reg_lock);
             return ERROR_ACCESS_DENIED;
+        }
     }
 
     int exists = 0;
@@ -749,8 +1059,10 @@ LONG WINAPI RegDeleteKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD samDesired,
             }
         }
     }
-    if (!exists)
+    if (!exists) {
+        spin_unlock(&reg_lock);
         return ERROR_FILE_NOT_FOUND;
+    }
 
     for (int i = 0; i < MAX_REG_VALUES; i++) {
         if (reg_values[i].used &&
@@ -765,6 +1077,9 @@ LONG WINAPI RegDeleteKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD samDesired,
             reg_stricmp(reg_keys[i].path, target) == 0)
             reg_keys[i].used = 0;
     }
+    reg_mark_dirty_locked();
+    spin_unlock(&reg_lock);
+    reg_store_maybe_flush(0);
     return ERROR_SUCCESS;
 }
 
@@ -874,16 +1189,24 @@ LONG WINAPI RegEnumKeyExA(HKEY hKey, DWORD dwIndex, PSTR lpName,
 
     const char *key_path = NULL;
     BYTE view;
-    if (!reg_key_context(hKey, &key_path, &view))
+    spin_lock(&reg_lock);
+    if (!reg_key_context(hKey, &key_path, &view)) {
+        spin_unlock(&reg_lock);
         return ERROR_FILE_NOT_FOUND;
+    }
 
     const char *child = NULL;
-    if (!reg_child_at(key_path, view, dwIndex, &child))
+    if (!reg_child_at(key_path, view, dwIndex, &child)) {
+        spin_unlock(&reg_lock);
         return ERROR_NO_MORE_ITEMS;
+    }
+    char child_copy[MAX_REG_PATH];
+    reg_strcpy(child_copy, child);
+    spin_unlock(&reg_lock);
 
-    int child_len = reg_strlen(child);
+    int child_len = reg_strlen(child_copy);
     if (lpName && lpcchName && *lpcchName > (DWORD)child_len) {
-        reg_strcpy(lpName, child);
+        reg_strcpy(lpName, child_copy);
         *lpcchName = child_len;
         return ERROR_SUCCESS;
     }
@@ -900,29 +1223,37 @@ LONG WINAPI RegEnumValueA(HKEY hKey, DWORD dwIndex, PSTR lpValueName,
 
     const char *key_path = NULL;
     BYTE view;
-    if (!reg_key_context(hKey, &key_path, &view))
+    spin_lock(&reg_lock);
+    if (!reg_key_context(hKey, &key_path, &view)) {
+        spin_unlock(&reg_lock);
         return ERROR_FILE_NOT_FOUND;
+    }
 
     REG_VALUE *value = reg_value_at(key_path, view, dwIndex);
-    if (!value) return ERROR_NO_MORE_ITEMS;
+    if (!value) {
+        spin_unlock(&reg_lock);
+        return ERROR_NO_MORE_ITEMS;
+    }
+    REG_VALUE snapshot = *value;
+    spin_unlock(&reg_lock);
 
-    int name_len = reg_strlen(value->name);
+    int name_len = reg_strlen(snapshot.name);
     if (lpValueName && lpcchValueName) {
         if (*lpcchValueName <= (DWORD)name_len) {
             *lpcchValueName = name_len + 1;
             return ERROR_MORE_DATA;
         }
-        reg_strcpy(lpValueName, value->name);
+        reg_strcpy(lpValueName, snapshot.name);
         *lpcchValueName = name_len;
     }
-    if (lpType) *lpType = value->type;
+    if (lpType) *lpType = snapshot.type;
     if (lpcbData) {
-        if (lpData && *lpcbData < value->data_len) {
-            *lpcbData = value->data_len;
+        if (lpData && *lpcbData < snapshot.data_len) {
+            *lpcbData = snapshot.data_len;
             return ERROR_MORE_DATA;
         }
-        if (lpData) reg_memcpy(lpData, value->data, value->data_len);
-        *lpcbData = value->data_len;
+        if (lpData) reg_memcpy(lpData, snapshot.data, snapshot.data_len);
+        *lpcbData = snapshot.data_len;
     }
     return ERROR_SUCCESS;
 }
@@ -971,21 +1302,14 @@ LONG WINAPI RegQueryInfoKeyW(HKEY hKey, PWSTR lpClass, DWORD *lpcchClass,
 
     const char *key_path = NULL;
     BYTE view;
-    if (!reg_key_context(hKey, &key_path, &view))
+    spin_lock(&reg_lock);
+    if (!reg_key_context(hKey, &key_path, &view)) {
+        spin_unlock(&reg_lock);
         return 6; /* ERROR_INVALID_HANDLE */
-    if (!key_path) return 6; /* ERROR_INVALID_HANDLE */
-
-    if (lpClass) {
-        if (!lpcchClass || *lpcchClass == 0)
-            return ERROR_MORE_DATA;
-        lpClass[0] = 0;
     }
-    if (lpcchClass) *lpcchClass = 0;
-    if (lpcbMaxClassLen) *lpcbMaxClassLen = 0;
-    if (lpcbSecurityDescriptor) *lpcbSecurityDescriptor = 0;
-    if (lpftLastWriteTime) {
-        ((DWORD *)lpftLastWriteTime)[0] = 0;
-        ((DWORD *)lpftLastWriteTime)[1] = 0;
+    if (!key_path) {
+        spin_unlock(&reg_lock);
+        return 6; /* ERROR_INVALID_HANDLE */
     }
 
     DWORD subkeys = 0, max_subkey_len = 0;
@@ -1007,7 +1331,20 @@ LONG WINAPI RegQueryInfoKeyW(HKEY hKey, PWSTR lpClass, DWORD *lpcchClass,
         if (value->data_len > max_value_len)
             max_value_len = value->data_len;
     }
+    spin_unlock(&reg_lock);
 
+    /* A bad guest pointer can fault. Never expose reg_lock to that path. */
+    if (lpClass) {
+        if (!lpcchClass || *lpcchClass == 0) return ERROR_MORE_DATA;
+        lpClass[0] = 0;
+    }
+    if (lpcchClass) *lpcchClass = 0;
+    if (lpcbMaxClassLen) *lpcbMaxClassLen = 0;
+    if (lpcbSecurityDescriptor) *lpcbSecurityDescriptor = 0;
+    if (lpftLastWriteTime) {
+        ((DWORD *)lpftLastWriteTime)[0] = 0;
+        ((DWORD *)lpftLastWriteTime)[1] = 0;
+    }
     if (lpcSubKeys) *lpcSubKeys = subkeys;
     if (lpcbMaxSubKeyLen) *lpcbMaxSubKeyLen = max_subkey_len;
     if (lpcValues) *lpcValues = values;
@@ -1039,8 +1376,11 @@ LONG WINAPI RegDeleteTreeA(HKEY hKey, PCSTR lpSubKey)
     reg_init();
     const char *base = NULL;
     BYTE view;
-    if (!reg_key_context(hKey, &base, &view) || !base)
+    spin_lock(&reg_lock);
+    if (!reg_key_context(hKey, &base, &view) || !base) {
+        spin_unlock(&reg_lock);
         return 6; /* ERROR_INVALID_HANDLE */
+    }
 
     char target[MAX_REG_PATH];
     if (lpSubKey && *lpSubKey)
@@ -1055,11 +1395,6 @@ LONG WINAPI RegDeleteTreeA(HKEY hKey, PCSTR lpSubKey)
                               reg_values[i].view, view))
             continue;
         if (reg_path_has_prefix(reg_values[i].key_path, target)) {
-            if (reg_is_steam_service_path(reg_values[i].key_path) &&
-                reg_is_steam_pid_name(reg_values[i].name))
-                reg_trace_steam_pid("delete-tree", reg_values[i].key_path,
-                                    reg_values[i].view, ERROR_SUCCESS,
-                                    &reg_values[i]);
             reg_values[i].used = 0;
             removed = 1;
         }
@@ -1075,6 +1410,9 @@ LONG WINAPI RegDeleteTreeA(HKEY hKey, PCSTR lpSubKey)
         reg_keys[i].used = 0;
         removed = 1;
     }
+    if (removed) reg_mark_dirty_locked();
+    spin_unlock(&reg_lock);
+    if (removed) reg_store_maybe_flush(0);
     return removed ? ERROR_SUCCESS : ERROR_FILE_NOT_FOUND;
 }
 
@@ -1156,32 +1494,40 @@ LONG WINAPI RegEnumValueW(HKEY hKey, DWORD dwIndex, PWSTR lpValueName,
 
     const char *key_path = NULL;
     BYTE view;
-    if (!reg_key_context(hKey, &key_path, &view))
+    spin_lock(&reg_lock);
+    if (!reg_key_context(hKey, &key_path, &view)) {
+        spin_unlock(&reg_lock);
         return ERROR_FILE_NOT_FOUND;
+    }
 
     REG_VALUE *value = reg_value_at(key_path, view, dwIndex);
-    if (!value) return ERROR_NO_MORE_ITEMS;
+    if (!value) {
+        spin_unlock(&reg_lock);
+        return ERROR_NO_MORE_ITEMS;
+    }
+    REG_VALUE snapshot = *value;
+    spin_unlock(&reg_lock);
 
-    DWORD name_len = (DWORD)reg_strlen(value->name);
+    DWORD name_len = (DWORD)reg_strlen(snapshot.name);
     if (lpValueName && lpcchValueName) {
         if (*lpcchValueName <= name_len) {
             *lpcchValueName = name_len + 1;
             return ERROR_MORE_DATA;
         }
         for (DWORD j = 0; j < name_len; j++)
-            lpValueName[j] = (WCHAR)(BYTE)value->name[j];
+            lpValueName[j] = (WCHAR)(BYTE)snapshot.name[j];
         lpValueName[name_len] = 0;
     }
     if (lpcchValueName) *lpcchValueName = name_len;
-    if (lpType) *lpType = value->type;
+    if (lpType) *lpType = snapshot.type;
 
     if (lpcbData) {
-        if (lpData && *lpcbData < value->data_len) {
-            *lpcbData = value->data_len;
+        if (lpData && *lpcbData < snapshot.data_len) {
+            *lpcbData = snapshot.data_len;
             return ERROR_MORE_DATA;
         }
-        if (lpData) reg_memcpy(lpData, value->data, value->data_len);
-        *lpcbData = value->data_len;
+        if (lpData) reg_memcpy(lpData, snapshot.data, snapshot.data_len);
+        *lpcbData = snapshot.data_len;
     }
     return ERROR_SUCCESS;
 }
@@ -1444,7 +1790,6 @@ static NTSTATUS WINAPI BCryptGenRandom(PVOID algorithm, BYTE *buffer,
 #define PROV_RNG          21U
 #define PROV_RSA_AES      24U
 
-#define ERROR_NOT_ENOUGH_MEMORY    8U
 #define NTE_BAD_UID       0x80090001U
 #define NTE_BAD_FLAGS     0x80090009U
 #define NTE_NO_MEMORY     0x8009000EU
@@ -1725,6 +2070,20 @@ DWORD advapi32_crypto_release_process(DWORD process_id)
 #define SE_SACL_DEFAULTED            0x0020
 #define SE_SELF_RELATIVE             0x8000
 
+#define OWNER_SECURITY_INFORMATION          0x00000001U
+#define GROUP_SECURITY_INFORMATION          0x00000002U
+#define DACL_SECURITY_INFORMATION           0x00000004U
+#define SACL_SECURITY_INFORMATION           0x00000008U
+#define UNPROTECTED_DACL_SECURITY_INFORMATION 0x20000000U
+#define PROTECTED_DACL_SECURITY_INFORMATION   0x80000000U
+
+#define ERROR_NOT_SUPPORTED           50U
+#define ERROR_FILENAME_EXCED_RANGE    206U
+#define ERROR_NONE_MAPPED             1332U
+#define ERROR_INVALID_ACL             1336U
+#define ERROR_INVALID_SECURITY_DESCR  1338U
+#define ERROR_PRIVILEGE_NOT_HELD      1314U
+
 typedef struct {
     UCHAR revision;
     UCHAR sbz1;
@@ -1771,9 +2130,23 @@ typedef struct {
     USHORT sbz2;
 } ACL_HEADER;
 
+typedef struct {
+    DWORD acl_revision;
+} ACL_REVISION_INFORMATION;
+
+typedef struct {
+    DWORD ace_count;
+    DWORD acl_bytes_in_use;
+    DWORD acl_bytes_free;
+} ACL_SIZE_INFORMATION;
+
 _Static_assert(sizeof(BUILTIN_USERS_SID) == 16, "built-in users SID layout");
 _Static_assert(sizeof(LOCAL_USER_SID) == 28, "local user SID layout");
 _Static_assert(sizeof(ACL_HEADER) == 8, "ACL header layout");
+_Static_assert(sizeof(ACL_REVISION_INFORMATION) == 4,
+               "ACL revision information layout");
+_Static_assert(sizeof(ACL_SIZE_INFORMATION) == 12,
+               "ACL size information layout");
 
 static const LOCAL_USER_SID g_local_user_sid = {
     .revision = 1,
@@ -1961,13 +2334,13 @@ static BOOL WINAPI CreateWellKnownSid_stub(DWORD sid_type, PVOID domain_sid,
 static BOOL WINAPI InitializeAcl_stub(PVOID acl, DWORD acl_length, DWORD revision)
 {
     if (!acl || acl_length < sizeof(ACL_HEADER) || acl_length > 0xffff ||
-        revision != ACL_REVISION) {
+        (revision != ACL_REVISION && revision != 4)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
 
     ACL_HEADER *header = (ACL_HEADER *)acl;
-    header->revision = ACL_REVISION;
+    header->revision = (UCHAR)revision;
     header->sbz1 = 0;
     header->size = (USHORT)acl_length;
     header->ace_count = 0;
@@ -1975,9 +2348,8 @@ static BOOL WINAPI InitializeAcl_stub(PVOID acl, DWORD acl_length, DWORD revisio
     return TRUE;
 }
 
-static BOOL WINAPI IsValidAcl_stub(PVOID acl)
+static BOOL acl_measure(const ACL_HEADER *header, DWORD *bytes_in_use)
 {
-    ACL_HEADER *header = (ACL_HEADER *)acl;
     if (!header ||
         (header->revision != ACL_REVISION && header->revision != 4) ||
         header->size < sizeof(*header)) {
@@ -1987,17 +2359,162 @@ static BOOL WINAPI IsValidAcl_stub(PVOID acl)
 
     DWORD used = sizeof(*header);
     for (USHORT i = 0; i < header->ace_count; i++) {
-        if (used + 4 > header->size) {
+        if (used > header->size - sizeof(DWORD)) {
             SetLastError(1336);
             return FALSE;
         }
-        USHORT ace_size = *(USHORT *)((BYTE *)acl + used + 2);
-        if (ace_size < 4 || used + ace_size > header->size) {
+        const BYTE *ace = (const BYTE *)header + used;
+        USHORT ace_size = *(const USHORT *)(const void *)(ace + 2);
+        if (ace_size < sizeof(DWORD) || ace_size > header->size - used) {
             SetLastError(1336);
             return FALSE;
         }
         used += ace_size;
     }
+
+    if (bytes_in_use)
+        *bytes_in_use = used;
+    return TRUE;
+}
+
+static BOOL WINAPI IsValidAcl_stub(PVOID acl)
+{
+    return acl_measure((const ACL_HEADER *)acl, NULL);
+}
+
+static void acl_store_pointer(PVOID output, PVOID value)
+{
+    if (g_compat32_mode)
+        *(DWORD *)(void *)output = (DWORD)(ULONG_PTR)value;
+    else
+        *(PVOID *)output = value;
+}
+
+static BOOL WINAPI GetAce_stub(PVOID acl, DWORD ace_index, PVOID ace_output)
+{
+    ACL_HEADER *header = (ACL_HEADER *)acl;
+    if (!ace_output) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    acl_store_pointer(ace_output, NULL);
+    if (!acl_measure(header, NULL))
+        return FALSE;
+    if (ace_index >= header->ace_count) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    DWORD offset = sizeof(*header);
+    for (DWORD i = 0; i < ace_index; i++)
+        offset += *(const USHORT *)((const BYTE *)header + offset + 2);
+    acl_store_pointer(ace_output, (BYTE *)header + offset);
+    return TRUE;
+}
+
+static BOOL WINAPI GetAclInformation_stub(PVOID acl, PVOID information,
+                                           DWORD information_length,
+                                           DWORD information_class)
+{
+    ACL_HEADER *header = (ACL_HEADER *)acl;
+    DWORD used = 0;
+    if (!acl_measure(header, &used))
+        return FALSE;
+
+    if (information_class == 1) { /* AclRevisionInformation */
+        if (!information || information_length <
+                                sizeof(ACL_REVISION_INFORMATION)) {
+            SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+            return FALSE;
+        }
+        ((ACL_REVISION_INFORMATION *)information)->acl_revision =
+            header->revision;
+        return TRUE;
+    }
+    if (information_class == 2) { /* AclSizeInformation */
+        if (!information || information_length < sizeof(ACL_SIZE_INFORMATION)) {
+            SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+            return FALSE;
+        }
+        ACL_SIZE_INFORMATION *size = (ACL_SIZE_INFORMATION *)information;
+        size->ace_count = header->ace_count;
+        size->acl_bytes_in_use = used;
+        size->acl_bytes_free = header->size - used;
+        return TRUE;
+    }
+
+    SetLastError(87); /* ERROR_INVALID_PARAMETER */
+    return FALSE;
+}
+
+static BOOL WINAPI AddAce_stub(PVOID acl, DWORD revision,
+                                DWORD starting_ace_index, PVOID ace_list,
+                                DWORD ace_list_length)
+{
+    ACL_HEADER *header = (ACL_HEADER *)acl;
+    DWORD used = 0;
+    if (!acl_measure(header, &used))
+        return FALSE;
+    if ((revision != ACL_REVISION && revision != 4) || !ace_list ||
+        ace_list_length < sizeof(DWORD)) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    if (ace_list_length > header->size - used) {
+        SetLastError(1344); /* ERROR_ALLOTTED_SPACE_EXCEEDED */
+        return FALSE;
+    }
+
+    DWORD source_offset = 0;
+    DWORD source_count = 0;
+    while (source_offset < ace_list_length) {
+        if (ace_list_length - source_offset < sizeof(DWORD)) {
+            SetLastError(87);
+            return FALSE;
+        }
+        const BYTE *ace = (const BYTE *)ace_list + source_offset;
+        USHORT ace_size = *(const USHORT *)(const void *)(ace + 2);
+        if (ace_size < sizeof(DWORD) ||
+            ace_size > ace_list_length - source_offset) {
+            SetLastError(87);
+            return FALSE;
+        }
+        source_offset += ace_size;
+        source_count++;
+    }
+    if (source_offset != ace_list_length) {
+        SetLastError(87);
+        return FALSE;
+    }
+    if (source_count > 0xffffU - header->ace_count) {
+        SetLastError(1344); /* ERROR_ALLOTTED_SPACE_EXCEEDED */
+        return FALSE;
+    }
+
+    BYTE *copy = LocalAlloc(0, ace_list_length);
+    if (!copy) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return FALSE;
+    }
+    reg_memcpy(copy, ace_list, ace_list_length);
+
+    DWORD insert_offset = sizeof(*header);
+    DWORD insertion_index = starting_ace_index;
+    if (insertion_index > header->ace_count)
+        insertion_index = header->ace_count;
+    for (DWORD i = 0; i < insertion_index; i++)
+        insert_offset += *(const USHORT *)((const BYTE *)header +
+                                           insert_offset + 2);
+
+    BYTE *bytes = (BYTE *)header;
+    for (DWORD offset = used; offset > insert_offset; offset--)
+        bytes[offset + ace_list_length - 1] = bytes[offset - 1];
+    reg_memcpy(bytes + insert_offset, copy, ace_list_length);
+    LocalFree(copy);
+
+    header->ace_count = (USHORT)(header->ace_count + source_count);
+    if (revision > header->revision)
+        header->revision = (UCHAR)revision;
     return TRUE;
 }
 
@@ -2051,16 +2568,8 @@ static PVOID acl_entry_sid(const ACL_EXPLICIT_ENTRY *entry)
 
 static DWORD acl_used_size(const ACL_HEADER *acl)
 {
-    DWORD used = sizeof(*acl);
-    for (USHORT i = 0; i < acl->ace_count; i++) {
-        if (used + 4 > acl->size)
-            return 0;
-        USHORT ace_size = *(const USHORT *)((const BYTE *)acl + used + 2);
-        if (ace_size < 4 || used + ace_size > acl->size)
-            return 0;
-        used += ace_size;
-    }
-    return used;
+    DWORD used = 0;
+    return acl_measure(acl, &used) ? used : 0;
 }
 
 static void acl_append_explicit_ace(BYTE *destination, DWORD *used,
@@ -2306,26 +2815,16 @@ static BOOL WINAPI AddAccessAllowedAce_stub(PVOID acl, DWORD revision,
                                              DWORD access_mask, PVOID sid)
 {
     ACL_HEADER *header = (ACL_HEADER *)acl;
-    DWORD sid_length = GetLengthSid_stub(sid);
-    if (!header || revision != ACL_REVISION || header->revision != ACL_REVISION ||
-        header->size < sizeof(*header) || !sid_length) {
+    DWORD used = 0;
+    if ((revision != ACL_REVISION && revision != 4)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
-
-    DWORD used = sizeof(*header);
-    for (USHORT i = 0; i < header->ace_count; i++) {
-        if (used + 4 > header->size) {
-            SetLastError(87);
-            return FALSE;
-        }
-        USHORT ace_size = *(USHORT *)((BYTE *)acl + used + 2);
-        if (ace_size < 4 || used + ace_size > header->size) {
-            SetLastError(87);
-            return FALSE;
-        }
-        used += ace_size;
-    }
+    if (!acl_measure(header, &used))
+        return FALSE;
+    DWORD sid_length = GetLengthSid_stub(sid);
+    if (!sid_length)
+        return FALSE;
 
     DWORD ace_size = 8 + sid_length;
     if (used + ace_size > header->size) {
@@ -2340,6 +2839,8 @@ static BOOL WINAPI AddAccessAllowedAce_stub(PVOID acl, DWORD revision,
     *(DWORD *)(ace + 4) = access_mask;
     reg_memcpy(ace + 8, sid, sid_length);
     header->ace_count++;
+    if (revision > header->revision)
+        header->revision = (UCHAR)revision;
     return TRUE;
 }
 
@@ -2364,6 +2865,26 @@ static BOOL WINAPI InitializeSecurityDescriptor(PVOID descriptor, DWORD revision
         sd->owner = sd->group = sd->sacl = sd->dacl = NULL;
     }
     return TRUE;
+}
+
+void WINAPI MapGenericMask(DWORD *access_mask,
+                           const GENERIC_MAPPING *generic_mapping)
+{
+    if (!access_mask || !generic_mapping)
+        return;
+
+    DWORD original = *access_mask;
+    DWORD mapped = original & ~(GENERIC_READ | GENERIC_WRITE |
+                                GENERIC_EXECUTE | GENERIC_ALL);
+    if (original & GENERIC_READ)
+        mapped |= generic_mapping->GenericRead;
+    if (original & GENERIC_WRITE)
+        mapped |= generic_mapping->GenericWrite;
+    if (original & GENERIC_EXECUTE)
+        mapped |= generic_mapping->GenericExecute;
+    if (original & GENERIC_ALL)
+        mapped |= generic_mapping->GenericAll;
+    *access_mask = mapped;
 }
 
 static BOOL WINAPI SetSecurityDescriptorDacl(PVOID descriptor, BOOL present,
@@ -2393,6 +2914,54 @@ static void security_store_pointer(PVOID target, PVOID value)
         *(DWORD *)target = (DWORD)(ULONG_PTR)value;
     else
         *(PVOID *)target = value;
+}
+
+static BOOL WINAPI AllocateAndInitializeSid_stub(
+    const BYTE *identifier_authority, BYTE sub_authority_count,
+    DWORD sub_authority0, DWORD sub_authority1, DWORD sub_authority2,
+    DWORD sub_authority3, DWORD sub_authority4, DWORD sub_authority5,
+    DWORD sub_authority6, DWORD sub_authority7, PVOID sid_out)
+{
+    if (!identifier_authority || !sid_out || sub_authority_count > 8) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    security_store_pointer(sid_out, NULL);
+
+    DWORD sid_size = 8U + (DWORD)sub_authority_count * sizeof(DWORD);
+    BYTE *sid = LocalAlloc(0x0040, sid_size);
+    if (!sid) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    DWORD values[8];
+    values[0] = sub_authority0;
+    values[1] = sub_authority1;
+    values[2] = sub_authority2;
+    values[3] = sub_authority3;
+    values[4] = sub_authority4;
+    values[5] = sub_authority5;
+    values[6] = sub_authority6;
+    values[7] = sub_authority7;
+
+    sid[0] = 1;
+    sid[1] = sub_authority_count;
+    reg_memcpy(sid + 2, identifier_authority, 6);
+    for (BYTE i = 0; i < sub_authority_count; i++)
+        *(DWORD *)(void *)(sid + 8 + (DWORD)i * sizeof(DWORD)) = values[i];
+
+    security_store_pointer(sid_out, sid);
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+static PVOID WINAPI FreeSid_stub(PVOID sid)
+{
+    if (!sid) return NULL;
+    PVOID result = LocalFree(sid);
+    if (result) SetLastError(ERROR_INVALID_PARAMETER);
+    return result;
 }
 
 static BOOL parse_sid_component(const WCHAR **cursor, ULONGLONG limit,
@@ -2593,7 +3162,31 @@ static PVOID security_descriptor_part(PVOID descriptor, int part)
 
 static BOOL WINAPI IsValidSecurityDescriptor_stub(PVOID descriptor)
 {
-    return descriptor && *(UCHAR *)descriptor == SECURITY_DESCRIPTOR_REVISION;
+    if (!descriptor) return FALSE;
+    SECURITY_DESCRIPTOR32 *sd = (SECURITY_DESCRIPTOR32 *)descriptor;
+    if (sd->revision != SECURITY_DESCRIPTOR_REVISION || sd->sbz1 != 0)
+        return FALSE;
+
+    if (sd->control & SE_SELF_RELATIVE) {
+        for (int part = 0; part < 4; part++) {
+            DWORD offset = (&sd->owner)[part];
+            if (offset && (offset < sizeof(*sd) || (offset & 3U)))
+                return FALSE;
+        }
+    }
+
+    PVOID owner = security_descriptor_part(descriptor, 0);
+    PVOID group = security_descriptor_part(descriptor, 1);
+    PVOID sacl = security_descriptor_part(descriptor, 2);
+    PVOID dacl = security_descriptor_part(descriptor, 3);
+    if ((owner && !IsValidSid_stub(owner)) ||
+        (group && !IsValidSid_stub(group)) ||
+        ((sd->control & SE_SACL_PRESENT) && sacl &&
+         !IsValidAcl_stub(sacl)) ||
+        ((sd->control & SE_DACL_PRESENT) && dacl &&
+         !IsValidAcl_stub(dacl)))
+        return FALSE;
+    return TRUE;
 }
 
 static BOOL WINAPI GetSecurityDescriptorControl_stub(PVOID descriptor,
@@ -2655,6 +3248,231 @@ static BOOL WINAPI GetSecurityDescriptorSacl_stub(PVOID descriptor,
     security_store_pointer(sacl, security_descriptor_part(descriptor, 2));
     *defaulted = (control & SE_SACL_DEFAULTED) != 0;
     return TRUE;
+}
+
+#define SECURITY_CLASS_OWNER 0x01U
+#define SECURITY_CLASS_GROUP 0x02U
+#define SECURITY_CLASS_OTHER 0x04U
+
+static ULONGLONG security_sid_authority(const BYTE *sid)
+{
+    ULONGLONG authority = 0;
+    for (DWORD i = 0; i < 6; i++)
+        authority = (authority << 8) | sid[2 + i];
+    return authority;
+}
+
+static BOOL security_sid_has_subauthorities(const BYTE *sid, BYTE count,
+                                             const DWORD *values)
+{
+    if (!sid || sid[1] != count) return FALSE;
+    for (BYTE i = 0; i < count; i++) {
+        DWORD value = *(const DWORD *)(const void *)(sid + 8 + i * 4U);
+        if (value != values[i]) return FALSE;
+    }
+    return TRUE;
+}
+
+static BYTE security_sid_classes(PVOID sid_value)
+{
+    const BYTE *sid = (const BYTE *)sid_value;
+    DWORD sid_size = GetLengthSid_stub(sid_value);
+    if (!sid_size) return 0;
+
+    if (sid_size == sizeof(g_local_user_sid)) {
+        const BYTE *local = (const BYTE *)&g_local_user_sid;
+        BOOL equal = TRUE;
+        for (DWORD i = 0; i < sid_size; i++) {
+            if (sid[i] != local[i]) {
+                equal = FALSE;
+                break;
+            }
+        }
+        if (equal) return SECURITY_CLASS_OWNER;
+    }
+
+    ULONGLONG authority = security_sid_authority(sid);
+    static const DWORD world[] = { 0 };
+    static const DWORD creator_owner[] = { 0 };
+    static const DWORD creator_group[] = { 1 };
+    static const DWORD builtin_users[] = { 32, 545 };
+    static const DWORD authenticated_users[] = { 11 };
+
+    if (authority == 1 &&
+        security_sid_has_subauthorities(sid, 1, world))
+        return SECURITY_CLASS_OWNER | SECURITY_CLASS_GROUP |
+               SECURITY_CLASS_OTHER;
+    if (authority == 3 &&
+        security_sid_has_subauthorities(sid, 1, creator_owner))
+        return SECURITY_CLASS_OWNER;
+    if (authority == 3 &&
+        security_sid_has_subauthorities(sid, 1, creator_group))
+        return SECURITY_CLASS_GROUP;
+    if (authority == 5 &&
+        security_sid_has_subauthorities(sid, 2, builtin_users))
+        return SECURITY_CLASS_OWNER | SECURITY_CLASS_GROUP;
+    if (authority == 5 &&
+        security_sid_has_subauthorities(sid, 1, authenticated_users))
+        return SECURITY_CLASS_OWNER | SECURITY_CLASS_GROUP |
+               SECURITY_CLASS_OTHER;
+    return 0;
+}
+
+static BYTE security_access_mask_to_mode(DWORD mask)
+{
+    if (mask & GENERIC_ALL) return 7;
+    BYTE mode = 0;
+    if (mask & (GENERIC_READ | FILE_READ_DATA | FILE_READ_EA |
+                FILE_READ_ATTRIBUTES))
+        mode |= 4;
+    if (mask & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+                FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | FILE_DELETE_CHILD))
+        mode |= 2;
+    if (mask & (GENERIC_EXECUTE | FILE_EXECUTE))
+        mode |= 1;
+    return mode;
+}
+
+static DWORD security_acl_to_mode(PVOID acl_value, uint16_t *mode)
+{
+    ACL_HEADER *acl = (ACL_HEADER *)acl_value;
+    DWORD used;
+    if (!mode || !acl_measure(acl, &used)) return ERROR_INVALID_ACL;
+
+    BYTE decided[3] = { 0, 0, 0 };
+    BYTE granted[3] = { 0, 0, 0 };
+    DWORD offset = sizeof(*acl);
+    const DWORD supported_mask = 0xF0000000U | 0x001F01FFU;
+    for (USHORT i = 0; i < acl->ace_count; i++) {
+        const BYTE *ace = (const BYTE *)acl + offset;
+        USHORT ace_size = *(const USHORT *)(const void *)(ace + 2);
+        if (ace_size < 16 || (ace[0] != 0 && ace[0] != 1))
+            return ERROR_NOT_SUPPORTED;
+        /* Inheritance cannot be retained in the inode mode. An ACE that is
+         * merely marked as inherited still applies to this object. */
+        if (ace[1] & ~0x10U) return ERROR_NOT_SUPPORTED;
+
+        DWORD mask = *(const DWORD *)(const void *)(ace + 4);
+        if (mask & ~supported_mask) return ERROR_NOT_SUPPORTED;
+        PVOID sid = (PVOID)(ace + 8);
+        DWORD sid_size = GetLengthSid_stub(sid);
+        if (!sid_size || sid_size > (DWORD)ace_size - 8U)
+            return ERROR_INVALID_ACL;
+        BYTE classes = security_sid_classes(sid);
+        if (!classes) return ERROR_NONE_MAPPED;
+
+        BYTE rights = security_access_mask_to_mode(mask);
+        for (BYTE class_index = 0; class_index < 3; class_index++) {
+            BYTE class_bit = (BYTE)(1U << class_index);
+            if (!(classes & class_bit)) continue;
+            BYTE pending = rights & (BYTE)~decided[class_index];
+            decided[class_index] |= pending;
+            if (ace[0] == 0) granted[class_index] |= pending;
+        }
+        offset += ace_size;
+    }
+    if (offset != used) return ERROR_INVALID_ACL;
+
+    *mode = (uint16_t)((granted[0] << 6) |
+                       (granted[1] << 3) | granted[2]);
+    return ERROR_SUCCESS;
+}
+
+static BOOL set_file_security_error(DWORD error)
+{
+    SetLastError(error);
+    return FALSE;
+}
+
+static BOOL set_file_security_common(PCSTR file_name, DWORD security_info,
+                                     PVOID descriptor)
+{
+    const DWORD known_information =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+        DACL_SECURITY_INFORMATION | SACL_SECURITY_INFORMATION |
+        UNPROTECTED_DACL_SECURITY_INFORMATION |
+        PROTECTED_DACL_SECURITY_INFORMATION;
+    if (!file_name || !descriptor || !security_info ||
+        (security_info & ~known_information))
+        return set_file_security_error(ERROR_INVALID_PARAMETER);
+    if (!IsValidSecurityDescriptor_stub(descriptor))
+        return set_file_security_error(ERROR_INVALID_SECURITY_DESCR);
+    if (security_info & SACL_SECURITY_INFORMATION)
+        return set_file_security_error(ERROR_PRIVILEGE_NOT_HELD);
+    if (security_info & (OWNER_SECURITY_INFORMATION |
+                         GROUP_SECURITY_INFORMATION |
+                         UNPROTECTED_DACL_SECURITY_INFORMATION |
+                         PROTECTED_DACL_SECURITY_INFORMATION))
+        return set_file_security_error(ERROR_NOT_SUPPORTED);
+    if (!(security_info & DACL_SECURITY_INFORMATION))
+        return set_file_security_error(ERROR_INVALID_PARAMETER);
+
+    SECURITY_DESCRIPTOR32 *sd = (SECURITY_DESCRIPTOR32 *)descriptor;
+    if (!(sd->control & SE_DACL_PRESENT))
+        return set_file_security_error(ERROR_INVALID_SECURITY_DESCR);
+
+    char normalized[260];
+    if (!win32_normalize_path(file_name, normalized))
+        return set_file_security_error(ERROR_FILENAME_EXCED_RANGE);
+    vfs_node_t node;
+    if (!vfs_find(normalized, VFS_MODE_WIN32, &node)) {
+        if (win32_directory_exists_normalized(normalized))
+            return set_file_security_error(ERROR_NOT_SUPPORTED);
+        return set_file_security_error(ERROR_FILE_NOT_FOUND);
+    }
+
+    PVOID dacl = security_descriptor_part(descriptor, 3);
+    uint16_t mode = 0777;
+    if (dacl) {
+        DWORD status = security_acl_to_mode(dacl, &mode);
+        if (status != ERROR_SUCCESS)
+            return set_file_security_error(status);
+    }
+
+    int result = vfs_set_mode(&node, mode);
+    if (result == VFS_STATUS_NOT_SUPPORTED)
+        return set_file_security_error(ERROR_NOT_SUPPORTED);
+    if (result == VFS_STATUS_INVALID)
+        return set_file_security_error(ERROR_INVALID_PARAMETER);
+    if (result != VFS_STATUS_OK)
+        return set_file_security_error(ERROR_ACCESS_DENIED);
+
+    static uint32_t trace_count;
+    uint32_t trace = __atomic_fetch_add(&trace_count, 1, __ATOMIC_RELAXED);
+    if (trace < 16) {
+        serial_puts("[ADVAPI-FILE-SEC] path='");
+        serial_puts(normalized);
+        serial_puts("' mode=");
+        serial_puthex(mode, 3);
+        serial_puts("\n");
+    }
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+static BOOL WINAPI SetFileSecurityA_stub(PCSTR file_name,
+                                          DWORD security_info,
+                                          PVOID descriptor)
+{
+    return set_file_security_common(file_name, security_info, descriptor);
+}
+
+static BOOL WINAPI SetFileSecurityW_stub(PCWSTR file_name,
+                                          DWORD security_info,
+                                          PVOID descriptor)
+{
+    if (!file_name)
+        return set_file_security_error(ERROR_INVALID_PARAMETER);
+    char narrow[260];
+    DWORD length = 0;
+    while (length < 259 && file_name[length]) {
+        narrow[length] = (char)(file_name[length] & 0xff);
+        length++;
+    }
+    if (file_name[length])
+        return set_file_security_error(ERROR_FILENAME_EXCED_RANGE);
+    narrow[length] = 0;
+    return set_file_security_common(narrow, security_info, descriptor);
 }
 
 static DWORD WINAPI GetNamedSecurityInfoW_stub(
@@ -4065,9 +4883,13 @@ static LONG WINAPI RegNotifyChangeKeyValue_stub(HKEY key, BOOL watch_subtree,
 
 static LONG WINAPI RegDisableReflectionKey_stub(HKEY key)
 {
+    reg_init();
     const char *path = NULL;
     BYTE view = REG_VIEW_SHARED;
-    if (!reg_key_context(key, &path, &view))
+    spin_lock(&reg_lock);
+    int valid = reg_key_context(key, &path, &view);
+    spin_unlock(&reg_lock);
+    if (!valid)
         return 6; /* ERROR_INVALID_HANDLE */
     (void)path;
     (void)view;
@@ -4083,6 +4905,7 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "RegQueryValueExA",   (PVOID)RegQueryValueExA, 6, CC_STDCALL },
     { "RegSetValueExA",     (PVOID)RegSetValueExA,   6, CC_STDCALL },
     { "RegCloseKey",        (PVOID)RegCloseKey,      1, CC_STDCALL },
+    { "RegFlushKey",        (PVOID)RegFlushKey,      1, CC_STDCALL },
     { "RegDeleteKeyA",      (PVOID)RegDeleteKeyA,    2, CC_STDCALL },
     { "RegDeleteKeyExA",    (PVOID)RegDeleteKeyExA,  4, CC_STDCALL },
     { "RegDeleteValueA",    (PVOID)RegDeleteValueA,  2, CC_STDCALL },
@@ -4105,8 +4928,11 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "GetUserNameA",       (PVOID)GetUserNameA,     2, CC_STDCALL },
     { "GetUserNameW",       (PVOID)GetUserNameW,     2, CC_STDCALL },
     { "LookupAccountNameW", (PVOID)LookupAccountNameW_stub, 7, CC_STDCALL },
+    { "MapGenericMask",     (PVOID)MapGenericMask,    2, CC_STDCALL },
     { "InitializeSecurityDescriptor", (PVOID)InitializeSecurityDescriptor, 2, CC_STDCALL },
     { "CreateWellKnownSid", (PVOID)CreateWellKnownSid_stub, 4, CC_STDCALL },
+    { "AllocateAndInitializeSid", (PVOID)AllocateAndInitializeSid_stub, 11, CC_STDCALL },
+    { "FreeSid",            (PVOID)FreeSid_stub,       1, CC_STDCALL },
     { "ConvertStringSidToSidW", (PVOID)ConvertStringSidToSidW_stub, 2, CC_STDCALL },
     { "ConvertSidToStringSidA", (PVOID)ConvertSidToStringSidA_stub, 2, CC_STDCALL },
     { "ConvertSidToStringSidW", (PVOID)ConvertSidToStringSidW_stub, 2, CC_STDCALL },
@@ -4129,6 +4955,9 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "IsValidSid",         (PVOID)IsValidSid_stub, 1, CC_STDCALL },
     { "InitializeAcl",      (PVOID)InitializeAcl_stub, 3, CC_STDCALL },
     { "IsValidAcl",         (PVOID)IsValidAcl_stub, 1, CC_STDCALL },
+    { "GetAce",             (PVOID)GetAce_stub, 3, CC_STDCALL },
+    { "AddAce",             (PVOID)AddAce_stub, 5, CC_STDCALL },
+    { "GetAclInformation",  (PVOID)GetAclInformation_stub, 4, CC_STDCALL },
     { "AddAccessAllowedAce", (PVOID)AddAccessAllowedAce_stub, 4, CC_STDCALL },
     { "SetSecurityDescriptorDacl", (PVOID)SetSecurityDescriptorDacl, 4, CC_STDCALL },
     { "IsValidSecurityDescriptor", (PVOID)IsValidSecurityDescriptor_stub, 1, CC_STDCALL },
@@ -4137,6 +4966,8 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "GetSecurityDescriptorGroup", (PVOID)GetSecurityDescriptorGroup_stub, 3, CC_STDCALL },
     { "GetSecurityDescriptorDacl", (PVOID)GetSecurityDescriptorDacl_stub, 4, CC_STDCALL },
     { "GetSecurityDescriptorSacl", (PVOID)GetSecurityDescriptorSacl_stub, 4, CC_STDCALL },
+    { "SetFileSecurityA",  (PVOID)SetFileSecurityA_stub, 3, CC_STDCALL },
+    { "SetFileSecurityW",  (PVOID)SetFileSecurityW_stub, 3, CC_STDCALL },
     { "GetNamedSecurityInfoW", (PVOID)GetNamedSecurityInfoW_stub, 8, CC_STDCALL },
     { "SetNamedSecurityInfoW", (PVOID)SetNamedSecurityInfoW_stub, 7, CC_STDCALL },
     { "GetSecurityInfo",    (PVOID)GetSecurityInfo_stub, 8, CC_STDCALL },

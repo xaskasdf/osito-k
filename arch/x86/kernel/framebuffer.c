@@ -132,6 +132,27 @@ static void fb_mark_dirty(uint32_t pixel_top, uint32_t pixel_bot)
     if (pixel_bot > dirty_bot) dirty_bot = pixel_bot;
 }
 
+/* Publish rows written directly through fb_get_base(). Console primitives
+ * mark their own damage, while framebuffer clients such as DOS render whole
+ * spans without going through fb_putchar_at(). */
+void fb_present_rows(uint32_t pixel_top, uint32_t pixel_bot)
+{
+    if (!fb_base || pixel_top >= pixel_bot || pixel_top >= fb_height)
+        return;
+    if (pixel_bot > fb_height)
+        pixel_bot = fb_height;
+
+    if (redirect_active)
+        return;
+
+    if (fb_shadow) {
+        fb_mark_dirty(pixel_top, pixel_bot);
+        fb_flush();
+    } else {
+        fb_flush_virtio_rows(pixel_top, pixel_bot);
+    }
+}
+
 static void fb_flush_virtio_rows(uint32_t top, uint32_t bot)
 {
     static uint64_t dbg_flush_count;
@@ -188,7 +209,7 @@ static void fb_flush_virtio_rows(uint32_t top, uint32_t bot)
         serial_putdec(top);
         serial_puts("-");
         serial_putdec(bot);
-        serial_puts(" hash=0x");
+        serial_puts(" hash=");
         serial_puthex(hash, 8);
         serial_puts("\n");
     }

@@ -52,6 +52,15 @@ typedef struct _HANDLE_ENTRY {
 #define HANDLE_TO_INDEX(h)  ((ULONG)(ULONG_PTR)(h) >> 2)
 #define INDEX_TO_HANDLE(i)  ((HANDLE)(ULONG_PTR)((i) << 2))
 
+/* Reserved ownership identity for subsystem-global handles. It must never be
+ * assigned to a user process. */
+#define HANDLE_OWNER_SUBSYSTEM ((ULONG)0xFFFFFFFFU)
+
+/* Per-process handle-table attributes exposed by Get/SetHandleInformation. */
+#define HANDLE_USER_FLAG_INHERIT            0x00000001U
+#define HANDLE_USER_FLAG_PROTECT_FROM_CLOSE 0x00000002U
+#define HANDLE_USER_FLAG_MASK               0x00000003U
+
 typedef struct _HANDLE_TABLE {
     HANDLE_ENTRY entries[MAX_HANDLES];
     ULONG        count;     /* number of allocated handles */
@@ -72,6 +81,11 @@ typedef struct _HANDLE_TABLE {
 
 typedef struct _FILE_OBJECT {
     ULONG       flags;          /* FILE_OBJ_* */
+    ULONG       create_options; /* FILE_* options supplied to NtCreateFile */
+    volatile ULONG io_lock;     /* serializes synchronous file position */
+    BOOL        suppress_access_time;
+    BOOL        suppress_write_time;
+    BOOL        suppress_change_time;
     PVOID       osfs_file;      /* osfs2_file_t* for disk files */
     LONGLONG    position;       /* current byte offset */
     LONGLONG    size;           /* file size (cached) */
@@ -105,6 +119,14 @@ NTSTATUS    handle_alloc_for_process(PHANDLE_TABLE table,
                                      ULONG owner_pid,
                                      PHANDLE out_handle);
 
+/* Allocate a new handle only while another handle still keeps the object
+ * alive. The liveness check and allocation are one handle-table operation. */
+NTSTATUS    handle_open_referenced_object(PHANDLE_TABLE table,
+                                           OBJECT_TYPE_ID type,
+                                           ACCESS_MASK access,
+                                           PVOID object,
+                                           PHANDLE out_handle);
+
 NTSTATUS    handle_lookup(PHANDLE_TABLE table,
                           HANDLE handle,
                           OBJECT_TYPE_ID expected_type,
@@ -115,6 +137,13 @@ NTSTATUS    handle_lookup_for_process(PHANDLE_TABLE table,
                                       ULONG owner_pid,
                                       OBJECT_TYPE_ID expected_type,
                                       PVOID *out_object);
+
+NTSTATUS    handle_lookup_access_for_process(PHANDLE_TABLE table,
+                                             HANDLE handle,
+                                             ULONG owner_pid,
+                                             OBJECT_TYPE_ID expected_type,
+                                             PVOID *out_object,
+                                             ACCESS_MASK *out_access);
 
 /* Retain the same numeric handle for an inherited child owner. */
 NTSTATUS    handle_retain(PHANDLE_TABLE table,
@@ -154,6 +183,17 @@ BOOL        handle_query_state(PHANDLE_TABLE table,
                                ULONG *out_owner_refs,
                                ULONG *out_sole_owner);
 
+NTSTATUS    handle_query_flags_for_process(PHANDLE_TABLE table,
+                                            HANDLE handle,
+                                            ULONG owner_pid,
+                                            ULONG *out_flags);
+
+NTSTATUS    handle_update_flags_for_process(PHANDLE_TABLE table,
+                                             HANDLE handle,
+                                             ULONG owner_pid,
+                                             ULONG mask,
+                                             ULONG flags);
+
 /* Copy queryable object metadata while the handle table lock guarantees the
  * object's lifetime. The returned snapshot contains no live object pointer. */
 NTSTATUS    handle_snapshot_for_process(PHANDLE_TABLE table,
@@ -165,11 +205,17 @@ BOOL        handle_object_referenced(PHANDLE_TABLE table,
                                      OBJECT_TYPE_ID type,
                                      PVOID object);
 
+BOOL        handle_object_referenced_for_process(PHANDLE_TABLE table,
+                                                 OBJECT_TYPE_ID type,
+                                                 PVOID object,
+                                                 ULONG owner_pid);
+
 /* Remove one handle from an exiting process's ownership set. */
 HANDLE      handle_take_owned(PHANDLE_TABLE table,
                               ULONG owner_pid);
 
-/* Duplicate a handle within the same or across tables */
+/* Duplicate a handle within the same or across tables. Object-aware callers
+ * must perform DUPLICATE_CLOSE_SOURCE after this helper returns. */
 NTSTATUS    handle_duplicate(PHANDLE_TABLE src_table,
                              HANDLE src_handle,
                              PHANDLE_TABLE dst_table,

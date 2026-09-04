@@ -1,11 +1,11 @@
 /*
  * OsitoK Windows Compatibility Layer — shell32.dll Shim Implementation
  *
- * Stub implementation — ShellExecute logs the request and returns
- * success (handle > 32) without launching any process.
+ * Shell services backed by the generic Win32 process and filesystem layers.
  */
 
 #include "shell32_shim.h"
+#include "kernel32_shim.h"
 #include "ole32_shim.h"
 #include "advapi32_shim.h"
 #include "win32_abi.h"
@@ -15,16 +15,12 @@ extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t value);
 extern void serial_puthex(uint64_t value, int digits);
 extern PVOID WINAPI LocalAlloc(UINT uFlags, SIZE_T dwBytes);
-extern void WINAPI SetLastError(DWORD error);
 extern DWORD win32_current_process_id(void);
 extern BOOL WINAPI IsWindow(HWND window);
 extern HANDLE WINAPI CopyIcon(HANDLE icon);
 extern HANDLE WINAPI LoadIconW(HINSTANCE instance, PCWSTR name);
 extern BOOL user32_release_icon(HANDLE icon);
-extern DWORD WINAPI GetFileAttributesW(PCWSTR path);
-extern DWORD WINAPI GetFileAttributesA(PCSTR path);
 extern BOOL WINAPI CreateDirectoryA(PCSTR path, PVOID security_attributes);
-extern DWORD WINAPI GetLastError(void);
 extern int WINAPI GetSystemMetrics(int index);
 
 #define NIM_ADD         0x00000000U
@@ -429,45 +425,169 @@ static BOOL shell_notify_icon(DWORD message, PVOID input, BOOL wide)
 
 /* ── API Implementations ───────────────────────────────────── */
 
-/* True if path ends in ".exe" (case-insensitive) — UT99 relaunches itself this
- * way to apply a video/color-depth change. */
-static int ends_in_exe(PCSTR p)
+/* ShellExecute result codes share the historical HINSTANCE return channel. */
+enum {
+    SHELL_EXECUTE_SUCCESS = 33,
+    SHELL_SE_ERR_FNF = 2,
+    SHELL_SE_ERR_PNF = 3,
+    SHELL_SE_ERR_ACCESSDENIED = 5,
+    SHELL_SE_ERR_OOM = 8,
+    SHELL_SE_ERR_NOASSOC = 31,
+    SHELL_CP_UTF8 = 65001
+};
+
+static char shell_ascii_fold(char value)
 {
-    if (!p) return 0;
-    int n = 0; while (p[n]) n++;
-    if (n < 4) return 0;
-    const char *e = p + n - 4;
-    return (e[0] == '.' &&
-            (e[1] == 'e' || e[1] == 'E') &&
-            (e[2] == 'x' || e[2] == 'X') &&
-            (e[3] == 'e' || e[3] == 'E'));
+    return value >= 'A' && value <= 'Z' ? (char)(value + ('a' - 'A')) : value;
+}
+
+static BOOL shell_ascii_equal_ci(PCSTR left, PCSTR right)
+{
+    if (!left || !right) return left == right;
+    while (*left && *right &&
+           shell_ascii_fold(*left) == shell_ascii_fold(*right)) {
+        left++;
+        right++;
+    }
+    return *left == 0 && *right == 0;
+}
+
+static BOOL shell_executable_path(PCSTR path)
+{
+    if (!path) return FALSE;
+    int length = 0;
+    while (path[length]) length++;
+    if (length < 4) return FALSE;
+    const char *extension = path + length - 4;
+    return extension[0] == '.' &&
+           shell_ascii_fold(extension[1]) == 'e' &&
+           shell_ascii_fold(extension[2]) == 'x' &&
+           shell_ascii_fold(extension[3]) == 'e';
+}
+
+static HINSTANCE shell_execute_error(DWORD error)
+{
+    ULONG_PTR result;
+    switch (error) {
+    case 2: result = SHELL_SE_ERR_FNF; break;
+    case 3:
+    case 267: result = SHELL_SE_ERR_PNF; break;
+    case 8:
+    case 14: result = SHELL_SE_ERR_OOM; break;
+    case 193:
+    case 1155: result = SHELL_SE_ERR_NOASSOC; break;
+    default: result = SHELL_SE_ERR_ACCESSDENIED; break;
+    }
+    SetLastError(error);
+    return (HINSTANCE)result;
+}
+
+static BOOL shell_build_command_line(PCSTR file, PCSTR parameters,
+                                     char output[4096])
+{
+    SIZE_T out = 0;
+    output[out++] = '"';
+    for (SIZE_T i = 0; file[i]; i++) {
+        if (file[i] == '"' || out + 2 >= 4096) return FALSE;
+        output[out++] = file[i];
+    }
+    output[out++] = '"';
+    if (parameters && parameters[0]) {
+        if (out + 1 >= 4096) return FALSE;
+        output[out++] = ' ';
+        for (SIZE_T i = 0; parameters[i]; i++) {
+            if (out + 1 >= 4096) return FALSE;
+            output[out++] = parameters[i];
+        }
+    }
+    output[out] = 0;
+    return TRUE;
+}
+
+static HINSTANCE shell_execute_common(PCSTR api, PCSTR operation, PCSTR file,
+                                      PCSTR parameters, PCSTR directory,
+                                      int show_command)
+{
+    (void)show_command;
+    serial_puts("[SHELL32] ShellExecute");
+    serial_puts(api);
+    serial_puts(" verb=");
+    serial_puts(operation && operation[0] ? operation : "open");
+    serial_puts(" file=");
+    if (file) serial_puts(file);
+    serial_puts(" params=");
+    if (parameters) serial_puts(parameters);
+    serial_puts(" dir=");
+    if (directory) serial_puts(directory);
+    serial_puts("\n");
+
+    if (!file || !file[0])
+        return shell_execute_error(2); /* ERROR_FILE_NOT_FOUND */
+    if (operation && operation[0] &&
+        !shell_ascii_equal_ci(operation, "open") &&
+        !shell_ascii_equal_ci(operation, "runas"))
+        return shell_execute_error(1155); /* ERROR_NO_ASSOCIATION */
+    if (!shell_executable_path(file))
+        return shell_execute_error(1155);
+
+    DWORD attributes = GetFileAttributesA(file);
+    if (attributes == 0xFFFFFFFFU) {
+        DWORD error = GetLastError();
+        return shell_execute_error(error ? error : 2);
+    }
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY)
+        return shell_execute_error(1155);
+
+    char command_line[4096];
+    if (!shell_build_command_line(file, parameters, command_line))
+        return shell_execute_error(206); /* ERROR_FILENAME_EXCED_RANGE */
+    if (!kernel32_launch_process_a(file, command_line, directory)) {
+        DWORD error = GetLastError();
+        return shell_execute_error(error ? error : 5);
+    }
+
+    SetLastError(0);
+    serial_puts("[SHELL32] ShellExecute -> process scheduled\n");
+    return (HINSTANCE)(ULONG_PTR)SHELL_EXECUTE_SUCCESS;
+}
+
+static BOOL shell_wide_to_utf8(PCWSTR input, char *output, int capacity)
+{
+    if (!input) {
+        output[0] = 0;
+        return TRUE;
+    }
+    return WideCharToMultiByte(SHELL_CP_UTF8, 0, input, -1,
+                               output, capacity, NULL, NULL) > 0;
 }
 
 HINSTANCE WINAPI ShellExecuteA(HWND hwnd, PCSTR lpOperation, PCSTR lpFile,
                                 PCSTR lpParameters, PCSTR lpDirectory, int nShowCmd)
 {
-    (void)hwnd; (void)lpParameters; (void)lpDirectory; (void)nShowCmd;
-    serial_puts("[SHELL32] ShellExecuteA: ");
-    if (lpOperation) { serial_puts(lpOperation); serial_puts(" "); }
-    if (lpFile) serial_puts(lpFile);
-    serial_puts("\n");
-    /* Launching an .exe = the game relaunching itself → request a re-exec so the
-     * current process's ExitProcess restarts the EXE instead of exiting dead. */
-    if (ends_in_exe(lpFile)) {
-        extern int g_win32_relaunch;
-        g_win32_relaunch = 1;
-        serial_puts("[SHELL32] .exe launch → RE-EXEC requested\n");
-    }
-    return (HINSTANCE)(ULONG_PTR)32; /* >32 = success */
+    (void)hwnd;
+    return shell_execute_common("A", lpOperation, lpFile, lpParameters,
+                                lpDirectory, nShowCmd);
 }
 
 HINSTANCE WINAPI ShellExecuteW(HWND hwnd, PCWSTR lpOperation, PCWSTR lpFile,
                                 PCWSTR lpParameters, PCWSTR lpDirectory, int nShowCmd)
 {
-    (void)hwnd; (void)lpOperation; (void)lpFile;
-    (void)lpParameters; (void)lpDirectory; (void)nShowCmd;
-    serial_puts("[SHELL32] ShellExecuteW: stub\n");
-    return (HINSTANCE)(ULONG_PTR)32; /* >32 = success */
+    (void)hwnd;
+    char operation[32];
+    char file[260];
+    char parameters[4096];
+    char directory[260];
+    if (!shell_wide_to_utf8(lpOperation, operation, sizeof(operation)) ||
+        !shell_wide_to_utf8(lpFile, file, sizeof(file)) ||
+        !shell_wide_to_utf8(lpParameters, parameters, sizeof(parameters)) ||
+        !shell_wide_to_utf8(lpDirectory, directory, sizeof(directory))) {
+        DWORD error = GetLastError();
+        return shell_execute_error(error ? error : 206);
+    }
+    return shell_execute_common("W", lpOperation ? operation : NULL,
+                                lpFile ? file : NULL,
+                                lpParameters ? parameters : NULL,
+                                lpDirectory ? directory : NULL, nShowCmd);
 }
 
 BOOL WINAPI Shell_NotifyIconA(DWORD dwMessage, PVOID lpData)

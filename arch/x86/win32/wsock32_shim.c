@@ -624,6 +624,15 @@ static PVOID wsabuf_data_for_mode(PCVOID buffers, DWORD index, BOOL compat32)
         : ((const WSABUF64 *)buffers)[index].buf;
 }
 
+static void wsabuf_set_len_for_mode(PVOID buffers, DWORD index,
+                                    BOOL compat32, uint32_t length)
+{
+    if (compat32)
+        ((WSABUF32 *)buffers)[index].len = length;
+    else
+        ((WSABUF64 *)buffers)[index].len = length;
+}
+
 static int wsock_message_view(PVOID message, BOOL compat32,
                               wsock_message_view_t *view)
 {
@@ -4808,6 +4817,45 @@ static char     hostent_name[256];
 static uint8_t  hostent_buf[16];
 static uint8_t  hostent_buf64[32];
 
+static PVOID wsock_make_hostent(PCSTR name, const uint8_t ip[4])
+{
+    int name_length = ws_strlen(name);
+    if (name_length > 255) name_length = 255;
+    ws_memcpy(hostent_name, name, (SIZE_T)name_length);
+    hostent_name[name_length] = 0;
+    ws_memcpy(hostent_ip, ip, sizeof(hostent_ip));
+
+    wsa_last_error = 0;
+    if (g_compat32_mode) {
+        hostent_addr_list[0] = (uint32_t)(uintptr_t)hostent_ip;
+        hostent_addr_list[1] = 0;
+        hostent_aliases[0] = 0;
+        uint32_t *host = (uint32_t *)hostent_buf;
+        host[0] = (uint32_t)(uintptr_t)hostent_name;
+        host[1] = (uint32_t)(uintptr_t)hostent_aliases;
+        hostent_buf[8] = AF_INET;
+        hostent_buf[9] = 0;
+        hostent_buf[10] = 4;
+        hostent_buf[11] = 0;
+        host[3] = (uint32_t)(uintptr_t)hostent_addr_list;
+        return (PVOID)hostent_buf;
+    }
+
+    ws_memset(hostent_buf64, 0, sizeof(hostent_buf64));
+    hostent_addr_list64[0] = (uint64_t)(uintptr_t)hostent_ip;
+    hostent_addr_list64[1] = 0;
+    hostent_aliases64[0] = 0;
+    uint64_t *host = (uint64_t *)hostent_buf64;
+    host[0] = (uint64_t)(uintptr_t)hostent_name;
+    host[1] = (uint64_t)(uintptr_t)hostent_aliases64;
+    hostent_buf64[16] = AF_INET;
+    hostent_buf64[17] = 0;
+    hostent_buf64[18] = 4;
+    hostent_buf64[19] = 0;
+    host[3] = (uint64_t)(uintptr_t)hostent_addr_list64;
+    return (PVOID)hostent_buf64;
+}
+
 PVOID WINAPI wsock_gethostbyname(PCSTR name)
 {
     if (!wsa_initialized) {
@@ -4838,45 +4886,38 @@ PVOID WINAPI wsock_gethostbyname(PCSTR name)
     serial_puthex(ip[2], 2); serial_puts(".");
     serial_puthex(ip[3], 2); serial_puts("\n");
 
-    /* Copy hostname */
-    int nlen = ws_strlen(name);
-    if (nlen > 255) nlen = 255;
-    ws_memcpy(hostent_name, name, (SIZE_T)nlen);
-    hostent_name[nlen] = '\0';
+    return wsock_make_hostent(name, ip);
+}
 
-    /* Fill IP address */
-    hostent_ip[0] = ip[0]; hostent_ip[1] = ip[1];
-    hostent_ip[2] = ip[2]; hostent_ip[3] = ip[3];
-
-    wsa_last_error = 0;
-    if (g_compat32_mode) {
-        hostent_addr_list[0] = (uint32_t)(uintptr_t)hostent_ip;
-        hostent_addr_list[1] = 0;
-        hostent_aliases[0] = 0;
-        uint32_t *he = (uint32_t *)hostent_buf;
-        he[0] = (uint32_t)(uintptr_t)hostent_name;
-        he[1] = (uint32_t)(uintptr_t)hostent_aliases;
-        hostent_buf[8] = AF_INET;
-        hostent_buf[9] = 0;
-        hostent_buf[10] = 4;
-        hostent_buf[11] = 0;
-        he[3] = (uint32_t)(uintptr_t)hostent_addr_list;
-        return (PVOID)hostent_buf;
+static PVOID WINAPI wsock_gethostbyaddr(PCVOID address, int length, int type)
+{
+    if (!wsa_initialized) {
+        wsa_last_error = WSANOTINITIALISED;
+        return NULL;
+    }
+    if (!address || length != 4) {
+        wsa_last_error = WSAEFAULT;
+        return NULL;
+    }
+    if (type != AF_INET) {
+        wsa_last_error = WSAEAFNOSUPPORT;
+        return NULL;
     }
 
-    ws_memset(hostent_buf64, 0, sizeof(hostent_buf64));
-    hostent_addr_list64[0] = (uint64_t)(uintptr_t)hostent_ip;
-    hostent_addr_list64[1] = 0;
-    hostent_aliases64[0] = 0;
-    uint64_t *he64 = (uint64_t *)hostent_buf64;
-    he64[0] = (uint64_t)(uintptr_t)hostent_name;
-    he64[1] = (uint64_t)(uintptr_t)hostent_aliases64;
-    hostent_buf64[16] = AF_INET;
-    hostent_buf64[17] = 0;
-    hostent_buf64[18] = 4;
-    hostent_buf64[19] = 0;
-    he64[3] = (uint64_t)(uintptr_t)hostent_addr_list64;
-    return (PVOID)hostent_buf64;
+    const uint8_t *ip = (const uint8_t *)address;
+    if (ip[0] == 127)
+        return wsock_make_hostent("localhost", ip);
+
+    const uint8_t *local = net_get_ip_ptr();
+    if ((local[0] || local[1] || local[2] || local[3]) &&
+        ip[0] == local[0] && ip[1] == local[1] &&
+        ip[2] == local[2] && ip[3] == local[3])
+        return wsock_make_hostent("osito", ip);
+
+    /* The kernel resolver currently supports A records but not PTR queries.
+     * Do not manufacture a reverse-DNS name for a non-local address. */
+    wsa_last_error = WSAHOST_NOT_FOUND;
+    return NULL;
 }
 
 /* The Winsock protocol database APIs return storage owned by Winsock. Like
@@ -6057,6 +6098,58 @@ int WINAPI wsock_shutdown(SOCKET s, int how)
     wsock_propagate_shared_state(ws);
     wsa_last_error = 0;
     return 0;
+}
+
+static int WINAPI wsock_WSASendDisconnect(SOCKET s, PCVOID disconnect_data)
+{
+    if (disconnect_data) {
+        uint32_t length = wsabuf_len_for_mode(disconnect_data, 0,
+                                              g_compat32_mode);
+        const char *data = (const char *)wsabuf_data_for_mode(
+            disconnect_data, 0, g_compat32_mode);
+        if (length > 0x7fffffffU) {
+            wsa_last_error = WSAEMSGSIZE;
+            return SOCKET_ERROR;
+        }
+        if (length && !data) {
+            wsa_last_error = WSAEFAULT;
+            return SOCKET_ERROR;
+        }
+
+        uint32_t sent_total = 0;
+        while (sent_total < length) {
+            int sent = wsock_send(s, data + sent_total,
+                                  (int)(length - sent_total), 0);
+            if (sent == SOCKET_ERROR)
+                return SOCKET_ERROR;
+            if (sent == 0) {
+                wsa_last_error = WSAEWOULDBLOCK;
+                return SOCKET_ERROR;
+            }
+            sent_total += (uint32_t)sent;
+        }
+    }
+
+    return wsock_shutdown(s, 1); /* SD_SEND */
+}
+
+static int WINAPI wsock_WSARecvDisconnect(SOCKET s, PVOID disconnect_data)
+{
+    if (disconnect_data) {
+        uint32_t capacity = wsabuf_len_for_mode(disconnect_data, 0,
+                                                g_compat32_mode);
+        PVOID data = wsabuf_data_for_mode(disconnect_data, 0,
+                                          g_compat32_mode);
+        if (capacity && !data) {
+            wsa_last_error = WSAEFAULT;
+            return SOCKET_ERROR;
+        }
+    }
+
+    int result = wsock_shutdown(s, 0); /* SD_RECEIVE */
+    if (result == 0 && disconnect_data)
+        wsabuf_set_len_for_mode(disconnect_data, 0, g_compat32_mode, 0);
+    return result;
 }
 
 int WINAPI wsock_recvfrom(SOCKET s, PSTR buf, int len, int flags,
@@ -8165,9 +8258,13 @@ static const SHIM_EXPORT wsock_exports[] = {
     { "WSASocketA",     (PVOID)wsock_WSASocketA,   6, CC_STDCALL },
     { "WSASocketW",     (PVOID)wsock_WSASocketA,   6, CC_STDCALL },
     { "WSASend",        (PVOID)wsock_WSASend,      7, CC_STDCALL },
+    { "WSASendDisconnect", (PVOID)wsock_WSASendDisconnect,
+                                                       2, CC_STDCALL },
     { "WSASendTo",      (PVOID)wsock_WSASendTo,    9, CC_STDCALL },
     { "WSASendMsg",     (PVOID)wsock_WSASendMsg,   6, CC_STDCALL },
     { "WSARecv",        (PVOID)wsock_WSARecv,      7, CC_STDCALL },
+    { "WSARecvDisconnect", (PVOID)wsock_WSARecvDisconnect,
+                                                       2, CC_STDCALL },
     { "WSARecvFrom",    (PVOID)wsock_WSARecvFrom,  9, CC_STDCALL },
     { "WSARecvMsg",     (PVOID)wsock_WSARecvMsg,   5, CC_STDCALL },
     { "WSAGetOverlappedResult", (PVOID)wsock_WSAGetOverlappedResult,
@@ -8197,6 +8294,7 @@ static const SHIM_EXPORT wsock_exports[] = {
     { "getsockopt",     (PVOID)wsock_getsockopt,   5, CC_STDCALL },
     { "setsockopt",     (PVOID)wsock_setsockopt,   5, CC_STDCALL },
     { "shutdown",       (PVOID)wsock_shutdown,     2, CC_STDCALL },
+    { "gethostbyaddr",  (PVOID)wsock_gethostbyaddr,3, CC_STDCALL },
     { "gethostbyname",  (PVOID)wsock_gethostbyname,1, CC_STDCALL },
     { "getprotobyname", (PVOID)wsock_getprotobyname, 1, CC_STDCALL },
     { "getprotobynumber", (PVOID)wsock_getprotobynumber,
@@ -8238,6 +8336,7 @@ static const SHIM_ORDINAL wsock_ordinals[] = {
     {  21, (PVOID)wsock_setsockopt   },  /* setsockopt   */
     {  22, (PVOID)wsock_shutdown     },  /* shutdown     */
     {  23, (PVOID)wsock_socket       },  /* socket       */
+    {  51, (PVOID)wsock_gethostbyaddr},  /* gethostbyaddr */
     {  52, (PVOID)wsock_gethostbyname},  /* gethostbyname */
     {  53, (PVOID)wsock_getprotobyname}, /* getprotobyname */
     {  54, (PVOID)wsock_getprotobynumber}, /* getprotobynumber */
@@ -8275,6 +8374,7 @@ static const SHIM_ORDINAL ws2_ordinals[] = {
     {  21, (PVOID)wsock_setsockopt    },
     {  22, (PVOID)wsock_shutdown      },
     {  23, (PVOID)wsock_socket        },
+    {  51, (PVOID)wsock_gethostbyaddr },
     {  52, (PVOID)wsock_gethostbyname },
     {  53, (PVOID)wsock_getprotobyname},
     {  54, (PVOID)wsock_getprotobynumber},

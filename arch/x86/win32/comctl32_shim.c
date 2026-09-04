@@ -20,6 +20,41 @@ extern int sched_current_get(void);
 #define MAX_SUBCLASS_WINDOWS       512
 #define MAX_SUBCLASS_ENTRIES       2048
 
+typedef struct {
+    const char *name;
+    DWORD groups;
+    DWORD style;
+    int cb_wnd_extra32;
+    int cb_wnd_extra64;
+    ULONG_PTR background;
+} COMMON_CONTROL_CLASS;
+
+/* Class metadata matches the v5 common-controls classes exposed by current
+ * 32-bit and 64-bit Windows.  The control state stored in cbWndExtra follows
+ * the caller ABI, while the class WNDPROC remains native inside the shim. */
+static const COMMON_CONTROL_CLASS common_control_classes[] = {
+    { "SysListView32",       ICC_LISTVIEW_CLASSES,   0x00004008, 4,  8,  6 },
+    { "SysHeader32",         ICC_LISTVIEW_CLASSES,   0x00004008, 4,  8, 16 },
+    { "SysTreeView32",       ICC_TREEVIEW_CLASSES,   0x00004008, 4,  8,  0 },
+    { "ToolbarWindow32",     ICC_BAR_CLASSES,        0x00004008, 4,  8, 16 },
+    { "msctls_statusbar32",  ICC_BAR_CLASSES,        0x00004009, 4,  8, 16 },
+    { "msctls_trackbar32",   ICC_BAR_CLASSES,        0x00004000, 4,  8, 16 },
+    { "tooltips_class32",    ICC_BAR_CLASSES,        0x00004808, 4,  8,  0 },
+    { "SysTabControl32",     ICC_TAB_CLASSES,        0x0000400B, 4,  8, 16 },
+    { "msctls_updown32",     ICC_UPDOWN_CLASS,       0x00004003, 4,  8, 16 },
+    { "msctls_progress32",   ICC_PROGRESS_CLASS,     0x00004003, 4,  8, 16 },
+    { "msctls_hotkey32",     ICC_HOTKEY_CLASS,       0x00004000, 24, 48,  0 },
+    { "SysAnimate32",        ICC_ANIMATE_CLASS,      0x00004008, 4,  8, 16 },
+    { "SysDateTimePick32",   ICC_DATE_CLASSES,       0x00004000, 4,  8,  6 },
+    { "SysMonthCal32",       ICC_DATE_CLASSES,       0x00004000, 4,  8,  6 },
+    { "ComboBoxEx32",        ICC_USEREX_CLASSES,     0x00004000, 4,  8,  6 },
+    { "ReBarWindow32",       ICC_COOL_CLASSES,       0x00004008, 4,  8, 16 },
+    { "SysIPAddress32",      ICC_INTERNET_CLASSES,   0x0000400B, 4,  4,  6 },
+    { "SysPager",            ICC_PAGESCROLLER_CLASS, 0x00004000, 4,  8, 16 },
+    { "NativeFontCtl",       ICC_NATIVEFNTCTL_CLASS, 0x00004000, 4,  8, 16 },
+    { "SysLink",             ICC_LINK_CLASS,         0x00004008, 4,  8,  6 },
+};
+
 typedef LRESULT (WINAPI *SUBCLASS_PROC)(HWND window, UINT message,
     WPARAM wparam, LPARAM lparam, ULONG_PTR subclass_id,
     ULONG_PTR reference_data);
@@ -507,6 +542,11 @@ LRESULT WINAPI shim_DefSubclassProc(HWND window, UINT message,
     return subclass_dispatch_next(frame, message, wparam, lparam);
 }
 
+void comctl32_release_window(DWORD owner_pid, HWND window)
+{
+    subclass_forget_window(owner_pid, window, FALSE);
+}
+
 void comctl32_release_process(DWORD owner_pid)
 {
     uint64_t flags = subclass_lock_irqsave();
@@ -525,16 +565,47 @@ void comctl32_release_process(DWORD owner_pid)
     subclass_unlock_irqrestore(flags);
 }
 
-void WINAPI shim_InitCommonControls(void)
+static LRESULT WINAPI common_control_wndproc(HWND window, DWORD message,
+                                              WPARAM wparam, LPARAM lparam)
 {
-    serial_puts("[COMCTL32] InitCommonControls (stub)\n");
+    return DefWindowProcW(window, message, wparam, lparam);
 }
 
-BOOL WINAPI shim_InitCommonControlsEx(PVOID icc)
+static BOOL register_common_control_classes(DWORD groups)
 {
-    (void)icc;
-    serial_puts("[COMCTL32] InitCommonControlsEx (stub)\n");
+    for (SIZE_T i = 0;
+         i < sizeof(common_control_classes) / sizeof(common_control_classes[0]);
+         i++) {
+        const COMMON_CONTROL_CLASS *control = &common_control_classes[i];
+        if (!(groups & control->groups))
+            continue;
+        int cb_wnd_extra = g_compat32_mode ? control->cb_wnd_extra32
+                                           : control->cb_wnd_extra64;
+        if (!user32_register_library_class(
+                control->name, control->style, 0, cb_wnd_extra,
+                (HBRUSH)control->background, common_control_wndproc)) {
+            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+            return FALSE;
+        }
+    }
     return TRUE;
+}
+
+void WINAPI shim_InitCommonControls(void)
+{
+    serial_puts("[COMCTL32] InitCommonControls flags=0x000000FF\n");
+    (void)register_common_control_classes(ICC_WIN95_CLASSES);
+}
+
+BOOL WINAPI shim_InitCommonControlsEx(const INITCOMMONCONTROLSEX *icc)
+{
+    if (!icc || icc->dwSize != sizeof(*icc))
+        return FALSE;
+
+    serial_puts("[COMCTL32] InitCommonControlsEx flags=0x");
+    serial_puthex(icc->dwICC, 8);
+    serial_puts("\n");
+    return register_common_control_classes(icc->dwICC);
 }
 
 PVOID WINAPI shim_CreateStatusWindowA(LONG style, const char *text,
@@ -584,8 +655,8 @@ PVOID comctl32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 {
     if (by_ordinal) {
         switch (ordinal) {
-        case 17:  return (PVOID)shim_InitCommonControlsEx;
-        case 345: return (PVOID)shim_InitCommonControls;
+        case 17:  return (PVOID)shim_InitCommonControls;
+        case 82:  return (PVOID)shim_InitCommonControlsEx;
         case 410: return (PVOID)shim_SetWindowSubclass;
         case 411: return (PVOID)shim_GetWindowSubclass;
         case 412: return (PVOID)shim_RemoveWindowSubclass;

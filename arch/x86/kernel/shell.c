@@ -635,15 +635,22 @@ static void cmd_help(void)
     sh_puts("  apipa     Auto-assign link-local 169.254.X.Y (RFC 3927)\n");
     sh_puts("  ipconf    Set static IP (ipconf <ip> [gw] [mask] [dns])\n");
     sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
+    sh_puts("  dos-api-test  Validate DOS paths, seek, and disk geometry\n");
+    sh_puts("  oss-audio-test  Validate OSS playback and legacy PCM formats\n");
     sh_puts("  win32-wm-test  Validate USER32 hierarchy, geometry, z-order, and teardown\n");
+    sh_puts("  win32-dialog-test  Validate USER32 resource and modal dialog contracts\n");
     sh_puts("  win32-input-test  Validate USER32 SendInput and message metadata\n");
     sh_puts("  win32-tls-test  Validate process-local Win32 TLS allocation\n");
     sh_puts("  win32-reg-test  Validate predefined HKEY aliases and WOW64 views\n");
     sh_puts("  win32-gdi-test  Validate DIB orientation, scaling, conversion, and presentation\n");
+    sh_puts("  win32-com-test  Validate per-thread COM apartment initialization\n");
+    sh_puts("  win32-dsound-test  Validate DirectSound formats, capabilities, and cursors\n");
+    sh_puts("  win32-ddraw-test  Validate DirectDraw generations, descriptors, and COM ABI\n");
     sh_puts("  win32-dwrite-test  Validate custom font loaders, streams, and COM lifetime\n");
     sh_puts("  win32-oleacc-test  Validate MSAA objects, enumeration, and WM_GETOBJECT tokens\n");
     sh_puts("  win32-wsock-test  Validate Winsock UDP, select, catalog, extensions, and IOCP\n");
     sh_puts("  win32-vm-test  Validate NT reserve, commit, protect, decommit, query, and release\n");
+    sh_puts("  win32-file-test  Validate NT create, offsets, append, and file position\n");
     sh_puts("  win32-pe-test  Validate PE section permissions and protection transitions\n");
     sh_puts("  win32-cr3-test  Validate private process mappings and shared kernel mappings\n");
     sh_puts("  win32-process-test  Validate per-process image and PEB identity\n");
@@ -7048,6 +7055,36 @@ q4kgdone:
         if (!found) sh_puts("No crash reports saved\n");
     } else if (strcmp(cmd, "httpd") == 0) {
         cmd_httpd(argc, argv);
+    } else if (strcmp(cmd, "dos-api-test") == 0) {
+        extern int dos_api_selftest(void);
+        int failures = dos_api_selftest();
+        if (!failures) {
+            sh_puts("DOS API contract test: PASS\n");
+        } else {
+            sh_puts("DOS API contract test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "oss-audio-test") == 0) {
+        extern int oss_audio_selftest(void);
+        int failures = oss_audio_selftest();
+        if (!failures) {
+            sh_puts("OSS audio contract test: PASS\n");
+        } else {
+            sh_puts("OSS audio contract test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-dsound-test") == 0) {
+        extern int dsound_selftest(void);
+        int failures = dsound_selftest();
+        if (!failures) {
+            sh_puts("DirectSound contract test: PASS\n");
+        } else {
+            sh_puts("DirectSound contract test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
     } else if (strcmp(cmd, "win32-wm-test") == 0) {
         extern int user32_window_model_selftest(void);
         int failures = user32_window_model_selftest();
@@ -7055,6 +7092,26 @@ q4kgdone:
             sh_puts("USER32 window-model test: PASS\n");
         } else {
             sh_puts("USER32 window-model test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-dialog-test") == 0) {
+        extern int user32_dialog_selftest(void);
+        int failures = user32_dialog_selftest();
+        if (!failures) {
+            sh_puts("USER32 dialog contract test: PASS\n");
+        } else {
+            sh_puts("USER32 dialog contract test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-ddraw-test") == 0) {
+        extern int ddraw_selftest(void);
+        int failures = ddraw_selftest();
+        if (!failures) {
+            sh_puts("DirectDraw ABI test: PASS\n");
+        } else {
+            sh_puts("DirectDraw ABI test: FAIL (");
             sh_putdec((uint64_t)failures);
             sh_puts(")\n");
         }
@@ -7108,6 +7165,16 @@ q4kgdone:
             sh_putdec((uint64_t)failures);
             sh_puts(")\n");
         }
+    } else if (strcmp(cmd, "win32-com-test") == 0) {
+        extern int ole32_apartment_selftest(void);
+        int failures = ole32_apartment_selftest();
+        if (!failures) {
+            sh_puts("Win32 COM apartment test: PASS\n");
+        } else {
+            sh_puts("Win32 COM apartment test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
     } else if (strcmp(cmd, "win32-region-test") == 0) {
         extern int gdi32_region_selftest(void);
         int failures = gdi32_region_selftest();
@@ -7145,6 +7212,16 @@ q4kgdone:
             sh_puts("NT virtual-memory test: PASS\n");
         } else {
             sh_puts("NT virtual-memory test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-file-test") == 0) {
+        extern int nt_file_selftest(void);
+        int failures = nt_file_selftest();
+        if (!failures) {
+            sh_puts("NT file contract test: PASS\n");
+        } else {
+            sh_puts("NT file contract test: FAIL (");
             sh_putdec((uint64_t)failures);
             sh_puts(")\n");
         }
@@ -7307,8 +7384,8 @@ q4kgdone:
                 /* Restore IST1 after longjmp — the compat32 exception path
                  * bypasses int2e_stub's IST1 restore, leaving it corrupted.
                  * Without this, the next IST1 interrupt loads RSP=0. */
-                extern void x86_tss_reset_ist1(void);
-                x86_tss_reset_ist1();
+                extern void sched_reset_current_compat_ist1(void);
+                sched_reset_current_compat_ist1();
                 /* Reset compat32 mode flag */
                 extern int *proc_win32_compat32_mode_slot(void);
                 *proc_win32_compat32_mode_slot() = 0;
@@ -7352,8 +7429,8 @@ q4kgdone:
                 else        sh_puts(" [MSI] install complete\n");
             } else {
                 sh_puts("\n [WIN32] Installer crashed — returned to shell\n");
-                extern void x86_tss_reset_ist1(void);
-                x86_tss_reset_ist1();
+                extern void sched_reset_current_compat_ist1(void);
+                sched_reset_current_compat_ist1();
                 extern int *proc_win32_compat32_mode_slot(void);
                 *proc_win32_compat32_mode_slot() = 0;
                 sh_sti();
@@ -7368,7 +7445,8 @@ q4kgdone:
             extern int dos_run(const char *filename, int argc, const char **argv);
             extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
             extern uint64_t *dos_native_exit_jmpbuf;
-            extern void x86_tss_reset_ist1(void);
+            extern void x86_tss_reset_ist2(void);
+            extern void x86_tss_reset_ist3(void);
             static uint64_t dosrun_jmpbuf[9];
             dos_native_exit_jmpbuf = dosrun_jmpbuf;
             int rc = kern_setjmp(dosrun_jmpbuf);
@@ -7378,7 +7456,9 @@ q4kgdone:
                 sh_puts("\n [DOS] Program exited (");
                 sh_puts(rc == 2 ? "crash" : "normal");
                 sh_puts(") — returned to shell\n");
-                x86_tss_reset_ist1();
+                x86_tss_reset_ist2();
+                x86_tss_reset_ist3();
+                sh_sti();
             }
             dos_native_exit_jmpbuf = NULL;
         }
@@ -7797,61 +7877,6 @@ void __cold shell_run(void)
     }
     else if (osfs2_is_mounted() && shell_run_autoload_file()) {
         /* The command file owns autoload selection, including invalid files. */
-    }
-    else if (osfs2_is_mounted() &&
-             osfs2_find("diag/autoexec-gta5") &&
-             osfs2_find("GTA5.elf")) {
-        sh_puts(" Auto-launching GTA5.elf...\n");
-        sh_diag_mark("autoexec-gta5-start");
-        shell_exec("execg GTA5.elf");
-        sh_diag_mark("autoexec-gta5-done");
-    }
-    /* Prefer the updated client; retain the bootstrap for incomplete installs. */
-    else if (osfs2_is_mounted() &&
-             osfs2_find("System\\Program Files\\Steam\\steam.exe")) {
-        char steam_cmd[] =
-            "winexec \"System\\Program Files\\Steam\\steam.exe\""
-            " -no-dwrite -cef-disable-breakpad"
-            " -cef-verbose-logging -cef-verbose-js-logging"
-            " -no-cef-sandbox"
-            " -noverifyfiles -nobootstrapupdate -skipinitialbootstrap"
-            " -norepairfiles";
-        shell_ensure_desktop();
-        sh_puts(" Auto-launching Steam.exe...\n");
-        shell_exec(steam_cmd);
-    }
-    else if (osfs2_is_mounted() &&
-             osfs2_find("Program Files\\Steam\\Steam.exe")) {
-        char steam_cmd[] = "winexec \"Program Files\\Steam\\Steam.exe\" -no-dwrite";
-        shell_ensure_desktop();
-        sh_puts(" Auto-launching Steam bootstrap...\n");
-        shell_exec(steam_cmd);
-    }
-    else if (osfs2_is_mounted() && osfs2_find("SteamSetup.exe")) {
-        shell_ensure_desktop();
-        sh_puts(" Auto-launching SteamSetup.exe...\n");
-        shell_exec("winexec SteamSetup.exe /S");
-    }
-    /* Auto-launch the installed application before legacy runtime tests. */
-    else if (osfs2_is_mounted() && osfs2_find("gtav-sp")) {
-        sh_puts(" Auto-launching gtav-sp...\n");
-        shell_exec("exec gtav-sp");
-    }
-    /* Auto-launch hello_gl.elf if present (W4.10 runtime test) */
-    else if (osfs2_is_mounted() && osfs2_find("hello_gl.elf")) {
-        sh_puts(" Auto-launching hello_gl.elf...\n");
-        sh_diag_mark("autoexec-hello-start");
-        shell_exec("exec hello_gl.elf");
-        sh_diag_mark("autoexec-hello-done");
-    }
-    /* UT99 assets may be present on the USB, but do not auto-launch them.
-     * Real-HW bringup needs a quiet shell so GTA5 can be started explicitly. */
-    /* Panorama: auto-launch DOOM.EXE (DOS4GW embedded) when no UT99 present */
-    else if (osfs2_is_mounted() && osfs2_find("DOOM.EXE")) {
-        sh_puts(" Auto-launching DOOM.EXE...\n");
-        sh_diag_mark("autoexec-doom-start");
-        shell_exec("dosrun DOOM.EXE");
-        sh_diag_mark("autoexec-doom-done");
     }
     sh_diag_flush("shell-ready");
 

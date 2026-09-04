@@ -17,14 +17,22 @@
 
 #include "ntsyscall.h"
 #include "handle.h"
+#include "filelock.h"
 #include "pe.h"
 #include "dllloader.h"
+#include "ddraw_shim.h"
 #include "dinput8_shim.h"
+#include "dsound_shim.h"
+#include "gdi32_shim.h"
 #include "kernel32_shim.h"
 #include "msvcrt_shim.h"
+#include "winmm_shim.h"
+#include "wintime.h"
 #include "../include/fd.h"
 #include "../include/paging.h"
 #include "../kernel/smp.h"
+#include "../fs/ositofs3.h"
+#include "../fs/ositofs_metadata.h"
 #include "../fs/vfs.h"
 
 /* ── External kernel interfaces ─────────────────────────────── */
@@ -55,13 +63,23 @@ extern int   osfs2_file_retain(void *file);
 extern void  osfs2_file_release(void *file);
 extern uint64_t osfs2_file_revision(void *file);
 extern void *osfs2_create(const char *name, uint64_t size);
+extern int   osfs2_delete(const char *name);
 extern int   osfs2_rename(const char *from, const char *to, bool replace);
 extern uint64_t osfs2_file_size(void *file);
 extern const char *osfs2_file_name(void *file);
+extern int osfs2_get_mode(const void *file, uint16_t *mode);
+extern int osfs2_set_mode(void *file, uint16_t mode);
 
 /* Physical memory */
 extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
+#ifndef TEST_HARNESS
+extern uint64_t mem_identity_reservation_conflict_end(uint64_t base,
+                                                       uint64_t size);
+extern int mem_identity_reservation_query(uint64_t address, uint64_t *base,
+                                          uint64_t *size,
+                                          uint64_t *next_base);
+#endif
 
 /* Paging */
 extern int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt,
@@ -75,6 +93,27 @@ extern uint64_t proc_current_cr3(void);
 
 static void nt_log_hex(const char *prefix, ULONGLONG val);
 
+static LONGLONG nt_filetime_from_unix_seconds(uint64_t seconds)
+{
+    if (!seconds) return 0;
+    if (seconds >
+        (0x7FFFFFFFFFFFFFFFULL - WINTIME_UNIX_EPOCH_FILETIME) /
+            WINTIME_TICKS_PER_SECOND)
+        return 0;
+    return (LONGLONG)(WINTIME_UNIX_EPOCH_FILETIME +
+                      seconds * WINTIME_TICKS_PER_SECOND);
+}
+
+static bool nt_filetime_to_unix_seconds(LONGLONG filetime,
+                                         uint64_t *seconds)
+{
+    if (!seconds || filetime < (LONGLONG)WINTIME_UNIX_EPOCH_FILETIME)
+        return false;
+    *seconds = ((uint64_t)filetime - WINTIME_UNIX_EPOCH_FILETIME) /
+               WINTIME_TICKS_PER_SECOND;
+    return true;
+}
+
 /* PTE flags (must match paging.c) */
 #define PTE_PRESENT   (1ULL << 0)
 #define PTE_WRITABLE  (1ULL << 1)
@@ -85,25 +124,18 @@ static void nt_log_hex(const char *prefix, ULONGLONG val);
 /*
  * Win32 VirtualAlloc semantics: each allocation returns a UNIQUE virtual
  * address mapped to freshly zeroed pages.  Previous implementation used
- * identity-mapped mem_alloc_pages which recycled physical addresses,
- * causing live data destruction (FName::Names bug in UT99).
+ * identity-mapped mem_alloc_pages which recycled physical addresses and
+ * allowed unrelated live allocations to alias the same virtual range.
  *
  * Fix: allocate physical pages + map at unique VA via paging_map_page().
- * VA range: 0x20000000-0x78000000 (Win32 user heap region, below 2GB).
+ * VA range: 0x20000000-0x7FFF0000 (exclusive upper bound, below 2GB).
  */
 #define WIN32_VA_BASE  0x20000000ULL
-/* WAS 0x7FFF0000 — but the kernel's pre-MMU UEFI stack lives around
- * 0x7FE60000, INSIDE the old VA range. UT99 making >900 MB of
- * VirtualAlloc would push win32_va_next past 0x7FE60000 and start
- * overwriting the shell's saved registers / setjmp buffer that lives
- * on that stack. After UT99 crash + longjmp returns to shell, the
- * corrupted return addresses caused #PF at RIP=0.
- *
- * Cap at 0x78000000 (= 1920 MB user range, 0x40000000..0x78000000) to
- * leave a 128 MB gap below the kernel's UEFI stack. Plenty for UT99
- * engine init (1737 VirtualAllocs observed; even with the 256MB cap
- * burst, total ~600 MB sustained). */
-#define WIN32_VA_LIMIT 0x78000000ULL
+/* GetSystemInfo exposes 0x7FFEFFFF as the highest PE32 application address,
+ * so the allocator uses the following page as its exclusive limit. A
+ * shell-hosted PE shares kernel_cr3; live low-identity kernel ranges are
+ * skipped dynamically through memory.c instead of reducing this contract. */
+#define WIN32_VA_LIMIT 0x7FFF0000ULL
 #define WIN64_VA_BASE        0x0000000200000000ULL
 #define WIN64_AUTO_VA_FLOOR  0x0000004000000000ULL
 #define WIN64_VA_LIMIT       0x0000010000000000ULL
@@ -132,6 +164,7 @@ typedef struct {
     ULONG    owner_pid;
     uint64_t next32;
     uint64_t next64;
+    BOOL     dep_enabled;
     BOOL     used;
 } vm_process_state_t;
 
@@ -152,8 +185,9 @@ static NTSTATUS section_flush_mapping(PVOID section, uint64_t view_phys,
                                       SIZE_T section_offset,
                                       SIZE_T relative_offset,
                                       SIZE_T bytes_to_flush);
-static int vm_map_private_backing(uint64_t cr3, uint64_t va, SIZE_T size,
-                                  ULONG protect, uint64_t *out_phys);
+static int vm_map_private_backing(ULONG owner_pid, uint64_t cr3, uint64_t va,
+                                  SIZE_T size, ULONG protect,
+                                  uint64_t *out_phys);
 
 static ULONG nt_current_owner_pid(void)
 {
@@ -165,6 +199,33 @@ static uint64_t nt_current_cr3(void)
 {
     uint64_t cr3 = proc_current_cr3();
     return cr3 ? cr3 : paging_get_kernel_cr3();
+}
+
+static uint64_t nt_identity_reservation_conflict_end(uint64_t base,
+                                                      uint64_t size)
+{
+#ifdef TEST_HARNESS
+    (void)base;
+    (void)size;
+    return 0;
+#else
+    return mem_identity_reservation_conflict_end(base, size);
+#endif
+}
+
+static int nt_identity_reservation_query(uint64_t address, uint64_t *base,
+                                         uint64_t *size,
+                                         uint64_t *next_base)
+{
+#ifdef TEST_HARNESS
+    (void)address;
+    if (base) *base = 0;
+    if (size) *size = 0;
+    if (next_base) *next_base = 0;
+    return 0;
+#else
+    return mem_identity_reservation_query(address, base, size, next_base);
+#endif
 }
 
 static int nt_map_page_in(uint64_t cr3, uint64_t va, uint64_t phys,
@@ -243,8 +304,19 @@ static vm_process_state_t *vm_process_state_get_locked(ULONG owner_pid,
     state->owner_pid = owner_pid;
     state->next32 = WIN32_VA_BASE;
     state->next64 = vm_safe_auto_base;
+    /* Until winexec publishes image metadata, unknown/native callers use the
+     * secure policy and keep data pages non-executable. */
+    state->dep_enabled = TRUE;
     state->used = TRUE;
     return state;
+}
+
+/* Must be called with vm_track_lock held. */
+static BOOL vm_process_dep_enabled_locked(ULONG owner_pid)
+{
+    vm_process_state_t *state =
+        vm_process_state_get_locked(owner_pid, FALSE);
+    return !state || state->dep_enabled;
 }
 
 /* Must be called with vm_track_lock held. */
@@ -355,6 +427,28 @@ static inline void vm_track_unlock_irqrestore(uint64_t flags)
         __asm__ volatile ("sti" ::: "memory");
 }
 
+void nt_vm_configure_process_dep(ULONG owner_pid, BOOL enabled)
+{
+    if (!owner_pid) return;
+
+    uint64_t vm_irq_flags = vm_track_lock_irqsave();
+    vm_process_state_t *state =
+        vm_process_state_get_locked(owner_pid, TRUE);
+    if (state)
+        state->dep_enabled = enabled ? TRUE : FALSE;
+    vm_track_unlock_irqrestore(vm_irq_flags);
+}
+
+BOOL nt_vm_process_dep_enabled(ULONG owner_pid)
+{
+    if (!owner_pid) return TRUE;
+
+    uint64_t vm_irq_flags = vm_track_lock_irqsave();
+    BOOL enabled = vm_process_dep_enabled_locked(owner_pid);
+    vm_track_unlock_irqrestore(vm_irq_flags);
+    return enabled;
+}
+
 static int vm_track_add(uint64_t va, uint64_t phys, SIZE_T size, ULONG protect,
                         BOOL owns_phys, PVOID section,
                         uint64_t section_offset)
@@ -451,6 +545,69 @@ static vm_track_entry_t *vm_track_find_committed_locked(ULONG owner_pid,
             best = &vm_track[i];
     }
     return best;
+}
+
+static BOOL vm_protection_allows_access(ULONG protect, BOOL writable)
+{
+    if (protect & PAGE_GUARD)
+        return FALSE;
+
+    switch (protect & 0xFF) {
+    case PAGE_READONLY:
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:
+        return writable ? FALSE : TRUE;
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+BOOL nt_vm_user_range_accessible(ULONGLONG base, SIZE_T size, BOOL writable)
+{
+    uint64_t end = base + size;
+    if (!size || end < base)
+        return FALSE;
+
+    ULONG owner_pid = nt_current_owner_pid();
+    uint64_t owner_cr3 = nt_current_cr3();
+    uint64_t cursor = base;
+    BOOL accessible = TRUE;
+    uint64_t vm_irq_flags = vm_track_lock_irqsave();
+
+    while (cursor < end) {
+        vm_track_entry_t *best = NULL;
+        for (int i = 0; i < vm_track_count; i++) {
+            vm_track_entry_t *entry = &vm_track[i];
+            uint64_t entry_end = entry->va + entry->size;
+            if (entry->owner_pid != owner_pid || entry->cr3 != owner_cr3 ||
+                !vm_track_entry_committed(entry) || entry_end < entry->va ||
+                cursor < entry->va || cursor >= entry_end)
+                continue;
+            if (!best || entry->size < best->size)
+                best = entry;
+        }
+
+        if (!best ||
+            !vm_protection_allows_access(best->protect, writable)) {
+            accessible = FALSE;
+            break;
+        }
+
+        uint64_t next = best->va + best->size;
+        if (next <= cursor) {
+            accessible = FALSE;
+            break;
+        }
+        cursor = next < end ? next : end;
+    }
+
+    vm_track_unlock_irqrestore(vm_irq_flags);
+    return accessible;
 }
 
 /* Private VMA records describe virtual ranges. Their physical pages need not
@@ -603,7 +760,8 @@ static int vm_commit_range_locked(ULONG owner_pid, uint64_t cr3, uint64_t va,
         }
 
         uint64_t phys = 0;
-        if (!vm_map_private_backing(cr3, cursor, gap_size, protect, &phys) ||
+        if (!vm_map_private_backing(owner_pid, cr3, cursor, gap_size,
+                                    protect, &phys) ||
             !vm_track_add(cursor, phys, gap_size, protect, TRUE, NULL, 0)) {
             if (phys) {
                 SIZE_T pages = gap_size / 4096;
@@ -690,6 +848,10 @@ void nt_vm_release_process(ULONG owner_pid)
 {
     if (!owner_pid) return;
 
+    /* Timer callbacks can re-enter process code. Stop their dispatcher before
+     * transferring or removing any process-owned mappings. */
+    winmm_release_process(owner_pid);
+
     /* Individual thread stacks are reservations in this same owner table.
      * Transfer their pending cleanup before removing any entry so the task
      * reaper cannot race process teardown and report a false double free. */
@@ -697,7 +859,10 @@ void nt_vm_release_process(ULONG owner_pid)
 
     /* The CRT caches pointers into this process's user mappings. Remove those
      * references before the mappings themselves are torn down. */
+    ddraw_release_process(owner_pid);
     dinput8_release_process(owner_pid);
+    dsound_release_process(owner_pid);
+    gdi32_release_process(owner_pid);
     msvcrt_release_process(owner_pid);
 
     uint64_t released_pages = 0;
@@ -781,6 +946,60 @@ void nt_vm_get_stats(uint32_t *entries, uint64_t *private_pages,
     if (entries) *entries = entry_count;
     if (private_pages) *private_pages = private_count;
     if (mapped_pages) *mapped_pages = mapped_count;
+}
+
+void nt_vm_get_address_space(SIZE_T *total, SIZE_T *available)
+{
+    vm_global_init_once();
+
+    const int compat32 = g_compat32_mode != 0;
+    const uint64_t base = compat32 ? WIN32_VA_BASE : vm_safe_auto_base;
+    const uint64_t limit = compat32 ? WIN32_VA_LIMIT : WIN64_VA_LIMIT;
+    uint64_t next = base;
+
+    uint64_t vm_irq_flags = vm_track_lock_irqsave();
+    vm_process_state_t *state =
+        vm_process_state_get_locked(nt_current_owner_pid(), FALSE);
+    if (state)
+        next = compat32 ? state->next32 : state->next64;
+    vm_track_unlock_irqrestore(vm_irq_flags);
+
+    if (next < base)
+        next = base;
+    if (next > limit)
+        next = limit;
+    uint64_t available_bytes = limit - next;
+    if (compat32 && nt_current_cr3() == paging_get_kernel_cr3()) {
+        uint64_t cursor = next;
+        while (cursor < limit) {
+            uint64_t reserved_base = 0;
+            uint64_t reserved_size = 0;
+            uint64_t next_reserved = 0;
+            int inside = nt_identity_reservation_query(
+                cursor, &reserved_base, &reserved_size, &next_reserved);
+            if (!inside) {
+                if (!next_reserved || next_reserved >= limit)
+                    break;
+                cursor = next_reserved;
+                continue;
+            }
+
+            uint64_t reserved_end = reserved_base + reserved_size;
+            if (reserved_end < reserved_base)
+                break;
+            uint64_t overlap_base = cursor > reserved_base
+                                  ? cursor : reserved_base;
+            uint64_t overlap_end = reserved_end < limit
+                                 ? reserved_end : limit;
+            if (overlap_end > overlap_base)
+                available_bytes -= overlap_end - overlap_base;
+            if (reserved_end <= cursor)
+                break;
+            cursor = reserved_end;
+        }
+    }
+    if (total) *total = limit >= base ? limit - base : 0;
+    if (available) *available = available_bytes;
 }
 
 static int vm_track_contains(uint64_t va, SIZE_T size)
@@ -892,13 +1111,19 @@ static uint64_t vm_range_conflict_end_locked(uint64_t va, SIZE_T size,
     }
 
     uint64_t cr3 = nt_current_cr3();
-    /* The shell-hosted PE32 main process still runs on the kernel CR3, whose
-     * lower half identity-maps RAM. Win32 allocations intentionally replace
-     * pages in its dedicated 0x40000000..0x78000000 window, so those inherited
-     * identity PTEs are not user-space conflicts. Owner VMAs and PE ranges
-     * above remain authoritative. Private process CR3s have no identity map
-     * and must continue checking their actual page tables. */
-    if (!(compat32 && cr3 == paging_get_kernel_cr3())) {
+    /* A shell-hosted PE32 main process runs on kernel_cr3, where ordinary low
+     * RAM PTEs are inherited identity aliases rather than user allocations.
+     * Ignore those aliases, but preserve the small set of low ranges that the
+     * kernel still dereferences directly (currently the firmware boot stack).
+     * Private process roots have no identity map and use their PTEs normally. */
+    if (compat32 && cr3 == paging_get_kernel_cr3()) {
+        uint64_t identity_end =
+            nt_identity_reservation_conflict_end(va, size);
+        if (identity_end == UINT64_MAX)
+            return UINT64_MAX;
+        if (identity_end > conflict_end)
+            conflict_end = identity_end;
+    } else {
         uint64_t mapped_end = paging_first_mapped_end_in_cr3(cr3, va, size);
         if (mapped_end == UINT64_MAX)
             return UINT64_MAX;
@@ -952,12 +1177,13 @@ static uint64_t vm_choose_address_locked(SIZE_T size, uint64_t requested_va,
 
 /* Forward declaration (defined below with other nt_* helpers) */
 static inline void nt_memset(void *s, int c, SIZE_T n);
-static uint64_t nt_prot_to_page_flags(ULONG protect);
+static uint64_t nt_prot_to_page_flags(ULONG protect, BOOL dep_enabled);
 
 /* Allocate zeroed physical backing and install it atomically in one address
  * space. The final PTE flags reflect the requested protection. */
-static int vm_map_private_backing(uint64_t cr3, uint64_t va, SIZE_T size,
-                                  ULONG protect, uint64_t *out_phys)
+static int vm_map_private_backing(ULONG owner_pid, uint64_t cr3, uint64_t va,
+                                  SIZE_T size, ULONG protect,
+                                  uint64_t *out_phys)
 {
     uint64_t pages = size / 4096;
     void *phys = mem_alloc_pages(pages);
@@ -966,7 +1192,8 @@ static int vm_map_private_backing(uint64_t cr3, uint64_t va, SIZE_T size,
 
     nt_memset(PHYS_TO_VIRT(phys), 0, size);
     uint64_t pa = (uint64_t)(uintptr_t)phys;
-    uint64_t final_flags = nt_prot_to_page_flags(protect);
+    uint64_t final_flags = nt_prot_to_page_flags(
+        protect, vm_process_dep_enabled_locked(owner_pid));
     uint64_t mapped_pages = 0;
 
     while (mapped_pages < pages) {
@@ -1002,18 +1229,9 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect,
     uint64_t pages = size / 4096;
     if (pages == 0) return NULL;
 
-    /* Free-list recycling DISABLED (regression investigation 2026-05-15).
-     * GMalloc state logging confirmed GMalloc is INTACT across the entire
-     * run (525+ calls, no CHANGED events after init).  Tombstone +
-     * STALE-PTR detector saw 0 hits.  Yet engine still crashes at
-     * vec=14 NX-fault RIP=0x401BC870 → engine treats DATA as code at a
-     * freshly-allocated NX page.  Root cause not pinpointed; engine
-     * derives a function pointer from somewhere that points to a
-     * data buffer.  Cannot fix without engine source.
-     *
-     * Keep the free-list scaffolding so future investigations can
-     * re-enable trivially.  See project_ut99_thunks_at_13d5.md and
-     * project_ut99_stale_ptr_falsified.md for the trail. */
+    /* Reuse remains disabled until the VM tracker has a generation-safe
+     * free-range index. Monotonic allocation prevents stale aliases without
+     * coupling the allocator to any particular executable. */
     uint64_t *auto_next = vm_auto_next_locked(owner_pid, compat32);
     uint64_t va = vm_choose_address_locked(size, requested_va, compat32);
     if (!auto_next || !va) {
@@ -1036,7 +1254,7 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect,
     }
 
     uint64_t pa = 0;
-    if (!vm_map_private_backing(cr3, va, size, protect, &pa)) {
+    if (!vm_map_private_backing(owner_pid, cr3, va, size, protect, &pa)) {
         serial_puts("[VA-PHYS-FAIL] pages=0x");
         serial_puthex(pages, 16);
         serial_puts(" size=0x");
@@ -1045,12 +1263,8 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect,
         return NULL;
     }
 
-    /* VA-ALLOC trace — every fresh allocation. Caller EIP comes from
-     * compat32's saved per-thunk return address (compat32_get_last_caller_eip)
-     * — that's the PE32 instruction immediately after the VirtualAlloc
-     * INT 0x2E thunk return. Cross-reference with FMW-ASSERT logs to
-     * identify which alloc became a Pool->Mem that later failed the
-     * pool-integrity check. */
+    /* Optional allocation trace. The caller is the PE32 instruction after
+     * the VirtualAlloc INT 0x2E thunk return. */
 #if defined(WIN32_VM_TRACE) && WIN32_VM_TRACE
     {
         extern uint32_t compat32_get_last_caller_eip(void);
@@ -1075,6 +1289,7 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect,
 
 HANDLE_TABLE g_handle_table;
 static BOOL  g_initialized = FALSE;
+static spinlock_t g_initialize_lock = SPINLOCK_INIT;
 
 /* Standard console handles (pre-allocated) */
 static FILE_OBJECT  g_console_in;
@@ -1121,13 +1336,6 @@ static void nt_log_hex(const char *prefix, ULONGLONG val)
     serial_puts("\n");
 }
 
-static inline void nt_memcpy(void *dst, const void *src, SIZE_T n)
-{
-    BYTE *d = (BYTE *)dst;
-    const BYTE *s = (const BYTE *)src;
-    while (n--) *d++ = *s++;
-}
-
 static inline void nt_memset(void *s, int c, SIZE_T n)
 {
     BYTE *p = (BYTE *)s;
@@ -1167,10 +1375,44 @@ static FILE_OBJECT *nt_file_object_allocate(ULONG flags)
 static void nt_file_object_release(FILE_OBJECT *object)
 {
     if (!object) return;
+    nt_file_locks_release_object(object);
     spin_lock(&g_file_pool_lock);
     object->flags = 0;
     object->osfs_file = NULL;
     spin_unlock(&g_file_pool_lock);
+}
+
+static void nt_object_state_init_once(void)
+{
+    if (__atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE)) return;
+
+    spin_lock(&g_initialize_lock);
+    if (!g_initialized) {
+        handle_table_init(&g_handle_table);
+        nt_memset(g_win32_pipes, 0, sizeof(g_win32_pipes));
+        nt_memset(&g_console_in, 0, sizeof(g_console_in));
+        nt_memset(&g_console_out, 0, sizeof(g_console_out));
+        nt_memset(&g_console_err, 0, sizeof(g_console_err));
+        g_console_in.flags = FILE_OBJ_CONSOLE_IN;
+        g_console_out.flags = FILE_OBJ_CONSOLE_OUT;
+        g_console_err.flags = FILE_OBJ_CONSOLE_ERR;
+
+        HANDLE dummy;
+        (void)handle_alloc_for_process(
+            &g_handle_table, OBJ_TYPE_FILE, GENERIC_READ,
+            &g_console_in, HANDLE_OWNER_SUBSYSTEM, &dummy);
+        (void)handle_alloc_for_process(
+            &g_handle_table, OBJ_TYPE_FILE, GENERIC_WRITE,
+            &g_console_out, HANDLE_OWNER_SUBSYSTEM, &dummy);
+        (void)handle_alloc_for_process(
+            &g_handle_table, OBJ_TYPE_FILE, GENERIC_WRITE,
+            &g_console_err, HANDLE_OWNER_SUBSYSTEM, &dummy);
+
+        __atomic_store_n(&g_initialized, TRUE, __ATOMIC_RELEASE);
+        nt_log("NT object state initialized");
+        nt_log("  console handles: stdin=4, stdout=8, stderr=12");
+    }
+    spin_unlock(&g_initialize_lock);
 }
 
 static void nt_pipe_buf_init(pipe_buf_t *pipe)
@@ -1606,32 +1848,24 @@ static bool nt_path_equal_ci(const char *a, const char *b)
     return *a == *b;
 }
 
-static bool nt_path_contains_ci(const char *path, const char *needle)
+#ifndef NT_FILE_CREATE_TRACE
+#define NT_FILE_CREATE_TRACE 0
+#endif
+
+static bool nt_file_create_trace_take(uint32_t *id)
 {
-    if (!path || !needle || !*needle) return false;
-    for (; *path; path++) {
-        const char *a = path;
-        const char *b = needle;
-        while (*a && *b) {
-            char ca = *a++, cb = *b++;
-            if (ca == '/') ca = '\\';
-            if (cb == '/') cb = '\\';
-            if (ca >= 'A' && ca <= 'Z') ca += 'a' - 'A';
-            if (cb >= 'A' && cb <= 'Z') cb += 'a' - 'A';
-            if (ca != cb) break;
-        }
-        if (!*b) return true;
-    }
+#if NT_FILE_CREATE_TRACE
+    static uint32_t sequence;
+    uint32_t current = __atomic_fetch_add(&sequence, 1, __ATOMIC_RELAXED);
+    if (id) *id = current;
+    return current < 256;
+#else
+    if (id) *id = 0;
     return false;
+#endif
 }
 
-static bool nt_is_cef_cache_path(const char *path)
-{
-    return nt_path_contains_ci(path, "httpcache") ||
-           nt_path_contains_ci(path, "htmlcache");
-}
-
-static void nt_trace_cache_create(uint32_t id, const char *stage,
+static void nt_trace_file_create(uint32_t id, const char *stage,
                                   const char *path, ACCESS_MASK access,
                                   ULONG disposition, ULONG options,
                                   NTSTATUS status, bool existed)
@@ -1646,7 +1880,7 @@ static void nt_trace_cache_create(uint32_t id, const char *stage,
     (void)status;
     (void)existed;
 #else
-    serial_puts("[NT-CACHE-CREATE] id=");
+    serial_puts("[NT-FILE-CREATE] id=");
     serial_putdec(id);
     serial_puts(" stage=");
     serial_puts(stage);
@@ -1689,6 +1923,96 @@ static void nt_log_create_failure(const char *path, NTSTATUS status,
     count++;
 }
 
+static NTSTATUS nt_complete_io(PIO_STATUS_BLOCK iosb, NTSTATUS status,
+                               ULONG_PTR information)
+{
+    if (iosb) {
+        iosb->Status = status;
+        iosb->Information = information;
+    }
+    return status;
+}
+
+static void nt_file_io_lock(FILE_OBJECT *file)
+{
+    while (__atomic_exchange_n(&file->io_lock, 1U, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&file->io_lock, __ATOMIC_RELAXED))
+            __asm__ volatile ("pause");
+    }
+}
+
+static void nt_file_io_unlock(FILE_OBJECT *file)
+{
+    __atomic_store_n(&file->io_lock, 0U, __ATOMIC_RELEASE);
+}
+
+static bool nt_file_is_synchronous(const FILE_OBJECT *file)
+{
+    return (file->create_options &
+            (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)) != 0;
+}
+
+static ULONG nt_file_create_information(bool existed, ULONG disposition)
+{
+    if (!existed) return FILE_CREATED;
+    if (disposition == FILE_SUPERSEDE) return FILE_SUPERSEDED;
+    if (disposition == FILE_OVERWRITE ||
+        disposition == FILE_OVERWRITE_IF)
+        return FILE_OVERWRITTEN;
+    return FILE_OPENED;
+}
+
+static ACCESS_MASK nt_map_file_access(ACCESS_MASK access)
+{
+    ACCESS_MASK mapped = access &
+        ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+    if (access & GENERIC_READ) mapped |= FILE_GENERIC_READ;
+    if (access & GENERIC_WRITE) mapped |= FILE_GENERIC_WRITE;
+    if (access & GENERIC_EXECUTE) mapped |= FILE_GENERIC_EXECUTE;
+    if (access & GENERIC_ALL) {
+        mapped |= DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER |
+                  SYNCHRONIZE | 0x1FFU;
+    }
+    return mapped;
+}
+
+static NTSTATUS nt_file_resolve_offset_locked(FILE_OBJECT *file,
+                                               PLARGE_INTEGER byte_offset,
+                                               bool write,
+                                               uint64_t *offset,
+                                               bool *advance_position)
+{
+    bool synchronous = nt_file_is_synchronous(file);
+    if (!byte_offset) {
+        if (!synchronous || file->position < 0)
+            return STATUS_INVALID_PARAMETER;
+        *offset = (uint64_t)file->position;
+        *advance_position = true;
+        return STATUS_SUCCESS;
+    }
+
+    if (byte_offset->HighPart == -1) {
+        if (byte_offset->LowPart == FILE_USE_FILE_POINTER_POSITION) {
+            if (!synchronous || file->position < 0)
+                return STATUS_INVALID_PARAMETER;
+            *offset = (uint64_t)file->position;
+            *advance_position = true;
+            return STATUS_SUCCESS;
+        }
+        if (write && byte_offset->LowPart == FILE_WRITE_TO_END_OF_FILE) {
+            *offset = (uint64_t)file->size;
+            *advance_position = synchronous;
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if (byte_offset->QuadPart < 0)
+        return STATUS_INVALID_PARAMETER;
+    *offset = (uint64_t)byte_offset->QuadPart;
+    *advance_position = synchronous;
+    return STATUS_SUCCESS;
+}
+
 /* ── NtCreateFile ───────────────────────────────────────────── */
 
 NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
@@ -1705,45 +2029,38 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
     /* PVOID            EaBuffer         = (PVOID)args[9]; */
     /* ULONG            EaLength         = (ULONG)args[10]; */
 
+    if (FileHandle) *FileHandle = NULL;
     if (!FileHandle || !ObjectAttributes || !ObjectAttributes->ObjectName)
-        return STATUS_INVALID_PARAMETER;
+        return nt_complete_io(IoStatusBlock, STATUS_INVALID_PARAMETER, 0);
+
+    DesiredAccess = nt_map_file_access(DesiredAccess);
+    ULONG synchronous_options = CreateOptions &
+        (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT);
+    if (CreateDisposition > FILE_OVERWRITE_IF ||
+        synchronous_options ==
+            (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT) ||
+        (synchronous_options && !(DesiredAccess & SYNCHRONIZE)) ||
+        ((CreateOptions & FILE_DIRECTORY_FILE) &&
+         (CreateOptions & FILE_NON_DIRECTORY_FILE)) ||
+        ((CreateOptions & FILE_DIRECTORY_FILE) &&
+         CreateDisposition != FILE_CREATE &&
+         CreateDisposition != FILE_OPEN &&
+         CreateDisposition != FILE_OPEN_IF)) {
+        return nt_complete_io(IoStatusBlock, STATUS_INVALID_PARAMETER, 0);
+    }
 
     char path_buf[260];
     NTSTATUS path_status = nt_resolve_object_path(ObjectAttributes, path_buf);
     if (!NT_SUCCESS(path_status)) {
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = path_status;
-            IoStatusBlock->Information = 0;
-        }
-        return path_status;
+        return nt_complete_io(IoStatusBlock, path_status, 0);
     }
     const char *path = path_buf;
 
-    static uint32_t cache_create_sequence;
-    static uint32_t cache_create_new_sequence;
-    uint32_t cache_create_id = 0;
-    bool trace_cache = nt_is_cef_cache_path(path);
-    if (trace_cache) {
-        cache_create_id = __atomic_fetch_add(&cache_create_sequence, 1,
-                                              __ATOMIC_RELAXED);
-        trace_cache = cache_create_id < 256;
-        if (!trace_cache && CreateDisposition == FILE_CREATE) {
-            uint32_t create_new_id = __atomic_fetch_add(
-                &cache_create_new_sequence, 1, __ATOMIC_RELAXED);
-            trace_cache = create_new_id < 128;
-            cache_create_id = 100000U + create_new_id;
-        }
-    }
-
-    static uint32_t rebuild_create_logs;
-    bool trace_rebuild = nt_path_contains_ci(path, "__tmp_for_rebuild");
-    if (trace_rebuild) {
-        uint32_t index = __atomic_fetch_add(&rebuild_create_logs, 1,
-                                             __ATOMIC_RELAXED);
-        trace_rebuild = index < 128;
-    }
-    if (trace_rebuild) {
-        serial_puts("[NT-REBUILD] create '");
+    uint32_t create_trace_id = 0;
+    bool trace_create = nt_file_create_trace_take(&create_trace_id);
+    bool trace_detail = trace_create;
+    if (trace_detail) {
+        serial_puts("[NT-FILE-CREATE] create '");
         serial_puts(path);
         serial_puts("' access=0x");
         serial_puthex(DesiredAccess, 8);
@@ -1754,7 +2071,7 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
         serial_puts("\n");
     }
 
-#ifndef OK_QUIET
+#if NT_FILE_CREATE_TRACE
     serial_puts("[NT] NtCreateFile: '");
     serial_puts(path);
     serial_puts("' buf=0x");
@@ -1771,22 +2088,18 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
     serial_puts("\n");
 #endif
 
-    /* For BMP files that don't exist in OsitoFS, provide a minimal 1x1 BMP
-     * so that Bitmap.LoadFile() assertions pass. The engine requires a valid
-     * BMP for the splash screen — returning NOT_FOUND triggers a fatal assert. */
-
     /* Try to find/create in OsitoFS (case-insensitive for Win32). */
     void *osfs_file = osfs2_find_ci(path);
     bool existed_before = osfs_file != NULL;
-    if (trace_cache)
-        nt_trace_cache_create(cache_create_id, "lookup", path, DesiredAccess,
+    if (trace_create)
+        nt_trace_file_create(create_trace_id, "lookup", path, DesiredAccess,
                               CreateDisposition, CreateOptions,
                               STATUS_SUCCESS, existed_before);
 
     if (CreateOptions & FILE_DIRECTORY_FILE) {
         bool existed = win32_directory_exists_normalized(path);
-        if (trace_rebuild) {
-            serial_puts("[NT-REBUILD] directory existed=");
+        if (trace_detail) {
+            serial_puts("[NT-FILE-CREATE] directory existed=");
             serial_putdec(existed);
             serial_puts(" file_collision=");
             serial_putdec(osfs_file != NULL);
@@ -1800,8 +2113,8 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
             nt_log_create_failure(path, STATUS_OBJECT_NAME_COLLISION,
                                   CreateDisposition, CreateOptions,
                                   ObjectAttributes->RootDirectory);
-            if (trace_cache)
-                nt_trace_cache_create(cache_create_id, "dir-collision", path,
+            if (trace_create)
+                nt_trace_file_create(create_trace_id, "dir-collision", path,
                                       DesiredAccess, CreateDisposition,
                                       CreateOptions,
                                       STATUS_OBJECT_NAME_COLLISION, existed);
@@ -1817,16 +2130,16 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
                 nt_log_create_failure(path, STATUS_OBJECT_NAME_NOT_FOUND,
                                       CreateDisposition, CreateOptions,
                                       ObjectAttributes->RootDirectory);
-                if (trace_cache)
-                    nt_trace_cache_create(cache_create_id, "dir-missing", path,
+                if (trace_create)
+                    nt_trace_file_create(create_trace_id, "dir-missing", path,
                                           DesiredAccess, CreateDisposition,
                                           CreateOptions,
                                           STATUS_OBJECT_NAME_NOT_FOUND, false);
                 return STATUS_OBJECT_NAME_NOT_FOUND;
             }
             DWORD error = win32_directory_create_normalized(path);
-            if (trace_rebuild) {
-                serial_puts("[NT-REBUILD] mkdir error=");
+            if (trace_detail) {
+                serial_puts("[NT-FILE-CREATE] mkdir error=");
                 serial_putdec(error);
                 serial_puts(" exists_after=");
                 serial_putdec(win32_directory_exists_normalized(path));
@@ -1845,8 +2158,8 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
                 nt_log_create_failure(path, create_status, CreateDisposition,
                                       CreateOptions,
                                       ObjectAttributes->RootDirectory);
-                if (trace_cache)
-                    nt_trace_cache_create(cache_create_id, "mkdir-failed", path,
+                if (trace_create)
+                    nt_trace_file_create(create_trace_id, "mkdir-failed", path,
                                           DesiredAccess, CreateDisposition,
                                           CreateOptions, create_status, false);
                 return create_status;
@@ -1855,13 +2168,15 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
 
         FILE_OBJECT *directory = nt_file_object_allocate(FILE_OBJ_DIRECTORY);
         if (!directory) {
-            if (trace_cache)
-                nt_trace_cache_create(cache_create_id, "dir-pool", path,
+            if (trace_create)
+                nt_trace_file_create(create_trace_id, "dir-pool", path,
                                       DesiredAccess, CreateDisposition,
                                       CreateOptions,
                                       STATUS_INSUFFICIENT_RESOURCES, existed);
-            return STATUS_INSUFFICIENT_RESOURCES;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INSUFFICIENT_RESOURCES, 0);
         }
+        directory->create_options = CreateOptions;
         int name_length = 0;
         while (path[name_length] && name_length < 259) {
             directory->name[name_length] =
@@ -1869,38 +2184,40 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
             name_length++;
         }
         directory->name[name_length] = 0;
+        if (osfs3_is_mounted()) {
+            uint32_t ino = osfs3_resolve_path_ci(path);
+            directory->osfs_file = osfs3_get_node((int)ino);
+        }
 
         NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_FILE,
                                        DesiredAccess, directory, FileHandle);
         if (!NT_SUCCESS(status)) {
             nt_file_object_release(directory);
-            if (trace_cache)
-                nt_trace_cache_create(cache_create_id, "dir-handle", path,
+            if (trace_create)
+                nt_trace_file_create(create_trace_id, "dir-handle", path,
                                       DesiredAccess, CreateDisposition,
                                       CreateOptions, status, existed);
-            return status;
+            return nt_complete_io(IoStatusBlock, status, 0);
         }
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = existed ? 1 /* FILE_OPENED */
-                                                  : 2 /* FILE_CREATED */;
-        }
-        if (trace_rebuild) {
-            serial_puts("[NT-REBUILD] directory success handle=0x");
+        ULONG create_information = nt_file_create_information(
+            existed, CreateDisposition);
+        nt_complete_io(IoStatusBlock, STATUS_SUCCESS, create_information);
+        if (trace_detail) {
+            serial_puts("[NT-FILE-CREATE] directory success handle=0x");
             serial_puthex((uint64_t)(ULONG_PTR)*FileHandle, 8);
             serial_puts(" info=");
-            serial_putdec(existed ? 1 : 2);
+            serial_putdec(create_information);
             serial_puts("\n");
         }
-        if (trace_cache)
-            nt_trace_cache_create(cache_create_id, "dir-success", path,
+        if (trace_create)
+            nt_trace_file_create(create_trace_id, "dir-success", path,
                                   DesiredAccess, CreateDisposition,
                                   CreateOptions, STATUS_SUCCESS, existed);
         return STATUS_SUCCESS;
     }
 
-    if (trace_rebuild) {
-        serial_puts("[NT-REBUILD] regular existed=");
+    if (trace_detail) {
+        serial_puts("[NT-FILE-CREATE] regular existed=");
         serial_putdec(osfs_file != NULL);
         serial_puts("\n");
     }
@@ -1920,8 +2237,8 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
             IoStatusBlock->Status = STATUS_OBJECT_NAME_COLLISION;
             IoStatusBlock->Information = 0;
         }
-        if (trace_cache)
-            nt_trace_cache_create(cache_create_id, "file-collision", path,
+        if (trace_create)
+            nt_trace_file_create(create_trace_id, "file-collision", path,
                                   DesiredAccess, CreateDisposition,
                                   CreateOptions, STATUS_OBJECT_NAME_COLLISION,
                                   true);
@@ -1933,8 +2250,8 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
                        CreateDisposition == FILE_OVERWRITE_IF ||
                        CreateDisposition == FILE_SUPERSEDE)) {
         osfs_file = osfs2_create(path, 0);
-        if (trace_cache)
-            nt_trace_cache_create(cache_create_id,
+        if (trace_create)
+            nt_trace_file_create(create_trace_id,
                                   osfs_file ? "fs-create-ok" : "fs-create-null",
                                   path, DesiredAccess, CreateDisposition,
                                   CreateOptions,
@@ -1945,46 +2262,11 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
                              CreateDisposition == FILE_OVERWRITE_IF ||
                              CreateDisposition == FILE_SUPERSEDE)) {
         if (osfs2_truncate(osfs_file, 0) < 0) {
-            if (trace_cache)
-                nt_trace_cache_create(cache_create_id, "truncate-failed", path,
+            if (trace_create)
+                nt_trace_file_create(create_trace_id, "truncate-failed", path,
                                       DesiredAccess, CreateDisposition,
                                       CreateOptions, STATUS_UNSUCCESSFUL, true);
-            return STATUS_UNSUCCESSFUL;
-        }
-    }
-
-    if (!osfs_file) {
-        /* Check if this is a BMP file — provide minimal 1x1 BMP to avoid
-         * fatal assertion in Bitmap.LoadFile(). The engine asserts on
-         * missing splash/logo BMPs with no recovery path. */
-        int is_bmp = 0;
-        for (const char *p = path; *p; p++) {
-            if (p[0] == '.' && (p[1] == 'b' || p[1] == 'B') &&
-                (p[2] == 'm' || p[2] == 'M') && (p[3] == 'p' || p[3] == 'P') &&
-                p[4] == '\0') {
-                is_bmp = 1;
-                break;
-            }
-        }
-        if (is_bmp) {
-            serial_puts("[NT] BMP fallback: creating minimal ");
-            serial_puts(path);
-            serial_puts("\n");
-            osfs_file = osfs2_create(path, 0);
-            if (osfs_file) {
-                /* Write a valid 1x1 24-bit BMP (58 bytes) */
-                static const uint8_t bmp_1x1[] = {
-                    0x42, 0x4D, 0x3A, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x28, 0x00,
-                    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
-                    0x00, 0x00, 0x01, 0x00, 0x18, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00,
-                };
-                osfs2_write(osfs_file, 0, bmp_1x1, sizeof(bmp_1x1));
-            }
+            return nt_complete_io(IoStatusBlock, STATUS_UNSUCCESSFUL, 0);
         }
     }
 
@@ -1996,8 +2278,8 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;
         }
-        if (trace_cache)
-            nt_trace_cache_create(cache_create_id, "file-missing", path,
+        if (trace_create)
+            nt_trace_file_create(create_trace_id, "file-missing", path,
                                   DesiredAccess, CreateDisposition,
                                   CreateOptions, STATUS_OBJECT_NAME_NOT_FOUND,
                                   existed_before);
@@ -2007,19 +2289,19 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
     /* Create file object. The pool is reused: a free slot has flags==0 (an
      * in-use object always has FILE_OBJ_DISK_FILE set); NtClose returns the slot
      * by zeroing flags. Previously this was a monotonic bump allocator that never
-     * freed, so after 64 opens NtCreateFile failed for everything — which is why
-     * UT99 opened Entry.unr fine early but got "Can't find file" at LoadMap once
-     * the 64 slots were exhausted (64 opens / 5 closes). */
+     * freed, so after 64 opens NtCreateFile failed for every caller. */
     FILE_OBJECT *fobj = nt_file_object_allocate(FILE_OBJ_DISK_FILE);
     if (!fobj) {
-        if (trace_cache)
-            nt_trace_cache_create(cache_create_id, "file-pool", path,
+        if (trace_create)
+            nt_trace_file_create(create_trace_id, "file-pool", path,
                                   DesiredAccess, CreateDisposition,
                                   CreateOptions, STATUS_INSUFFICIENT_RESOURCES,
                                   existed_before);
-        return STATUS_INSUFFICIENT_RESOURCES;
+        return nt_complete_io(IoStatusBlock,
+                              STATUS_INSUFFICIENT_RESOURCES, 0);
     }
 
+    fobj->create_options = CreateOptions;
     fobj->osfs_file = osfs_file;
     fobj->position  = 0;
     fobj->size      = osfs2_file_size(osfs_file);
@@ -2035,32 +2317,31 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
                                    DesiredAccess, fobj, FileHandle);
     if (!NT_SUCCESS(status)) {
         nt_file_object_release(fobj);
-        if (trace_cache)
-            nt_trace_cache_create(cache_create_id, "file-handle", path,
+        if (trace_create)
+            nt_trace_file_create(create_trace_id, "file-handle", path,
                                   DesiredAccess, CreateDisposition,
                                   CreateOptions, status, existed_before);
-        return status;
+        return nt_complete_io(IoStatusBlock, status, 0);
     }
 
-    if (IoStatusBlock) {
-        IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = (osfs_file ? 1 /* FILE_OPENED */ : 2 /* FILE_CREATED */);
-    }
+    ULONG create_information = nt_file_create_information(
+        existed_before, CreateDisposition);
+    nt_complete_io(IoStatusBlock, STATUS_SUCCESS, create_information);
 
-    if (trace_rebuild) {
-        serial_puts("[NT-REBUILD] regular success handle=0x");
+    if (trace_detail) {
+        serial_puts("[NT-FILE-CREATE] regular success handle=0x");
         serial_puthex((uint64_t)(ULONG_PTR)*FileHandle, 8);
         serial_puts(" size=");
         serial_putdec(fobj->size);
         serial_puts("\n");
     }
 
-    if (trace_cache)
-        nt_trace_cache_create(cache_create_id, "file-success", path,
+    if (trace_create)
+        nt_trace_file_create(create_trace_id, "file-success", path,
                               DesiredAccess, CreateDisposition, CreateOptions,
                               STATUS_SUCCESS, existed_before);
 
-#ifndef OK_QUIET
+#if NT_FILE_CREATE_TRACE
     nt_log_hex("NtCreateFile: handle = ", (ULONGLONG)*FileHandle);
 #endif
     return STATUS_SUCCESS;
@@ -2084,15 +2365,12 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
     NTSTATUS status = handle_lookup(&g_handle_table, FileHandle,
                                     OBJ_TYPE_FILE, (PVOID *)&fobj);
     if (!NT_SUCCESS(status))
-        return status;
+        return nt_complete_io(IoStatusBlock, status, 0);
 
-    if (!Buffer || Length == 0) {
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = 0;
-        }
-        return STATUS_SUCCESS;
-    }
+    if (Length == 0)
+        return nt_complete_io(IoStatusBlock, STATUS_SUCCESS, 0);
+    if (!Buffer)
+        return nt_complete_io(IoStatusBlock, STATUS_ACCESS_VIOLATION, 0);
 
     /* Console input */
     if (fobj->flags & FILE_OBJ_CONSOLE_IN) {
@@ -2107,42 +2385,45 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
     if (fobj->flags & FILE_OBJ_PIPE_READ)
         return nt_pipe_read(fobj, Buffer, Length, IoStatusBlock);
 
-    /* Disk file */
-    LONGLONG offset = ByteOffset ? ByteOffset->QuadPart : fobj->position;
+    if (!(fobj->flags & FILE_OBJ_DISK_FILE) || !fobj->osfs_file)
+        return nt_complete_io(IoStatusBlock,
+                              STATUS_INVALID_DEVICE_REQUEST, 0);
 
-    if (offset >= fobj->size) {
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_END_OF_FILE;
-            IoStatusBlock->Information = 0;
-        }
-        return STATUS_END_OF_FILE;
+    nt_file_io_lock(fobj);
+    uint64_t file_size = osfs2_file_size(fobj->osfs_file);
+    if (file_size > 0x7FFFFFFFFFFFFFFFULL) {
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, STATUS_INVALID_PARAMETER, 0);
+    }
+    fobj->size = (LONGLONG)file_size;
+
+    uint64_t offset = 0;
+    bool advance_position = false;
+    status = nt_file_resolve_offset_locked(fobj, ByteOffset, false,
+                                           &offset, &advance_position);
+    if (!NT_SUCCESS(status)) {
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, status, 0);
+    }
+
+    if (offset >= file_size) {
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, STATUS_END_OF_FILE, 0);
     }
 
     ULONG to_read = Length;
-    if (offset + to_read > (ULONGLONG)fobj->size)
-        to_read = (ULONG)(fobj->size - offset);
+    if ((uint64_t)to_read > file_size - offset)
+        to_read = (ULONG)(file_size - offset);
 
-#if !defined(OK_QUIET) || !OK_QUIET
-    static uint32_t read_trace_count;
-    uint32_t read_trace_seq = __atomic_fetch_add(&read_trace_count, 1,
-                                                  __ATOMIC_RELAXED);
-    BOOL trace_read = read_trace_seq < 64;
-    if (trace_read) {
-        serial_puts("[NtReadFile] h=0x");
-        serial_puthex((uint64_t)FileHandle, 4);
-        serial_puts(" buf=0x");
-        serial_puthex((uint64_t)Buffer, 8);
-        serial_puts(" len=");
-        serial_puthex(to_read, 4);
-        serial_puts(" off=");
-        serial_puthex(offset, 8);
-        serial_puts(" fsz=");
-        serial_puthex(fobj->size, 8);
-        serial_puts("\n");
-    } else if (read_trace_seq == 64) {
-        serial_puts("[NtReadFile] repetitive success tracing suppressed\n");
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    NT_FILE_IO_GUARD io_guard;
+    status = nt_file_io_guard_begin(fobj, owner_pid, offset, to_read,
+                                    FALSE, &io_guard);
+    if (!NT_SUCCESS(status)) {
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, status, 0);
     }
-#endif
 
     /*
      * Buffered I/O: read into a kernel-allocated temp buffer, then copy
@@ -2155,66 +2436,30 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
      * from any CR3) and then copying to the user VA (accessible under
      * the current Win32 CR3), we guarantee correct data delivery.
      */
-    extern void *kmalloc(uint64_t size);
-    extern void kfree(void *ptr);
     void *sys_buf = kmalloc(to_read);
-    int result;
-    if (sys_buf) {
-        result = osfs2_read(fobj->osfs_file, (uint64_t)offset, sys_buf, to_read);
-        if (result >= 0) {
-            /* Debug: check if sys_buf has data */
-            uint8_t *sb = (uint8_t *)sys_buf;
-            if (to_read <= 8192 && offset == 0 && sb[0] == 0 && sb[1] == 0) {
-                serial_puts("[NtReadFile] SYS_BUF ZERO! buf=0x");
-                serial_puthex((uint64_t)sys_buf, 16);
-                serial_puts("\n");
-            }
-            /* Copy directly to user buffer. Use volatile to prevent
-             * the compiler from optimizing away the copy. */
-            volatile uint8_t *dst = (volatile uint8_t *)Buffer;
-            uint8_t *src = (uint8_t *)sys_buf;
-            for (ULONG i = 0; i < to_read; i++)
-                dst[i] = src[i];
-        }
-        kfree(sys_buf);
-    } else {
-        /* Fallback: direct read (may fail for VirtualAlloc buffers) */
-        result = osfs2_read(fobj->osfs_file, (uint64_t)offset, Buffer, to_read);
+    if (!sys_buf) {
+        nt_file_io_guard_end(&io_guard);
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock,
+                              STATUS_INSUFFICIENT_RESOURCES, 0);
     }
 
-#if !defined(OK_QUIET) || !OK_QUIET
-    if (trace_read) {
-        serial_puts("[NtReadFile] result=");
-        serial_puthex((uint64_t)(int64_t)result, 8);
-        serial_puts("\n");
+    int result = osfs2_read(fobj->osfs_file, offset, sys_buf, to_read);
+    if (result == (int)to_read) {
+        volatile uint8_t *dst = (volatile uint8_t *)Buffer;
+        const uint8_t *src = (const uint8_t *)sys_buf;
+        for (ULONG i = 0; i < to_read; i++)
+            dst[i] = src[i];
     }
-#endif
+    kfree(sys_buf);
 
-#ifndef OK_QUIET
-    /* Dump first 16 bytes as hex for localization debugging */
-    if (result > 0 && result <= 8192 && offset == 0) {
-        serial_puts("[NtReadFile] hex: ");
-        const uint8_t *d = (const uint8_t *)Buffer;
-        int dlen = result < 16 ? result : 16;
-        for (int di = 0; di < dlen; di++) {
-            serial_puthex(d[di], 2);
-            serial_puts(" ");
-        }
-        serial_puts("= \"");
-        for (int di = 0; di < dlen; di++) {
-            char c = d[di];
-            if (c >= 32 && c < 127) {
-                char buf[2] = { c, 0 };
-                serial_puts(buf);
-            } else {
-                serial_puts(".");
-            }
-        }
-        serial_puts("\"\n");
-    }
-#endif
-
-    if (result < 0) {
+    if (result != (int)to_read) {
+        nt_file_io_guard_end(&io_guard);
+        nt_file_io_unlock(fobj);
+        static uint32_t read_failure_logs;
+        uint32_t log_index = __atomic_fetch_add(&read_failure_logs, 1,
+                                                 __ATOMIC_RELAXED);
+        if (log_index < 32) {
         serial_puts("[NtReadFile] read failed: h=0x");
         serial_puthex((uint64_t)FileHandle, 4);
         serial_puts(" off=0x");
@@ -2224,18 +2469,15 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
         serial_puts(" result=0x");
         serial_puthex((uint64_t)(int64_t)result, 16);
         serial_puts("\n");
-        return STATUS_UNSUCCESSFUL;
+        }
+        return nt_complete_io(IoStatusBlock, STATUS_UNSUCCESSFUL, 0);
     }
 
-    if (!ByteOffset)
-        fobj->position = offset + to_read;
-
-    if (IoStatusBlock) {
-        IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = to_read;
-    }
-
-    return STATUS_SUCCESS;
+    if (advance_position)
+        fobj->position = (LONGLONG)(offset + to_read);
+    nt_file_io_guard_end(&io_guard);
+    nt_file_io_unlock(fobj);
+    return nt_complete_io(IoStatusBlock, STATUS_SUCCESS, to_read);
 }
 
 /* ── NtWriteFile ────────────────────────────────────────────── */
@@ -2256,15 +2498,12 @@ NTSTATUS sys_NtWriteFile(ULONG_PTR *args)
     NTSTATUS status = handle_lookup(&g_handle_table, FileHandle,
                                     OBJ_TYPE_FILE, (PVOID *)&fobj);
     if (!NT_SUCCESS(status))
-        return status;
+        return nt_complete_io(IoStatusBlock, status, 0);
 
-    if (!Buffer || Length == 0) {
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = 0;
-        }
-        return STATUS_SUCCESS;
-    }
+    if (Length == 0)
+        return nt_complete_io(IoStatusBlock, STATUS_SUCCESS, 0);
+    if (!Buffer)
+        return nt_complete_io(IoStatusBlock, STATUS_ACCESS_VIOLATION, 0);
 
     /* Console output */
     if (fobj->flags & (FILE_OBJ_CONSOLE_OUT | FILE_OBJ_CONSOLE_ERR)) {
@@ -2283,12 +2522,68 @@ NTSTATUS sys_NtWriteFile(ULONG_PTR *args)
     if (fobj->flags & FILE_OBJ_PIPE_WRITE)
         return nt_pipe_write(fobj, Buffer, Length, IoStatusBlock);
 
-    LONGLONG offset = ByteOffset ? ByteOffset->QuadPart : fobj->position;
-    if (offset < 0)
-        return STATUS_INVALID_PARAMETER;
+    if (!(fobj->flags & FILE_OBJ_DISK_FILE) || !fobj->osfs_file)
+        return nt_complete_io(IoStatusBlock,
+                              STATUS_INVALID_DEVICE_REQUEST, 0);
 
-    int result = osfs2_write(fobj->osfs_file, (uint64_t)offset, Buffer, Length);
+    nt_file_io_lock(fobj);
+    uint64_t file_size = osfs2_file_size(fobj->osfs_file);
+    if (file_size > 0x7FFFFFFFFFFFFFFFULL) {
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, STATUS_INVALID_PARAMETER, 0);
+    }
+    fobj->size = (LONGLONG)file_size;
+
+    uint64_t offset = 0;
+    bool advance_position = false;
+    status = nt_file_resolve_offset_locked(fobj, ByteOffset, true,
+                                           &offset, &advance_position);
+    if (!NT_SUCCESS(status) ||
+        offset > 0x7FFFFFFFFFFFFFFFULL - (uint64_t)Length) {
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock,
+                              NT_SUCCESS(status) ? STATUS_INVALID_PARAMETER
+                                                 : status,
+                              0);
+    }
+
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    NT_FILE_IO_GUARD io_guard;
+    status = nt_file_io_guard_begin(fobj, owner_pid, offset, Length,
+                                    TRUE, &io_guard);
+    if (!NT_SUCCESS(status)) {
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, status, 0);
+    }
+
+    void *sys_buf = kmalloc(Length);
+    if (!sys_buf) {
+        nt_file_io_guard_end(&io_guard);
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock,
+                              STATUS_INSUFFICIENT_RESOURCES, 0);
+    }
+    uint8_t *dst = (uint8_t *)sys_buf;
+    const volatile uint8_t *src = (const volatile uint8_t *)Buffer;
+    for (ULONG i = 0; i < Length; i++)
+        dst[i] = src[i];
+
+    uint32_t io_flags = 0;
+    if (fobj->suppress_write_time)
+        io_flags |= OSFS_IO_PRESERVE_MTIME;
+    if (fobj->suppress_change_time)
+        io_flags |= OSFS_IO_PRESERVE_CTIME;
+    int result = osfs2_write_ex(fobj->osfs_file, offset, sys_buf, Length,
+                                io_flags);
+    kfree(sys_buf);
     if (result < 0) {
+        nt_file_io_guard_end(&io_guard);
+        nt_file_io_unlock(fobj);
+        static uint32_t write_failure_logs;
+        uint32_t log_index = __atomic_fetch_add(&write_failure_logs, 1,
+                                                 __ATOMIC_RELAXED);
+        if (log_index < 32) {
         serial_puts("[NtWriteFile] failed h=0x");
         serial_puthex((uint64_t)FileHandle, 8);
         serial_puts(" fobj=0x");
@@ -2304,26 +2599,25 @@ NTSTATUS sys_NtWriteFile(ULONG_PTR *args)
         serial_puts(" size=0x");
         serial_puthex((uint64_t)fobj->size, 16);
         serial_puts("\n");
-        return STATUS_UNSUCCESSFUL;
+        }
+        return nt_complete_io(IoStatusBlock, STATUS_UNSUCCESSFUL, 0);
     }
 
-    LONGLONG end = offset + Length;
-    if (!ByteOffset)
-        fobj->position = end;
-    if (end > fobj->size)
-        fobj->size = end;
-
-    if (IoStatusBlock) {
-        IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = Length;
-    }
-
-    return STATUS_SUCCESS;
+    uint64_t end = offset + Length;
+    if (advance_position)
+        fobj->position = (LONGLONG)end;
+    if (end > file_size)
+        fobj->size = (LONGLONG)end;
+    nt_file_io_guard_end(&io_guard);
+    nt_file_io_unlock(fobj);
+    return nt_complete_io(IoStatusBlock, STATUS_SUCCESS, Length);
 }
 
 /* ── NtClose ────────────────────────────────────────────────── */
 
-NTSTATUS nt_close_handle_for_process(HANDLE Handle, ULONG owner_pid)
+static NTSTATUS nt_close_handle_for_process_internal(HANDLE Handle,
+                                                     ULONG owner_pid,
+                                                     BOOL force)
 {
     /* Don't close console handles */
     if (Handle == STD_INPUT_HANDLE_VALUE ||
@@ -2332,11 +2626,32 @@ NTSTATUS nt_close_handle_for_process(HANDLE Handle, ULONG owner_pid)
         return STATUS_SUCCESS;
     }
 
+    if (!force) {
+        ULONG handle_flags = 0;
+        NTSTATUS flag_status = handle_query_flags_for_process(
+            &g_handle_table, Handle, owner_pid, &handle_flags);
+        if (!NT_SUCCESS(flag_status))
+            return flag_status;
+        if (handle_flags & HANDLE_USER_FLAG_PROTECT_FROM_CLOSE)
+            return STATUS_HANDLE_NOT_CLOSABLE;
+    }
+
     HANDLE_ENTRY closed;
     NTSTATUS status = handle_close_entry_for_process(
         &g_handle_table, Handle, owner_pid, &closed);
-    if (!NT_SUCCESS(status) || !closed.object ||
-        handle_object_referenced(&g_handle_table, closed.type, closed.object))
+    if (!NT_SUCCESS(status) || !closed.object)
+        return status;
+
+    if (closed.type == OBJ_TYPE_FILE)
+        (void)nt_file_lock_cancel(Handle, owner_pid, 0, NULL, FALSE);
+
+    if (closed.type == OBJ_TYPE_FILE &&
+        !handle_object_referenced_for_process(
+            &g_handle_table, OBJ_TYPE_FILE, closed.object, owner_pid)) {
+        nt_file_locks_release_owner((PFILE_OBJECT)closed.object, owner_pid);
+    }
+
+    if (handle_object_referenced(&g_handle_table, closed.type, closed.object))
         return status;
 
     /* Return the FILE_OBJECT pool slot so NtCreateFile can reuse it (zeroing
@@ -2367,6 +2682,16 @@ NTSTATUS nt_close_handle_for_process(HANDLE Handle, ULONG owner_pid)
     return STATUS_SUCCESS;
 }
 
+NTSTATUS nt_close_handle_for_process(HANDLE Handle, ULONG owner_pid)
+{
+    return nt_close_handle_for_process_internal(Handle, owner_pid, FALSE);
+}
+
+NTSTATUS nt_force_close_handle_for_process(HANDLE Handle, ULONG owner_pid)
+{
+    return nt_close_handle_for_process_internal(Handle, owner_pid, TRUE);
+}
+
 NTSTATUS sys_NtClose(ULONG_PTR *args)
 {
     extern DWORD win32_current_process_id(void);
@@ -2377,7 +2702,7 @@ NTSTATUS sys_NtClose(ULONG_PTR *args)
 
 /* ── NtAllocateVirtualMemory ────────────────────────────────── */
 
-NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
+static NTSTATUS nt_allocate_virtual_memory(ULONG_PTR *args, int compat32)
 {
     /* HANDLE   ProcessHandle = (HANDLE)args[0]; */
     PVOID   *BaseAddress   = (PVOID *)args[1];
@@ -2457,7 +2782,7 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
         }
 
         addr = win32_va_alloc(size, &phys, Protect, requested_va,
-                              !want_commit, g_compat32_mode);
+                              !want_commit, compat32);
         if (!addr) {
             vm_track_unlock_irqrestore(vm_irq_flags);
             return requested_va ? STATUS_CONFLICTING_ADDRESSES
@@ -2477,7 +2802,7 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
             vm_track_unlock_irqrestore(vm_irq_flags);
             return STATUS_NO_MEMORY;
         }
-        vm_advance_auto_next_locked(owner_pid, g_compat32_mode,
+        vm_advance_auto_next_locked(owner_pid, compat32,
                                     (uint64_t)addr, size);
     } else {
         if (!requested_va ||
@@ -2504,6 +2829,28 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
 #endif
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
+{
+    return nt_allocate_virtual_memory(args, g_compat32_mode);
+}
+
+NTSTATUS nt_vm_allocate_compat32(PVOID *base_address, SIZE_T *region_size,
+                                 ULONG allocation_type, ULONG protect)
+{
+    if (!base_address || !region_size)
+        return STATUS_INVALID_PARAMETER;
+
+    ULONG_PTR args[6] = {
+        (ULONG_PTR)NT_CURRENT_PROCESS,
+        (ULONG_PTR)base_address,
+        0,
+        (ULONG_PTR)region_size,
+        allocation_type,
+        protect,
+    };
+    return nt_allocate_virtual_memory(args, TRUE);
 }
 
 /* ── NtFreeVirtualMemory ────────────────────────────────────── */
@@ -2631,8 +2978,8 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
     return STATUS_SUCCESS;
 }
 
-NTSTATUS nt_vm_free_stack_for_process(ULONG owner_pid,
-                                      PVOID allocation_base)
+NTSTATUS nt_vm_release_allocation_for_process(ULONG owner_pid,
+                                              PVOID allocation_base)
 {
     if (!owner_pid || !allocation_base ||
         ((uint64_t)(ULONG_PTR)allocation_base & 0xFFFULL))
@@ -2643,6 +2990,12 @@ NTSTATUS nt_vm_free_stack_for_process(ULONG owner_pid,
         owner_pid, (uint64_t)(ULONG_PTR)allocation_base, NULL);
     vm_track_unlock_irqrestore(vm_irq_flags);
     return status;
+}
+
+NTSTATUS nt_vm_free_stack_for_process(ULONG owner_pid,
+                                      PVOID allocation_base)
+{
+    return nt_vm_release_allocation_for_process(owner_pid, allocation_base);
 }
 
 NTSTATUS nt_vm_free_stack(PVOID allocation_base)
@@ -2699,6 +3052,21 @@ NTSTATUS nt_vm_allocate_stack(SIZE_T reserve_size, PVOID *allocation_base,
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS nt_file_require_access(HANDLE handle, ACCESS_MASK required)
+{
+    HANDLE_OBJECT_SNAPSHOT snapshot;
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+
+    NTSTATUS status = handle_snapshot_for_process(
+        &g_handle_table, handle, owner_pid, &snapshot);
+    if (!NT_SUCCESS(status) || snapshot.type != OBJ_TYPE_FILE)
+        return STATUS_INVALID_HANDLE;
+    if ((snapshot.access & required) != required)
+        return STATUS_ACCESS_DENIED;
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS sys_NtQueryInformationFile(ULONG_PTR *args)
 {
     HANDLE              FileHandle       = (HANDLE)args[0];
@@ -2711,64 +3079,119 @@ NTSTATUS sys_NtQueryInformationFile(ULONG_PTR *args)
     NTSTATUS status = handle_lookup(&g_handle_table, FileHandle,
                                     OBJ_TYPE_FILE, (PVOID *)&fobj);
     if (!NT_SUCCESS(status))
-        return status;
+        return nt_complete_io(IoStatusBlock, status, 0);
 
     switch (InfoClass) {
     case FileStandardInformation: {
+        if (!FileInformation)
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_ACCESS_VIOLATION, 0);
         if (Length < sizeof(FILE_STANDARD_INFORMATION))
-            return STATUS_INFO_LENGTH_MISMATCH;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INFO_LENGTH_MISMATCH, 0);
         FILE_STANDARD_INFORMATION *info = (FILE_STANDARD_INFORMATION *)FileInformation;
+        nt_file_io_lock(fobj);
+        if ((fobj->flags & FILE_OBJ_DISK_FILE) && fobj->osfs_file)
+            fobj->size = (LONGLONG)osfs2_file_size(fobj->osfs_file);
         info->EndOfFile.QuadPart    = fobj->size;
         info->AllocationSize.QuadPart = (fobj->size + 4095) & ~4095LL;
         info->NumberOfLinks = 1;
         info->DeletePending = FALSE;
         info->Directory     = (fobj->flags & FILE_OBJ_DIRECTORY) != 0;
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = sizeof(FILE_STANDARD_INFORMATION);
-        }
-        return STATUS_SUCCESS;
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, STATUS_SUCCESS,
+                              sizeof(FILE_STANDARD_INFORMATION));
     }
 
     case FilePositionInformation: {
+        if (!FileInformation)
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_ACCESS_VIOLATION, 0);
         if (Length < sizeof(FILE_POSITION_INFORMATION))
-            return STATUS_INFO_LENGTH_MISMATCH;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INFO_LENGTH_MISMATCH, 0);
         FILE_POSITION_INFORMATION *info = (FILE_POSITION_INFORMATION *)FileInformation;
+        nt_file_io_lock(fobj);
         info->CurrentByteOffset.QuadPart = fobj->position;
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = sizeof(FILE_POSITION_INFORMATION);
-        }
-        return STATUS_SUCCESS;
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, STATUS_SUCCESS,
+                              sizeof(FILE_POSITION_INFORMATION));
     }
 
     case FileBasicInformation: {
+        if (!FileInformation)
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_ACCESS_VIOLATION, 0);
         if (Length < sizeof(FILE_BASIC_INFORMATION))
-            return STATUS_INFO_LENGTH_MISMATCH;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INFO_LENGTH_MISMATCH, 0);
         FILE_BASIC_INFORMATION *info = (FILE_BASIC_INFORMATION *)FileInformation;
-        /* We don't have timestamps — zero them */
+        /* Non-disk handles have no filesystem timestamps. */
         info->CreationTime.QuadPart   = 0;
         info->LastAccessTime.QuadPart = 0;
         info->LastWriteTime.QuadPart  = 0;
         info->ChangeTime.QuadPart     = 0;
         info->FileAttributes = (fobj->flags & FILE_OBJ_DIRECTORY)
             ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
-        if (fobj->flags & (FILE_OBJ_CONSOLE_IN | FILE_OBJ_CONSOLE_OUT | FILE_OBJ_CONSOLE_ERR))
-            info->FileAttributes = 0; /* device, not a file */
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = sizeof(FILE_BASIC_INFORMATION);
+
+        if ((fobj->flags & (FILE_OBJ_DISK_FILE | FILE_OBJ_DIRECTORY)) &&
+            fobj->osfs_file) {
+            osfs_file_times_t times;
+            uint16_t mode;
+            nt_file_io_lock(fobj);
+            if (osfs2_file_get_times(fobj->osfs_file, &times) == 0) {
+                info->CreationTime.QuadPart =
+                    nt_filetime_from_unix_seconds(times.creation);
+                info->LastAccessTime.QuadPart =
+                    nt_filetime_from_unix_seconds(times.access);
+                info->LastWriteTime.QuadPart =
+                    nt_filetime_from_unix_seconds(times.modified);
+                info->ChangeTime.QuadPart =
+                    nt_filetime_from_unix_seconds(times.changed);
+            }
+            if (osfs2_get_mode(fobj->osfs_file, &mode) == 0 &&
+                !(mode & 0222U)) {
+                info->FileAttributes &= ~FILE_ATTRIBUTE_NORMAL;
+                info->FileAttributes |= FILE_ATTRIBUTE_READONLY;
+            }
+            nt_file_io_unlock(fobj);
         }
-        return STATUS_SUCCESS;
+
+        if (fobj->flags &
+            (FILE_OBJ_CONSOLE_IN | FILE_OBJ_CONSOLE_OUT |
+             FILE_OBJ_CONSOLE_ERR | FILE_OBJ_PIPE_READ |
+             FILE_OBJ_PIPE_WRITE | FILE_OBJ_SERIAL))
+            info->FileAttributes = 0; /* device, not a file */
+        return nt_complete_io(IoStatusBlock, STATUS_SUCCESS,
+                              sizeof(FILE_BASIC_INFORMATION));
     }
 
     default:
         nt_log_hex("NtQueryInformationFile: unsupported class ", (ULONGLONG)InfoClass);
-        return STATUS_INVALID_INFO_CLASS;
+        return nt_complete_io(IoStatusBlock, STATUS_INVALID_INFO_CLASS, 0);
     }
 }
 
 /* ── NtSetInformationFile ───────────────────────────────────── */
+
+static NTSTATUS nt_file_parse_mutable_time(LONGLONG input,
+                                           uint32_t time_bit,
+                                           uint64_t *seconds,
+                                           uint32_t *time_mask,
+                                           BOOL *set_suppression,
+                                           BOOL *suppression)
+{
+    if (!input) return STATUS_SUCCESS;
+    if (input == -1 || input == -2) {
+        *set_suppression = TRUE;
+        *suppression = input == -1;
+        return STATUS_SUCCESS;
+    }
+    if (input < 0 || !nt_filetime_to_unix_seconds(input, seconds))
+        return STATUS_INVALID_PARAMETER;
+    *time_mask |= time_bit;
+    return STATUS_SUCCESS;
+}
 
 NTSTATUS sys_NtSetInformationFile(ULONG_PTR *args)
 {
@@ -2782,70 +3205,753 @@ NTSTATUS sys_NtSetInformationFile(ULONG_PTR *args)
     NTSTATUS status = handle_lookup(&g_handle_table, FileHandle,
                                     OBJ_TYPE_FILE, (PVOID *)&fobj);
     if (!NT_SUCCESS(status))
-        return status;
+        return nt_complete_io(IoStatusBlock, status, 0);
+
+    if (!FileInformation)
+        return nt_complete_io(IoStatusBlock, STATUS_ACCESS_VIOLATION, 0);
 
     switch (InfoClass) {
-    case FileBasicInformation:
+    case FileBasicInformation: {
         if (Length < sizeof(FILE_BASIC_INFORMATION))
-            return STATUS_INFO_LENGTH_MISMATCH;
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = 0;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INFO_LENGTH_MISMATCH, 0);
+
+        status = nt_file_require_access(FileHandle, FILE_WRITE_ATTRIBUTES);
+        if (!NT_SUCCESS(status))
+            return nt_complete_io(IoStatusBlock, status, 0);
+        if (!(fobj->flags & (FILE_OBJ_DISK_FILE | FILE_OBJ_DIRECTORY)) ||
+            !fobj->osfs_file)
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INVALID_DEVICE_REQUEST, 0);
+
+        FILE_BASIC_INFORMATION requested =
+            *(const FILE_BASIC_INFORMATION *)FileInformation;
+        if ((requested.FileAttributes & FILE_ATTRIBUTE_NORMAL) &&
+            requested.FileAttributes != FILE_ATTRIBUTE_NORMAL)
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INVALID_PARAMETER, 0);
+
+        osfs_file_times_t times = {0};
+        uint32_t time_mask = 0;
+        BOOL set_suppress_access = FALSE;
+        BOOL set_suppress_write = FALSE;
+        BOOL set_suppress_change = FALSE;
+        BOOL suppress_access = FALSE;
+        BOOL suppress_write = FALSE;
+        BOOL suppress_change = FALSE;
+
+        if (requested.CreationTime.QuadPart) {
+            if (requested.CreationTime.QuadPart < 0 ||
+                !nt_filetime_to_unix_seconds(
+                    requested.CreationTime.QuadPart, &times.creation))
+                return nt_complete_io(IoStatusBlock,
+                                      STATUS_INVALID_PARAMETER, 0);
+            time_mask |= OSFS_FILE_TIME_CREATION;
         }
-        return STATUS_SUCCESS;
+
+        status = nt_file_parse_mutable_time(
+            requested.LastAccessTime.QuadPart, OSFS_FILE_TIME_ACCESS,
+            &times.access, &time_mask, &set_suppress_access,
+            &suppress_access);
+        if (NT_SUCCESS(status))
+            status = nt_file_parse_mutable_time(
+                requested.LastWriteTime.QuadPart, OSFS_FILE_TIME_MODIFIED,
+                &times.modified, &time_mask, &set_suppress_write,
+                &suppress_write);
+        if (NT_SUCCESS(status))
+            status = nt_file_parse_mutable_time(
+                requested.ChangeTime.QuadPart, OSFS_FILE_TIME_CHANGED,
+                &times.changed, &time_mask, &set_suppress_change,
+                &suppress_change);
+        if (!NT_SUCCESS(status))
+            return nt_complete_io(IoStatusBlock, status, 0);
+
+        nt_file_io_lock(fobj);
+        if (requested.FileAttributes) {
+            uint16_t mode;
+            if (osfs2_get_mode(fobj->osfs_file, &mode) < 0) {
+                nt_file_io_unlock(fobj);
+                return nt_complete_io(IoStatusBlock,
+                                      STATUS_UNSUCCESSFUL, 0);
+            }
+            mode &= 07777U;
+            if (requested.FileAttributes & FILE_ATTRIBUTE_READONLY)
+                mode &= (uint16_t)~0222U;
+            else
+                mode |= 0222U;
+            if (osfs2_set_mode(fobj->osfs_file, mode) < 0) {
+                nt_file_io_unlock(fobj);
+                return nt_complete_io(IoStatusBlock,
+                                      STATUS_UNSUCCESSFUL, 0);
+            }
+        }
+        if (time_mask) {
+            int result = osfs2_file_set_times(fobj->osfs_file, time_mask,
+                                              &times);
+            if (result < 0) {
+                nt_file_io_unlock(fobj);
+                return nt_complete_io(
+                    IoStatusBlock,
+                    result == -2 ? STATUS_NOT_SUPPORTED
+                                 : STATUS_UNSUCCESSFUL,
+                    0);
+            }
+        }
+        if (set_suppress_access)
+            fobj->suppress_access_time = suppress_access;
+        if (set_suppress_write)
+            fobj->suppress_write_time = suppress_write;
+        if (set_suppress_change)
+            fobj->suppress_change_time = suppress_change;
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, STATUS_SUCCESS, 0);
+    }
 
     case FilePositionInformation: {
         if (Length < sizeof(FILE_POSITION_INFORMATION))
-            return STATUS_INFO_LENGTH_MISMATCH;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INFO_LENGTH_MISMATCH, 0);
         FILE_POSITION_INFORMATION *info = (FILE_POSITION_INFORMATION *)FileInformation;
+        if (!nt_file_is_synchronous(fobj) ||
+            info->CurrentByteOffset.QuadPart < 0)
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INVALID_PARAMETER, 0);
+        nt_file_io_lock(fobj);
         fobj->position = info->CurrentByteOffset.QuadPart;
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = 0;
-        }
-        return STATUS_SUCCESS;
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, STATUS_SUCCESS, 0);
     }
 
     case FileEndOfFileInformation: {
         if (Length < sizeof(LARGE_INTEGER))
-            return STATUS_INFO_LENGTH_MISMATCH;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INFO_LENGTH_MISMATCH, 0);
         PLARGE_INTEGER new_size = (PLARGE_INTEGER)FileInformation;
         if (new_size->QuadPart < 0 || (fobj->flags & FILE_OBJ_DIRECTORY))
-            return STATUS_INVALID_PARAMETER;
-        if ((fobj->flags & FILE_OBJ_DISK_FILE) && fobj->osfs_file &&
-            osfs2_truncate(fobj->osfs_file,
-                           (uint64_t)new_size->QuadPart) < 0)
-            return STATUS_UNSUCCESSFUL;
-        fobj->size = new_size->QuadPart;
-        if (fobj->position > fobj->size)
-            fobj->position = fobj->size;
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = 0;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INVALID_PARAMETER, 0);
+        if (!(fobj->flags & FILE_OBJ_DISK_FILE) || !fobj->osfs_file)
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INVALID_DEVICE_REQUEST, 0);
+        status = nt_file_require_access(FileHandle, FILE_WRITE_DATA);
+        if (!NT_SUCCESS(status))
+            return nt_complete_io(IoStatusBlock, status, 0);
+        nt_file_io_lock(fobj);
+        uint32_t io_flags = 0;
+        if (fobj->suppress_write_time)
+            io_flags |= OSFS_IO_PRESERVE_MTIME;
+        if (fobj->suppress_change_time)
+            io_flags |= OSFS_IO_PRESERVE_CTIME;
+        if (osfs2_truncate_ex(fobj->osfs_file,
+                              (uint64_t)new_size->QuadPart,
+                              io_flags) < 0) {
+            nt_file_io_unlock(fobj);
+            return nt_complete_io(IoStatusBlock, STATUS_UNSUCCESSFUL, 0);
         }
-        return STATUS_SUCCESS;
+        fobj->size = new_size->QuadPart;
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, STATUS_SUCCESS, 0);
     }
 
     case FileAllocationInformation:
         if (Length < sizeof(LARGE_INTEGER))
-            return STATUS_INFO_LENGTH_MISMATCH;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INFO_LENGTH_MISMATCH, 0);
         if (((PLARGE_INTEGER)FileInformation)->QuadPart < 0 ||
             (fobj->flags & FILE_OBJ_DIRECTORY))
-            return STATUS_INVALID_PARAMETER;
+            return nt_complete_io(IoStatusBlock,
+                                  STATUS_INVALID_PARAMETER, 0);
         /* OsitoFS allocates extents on write; preallocation is advisory. */
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_SUCCESS;
-            IoStatusBlock->Information = 0;
-        }
-        return STATUS_SUCCESS;
+        return nt_complete_io(IoStatusBlock, STATUS_SUCCESS, 0);
 
     default:
         nt_log_hex("NtSetInformationFile: unsupported class ", (ULONGLONG)InfoClass);
-        return STATUS_INVALID_INFO_CLASS;
+        return nt_complete_io(IoStatusBlock, STATUS_INVALID_INFO_CLASS, 0);
     }
 }
 
 /* ── NtDuplicateObject ──────────────────────────────────────── */
+
+static void nt_file_test_expect(bool condition, const char *name,
+                                int *checks, int *failures)
+{
+    (*checks)++;
+    if (condition) return;
+    (*failures)++;
+    serial_puts("[FILETEST] FAIL: ");
+    serial_puts(name);
+    serial_puts("\n");
+}
+
+static NTSTATUS nt_file_test_create(HANDLE *handle, ULONG disposition,
+                                    ULONG options, ACCESS_MASK access,
+                                    IO_STATUS_BLOCK *iosb)
+{
+    static WCHAR path[] = {
+        'C', ':', '\\', 'n', 't', '_', 'f', 'i', 'l', 'e', '_',
+        'c', 'o', 'n', 't', 'r', 'a', 'c', 't', '.', 't', 'm', 'p', 0
+    };
+    UNICODE_STRING name;
+    name.Length = (USHORT)((sizeof(path) / sizeof(path[0]) - 1) *
+                           sizeof(WCHAR));
+    name.MaximumLength = sizeof(path);
+    name.Buffer = path;
+    OBJECT_ATTRIBUTES attributes;
+    InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE,
+                               NULL, NULL);
+    ULONG_PTR args[11] = {
+        (ULONG_PTR)handle, access, (ULONG_PTR)&attributes,
+        (ULONG_PTR)iosb, 0, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        disposition, options, 0, 0
+    };
+    return sys_NtCreateFile(args);
+}
+
+static NTSTATUS nt_file_test_read(HANDLE handle, void *buffer, ULONG length,
+                                  PLARGE_INTEGER offset,
+                                  IO_STATUS_BLOCK *iosb)
+{
+    ULONG_PTR args[9] = {
+        (ULONG_PTR)handle, 0, 0, 0, (ULONG_PTR)iosb,
+        (ULONG_PTR)buffer, length, (ULONG_PTR)offset, 0
+    };
+    return sys_NtReadFile(args);
+}
+
+static NTSTATUS nt_file_test_write(HANDLE handle, const void *buffer,
+                                   ULONG length, PLARGE_INTEGER offset,
+                                   IO_STATUS_BLOCK *iosb)
+{
+    ULONG_PTR args[9] = {
+        (ULONG_PTR)handle, 0, 0, 0, (ULONG_PTR)iosb,
+        (ULONG_PTR)buffer, length, (ULONG_PTR)offset, 0
+    };
+    return sys_NtWriteFile(args);
+}
+
+static NTSTATUS nt_file_test_query(HANDLE handle,
+                                   FILE_INFORMATION_CLASS info_class,
+                                   void *information, ULONG length,
+                                   IO_STATUS_BLOCK *iosb)
+{
+    ULONG_PTR args[5] = {
+        (ULONG_PTR)handle, (ULONG_PTR)iosb, (ULONG_PTR)information,
+        length, info_class
+    };
+    return sys_NtQueryInformationFile(args);
+}
+
+static NTSTATUS nt_file_test_set_position(HANDLE handle, LONGLONG position,
+                                          IO_STATUS_BLOCK *iosb)
+{
+    FILE_POSITION_INFORMATION information;
+    information.CurrentByteOffset.QuadPart = position;
+    ULONG_PTR args[5] = {
+        (ULONG_PTR)handle, (ULONG_PTR)iosb, (ULONG_PTR)&information,
+        sizeof(information), FilePositionInformation
+    };
+    return sys_NtSetInformationFile(args);
+}
+
+static NTSTATUS nt_file_test_set_basic(
+    HANDLE handle, const FILE_BASIC_INFORMATION *information,
+    IO_STATUS_BLOCK *iosb)
+{
+    ULONG_PTR args[5] = {
+        (ULONG_PTR)handle, (ULONG_PTR)iosb, (ULONG_PTR)information,
+        sizeof(*information), FileBasicInformation
+    };
+    return sys_NtSetInformationFile(args);
+}
+
+static void nt_file_test_close(HANDLE *handle)
+{
+    if (!handle || !*handle) return;
+    ULONG_PTR args[1] = { (ULONG_PTR)*handle };
+    (void)sys_NtClose(args);
+    *handle = NULL;
+}
+
+static void nt_file_lock_selftest(ULONG sync_options,
+                                  ACCESS_MASK read_write_access,
+                                  int *checks, int *failures)
+{
+    HANDLE first = NULL;
+    HANDLE peer = NULL;
+    HANDLE duplicate = NULL;
+    HANDLE attributes_only = NULL;
+    IO_STATUS_BLOCK iosb = {0};
+    LARGE_INTEGER offset;
+    NTSTATUS status;
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+
+    status = nt_file_test_create(&first, FILE_OPEN, sync_options,
+                                 read_write_access, &iosb);
+    if (NT_SUCCESS(status))
+        status = nt_file_test_create(&peer, FILE_OPEN, sync_options,
+                                     read_write_access, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) && first && peer,
+                        "two opens share byte-lock identity", checks,
+                        failures);
+    if (!NT_SUCCESS(status) || !first || !peer)
+        goto cleanup;
+
+    status = nt_file_lock_range(first, owner_pid, 0, 4, 0, TRUE, TRUE);
+    nt_file_test_expect(status == STATUS_SUCCESS,
+                        "exclusive range lock succeeds", checks, failures);
+    status = nt_file_lock_range(first, owner_pid, 0, 4, 0, TRUE, TRUE);
+    nt_file_test_expect(status == STATUS_LOCK_NOT_GRANTED,
+                        "exclusive locks cannot overlap themselves", checks,
+                        failures);
+
+    char value = 0;
+    offset.QuadPart = 0;
+    status = nt_file_test_read(peer, &value, 1, &offset, &iosb);
+    nt_file_test_expect(status == STATUS_FILE_LOCK_CONFLICT &&
+                        iosb.Status == STATUS_FILE_LOCK_CONFLICT,
+                        "exclusive lock denies peer reads", checks,
+                        failures);
+    value = 'L';
+    status = nt_file_test_write(peer, &value, 1, &offset, &iosb);
+    nt_file_test_expect(status == STATUS_FILE_LOCK_CONFLICT,
+                        "exclusive lock denies peer writes", checks,
+                        failures);
+    status = nt_file_test_read(first, &value, 1, &offset, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status),
+                        "exclusive owner can read", checks, failures);
+    value = 'O';
+    status = nt_file_test_write(first, &value, 1, &offset, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status),
+                        "exclusive owner can write", checks, failures);
+
+    status = nt_file_lock_range(first, owner_pid, 0, 4, 0, TRUE, FALSE);
+    nt_file_test_expect(status == STATUS_SUCCESS,
+                        "same file object overlays shared on exclusive",
+                        checks, failures);
+    value = 'S';
+    status = nt_file_test_write(first, &value, 1, &offset, &iosb);
+    nt_file_test_expect(status == STATUS_FILE_LOCK_CONFLICT,
+                        "shared lock denies owner writes", checks, failures);
+    status = nt_file_lock_range(peer, owner_pid, 0, 4, 0, TRUE, FALSE);
+    nt_file_test_expect(status == STATUS_LOCK_NOT_GRANTED,
+                        "exclusive lock denies shared peer lock", checks,
+                        failures);
+
+    offset.QuadPart = 4;
+    value = 'N';
+    status = nt_file_test_write(peer, &value, 1, &offset, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status),
+                        "nonoverlapping write remains available", checks,
+                        failures);
+    status = nt_file_unlock_range(first, owner_pid, 0, 3, 0);
+    nt_file_test_expect(status == STATUS_RANGE_NOT_LOCKED,
+                        "unlock requires an exact range", checks, failures);
+    status = nt_file_unlock_range(first, owner_pid, 0, 4, 0);
+    nt_file_test_expect(status == STATUS_SUCCESS,
+                        "first unlock removes exclusive overlay", checks,
+                        failures);
+
+    status = nt_file_lock_range(peer, owner_pid, 0, 4, 0, TRUE, FALSE);
+    nt_file_test_expect(status == STATUS_SUCCESS,
+                        "shared locks may overlap", checks, failures);
+    offset.QuadPart = 0;
+    status = nt_file_test_read(peer, &value, 1, &offset, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status),
+                        "shared lock permits reads", checks, failures);
+    status = nt_file_test_write(peer, &value, 1, &offset, &iosb);
+    nt_file_test_expect(status == STATUS_FILE_LOCK_CONFLICT,
+                        "shared locks deny all writes", checks, failures);
+    nt_file_test_expect(
+        nt_file_unlock_range(first, owner_pid, 0, 4, 0) == STATUS_SUCCESS &&
+        nt_file_unlock_range(peer, owner_pid, 0, 4, 0) == STATUS_SUCCESS &&
+        nt_file_unlock_range(peer, owner_pid, 0, 4, 0) ==
+            STATUS_RANGE_NOT_LOCKED,
+        "shared overlays unlock independently", checks, failures);
+
+    nt_file_test_expect(
+        nt_file_lock_range(first, owner_pid, 0, 0, 0, TRUE, TRUE) ==
+            STATUS_SUCCESS &&
+        nt_file_unlock_range(first, owner_pid, 0, 0, 0) == STATUS_SUCCESS,
+        "zero-length lock and unlock are no-ops", checks, failures);
+
+    status = nt_file_lock_range(first, owner_pid, 0, 4, 0, TRUE, TRUE);
+    if (NT_SUCCESS(status)) {
+        status = handle_duplicate(&g_handle_table, first, &g_handle_table,
+                                  &duplicate, 0, FALSE,
+                                  DUPLICATE_SAME_ACCESS);
+    }
+    nt_file_test_expect(NT_SUCCESS(status) && duplicate,
+                        "duplicate handle shares lock owner", checks,
+                        failures);
+    if (duplicate) {
+        nt_file_test_close(&first);
+        offset.QuadPart = 0;
+        status = nt_file_test_read(peer, &value, 1, &offset, &iosb);
+        nt_file_test_expect(status == STATUS_FILE_LOCK_CONFLICT,
+                            "lock survives one duplicate close", checks,
+                            failures);
+        nt_file_test_close(&duplicate);
+        status = nt_file_test_read(peer, &value, 1, &offset, &iosb);
+        nt_file_test_expect(NT_SUCCESS(status),
+                            "last duplicate close releases locks", checks,
+                            failures);
+    }
+
+    status = nt_file_test_create(&attributes_only, FILE_OPEN, sync_options,
+                                 FILE_READ_ATTRIBUTES | SYNCHRONIZE, &iosb);
+    if (NT_SUCCESS(status))
+        status = nt_file_lock_range(attributes_only, owner_pid, 0, 1, 0,
+                                    TRUE, TRUE);
+    nt_file_test_expect(status == STATUS_ACCESS_DENIED,
+                        "byte lock requires data access", checks, failures);
+    status = nt_file_lock_range((HANDLE)(ULONG_PTR)0x7FFFFFFCU, owner_pid,
+                                0, 1, 0, TRUE, TRUE);
+    nt_file_test_expect(status == STATUS_INVALID_HANDLE,
+                        "byte lock rejects invalid handles", checks,
+                        failures);
+
+cleanup:
+    nt_file_test_close(&attributes_only);
+    nt_file_test_close(&duplicate);
+    nt_file_test_close(&peer);
+    nt_file_test_close(&first);
+}
+
+int nt_file_selftest(void)
+{
+    const ULONG sync_options = FILE_NON_DIRECTORY_FILE |
+                               FILE_SYNCHRONOUS_IO_NONALERT;
+    const ACCESS_MASK read_write_access = FILE_GENERIC_READ |
+                                          FILE_GENERIC_WRITE;
+    int checks = 0;
+    int failures = 0;
+    HANDLE handle = NULL;
+    IO_STATUS_BLOCK iosb = {0};
+    NTSTATUS status;
+
+    serial_puts("[FILETEST] starting NT file contract test\n");
+    nt_object_state_init_once();
+    (void)osfs2_delete("nt_file_contract.tmp");
+
+    status = nt_file_test_create(&handle, FILE_OPEN_IF, sync_options,
+                                 read_write_access, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) && handle &&
+                        iosb.Status == STATUS_SUCCESS &&
+                        iosb.Information == FILE_CREATED,
+                        "FILE_OPEN_IF reports FILE_CREATED", &checks,
+                        &failures);
+    if (!NT_SUCCESS(status) || !handle) goto cleanup;
+
+    static const char initial[] = { 'a', 'b', 'c' };
+    status = nt_file_test_write(handle, initial, sizeof(initial), NULL, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) && iosb.Information == 3,
+                        "NULL offset writes at current position", &checks,
+                        &failures);
+
+    LARGE_INTEGER special;
+    special.HighPart = -1;
+    special.LowPart = FILE_USE_FILE_POINTER_POSITION;
+    char value = 'd';
+    status = nt_file_test_write(handle, &value, 1, &special, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) && iosb.Information == 1,
+                        "FILE_USE_FILE_POINTER_POSITION writes", &checks,
+                        &failures);
+
+    LARGE_INTEGER explicit_offset;
+    explicit_offset.QuadPart = 1;
+    value = 'X';
+    status = nt_file_test_write(handle, &value, 1, &explicit_offset, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status),
+                        "explicit synchronous write succeeds", &checks,
+                        &failures);
+
+    special.HighPart = -1;
+    special.LowPart = FILE_WRITE_TO_END_OF_FILE;
+    value = 'E';
+    status = nt_file_test_write(handle, &value, 1, &special, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status),
+                        "FILE_WRITE_TO_END_OF_FILE appends", &checks,
+                        &failures);
+
+    explicit_offset.QuadPart = 8;
+    value = 'Z';
+    status = nt_file_test_write(handle, &value, 1, &explicit_offset, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status),
+                        "write beyond EOF succeeds", &checks, &failures);
+
+    char contents[9];
+    for (int i = 0; i < 9; i++) contents[i] = (char)0x55;
+    explicit_offset.QuadPart = 0;
+    status = nt_file_test_read(handle, contents, sizeof(contents),
+                               &explicit_offset, &iosb);
+    bool content_ok = NT_SUCCESS(status) && iosb.Information == 9 &&
+        contents[0] == 'a' && contents[1] == 'X' &&
+        contents[2] == 'c' && contents[3] == 'd' &&
+        contents[4] == 'E' && contents[5] == 0 &&
+        contents[6] == 0 && contents[7] == 0 && contents[8] == 'Z';
+    nt_file_test_expect(content_ok,
+                        "append, overwrite, and zero-filled gap persist",
+                        &checks, &failures);
+
+    FILE_POSITION_INFORMATION position;
+    status = nt_file_test_query(handle, FilePositionInformation, &position,
+                                sizeof(position), &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        position.CurrentByteOffset.QuadPart == 9,
+                        "explicit synchronous I/O advances position",
+                        &checks, &failures);
+
+    status = nt_file_test_set_position(handle, 1, &iosb);
+    special.HighPart = -1;
+    special.LowPart = FILE_USE_FILE_POINTER_POSITION;
+    char pair[2] = {0};
+    if (NT_SUCCESS(status))
+        status = nt_file_test_read(handle, pair, sizeof(pair), &special,
+                                   &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) && pair[0] == 'X' &&
+                        pair[1] == 'c',
+                        "special current-position read uses seek state",
+                        &checks, &failures);
+
+    explicit_offset.QuadPart = -3;
+    status = nt_file_test_read(handle, pair, 1, &explicit_offset, &iosb);
+    nt_file_test_expect(status == STATUS_INVALID_PARAMETER &&
+                        iosb.Status == STATUS_INVALID_PARAMETER,
+                        "negative read offset is rejected", &checks,
+                        &failures);
+
+    FILE_BASIC_INFORMATION basic = {0};
+    FILE_BASIC_INFORMATION queried = {0};
+    basic.FileAttributes = FILE_ATTRIBUTE_READONLY;
+    status = nt_file_test_set_basic(handle, &basic, &iosb);
+    if (NT_SUCCESS(status))
+        status = nt_file_test_query(handle, FileBasicInformation, &queried,
+                                    sizeof(queried), &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        (queried.FileAttributes & FILE_ATTRIBUTE_READONLY) &&
+                        !(queried.FileAttributes & FILE_ATTRIBUTE_NORMAL),
+                        "FileBasicInformation persists READONLY", &checks,
+                        &failures);
+
+    nt_memset(&basic, 0, sizeof(basic));
+    basic.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+    status = nt_file_test_set_basic(handle, &basic, &iosb);
+    if (NT_SUCCESS(status))
+        status = nt_file_test_query(handle, FileBasicInformation, &queried,
+                                    sizeof(queried), &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        !(queried.FileAttributes & FILE_ATTRIBUTE_READONLY) &&
+                        (queried.FileAttributes & FILE_ATTRIBUTE_NORMAL),
+                        "FILE_ATTRIBUTE_NORMAL restores writable mode",
+                        &checks, &failures);
+
+    nt_memset(&basic, 0, sizeof(basic));
+    basic.CreationTime.QuadPart =
+        nt_filetime_from_unix_seconds(1704067200ULL);
+    basic.LastAccessTime.QuadPart =
+        nt_filetime_from_unix_seconds(1704153600ULL);
+    basic.LastWriteTime.QuadPart =
+        nt_filetime_from_unix_seconds(1704240000ULL);
+    basic.ChangeTime.QuadPart =
+        nt_filetime_from_unix_seconds(1704326400ULL);
+    status = nt_file_test_set_basic(handle, &basic, &iosb);
+    if (NT_SUCCESS(status))
+        status = nt_file_test_query(handle, FileBasicInformation, &queried,
+                                    sizeof(queried), &iosb);
+    LONGLONG expected_change = osfs3_is_mounted()
+        ? basic.ChangeTime.QuadPart : basic.LastWriteTime.QuadPart;
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        queried.CreationTime.QuadPart ==
+                            basic.CreationTime.QuadPart &&
+                        queried.LastAccessTime.QuadPart ==
+                            basic.LastAccessTime.QuadPart &&
+                        queried.LastWriteTime.QuadPart ==
+                            basic.LastWriteTime.QuadPart &&
+                        queried.ChangeTime.QuadPart == expected_change,
+                        "FileBasicInformation timestamps round-trip",
+                        &checks, &failures);
+    FILE_BASIC_INFORMATION baseline = queried;
+
+    nt_memset(&basic, 0, sizeof(basic));
+    status = nt_file_test_set_basic(handle, &basic, &iosb);
+    if (NT_SUCCESS(status))
+        status = nt_file_test_query(handle, FileBasicInformation, &queried,
+                                    sizeof(queried), &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        queried.CreationTime.QuadPart ==
+                            baseline.CreationTime.QuadPart &&
+                        queried.LastAccessTime.QuadPart ==
+                            baseline.LastAccessTime.QuadPart &&
+                        queried.LastWriteTime.QuadPart ==
+                            baseline.LastWriteTime.QuadPart &&
+                        queried.ChangeTime.QuadPart ==
+                            baseline.ChangeTime.QuadPart,
+                        "zero FileBasicInformation times preserve metadata",
+                        &checks, &failures);
+
+    nt_memset(&basic, 0, sizeof(basic));
+    basic.LastAccessTime.QuadPart = -1;
+    basic.LastWriteTime.QuadPart = -1;
+    basic.ChangeTime.QuadPart = -1;
+    status = nt_file_test_set_basic(handle, &basic, &iosb);
+    explicit_offset.QuadPart = 0;
+    value = 'S';
+    if (NT_SUCCESS(status))
+        status = nt_file_test_write(handle, &value, 1, &explicit_offset,
+                                    &iosb);
+    if (NT_SUCCESS(status))
+        status = nt_file_test_query(handle, FileBasicInformation, &queried,
+                                    sizeof(queried), &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        queried.LastWriteTime.QuadPart ==
+                            baseline.LastWriteTime.QuadPart &&
+                        queried.ChangeTime.QuadPart ==
+                            baseline.ChangeTime.QuadPart,
+                        "-1 suppresses automatic write/change timestamps",
+                        &checks, &failures);
+
+    nt_memset(&basic, 0, sizeof(basic));
+    basic.LastAccessTime.QuadPart = -2;
+    basic.LastWriteTime.QuadPart = -2;
+    basic.ChangeTime.QuadPart = -2;
+    status = nt_file_test_set_basic(handle, &basic, &iosb);
+    value = 'R';
+    if (NT_SUCCESS(status))
+        status = nt_file_test_write(handle, &value, 1, &explicit_offset,
+                                    &iosb);
+    if (NT_SUCCESS(status))
+        status = nt_file_test_query(handle, FileBasicInformation, &queried,
+                                    sizeof(queried), &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        queried.LastWriteTime.QuadPart !=
+                            baseline.LastWriteTime.QuadPart &&
+                        queried.ChangeTime.QuadPart !=
+                            baseline.ChangeTime.QuadPart,
+                        "-2 restores automatic timestamp updates", &checks,
+                        &failures);
+
+    nt_memset(&basic, 0, sizeof(basic));
+    basic.CreationTime.QuadPart =
+        (LONGLONG)(WINTIME_UNIX_EPOCH_FILETIME - 1ULL);
+    status = nt_file_test_set_basic(handle, &basic, &iosb);
+    nt_file_test_expect(status == STATUS_INVALID_PARAMETER,
+                        "unrepresentable pre-Unix timestamp is rejected",
+                        &checks, &failures);
+
+    nt_memset(&basic, 0, sizeof(basic));
+    basic.FileAttributes = FILE_ATTRIBUTE_NORMAL |
+                           FILE_ATTRIBUTE_READONLY;
+    status = nt_file_test_set_basic(handle, &basic, &iosb);
+    nt_file_test_expect(status == STATUS_INVALID_PARAMETER,
+                        "FILE_ATTRIBUTE_NORMAL cannot be combined",
+                        &checks, &failures);
+    nt_file_test_close(&handle);
+
+    status = nt_file_test_create(&handle, FILE_OPEN_IF, sync_options,
+                                 read_write_access, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        iosb.Information == FILE_OPENED,
+                        "FILE_OPEN_IF reports FILE_OPENED", &checks,
+                        &failures);
+    nt_file_test_close(&handle);
+
+    status = nt_file_test_create(&handle, FILE_OVERWRITE, sync_options,
+                                 read_write_access, &iosb);
+    FILE_STANDARD_INFORMATION standard = {0};
+    ULONG_PTR overwrite_information = iosb.Information;
+    if (NT_SUCCESS(status))
+        status = nt_file_test_query(handle, FileStandardInformation,
+                                    &standard, sizeof(standard), &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        overwrite_information == FILE_OVERWRITTEN &&
+                        standard.EndOfFile.QuadPart == 0,
+                        "FILE_OVERWRITE reports and truncates", &checks,
+                        &failures);
+    nt_file_test_close(&handle);
+
+    status = nt_file_test_create(&handle, FILE_SUPERSEDE, sync_options,
+                                 read_write_access, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status) &&
+                        iosb.Information == FILE_SUPERSEDED,
+                        "FILE_SUPERSEDE reports FILE_SUPERSEDED", &checks,
+                        &failures);
+    value = 'Q';
+    if (NT_SUCCESS(status))
+        status = nt_file_test_write(handle, &value, 1, NULL, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status),
+                        "superseded file remains writable", &checks,
+                        &failures);
+    nt_file_test_close(&handle);
+
+    status = nt_file_test_create(&handle, FILE_OPEN,
+                                 FILE_NON_DIRECTORY_FILE,
+                                 FILE_READ_DATA, &iosb);
+    nt_file_test_expect(NT_SUCCESS(status),
+                        "asynchronous file opens without SYNCHRONIZE",
+                        &checks, &failures);
+    if (NT_SUCCESS(status)) {
+        FILE_BASIC_INFORMATION denied = {0};
+        denied.LastWriteTime.QuadPart =
+            nt_filetime_from_unix_seconds(1704240000ULL);
+        status = nt_file_test_set_basic(handle, &denied, &iosb);
+        nt_file_test_expect(status == STATUS_ACCESS_DENIED,
+                            "metadata write requires FILE_WRITE_ATTRIBUTES",
+                            &checks, &failures);
+
+        explicit_offset.QuadPart = 0;
+        value = 0;
+        status = nt_file_test_read(handle, &value, 1, &explicit_offset,
+                                   &iosb);
+        nt_file_test_expect(NT_SUCCESS(status) && value == 'Q',
+                            "asynchronous explicit-offset read succeeds",
+                            &checks, &failures);
+        status = nt_file_test_query(handle, FilePositionInformation,
+                                    &position, sizeof(position), &iosb);
+        nt_file_test_expect(NT_SUCCESS(status) &&
+                            position.CurrentByteOffset.QuadPart == 0,
+                            "asynchronous I/O does not advance position",
+                            &checks, &failures);
+        status = nt_file_test_read(handle, &value, 1, NULL, &iosb);
+        nt_file_test_expect(status == STATUS_INVALID_PARAMETER,
+                            "asynchronous NULL offset is rejected", &checks,
+                            &failures);
+        special.HighPart = -1;
+        special.LowPart = FILE_USE_FILE_POINTER_POSITION;
+        status = nt_file_test_read(handle, &value, 1, &special, &iosb);
+        nt_file_test_expect(status == STATUS_INVALID_PARAMETER,
+                            "asynchronous current-position token is rejected",
+                            &checks, &failures);
+    }
+    nt_file_test_close(&handle);
+
+    nt_file_lock_selftest(sync_options, read_write_access, &checks,
+                          &failures);
+
+    status = nt_file_test_create(&handle, FILE_CREATE, sync_options,
+                                 read_write_access, &iosb);
+    nt_file_test_expect(status == STATUS_OBJECT_NAME_COLLISION && !handle &&
+                        iosb.Information == 0,
+                        "FILE_CREATE rejects an existing file", &checks,
+                        &failures);
+
+    status = nt_file_test_create(&handle, FILE_OPEN, sync_options,
+                                 FILE_READ_DATA, &iosb);
+    nt_file_test_expect(status == STATUS_INVALID_PARAMETER && !handle,
+                        "synchronous open requires SYNCHRONIZE", &checks,
+                        &failures);
+
+cleanup:
+    nt_file_test_close(&handle);
+    (void)osfs2_delete("nt_file_contract.tmp");
+    serial_puts("[FILETEST] checks=");
+    serial_putdec((uint64_t)checks);
+    serial_puts(" failures=");
+    serial_putdec((uint64_t)failures);
+    serial_puts("\n");
+    return failures;
+}
 
 static void nt_duplicate_trace_failure(const char *stage, NTSTATUS status,
                                        DWORD current_pid, DWORD source_pid,
@@ -2960,10 +4066,12 @@ NTSTATUS sys_NtDuplicateObject(ULONG_PTR *args)
     HANDLE  TargetProcessHandle  = (HANDLE)args[2];
     PHANDLE TargetHandle         = (PHANDLE)args[3];
     ACCESS_MASK DesiredAccess    = (ACCESS_MASK)args[4];
-    /* ULONG  HandleAttributes   = (ULONG)args[5]; */
+    ULONG   HandleAttributes     = (ULONG)args[5];
     ULONG   Options              = (ULONG)args[6];
+    BOOL    close_source         =
+        (Options & DUPLICATE_CLOSE_SOURCE) != 0;
 
-    if (!TargetHandle && !(Options & DUPLICATE_CLOSE_SOURCE))
+    if (!TargetHandle && !close_source)
         return STATUS_INVALID_PARAMETER;
 
     extern DWORD win32_current_process_id(void);
@@ -2985,6 +4093,28 @@ NTSTATUS sys_NtDuplicateObject(ULONG_PTR *args)
             TargetProcessHandle, TargetHandle, DesiredAccess, Options);
         return process_status;
     }
+
+    BOOL source_is_pseudo = nt_is_current_process_handle(SourceHandle) ||
+                            nt_is_current_thread_handle(SourceHandle);
+    HANDLE new_handle = NULL;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (HandleAttributes & ~(OBJ_INHERIT | OBJ_PROTECT_CLOSE)) {
+        status = STATUS_INVALID_PARAMETER;
+        goto close_source_and_return;
+    }
+
+    /* Native callers may omit both target arguments to close a source handle
+     * without creating a replacement.  Access and attributes are irrelevant
+     * when there is no target handle to publish. */
+    if (!TargetProcessHandle) {
+        if (!close_source)
+            status = STATUS_INVALID_PARAMETER;
+        goto close_source_and_return;
+    }
+    if (!TargetHandle)
+        goto close_source_and_return;
+
     process_status = nt_duplicate_resolve_process(
         TargetProcessHandle, current_pid, &target_pid);
     if (!NT_SUCCESS(process_status)) {
@@ -2992,11 +4122,10 @@ NTSTATUS sys_NtDuplicateObject(ULONG_PTR *args)
             "target-process", process_status, current_pid, source_pid,
             0, SourceProcessHandle, SourceHandle, TargetProcessHandle,
             TargetHandle, DesiredAccess, Options);
-        return process_status;
+        status = process_status;
+        goto close_source_and_return;
     }
 
-    HANDLE new_handle = NULL;
-    NTSTATUS status;
     if (nt_is_current_process_handle(SourceHandle)) {
         ACCESS_MASK access = (Options & DUPLICATE_SAME_ACCESS)
                              ? GENERIC_ALL : DesiredAccess;
@@ -3017,7 +4146,8 @@ NTSTATUS sys_NtDuplicateObject(ULONG_PTR *args)
         status = handle_duplicate_for_process(
             &g_handle_table, SourceHandle, source_pid,
             &g_handle_table, &new_handle, target_pid,
-            DesiredAccess, FALSE, Options);
+            DesiredAccess, (HandleAttributes & OBJ_INHERIT) != 0,
+            Options & ~DUPLICATE_CLOSE_SOURCE);
         if (source_entry && source_entry->type == OBJ_TYPE_SECTION &&
             source_pid != target_pid) {
             nt_trace_section_transfer(source_entry->object, current_pid,
@@ -3026,6 +4156,35 @@ NTSTATUS sys_NtDuplicateObject(ULONG_PTR *args)
                                       DesiredAccess, Options, status);
         }
     }
+    if (NT_SUCCESS(status) && new_handle) {
+        ULONG handle_flags = 0;
+        if (HandleAttributes & OBJ_INHERIT)
+            handle_flags |= HANDLE_USER_FLAG_INHERIT;
+        if (HandleAttributes & OBJ_PROTECT_CLOSE)
+            handle_flags |= HANDLE_USER_FLAG_PROTECT_FROM_CLOSE;
+        NTSTATUS flag_status = handle_update_flags_for_process(
+            &g_handle_table, new_handle, target_pid, HANDLE_USER_FLAG_MASK,
+            handle_flags);
+        if (!NT_SUCCESS(flag_status)) {
+            (void)nt_force_close_handle_for_process(new_handle, target_pid);
+            new_handle = NULL;
+            status = flag_status;
+        }
+    }
+
+close_source_and_return:
+    if (close_source && !source_is_pseudo) {
+        NTSTATUS close_status =
+            nt_force_close_handle_for_process(SourceHandle, source_pid);
+        if (NT_SUCCESS(status) && !NT_SUCCESS(close_status)) {
+            if (new_handle)
+                (void)nt_force_close_handle_for_process(new_handle,
+                                                        target_pid);
+            new_handle = NULL;
+            status = close_status;
+        }
+    }
+
     if (NT_SUCCESS(status) && TargetHandle)
         *TargetHandle = new_handle;
     if (!NT_SUCCESS(status))
@@ -3039,8 +4198,10 @@ NTSTATUS sys_NtDuplicateObject(ULONG_PTR *args)
 
 /* ── NtProtectVirtualMemory ─────────────────────────────────── */
 
-/* Convert NT page protection to x86 page flags */
-static uint64_t nt_prot_to_page_flags(ULONG protect)
+/* Convert the logical Win32 protection to physical x86 PTE flags. When DEP is
+ * disabled, readable/writable data remains logically PAGE_READ* but is also
+ * executable at the hardware level, matching 32-bit Windows OptIn behavior. */
+static uint64_t nt_prot_to_page_flags(ULONG protect, BOOL dep_enabled)
 {
     uint64_t flags = 0x01;  /* Present */
 
@@ -3062,8 +4223,9 @@ static uint64_t nt_prot_to_page_flags(ULONG protect)
         break;
     }
 
-    /* NX bit: set bit 63 if NOT executable */
-    if (!(protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+    /* PAGE_NOACCESS remains inaccessible regardless of DEP policy. */
+    if (dep_enabled &&
+        !(protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                      PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
         flags |= (1ULL << 63);  /* NX */
     }
@@ -3161,7 +4323,8 @@ static int vm_protect_tracked_range_locked(ULONG owner_pid, uint64_t cr3,
             return -1;
     }
 
-    uint64_t flags = nt_prot_to_page_flags(new_protect);
+    uint64_t flags = nt_prot_to_page_flags(
+        new_protect, vm_process_dep_enabled_locked(owner_pid));
     for (uint64_t page = 0; page < pages; page++) {
         uint64_t page_va = base + page * 4096;
         uint64_t *pte = nt_get_pte_in(cr3, page_va);
@@ -3281,7 +4444,11 @@ NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args)
                 return STATUS_CONFLICTING_ADDRESSES;
             }
         }
-        uint64_t flags = nt_prot_to_page_flags(NewProtect);
+        /* Section characteristics define the logical protection. Hardware NX
+         * still follows the process DEP policy: legacy PE32 images running
+         * under OptIn may contain linker-generated code in writable sections. */
+        uint64_t flags = nt_prot_to_page_flags(
+            NewProtect, vm_process_dep_enabled_locked(owner_pid));
         for (uint64_t page = 0; page < pages; page++)
             nt_set_page_flags_in(cr3, base + page * 4096, flags);
     } else if (tracked < 0) {
@@ -3376,6 +4543,12 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
     uint64_t image_base = 0;
     uint64_t image_size = 0;
     uint64_t next_image = 0;
+    uint64_t identity_base = 0;
+    uint64_t identity_size = 0;
+    uint64_t next_identity = 0;
+    int have_identity = cr3 == paging_get_kernel_cr3() &&
+        nt_identity_reservation_query(page_base, &identity_base,
+                                      &identity_size, &next_identity);
     int have_image = pe_va_query_range(page_base, &image_base, &image_size,
                                        &next_image);
 
@@ -3405,6 +4578,8 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
 
     if (next_image && (!next_mapping || next_image < next_mapping))
         next_mapping = next_image;
+    if (next_identity && (!next_mapping || next_identity < next_mapping))
+        next_mapping = next_identity;
 
     if (have_committed) {
         uint64_t region_end = committed.va + committed.size;
@@ -3536,10 +4711,27 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
         return STATUS_SUCCESS;
     }
 
+    /* A process hosted in kernel_cr3 must not see or replace low identity
+     * aliases that remain live in the kernel. Expose them as an inaccessible
+     * system reservation, matching the address allocator's collision view. */
+    if (have_identity) {
+        mbi->BaseAddress = (PVOID)identity_base;
+        mbi->AllocationBase = (PVOID)identity_base;
+        mbi->AllocationProtect = PAGE_NOACCESS;
+        mbi->RegionSize = identity_size;
+        mbi->State = MEM_RESERVE;
+        mbi->Protect = 0;
+        mbi->Type = MEM_PRIVATE;
+        return STATUS_SUCCESS;
+    }
+
     /* Preserve compatibility for mapped kernel/section pages that predate
      * vm_track. They remain page-sized until their owners gain VMA records. */
     uint64_t *pte = nt_get_pte_in(cr3, page_base);
-    if (pte && (*pte & PTE_PRESENT)) {
+    BOOL inherited_win32_identity = g_compat32_mode &&
+        cr3 == paging_get_kernel_cr3() &&
+        page_base >= WIN32_VA_BASE && page_base < WIN32_VA_LIMIT;
+    if (!inherited_win32_identity && pte && (*pte & PTE_PRESENT)) {
         int writable = (*pte & PTE_WRITABLE) != 0;
         int executable = (*pte & PTE_NX) == 0;
         ULONG protect = executable
@@ -3555,7 +4747,7 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
         return STATUS_SUCCESS;
     }
 
-    uint64_t region_end = page_base < WIN32_VA_LIMIT
+    uint64_t region_end = g_compat32_mode
                           ? WIN32_VA_LIMIT : WIN64_FIXED_VA_LIMIT;
     if (next_mapping > page_base && next_mapping < region_end)
         region_end = next_mapping;
@@ -3642,6 +4834,24 @@ int nt_vm_selftest(void)
     NTSTATUS status;
 
     serial_puts("[VMTEST] starting NT virtual-memory contract test\n");
+    extern int win32_user_range_readable(const void *, SIZE_T, BOOL);
+    vm_test_expect(
+        !win32_user_range_readable((const void *)(ULONG_PTR)0x00100000U,
+                                   sizeof(uint32_t), TRUE),
+        "reject unowned low identity mapping as Win32 user memory",
+        &checks, &failures);
+    vm_test_expect(
+        (nt_prot_to_page_flags(PAGE_READWRITE, TRUE) & PTE_NX) != 0,
+        "DEP marks private PAGE_READWRITE as NX", &checks, &failures);
+    vm_test_expect(
+        (nt_prot_to_page_flags(PAGE_READWRITE, FALSE) & PTE_NX) == 0,
+        "legacy PE32 data page remains executable", &checks, &failures);
+    vm_test_expect(
+        (nt_prot_to_page_flags(PAGE_EXECUTE_READ, TRUE) & PTE_NX) == 0,
+        "explicit executable protection bypasses NX", &checks, &failures);
+    vm_test_expect(
+        (nt_prot_to_page_flags(PAGE_NOACCESS, FALSE) & PTE_PRESENT) == 0,
+        "legacy DEP policy preserves PAGE_NOACCESS", &checks, &failures);
     vm_test_expect(
         vm_address_allowed(0x00000001F0000000ULL, 0x0FFE0000ULL,
                            TRUE, FALSE),
@@ -3654,6 +4864,59 @@ int nt_vm_selftest(void)
         vm_address_allowed(WIN32_VA_BASE + 0x04000000ULL,
                            0x40000000ULL, FALSE, TRUE),
         "Win32 arena admits a 1 GiB reservation", &checks, &failures);
+    vm_test_expect(
+        vm_address_allowed(WIN32_VA_LIMIT - 0x10000ULL, 0x10000ULL,
+                           FALSE, TRUE) &&
+        !vm_address_allowed(WIN32_VA_LIMIT - 0x10000ULL, 0x10001ULL,
+                            FALSE, TRUE),
+        "Win32 arena enforces the advertised application limit",
+        &checks, &failures);
+
+    if (nt_current_cr3() == paging_get_kernel_cr3()) {
+        uint64_t identity_base = 0;
+        uint64_t identity_size = 0;
+        uint64_t next_identity = 0;
+        int have_identity = nt_identity_reservation_query(
+            WIN32_VA_BASE, &identity_base, &identity_size, &next_identity);
+        if (!have_identity && next_identity)
+            have_identity = nt_identity_reservation_query(
+                next_identity, &identity_base, &identity_size, NULL);
+
+        uint64_t identity_end = identity_base + identity_size;
+        if (have_identity && identity_end >= identity_base &&
+            identity_base >= WIN32_VA_BASE &&
+            identity_end <= WIN32_VA_LIMIT) {
+            uint64_t vm_irq_flags = vm_track_lock_irqsave();
+            uint64_t conflict_end = vm_range_conflict_end_locked(
+                identity_base, 4096, TRUE);
+            vm_track_unlock_irqrestore(vm_irq_flags);
+            vm_test_expect(conflict_end >= identity_end,
+                           "Win32 allocator preserves live identity ranges",
+                           &checks, &failures);
+
+            int saved_compat32_mode = g_compat32_mode;
+            g_compat32_mode = 1;
+            status = vm_test_query((PVOID)identity_base, &info);
+            vm_test_expect(NT_SUCCESS(status) &&
+                           info.State == MEM_RESERVE &&
+                           info.AllocationBase == (PVOID)identity_base &&
+                           info.RegionSize == identity_size,
+                           "query live identity range as system reservation",
+                           &checks, &failures);
+
+            if (identity_base >= WIN32_VA_BASE + 4096) {
+                uint64_t preceding = identity_base - 4096;
+                status = vm_test_query((PVOID)preceding, &info);
+                vm_test_expect(NT_SUCCESS(status) &&
+                               info.State == MEM_FREE &&
+                               (uint64_t)(ULONG_PTR)info.BaseAddress +
+                                   info.RegionSize == identity_base,
+                               "free query stops at identity reservation",
+                               &checks, &failures);
+            }
+            g_compat32_mode = saved_compat32_mode;
+        }
+    }
 
     size = 4096;
     status = vm_test_allocate(&implicit_commit_allocation, &size,
@@ -3718,6 +4981,13 @@ int nt_vm_selftest(void)
                    info.AllocationBase == allocation &&
                    info.RegionSize == 2 * 4096,
                    "query committed span", &checks, &failures);
+    vm_test_expect(
+        nt_vm_user_range_accessible((ULONGLONG)(ULONG_PTR)committed,
+                                    2 * 4096, FALSE) &&
+        nt_vm_user_range_accessible((ULONGLONG)(ULONG_PTR)committed,
+                                    2 * 4096, TRUE),
+        "recognize readable and writable committed owner VMA",
+        &checks, &failures);
 
     PVOID protected_page = (PVOID)((uint64_t)(ULONG_PTR)committed + 4096);
     size = 4096;
@@ -3730,6 +5000,15 @@ int nt_vm_selftest(void)
     vm_test_expect(NT_SUCCESS(status) && info.Protect == PAGE_READONLY &&
                    info.RegionSize == 4096,
                    "query split protection", &checks, &failures);
+    vm_test_expect(
+        nt_vm_user_range_accessible((ULONGLONG)(ULONG_PTR)protected_page,
+                                    4096, FALSE) &&
+        !nt_vm_user_range_accessible((ULONGLONG)(ULONG_PTR)protected_page,
+                                     4096, TRUE) &&
+        !nt_vm_user_range_accessible((ULONGLONG)(ULONG_PTR)committed,
+                                     2 * 4096, TRUE),
+        "enforce logical VMA write protection across split ranges",
+        &checks, &failures);
 
     PVOID decommit = committed;
     size = 4096;
@@ -4004,7 +5283,7 @@ NTSTATUS sys_NtDelayExecution(ULONG_PTR *args)
     uint64_t start = nt_rdtsc();
 
     /* Scheduler unavailable (or no runnable peer): retain the cooperative TSC
-     * fallback used by early boot and UT99's timer-masked compat32 mode. */
+     * fallback used while interrupts are masked in early boot or guest code. */
     sched_yield();
     nt_win32_exit_checkpoint();
     uint64_t last_yield = nt_rdtsc();
@@ -5106,6 +6385,7 @@ int nt_section_page_fault(uint64_t address, uint64_t error_code)
     ULONG owner_pid = nt_current_owner_pid();
     vm_track_entry_t mapping = {0};
     BOOL found = FALSE;
+    BOOL dep_enabled = TRUE;
 
     uint64_t vm_irq_flags = vm_track_lock_irqsave();
     for (int i = 0; i < vm_track_count; i++) {
@@ -5117,6 +6397,7 @@ int nt_section_page_fault(uint64_t address, uint64_t error_code)
         SECTION_OBJECT *sec = (SECTION_OBJECT *)vm_track[i].section;
         if (sec->sparse && section_view_pin(sec)) {
             mapping = vm_track[i];
+            dep_enabled = vm_process_dep_enabled_locked(owner_pid);
             found = TRUE;
         }
         break;
@@ -5140,9 +6421,10 @@ int nt_section_page_fault(uint64_t address, uint64_t error_code)
     if (batch_pages > SECTION_FAULT_BATCH_PAGES)
         batch_pages = SECTION_FAULT_BATCH_PAGES;
 
-    /* SteamChrome clears each new shared-memory stream sequentially. Map a
-     * small run per fault while keeping every physical page independent. */
-    uint64_t pte_flags = nt_prot_to_page_flags(mapping.protect);
+    /* Sequential consumers benefit from a small fault batch while each
+     * physical page remains independently owned and reclaimable. */
+    uint64_t pte_flags = nt_prot_to_page_flags(mapping.protect,
+                                                dep_enabled);
     uint64_t phys_pages[SECTION_FAULT_BATCH_PAGES];
     uint32_t resolved_pages = section_sparse_pages_get(
         sec, first_page_index, (uint32_t)batch_pages, phys_pages);
@@ -5460,7 +6742,8 @@ NTSTATUS sys_NtMapViewOfSection(ULONG_PTR *args)
         section_view_release(sec);
         return STATUS_ACCESS_DENIED;
     }
-    uint64_t pte_flags = nt_prot_to_page_flags(protect);
+    uint64_t pte_flags = nt_prot_to_page_flags(
+        protect, vm_process_dep_enabled_locked(owner_pid));
 
     uint64_t mapped_pages = 0;
     uint64_t pages = map_size / 4096;
@@ -5656,22 +6939,7 @@ void nt_syscall_init(NT_SERVICE_TABLE *table)
 
     #undef REG
 
-    /* Initialize handle table */
-    handle_table_init(&g_handle_table);
-    nt_memset(g_win32_pipes, 0, sizeof(g_win32_pipes));
-
-    /* Pre-allocate console handles */
-    g_console_in.flags  = FILE_OBJ_CONSOLE_IN;
-    g_console_out.flags = FILE_OBJ_CONSOLE_OUT;
-    g_console_err.flags = FILE_OBJ_CONSOLE_ERR;
-
-    HANDLE dummy;
-    handle_alloc(&g_handle_table, OBJ_TYPE_FILE, GENERIC_READ,
-                 &g_console_in, &dummy);   /* handle 4 → index 1 */
-    handle_alloc(&g_handle_table, OBJ_TYPE_FILE, GENERIC_WRITE,
-                 &g_console_out, &dummy);  /* handle 8 → index 2 */
-    handle_alloc(&g_handle_table, OBJ_TYPE_FILE, GENERIC_WRITE,
-                 &g_console_err, &dummy);  /* handle 12 → index 3 */
+    nt_object_state_init_once();
 
     /* Register process/thread handlers (Phase 6) */
     extern void nt_process_register_syscalls(NT_SERVICE_TABLE *table);
@@ -5681,9 +6949,7 @@ void nt_syscall_init(NT_SERVICE_TABLE *table)
     extern void nt_sync_register_syscalls(NT_SERVICE_TABLE *table);
     nt_sync_register_syscalls(table);
 
-    g_initialized = TRUE;
     nt_log("NT syscall table initialized (file, mem, proc, sync)");
-    nt_log("  console handles: stdin=4, stdout=8, stderr=12");
 }
 
 /* ── Dispatch ───────────────────────────────────────────────── */

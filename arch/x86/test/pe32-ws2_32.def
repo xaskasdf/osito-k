@@ -1,0 +1,7 @@
+LIBRARY WS2_32.dll
+EXPORTS
+    WSAStartup@8
+    WSACleanup@0
+    WSAGetLastError@0
+    WSASendDisconnect@8
+    gethostbyaddr@12 @51 NONAME

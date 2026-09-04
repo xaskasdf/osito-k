@@ -145,6 +145,9 @@ typedef struct {
 /* Initialize JIT engine */
 void jit_init(jit_state_t *jit);
 
+/* Release allocations owned by an initialized JIT state. */
+void jit_destroy(jit_state_t *jit);
+
 /* Look up or create a block for CS:IP */
 jit_block_t *jit_get_block(jit_state_t *jit, uint16_t cs, uint16_t ip);
 

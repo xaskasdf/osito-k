@@ -59,16 +59,40 @@ for v in /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd \
 [ -n "$OVMF_CODE" ] || die "OVMF firmware not found — sudo apt install -y ovmf"
 cp -f "$OVMF_VARS_SRC" "$STAGE/OVMF_VARS.fd"   # writable per-run vars copy
 
-# Optional NVMe (UT99 image). Stage onto ext4 once (1 GB; only re-copy if newer).
+# Optional NVMe image. Persistent staging is the default; test helpers can set
+# OK_NVME_FRESH=1 when guest writes must never leak into the next run.
 NVME_ARGS=()
 if [ -n "${OK_NVME:-}" ]; then
     [ -f "$OK_NVME" ] || die "OK_NVME not found: $OK_NVME"
+    NVME_FRESH="${OK_NVME_FRESH:-0}"
+    NVME_SNAPSHOT="${OK_NVME_SNAPSHOT:-0}"
+    case "$NVME_FRESH" in
+        0|1) ;;
+        *) die "OK_NVME_FRESH must be 0 or 1" ;;
+    esac
+    case "$NVME_SNAPSHOT" in
+        0|1) ;;
+        *) die "OK_NVME_SNAPSHOT must be 0 or 1" ;;
+    esac
     NVME_LOCAL="$STAGE/$(basename "$OK_NVME")"
-    if [ ! -f "$NVME_LOCAL" ] || [ "$OK_NVME" -nt "$NVME_LOCAL" ]; then
-        info "Staging NVMe image (1 GB, one-time copy to ext4)..."
+    NVME_SOURCE_REAL="$(readlink -f "$OK_NVME")"
+    NVME_LOCAL_REAL="$(readlink -m "$NVME_LOCAL")"
+    if [ "$NVME_SOURCE_REAL" != "$NVME_LOCAL_REAL" ] &&
+       { [ "$NVME_FRESH" = "1" ] || [ ! -f "$NVME_LOCAL" ] ||
+         [ "$OK_NVME" -nt "$NVME_LOCAL" ]; }; then
+        if [ "$NVME_FRESH" = "1" ]; then
+            info "Staging fresh NVMe image onto ext4..."
+        else
+            info "Staging newer NVMe image onto ext4..."
+        fi
         cp -f "$OK_NVME" "$NVME_LOCAL"
     fi
-    NVME_ARGS=(-drive "file=$NVME_LOCAL,format=raw,if=none,id=nvme0,cache=writeback,aio=threads"
+    NVME_SNAPSHOT_ARG=""
+    if [ "$NVME_SNAPSHOT" = "1" ]; then
+        NVME_SNAPSHOT_ARG=",snapshot=on"
+        info "NVMe writes use a temporary QEMU snapshot"
+    fi
+    NVME_ARGS=(-drive "file=$NVME_LOCAL,format=raw,if=none,id=nvme0,cache=writeback,aio=threads$NVME_SNAPSHOT_ARG"
                -device "nvme,serial=deadbeef,drive=nvme0")
     info "NVMe: $NVME_LOCAL"
 fi
@@ -79,9 +103,35 @@ CPU="${OK_CPU:-host}"   # host passthrough = max KVM speed
 
 MON_ARGS=()
 if [ "${OK_MONITOR:-0}" = "1" ]; then
-    MON_ARGS=(-monitor "tcp:127.0.0.1:55555,server,nowait")
-    info "QEMU monitor -> tcp:127.0.0.1:55555 (WSL2 localhostForwarding makes it reachable from Windows too)"
+    MON_HOST="${OK_MON_HOST:-127.0.0.1}"
+    MON_PORT="${OK_MON_PORT:-55555}"
+    case "$MON_PORT" in
+        ''|*[!0-9]*) die "OK_MON_PORT must be an integer from 1 to 65535" ;;
+    esac
+    if [ "$MON_PORT" -lt 1 ] || [ "$MON_PORT" -gt 65535 ]; then
+        die "OK_MON_PORT must be an integer from 1 to 65535"
+    fi
+    MON_ARGS=(-monitor "tcp:$MON_HOST:$MON_PORT,server,nowait")
+    info "QEMU monitor -> tcp:$MON_HOST:$MON_PORT"
 fi
+
+AUDIO_ARGS=()
+case "${OK_AUDIO:-none}" in
+    none)
+        ;;
+    wav)
+        AUDIO_WAV="${OK_AUDIO_WAV:-$STAGE/audio.wav}"
+        AUDIO_RATE="${OK_AUDIO_RATE:-48000}"
+        rm -f "$AUDIO_WAV"
+        AUDIO_ARGS=(-audiodev "wav,id=audio0,path=$AUDIO_WAV,out.fixed-settings=on,out.frequency=$AUDIO_RATE,out.channels=2,out.format=s16"
+                    -device intel-hda
+                    -device "hda-output,audiodev=audio0")
+        info "HDA output -> $AUDIO_WAV"
+        ;;
+    *)
+        die "OK_AUDIO must be none or wav"
+        ;;
+esac
 
 info "KVM accel, q35, smp 4, cpu $CPU, mem $MEM, display=$DISPLAY_MODE"
 info "Serial log -> $SERIAL"
@@ -98,6 +148,7 @@ exec qemu-system-x86_64 \
     -device qemu-xhci,id=usb \
     -device usb-kbd,bus=usb.0 \
     -device usb-tablet,bus=usb.0 \
+    "${AUDIO_ARGS[@]}" \
     -display "$DISPLAY_MODE" \
     "${MON_ARGS[@]}" \
     -serial "file:$SERIAL" \

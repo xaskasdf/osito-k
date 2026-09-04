@@ -110,7 +110,7 @@ for f in ositofs2.c gpt.c gguf.c; do
 done
 
 # win32/ (except compat32.c, msvcrt_shim.c → GCC only)
-for f in win32_init.c pe.c winexec.c handle.c ntsyscall.c \
+for f in win32_init.c pe.c winexec.c handle.c filelock.c ntsyscall.c \
          ntprocess.c ntsync.c dllloader.c kernel32_shim.c \
          ntdll_shim.c user32_shim.c gdi32_shim.c advapi32_shim.c \
          ddraw_shim.c dsound_shim.c ole32_shim.c shell32_shim.c \
@@ -153,7 +153,7 @@ for f in i211.h gpu.h sass.h gpu_tensor.h gpu_inference.h \
 done
 
 # win32/*.h
-for f in pe.h handle.h ntsyscall.h ntdll_shim.h kernel32_shim.h \
+for f in pe.h handle.h filelock.h ntsyscall.h ntdll_shim.h kernel32_shim.h \
          msvcrt_shim.h advapi32_shim.h user32_shim.h gdi32_shim.h \
          wsock32_shim.h shell32_shim.h winmm_shim.h comctl32_shim.h \
          comdlg32_shim.h dllloader.h ddraw_shim.h ole32_shim.h \

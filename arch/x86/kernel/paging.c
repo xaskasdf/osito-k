@@ -415,6 +415,67 @@ uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt)
     return &pt[PT_INDEX(virt)];
 }
 
+int paging_query_mapping_in_cr3(uint64_t cr3, uint64_t virt,
+                                uint64_t *flags, uint64_t *page_size)
+{
+    if (!cr3) return -1;
+
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
+    uint64_t pml4e = pml4[PML4_INDEX(virt)];
+    if (!(pml4e & PTE_PRESENT)) return -1;
+
+    int writable = (pml4e & PTE_WRITABLE) != 0;
+    int user = (pml4e & PTE_USER) != 0;
+    uint64_t nx = pml4e & PTE_NX;
+
+    uint64_t *pdpt = (uint64_t *)PHYS_TO_VIRT(pml4e & PTE_ADDR_MASK);
+    uint64_t pdpte = pdpt[PDPT_INDEX(virt)];
+    if (!(pdpte & PTE_PRESENT)) return -1;
+    writable = writable && (pdpte & PTE_WRITABLE);
+    user = user && (pdpte & PTE_USER);
+    nx |= pdpte & PTE_NX;
+    if (pdpte & PTE_LARGE) {
+        uint64_t effective = pdpte;
+        if (!writable) effective &= ~PTE_WRITABLE;
+        if (!user) effective &= ~PTE_USER;
+        effective |= nx;
+        if (flags) *flags = effective;
+        if (page_size) *page_size = 1ULL << 30;
+        return 0;
+    }
+
+    uint64_t *pd = (uint64_t *)PHYS_TO_VIRT(pdpte & PTE_ADDR_MASK);
+    uint64_t pde = pd[PD_INDEX(virt)];
+    if (!(pde & PTE_PRESENT)) return -1;
+    writable = writable && (pde & PTE_WRITABLE);
+    user = user && (pde & PTE_USER);
+    nx |= pde & PTE_NX;
+    if (pde & PTE_LARGE) {
+        uint64_t effective = pde;
+        if (!writable) effective &= ~PTE_WRITABLE;
+        if (!user) effective &= ~PTE_USER;
+        effective |= nx;
+        if (flags) *flags = effective;
+        if (page_size) *page_size = 1ULL << 21;
+        return 0;
+    }
+
+    uint64_t *pt = (uint64_t *)PHYS_TO_VIRT(pde & PTE_ADDR_MASK);
+    uint64_t pte = pt[PT_INDEX(virt)];
+    if (!(pte & PTE_PRESENT)) return -1;
+    writable = writable && (pte & PTE_WRITABLE);
+    user = user && (pte & PTE_USER);
+    nx |= pte & PTE_NX;
+
+    uint64_t effective = pte;
+    if (!writable) effective &= ~PTE_WRITABLE;
+    if (!user) effective &= ~PTE_USER;
+    effective |= nx;
+    if (flags) *flags = effective;
+    if (page_size) *page_size = PAGE_SIZE;
+    return 0;
+}
+
 uint64_t paging_translate_in_cr3(uint64_t cr3, uint64_t virt)
 {
     if (!cr3) return UINT64_MAX;

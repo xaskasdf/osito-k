@@ -1,8 +1,8 @@
 /*
  * OsitoK — DOS INT Handler Stubs for Native 32-bit Execution
  *
- * When DOS4GW switches to 32-bit protected mode and DOOM runs natively,
- * INT 21h/10h/16h/20h trap here via the IDT. We save the full register
+ * When a DPMI client enters 32-bit protected mode, its DOS, BIOS, DPMI,
+ * and mouse interrupts trap here through the IDT. We save the full register
  * state, call the C dispatcher, restore registers, and IRETQ back.
  *
  * Uses IST2 (separate from Win32's IST1) to avoid stack conflicts.
@@ -16,12 +16,13 @@
 .text
 
 /*
- * Common handler body — entered with RDI = interrupt number.
+ * Common handler body — entered with the interrupt number pushed by the
+ * vector stub immediately above the CPU's IRET frame.
  * Saves all GPRs, calls dos_int_native_dispatch(int_num, regs_ptr), restores.
  */
 dos_int_common:
-    /* CPU loaded RSP from TSS.IST2, pushed 40-byte IRET frame.
-     * RDI already contains the interrupt number (set by each stub). */
+    /* CPU loaded RSP from TSS.IST2 and pushed a 40-byte IRET frame. The
+     * vector stub then pushed one qword without clobbering a guest GPR. */
 
     /* Save all registers */
     push %rax
@@ -57,7 +58,7 @@ dos_int_common:
     movq %r10, (%r11)
 
     /*
-     * Stack layout (17 GPRs + 2 segs + IST2 = 20 * 8 = 160 bytes + IRET 40 = 200):
+     * Stack layout after the common saves:
      *   [RSP +   0]:  saved old IST2
      *   [RSP +   8]:  ES
      *   [RSP +  16]:  DS
@@ -79,17 +80,18 @@ dos_int_common:
      *   [RSP +  72]:  R9
      *   [RSP +  80]:  R8
      *   [RSP +  88]:  RBP
-     *   [RSP +  96]:  RDI (= int_num)
+     *   [RSP +  96]:  guest RDI
      *   [RSP + 104]:  RSI
      *   [RSP + 112]:  RDX
      *   [RSP + 120]:  RCX
      *   [RSP + 128]:  RBX
      *   [RSP + 136]:  RAX
-     *   [RSP + 144]:  IRET RIP
-     *   [RSP + 152]:  IRET CS
-     *   [RSP + 160]:  IRET RFLAGS
-     *   [RSP + 168]:  IRET RSP
-     *   [RSP + 176]:  IRET SS
+     *   [RSP + 144]:  interrupt number
+     *   [RSP + 152]:  IRET RIP
+     *   [RSP + 160]:  IRET CS
+     *   [RSP + 168]:  IRET RFLAGS
+     *   [RSP + 176]:  IRET RSP
+     *   [RSP + 184]:  IRET SS
      */
 
     /* Restore 64-bit data segments for kernel C code */
@@ -98,10 +100,10 @@ dos_int_common:
     mov %ax, %es
 
     /* Call C dispatcher:
-     *   RDI = interrupt number (already in saved RDI at RSP+96)
+     *   RDI = interrupt number
      *   RSI = pointer to saved register frame on stack
      * The C function reads/writes registers via the frame pointer. */
-    movq 96(%rsp), %rdi     /* int_num from saved RDI */
+    movq 144(%rsp), %rdi    /* vector pushed by the entry stub */
     leaq 8(%rsp), %rsi      /* pointer to ES on stack = start of regs frame */
 
     mov %rsp, %rbp
@@ -136,51 +138,81 @@ dos_int_common:
     pop %rbx
     pop %rax
 
+    addq $8, %rsp           /* discard interrupt number */
     iretq
 
 /*
- * Individual INT stubs — each sets RDI to the interrupt number
- * and jumps to the common handler.
+ * Individual INT stubs push the vector without changing guest registers.
  */
 
 .globl dos_int08_stub
 dos_int08_stub:             /* Timer (IRQ 0) */
-    mov $0x08, %edi
+    pushq $0x08
     jmp dos_int_common
 
 .globl dos_int10_stub
 dos_int10_stub:             /* BIOS Video */
-    mov $0x10, %edi
+    pushq $0x10
     jmp dos_int_common
 
 .globl dos_int16_stub
 dos_int16_stub:             /* BIOS Keyboard */
-    mov $0x16, %edi
+    pushq $0x16
     jmp dos_int_common
 
 .globl dos_int20_stub
 dos_int20_stub:             /* DOS Terminate */
-    mov $0x20, %edi
+    pushq $0x20
     jmp dos_int_common
 
 .globl dos_int21_stub
 dos_int21_stub:             /* DOS API */
-    mov $0x21, %edi
+    pushq $0x21
     jmp dos_int_common
 
 .globl dos_int2f_stub
 dos_int2f_stub:             /* DOS Multiplex */
-    mov $0x2F, %edi
+    pushq $0x2F
     jmp dos_int_common
 
 .globl dos_int31_stub
 dos_int31_stub:             /* DPMI */
-    mov $0x31, %edi
+    pushq $0x31
     jmp dos_int_common
 
 .globl dos_int33_stub
 dos_int33_stub:             /* Mouse */
-    mov $0x33, %edi
+    pushq $0x33
+    jmp dos_int_common
+
+.globl dos_int67_stub
+dos_int67_stub:             /* EMS / VCPI */
+    pushq $0x67
+    jmp dos_int_common
+
+.globl dos_intf9_stub
+dos_intf9_stub:             /* DPMI default protected-mode reflector */
+    pushq $0xF9
+    jmp dos_int_common
+
+.globl dos_intfa_stub
+dos_intfa_stub:             /* DPMI real-mode callback return */
+    pushq $0xFA
+    jmp dos_int_common
+
+.globl dos_intfc_stub
+dos_intfc_stub:             /* DPMI raw PM-to-RM switch */
+    pushq $0xFC
+    jmp dos_int_common
+
+.globl dos_intfd_stub
+dos_intfd_stub:             /* DPMI processor-exception return */
+    pushq $0xFD
+    jmp dos_int_common
+
+.globl dos_exc01_stub
+dos_exc01_stub:             /* #DB, distinguished from software INT 01h */
+    pushq $0x101
     jmp dos_int_common
 
 .section .note.GNU-stack,"",%progbits

@@ -8,6 +8,8 @@
  */
 
 #include "cpu8086.h"
+#include "dos_audio.h"
+#include "dos_io.h"
 #include "dos_jit.h"
 
 /* ── External interfaces ─────────────────────────────────────────── */
@@ -18,23 +20,74 @@ extern void serial_putdec(uint64_t val);
 
 /* INT dispatch (dos_int.c) */
 extern void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num);
+extern void dos_transfer_to_native(dos_vm_t *vm);
+extern int kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
+extern uint64_t idt_get_ticks(void);
+extern int sched_sleep_ticks(uint64_t ticks);
+extern void sched_yield(void);
+
+#define DOS_CR0_MP (1U << 1)
+#define DOS_CR0_EM (1U << 2)
+#define DOS_CR0_TS (1U << 3)
+#define DOS_CR0_ET (1U << 4)
+
+#define DOS_CPUID_MAX_BASIC    0x00000001U
+#define DOS_CPUID_MAX_EXTENDED 0x80000000U
+#define DOS_CPUID_SIGNATURE    0x00000500U
+
+static void cpu_cpuid(cpu8086_state_t *cpu)
+{
+    uint32_t leaf = cpu->eax;
+
+    cpu->eax = 0;
+    cpu->ebx = 0;
+    cpu->ecx = 0;
+    cpu->edx = 0;
+
+    switch (leaf) {
+    case 0:
+        cpu->eax = DOS_CPUID_MAX_BASIC;
+        cpu->ebx = 0x7469734FU; /* "Osit" */
+        cpu->edx = 0x4D564B6FU; /* "oKVM" */
+        cpu->ecx = 0x20555043U; /* "CPU " */
+        break;
+    case 1:
+        /* Pentium-class integer core. No optional feature is advertised
+         * until its instruction and state-management contracts exist. */
+        cpu->eax = DOS_CPUID_SIGNATURE;
+        break;
+    case DOS_CPUID_MAX_EXTENDED:
+        cpu->eax = DOS_CPUID_MAX_EXTENDED;
+        break;
+    default:
+        break;
+    }
+}
 
 /* VGA flush (dos_vga.c) */
 extern void dos_vga_flush(dos_vm_t *vm);
 extern void dos_vga_mark_dirty(dos_vm_t *vm, uint32_t addr);
-
-/* I/O ports (dos_io.c) */
-extern uint8_t  dos_io_read8(dos_vm_t *vm, uint16_t port);
-extern uint16_t dos_io_read16(dos_vm_t *vm, uint16_t port);
-extern void     dos_io_write8(dos_vm_t *vm, uint16_t port, uint8_t val);
-extern void     dos_io_write16(dos_vm_t *vm, uint16_t port, uint16_t val);
+extern void dos_vga_mode13_present(void);
 
 /* ── Memory write (with VGA dirty tracking) ──────────────────────── */
 
 void dos_mem_write8(dos_vm_t *vm, uint32_t addr, uint8_t val)
 {
-    if (addr >= DOS_MEM_SIZE)
+    if (!vm || !vm->mem || addr >= vm->total_mem_size)
         return;
+    addr = dos_vbe_memory_address(vm, addr);
+    if (addr >= vm->total_mem_size)
+        return;
+    uint32_t frame_offset = addr - DOS_EMS_PAGE_FRAME_BASE;
+    if (frame_offset < DOS_EMS_FRAME_PAGES * DOS_EMS_PAGE_SIZE) {
+        uint32_t backing = vm->ems_frame_bases[frame_offset /
+                                                DOS_EMS_PAGE_SIZE];
+        if (backing) {
+            addr = backing + (frame_offset & (DOS_EMS_PAGE_SIZE - 1u));
+            if (addr >= vm->total_mem_size)
+                return;
+        }
+    }
     /* Watchpoint: catch MCB owner corruption at 0x600-0x604 */
     if (addr >= 0x600 && addr <= 0x604) {
         serial_puts("[WATCH] write @");
@@ -50,7 +103,10 @@ void dos_mem_write8(dos_vm_t *vm, uint32_t addr, uint8_t val)
         serial_puts("\n");
     }
     vm->mem[addr] = val;
-    if (addr >= DOS_VRAM_BASE && addr < DOS_VRAM_BASE + DOS_VRAM_SIZE)
+    if ((addr >= DOS_CONV_TOP &&
+         addr < DOS_VRAM_BASE + DOS_VRAM_SIZE) ||
+        (addr >= DOS_VBE_FB_BASE &&
+         addr < DOS_VBE_FB_BASE + DOS_VBE_FB_SIZE))
         dos_vga_mark_dirty(vm, addr);
 }
 
@@ -76,10 +132,17 @@ void cpu8086_init(cpu8086_state_t *cpu, dos_vm_t *vm)
     cpu->fs = 0; cpu->gs = 0;
     cpu->eip = 0;
     cpu->eflags = FLAGS_FIXED;
-    cpu->cr0 = 0; cpu->cr2 = 0; cpu->cr3 = 0;
+    /* The interpreter exposes the x86 software-emulation contract. */
+    cpu->cr0 = DOS_CR0_ET | DOS_CR0_EM | DOS_CR0_MP;
+    cpu->cr2 = 0; cpu->cr3 = 0;
+    for (unsigned i = 0; i < 8; i++) cpu->dr[i] = 0;
+    cpu->dr[6] = 0xFFFF0FF0u;
+    cpu->dr[7] = 0x00000400u;
     cpu->gdtr.limit = 0; cpu->gdtr.base = 0;
     cpu->idtr.limit = 0; cpu->idtr.base = 0;
+    cpu->ldtr = 0; cpu->tr = 0;
     cpu->protected_mode = false;
+    cpu->pm_cs_loaded    = false;
     cpu->op_size_32     = false;
     cpu->addr_size_32   = false;
     cpu->prefix_66      = false;
@@ -185,30 +248,58 @@ typedef struct {
     bool     is_reg;      /* true if mod==11 (register operand) */
 } modrm_t;
 
-/* Update op/addr size from CS descriptor's D bit after CS load in PM */
-static void cpu_update_cs_mode(cpu8086_state_t *cpu)
+static bool cpu_cs_descriptor(dos_vm_t *vm, uint16_t selector,
+                              dpmi_descriptor_t *out)
+{
+    return dpmi_guest_descriptor(vm, selector, out);
+}
+
+/* Validate a reloaded CS and update its default operand/address size. */
+static bool cpu_update_cs_mode(cpu8086_state_t *cpu)
 {
     dos_vm_t *vm = cpu->vm;
-    if (!cpu->protected_mode) return;
-    uint16_t index = cpu->cs >> 3;
-    bool ti = (cpu->cs >> 2) & 1;
-    if (ti && index < DPMI_MAX_DESCRIPTORS) {
-        bool d32 = (vm->dpmi.ldt[index].flags_lim & 0x40) != 0;
-        bool old32 = cpu->op_size_32;
-        cpu->op_size_32 = d32;
-        cpu->addr_size_32 = d32;
-        if (d32 != old32) {
-            serial_puts("[DPMI] CS mode: ");
-            serial_puthex(cpu->cs, 4);
-            serial_puts(d32 ? " -> USE32" : " -> USE16");
-            serial_puts(" EIP=");
-            serial_puthex(cpu->eip, 8);
-            serial_puts(" base=");
-            uint32_t base = dpmi_desc_get_base(&vm->dpmi.ldt[index]);
-            serial_puthex(base, 8);
-            serial_puts("\n");
-        }
+    if (!cpu->protected_mode) return false;
+    dpmi_descriptor_t desc;
+    if (!cpu_cs_descriptor(vm, cpu->cs, &desc) ||
+        (desc.access & (DESC_PRESENT | DESC_SEGMENT | DESC_CODE)) !=
+        (DESC_PRESENT | DESC_SEGMENT | DESC_CODE)) {
+        cpu->op_size_32 = false;
+        cpu->addr_size_32 = false;
+        serial_puts("[DPMI] Invalid CS selector: ");
+        serial_puthex(cpu->cs, 4);
+        serial_puts("\n");
+        return false;
     }
+
+    bool d32 = (desc.flags_lim & DESC_32BIT) != 0;
+    bool old32 = cpu->op_size_32;
+    cpu->op_size_32 = d32;
+    cpu->addr_size_32 = d32;
+    if (d32 != old32) {
+        serial_puts("[DPMI] CS mode: ");
+        serial_puthex(cpu->cs, 4);
+        serial_puts(d32 ? " -> USE32" : " -> USE16");
+        serial_puts(" EIP=");
+        serial_puthex(cpu->eip, 8);
+        serial_puts(" base=");
+        serial_puthex(dpmi_desc_get_base(&desc), 8);
+        serial_puts("\n");
+    }
+    return true;
+}
+
+void cpu8086_sync_cs(cpu8086_state_t *cpu)
+{
+    if (!cpu->protected_mode) return;
+    cpu->pm_cs_loaded = true;
+    (void)cpu_update_cs_mode(cpu);
+}
+
+static void cpu_commit_cs_load(cpu8086_state_t *cpu)
+{
+    cpu8086_sync_cs(cpu);
+    if (cpu->protected_mode && cpu->op_size_32)
+        dos_transfer_to_native(cpu->vm);
 }
 
 static modrm_t decode_modrm(cpu8086_state_t *cpu, uint8_t modrm)
@@ -1169,21 +1260,122 @@ static uint16_t string_src_seg(cpu8086_state_t *cpu)
     return cpu->ds;
 }
 
+static bool cpu_service_timer(dos_vm_t *vm)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+    uint64_t now = idt_get_ticks();
+    uint64_t elapsed = now - vm->start_ticks;
+    uint32_t ticks = (uint32_t)((elapsed * 182u) / 1000u);
+    bool bios_tick_changed = ticks != vm->bios_ticks;
+
+    if (bios_tick_changed) {
+        vm->bios_ticks = ticks;
+        vm->last_timer_tick = now;
+        dos_mem_write32(vm, 0x46C, ticks);
+    }
+    if (dos_io_timer_poll(vm) || (!vm->io && bios_tick_changed))
+        vm->timer_irq_pending = true;
+
+    bool interrupts_enabled = cpu->protected_mode && vm->dpmi.active
+                            ? vm->dpmi.virtual_interrupts_enabled
+                            : (cpu->flags & FLAG_IF) != 0;
+    if (!interrupts_enabled)
+        return false;
+
+    uint8_t audio_irq = 0;
+    uint32_t audio_pending = 0;
+    if (dos_audio_take_irq(vm, &audio_irq, &audio_pending)) {
+        uint8_t audio_vector = 0;
+        if (dos_io_irq_begin(vm, audio_irq, &audio_vector) &&
+            cpu_deliver_hw_interrupt(vm, audio_vector))
+            return true;
+        dos_audio_restore_irq(vm, audio_pending);
+    }
+
+    if (!vm->timer_irq_pending)
+        return false;
+
+    uint8_t timer_vector = 0;
+    if (!dos_io_irq_begin(vm, 0U, &timer_vector) ||
+        !cpu_deliver_hw_interrupt(vm, timer_vector))
+        return false;
+    vm->timer_irq_pending = false;
+    return true;
+}
+
+static void cpu_wait_halted(dos_vm_t *vm)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+    while (cpu->running && cpu->halted) {
+        if (cpu_service_timer(vm))
+            break;
+        if (sched_sleep_ticks(1) < 0)
+            sched_yield();
+    }
+}
+
 /* ── Main execution loop ─────────────────────────────────────────── */
 
 int cpu8086_run(dos_vm_t *vm)
 {
-    cpu8086_state_t *cpu = vm->cpu;
+    cpu8086_state_t *cpu;
     uint8_t opcode;
     uint8_t modrm_byte;
     modrm_t m;
 
-    /* JIT engine (optional — NULL if not initialized) */
-    jit_state_t *jit = (jit_state_t *)vm->jit;
+    jit_state_t *jit;
+    uint16_t prev_cs;
 
-    uint16_t prev_cs = cpu->cs;
+    /* Native DPMI clients return through INT FC. Resume here, above the
+     * opcode handlers that initiated the native transition, so no stale
+     * handler-local state can overwrite the restored real-mode CS:IP. */
+    vm->native_resume_armed = true;
+    int native_resume = kern_setjmp(vm->native_resume_jmpbuf);
 
-    while (cpu->running && !cpu->halted) {
+    cpu = vm->cpu;
+    jit = (jit_state_t *)vm->jit;
+    prev_cs = cpu->cs;
+
+    if (native_resume != 0) {
+        __asm__ volatile ("sti" ::: "memory");
+        serial_puts("[DOS-NT] resumed interpreter at ");
+        serial_puthex(cpu->cs, 4);
+        serial_puts(":");
+        serial_puthex(cpu->eip, 8);
+        serial_puts(" ss:sp=");
+        serial_puthex(cpu->ss, 4);
+        serial_puts(":");
+        serial_puthex(cpu->esp, 8);
+        serial_puts("\n");
+    }
+
+    for (;;) {
+        if (!cpu->running) {
+            if (!dos_exec_complete_termination(vm)) break;
+            cpu = vm->cpu;
+            jit = (jit_state_t *)vm->jit;
+            prev_cs = cpu->cs;
+        }
+
+        if (dos_exec_activate_loaded_child(vm)) {
+            cpu = vm->cpu;
+            jit = (jit_state_t *)vm->jit;
+            prev_cs = cpu->cs;
+        }
+
+        if (vm->interpreter_stop_active && !cpu->protected_mode &&
+            cpu->cs == vm->interpreter_stop_cs &&
+            cpu->ip == vm->interpreter_stop_ip) {
+            vm->interpreter_stop_reached = true;
+            break;
+        }
+
+        if (cpu->halted) {
+            cpu_wait_halted(vm);
+            if (!cpu->running) continue;
+        }
+
+        uint32_t insn_eip = cpu->eip;
 
         /* ── Hybrid dispatcher: JIT cache → compile if hot → interpret ── */
         if (jit && !cpu->protected_mode) {
@@ -1412,102 +1604,16 @@ int cpu8086_run(dos_vm_t *vm)
         case 0x0F: {
             uint8_t op2 = cpu_fetch8(cpu);
             switch (op2) {
-            case 0x80: { /* JO near (386+) */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (get_flag(cpu, FLAG_OF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x81: { /* JNO near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (!get_flag(cpu, FLAG_OF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x82: { /* JB/JC near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (get_flag(cpu, FLAG_CF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x83: { /* JNB/JAE/JNC near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (!get_flag(cpu, FLAG_CF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x84: { /* JZ/JE near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (get_flag(cpu, FLAG_ZF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x85: { /* JNZ/JNE near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (!get_flag(cpu, FLAG_ZF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x86: { /* JBE/JNA near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (get_flag(cpu, FLAG_CF) || get_flag(cpu, FLAG_ZF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x87: { /* JA/JNBE near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (!get_flag(cpu, FLAG_CF) && !get_flag(cpu, FLAG_ZF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x88: { /* JS near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (get_flag(cpu, FLAG_SF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x89: { /* JNS near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (!get_flag(cpu, FLAG_SF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x8A: { /* JP/JPE near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (get_flag(cpu, FLAG_PF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x8B: { /* JNP/JPO near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (!get_flag(cpu, FLAG_PF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x8C: { /* JL/JNGE near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (get_flag(cpu, FLAG_SF) != get_flag(cpu, FLAG_OF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x8D: { /* JGE/JNL near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (get_flag(cpu, FLAG_SF) == get_flag(cpu, FLAG_OF))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x8E: { /* JLE/JNG near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (get_flag(cpu, FLAG_ZF) ||
-                    (get_flag(cpu, FLAG_SF) != get_flag(cpu, FLAG_OF)))
-                    cpu->ip += rel;
-                break;
-            }
-            case 0x8F: { /* JG/JNLE near */
-                int16_t rel = (int16_t)cpu_fetch16(cpu);
-                if (!get_flag(cpu, FLAG_ZF) &&
-                    (get_flag(cpu, FLAG_SF) == get_flag(cpu, FLAG_OF)))
-                    cpu->ip += rel;
+            case 0x80: case 0x81: case 0x82: case 0x83:
+            case 0x84: case 0x85: case 0x86: case 0x87:
+            case 0x88: case 0x89: case 0x8A: case 0x8B:
+            case 0x8C: case 0x8D: case 0x8E: case 0x8F: { /* Jcc near */
+                int32_t rel = op32 ? (int32_t)cpu_fetch32(cpu)
+                                   : (int16_t)cpu_fetch16(cpu);
+                if (eval_condition(cpu, op2 - 0x80)) {
+                    if (op32) cpu->eip += (uint32_t)rel;
+                    else cpu->ip += (int16_t)rel;
+                }
                 break;
             }
             /* ── 0F 00: Group 6 (SLDT/STR/LLDT/LTR/VERR/VERW) ─── */
@@ -1516,13 +1622,13 @@ int cpu8086_run(dos_vm_t *vm)
                 modrm_t g6m = decode_modrm(cpu, g6_modrm);
                 switch (g6m.reg_field) {
                 case 0: /* SLDT */
-                    modrm_write16(cpu, &g6m, 0); break;
+                    modrm_write16(cpu, &g6m, cpu->ldtr); break;
                 case 1: /* STR */
-                    modrm_write16(cpu, &g6m, 0); break;
+                    modrm_write16(cpu, &g6m, cpu->tr); break;
                 case 2: /* LLDT */
-                    (void)modrm_read16(cpu, &g6m); break;
+                    cpu->ldtr = modrm_read16(cpu, &g6m); break;
                 case 3: /* LTR */
-                    (void)modrm_read16(cpu, &g6m); break;
+                    cpu->tr = modrm_read16(cpu, &g6m); break;
                 case 4: /* VERR */
                     set_flag(cpu, FLAG_ZF, true); break;
                 case 5: /* VERW */
@@ -1650,10 +1756,8 @@ int cpu8086_run(dos_vm_t *vm)
                     if ((cr_val & 1) && !cpu->protected_mode) {
                         cpu->protected_mode = true;
                         serial_puts("[DOS] MOV CR0: PE=1\n");
-                        extern void dos_transfer_to_native(dos_vm_t *vm);
-                        dos_transfer_to_native(vm);
                     } else if (!(cr_val & 1) && cpu->protected_mode) {
-                        /* PM → RM transition (DOS4GW raw mode switch) */
+                        /* Protected-mode to real-mode transition. */
                         cpu->protected_mode = false;
                         cpu->pm_cs_loaded   = false;
                         cpu->op_size_32     = false;
@@ -1669,6 +1773,58 @@ int cpu8086_run(dos_vm_t *vm)
                     serial_puts("\n");
                     break;
                 }
+                break;
+            }
+
+            case 0x06: /* CLTS */
+                cpu->cr0 &= ~DOS_CR0_TS;
+                break;
+
+            case 0x08: /* INVD */
+            case 0x09: /* WBINVD */
+                /* Guest memory is coherent and has no virtual CPU cache. */
+                break;
+
+            case 0x0B: /* UD2 */
+                (void)cpu_deliver_exception(vm, 6, insn_eip, 0, false);
+                break;
+
+            case 0xA0: /* PUSH FS */
+                if (op32) cpu_push32(cpu, (uint32_t)cpu->fs);
+                else cpu_push16(cpu, cpu->fs);
+                break;
+
+            case 0xA1: /* POP FS */
+                if (op32) cpu->fs = (uint16_t)cpu_pop32(cpu);
+                else cpu->fs = cpu_pop16(cpu);
+                break;
+
+            case 0xA2: /* CPUID */
+                cpu_cpuid(cpu);
+                break;
+
+            case 0xA8: /* PUSH GS */
+                if (op32) cpu_push32(cpu, (uint32_t)cpu->gs);
+                else cpu_push16(cpu, cpu->gs);
+                break;
+
+            case 0xA9: /* POP GS */
+                if (op32) cpu->gs = (uint16_t)cpu_pop32(cpu);
+                else cpu->gs = cpu_pop16(cpu);
+                break;
+
+            case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+            case 0xCC: case 0xCD: case 0xCE: case 0xCF: { /* BSWAP r32 */
+                if (!op32) {
+                    (void)cpu_deliver_exception(vm, 6, insn_eip, 0, false);
+                    break;
+                }
+                uint32_t *reg = reg32_ptr(cpu, op2 - 0xC8);
+                uint32_t value = *reg;
+                *reg = ((value & 0x000000FFU) << 24) |
+                       ((value & 0x0000FF00U) << 8) |
+                       ((value & 0x00FF0000U) >> 8) |
+                       ((value & 0xFF000000U) >> 24);
                 break;
             }
 
@@ -1921,15 +2077,7 @@ int cpu8086_run(dos_vm_t *vm)
             }
 
             default:
-                /* Unknown 0F opcode — most have a ModRM byte.
-                 * Consume it silently to stay aligned. */
-                if (op2 != 0x0B && op2 != 0x06 && op2 != 0x08 &&
-                    op2 != 0x09 && op2 != 0x77) {
-                    /* These are single-byte 0F opcodes (UD2, CLTS, INVD, WBINVD, EMMS).
-                     * Everything else has ModRM. */
-                    modrm_byte = cpu_fetch8(cpu);
-                    (void)decode_modrm(cpu, modrm_byte);
-                }
+                (void)cpu_deliver_exception(vm, 6, insn_eip, 0, false);
                 break;
             }
             break;
@@ -2724,17 +2872,17 @@ int cpu8086_run(dos_vm_t *vm)
             }
             cpu->cs = seg;
             cpu->eip = off;
-            if (cpu->protected_mode) {
-                cpu->pm_cs_loaded = true;
-                cpu_update_cs_mode(cpu);
-            }
+            cpu_commit_cs_load(cpu);
             break;
         }
 
         /* ════════════════════════════════════════════════════════════
          *  FWAIT / SAHF / LAHF  (0x9B / 0x9E / 0x9F)
          * ════════════════════════════════════════════════════════════ */
-        case 0x9B: /* FWAIT/WAIT — NOP (no FPU to wait for) */
+        case 0x9B: /* FWAIT/WAIT */
+            if ((cpu->cr0 & (DOS_CR0_MP | DOS_CR0_TS)) ==
+                (DOS_CR0_MP | DOS_CR0_TS))
+                (void)cpu_deliver_exception(vm, 7, insn_eip, 0, false);
             break;
         case 0x9E: /* SAHF — AH → flags low byte */
             cpu->flags = (cpu->flags & 0xFF00) | (cpu->ah & 0xD5) | FLAGS_FIXED;
@@ -3106,11 +3254,10 @@ int cpu8086_run(dos_vm_t *vm)
             uint16_t pop_bytes = cpu_fetch16(cpu);
             if (op32) {
                 cpu->eip = cpu_pop32(cpu);
-                cpu->esp += pop_bytes;
             } else {
                 cpu->ip = cpu_pop16(cpu);
-                cpu->sp += pop_bytes;
             }
+            cpu_stack_adjust(cpu, pop_bytes);
             break;
         }
         case 0xC3: /* RET near */
@@ -3148,42 +3295,59 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xC8: { /* ENTER imm16, imm8 */
             uint16_t alloc_size = cpu_fetch16(cpu);
-            uint8_t nesting = cpu_fetch8(cpu);
+            uint8_t nesting = cpu_fetch8(cpu) & 0x1Fu;
+            bool stack32 = cpu_stack_addr32(cpu);
             if (op32) {
                 cpu_push32(cpu, cpu->ebp);
                 uint32_t frame = cpu->esp;
                 if (nesting > 0) {
                     for (uint8_t i = 1; i < nesting; i++) {
-                        cpu->ebp -= 4;
-                        cpu_push32(cpu, dos_mem_read32(vm, dos_addr(vm, cpu->ss, cpu->ebp)));
+                        uint32_t source;
+                        if (stack32) {
+                            cpu->ebp -= 4u;
+                            source = cpu->ebp;
+                        } else {
+                            cpu->bp -= 4u;
+                            source = cpu->bp;
+                        }
+                        cpu_push32(cpu, dos_mem_read32(
+                            vm, dos_addr(vm, cpu->ss, source)));
                     }
                     cpu_push32(cpu, frame);
                 }
                 cpu->ebp = frame;
-                cpu->esp -= alloc_size;
             } else {
                 cpu_push16(cpu, cpu->bp);
                 uint16_t frame = cpu->sp;
                 if (nesting > 0) {
                     for (uint8_t i = 1; i < nesting; i++) {
-                        cpu->bp -= 2;
-                        cpu_push16(cpu, dos_mem_read16(vm, dos_addr(vm, cpu->ss, cpu->bp)));
+                        uint32_t source;
+                        if (stack32) {
+                            cpu->ebp -= 2u;
+                            source = cpu->ebp;
+                        } else {
+                            cpu->bp -= 2u;
+                            source = cpu->bp;
+                        }
+                        cpu_push16(cpu, dos_mem_read16(
+                            vm, dos_addr(vm, cpu->ss, source)));
                     }
                     cpu_push16(cpu, frame);
                 }
                 cpu->bp = frame;
-                cpu->sp -= alloc_size;
             }
+            cpu_stack_adjust(cpu, -(int32_t)alloc_size);
             break;
         }
         case 0xC9: /* LEAVE */
-            if (op32) {
-                cpu->esp = cpu->ebp;
+            if (cpu_stack_addr32(cpu))
+                cpu_stack_set_offset(cpu, cpu->ebp);
+            else
+                cpu_stack_set_offset(cpu, cpu->bp);
+            if (op32)
                 cpu->ebp = cpu_pop32(cpu);
-            } else {
-                cpu->sp = cpu->bp;
+            else
                 cpu->bp = cpu_pop16(cpu);
-            }
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -3194,16 +3358,12 @@ int cpu8086_run(dos_vm_t *vm)
             if (op32) {
                 cpu->eip = cpu_pop32(cpu);
                 cpu->cs  = (uint16_t)cpu_pop32(cpu);
-                cpu->esp += pop_bytes;
             } else {
                 cpu->ip = cpu_pop16(cpu);
                 cpu->cs = cpu_pop16(cpu);
-                cpu->sp += pop_bytes;
             }
-            if (cpu->protected_mode) {
-                cpu->pm_cs_loaded = true;
-                cpu_update_cs_mode(cpu);
-            }
+            cpu_stack_adjust(cpu, pop_bytes);
+            cpu_commit_cs_load(cpu);
             break;
         }
         case 0xCB: /* RETF */
@@ -3214,33 +3374,14 @@ int cpu8086_run(dos_vm_t *vm)
                 cpu->ip = cpu_pop16(cpu);
                 cpu->cs = cpu_pop16(cpu);
             }
-            if (cpu->protected_mode) {
-                cpu->pm_cs_loaded = true;
-                cpu_update_cs_mode(cpu);
-            }
+            cpu_commit_cs_load(cpu);
             break;
 
         /* ════════════════════════════════════════════════════════════
          *  INT 3 (0xCC) — Breakpoint
          * ════════════════════════════════════════════════════════════ */
         case 0xCC: { /* INT 3 */
-            uint16_t s_cs = cpu->cs; uint32_t s_eip = cpu->eip;
-            if (cpu->pm_cs_loaded) {
-                cpu_push32(cpu, cpu->eflags);
-                cpu_push32(cpu, (uint32_t)cpu->cs);
-                cpu_push32(cpu, cpu->eip);
-            } else {
-                cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                cpu_push16(cpu, cpu->cs);
-                cpu_push16(cpu, cpu->ip);
-            }
-            set_flag(cpu, FLAG_IF, false);
-            set_flag(cpu, FLAG_TF, false);
-            dos_int_dispatch(vm, 3);
-            if (cpu->cs == s_cs && cpu->eip == s_eip) {
-                if (cpu->pm_cs_loaded) cpu->esp += 12;
-                else cpu->sp += 6;
-            }
+            (void)cpu_deliver_exception(vm, 3, cpu->eip, 0, false);
             break;
         }
 
@@ -3249,6 +3390,7 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCD: { /* INT imm8 */
             uint8_t int_num = cpu_fetch8(cpu);
+            bool frame32 = cpu->protected_mode ? cpu->op_size_32 : op32;
             /* Log INTs during early boot only. Post-5K insns the serial
              * spam dominates wall-clock (every [INT] is ~40 bytes at 115200
              * baud → caps the emulator at ~3000 insns/s). Unhandled INTs
@@ -3265,9 +3407,14 @@ int cpu8086_run(dos_vm_t *vm)
             /* Save return address for detecting C-handled vs IVT-redirect */
             uint16_t saved_cs = cpu->cs;
             uint32_t saved_eip = cpu->eip;
+            uint32_t saved_eflags = cpu->eflags;
+
+            if (cpu_deliver_pm_software_interrupt(vm, int_num,
+                                                  saved_eip))
+                break;
 
             /* Push interrupt frame */
-            if (cpu->pm_cs_loaded) {
+            if (frame32) {
                 cpu_push32(cpu, cpu->eflags);
                 cpu_push32(cpu, (uint32_t)cpu->cs);
                 cpu_push32(cpu, cpu->eip);
@@ -3279,19 +3426,29 @@ int cpu8086_run(dos_vm_t *vm)
             set_flag(cpu, FLAG_IF, false);
             set_flag(cpu, FLAG_TF, false);
 
+            uint8_t previous_frame_bytes = vm->software_int_frame_bytes;
+            uint32_t previous_return_flags =
+                vm->software_int_return_flags;
+            vm->software_int_frame_bytes = frame32 ? 12u : 6u;
+            vm->software_int_return_flags = saved_eflags;
             dos_int_dispatch(vm, int_num);
+            vm->software_int_frame_bytes = previous_frame_bytes;
+            vm->software_int_return_flags = previous_return_flags;
 
             /* If C handler (CS:IP unchanged), discard the frame — no IRET.
              * Keep current flags (handler set CF etc.), only restore SP.
              * If IVT redirect (CS:IP changed), leave frame for handler's IRET. */
             if (cpu->cs == saved_cs && cpu->eip == saved_eip) {
                 /* Discard the interrupt frame from stack */
-                if (cpu->pm_cs_loaded) {
-                    cpu->esp += 12;  /* 3 × 4 bytes (EIP + CS + EFLAGS) */
-                } else {
-                    cpu->sp += 6;    /* 3 × 2 bytes (IP + CS + FLAGS) */
-                }
-                /* Don't restore flags — handler's flags (CF etc.) are correct */
+                cpu_stack_adjust(cpu, frame32 ? 12 : 6);
+                const uint32_t status_flags = FLAG_CF | FLAG_PF | FLAG_AF |
+                                              FLAG_ZF | FLAG_SF | FLAG_OF;
+                cpu->eflags = (saved_eflags & ~status_flags) |
+                              (cpu->eflags & status_flags) | FLAGS_FIXED;
+                if (cpu->protected_mode && vm->dpmi.active)
+                    cpu->flags |= FLAG_IF;
+            } else {
+                cpu_commit_cs_load(cpu);
             }
             break;
         }
@@ -3301,23 +3458,7 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCE: /* INTO */
             if (cpu->flags & FLAG_OF) {
-                uint16_t s_cs4 = cpu->cs; uint32_t s_eip4 = cpu->eip;
-                if (cpu->pm_cs_loaded) {
-                    cpu_push32(cpu, cpu->eflags);
-                    cpu_push32(cpu, (uint32_t)cpu->cs);
-                    cpu_push32(cpu, cpu->eip);
-                } else {
-                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                    cpu_push16(cpu, cpu->cs);
-                    cpu_push16(cpu, cpu->ip);
-                }
-                set_flag(cpu, FLAG_IF, false);
-                set_flag(cpu, FLAG_TF, false);
-                dos_int_dispatch(vm, 4);
-                if (cpu->cs == s_cs4 && cpu->eip == s_eip4) {
-                    if (cpu->pm_cs_loaded) cpu->esp += 12;
-                    else cpu->sp += 6;
-                }
+                (void)cpu_deliver_exception(vm, 4, cpu->eip, 0, false);
             }
             break;
 
@@ -3325,7 +3466,7 @@ int cpu8086_run(dos_vm_t *vm)
          *  IRET  (0xCF)
          * ════════════════════════════════════════════════════════════ */
         case 0xCF: /* IRET */
-            if (cpu->pm_cs_loaded) {
+            if (op32) {
                 cpu->eip    = cpu_pop32(cpu);
                 cpu->cs     = (uint16_t)cpu_pop32(cpu);
                 cpu->eflags = (cpu_pop32(cpu) & 0x003FFFFF) | FLAGS_FIXED;
@@ -3334,8 +3475,7 @@ int cpu8086_run(dos_vm_t *vm)
                 cpu->cs    = cpu_pop16(cpu);
                 cpu->flags = (cpu_pop16(cpu) & 0x0FFF) | FLAGS_FIXED;
             }
-            if (cpu->protected_mode)
-                cpu_update_cs_mode(cpu);
+            cpu_commit_cs_load(cpu);
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -3496,10 +3636,7 @@ int cpu8086_run(dos_vm_t *vm)
             cpu->cs = seg;
             cpu->eip = off;
 
-            if (cpu->protected_mode) {
-                cpu->pm_cs_loaded = true;
-                cpu_update_cs_mode(cpu);
-            }
+            cpu_commit_cs_load(cpu);
             break;
         }
 
@@ -3533,21 +3670,9 @@ int cpu8086_run(dos_vm_t *vm)
          *  HLT  (0xF4)
          * ════════════════════════════════════════════════════════════ */
         case 0xF4: /* HLT */
-            if (cpu->protected_mode) {
-                /* In PM, HLT waits for an interrupt (typically timer).
-                 * Don't halt the emulator — just advance the BDA tick
-                 * counter and continue. DOS4GW uses STI;HLT to idle. */
-                extern uint64_t idt_get_ticks(void);
-                uint64_t now = idt_get_ticks();
-                if (now - vm->last_timer_tick >= 5) {
-                    vm->last_timer_tick = now;
-                    vm->bios_ticks++;
-                    dos_mem_write32(vm, 0x46C, vm->bios_ticks);
-                }
-                /* Don't halt — continue executing next instruction */
-            } else {
-                cpu->halted = true;
-            }
+            /* HLT resumes only after an interrupt is accepted. The outer
+             * loop parks this host task instead of ending the DOS process. */
+            cpu->halted = true;
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -3603,22 +3728,14 @@ int cpu8086_run(dos_vm_t *vm)
             case 6: { /* DIV r/m8 (unsigned) */
                 uint8_t val = modrm_read8(cpu, &m);
                 if (val == 0) {
-                    /* Division by zero: trigger INT 0 */
-                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                    cpu_push16(cpu, cpu->cs);
-                    cpu_push16(cpu, cpu->ip);
-                    dos_int_dispatch(vm, 0);
+                    (void)cpu_deliver_exception(vm, 0, insn_eip, 0, false);
                     break;
                 }
                 uint16_t dividend = cpu->ax;
                 uint16_t quotient = dividend / val;
                 uint8_t  remainder = dividend % val;
                 if (quotient > 0xFF) {
-                    /* Overflow: trigger INT 0 */
-                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                    cpu_push16(cpu, cpu->cs);
-                    cpu_push16(cpu, cpu->ip);
-                    dos_int_dispatch(vm, 0);
+                    (void)cpu_deliver_exception(vm, 0, insn_eip, 0, false);
                     break;
                 }
                 cpu->al = (uint8_t)quotient;
@@ -3628,10 +3745,7 @@ int cpu8086_run(dos_vm_t *vm)
             case 7: { /* IDIV r/m8 (signed) */
                 uint8_t val = modrm_read8(cpu, &m);
                 if (val == 0) {
-                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                    cpu_push16(cpu, cpu->cs);
-                    cpu_push16(cpu, cpu->ip);
-                    dos_int_dispatch(vm, 0);
+                    (void)cpu_deliver_exception(vm, 0, insn_eip, 0, false);
                     break;
                 }
                 int16_t dividend = (int16_t)cpu->ax;
@@ -3639,10 +3753,7 @@ int cpu8086_run(dos_vm_t *vm)
                 int16_t quotient = dividend / divisor;
                 int8_t  remainder = dividend % divisor;
                 if (quotient < -128 || quotient > 127) {
-                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                    cpu_push16(cpu, cpu->cs);
-                    cpu_push16(cpu, cpu->ip);
-                    dos_int_dispatch(vm, 0);
+                    (void)cpu_deliver_exception(vm, 0, insn_eip, 0, false);
                     break;
                 }
                 cpu->al = (uint8_t)(int8_t)quotient;
@@ -3698,20 +3809,14 @@ int cpu8086_run(dos_vm_t *vm)
             case 6: { /* DIV r/m16 (unsigned) */
                 uint16_t val = modrm_read16(cpu, &m);
                 if (val == 0) {
-                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                    cpu_push16(cpu, cpu->cs);
-                    cpu_push16(cpu, cpu->ip);
-                    dos_int_dispatch(vm, 0);
+                    (void)cpu_deliver_exception(vm, 0, insn_eip, 0, false);
                     break;
                 }
                 uint32_t dividend = ((uint32_t)cpu->dx << 16) | cpu->ax;
                 uint32_t quotient = dividend / val;
                 uint16_t remainder = dividend % val;
                 if (quotient > 0xFFFF) {
-                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                    cpu_push16(cpu, cpu->cs);
-                    cpu_push16(cpu, cpu->ip);
-                    dos_int_dispatch(vm, 0);
+                    (void)cpu_deliver_exception(vm, 0, insn_eip, 0, false);
                     break;
                 }
                 cpu->ax = (uint16_t)quotient;
@@ -3721,10 +3826,7 @@ int cpu8086_run(dos_vm_t *vm)
             case 7: { /* IDIV r/m16 (signed) */
                 uint16_t val = modrm_read16(cpu, &m);
                 if (val == 0) {
-                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                    cpu_push16(cpu, cpu->cs);
-                    cpu_push16(cpu, cpu->ip);
-                    dos_int_dispatch(vm, 0);
+                    (void)cpu_deliver_exception(vm, 0, insn_eip, 0, false);
                     break;
                 }
                 int32_t dividend = (int32_t)(((uint32_t)cpu->dx << 16) | cpu->ax);
@@ -3732,10 +3834,7 @@ int cpu8086_run(dos_vm_t *vm)
                 int32_t quotient = dividend / divisor;
                 int16_t remainder = dividend % divisor;
                 if (quotient < -32768 || quotient > 32767) {
-                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                    cpu_push16(cpu, cpu->cs);
-                    cpu_push16(cpu, cpu->ip);
-                    dos_int_dispatch(vm, 0);
+                    (void)cpu_deliver_exception(vm, 0, insn_eip, 0, false);
                     break;
                 }
                 cpu->ax = (uint16_t)(int16_t)quotient;
@@ -3756,9 +3855,16 @@ int cpu8086_run(dos_vm_t *vm)
             set_flag(cpu, FLAG_CF, true);
             break;
         case 0xFA: /* CLI */
-            set_flag(cpu, FLAG_IF, false);
+            if (cpu->protected_mode && vm->dpmi.active) {
+                vm->dpmi.virtual_interrupts_enabled = false;
+                set_flag(cpu, FLAG_IF, true);
+            } else {
+                set_flag(cpu, FLAG_IF, false);
+            }
             break;
         case 0xFB: /* STI */
+            if (cpu->protected_mode && vm->dpmi.active)
+                vm->dpmi.virtual_interrupts_enabled = true;
             set_flag(cpu, FLAG_IF, true);
             break;
         case 0xFC: /* CLD */
@@ -3772,7 +3878,9 @@ int cpu8086_run(dos_vm_t *vm)
          *  ICEBP / INT1  (0xF1) — debug breakpoint (undocumented)
          * ════════════════════════════════════════════════════════════ */
         case 0xF1:
-            /* Treat as NOP — DOS4GW uses this as a debug trap */
+            /* ICEBP is a one-byte debug trap. Its saved IP points to the
+             * instruction following F1, like the processor's #DB trap. */
+            (void)cpu_deliver_exception(vm, 1, cpu->eip, 0, false);
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -3841,14 +3949,7 @@ int cpu8086_run(dos_vm_t *vm)
                     cpu->cs = seg;
                     cpu->ip = off;
                 }
-                if (cpu->protected_mode) {
-                    cpu->pm_cs_loaded = true;
-                    cpu_update_cs_mode(cpu);
-                    /* DOS4GW typically uses FF /3 (CALL FAR) to enter its
-                     * 32-bit code. Attempt native handoff. */
-                    extern void dos_transfer_to_native(dos_vm_t *vm);
-                    dos_transfer_to_native(vm);
-                }
+                cpu_commit_cs_load(cpu);
                 break;
             }
             case 4: { /* JMP r/m16 (near indirect) */
@@ -3872,12 +3973,7 @@ int cpu8086_run(dos_vm_t *vm)
                     cpu->cs = seg;
                     cpu->ip = off;
                 }
-                if (cpu->protected_mode) {
-                    cpu->pm_cs_loaded = true;
-                    cpu_update_cs_mode(cpu);
-                    extern void dos_transfer_to_native(dos_vm_t *vm);
-                    dos_transfer_to_native(vm);
-                }
+                cpu_commit_cs_load(cpu);
                 break;
             }
             case 6: { /* PUSH r/m16 */
@@ -3922,11 +4018,7 @@ int cpu8086_run(dos_vm_t *vm)
             int16_t lo  = (int16_t)dos_mem_read16(vm, m.addr);
             int16_t hi  = (int16_t)dos_mem_read16(vm, m.addr + 2);
             if (idx < lo || idx > hi) {
-                /* Bounds check failed — trigger INT 5 */
-                cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                cpu_push16(cpu, cpu->cs);
-                cpu_push16(cpu, cpu->ip);
-                dos_int_dispatch(vm, 5);
+                (void)cpu_deliver_exception(vm, 5, insn_eip, 0, false);
             }
             break;
         }
@@ -4096,7 +4188,10 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xD4: { /* AAM imm8 */
             uint8_t base = cpu_fetch8(cpu);
-            if (base == 0) { dos_int_dispatch(vm, 0); break; } /* divide by zero */
+            if (base == 0) {
+                (void)cpu_deliver_exception(vm, 0, insn_eip, 0, false);
+                break;
+            }
             uint8_t al = cpu->al;
             cpu->ah = al / base;
             cpu->al = al % base;
@@ -4115,20 +4210,12 @@ int cpu8086_run(dos_vm_t *vm)
             break;
 
         /* ════════════════════════════════════════════════════════════
-         *  FPU escape opcodes (0xD8-0xDF) — stub: consume ModRM, NOP
-         *  Real FPU emulation is Phase 5+. For now, skip cleanly.
+         *  FPU escape opcodes (0xD8-0xDF)
          * ════════════════════════════════════════════════════════════ */
         case 0xD8: case 0xD9: case 0xDA: case 0xDB:
         case 0xDC: case 0xDD: case 0xDE: case 0xDF: {
-            /* FPU instructions have a ModRM byte.
-             * If mod != 3, there's a memory operand to skip.
-             * If mod == 3, it's register-only (just the ModRM byte). */
-            modrm_byte = cpu_fetch8(cpu);
-            if ((modrm_byte >> 6) != 3) {
-                /* Memory operand — decode to consume displacement bytes */
-                (void)decode_modrm(cpu, modrm_byte);
-            }
-            /* Silently NOP — no FPU state maintained */
+            /* A guest x87 emulator can handle vector 7 and retry or skip. */
+            (void)cpu_deliver_exception(vm, 7, insn_eip, 0, false);
             break;
         }
 
@@ -4136,17 +4223,7 @@ int cpu8086_run(dos_vm_t *vm)
          *  Unknown opcode
          * ════════════════════════════════════════════════════════════ */
         default:
-            /* Log once, don't halt — let the program continue */
-            if (cpu->insn_count < 1000000) {
-                serial_puts("[8086] unknown opcode: ");
-                serial_puthex(opcode, 2);
-                serial_puts(" at ");
-                serial_puthex(cpu->cs, 4);
-                serial_puts(":");
-                serial_puthex(cpu->eip - 1, 4);
-                serial_puts("\n");
-            }
-            cpu->exit_code = -1;
+            (void)cpu_deliver_exception(vm, 6, insn_eip, 0, false);
             break;
 
         } /* switch (opcode) */
@@ -4207,21 +4284,8 @@ int cpu8086_run(dos_vm_t *vm)
         /* Periodic checks every 16K instructions */
         if ((cpu->insn_count & 0x3FFF) == 0) {
             dos_vga_flush(vm);
-
-            /* Timer tick (~18.2 Hz): update BDA counter + deliver INT 8 */
-            extern uint64_t idt_get_ticks(void);
-            extern void cpu_deliver_hw_interrupt(dos_vm_t *vm, uint8_t int_num);
-            uint64_t now = idt_get_ticks();
-            if (now - vm->last_timer_tick >= 5) {  /* 5 ticks @ 100Hz ≈ 50ms */
-                vm->last_timer_tick = now;
-                vm->bios_ticks++;
-                /* Update BIOS Data Area timer counter at 0040:006C (linear 0x46C) */
-                dos_mem_write32(vm, 0x46C, vm->bios_ticks);
-                /* Don't inject INT 8 — DOS4GW's IDT at base 0 has no valid
-                 * gate descriptors (just repeated 0x1308 pattern).
-                 * Instead, only update BDA tick counter. DOS4GW polls the
-                 * PIT port (0x40) and BDA tick count for timing. */
-            }
+            dos_vga_mode13_present();
+            (void)cpu_service_timer(vm);
         }
 
         /* Milestones for debugging DOS4GW init */
@@ -4267,7 +4331,48 @@ int cpu8086_run(dos_vm_t *vm)
             cpu->running = false;
         }
 
-    } /* while running */
+    } /* execution loop */
 
-    return cpu->exit_code;
+    int exit_code = cpu->exit_code;
+    vm->native_resume_armed = false;
+    return exit_code;
+}
+
+bool cpu8086_run_until_real(dos_vm_t *vm, uint16_t stop_cs,
+                            uint16_t stop_ip)
+{
+    if (!vm || !vm->cpu)
+        return false;
+
+    uint64_t saved_resume_jmpbuf[9];
+    for (unsigned i = 0; i < 9; i++)
+        saved_resume_jmpbuf[i] = vm->native_resume_jmpbuf[i];
+
+    bool saved_resume_armed = vm->native_resume_armed;
+    bool saved_stop_active = vm->interpreter_stop_active;
+    bool saved_stop_reached = vm->interpreter_stop_reached;
+    uint16_t saved_stop_cs = vm->interpreter_stop_cs;
+    uint16_t saved_stop_ip = vm->interpreter_stop_ip;
+    bool saved_running = vm->cpu->running;
+
+    vm->interpreter_stop_cs = stop_cs;
+    vm->interpreter_stop_ip = stop_ip;
+    vm->interpreter_stop_reached = false;
+    vm->interpreter_stop_active = true;
+    vm->cpu->running = true;
+
+    (void)cpu8086_run(vm);
+    bool reached = vm->interpreter_stop_reached;
+
+    vm->interpreter_stop_active = saved_stop_active;
+    vm->interpreter_stop_reached = saved_stop_reached;
+    vm->interpreter_stop_cs = saved_stop_cs;
+    vm->interpreter_stop_ip = saved_stop_ip;
+    vm->native_resume_armed = saved_resume_armed;
+    for (unsigned i = 0; i < 9; i++)
+        vm->native_resume_jmpbuf[i] = saved_resume_jmpbuf[i];
+
+    if (reached)
+        vm->cpu->running = saved_running;
+    return reached;
 }

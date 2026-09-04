@@ -321,6 +321,8 @@ typedef struct _PE_IMAGE_INFO {
     ULONG       EntryPointRVA;
     PVOID       EntryPoint;         /* ImageBase + EntryPointRVA */
     USHORT      Subsystem;          /* CUI, GUI, native */
+    USHORT      MajorSubsystemVersion;
+    USHORT      MinorSubsystemVersion;
     USHORT      DllCharacteristics;
     ULONGLONG   StackReserve;
     ULONGLONG   StackCommit;
@@ -335,6 +337,7 @@ NTSTATUS pe_load(const BYTE *file_data, SIZE_T file_size,
 NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
                        PPE_IMAGE_INFO info, const char *image_name);
 void     pe_unload(PPE_IMAGE_INFO info);
+void     pe_unload_for_owner(PPE_IMAGE_INFO info, ULONG owner_pid);
 NTSTATUS compat32_attach_tls(PPE_IMAGE_INFO info);
 
 /* Apply final page permissions after relocations and IAT fixups, before
@@ -358,6 +361,9 @@ void  pe_free_for_owner(PVOID addr, SIZE_T size, ULONG owner_pid);
  * let NtAllocateVirtualMemory/NtQueryVirtualMemory treat them as occupied. */
 BOOL pe_va_range_conflicts(ULONGLONG base, ULONGLONG size);
 ULONGLONG pe_va_range_conflict_end(ULONGLONG base, ULONGLONG size);
+/* Return TRUE only when the complete range belongs to one PE allocation
+ * owned by the current Win32 process in its current address space. */
+BOOL pe_va_range_contains(ULONGLONG base, ULONGLONG size);
 BOOL pe_va_query_range(ULONGLONG address, ULONGLONG *base,
                        ULONGLONG *size, ULONGLONG *next_base);
 

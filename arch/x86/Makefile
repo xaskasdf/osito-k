@@ -76,6 +76,15 @@ ifeq ($(IOCP_TRACE),1)
   KCFLAGS += -DK32_IOCP_TRACE=1
 endif
 
+# General Win32 loader/API diagnostics. Keep these off in normal builds: CEF
+# and games call these paths often enough for serial output to dominate QEMU.
+#   make -C arch/x86 CLANG=1 WIN32_TRACE=1
+WIN32_TRACE ?= 0
+ifeq ($(WIN32_TRACE),1)
+  KCFLAGS += -DK32_VERBOSE_DIAGNOSTICS=1 -DU32_API_DIAGNOSTICS=1 \
+             -DNTSYNC_TRACE_DIAGNOSTICS=1
+endif
+
 # Per-operation virtual-memory tracing is useful for allocator corruption
 # investigations, but Steam/CEF can issue thousands of successful calls per
 # second. Keep failures and aggregate VM statistics enabled in normal builds.
@@ -83,6 +92,15 @@ endif
 WIN32_VM_TRACE ?= 0
 ifeq ($(WIN32_VM_TRACE),1)
   KCFLAGS += -DWIN32_VM_TRACE=1
+endif
+
+# DOS API and MCB tracing is intentionally opt-in. Native DOS programs can
+# issue these calls in tight loops, and COM1 output is expensive under QEMU.
+#   make -C arch/x86 CLANG=1 DOS_TRACE=1
+DOS_TRACE ?= 0
+ifeq ($(DOS_TRACE),1)
+  DOS_TRACE_FLAGS = -DDOS_DIAGNOSTICS=1
+  KCFLAGS += $(DOS_TRACE_FLAGS)
 endif
 
 # Diagnose native PE calls that return from a Win32 shim with interrupts
@@ -195,7 +213,7 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/lockdep.c kernel/psi.c kernel/kobject.c \
            kernel/inotify.c kernel/kallsyms.c kernel/cpu_topology.c \
            kernel/usym.c kernel/crash_report.c kernel/kstate.c \
-           kernel/audio_sched.c kernel/dma_sched.c kernel/tokenizer_trie.c \
+           kernel/audio_sched.c kernel/pcm.c kernel/oss_audio.c kernel/dma_sched.c kernel/tokenizer_trie.c \
            kernel/vdso_thunks.c \
            kernel/cpu_features.c kernel/perf.c kernel/dispatch.c \
            kernel/tensor_arena.c kernel/sys_inference.c \
@@ -219,9 +237,10 @@ FS_SRC   = fs/ositofs2.c fs/ositofs3.c fs/gpt.c fs/gguf.c fs/vfs.c fs/fat32.c \
            fs/tmpfs.c fs/iso9660.c fs/ext2.c fs/exfat.c fs/ntfs.c \
            fs/udf.c fs/squashfs.c fs/hfsplus.c fs/btrfs.c fs/apfs.c
 WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
-            win32/handle.c win32/ntsyscall.c win32/ntprocess.c win32/ntsync.c \
-            win32/dllloader.c win32/wdbg.c win32/if_audit.c win32/win32_abi.c \
-            win32/wintime.c win32/kernel32_shim.c win32/ntdll_shim.c \
+            win32/handle.c win32/filelock.c win32/ntsyscall.c win32/ntprocess.c win32/ntsync.c \
+            win32/dllloader.c win32/unwind64.c win32/wdbg.c win32/if_audit.c win32/win32_abi.c \
+             win32/wintime.c win32/kernel32_shim.c win32/profile.c \
+             win32/ntdll_shim.c \
             win32/msvcrt_shim.c \
              win32/user32_shim.c win32/gdi32_shim.c win32/opengl32_shim.c \
              win32/libusb_shim.c \
@@ -231,14 +250,17 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/ole32_shim.c win32/oleacc_shim.c \
              win32/crypt32_shim.c win32/authenticode.c win32/shell32_shim.c \
             win32/comctl32_shim.c win32/comdlg32_shim.c \
+            win32/richedit_shim.c \
             win32/winmm_shim.c win32/wsock32_shim.c \
             win32/ole2.c win32/msi.c win32/cab.c \
             win32/zip.c win32/msix.c win32/installer.c
-WIN32_ASM = win32/int2e_stub.S
+WIN32_ASM = win32/int2e_stub.S win32/context64.S
 DOS_ASM  = dos/dos_int_stub.S
 DOS_SRC  = dos/dos_init.c dos/dos_exec.c dos/dos_loader.c \
            dos/dos_mem.c dos/cpu8086.c dos/dos_int.c \
-           dos/dos_api.c dos/dos_bios.c dos/dos_vga.c dos/dos_io.c \
+           dos/dos_api.c dos/dos_bios.c dos/dos_time.c dos/dos_find.c \
+           dos/dos_vga.c dos/dos_vbe.c dos/dos_io.c dos/dos_mouse.c \
+           dos/dos_audio.c \
            dos/dos_dpmi.c dos/dos_vcpi.c dos/dos_jit.c
 GUI_SRC  = ../../gui/gui_draw.c ../../gui/gui_text.c \
            ../../gui/gui_panel.c ../../gui/gui_dock.c \
@@ -290,7 +312,14 @@ FS_MIN_OBJ   = $(FS_MINIMAL:%.c=$(BUILD)/%.o)
 ALL_MIN_OBJ  = $(KERN_MIN_OBJ) $(ASM_OBJ) $(DRV_MIN_OBJ) $(FS_MIN_OBJ) \
                $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
 
-.PHONY: all clean check-deps legacy tcc tcc-clean minimal libvulkan pxe
+.PHONY: all clean check-deps legacy tcc tcc-clean minimal libvulkan pxe \
+	dos-dpmi-test dos-vbe-native-test dos-audio-native-test dos-vga-test \
+	oss-audio-elf-test \
+	oss-audio-execve-elf-test oss-audio-no-device-elf-test \
+	shm-surface-elf-test console-input-elf-test dos-console-input-test \
+	dos-extended-error-test dos-file-create-test dos-handle-table-test \
+	dos-truename-test dos-exec-test dos-find-test dos-env-test dos-mouse-test \
+	dos-vbe-test
 
 $(KERNEL_FLAGS_STAMP): | $(BUILD)
 	@rm -f $(BUILD)/.kernel-cflags $(BUILD)/.kernel-cflags-*
@@ -299,6 +328,194 @@ $(KERNEL_FLAGS_STAMP): | $(BUILD)
 $(KERNEL_C_OBJ): $(KERNEL_FLAGS_STAMP)
 
 all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf libvulkan
+
+dos-dpmi-test: $(BUILD)/test/dpmi_native.com
+
+dos-vbe-native-test: $(BUILD)/test/dpmi_vbe.com
+
+dos-audio-native-test: $(BUILD)/test/dpmi_audio.com
+
+dos-vga-test: $(BUILD)/test/dosvga.com
+
+dos-console-input-test: $(BUILD)/test/doscon.com
+
+dos-extended-error-test: $(BUILD)/test/doserr.com
+
+dos-file-create-test: $(BUILD)/test/dosfile.com
+
+dos-handle-table-test: $(BUILD)/test/dosjft.com
+
+dos-truename-test: $(BUILD)/test/dostrue.com
+
+dos-exec-test: $(BUILD)/test/dosexec.com $(BUILD)/test/dexchild.com \
+	$(BUILD)/test/dexmz.exe $(BUILD)/test/dexdpmi.com
+
+dos-find-test: $(BUILD)/test/dosfind.com
+
+dos-env-test: $(BUILD)/test/dosenv.com
+
+dos-mouse-test: $(BUILD)/test/dosmouse.com
+
+dos-vbe-test: $(BUILD)/test/dosvbe.com
+
+oss-audio-elf-test: $(BUILD)/test/ossaud.elf
+
+oss-audio-execve-elf-test: $(BUILD)/test/ossexec.elf \
+	$(BUILD)/test/ossaud.elf
+
+oss-audio-no-device-elf-test: $(BUILD)/test/ossnone.elf
+
+shm-surface-elf-test: $(BUILD)/test/shmsurf.elf
+
+console-input-elf-test: $(BUILD)/test/coninput.elf
+
+$(BUILD)/test/dpmi_native.com: $(BUILD)/test/dpmi_native.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_native.o: test/dpmi_native.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpmi_vbe.com: $(BUILD)/test/dpmi_vbe.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_vbe.o: test/dpmi_vbe.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpmi_audio.com: $(BUILD)/test/dpmi_audio.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_audio.o: test/dpmi_audio.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dosvga.com: $(BUILD)/test/dos_vga_text.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_vga_text.o: test/dos_vga_text.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/doscon.com: $(BUILD)/test/dos_console_input.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_console_input.o: test/dos_console_input.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/doserr.com: $(BUILD)/test/dos_extended_error.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_extended_error.o: test/dos_extended_error.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dosfile.com: $(BUILD)/test/dos_file_create.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_file_create.o: test/dos_file_create.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dosjft.com: $(BUILD)/test/dos_handle_table.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_handle_table.o: test/dos_handle_table.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dostrue.com: $(BUILD)/test/dos_truename.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_truename.o: test/dos_truename.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dosexec.com: $(BUILD)/test/dos_exec_contract.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_exec_contract.o: test/dos_exec_contract.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dexchild.com: $(BUILD)/test/dos_exec_child.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_exec_child.o: test/dos_exec_child.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dexmz.exe: $(BUILD)/test/dos_exec_mz_child.o test/dos_mz.ld
+	ld -m elf_i386 -T test/dos_mz.ld -o $@ $<
+
+$(BUILD)/test/dos_exec_mz_child.o: test/dos_exec_mz_child.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dexdpmi.com: $(BUILD)/test/dpmi_native.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dosfind.com: $(BUILD)/test/dos_find_contract.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_find_contract.o: test/dos_find_contract.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dosenv.com: $(BUILD)/test/dos_env_contract.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_env_contract.o: test/dos_env_contract.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dosmouse.com: $(BUILD)/test/dos_mouse_contract.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_mouse_contract.o: test/dos_mouse_contract.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dosvbe.com: $(BUILD)/test/dos_vbe_contract.o \
+		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_vbe_contract.o: test/dos_vbe_contract.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/console_input_elf.o: test/console_input_elf.c | $(BUILD)/test
+	$(CC) -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
+		-O2 -fno-pie -nostdlib -c -o $@ $<
+
+$(BUILD)/test/coninput.elf: $(BUILD)/test/console_input_elf.o
+	$(LD) -m elf_x86_64 -static -e _start -o $@ $<
+
+$(BUILD)/test/oss_audio_elf.o: test/oss_audio_elf.c | $(BUILD)/test
+	$(CC) -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
+		-O2 -fno-pie -nostdlib -c -o $@ $<
+
+$(BUILD)/test/ossaud.elf: $(BUILD)/test/oss_audio_elf.o
+	$(LD) -m elf_x86_64 -static -e _start -o $@ $<
+
+$(BUILD)/test/oss_audio_no_device_elf.o: test/oss_audio_elf.c | $(BUILD)/test
+	$(CC) -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
+		-O2 -fno-pie -nostdlib -DOSS_EXPECT_NO_DEVICE=1 -c -o $@ $<
+
+$(BUILD)/test/ossnone.elf: $(BUILD)/test/oss_audio_no_device_elf.o
+	$(LD) -m elf_x86_64 -static -e _start -o $@ $<
+
+$(BUILD)/test/oss_audio_execve_elf.o: test/oss_audio_execve_elf.c | $(BUILD)/test
+	$(CC) -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
+		-O2 -fno-pie -nostdlib -c -o $@ $<
+
+$(BUILD)/test/ossexec.elf: $(BUILD)/test/oss_audio_execve_elf.o
+	$(LD) -m elf_x86_64 -static -e _start -o $@ $<
+
+$(BUILD)/test/shm_surface_elf.o: test/shm_surface_elf.c | $(BUILD)/test
+	$(CC) -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
+		-O2 -fno-pie -nostdlib -c -o $@ $<
+
+$(BUILD)/test/shmsurf.elf: $(BUILD)/test/shm_surface_elf.o
+	$(LD) -m elf_x86_64 -static -e _start -o $@ $<
+
+$(BUILD)/test:
+	mkdir -p $@
 	@echo ""
 	@echo "Built: $(BUILD)/boot.efi + $(BUILD)/kernel.elf + lib/vulkan/libvulkan.a"
 
@@ -435,7 +652,8 @@ $(BUILD)/gui/%.o: ../../gui/%.c | $(BUILD)/gui
 
 TCC      = tcc
 TCCDIR   = $(BUILD)/tcc
-TCCFLAGS = -c -nostdlib -Iinclude -I../../include/common -D__KERNEL_X86__=1
+TCCFLAGS = -c -nostdlib -Iinclude -I../../include/common -D__KERNEL_X86__=1 \
+           $(DOS_TRACE_FLAGS)
 
 # Files that MUST use GCC (SSE/AVX asm constraints, special builtins)
 GCC_ONLY_C = kernel/tensor.c kernel/tensor_avx2.c \

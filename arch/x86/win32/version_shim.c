@@ -10,6 +10,8 @@ extern void serial_puts(const char *s);
 #define ERROR_RESOURCE_DATA_NOT_FOUND 1812
 #define ERROR_INSUFFICIENT_BUFFER      122
 #define ERROR_BAD_EXE_FORMAT           193
+#define ERROR_INVALID_PARAMETER         87
+#define ERROR_NOT_ENOUGH_MEMORY           8
 
 #define OPEN_EXISTING                  3U
 #define FILE_BEGIN                     0U
@@ -98,10 +100,10 @@ static const VERSION_BLOB kernel_version = {
     {
         VS_FFI_SIGNATURE,
         VS_FFI_STRUCVERSION,
-        (10U << 16),
-        (19045U << 16),
-        (10U << 16),
-        (19045U << 16),
+        (WIN32_NT_VERSION_MAJOR << 16) | WIN32_NT_VERSION_MINOR,
+        (WIN32_NT_VERSION_BUILD << 16),
+        (WIN32_NT_VERSION_MAJOR << 16) | WIN32_NT_VERSION_MINOR,
+        (WIN32_NT_VERSION_BUILD << 16),
         0x0000003FU,
         0,
         VOS_NT_WINDOWS32,
@@ -157,6 +159,40 @@ static void version_copy(void *dst, const void *src, SIZE_T length)
     BYTE *out = (BYTE *)dst;
     const BYTE *in = (const BYTE *)src;
     while (length--) *out++ = *in++;
+}
+
+static PWSTR version_ansi_to_wide(PCSTR value)
+{
+    if (!value) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+
+    int count = MultiByteToWideChar(0, 0, value, -1, NULL, 0);
+    if (count <= 0)
+        return NULL;
+
+    PWSTR wide = LocalAlloc(0, (SIZE_T)count * sizeof(WCHAR));
+    if (!wide) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    if (!MultiByteToWideChar(0, 0, value, -1, wide, count)) {
+        DWORD error = GetLastError();
+        LocalFree(wide);
+        SetLastError(error);
+        return NULL;
+    }
+    return wide;
+}
+
+static void version_store_pointer(PVOID output, PVOID value)
+{
+    if (!output) return;
+    if (g_compat32_mode)
+        *(DWORD *)output = (DWORD)(ULONG_PTR)value;
+    else
+        *(PVOID *)output = value;
 }
 
 static BOOL version_range_valid(DWORD offset, DWORD length, DWORD limit)
@@ -405,6 +441,10 @@ static BOOL version_locate_resource(HANDLE file, DWORD file_size,
 DWORD WINAPI shim_GetFileVersionInfoSizeW(PCWSTR filename, DWORD *handle)
 {
     if (handle) *handle = 0;
+    if (!filename) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     if (version_is_kernel_module(filename)) {
         SetLastError(0);
         serial_puts("[VERSION] kernel version 10.0.19045.0\n");
@@ -431,10 +471,28 @@ DWORD WINAPI shim_GetFileVersionInfoSizeW(PCWSTR filename, DWORD *handle)
     return location.size;
 }
 
+DWORD WINAPI shim_GetFileVersionInfoSizeA(PCSTR filename, DWORD *handle)
+{
+    if (handle) *handle = 0;
+    PWSTR wide = version_ansi_to_wide(filename);
+    if (!wide)
+        return 0;
+
+    DWORD result = shim_GetFileVersionInfoSizeW(wide, handle);
+    DWORD error = GetLastError();
+    LocalFree(wide);
+    SetLastError(error);
+    return result;
+}
+
 BOOL WINAPI shim_GetFileVersionInfoW(PCWSTR filename, DWORD handle,
                                      DWORD length, PVOID data)
 {
     (void)handle;
+    if (!filename) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     if (!version_is_kernel_module(filename)) {
         DWORD file_size = 0;
         HANDLE file = version_open_file(filename, &file_size);
@@ -473,6 +531,20 @@ BOOL WINAPI shim_GetFileVersionInfoW(PCWSTR filename, DWORD handle,
     version_copy(data, &kernel_version, sizeof(kernel_version));
     SetLastError(0);
     return TRUE;
+}
+
+BOOL WINAPI shim_GetFileVersionInfoA(PCSTR filename, DWORD handle,
+                                     DWORD length, PVOID data)
+{
+    PWSTR wide = version_ansi_to_wide(filename);
+    if (!wide)
+        return FALSE;
+
+    BOOL result = shim_GetFileVersionInfoW(wide, handle, length, data);
+    DWORD error = GetLastError();
+    LocalFree(wide);
+    SetLastError(error);
+    return result;
 }
 
 static BOOL version_query_string(const VERSION_BLOB *blob, PCWSTR sub_block,
@@ -621,17 +693,9 @@ static BOOL version_query_native(PCVOID block, PCWSTR sub_block,
     return TRUE;
 }
 
-BOOL WINAPI shim_VerQueryValueW(PCVOID block, PCWSTR sub_block,
+static BOOL version_query_value(PCVOID block, PCWSTR sub_block,
                                 PVOID *buffer, UINT *length)
 {
-    if (buffer) *buffer = NULL;
-    if (length) *length = 0;
-
-    if (!block || !sub_block || !buffer || !length) {
-        SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
-        return FALSE;
-    }
-
     if (version_read_u32((const BYTE *)block) == VS_FFI_SIGNATURE) {
         const VERSION_BLOB *blob = (const VERSION_BLOB *)block;
         if (version_wstr_eq_ascii(sub_block, "\\")) {
@@ -660,11 +724,62 @@ BOOL WINAPI shim_VerQueryValueW(PCVOID block, PCWSTR sub_block,
     return FALSE;
 }
 
+BOOL WINAPI shim_VerQueryValueW(PCVOID block, PCWSTR sub_block,
+                                PVOID *buffer, UINT *length)
+{
+    if (buffer) version_store_pointer(buffer, NULL);
+    if (length) *length = 0;
+    if (!block || !sub_block || !buffer || !length) {
+        SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
+        return FALSE;
+    }
+
+    PVOID value = NULL;
+    UINT value_length = 0;
+    if (!version_query_value(block, sub_block, &value, &value_length))
+        return FALSE;
+    version_store_pointer(buffer, value);
+    *length = value_length;
+    return TRUE;
+}
+
+BOOL WINAPI shim_VerQueryValueA(PCVOID block, PCSTR sub_block,
+                                PVOID *buffer, UINT *length)
+{
+    if (buffer) version_store_pointer(buffer, NULL);
+    if (length) *length = 0;
+    if (!block || !sub_block || !buffer || !length) {
+        SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
+        return FALSE;
+    }
+
+    PWSTR wide = version_ansi_to_wide(sub_block);
+    if (!wide)
+        return FALSE;
+
+    PVOID value = NULL;
+    UINT value_length = 0;
+    BOOL result = version_query_value(block, wide, &value, &value_length);
+    DWORD error = GetLastError();
+    LocalFree(wide);
+    if (result) {
+        version_store_pointer(buffer, value);
+        *length = value_length;
+    }
+    SetLastError(error);
+    return result;
+}
+
 static const WIN32_EXPORT version_exports[] = {
+    { "GetFileVersionInfoSizeA", (PVOID)shim_GetFileVersionInfoSizeA,
+      2, CC_STDCALL },
     { "GetFileVersionInfoSizeW", (PVOID)shim_GetFileVersionInfoSizeW,
       2, CC_STDCALL },
+    { "GetFileVersionInfoA", (PVOID)shim_GetFileVersionInfoA,
+      4, CC_STDCALL },
     { "GetFileVersionInfoW", (PVOID)shim_GetFileVersionInfoW,
       4, CC_STDCALL },
+    { "VerQueryValueA", (PVOID)shim_VerQueryValueA, 4, CC_STDCALL },
     { "VerQueryValueW", (PVOID)shim_VerQueryValueW, 4, CC_STDCALL },
     { NULL, NULL, 0, CC_STDCALL }
 };

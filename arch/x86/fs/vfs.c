@@ -12,6 +12,8 @@ extern void *osfs2_find(const char *name);
 extern void *osfs2_find_ci(const char *name);
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern uint64_t osfs2_file_size(void *file);
+extern int   osfs2_get_mode(const void *file, uint16_t *mode);
+extern int   osfs2_set_mode(void *file, uint16_t mode);
 
 /* ── Helpers ─────────────────────────────────────────────── */
 
@@ -116,6 +118,31 @@ int vfs_read(vfs_node_t *node, uint64_t offset, void *buf, uint64_t len)
     if (node->fs_version == 3) return osfs3_read(node->ino, offset, buf, len);
     if (node->fs_version == 2) return osfs2_read(node->data, offset, buf, len);
     return -1;
+}
+
+int vfs_get_mode(const vfs_node_t *node, uint16_t *mode)
+{
+    if (!node || !mode) return VFS_STATUS_INVALID;
+    if (node->fs_version == 3)
+        return osfs3_get_mode(node->ino, mode) == 0
+            ? VFS_STATUS_OK : VFS_STATUS_INVALID;
+    if (node->fs_version == 2)
+        return osfs2_get_mode(node->data, mode) == 0
+            ? VFS_STATUS_OK : VFS_STATUS_INVALID;
+    return VFS_STATUS_INVALID;
+}
+
+int vfs_set_mode(vfs_node_t *node, uint16_t mode)
+{
+    if (!node || (mode & ~07777U)) return VFS_STATUS_INVALID;
+    int result;
+    if (node->fs_version == 3)
+        result = osfs3_set_mode(node->ino, mode);
+    else if (node->fs_version == 2)
+        result = osfs2_set_mode(node->data, mode);
+    else
+        return VFS_STATUS_INVALID;
+    return result == 0 ? VFS_STATUS_OK : VFS_STATUS_IO_ERROR;
 }
 
 void vfs_list(const char *path)

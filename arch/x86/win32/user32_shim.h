@@ -77,6 +77,7 @@ typedef LRESULT (WINAPI *HOOKPROC)(int, WPARAM, LPARAM);
 #define WM_CHAR             0x0102
 #define WM_SYSKEYDOWN       0x0104
 #define WM_SYSKEYUP         0x0105
+#define WM_INITDIALOG       0x0110
 #define WM_COMMAND          0x0111
 #define WM_SYSCOMMAND       0x0112
 #define WM_TIMER            0x0113
@@ -196,8 +197,16 @@ typedef LRESULT (WINAPI *HOOKPROC)(int, WPARAM, LPARAM);
 #define WS_THICKFRAME       0x00040000
 #define WS_MINIMIZEBOX      0x00020000
 #define WS_MAXIMIZEBOX      0x00010000
+#define WS_GROUP            0x00020000
+#define WS_TABSTOP          0x00010000
 #define WS_OVERLAPPEDWINDOW (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | \
                              WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+
+/* Dialog/control constants. */
+#define IDOK                1
+#define IDCANCEL            2
+#define BN_CLICKED          0
+#define BM_CLICK            0x00F5
 
 /* Window-menu commands (WM_SYSCOMMAND). */
 #define SC_SIZE             0xF000
@@ -482,6 +491,7 @@ typedef struct tagINPUT {
 #define CS_OWNDC            0x0020
 #define CS_DBLCLKS          0x0008
 #define CS_NOCLOSE          0x0200
+#define CS_GLOBALCLASS      0x4000
 
 /* Menu flags, types, states, and information masks. */
 #define MF_BYCOMMAND        0x00000000
@@ -755,6 +765,9 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
 void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons);
 BOOL user32_get_current_display_mode(uint32_t *width, uint32_t *height,
                                      uint32_t *bpp, uint32_t *frequency);
+uint32_t user32_get_display_resolution_count(void);
+BOOL user32_get_display_resolution(uint32_t index, uint32_t *width,
+                                   uint32_t *height);
 
 /* Misc */
 int     WINAPI MessageBoxA(HWND hWnd, PCSTR lpText, PCSTR lpCaption, DWORD uType);
@@ -773,6 +786,9 @@ HDC     WINAPI GetWindowDC(HWND hWnd);
 HWND    WINAPI WindowFromDC(HDC hDC);
 int     WINAPI ReleaseDC(HWND hWnd, HDC hDC);
 BOOL    WINAPI InvalidateRect(HWND hWnd, const RECT *lpRect, BOOL bErase);
+BOOL    user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
+                                            BOOL allow_window_changes,
+                                            int width, int height);
 BOOL    WINAPI RedrawWindow(HWND hWnd, const RECT *lprcUpdate,
                             HANDLE hrgnUpdate, UINT flags);
 BOOL    WINAPI SetForegroundWindow(HWND hWnd);
@@ -785,7 +801,23 @@ HWND    WINAPI CreateDialogParamA(HINSTANCE hInstance, PCSTR lpTemplateName,
                                    HWND hWndParent, DLGPROC lpDialogFunc, LPARAM dwInitParam);
 HWND    WINAPI CreateDialogParamW(HINSTANCE hInstance, PCWSTR lpTemplateName,
                                    HWND hWndParent, DLGPROC lpDialogFunc, LPARAM dwInitParam);
+HWND    WINAPI CreateDialogIndirectParamA(HINSTANCE hInstance,
+                                           PCVOID lpTemplate,
+                                           HWND hWndParent,
+                                           DLGPROC lpDialogFunc,
+                                           LPARAM dwInitParam);
+HWND    WINAPI CreateDialogIndirectParamW(HINSTANCE hInstance,
+                                           PCVOID lpTemplate,
+                                           HWND hWndParent,
+                                           DLGPROC lpDialogFunc,
+                                           LPARAM dwInitParam);
 BOOL    WINAPI EndDialog(HWND hDlg, LONG_PTR nResult);
+LRESULT WINAPI DefDlgProcA(HWND hDlg, DWORD msg, WPARAM wParam,
+                            LPARAM lParam);
+LRESULT WINAPI DefDlgProcW(HWND hDlg, DWORD msg, WPARAM wParam,
+                            LPARAM lParam);
+BOOL    WINAPI IsDialogMessageA(HWND hDlg, LPMSG lpMsg);
+BOOL    WINAPI IsDialogMessageW(HWND hDlg, LPMSG lpMsg);
 HWND    WINAPI GetDlgItem(HWND hDlg, int nIDDlgItem);
 UINT    WINAPI GetDlgItemInt(HWND hDlg, int nIDDlgItem, BOOL *translated,
                              BOOL is_signed);
@@ -892,9 +924,19 @@ DWORD   WINAPI GetSysColor(int nIndex);
 
 /* Dialog box */
 LONG_PTR WINAPI DialogBoxParamA(HINSTANCE hInstance, PCSTR lpTemplateName,
-                                 HWND hWndParent, PVOID lpDialogFunc, LPARAM dwInitParam);
+                                 HWND hWndParent, DLGPROC lpDialogFunc, LPARAM dwInitParam);
 LONG_PTR WINAPI DialogBoxParamW(HINSTANCE hInstance, PCWSTR lpTemplateName,
-                                 HWND hWndParent, PVOID lpDialogFunc, LPARAM dwInitParam);
+                                 HWND hWndParent, DLGPROC lpDialogFunc, LPARAM dwInitParam);
+LONG_PTR WINAPI DialogBoxIndirectParamA(HINSTANCE hInstance,
+                                         PCVOID lpTemplate,
+                                         HWND hWndParent,
+                                         DLGPROC lpDialogFunc,
+                                         LPARAM dwInitParam);
+LONG_PTR WINAPI DialogBoxIndirectParamW(HINSTANCE hInstance,
+                                         PCVOID lpTemplate,
+                                         HWND hWndParent,
+                                         DLGPROC lpDialogFunc,
+                                         LPARAM dwInitParam);
 
 /* Menu */
 HMENU   WINAPI CreateMenu(void);
@@ -959,10 +1001,16 @@ BOOL  WINAPI ValidateRect(HWND hWnd, const RECT *lpRect);
 
 /* ── Shim init / resolve ───────────────────────────────────── */
 
+void  user32_release_thread(DWORD pid, DWORD tid);
 void  user32_release_process(DWORD pid);
+WORD  user32_register_library_class(PCSTR class_name, DWORD style,
+                                    int cb_cls_extra, int cb_wnd_extra,
+                                    HBRUSH background, WNDPROC wndproc);
+BOOL  user32_unregister_library_class(PCSTR class_name, WNDPROC wndproc);
 BOOL  user32_release_icon(HICON icon);
 int   user32_window_model_selftest(void);
 int   user32_input_selftest(void);
+int   user32_dialog_selftest(void);
 BOOL  user32_accessibility_snapshot(HWND window,
                                     USER32_ACCESSIBLE_WINDOW_INFO *info);
 UINT  user32_accessibility_children(HWND parent, HWND *children,

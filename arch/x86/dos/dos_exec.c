@@ -6,6 +6,12 @@
  */
 
 #include "cpu8086.h"
+#include "dos_audio.h"
+#include "dos_io.h"
+#include "dos_jit.h"
+#include "dos_loader.h"
+#include "dos_mouse.h"
+#include "dos_vbe.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -17,8 +23,8 @@ extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* OsitoFS */
-extern int      osfs2_is_mounted(void);
-extern void    *osfs2_find(const char *name);
+extern bool     osfs2_is_mounted(void);
+extern void    *osfs2_find_ci(const char *name);
 extern int      osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern uint64_t osfs2_file_size(void *file);
 
@@ -28,13 +34,21 @@ extern uint64_t idt_get_ticks(void);
 /* DOS subsystem */
 extern int  dos_is_initialized(void);
 extern void dos_mem_init(dos_vm_t *vm);
-extern int  dos_detect_format(const uint8_t *data, uint64_t size);
-extern int  dos_load_com(dos_vm_t *vm, const uint8_t *data, uint64_t size,
-                         const char *cmdline);
-extern int  dos_load_mz(dos_vm_t *vm, const uint8_t *data, uint64_t size,
-                        const char *cmdline);
 extern void cpu8086_init(cpu8086_state_t *cpu, dos_vm_t *vm);
 extern int  cpu8086_run(dos_vm_t *vm);
+extern uint64_t *dos_native_exit_jmpbuf;
+extern void dos_vga_bind_vm(dos_vm_t *vm);
+extern void dos_vga_unbind_vm(dos_vm_t *vm);
+extern void dos_vga_set_direct_writes(dos_vm_t *vm, bool enabled);
+
+static void dos_jit_release(dos_vm_t *vm)
+{
+    if (!vm || !vm->jit) return;
+    jit_state_t *jit = (jit_state_t *)vm->jit;
+    jit_destroy(jit);
+    mem_free_pages(jit, (sizeof(jit_state_t) + 4095u) / 4096u);
+    vm->jit = NULL;
+}
 
 /* ── IVT initialization: ROM stubs ──────────────────────────────── */
 
@@ -43,22 +57,22 @@ static void dos_init_ivt(dos_vm_t *vm)
     uint16_t rom_seg = DOS_ROM_BASE >> 4;  /* 0xF000 */
     uint16_t stub_off = 0;
 
-    /* Only initialize IVT entries for vectors 0x80+ (above the GDT range).
-     * DOS4GW puts its GDT at address 0 with limit 0x02FF (768 bytes = 96 entries).
-     * IVT entries 0-95 (addresses 0x000-0x17F) overlap with GDT space.
-     * Leave those as zero so DOS4GW can use them for GDT descriptors.
-     * Our INT dispatch handles vectors 0x00-0x7F via dos_int_dispatch anyway. */
+    /* Initialize a conventional real-mode IVT. A protected-mode client may
+     * later reuse this memory for its own GDT after loading GDTR. */
     for (int i = 0; i < 256; i++) {
         /* ROM stub: IRET (0xCF) for all vectors */
         vm->mem[DOS_ROM_BASE + stub_off] = 0xCF;
 
-        /* Only write IVT entries above the GDT range */
-        if (i >= 0xC0) {  /* vectors 0xC0+ (address 0x300+) are above GDT limit 0x2FF */
-            dos_mem_write16(vm, i * 4, stub_off);
-            dos_mem_write16(vm, i * 4 + 2, rom_seg);
-        }
+        dos_mem_write16(vm, i * 4, stub_off);
+        dos_mem_write16(vm, i * 4 + 2, rom_seg);
         stub_off++;
     }
+
+    /* Installed mouse drivers must not publish an IRET as the first byte of
+     * vector 33h; legacy programs use that probe before calling function 0.
+     * INT instructions are host-dispatched, while NOP;IRET remains a valid
+     * fallback if guest code reaches the ROM vector directly. */
+    vm->mem[DOS_ROM_BASE + 0x33U] = 0x90;
 }
 
 /* ── Initialize BDA (BIOS Data Area) ───────────────────────────── */
@@ -83,11 +97,27 @@ static void dos_init_bda(dos_vm_t *vm)
     /* Cursor position for page 0 at 0040:0050 */
     dos_mem_write16(vm, 0x450, 0x0000);
 
+    /* Cursor shape and active display page. */
+    dos_mem_write16(vm, 0x460, 0x0607);
+    vm->mem[0x462] = 0;
+
     /* Rows minus 1 at 0040:0084 */
     vm->mem[0x484] = 24;
 
     /* Char height at 0040:0085 */
     dos_mem_write16(vm, 0x485, 16);
+
+    /* Hardware text memory powers up with implementation-defined contents;
+     * BIOS mode 3 presents a cleared page to applications. */
+    for (uint8_t page = 0; page < 8U; page++) {
+        for (uint32_t cell = 0; cell < 80U * 25U; cell++) {
+            uint32_t addr = DOS_VRAM_BASE + (uint32_t)page * 4096U +
+                            cell * 2U;
+            vm->mem[addr] = ' ';
+            vm->mem[addr + 1U] = 0x07;
+        }
+    }
+    memset(vm->vga_dirty, 0xFF, sizeof(vm->vga_dirty));
 }
 
 /* ── Check if filename ends with .COM ───────────────────────────── */
@@ -119,7 +149,7 @@ int dos_run(const char *filename, int argc, const char **argv)
     }
 
     /* Find file */
-    void *file = osfs2_find(filename);
+    void *file = osfs2_find_ci(filename);
     if (!file) {
         serial_puts("[DOS] File not found: ");
         serial_puts(filename);
@@ -163,16 +193,19 @@ int dos_run(const char *filename, int argc, const char **argv)
     vm.cpu = &cpu;
     cpu.vm = &vm;
 
-    /* Allocate 16MB emulated memory (1MB conventional + 15MB extended for DPMI) */
-    uint64_t total_mem = DOS_TOTAL_MEM;
+    /* System RAM remains 16 MB; VBE contributes a separate 4 MB physical
+     * aperture after it so framebuffer bytes never consume DPMI memory. */
+    uint64_t total_mem = DOS_VM_ADDRESS_SPACE_SIZE;
     uint64_t mem_pages = (total_mem + 0xFFF) / 4096;
     vm.mem = (uint8_t *)mem_alloc_pages(mem_pages);
     if (!vm.mem) {
-        serial_puts("[DOS] Failed to allocate 16MB emulated memory\n");
+        serial_puts("[DOS] Failed to allocate DOS address space\n");
         mem_free_pages(buf, buf_pages);
         return -1;
     }
     vm.total_mem_size = (uint32_t)total_mem;
+    vm.system_mem_size = DOS_TOTAL_MEM;
+    vm.mem_pages = mem_pages;
 
     /* Zero emulated memory */
     for (uint64_t i = 0; i < total_mem; i++) vm.mem[i] = 0;
@@ -184,21 +217,6 @@ int dos_run(const char *filename, int argc, const char **argv)
     extern void dpmi_init(dos_vm_t *vm);
     dpmi_init(&vm);
 
-    /* Initialize JIT/DBT engine */
-    {
-        #include "dos_jit.h"
-        /* jit_state_t is large (~200KB+), allocate via pages */
-        uint64_t jit_pages = (sizeof(jit_state_t) + 4095) / 4096;
-        jit_state_t *jit = (jit_state_t *)mem_alloc_pages(jit_pages);
-        if (jit) {
-            uint8_t *p = (uint8_t *)jit;
-            for (uint64_t i = 0; i < jit_pages * 4096; i++) p[i] = 0;
-            jit_init(jit);
-            vm.jit = jit;
-            serial_puts("[DOS] JIT engine initialized\n");
-        }
-    }
-
     cpu8086_init(&cpu, &vm);
 
     /* Set defaults */
@@ -209,15 +227,20 @@ int dos_run(const char *filename, int argc, const char **argv)
     vm.cursor_end = 7;
     vm.start_ticks = idt_get_ticks();
     vm.last_timer_tick = vm.start_ticks;
+    dos_mouse_init(&vm);
+    dos_vbe_init(&vm);
+    dos_api_init(&vm);
+
+    if (!dos_io_init(&vm)) {
+        serial_puts("[DOS] Failed to initialize virtual ISA devices\n");
+        mem_free_pages(buf, buf_pages);
+        dos_native_cleanup(&vm);
+        return -1;
+    }
+    dos_audio_init(&vm);
 
     /* DTA defaults to PSP:0080 */
     vm.dta_off = 0x0080;
-
-    /* Set up standard handles */
-    for (int i = 0; i < 5; i++) {
-        vm.handles[i].open = true;
-        vm.handles[i].is_device = true;
-    }
 
     /* Build command line from argv */
     char cmdline[128];
@@ -234,13 +257,13 @@ int dos_run(const char *filename, int argc, const char **argv)
     int rc;
 
     if (fmt == DOS_FMT_MZ) {
-        rc = dos_load_mz(&vm, buf, size, cmdline);
+        rc = dos_load_mz(&vm, buf, size, filename, cmdline);
     } else if (fmt == DOS_FMT_NONE && ends_with_com(filename)) {
-        rc = dos_load_com(&vm, buf, size, cmdline);
+        rc = dos_load_com(&vm, buf, size, filename, cmdline);
     } else {
         serial_puts("[DOS] Unknown binary format\n");
         mem_free_pages(buf, buf_pages);
-        mem_free_pages(vm.mem, mem_pages);
+        dos_native_cleanup(&vm);
         return -1;
     }
 
@@ -249,38 +272,25 @@ int dos_run(const char *filename, int argc, const char **argv)
 
     if (rc != 0) {
         serial_puts("[DOS] Failed to load binary\n");
-        mem_free_pages(vm.mem, mem_pages);
+        dos_native_cleanup(&vm);
         return -1;
     }
 
-    /* Write program name to environment block AND to DOS4GW's internal
-     * buffer area. DOS4GW reads from env at PSP:0x2C then copies to its
-     * own data area. We also write directly to 0x18A0 as a workaround. */
+    /* Initialize the optional JIT only after the image loaded successfully. */
     {
-        /* Environment block at 0x500. Format:
-         * VAR=VALUE\0 ... \0\0  (double null = end of vars)
-         * \x01\x00              (word: 1 string follows)
-         * DOOM.EXE\0            (program name) */
-        uint32_t env_addr = 0x500;
-        uint32_t p = env_addr;
-
-        /* Empty environment variables: just double-null */
-        vm.mem[p++] = 0;   /* end of (empty) var list */
-        vm.mem[p++] = 0;   /* second null = end of environment */
-
-        /* Count word: 1 additional string follows */
-        vm.mem[p++] = 0x01;
-        vm.mem[p++] = 0x00;
-
-        /* Program name (full path as DOS4GW expects) */
-        int k;
-        for (k = 0; filename[k] && k < 60; k++)
-            vm.mem[p++] = filename[k];
-        vm.mem[p] = 0;
-
-        serial_puts("[DOS] Env @0x500: '");
-        serial_puts(filename);
-        serial_puts("'\n");
+        uint64_t jit_pages = (sizeof(jit_state_t) + 4095u) / 4096u;
+        jit_state_t *jit = (jit_state_t *)mem_alloc_pages(jit_pages);
+        if (jit) {
+            uint8_t *p = (uint8_t *)jit;
+            for (uint64_t i = 0; i < jit_pages * 4096u; i++) p[i] = 0;
+            jit_init(jit);
+            if (jit->code_buf) {
+                vm.jit = jit;
+                serial_puts("[DOS] JIT engine initialized\n");
+            } else {
+                mem_free_pages(jit, jit_pages);
+            }
+        }
     }
 
     /* DTA segment = PSP */
@@ -288,6 +298,7 @@ int dos_run(const char *filename, int argc, const char **argv)
 
     /* Run! */
     serial_puts("[DOS] Starting...\n");
+    dos_vga_bind_vm(&vm);
     int exit_code = cpu8086_run(&vm);
 
     serial_puts("[DOS] Exit code ");
@@ -296,44 +307,26 @@ int dos_run(const char *filename, int argc, const char **argv)
     serial_putdec(cpu.insn_count);
     serial_puts(" instructions)\n");
 
-    /* Cleanup */
-    mem_free_pages(vm.mem, mem_pages);
+    dos_native_cleanup(&vm);
 
     return exit_code;
 }
 
-/* ── Transfer from 8086 interpreter to native 32-bit execution ──── */
+/* ── Native protected-mode backend ────────────────────────────── */
 /*
- * Called when the interpreter detects MOV CR0 with PE bit set.
- * DOS4GW has set up its GDT/IDT in emulated memory and is switching
- * to protected mode. We take over: install real GDT segments and
- * jump to the 32-bit code natively via LRETQ.
- *
- * Pattern: same as win32/compat32.c:compat32_enter()
+ * The interpreter establishes the guest GDT and DPMI LDT first. Native
+ * execution mirrors them into per-VM hardware tables, preserving the guest
+ * contract and all kernel-owned descriptors.
  */
 
 extern void dos_set_native_vm(dos_vm_t *vm);
 
-/* ── Native transfer: emulator → 32-bit compat mode ──────────────
- *
- * Approach: LDT-based. DOS4GW installs segment descriptors in an LDT
- * (TI=1 in selectors like 0x47, 0x4F). The dpmi->ldt[] array in the
- * dos_vm_t is already in Intel 8-byte descriptor format, so we can
- * point the hardware LDTR at it directly.
- *
- * Mapping: a dedicated DOS CR3 (via paging_create_process_cr3) maps
- * vm->mem physical pages at VA 0..total_mem_size, giving DOS4GW a
- * flat base=0 address space it expects. The kernel higher-half is
- * preserved so IDT handlers (INT 21h, etc.) can run normally from
- * the IST2 stack when DOS code issues software interrupts.
- *
- * After LRETQ, DOS native code runs at hardware speed. INTs trap via
- * dos_int_stub.S → dos_int_native_dispatch, handle the DOS API call,
- * and IRETQ back into DOS. */
-
 extern uint64_t paging_create_process_cr3(void);
 extern int      paging_map_page_in_cr3(uint64_t cr3, uint64_t virt,
                                        uint64_t phys, uint64_t flags);
+extern uint64_t paging_get_kernel_cr3(void);
+extern void     paging_switch(uint64_t cr3);
+extern void     paging_free_process_cr3(uint64_t cr3);
 
 /* Kernel GDT and its GDTR (shared with idt.c/win32_init.c) */
 extern uint64_t kernel_gdt[] __attribute__((weak));
@@ -387,18 +380,457 @@ static void dos_nt_propagate_user(uint64_t cr3, uint64_t va)
     pt[i1] |= PTE_USER;
 }
 
+void dos_native_ems_map_frame(dos_vm_t *vm, unsigned frame,
+                              uint32_t backing)
+{
+    if (!vm || !vm->mem || !vm->native_cr3 ||
+        frame >= DOS_EMS_FRAME_PAGES)
+        return;
+
+    uint64_t mem_pa = dos_nt_va_to_pa(vm->mem);
+    uint64_t window = DOS_EMS_PAGE_FRAME_BASE +
+                      (uint64_t)frame * DOS_EMS_PAGE_SIZE;
+    uint64_t source = backing ? backing : window;
+    if (source + DOS_EMS_PAGE_SIZE > vm->total_mem_size)
+        return;
+
+    for (uint64_t off = 0; off < DOS_EMS_PAGE_SIZE; off += 4096u) {
+        if (paging_map_page_in_cr3(vm->native_cr3, window + off,
+                                   mem_pa + source + off,
+                                   PTE_PRESENT | PTE_WRITABLE |
+                                   PTE_USER) == 0)
+            dos_nt_propagate_user(vm->native_cr3, window + off);
+    }
+}
+
+void dos_native_map_vbe_window(dos_vm_t *vm)
+{
+    if (!vm || !vm->mem || !vm->native_cr3) return;
+
+    uint32_t source = DOS_VBE_WINDOW_BASE;
+    if (vm->vbe_active && !vm->vbe_linear) {
+        uint64_t bank_offset =
+            (uint64_t)vm->vbe_bank * DOS_VBE_WINDOW_SIZE;
+        if (bank_offset + DOS_VBE_WINDOW_SIZE > DOS_VBE_FB_SIZE)
+            return;
+        source = DOS_VBE_FB_BASE + (uint32_t)bank_offset;
+    }
+    if ((uint64_t)source + DOS_VBE_WINDOW_SIZE > vm->total_mem_size)
+        return;
+
+    uint64_t mem_pa = dos_nt_va_to_pa(vm->mem);
+    for (uint64_t offset = 0; offset < DOS_VBE_WINDOW_SIZE;
+         offset += 4096u) {
+        if (paging_map_page_in_cr3(vm->native_cr3,
+                                   DOS_VBE_WINDOW_BASE + offset,
+                                   mem_pa + source + offset,
+                                   PTE_PRESENT | PTE_WRITABLE |
+                                   PTE_USER) == 0) {
+            dos_nt_propagate_user(vm->native_cr3,
+                                  DOS_VBE_WINDOW_BASE + offset);
+        }
+    }
+}
+
 /* GDT slot reserved for the DOS LDT descriptor (2 slots, 16 bytes).
  * CPU-local TSS descriptors live at slot 32 and above. Keep the historical
  * DOS selector at slot 12 so guest assumptions remain unchanged. */
 #define DOS_LDT_GDT_SLOT   12
 #define DOS_LDT_SELECTOR   (DOS_LDT_GDT_SLOT << 3)
+#define DOS_NT_GDT_ENTRIES 68
+#define DOS_NT_TABLE_PAGES 1
+#define DOS_NT_DESC_PRESENT_RAW (0x80ULL << 40)
+#define DOS_NT_DESC_SEGMENT_RAW (0x10ULL << 40)
+#define DOS_NT_DESC_ACCESSED_RAW (0x01ULL << 40)
 
-static uint64_t dos_cr3    = 0;
-static int      dos_ldt_ok = 0;
+typedef struct __attribute__((packed)) {
+    uint16_t offset_low;
+    uint16_t selector;
+    uint8_t  ist;
+    uint8_t  type_attr;
+    uint16_t offset_mid;
+    uint32_t offset_high;
+    uint32_t reserved;
+} dos_nt_idt_entry_t;
+
+extern dos_nt_idt_entry_t idt[];
+
+static const uint8_t dos_nt_idt_vectors[12] = {
+    0x01, 0x10, 0x16, 0x21, 0x2F, 0x31, 0x33,
+    0x67,
+    DPMI_DEFAULT_REFLECT_INT, DPMI_CALLBACK_RETURN_INT,
+    DPMI_EXCEPTION_RETURN_INT,
+    DPMI_RAW_SWITCH_INT
+};
+
+typedef struct __attribute__((packed)) {
+    uint16_t limit;
+    uint64_t base;
+} dos_nt_gdtr_t;
+
+/*
+ * The native CR3 intentionally does not map the host task's lower-half
+ * kernel stack. Keep the final transition operands in kernel BSS so no local
+ * stack access occurs after CR3/RSP are replaced with the guest values.
+ */
+typedef struct {
+    dos_nt_gdtr_t gdtr;
+    uint16_t ldt;
+    uint32_t reserved;
+    uint64_t cr3, cs, ds, es, ss, ip, sp, rflags, kernel_sp;
+    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
+} dos_nt_enter_state_t;
+
+static dos_nt_enter_state_t dos_nt_enter_state;
+static uint8_t dos_nt_enter_stack[4096] __attribute__((aligned(16)));
+
+extern void kern_longjmp(uint64_t *buf, int value) __attribute__((noreturn));
+
+static uint64_t dos_nt_descriptor_raw(const dpmi_descriptor_t *desc)
+{
+    return (uint64_t)desc->limit_lo |
+           ((uint64_t)desc->base_lo << 16) |
+           ((uint64_t)desc->base_mid << 32) |
+           ((uint64_t)desc->access << 40) |
+           ((uint64_t)desc->flags_lim << 48) |
+           ((uint64_t)desc->base_hi << 56);
+}
+
+static uint64_t dos_nt_backend_descriptor(uint64_t raw)
+{
+    if ((raw & (DOS_NT_DESC_PRESENT_RAW | DOS_NT_DESC_SEGMENT_RAW)) ==
+        (DOS_NT_DESC_PRESENT_RAW | DOS_NT_DESC_SEGMENT_RAW))
+        raw |= DOS_NT_DESC_ACCESSED_RAW;
+    return raw;
+}
+
+static bool dos_nt_guest_gdt_slot_allowed(unsigned index)
+{
+    if (index == 0 || index >= 32 || index >= DOS_NT_GDT_ENTRIES)
+        return false;
+    if ((index >= 5 && index <= 9) || index == 12 || index == 13 ||
+        index == 18 || index == 19)
+        return false;
+    return true;
+}
+
+static bool dos_nt_guest_gdt_read(dos_vm_t *vm, unsigned index,
+                                  uint64_t *raw_out)
+{
+    if (!vm || !vm->cpu || !raw_out || !dos_nt_guest_gdt_slot_allowed(index))
+        return false;
+
+    uint32_t offset = index * 8u;
+    if (offset + 7u > vm->cpu->gdtr.limit)
+        return false;
+
+    uint64_t address = (uint64_t)vm->cpu->gdtr.base + offset;
+    if (address + 7u >= vm->total_mem_size || address + 7u < address)
+        return false;
+
+    uint64_t raw = 0;
+    for (unsigned i = 0; i < 8; i++)
+        raw |= (uint64_t)vm->mem[address + i] << (i * 8);
+    *raw_out = raw;
+    return true;
+}
+
+static void *dos_nt_alloc_table_page(void)
+{
+    void *physical = mem_alloc_pages(DOS_NT_TABLE_PAGES);
+    if (!physical) return NULL;
+    uint8_t *bytes = (uint8_t *)physical;
+    for (unsigned i = 0; i < 4096; i++) bytes[i] = 0;
+    return (void *)(dos_nt_va_to_pa(physical) + DOS_NT_KERNEL_VBASE);
+}
+
+static void dos_nt_free_table_page(void **table)
+{
+    if (!table || !*table) return;
+    mem_free_pages((void *)dos_nt_va_to_pa(*table), DOS_NT_TABLE_PAGES);
+    *table = NULL;
+}
+
+void dos_native_sync_ldt(dos_vm_t *vm)
+{
+    if (!vm || !vm->native_ldt) return;
+    uint64_t *native = (uint64_t *)vm->native_ldt;
+    for (unsigned i = 0; i < DPMI_MAX_DESCRIPTORS; i++) {
+        dpmi_descriptor_t descriptor;
+        uint16_t selector = (uint16_t)((i << 3) | 0x07u);
+        native[i] = dpmi_guest_descriptor(vm, selector, &descriptor)
+                  ? dos_nt_backend_descriptor(
+                        dos_nt_descriptor_raw(&descriptor))
+                  : 0;
+    }
+    __asm__ volatile ("mfence" ::: "memory");
+}
+
+static void dos_native_sync_gdt(dos_vm_t *vm)
+{
+    if (!vm || !vm->native_gdt || !vm->native_ldt) return;
+    uint64_t *native = (uint64_t *)vm->native_gdt;
+
+    for (unsigned i = 0; i < DOS_NT_GDT_ENTRIES; i++)
+        native[i] = kernel_gdt[i];
+
+    for (unsigned i = 1; i < 32; i++) {
+        if (!dos_nt_guest_gdt_slot_allowed(i)) continue;
+        native[i] = 0;
+        uint64_t raw;
+        if (dos_nt_guest_gdt_read(vm, i, &raw) &&
+            (raw & DOS_NT_DESC_SEGMENT_RAW))
+            native[i] = dos_nt_backend_descriptor(raw);
+    }
+
+    uint64_t ldt_base = (uint64_t)vm->native_ldt;
+    uint32_t ldt_limit = (uint32_t)(sizeof(vm->dpmi.ldt) - 1);
+    native[DOS_LDT_GDT_SLOT] =
+          (uint64_t)(ldt_limit & 0xFFFF)
+        | ((ldt_base & 0xFFFFFFULL) << 16)
+        | ((uint64_t)0x82 << 40)
+        | ((uint64_t)((ldt_limit >> 16) & 0xF) << 48)
+        | (((ldt_base >> 24) & 0xFFULL) << 56);
+    native[DOS_LDT_GDT_SLOT + 1] = ldt_base >> 32;
+    __asm__ volatile ("mfence" ::: "memory");
+}
+
+static bool dos_nt_selector_descriptor(dos_vm_t *vm, uint16_t selector,
+                                       uint64_t *raw_out)
+{
+    if (!vm || !raw_out || (selector & ~3u) == 0) return false;
+    unsigned index = selector >> 3;
+    uint64_t raw;
+
+    if (selector & 0x04) {
+        dpmi_descriptor_t descriptor;
+        if (index >= DPMI_MAX_DESCRIPTORS ||
+            !dpmi_guest_descriptor(vm, selector, &descriptor))
+            return false;
+        raw = dos_nt_descriptor_raw(&descriptor);
+    } else if (!dos_nt_guest_gdt_read(vm, index, &raw)) {
+        return false;
+    }
+
+    if (!(raw & DOS_NT_DESC_SEGMENT_RAW)) return false;
+    *raw_out = raw;
+    return true;
+}
+
+static bool dos_nt_selector_valid(dos_vm_t *vm, uint16_t selector,
+                                  bool require_code, bool require_stack)
+{
+    if ((selector & ~3u) == 0)
+        return !require_code && !require_stack;
+
+    uint64_t raw;
+    if (!dos_nt_selector_descriptor(vm, selector, &raw) ||
+        !(raw & DOS_NT_DESC_PRESENT_RAW))
+        return false;
+
+    uint8_t access = (uint8_t)(raw >> 40);
+    bool is_code = (access & DESC_CODE) != 0;
+    if (require_code) return is_code;
+    if (require_stack) return !is_code && (access & DESC_WRITABLE);
+    return !is_code || (access & DESC_READABLE);
+}
+
+static bool dos_nt_selector_linear(dos_vm_t *vm, uint16_t selector,
+                                   uint32_t offset, uint64_t *linear_out)
+{
+    uint64_t raw;
+    if (!linear_out || !dos_nt_selector_descriptor(vm, selector, &raw) ||
+        !(raw & DOS_NT_DESC_PRESENT_RAW))
+        return false;
+
+    uint32_t base = (uint32_t)((raw >> 16) & 0xFFFF)
+                  | (uint32_t)(((raw >> 32) & 0xFF) << 16)
+                  | (uint32_t)(((raw >> 56) & 0xFF) << 24);
+    uint32_t limit = (uint32_t)(raw & 0xFFFF)
+                   | (uint32_t)(((raw >> 48) & 0xF) << 16);
+    if (raw & (1ULL << 55))
+        limit = (limit << 12) | 0xFFF;
+    if (offset > limit) return false;
+
+    uint64_t linear = (uint64_t)base + offset;
+    if (linear >= vm->total_mem_size || linear < base) return false;
+    *linear_out = linear;
+    return true;
+}
+
+int dos_native_refresh_guest_selector(dos_vm_t *vm, uint16_t error_code)
+{
+    if (!vm || !error_code || (error_code & 0x02))
+        return 0;
+
+    uint64_t saved_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        paging_switch(kernel_cr3);
+
+    if (!vm->native_active || !vm->native_gdt || !vm->native_ldt)
+        goto unchanged;
+
+    unsigned index = error_code >> 3;
+    uint64_t *table;
+    uint64_t next;
+    if (error_code & 0x04) {
+        dpmi_descriptor_t descriptor;
+        if (index >= DPMI_MAX_DESCRIPTORS ||
+            !dpmi_guest_descriptor(vm, (uint16_t)error_code,
+                                   &descriptor))
+            goto unchanged;
+        table = (uint64_t *)vm->native_ldt;
+        next = dos_nt_backend_descriptor(
+            dos_nt_descriptor_raw(&descriptor));
+    } else {
+        uint64_t raw;
+        if (!dos_nt_guest_gdt_read(vm, index, &raw) ||
+            !(raw & DOS_NT_DESC_SEGMENT_RAW))
+            goto unchanged;
+        table = (uint64_t *)vm->native_gdt;
+        next = dos_nt_backend_descriptor(raw);
+    }
+
+    if (table[index] == next) goto unchanged;
+    table[index] = next;
+    __asm__ volatile ("mfence" ::: "memory");
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        paging_switch(saved_cr3);
+    return (next & DOS_NT_DESC_PRESENT_RAW) != 0;
+
+unchanged:
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        paging_switch(saved_cr3);
+    return 0;
+}
+
+static void dos_native_switch_to_kernel_cr3(void)
+{
+    uint64_t current_cr3;
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(current_cr3));
+    if (kernel_cr3 && current_cr3 != kernel_cr3)
+        paging_switch(kernel_cr3);
+}
+
+static void dos_native_leave_backend(dos_vm_t *vm)
+{
+    if (!vm) return;
+
+    /* vm may live on a host stack that is absent from the DOS address space. */
+    dos_native_switch_to_kernel_cr3();
+    dos_vga_set_direct_writes(vm, false);
+
+    bool had_native_state = vm->native_cr3 || vm->native_gdt ||
+                            vm->native_ldt || vm->native_idt_saved ||
+                            vm->native_active;
+    if (had_native_state) {
+        __asm__ volatile ("cli" ::: "memory");
+
+        /* Native DOS traps arrive at CPL0 on an IST stack. Restore host
+         * segments before invalidating the client's LDTR. */
+        uint16_t host_data = 0x30;
+        uint16_t null_ldt = 0;
+        __asm__ volatile (
+            "mov %0, %%ds\n"
+            "mov %0, %%es\n"
+            "mov %0, %%ss\n"
+            "lldt %1\n"
+            : : "r"(host_data), "r"(null_ldt) : "memory");
+
+        if (vm->native_idt_saved) {
+            for (unsigned i = 0; i < sizeof(dos_nt_idt_vectors); i++) {
+                uint8_t *dst = (uint8_t *)&idt[dos_nt_idt_vectors[i]];
+                for (unsigned j = 0; j < 16; j++)
+                    dst[j] = vm->native_saved_idt[i][j];
+            }
+            vm->native_idt_saved = false;
+        }
+
+        __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr) : "memory");
+
+        dos_set_native_vm(NULL);
+        vm->native_active = false;
+        vm->native_ready = false;
+
+        if (vm->native_cr3) {
+            paging_free_process_cr3(vm->native_cr3);
+            vm->native_cr3 = 0;
+        }
+        dos_nt_free_table_page(&vm->native_gdt);
+        dos_nt_free_table_page(&vm->native_ldt);
+    }
+
+}
+
+void dos_native_release_backend(dos_vm_t *vm)
+{
+    dos_native_leave_backend(vm);
+}
+
+void dos_native_cleanup(dos_vm_t *vm)
+{
+    if (!vm) return;
+
+    uint64_t saved_flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(saved_flags));
+
+    /* Fault recovery can enter here while the DOS process CR3 is active. */
+    dos_native_switch_to_kernel_cr3();
+    dos_exec_cleanup(vm);
+    dos_native_leave_backend(vm);
+    vm->native_resume_armed = false;
+    dos_vga_unbind_vm(vm);
+
+    dos_audio_shutdown(vm);
+    dos_io_shutdown(vm);
+    dos_api_close_all(vm);
+    dos_jit_release(vm);
+    dos_vcpi_cleanup(vm);
+    if (vm->mem && vm->mem_pages) {
+        mem_free_pages(vm->mem, vm->mem_pages);
+        vm->mem = NULL;
+        vm->mem_pages = 0;
+        vm->total_mem_size = 0;
+    }
+
+    if (saved_flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
+
+void dos_native_suspend(dos_vm_t *vm)
+{
+    if (!vm || !vm->native_resume_armed) {
+        serial_puts("[DOS-NT] raw mode switch has no interpreter context\n");
+        dos_native_cleanup(vm);
+        if (dos_native_exit_jmpbuf)
+            kern_longjmp(dos_native_exit_jmpbuf, 2);
+        __asm__ volatile ("cli" ::: "memory");
+        for (;;) __asm__ volatile ("hlt");
+    }
+
+    dos_native_leave_backend(vm);
+    extern void x86_tss_reset_ist2(void);
+    x86_tss_reset_ist2();
+    kern_longjmp(vm->native_resume_jmpbuf, 1);
+}
 
 void dos_transfer_to_native(dos_vm_t *vm)
 {
     cpu8086_state_t *cpu = vm->cpu;
+
+    /* A translated real-mode service may invoke a callback while its outer
+     * native INT frame is still live. Interpret that nested protected-mode
+     * callback so the outer CR3/IDT context remains intact. */
+    if (vm->native_dispatch_depth)
+        return;
+
+    if (!vm->native_resume_armed) {
+        serial_puts("[DOS-NT] native entry has no interpreter context\n");
+        return;
+    }
 
     serial_puts("[DOS-NT] enter cs=0x");  serial_puthex(cpu->cs, 4);
     serial_puts(" eip=0x");                serial_puthex(cpu->eip, 8);
@@ -407,16 +839,20 @@ void dos_transfer_to_native(dos_vm_t *vm)
     serial_puts(" ds=0x");                 serial_puthex(cpu->ds, 4);
     serial_puts("\n");
 
-    /* Skip if DOS4GW isn't using LDT yet — stay in interpreter. */
-    if ((cpu->cs & 0x04) == 0) {
-        serial_puts("[DOS-NT] CS is GDT selector (not LDT), skipping\n");
+    uint64_t target_linear;
+    if (!dos_nt_selector_valid(vm, cpu->cs, true, false) ||
+        !dos_nt_selector_valid(vm, cpu->ss, false, true) ||
+        !dos_nt_selector_valid(vm, cpu->ds, false, false) ||
+        !dos_nt_selector_valid(vm, cpu->es, false, false) ||
+        !dos_nt_selector_linear(vm, cpu->cs, cpu->eip, &target_linear)) {
+        serial_puts("[DOS-NT] descriptor state is not ready; continuing in interpreter\n");
         return;
     }
 
     /* ── One-time CR3 + LDT-descriptor setup ────────────────── */
-    if (!dos_cr3) {
-        dos_cr3 = paging_create_process_cr3();
-        if (!dos_cr3) {
+    if (!vm->native_ready) {
+        vm->native_cr3 = paging_create_process_cr3();
+        if (!vm->native_cr3) {
             serial_puts("[DOS-NT] paging_create_process_cr3 FAILED\n");
             return;
         }
@@ -425,115 +861,42 @@ void dos_transfer_to_native(dos_vm_t *vm)
         uint64_t mem_pa = dos_nt_va_to_pa(vm->mem);
         uint64_t mapped = 0;
         for (uint64_t off = 0; off < vm->total_mem_size; off += 4096) {
-            if (paging_map_page_in_cr3(dos_cr3, off, mem_pa + off,
+            if (paging_map_page_in_cr3(vm->native_cr3, off, mem_pa + off,
                                        PTE_PRESENT | PTE_WRITABLE | PTE_USER) != 0) {
                 serial_puts("[DOS-NT] map FAILED at off=0x");
                 serial_puthex(off, 8); serial_puts("\n");
+                paging_free_process_cr3(vm->native_cr3);
+                vm->native_cr3 = 0;
                 return;
             }
-            dos_nt_propagate_user(dos_cr3, off);
+            dos_nt_propagate_user(vm->native_cr3, off);
             mapped += 4096;
         }
-        serial_puts("[DOS-NT] CR3=0x");    serial_puthex(dos_cr3, 16);
+        for (unsigned frame = 0; frame < DOS_EMS_FRAME_PAGES; frame++) {
+            if (vm->ems_frame_bases[frame])
+                dos_native_ems_map_frame(vm, frame,
+                                         vm->ems_frame_bases[frame]);
+        }
+        dos_native_map_vbe_window(vm);
+        serial_puts("[DOS-NT] CR3=0x");    serial_puthex(vm->native_cr3, 16);
         serial_puts(" vm->mem pa=0x");     serial_puthex(mem_pa, 16);
         serial_puts(" mapped=");           serial_putdec(mapped >> 10);
         serial_puts(" KB @ VA 0\n");
 
-        /* Also map the dos_vm_t struct pages at their own kernel VA in
-         * dos_cr3. The LDT (dpmi->ldt) and VM state live here; hardware
-         * LDT access on segment-register loads dereferences the kernel
-         * VA, and INT handlers read the VM pointer through this mapping. */
-        uint64_t vm_va    = (uint64_t)vm;
-        uint64_t vm_end   = vm_va + sizeof(*vm);
-        uint64_t vm_pbase = vm_va & ~0xFFFULL;
-        uint64_t vm_pages = 0;
-        for (uint64_t va = vm_pbase; va < vm_end; va += 4096) {
-            uint64_t pa = dos_nt_va_to_pa((void *)va);
-            if (paging_map_page_in_cr3(dos_cr3, va, pa,
-                                       PTE_PRESENT | PTE_WRITABLE | PTE_USER) != 0) {
-                serial_puts("[DOS-NT] vm-struct map FAILED va=0x");
-                serial_puthex(va, 16); serial_puts("\n");
-                return;
-            }
-            dos_nt_propagate_user(dos_cr3, va);
-            vm_pages++;
-        }
-        serial_puts("[DOS-NT] vm struct mapped: ");
-        serial_putdec(vm_pages); serial_puts(" pages @ VA 0x");
-        serial_puthex(vm_pbase, 16); serial_puts("\n");
-
-        /* Build the long-mode LDT descriptor pointing at dpmi->ldt[].
-         * System descriptor, 16 bytes. Low 64 bits hold base[31:0] +
-         * limit[19:0] + access/flags; high 64 bits hold base[63:32]. */
-        uint64_t ldt_base = (uint64_t)&vm->dpmi.ldt[0];
-        uint32_t ldt_limit = (uint32_t)(sizeof(vm->dpmi.ldt) - 1);
-
-        uint64_t desc_lo =
-              ((uint64_t)(ldt_limit & 0xFFFF))
-            | (((uint64_t)(ldt_base) & 0xFFFFFF) << 16)
-            | ((uint64_t)0x82 << 40)                       /* P=1, Type=2 LDT */
-            | ((uint64_t)((ldt_limit >> 16) & 0xF) << 48)
-            | (((uint64_t)(ldt_base >> 24) & 0xFF) << 56);
-        uint64_t desc_hi = (ldt_base >> 32);               /* base[63:32] */
-
-        kernel_gdt[DOS_LDT_GDT_SLOT]     = desc_lo;
-        kernel_gdt[DOS_LDT_GDT_SLOT + 1] = desc_hi;
-
-        /* Extend GDTR limit to cover slots 13 (LDT desc upper half),
-         * and 14-16 (DOS4GW scratch slot for synthesized real-mode
-         * segment aliases — see dos_int.c MOV Sreg handler). */
-        uint16_t needed = (17 * 8) - 1;  /* slots 0..16 inclusive */
-        if (kernel_gdtr.limit < needed) {
-            kernel_gdtr.limit = needed;
-            __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr));
+        vm->native_gdt = dos_nt_alloc_table_page();
+        vm->native_ldt = dos_nt_alloc_table_page();
+        if (!vm->native_gdt || !vm->native_ldt) {
+            serial_puts("[DOS-NT] descriptor-table allocation FAILED\n");
+            dos_nt_free_table_page(&vm->native_gdt);
+            dos_nt_free_table_page(&vm->native_ldt);
+            paging_free_process_cr3(vm->native_cr3);
+            vm->native_cr3 = 0;
+            return;
         }
 
-        serial_puts("[DOS-NT] LDT installed: sel=0x");
-        serial_puthex(DOS_LDT_SELECTOR, 4);
-        serial_puts(" base=0x");  serial_puthex(ldt_base, 16);
-        serial_puts(" limit=0x"); serial_puthex(ldt_limit, 4);
-        serial_puts("\n");
-
-        /* DOS4GW quirk: DOOM hard-codes `LJMPW $0x18:$0x334` (and
-         * similar variants) at several places.  Selector 0x18 is GDT
-         * idx 3, which DOS4GW expected to set up itself via LGDT but
-         * our kernel keeps the host GDT.  Solution: install GDT[3] as
-         * a 16-bit code segment whose BASE matches DOOM's primary CS
-         * (LDT[0] base, e.g. 0x52B0).  Now `LJMPW $0x18:$N` lands at
-         * the SAME linear address as a `LJMPW $0x07:$N` would (where
-         * 0x07 is DOOM's LDT-CS selector) — i.e. inside DOOM's own
-         * code segment.  Only set this in DOS4GW mode so non-DOS4GW
-         * DOS binaries are untouched. */
-        if (vm->dos4gw_mode) {
-            /* Helper to build a 16-bit segment descriptor with the given
-             * base + access byte. limit fixed at 0xFFFF, flags=0. */
-            #define DOS_NT_DESC16(base32, acc) \
-                  (((uint64_t)0xFFFF)                                          \
-                 | ((uint64_t)((base32) & 0xFFFF) << 16)                       \
-                 | ((uint64_t)(((base32) >> 16) & 0xFF) << 32)                 \
-                 | ((uint64_t)((acc)) << 40)                                   \
-                 | ((uint64_t)0x00 << 52)                                      \
-                 | ((uint64_t)(((base32) >> 24) & 0xFF) << 56))
-            uint32_t doom_cs_base =
-                  (uint32_t)vm->dpmi.ldt[0].base_lo
-                | ((uint32_t)vm->dpmi.ldt[0].base_mid << 16)
-                | ((uint32_t)vm->dpmi.ldt[0].base_hi  << 24);
-            uint32_t doom_ds_base =
-                  (uint32_t)vm->dpmi.ldt[2].base_lo
-                | ((uint32_t)vm->dpmi.ldt[2].base_mid << 16)
-                | ((uint32_t)vm->dpmi.ldt[2].base_hi  << 24);
-            /* GDT[3] sel 0x18: 16-bit code at DOOM CS base. acc=0x9A:
-             *   P=1 DPL=0 S=1 type=A (code, readable, non-conforming) */
-            kernel_gdt[3] = DOS_NT_DESC16(doom_cs_base, 0x9A);
-            /* GDT[4] sel 0x20: 16-bit data at DOOM DS/SS base. acc=0x92:
-             *   P=1 DPL=0 S=1 type=2 (data, writable, expand-up) */
-            kernel_gdt[4] = DOS_NT_DESC16(doom_ds_base, 0x92);
-            #undef DOS_NT_DESC16
-            serial_puts("[DOS-NT] GDT[3]=CS@0x");  serial_puthex(doom_cs_base, 8);
-            serial_puts(" GDT[4]=DS@0x");          serial_puthex(doom_ds_base, 8);
-            serial_puts(" (DOS4GW aliases, lim=0xFFFF)\n");
-        }
-
+        dos_native_sync_ldt(vm);
+        dos_native_sync_gdt(vm);
+        serial_puts("[DOS-NT] private GDT/LDT prepared from guest tables\n");
         /* Install DOS INT handlers in the IDT with DPL=3 so ring-3 DOS
          * code can invoke them via the INT instruction. Without DPL=3
          * the CPU raises #GP on INT 21h etc. */
@@ -545,28 +908,38 @@ void dos_transfer_to_native(dos_vm_t *vm)
         extern void dos_int2f_stub(void);
         extern void dos_int31_stub(void);
         extern void dos_int33_stub(void);
-        struct __attribute__((packed)) idt_entry_64 {
-            uint16_t offset_low;
-            uint16_t selector;
-            uint8_t  ist;
-            uint8_t  type_attr;
-            uint16_t offset_mid;
-            uint32_t offset_high;
-            uint32_t reserved;
-        };
-        extern struct idt_entry_64 idt[];
+        extern void dos_int67_stub(void);
+        extern void dos_intf9_stub(void);
+        extern void dos_intfa_stub(void);
+        extern void dos_intfc_stub(void);
+        extern void dos_intfd_stub(void);
+        extern void dos_exc01_stub(void);
         uint16_t cs;
         __asm__ volatile ("mov %%cs, %0" : "=r"(cs));
         /* Vector 0x20 is the APIC timer — MUST NOT overwrite. DOS programs
          * rarely use INT 20h (they use INT 21h AH=4Ch). Vector 0x08 is the
          * legacy PIC IRQ0 (also timer); skip it too for safety. */
         struct { uint8_t vec; void (*h)(void); } dos_gates[] = {
+            { 0x01, dos_exc01_stub },
             { 0x10, dos_int10_stub },
             { 0x16, dos_int16_stub },
             { 0x21, dos_int21_stub }, { 0x2F, dos_int2f_stub },
             { 0x31, dos_int31_stub }, { 0x33, dos_int33_stub },
+            { 0x67, dos_int67_stub },
+            { DPMI_DEFAULT_REFLECT_INT, dos_intf9_stub },
+            { DPMI_CALLBACK_RETURN_INT, dos_intfa_stub },
+            { DPMI_EXCEPTION_RETURN_INT, dos_intfd_stub },
+            { DPMI_RAW_SWITCH_INT, dos_intfc_stub },
         };
         (void)dos_int08_stub; (void)dos_int20_stub;
+        if (!vm->native_idt_saved) {
+            for (unsigned i = 0; i < sizeof(dos_nt_idt_vectors); i++) {
+                const uint8_t *src = (const uint8_t *)&idt[dos_nt_idt_vectors[i]];
+                for (unsigned j = 0; j < 16; j++)
+                    vm->native_saved_idt[i][j] = src[j];
+            }
+            vm->native_idt_saved = true;
+        }
         for (unsigned i = 0; i < sizeof(dos_gates)/sizeof(dos_gates[0]); i++) {
             uint64_t addr = (uint64_t)dos_gates[i].h;
             uint8_t v = dos_gates[i].vec;
@@ -580,35 +953,18 @@ void dos_transfer_to_native(dos_vm_t *vm)
         }
         serial_puts("[DOS-NT] DOS IDT gates installed (DPL=3) on IST2\n");
 
-        dos_ldt_ok = 1;
+        vm->native_ready = true;
     }
 
-    if (!dos_ldt_ok) return;
+    if (!vm->native_ready) return;
+
+    dos_native_sync_ldt(vm);
+    dos_native_sync_gdt(vm);
 
     /* Record the VM pointer so native INT handlers can find it. */
+    dos_vga_set_direct_writes(vm, true);
+    vm->native_active = true;
     dos_set_native_vm(vm);
-
-    /* Safety net for uninitialised DOS function-pointer tables: plant
-     * a near-RET (0xC3) at CS:0 so a bad `callw *[X]` with a zero
-     * target returns harmlessly instead of crashing on invalid opcodes
-     * deeper in the data area. Touches one byte of DOOM's data but its
-     * offset 0 is typically padding/zero. */
-    {
-        uint16_t cs_idx = (cpu->cs >> 3) & 0x1FFF;
-        if (cs_idx < DPMI_MAX_DESCRIPTORS) {
-            dpmi_descriptor_t *d = &vm->dpmi.ldt[cs_idx];
-            uint32_t base = (uint32_t)d->base_lo
-                          | ((uint32_t)d->base_mid << 16)
-                          | ((uint32_t)d->base_hi  << 24);
-            if (base + 1 < vm->total_mem_size) {
-                uint8_t orig = vm->mem[base];
-                if (orig == 0x71 || orig == 0x00) {  /* padding-looking */
-                    vm->mem[base] = 0xC3;  /* RET near */
-                    serial_puts("[DOS-NT] patched CS:0 with C3 (RET) safety\n");
-                }
-            }
-        }
-    }
 
     /* Ring-3-to-ring-0 compatibility transitions use the BSP's permanent IRQ
      * stack through RSP0. Ordinary external interrupts select IST4 directly. */
@@ -618,191 +974,97 @@ void dos_transfer_to_native(dos_vm_t *vm)
         serial_puts("[DOS-NT] TSS.RSP0 reset to IRQ stack\n");
     }
 
-    /* ── The jump ───────────────────────────────────────────── */
-    /* Load DS/ES/SS from DOS4GW's LDT selectors first (they refer to
-     * the LDT we're about to LLDT). Then switch CR3 so VA 0 maps to
-     * vm->mem. Finally LRETQ to cs:eip in 32-bit compat mode. */
-    uint64_t cr3_new = dos_cr3;
-    uint16_t ldt_sel = DOS_LDT_SELECTOR;
-    uint64_t cs64    = cpu->cs;
-    uint64_t ip64    = cpu->eip;
-    uint64_t ds64    = cpu->ds;
-    /* For SS/ES, fall back to DS if the emulated value isn't a valid LDT
-     * selector (e.g. stale real-mode DOS segment like 0x147D). */
-    #define DOS_NT_SEL_OK(s) (((s) & 0x04) && (((s) >> 3) < DPMI_MAX_DESCRIPTORS))
-    uint64_t ss64    = DOS_NT_SEL_OK(cpu->ss) ? cpu->ss : cpu->ds;
-    uint64_t es64    = DOS_NT_SEL_OK(cpu->es) ? cpu->es : cpu->ds;
-    uint64_t sp64    = cpu->esp;
+    dos_nt_enter_state_t *enter = &dos_nt_enter_state;
+    enter->gdtr = (dos_nt_gdtr_t) {
+        .limit = (uint16_t)(DOS_NT_GDT_ENTRIES * 8 - 1),
+        .base = (uint64_t)vm->native_gdt,
+    };
+    enter->ldt = DOS_LDT_SELECTOR;
+    enter->cr3 = vm->native_cr3;
+    enter->cs = cpu->cs;
+    enter->ds = cpu->ds;
+    enter->es = cpu->es;
+    enter->ss = cpu->ss;
+    enter->ip = cpu->eip;
+    enter->sp = cpu->esp;
+    /* Host interrupts must remain enabled while a CPL3 DOS client runs.
+     * IOPL stays at zero so IN/OUT are mediated by the virtual-device bus. */
+    enter->rflags = (cpu->eflags | FLAGS_FIXED | FLAG_IF) &
+                    ~(uint64_t)FLAG_IOPL_MASK;
+    enter->kernel_sp = (uint64_t)(dos_nt_enter_stack +
+                                  sizeof(dos_nt_enter_stack));
+    enter->rax = cpu->eax;
+    enter->rbx = cpu->ebx;
+    enter->rcx = cpu->ecx;
+    enter->rdx = cpu->edx;
+    enter->rsi = cpu->esi;
+    enter->rdi = cpu->edi;
+    enter->rbp = cpu->ebp;
 
-    /* Ring-0 (CPL=0) transition: selectors must have RPL=0 to match
-     * the promoted DPL=0 descriptors. */
-    cs64 &= ~3ULL;
-    ds64 &= ~3ULL;
-    ss64 &= ~3ULL;
-    es64 &= ~3ULL;
+    serial_puts("[DOS-NT] IRETQ cs:eip=0x");
+    serial_puthex(enter->cs, 4); serial_puts(":0x");
+    serial_puthex(enter->ip, 8); serial_puts(" ss:esp=0x");
+    serial_puthex(enter->ss, 4); serial_puts(":0x");
+    serial_puthex(enter->sp, 8); serial_puts(" ds=0x");
+    serial_puthex(enter->ds, 4); serial_puts(" linear=0x");
+    serial_puthex(target_linear, 8); serial_puts("\n");
 
-    serial_puts("[DOS-NT] LRETQ cs:eip=0x");
-    serial_puthex(cs64, 4); serial_puts(":0x");
-    serial_puthex(ip64, 8); serial_puts(" ss:esp=0x");
-    serial_puthex(ss64, 4); serial_puts(":0x");
-    serial_puthex(sp64, 8); serial_puts(" ds=0x");
-    serial_puthex(ds64, 4); serial_puts("\n");
-
-    /* DOS4GW is a ring-0 DPMI client: it expects CPL=0 with DPL=0
-     * descriptors and RPL=0 selectors. Promote all LDT entries to
-     * DPL=0 so segment register loads from DOS code work under CPL=0. */
-    {
-        dpmi_descriptor_t *ldt = vm->dpmi.ldt;
-        int promoted = 0;
-        for (int i = 0; i < DPMI_MAX_DESCRIPTORS; i++) {
-            if ((ldt[i].access & 0x80) && (ldt[i].access & 0x60) != 0) {
-                ldt[i].access &= ~0x60;  /* clear DPL → DPL=0 */
-                promoted++;
-            }
-        }
-        if (promoted) {
-            serial_puts("[DOS-NT] promoted ");
-            serial_putdec(promoted);
-            serial_puts(" LDT entries to DPL=0 (ring-0 DPMI)\n");
-        }
+    serial_puts("[DOS-NT] bytes @linear=0x");
+    serial_puthex(target_linear, 8);
+    serial_puts(":");
+    for (unsigned i = 0; i < 16 && target_linear + i < vm->total_mem_size; i++) {
+        serial_puts(" ");
+        serial_puthex(vm->mem[target_linear + i], 2);
     }
+    serial_puts("\n");
 
-    /* Dump LDT entries for cs/ds/ss/es to verify they're sane before LRETQ */
-    {
-        dpmi_descriptor_t *ldt = vm->dpmi.ldt;
-        uint16_t sels[4] = { (uint16_t)cs64, (uint16_t)ds64,
-                             (uint16_t)ss64, (uint16_t)es64 };
-        const char *names[4] = { "CS", "DS", "SS", "ES" };
-        for (int i = 0; i < 4; i++) {
-            uint16_t sel = sels[i];
-            uint16_t idx = sel >> 3;
-            if ((sel & 0x04) == 0 || idx >= DPMI_MAX_DESCRIPTORS) {
-                serial_puts("[DOS-NT] "); serial_puts(names[i]);
-                serial_puts("=0x"); serial_puthex(sel, 4);
-                serial_puts(" NOT LDT or OOB\n");
-                continue;
-            }
-            dpmi_descriptor_t *d = &ldt[idx];
-            serial_puts("[DOS-NT] "); serial_puts(names[i]);
-            serial_puts("=0x"); serial_puthex(sel, 4);
-            serial_puts(" ldt["); serial_putdec(idx); serial_puts("]");
-            serial_puts(" base=0x");
-            serial_puthex((uint32_t)d->base_lo |
-                          ((uint32_t)d->base_mid << 16) |
-                          ((uint32_t)d->base_hi << 24), 8);
-            serial_puts(" limit=0x");
-            serial_puthex((uint32_t)d->limit_lo |
-                          ((uint32_t)(d->flags_lim & 0xF) << 16), 5);
-            serial_puts(" access=0x"); serial_puthex(d->access, 2);
-            serial_puts(" flags=0x"); serial_puthex(d->flags_lim, 2);
-            serial_puts("\n");
-        }
-    }
-
-    /* Build IRETQ frame for ring 0 → ring 3 transition.
-     * IRETQ pops (from low addr up): RIP, CS, RFLAGS, RSP, SS.
-     * We push in reverse: SS, RSP, RFLAGS, CS, RIP.
-     * Also propagate emulated GPRs (EAX/EBX/ECX/EDX/ESI/EDI/EBP) so DOS4GW
-     * starts with its expected register state instead of kernel leftovers. */
-    /* RFLAGS: IF=1 (bit 9), IOPL=3 (bits 12-13), reserved-1 (bit 1).
-     * IOPL=3 lets the ring-3 DOS code execute IN/OUT freely, so DOS4GW
-     * and DOOM can write to the VGA DAC ports (0x3C8/0x3C9), PIC, etc.
-     * The emulated chipset in QEMU absorbs the writes; future work can
-     * snoop specific ports via a #GP-handler port trap. */
-    uint64_t rflags = 0x3202;
-
-    /* Debug: show page-table entries along the walk for CS:RIP target
-     * (linear = CS_base + EIP) to verify USER/PRESENT/WRITABLE. */
-    {
-        uint64_t cs_base = (uint32_t)vm->dpmi.ldt[cs64 >> 3].base_lo
-                         | ((uint32_t)vm->dpmi.ldt[cs64 >> 3].base_mid << 16)
-                         | ((uint32_t)vm->dpmi.ldt[cs64 >> 3].base_hi << 24);
-        uint64_t target_linear = cs_base + ip64;
-
-        /* Dump first 16 instruction bytes at the target linear address.
-         * vm->mem is a PA identity-mapped in kernel CR3, so we can index
-         * directly from the kernel side to read the DOS code. */
-        serial_puts("[DOS-NT] bytes @linear=0x");
-        serial_puthex(target_linear, 8);
-        serial_puts(":");
-        for (int i = 0; i < 16 && (target_linear + i) < vm->total_mem_size; i++) {
-            serial_puts(" ");
-            serial_puthex(vm->mem[target_linear + i], 2);
-        }
-        serial_puts("\n");
-        serial_puts("[DOS-NT] target linear=0x");
-        serial_puthex(target_linear, 16); serial_puts("\n");
-        uint64_t *pml4 = DOS_NT_PHYS_TO_VIRT(cr3_new & PTE_ADDR_MASK);
-        int i4 = (target_linear >> 39) & 0x1FF;
-        serial_puts("[DOS-NT] PML4[");  serial_putdec(i4);
-        serial_puts("]=0x");             serial_puthex(pml4[i4], 16);
-        serial_puts("\n");
-        if (pml4[i4] & PTE_PRESENT) {
-            uint64_t *pdpt = DOS_NT_PHYS_TO_VIRT(pml4[i4] & PTE_ADDR_MASK);
-            int i3 = (target_linear >> 30) & 0x1FF;
-            serial_puts("[DOS-NT] PDPT["); serial_putdec(i3);
-            serial_puts("]=0x");           serial_puthex(pdpt[i3], 16);
-            serial_puts("\n");
-            if (pdpt[i3] & PTE_PRESENT) {
-                uint64_t *pd = DOS_NT_PHYS_TO_VIRT(pdpt[i3] & PTE_ADDR_MASK);
-                int i2 = (target_linear >> 21) & 0x1FF;
-                serial_puts("[DOS-NT] PD[");  serial_putdec(i2);
-                serial_puts("]=0x");          serial_puthex(pd[i2], 16);
-                serial_puts("\n");
-                if ((pd[i2] & PTE_PRESENT) && !(pd[i2] & (1ULL<<7))) {
-                    uint64_t *pt = DOS_NT_PHYS_TO_VIRT(pd[i2] & PTE_ADDR_MASK);
-                    int i1 = (target_linear >> 12) & 0x1FF;
-                    serial_puts("[DOS-NT] PT["); serial_putdec(i1);
-                    serial_puts("]=0x");         serial_puthex(pt[i1], 16);
-                    serial_puts("\n");
-                }
-            }
-        }
-    }
-    (void)rflags;
-    uint64_t reax = cpu->eax, rebx = cpu->ebx, recx = cpu->ecx, redx = cpu->edx;
-    uint64_t resi = cpu->esi, redi = cpu->edi, rebp = cpu->ebp;
-
-    /* Same-CPL (ring 0) transition via LRETQ. All LDT descriptors were
-     * promoted to DPL=0 and selectors masked to RPL=0, so SS/DS/ES loads
-     * in kernel context work. LRETQ pops only RIP:CS; RSP set manually. */
+    /* Enter the 32-bit compatibility client at CPL3. The transition frame
+     * lives on a high-half kernel stack mapped by both address spaces. */
     __asm__ volatile (
+        "mov %[enter], %%r11\n"
         "cli\n"
-        "lldt %w[ldt]\n"
-        "mov %[cr3], %%rax\n"
+        "lgdt %c[gdtr](%%r11)\n"
+        "lldt %c[ldt](%%r11)\n"
+        "movq %c[kernel_sp](%%r11), %%rsp\n"
+        "mov %c[cr3](%%r11), %%rax\n"
         "mov %%rax, %%cr3\n"
-        "mov %w[ds], %%ax\n  mov %%ax, %%ds\n"
-        "mov %w[es], %%ax\n  mov %%ax, %%es\n"
-        "mov %w[ss], %%ax\n  mov %%ax, %%ss\n"
-        "mov %[sp], %%rsp\n"
-        "pushq %[cs_q]\n"
-        "pushq %[ip_q]\n"
-        "mov %[r_ax], %%rax\n"
-        "mov %[r_bx], %%rbx\n"
-        "mov %[r_cx], %%rcx\n"
-        "mov %[r_dx], %%rdx\n"
-        "mov %[r_si], %%rsi\n"
-        "mov %[r_di], %%rdi\n"
-        "mov %[r_bp], %%rbp\n"
-        "sti\n"
-        "lretq\n"
+        "movw %c[ds](%%r11), %%ax\n  mov %%ax, %%ds\n"
+        "movw %c[es](%%r11), %%ax\n  mov %%ax, %%es\n"
+        "pushq %c[ss](%%r11)\n"
+        "pushq %c[sp](%%r11)\n"
+        "pushq %c[rflags](%%r11)\n"
+        "pushq %c[cs](%%r11)\n"
+        "pushq %c[ip](%%r11)\n"
+        "movq %c[rbx](%%r11), %%rbx\n"
+        "movq %c[rcx](%%r11), %%rcx\n"
+        "movq %c[rdx](%%r11), %%rdx\n"
+        "movq %c[rsi](%%r11), %%rsi\n"
+        "movq %c[rdi](%%r11), %%rdi\n"
+        "movq %c[rbp](%%r11), %%rbp\n"
+        "movq %c[rax](%%r11), %%rax\n"
+        "iretq\n"
         :
-        : [ldt]   "r"(ldt_sel),
-          [cr3]   "r"(cr3_new),
-          [ds]    "r"(ds64),
-          [es]    "r"(es64),
-          [ss]    "r"(ss64),
-          [sp]    "r"(sp64),
-          [cs_q]  "r"(cs64),
-          [ip_q]  "r"(ip64),
-          [r_ax]  "m"(reax),
-          [r_bx]  "m"(rebx),
-          [r_cx]  "m"(recx),
-          [r_dx]  "m"(redx),
-          [r_si]  "m"(resi),
-          [r_di]  "m"(redi),
-          [r_bp]  "m"(rebp)
-        : "memory", "cc"
+        : [enter] "r"(enter),
+          [gdtr] "i"(__builtin_offsetof(dos_nt_enter_state_t, gdtr)),
+          [ldt]  "i"(__builtin_offsetof(dos_nt_enter_state_t, ldt)),
+          [cr3]  "i"(__builtin_offsetof(dos_nt_enter_state_t, cr3)),
+          [cs]   "i"(__builtin_offsetof(dos_nt_enter_state_t, cs)),
+          [ds]   "i"(__builtin_offsetof(dos_nt_enter_state_t, ds)),
+          [es]   "i"(__builtin_offsetof(dos_nt_enter_state_t, es)),
+          [ss]   "i"(__builtin_offsetof(dos_nt_enter_state_t, ss)),
+          [ip]   "i"(__builtin_offsetof(dos_nt_enter_state_t, ip)),
+          [sp]   "i"(__builtin_offsetof(dos_nt_enter_state_t, sp)),
+          [rflags] "i"(__builtin_offsetof(dos_nt_enter_state_t, rflags)),
+          [kernel_sp] "i"(__builtin_offsetof(dos_nt_enter_state_t, kernel_sp)),
+          [rax]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rax)),
+          [rbx]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rbx)),
+          [rcx]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rcx)),
+          [rdx]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rdx)),
+          [rsi]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rsi)),
+          [rdi]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rdi)),
+          [rbp]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rbp))
+        : "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r11",
+          "memory", "cc"
     );
     /* NOTREACHED */
 }

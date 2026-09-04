@@ -11,10 +11,14 @@
  */
 
 #include "cpu8086.h"
+#include "dos_audio.h"
+#include "dos_io.h"
+#include "dos_mouse.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
+extern uint64_t idt_get_ticks(void);
 
 /* Forward declarations for service handlers */
 void dos_int21_dispatch(dos_vm_t *vm);
@@ -25,6 +29,124 @@ void dos_int2f_dispatch(dos_vm_t *vm);
 void dos_int31_dpmi(dos_vm_t *vm);
 void dpmi_enter_protected_mode(dos_vm_t *vm);
 void dos_int67_dispatch(dos_vm_t *vm);
+
+static uint16_t dos_u16_clamp(uint32_t value)
+{
+    return value > 0xFFFFu ? 0xFFFFu : (uint16_t)value;
+}
+
+bool dos_int_has_pm_translator(uint8_t int_num)
+{
+    switch (int_num) {
+    case 0x10:
+    case 0x15:
+    case 0x16:
+    case 0x1A:
+    case 0x20:
+    case 0x21:
+    case 0x2F:
+    case 0x31:
+    case 0x33:
+    case 0x67:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool dos_dpmi_pm_stub_source(const dos_vm_t *vm,
+                                    uint32_t stub_offset)
+{
+    const cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    return cpu && cpu->protected_mode && vm->dpmi.active &&
+           cpu->cs == vm->dpmi.sel_host_code &&
+           cpu->eip == stub_offset + 2u;
+}
+
+static bool dos_dpmi_pm_reflect_source(const dos_vm_t *vm,
+                                       uint8_t *reflected_int)
+{
+    const cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    if (!cpu || !cpu->protected_mode || !vm->dpmi.active ||
+        cpu->cs != vm->dpmi.sel_host_code)
+        return false;
+
+    uint32_t software_first = DPMI_PM_REFLECT_BASE_OFF + 2u;
+    uint32_t software_last = software_first +
+                             255u * DPMI_PM_REFLECT_STUB_SIZE;
+    uint32_t hardware_first = DPMI_PM_HW_REFLECT_BASE_OFF + 2u;
+    uint32_t hardware_last = hardware_first +
+                             255u * DPMI_PM_REFLECT_STUB_SIZE;
+    uint32_t relative;
+    if (cpu->eip >= software_first && cpu->eip <= software_last)
+        relative = cpu->eip - software_first;
+    else if (cpu->eip >= hardware_first && cpu->eip <= hardware_last)
+        relative = cpu->eip - hardware_first;
+    else
+        return false;
+
+    if (relative % DPMI_PM_REFLECT_STUB_SIZE)
+        return false;
+    if (reflected_int)
+        *reflected_int = (uint8_t)(relative / DPMI_PM_REFLECT_STUB_SIZE);
+    return true;
+}
+
+static bool dos_dpmi_pm_private_source(const dos_vm_t *vm, uint8_t int_num)
+{
+    if (int_num == DPMI_DEFAULT_REFLECT_INT)
+        return dos_dpmi_pm_reflect_source(vm, NULL);
+    if (int_num == DPMI_CALLBACK_RETURN_INT)
+        return dos_dpmi_pm_stub_source(vm, DPMI_CALLBACK_RETURN_OFF);
+    if (int_num == DPMI_RAW_SWITCH_INT)
+        return dos_dpmi_pm_stub_source(vm, DPMI_RAW_SWITCH_OFF);
+    if (int_num == DPMI_EXCEPTION_RETURN_INT)
+        return dos_dpmi_pm_stub_source(vm, DPMI_EXCEPTION_RETURN_OFF);
+    return false;
+}
+
+static bool dos_dpmi_rm_stub_source(const dos_vm_t *vm,
+                                    uint32_t stub_offset)
+{
+    const cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    return cpu && !cpu->protected_mode && cpu->cs == DPMI_ENTRY_SEG &&
+           cpu->eip == stub_offset + 2u;
+}
+
+static bool dos_dpmi_rm_callback_source(const dos_vm_t *vm)
+{
+    const cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    uint32_t first_return = DPMI_CALLBACK_BASE_OFF + 2u;
+    uint32_t last_return = first_return +
+                           (DPMI_MAX_CALLBACKS - 1u) *
+                           DPMI_CALLBACK_STUB_SIZE;
+    if (!cpu || cpu->protected_mode || cpu->cs != DPMI_ENTRY_SEG ||
+        cpu->eip < first_return || cpu->eip > last_return)
+        return false;
+    return (cpu->eip - first_return) % DPMI_CALLBACK_STUB_SIZE == 0;
+}
+
+static void dos_int15_e801(cpu8086_state_t *cpu, uint32_t total_bytes)
+{
+    const uint32_t one_mb = 1u << 20;
+    const uint32_t sixteen_mb = 16u << 20;
+    uint32_t below_16m_kb = 0;
+    uint32_t above_16m_blocks = 0;
+
+    if (total_bytes > one_mb) {
+        uint32_t below_16m_end = total_bytes < sixteen_mb ?
+                                 total_bytes : sixteen_mb;
+        below_16m_kb = (below_16m_end - one_mb) >> 10;
+    }
+    if (total_bytes > sixteen_mb)
+        above_16m_blocks = (total_bytes - sixteen_mb) >> 16;
+
+    cpu->ax = dos_u16_clamp(below_16m_kb);
+    cpu->bx = dos_u16_clamp(above_16m_blocks);
+    cpu->cx = cpu->ax;
+    cpu->dx = cpu->bx;
+    cpu->flags &= ~FLAG_CF;
+}
 
 /* ── INT dispatch ───────────────────────────────────────────────── */
 
@@ -47,25 +169,20 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
             c15->flags &= ~FLAG_CF;  /* success */
             c15->ah = 0;
             break;
-        case 0x88: /* Get extended memory size (KB above 1MB) */
-            c15->ax = (vm->total_mem_size > 0x100000) ?
-                      (uint16_t)((vm->total_mem_size - 0x100000) / 1024) : 0;
+        case 0x88: { /* Get extended memory size (KB above 1MB) */
+            uint32_t system_memory = vm->system_mem_size
+                                   ? vm->system_mem_size : vm->total_mem_size;
+            c15->ax = (system_memory > 0x100000) ?
+                      (uint16_t)((system_memory - 0x100000) / 1024) : 0;
             c15->flags &= ~FLAG_CF;
             break;
-        case 0xBF: /* DOS4GW extended memory query */
-            /* Return: AX = extended memory in KB */
-            c15->ax = (vm->total_mem_size > 0x100000) ?
-                      (uint16_t)((vm->total_mem_size - 0x100000) / 1024) : 0;
-            c15->flags &= ~FLAG_CF;
-            break;
+        }
         case 0xE8: /* Get memory map (E820h) */
             if (c15->al == 0x01) {
-                /* E801h: Get memory size for >64MB */
-                c15->ax = 0x3C00;  /* 15MB in 1KB units */
-                c15->bx = 0;       /* 0 in 64KB units above 16MB */
-                c15->cx = 0x3C00;
-                c15->dx = 0;
-                c15->flags &= ~FLAG_CF;
+                uint32_t system_memory = vm->system_mem_size
+                                       ? vm->system_mem_size
+                                       : vm->total_mem_size;
+                dos_int15_e801(c15, system_memory);
             } else {
                 c15->flags |= FLAG_CF;
             }
@@ -83,6 +200,8 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
 
     case 0x20:
         /* Terminate program */
+        vm->termination_type = 0;
+        vm->process_terminated = true;
         vm->cpu->running = false;
         vm->cpu->exit_code = 0;
         break;
@@ -100,20 +219,74 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
         break;
 
     case 0x33:
-        /* Mouse stub: not installed */
-        vm->cpu->ax = 0x0000;
+        dos_int33_mouse(vm);
         break;
 
     case 0x67:
         dos_int67_dispatch(vm);
         break;
 
-    case 0xFE:
+    case DPMI_DEFAULT_REFLECT_INT: {
+        uint8_t reflected_int;
+        if (!dos_dpmi_pm_reflect_source(vm, &reflected_int))
+            goto generic_interrupt;
+        if (!dpmi_dispatch_default_interrupt(
+                vm, reflected_int, vm->software_int_frame_bytes)) {
+            serial_puts("[DPMI] Default interrupt reflection failed\n");
+            vm->cpu->running = false;
+            vm->cpu->exit_code = -1;
+        }
+        break;
+    }
+
+    case DPMI_CALLBACK_ENTRY_INT:
+        if (!dos_dpmi_rm_callback_source(vm))
+            goto generic_interrupt;
+        if (!dpmi_callback_enter(vm)) {
+            serial_puts("[DPMI] Invalid real-mode callback entry\n");
+            vm->cpu->running = false;
+            vm->cpu->exit_code = -1;
+        }
+        break;
+
+    case DPMI_CALLBACK_RETURN_INT:
+        if (!dos_dpmi_pm_stub_source(vm, DPMI_CALLBACK_RETURN_OFF))
+            goto generic_interrupt;
+        if (!dpmi_callback_return(vm, true)) {
+            serial_puts("[DPMI] Invalid callback return\n");
+            vm->cpu->running = false;
+            vm->cpu->exit_code = -1;
+        }
+        break;
+
+    case DPMI_EXCEPTION_RETURN_INT:
+        if (!dos_dpmi_pm_stub_source(vm, DPMI_EXCEPTION_RETURN_OFF))
+            goto generic_interrupt;
+        if (!dpmi_exception_return(vm)) {
+            vm->cpu->running = false;
+            vm->cpu->exit_code = -1;
+        }
+        break;
+
+    case DPMI_RAW_SWITCH_INT:
+        if (!dos_dpmi_pm_stub_source(vm, DPMI_RAW_SWITCH_OFF) &&
+            !dos_dpmi_rm_stub_source(vm, DPMI_RAW_SWITCH_OFF))
+            goto generic_interrupt;
+        if (!dpmi_raw_mode_switch(vm)) {
+            vm->cpu->running = false;
+            vm->cpu->exit_code = -1;
+        }
+        break;
+
+    case DPMI_ENTRY_INT:
         /* DPMI entry trigger: switch to protected mode */
+        if (!dos_dpmi_rm_stub_source(vm, DPMI_ENTRY_OFF))
+            goto generic_interrupt;
         dpmi_enter_protected_mode(vm);
         break;
 
-    default: {
+    default:
+generic_interrupt: {
         /* Check IVT for user-installed handlers */
         uint32_t ivt_addr = (uint32_t)int_num * 4;
         uint16_t off = dos_mem_read16(vm, ivt_addr);
@@ -142,89 +315,375 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
     }
 }
 
+int dos_bios_memory_selftest(void)
+{
+    dos_vm_t vm = {0};
+    cpu8086_state_t cpu = {0};
+    int failures = 0;
+
+    vm.cpu = &cpu;
+    cpu.vm = &vm;
+
+    vm.total_mem_size = 8u << 20;
+    cpu.ax = 0xE801;
+    cpu.flags = FLAG_CF;
+    dos_int_dispatch(&vm, 0x15);
+    if ((cpu.flags & FLAG_CF) || cpu.ax != 7u * 1024u ||
+        cpu.cx != cpu.ax || cpu.bx != 0 || cpu.dx != 0)
+        failures++;
+
+    vm.total_mem_size = 16u << 20;
+    cpu.ax = 0xE801;
+    cpu.flags = FLAG_CF;
+    dos_int_dispatch(&vm, 0x15);
+    if ((cpu.flags & FLAG_CF) || cpu.ax != 0x3C00 ||
+        cpu.cx != 0x3C00 || cpu.bx != 0 || cpu.dx != 0)
+        failures++;
+
+    vm.total_mem_size = 48u << 20;
+    cpu.ax = 0xE801;
+    cpu.flags = FLAG_CF;
+    dos_int_dispatch(&vm, 0x15);
+    if ((cpu.flags & FLAG_CF) || cpu.ax != 0x3C00 ||
+        cpu.cx != 0x3C00 || cpu.bx != 512 || cpu.dx != 512)
+        failures++;
+
+    cpu.ax = 0xBF00;
+    cpu.flags = 0;
+    dos_int_dispatch(&vm, 0x15);
+    if (!(cpu.flags & FLAG_CF)) failures++;
+
+    return failures;
+}
+
 /* ── Hardware interrupt delivery (timer, etc.) ──────────────────── */
 
-void cpu_deliver_hw_interrupt(dos_vm_t *vm, uint8_t int_num)
+static bool cpu_deliver_pm_idt_gate(dos_vm_t *vm, uint8_t vector,
+                                    uint32_t return_eip,
+                                    uint32_t error_code,
+                                    bool has_error_code)
 {
     cpu8086_state_t *cpu = vm->cpu;
+    uint32_t gate_offset = (uint32_t)vector * 8u;
+    if (!cpu->idtr.base || gate_offset + 7u > cpu->idtr.limit)
+        return false;
 
-    /* In real mode, respect IF flag. In protected mode, always deliver
-     * (DOS4GW manages its own interrupt state via the PIC/IDT and
-     * may have IF=0 while still expecting timer ticks) */
-    if (!cpu->protected_mode && !(cpu->flags & FLAG_IF)) return;
+    uint32_t idt_linear = cpu->idtr.base + gate_offset;
+    uint32_t entry = dpmi_translate(vm, 0, idt_linear);
+    if (vm->total_mem_size < 8u || entry > vm->total_mem_size - 8u)
+        return false;
 
-    if (cpu->protected_mode) {
-        /* Check DPMI pm_vectors first (DOS4GW hooks INT 8 via INT 31h/0205h) */
-        if (vm->dpmi.pm_vectors[int_num].sel != 0) {
+    uint16_t off_lo = dos_mem_read16(vm, entry);
+    uint16_t sel = dos_mem_read16(vm, entry + 2u);
+    uint8_t attr = dos_mem_read8(vm, entry + 5u);
+    uint16_t off_hi = dos_mem_read16(vm, entry + 6u);
+    uint8_t gate_type = attr & 0x1Fu;
+    bool gate32 = gate_type == 0x0E || gate_type == 0x0F;
+    bool gate16 = gate_type == 0x06 || gate_type == 0x07;
+    if (!(attr & 0x80) || (!gate16 && !gate32) || !sel)
+        return false;
+
+    if (gate32) {
+        cpu_push32(cpu, cpu->eflags);
+        cpu_push32(cpu, (uint32_t)cpu->cs);
+        cpu_push32(cpu, return_eip);
+        if (has_error_code) cpu_push32(cpu, error_code);
+        cpu->eip = ((uint32_t)off_hi << 16) | off_lo;
+    } else {
+        cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+        cpu_push16(cpu, cpu->cs);
+        cpu_push16(cpu, (uint16_t)return_eip);
+        if (has_error_code) cpu_push16(cpu, (uint16_t)error_code);
+        cpu->eip = off_lo;
+    }
+    cpu->cs = sel;
+    cpu->flags &= ~FLAG_TF;
+    if (gate_type == 0x06 || gate_type == 0x0E)
+        cpu->flags &= ~FLAG_IF;
+    cpu8086_sync_cs(cpu);
+    return true;
+}
+
+static bool cpu_deliver_rm_vector(dos_vm_t *vm, uint8_t vector,
+                                  uint32_t return_eip)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+    uint32_t ivt_addr = (uint32_t)vector * 4u;
+    uint16_t off = dos_mem_read16(vm, ivt_addr);
+    uint16_t seg = dos_mem_read16(vm, ivt_addr + 2u);
+
+    /* Zero vectors and initialized ROM IRET stubs are host-owned vectors. */
+    if ((!seg && !off) || seg >= (DOS_ROM_BASE >> 4))
+        return true;
+
+    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+    cpu_push16(cpu, cpu->cs);
+    cpu_push16(cpu, (uint16_t)return_eip);
+    cpu->flags &= ~(FLAG_IF | FLAG_TF);
+    cpu->cs = seg;
+    cpu->ip = off;
+    return true;
+}
+
+static bool dpmi_deliver_exception(dos_vm_t *vm, uint8_t vector,
+                                   uint32_t return_eip,
+                                   uint32_t error_code)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+    uint16_t handler_sel = vm->dpmi.exception_vectors[vector].sel;
+    if (!handler_sel) return false;
+
+    uint16_t host_sel = dpmi_get_host_code_selector(vm);
+    if (!host_sel ||
+        vm->dpmi.exception_depth >= DPMI_MAX_EXCEPTION_DEPTH)
+        return false;
+
+    uint8_t exception_depth = vm->dpmi.exception_depth;
+    vm->dpmi.exception_virtual_interrupts[exception_depth] =
+        vm->dpmi.virtual_interrupts_enabled;
+    vm->dpmi.virtual_interrupts_enabled = false;
+
+    uint16_t old_ss = cpu->ss;
+    uint32_t old_esp = cpu->esp;
+    uint16_t old_cs = cpu->cs;
+    uint32_t old_flags = cpu->eflags | FLAGS_FIXED;
+
+    if (vm->dpmi.is_32bit) {
+        cpu_push32(cpu, old_ss);
+        cpu_push32(cpu, old_esp);
+        cpu_push32(cpu, old_flags);
+        cpu_push32(cpu, old_cs);
+        cpu_push32(cpu, return_eip);
+        cpu_push32(cpu, error_code);
+        cpu_push32(cpu, host_sel);
+        cpu_push32(cpu, DPMI_EXCEPTION_RETURN_OFF);
+    } else {
+        cpu_push16(cpu, old_ss);
+        cpu_push16(cpu, (uint16_t)old_esp);
+        cpu_push16(cpu, (uint16_t)old_flags);
+        cpu_push16(cpu, old_cs);
+        cpu_push16(cpu, (uint16_t)return_eip);
+        cpu_push16(cpu, (uint16_t)error_code);
+        cpu_push16(cpu, host_sel);
+        cpu_push16(cpu, DPMI_EXCEPTION_RETURN_OFF);
+    }
+
+    vm->dpmi.exception_depth = exception_depth + 1u;
+    cpu->cs = handler_sel;
+    cpu->eip = vm->dpmi.exception_vectors[vector].off;
+    cpu->flags = (cpu->flags | FLAG_IF) & ~FLAG_TF;
+    cpu8086_sync_cs(cpu);
+    return true;
+}
+
+static bool dpmi_exception_return_frame(dos_vm_t *vm,
+                                        bool discard_private_int_frame)
+{
+    cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    if (!cpu || !cpu->protected_mode || !vm->dpmi.exception_depth ||
+        cpu->cs != vm->dpmi.sel_host_code ||
+        cpu->eip != DPMI_EXCEPTION_RETURN_OFF + 2u) {
+        serial_puts("[DPMI] Invalid exception return\n");
+        return false;
+    }
+
+    uint32_t frame_size;
+    if (vm->dpmi.is_32bit)
+        frame_size = discard_private_int_frame ? 36u : 24u;
+    else
+        frame_size = discard_private_int_frame ? 18u : 12u;
+    uint32_t stack = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+    if (stack > vm->total_mem_size ||
+        frame_size > vm->total_mem_size - stack) {
+        serial_puts("[DPMI] Truncated exception return frame\n");
+        return false;
+    }
+
+    uint16_t restored_ss;
+    uint32_t restored_esp;
+    uint16_t restored_cs;
+    uint32_t restored_eip;
+    uint32_t restored_flags;
+    if (vm->dpmi.is_32bit) {
+        if (discard_private_int_frame)
+            cpu_stack_adjust(cpu, 12); /* interpreted INT FD frame */
+        (void)cpu_pop32(cpu);        /* exception error code */
+        restored_eip = cpu_pop32(cpu);
+        restored_cs = (uint16_t)cpu_pop32(cpu);
+        restored_flags = cpu_pop32(cpu);
+        restored_esp = cpu_pop32(cpu);
+        restored_ss = (uint16_t)cpu_pop32(cpu);
+    } else {
+        if (discard_private_int_frame)
+            cpu_stack_adjust(cpu, 6); /* interpreted INT FD frame */
+        (void)cpu_pop16(cpu);        /* exception error code */
+        restored_eip = cpu_pop16(cpu);
+        restored_cs = cpu_pop16(cpu);
+        restored_flags = cpu_pop16(cpu);
+        restored_esp = cpu_pop16(cpu);
+        restored_ss = cpu_pop16(cpu);
+    }
+
+    cpu->ss = restored_ss;
+    cpu->esp = restored_esp;
+    cpu->cs = restored_cs;
+    cpu->eip = restored_eip;
+    cpu->eflags = (restored_flags & 0x003FFFFFu) |
+                  FLAGS_FIXED | FLAG_IF;
+    cpu->halted = false;
+    vm->dpmi.exception_depth--;
+    vm->dpmi.virtual_interrupts_enabled =
+        vm->dpmi.exception_virtual_interrupts[vm->dpmi.exception_depth];
+    cpu8086_sync_cs(cpu);
+    return true;
+}
+
+bool dpmi_exception_return(dos_vm_t *vm)
+{
+    return dpmi_exception_return_frame(vm, true);
+}
+
+static bool dpmi_exception_return_native(dos_vm_t *vm)
+{
+    /* Native INT FD switches to IST2, so its CPU IRET frame is not part of
+     * the DPMI client stack that begins at the exception error-code field. */
+    return dpmi_exception_return_frame(vm, false);
+}
+
+bool cpu_deliver_pm_software_interrupt(dos_vm_t *vm, uint8_t int_num,
+                                       uint32_t return_eip)
+{
+    cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    if (!cpu || !cpu->protected_mode || !vm->dpmi.active ||
+        dos_dpmi_pm_private_source(vm, int_num))
+        return false;
+
+    uint16_t handler_sel = vm->dpmi.pm_vectors[int_num].sel;
+    uint32_t handler_off = vm->dpmi.pm_vectors[int_num].off;
+    if (!handler_sel) {
+        /* Keep built-in API translators on their direct fast path. Their
+         * chainable 0204h address still enters through the default stub. */
+        if (dos_int_has_pm_translator(int_num))
+            return false;
+        handler_sel = dpmi_get_host_code_selector(vm);
+        handler_off = DPMI_PM_REFLECT_BASE_OFF +
+                      int_num * DPMI_PM_REFLECT_STUB_SIZE;
+        if (!handler_sel)
+            return false;
+    }
+
+    if (vm->dpmi.is_32bit) {
+        cpu_push32(cpu, cpu->eflags | FLAGS_FIXED | FLAG_IF);
+        cpu_push32(cpu, (uint32_t)cpu->cs);
+        cpu_push32(cpu, return_eip);
+    } else {
+        cpu_push16(cpu, cpu->flags | FLAGS_FIXED | FLAG_IF);
+        cpu_push16(cpu, cpu->cs);
+        cpu_push16(cpu, (uint16_t)return_eip);
+    }
+
+    cpu->cs = handler_sel;
+    cpu->eip = handler_off;
+    cpu->flags = (cpu->flags | FLAG_IF) & ~FLAG_TF;
+    if (int_num <= 7u)
+        vm->dpmi.virtual_interrupts_enabled = false;
+    cpu8086_sync_cs(cpu);
+    return true;
+}
+
+bool cpu_deliver_hw_interrupt(dos_vm_t *vm, uint8_t int_num)
+{
+    cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    if (!cpu) return false;
+
+    cpu->halted = false;
+    if (!cpu->protected_mode) {
+        if (!(cpu->flags & FLAG_IF)) return false;
+        return cpu_deliver_rm_vector(vm, int_num, cpu->eip);
+    }
+
+    bool virtualized = vm->dpmi.active;
+    if (virtualized) {
+        if (!vm->dpmi.virtual_interrupts_enabled) return false;
+        cpu->flags |= FLAG_IF;
+    } else if (!(cpu->flags & FLAG_IF)) {
+        return false;
+    }
+
+    uint16_t handler_sel = vm->dpmi.pm_vectors[int_num].sel;
+    uint32_t handler_off = vm->dpmi.pm_vectors[int_num].off;
+    if (!handler_sel) {
+        handler_sel = dpmi_get_host_code_selector(vm);
+        handler_off = DPMI_PM_HW_REFLECT_BASE_OFF +
+                      int_num * DPMI_PM_REFLECT_STUB_SIZE;
+    }
+
+    if (handler_sel) {
+        if (vm->dpmi.is_32bit) {
             cpu_push32(cpu, cpu->eflags);
             cpu_push32(cpu, (uint32_t)cpu->cs);
             cpu_push32(cpu, cpu->eip);
-            cpu->cs  = vm->dpmi.pm_vectors[int_num].sel;
-            cpu->eip = vm->dpmi.pm_vectors[int_num].off;
+        } else {
+            cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+            cpu_push16(cpu, cpu->cs);
+            cpu_push16(cpu, cpu->ip);
+        }
+        cpu->cs = handler_sel;
+        cpu->eip = handler_off;
+        if (virtualized) {
+            vm->dpmi.virtual_interrupts_enabled = false;
+            cpu->flags = (cpu->flags | FLAG_IF) & ~FLAG_TF;
+        } else {
             cpu->flags &= ~(FLAG_IF | FLAG_TF);
-            return;
         }
-        /* Read guest IDT via page walker (IDT may be at high virtual address) */
-        if (cpu->idtr.base) {
-            uint32_t idt_linear = cpu->idtr.base + (uint32_t)int_num * 8;
-            uint32_t entry = dpmi_translate(vm, 0, idt_linear);
-            if (entry + 7 < vm->total_mem_size) {
-                uint16_t off_lo = dos_mem_read16(vm, entry);
-                uint16_t sel    = dos_mem_read16(vm, entry + 2);
-                uint16_t off_hi = dos_mem_read16(vm, entry + 6);
-                uint32_t handler = ((uint32_t)off_hi << 16) | off_lo;
-                if (sel != 0 && handler != 0) {
-                    /* Log first few timer deliveries */
-                    static int timer_log = 0;
-                    if (timer_log < 5) {
-                        serial_puts("[TIMER] INT ");
-                        serial_puthex(int_num, 2);
-                        serial_puts(" -> ");
-                        serial_puthex(sel, 4);
-                        serial_puts(":");
-                        serial_puthex(handler, 8);
-                        serial_puts(" IDTphys=");
-                        serial_puthex(entry, 8);
-                        serial_puts("\n");
-                        timer_log++;
-                    }
-                    cpu_push32(cpu, cpu->eflags);
-                    cpu_push32(cpu, (uint32_t)cpu->cs);
-                    cpu_push32(cpu, cpu->eip);
-                    cpu->cs  = sel;
-                    cpu->eip = handler;
-                    cpu->flags &= ~(FLAG_IF | FLAG_TF);
-                    return;
-                }
-            }
-        }
-        /* Try IDT via paging (DOS4GW maps IDT at high virtual address) */
-        if (cpu->idtr.base) {
-            /* dpmi_translate will walk page tables if CR0.PG is set */
-            uint32_t entry = dpmi_translate(vm, 0, cpu->idtr.base + (uint32_t)int_num * 8);
-            if (entry + 7 < vm->total_mem_size) {
-                uint16_t off_lo = dos_mem_read16(vm, entry);
-                uint16_t sel    = dos_mem_read16(vm, entry + 2);
-                uint16_t off_hi = dos_mem_read16(vm, entry + 6);
-                uint32_t handler = ((uint32_t)off_hi << 16) | off_lo;
-                if (sel != 0 && handler != 0) {
-                    cpu_push32(cpu, cpu->eflags);
-                    cpu_push32(cpu, (uint32_t)cpu->cs);
-                    cpu_push32(cpu, cpu->eip);
-                    cpu->cs  = sel;
-                    cpu->eip = handler;
-                    cpu->flags &= ~(FLAG_IF | FLAG_TF);
-                }
-            }
-        }
-    } else {
-        /* Real mode: push flags/CS/IP and dispatch via IVT */
-        cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-        cpu_push16(cpu, cpu->cs);
-        cpu_push16(cpu, cpu->ip);
-        cpu->flags &= ~(FLAG_IF | FLAG_TF);
-        dos_int_dispatch(vm, int_num);
+        cpu8086_sync_cs(cpu);
+        return true;
     }
+
+    if (cpu_deliver_pm_idt_gate(vm, int_num, cpu->eip, 0, false)) {
+        if (virtualized) {
+            vm->dpmi.virtual_interrupts_enabled = false;
+            cpu->flags = (cpu->flags | FLAG_IF) & ~FLAG_TF;
+        }
+        return true;
+    }
+    return true;  /* host-owned hardware vector */
+}
+
+bool cpu_deliver_exception(dos_vm_t *vm, uint8_t vector,
+                           uint32_t return_eip, uint32_t error_code,
+                           bool has_error_code)
+{
+    cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    if (!cpu || vector >= 32u) return false;
+
+    cpu->halted = false;
+    if (!cpu->protected_mode) {
+        uint32_t ivt_addr = (uint32_t)vector * 4U;
+        uint16_t off = dos_mem_read16(vm, ivt_addr);
+        uint16_t seg = dos_mem_read16(vm, ivt_addr + 2U);
+        if ((seg || off) && seg < (DOS_ROM_BASE >> 4))
+            return cpu_deliver_rm_vector(vm, vector, return_eip);
+        goto unhandled;
+    }
+    if (dpmi_deliver_exception(vm, vector, return_eip, error_code))
+        return true;
+    if (cpu_deliver_pm_idt_gate(vm, vector, return_eip, error_code,
+                                has_error_code))
+        return true;
+
+unhandled:
+    serial_puts(cpu->protected_mode ? "[DPMI]" : "[DOS]");
+    serial_puts(" Unhandled processor exception 0x");
+    serial_puthex(vector, 2);
+    serial_puts(" at ");
+    serial_puthex(cpu->cs, 4);
+    serial_puts(":");
+    serial_puthex(return_eip, 8);
+    serial_puts("\n");
+    cpu->running = false;
+    cpu->exit_code = -1;
+    return false;
 }
 
 /* ── Native 32-bit INT dispatch (called from dos_int_stub.S) ────── */
@@ -235,6 +694,7 @@ typedef struct {
     uint64_t es, ds;
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t int_num;
     /* IRET frame (pushed by CPU on INT entry, popped by IRETQ on return).
      * Layout matches dos_int_stub.S after the GPR area. */
     uint64_t iret_rip, iret_cs, iret_rflags, iret_rsp, iret_ss;
@@ -247,19 +707,32 @@ typedef struct {
  */
 static dos_vm_t *g_native_dos_vm = 0;
 static cpu8086_state_t g_native_cpu;
+static cpu8086_state_t *g_native_interpreter_cpu;
 
 void dos_set_native_vm(dos_vm_t *vm)
 {
+    if (vm && vm->cpu) {
+        g_native_interpreter_cpu = vm->cpu;
+        g_native_cpu = *vm->cpu;
+        g_native_cpu.vm = vm;
+    } else {
+        g_native_interpreter_cpu = NULL;
+    }
     g_native_dos_vm = vm;
-    extern void dos_vga_set_native_vm(dos_vm_t *vm);
-    dos_vga_set_native_vm(vm);
-    /* Prime the keyboard buffer with a few synthetic keystrokes so DOS
-     * programs that block on INT 16h AH=00 or INT 21h AH=07/08 can make
-     * initial progress in headless tests. Harmless if consumed or not. */
-    extern void kb_push(char c);
-    kb_push('\r');   /* ENTER — dismisses prompts */
-    kb_push(' ');    /* SPACE — skips DOOM intro sometimes */
-    kb_push('\r');
+}
+
+int dos_native_session_active(void)
+{
+    /* The VM object lives on the host task stack, which the DOS CR3 does not
+     * map. A non-NULL published pointer is the session-active token and is
+     * cleared synchronously during teardown. */
+    return g_native_dos_vm != 0;
+}
+
+void dos_native_cleanup_active(void)
+{
+    dos_vm_t *vm = g_native_dos_vm;
+    if (vm) dos_native_cleanup(vm);
 }
 
 /* Set by the shell 'dosrun' command via kern_setjmp, read by the IDT
@@ -267,473 +740,299 @@ void dos_set_native_vm(dos_vm_t *vm)
  * so DOS crashes / exits return cleanly to the shell prompt. */
 uint64_t *dos_native_exit_jmpbuf = 0;
 
-/* DOS4GW-specific surgical LRETW emulation. Reads the target IP:CS
- * from the DOS stack and rewrites the iret frame so the IRETQ from
- * the kernel's #GP handler lands at the target linear address — but
- * IN THE CURRENT CS, not the popped one. Works as long as target
- * linear falls inside current CS's base..base+limit window, which is
- * true in practice for DOS4GW's overlapping code segments.
- *
- * Returns 1 if emulation succeeded (caller returns from ISR normally);
- * 0 if not applicable (caller falls back to long-jump crash recovery).
- *
- * Why this works: x86_64 hardware strictly validates CS descriptors on
- * RETF/IRET/JMP FAR (CODE bit, DPL, limit). DOS4GW pre-dates strict
- * 64-bit validation and pushes DATA selectors as CS. By keeping the
- * current (valid) CS and only adjusting RIP, we skip the hardware
- * check without sacrificing universality: only DOS4GW mode triggers. */
-int dos_native_emulate_lretw(void *frame_ptr);
+extern int dos_native_refresh_guest_selector(dos_vm_t *vm,
+                                             uint16_t error_code);
+extern void dos_native_sync_ldt(dos_vm_t *vm);
 
-int dos_native_promote_to_code(uint16_t sel)
+int dos_native_refresh_selector(uint16_t error_code)
 {
-    if (!g_native_dos_vm) return 0;
-    if ((sel & 0x04) == 0) return 0;              /* must be LDT */
-    uint16_t idx = (sel >> 3) & 0x1FFF;
-    if (idx >= DPMI_MAX_DESCRIPTORS) return 0;
+    dos_vm_t *vm = g_native_dos_vm;
+    if (!vm) return 0;
+    if (!dos_native_refresh_guest_selector(vm, error_code)) return 0;
 
-    dpmi_descriptor_t *d = &g_native_dos_vm->dpmi.ldt[idx];
-    if (!(d->access & 0x80))         return 0;    /* not present */
-    if (d->access & 0x08)            return 0;    /* already CODE */
-
-    static uint32_t promote_count = 0;
-    if (++promote_count > 32) return 0;            /* rate-limit */
-
-    /* Flip DATA → CODE readable, keep DPL=0 (matches our transfer).
-     * 0x9B = P(1) DPL(00) S(1) type(1011=code-readable-non-conforming-ACCESSED).
-     * A (bit 0) is set preemptively — some CPU validation paths refuse
-     * to load a descriptor without the A bit if the LDT page isn't
-     * confirmed writable to the CPU's access-bit update.
-     * Also expand the segment limit to 4GB. The original descriptor was
-     * SetDesc'd with lim=0, which rejects any EIP>0 after the CS load.
-     * Set G=1 (4KB granularity) and limit[19:16]=0xF, limit[15:0]=0xFFFF
-     * for a 4GB flat segment. */
-    uint8_t old_acc = d->access;
-    uint8_t old_flg = d->flags_lim;
-    d->access    = 0x9B;
-    d->limit_lo  = 0xFFFF;
-    /* flags_lim: high nibble = G|D|L|AVL; low nibble = limit[19:16]. */
-    /* G=1 (4KB granularity) + D=0 (16-bit default — match DOOM's current
-     * 16-bit LDT[0] CS so a CALL/RET can transition without operand-size
-     * mismatch) + limit[19:16]=0xF → flags_lim = 0x8F. */
-    d->flags_lim = 0x8F;
-    serial_puts("[DOS-NT] LDT[");  serial_putdec(idx);
-    serial_puts("] access 0x");    serial_puthex(old_acc, 2);
-    serial_puts("/flags 0x");      serial_puthex(old_flg, 2);
-    serial_puts(" -> 0x9B/0x");    serial_puthex(d->flags_lim, 2);
-    serial_puts(" limit=4GB flat (CODE readable)\n");
+    serial_puts("[DOS-NT] refreshed selector 0x");
+    serial_puthex(error_code & ~7u, 4);
+    serial_puts(" from guest descriptor table\n");
     return 1;
 }
 
-/* Minimal mirror of the kernel interrupt_frame_t. Kept local so this
- * file doesn't need to include the kernel IDT header. Layout must
- * match isr_stubs.S / idt.c's interrupt_frame_t. */
-typedef struct __attribute__((packed)) {
-    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-    uint64_t rsi, rdi, rbp, rdx, rcx, rbx, rax;
-    uint64_t vector, error_code;
-    uint64_t rip, cs, rflags, rsp, ss;
-} dos_nt_iframe_t;
-
-static uint32_t dos_nt_ldt_base(dos_vm_t *vm, uint16_t sel)
+static bool dos_native_selector_base(dos_vm_t *vm, uint16_t selector,
+                                     uint32_t *base_out)
 {
-    uint16_t idx = (sel >> 3) & 0x1FFF;
-    /* GDT selector (TI=0): read base out of kernel_gdt directly.  Used
-     * for the DOS4GW aliases at slots 3 (sel 0x18) and 4 (sel 0x20). */
-    if ((sel & 0x04) == 0) {
-        extern uint64_t kernel_gdt[];
-        uint64_t d = kernel_gdt[idx];
-        uint32_t base = (uint32_t)((d >> 16) & 0xFFFF)
-                      | (uint32_t)(((d >> 32) & 0xFF) << 16)
-                      | (uint32_t)(((d >> 56) & 0xFF) << 24);
-        return base;
-    }
-    /* LDT selector (TI=1): read out of vm->dpmi.ldt. */
-    if (idx >= DPMI_MAX_DESCRIPTORS) return 0;
-    dpmi_descriptor_t *d = &vm->dpmi.ldt[idx];
-    return ((uint32_t)d->base_lo)
-         | ((uint32_t)d->base_mid << 16)
-         | ((uint32_t)d->base_hi  << 24);
+    if (!vm || !vm->cpu || !base_out || (selector & ~3u) == 0)
+        return false;
+
+    dpmi_descriptor_t descriptor;
+    if (!dpmi_guest_descriptor(vm, selector, &descriptor))
+        return false;
+    *base_out = dpmi_desc_get_base(&descriptor);
+    return true;
 }
 
-int dos_native_emulate_lretw(void *frame_ptr)
+static bool dos_native_fetch_code_byte(dos_vm_t *vm,
+                                       const dpmi_descriptor_t *code,
+                                       uint32_t offset, uint8_t *value)
 {
-    dos_nt_iframe_t *f = (dos_nt_iframe_t *)frame_ptr;
-    dos_vm_t *vm = g_native_dos_vm;
-    /* Rate-limit the entry trace so the segment-load loops don't drown
-     * out the rest of the run. Show first 32 calls in full, then sample
-     * 1 in every 1024 thereafter. */
-    static uint32_t emu_calls = 0;
-    int verbose = (++emu_calls < 32) || ((emu_calls & 0x3FF) == 0);
-    if (verbose) {
-        serial_puts("[emu] enter cs=0x"); serial_puthex(f->cs & 0xFFFF, 4);
-        serial_puts(" rip=0x"); serial_puthex(f->rip, 8);
-        serial_puts(" #"); serial_putdec(emu_calls);
-        serial_puts("\n");
-    }
-    if (!vm || !vm->dos4gw_mode) return 0;
+    if (!vm || !code || !value || offset > dpmi_desc_get_limit(code))
+        return false;
+    uint64_t linear = (uint64_t)dpmi_desc_get_base(code) + offset;
+    if (linear >= vm->total_mem_size)
+        return false;
+    *value = vm->mem[linear];
+    return true;
+}
 
-    /* Accept either an LDT selector (TI=1) OR one of the DOS4GW GDT
-     * aliases we install at slots 3 / 4 (sel 0x18, 0x20). The CS lookup
-     * for these uses the kernel GDT in dos_nt_ldt_base() — we patch
-     * that helper below. */
-    if ((f->cs & 0x04) == 0) {
-        uint16_t cs = (uint16_t)f->cs;
-        if (cs != 0x18 && cs != 0x20) return 0;
-    }
+int dos_native_handle_privileged_fault(x86_interrupt_frame_t *frame)
+{
+    if (!frame || !g_native_dos_vm || (frame->cs & 3U) != 3U)
+        return 0;
 
-    /* vm->mem is a PA that is identity-mapped only in the kernel CR3,
-     * so switch temporarily to read/write it safely. */
     extern uint64_t paging_get_kernel_cr3(void);
     uint64_t saved_cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
-    uint64_t kcr3 = paging_get_kernel_cr3();
-    if (kcr3 && saved_cr3 != kcr3)
-        __asm__ volatile ("mov %0, %%cr3" :: "r"(kcr3) : "memory");
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
 
-    /* Verify the faulting instruction is a far return variant that
-     * reads 4 bytes (IP16:CS16) from the stack:
-     *   0xCB            — RETF (no imm)
-     *   0xCA imm16      — RETF <imm>
-     * Other forms (CALLF/IRET) are left alone for now. */
-    uint32_t cs_base = dos_nt_ldt_base(vm, (uint16_t)f->cs);
-    uint32_t fault_linear = cs_base + (uint32_t)f->rip;
-    if (fault_linear >= vm->total_mem_size) return 0;
-    #define DOS_NT_EMU_FAIL do { \
-        if (kcr3 && saved_cr3 != kcr3) \
-            __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory"); \
-        return 0; } while (0)
+    dos_vm_t *vm = g_native_dos_vm;
+    dpmi_descriptor_t code;
+    int handled = 0;
+    if (!dpmi_guest_descriptor(vm, (uint16_t)frame->cs, &code) ||
+        !(code.access & DESC_PRESENT) || !(code.access & DESC_SEGMENT) ||
+        !(code.access & DESC_CODE))
+        goto done;
 
-    /* Support a few far-control opcodes DOS4GW triggers #GP on:
-     *   0xCB              — RETF (pop IP:CS, 4 bytes)
-     *   0xCA imm16        — RETF <imm16> (pop IP:CS, 4 + imm)
-     *   0xCF              — IRET (pop IP:CS:FLAGS, 6 bytes)
-     *   0x66 0xCF         — IRETD (pop EIP:CS:EFLAGS, 12 bytes)
-     *   0xEA off16:seg16  — JMP FAR direct (no stack pop)
-     *   0xFF /5 m16:16    — JMP FAR [mem] (indirect) — read IP:CS from [DS:disp16]
-     *   0xFF /3 m16:16    — CALL FAR [mem] (indirect) — push CS:IP, then jump */
-    /* Skip up to 4 instruction prefixes (segment-override + operand-/
-     * address-size). Track the operand-size override (0x66) explicitly
-     * since some opcode variants change behavior based on it. */
-    uint8_t opc = vm->mem[fault_linear];
-    uint8_t opc_prefix = 0;
-    uint8_t opc_modrm  = 0;
-    uint32_t prefix_bytes = 0;
-    int opc_is_ff_5    = 0;     /* JMP FAR indirect */
-    int opc_is_ff_3    = 0;     /* CALL FAR indirect */
-    int opc_is_mov_seg = 0;     /* 0x8E: MOV Sreg, r/m16 */
-    int opc_is_les     = 0;     /* 0xC4: LES r16, m16:16 */
-    int opc_is_lds     = 0;     /* 0xC5: LDS r16, m16:16 */
-    for (int p = 0; p < 4; p++) {
-        if (fault_linear + prefix_bytes >= vm->total_mem_size) break;
-        uint8_t b = vm->mem[fault_linear + prefix_bytes];
-        if (b == 0x66) {                 /* operand-size override */
-            opc_prefix = 0x66;
-            prefix_bytes++;
-        } else if (b == 0x67 ||          /* addr-size override */
-                   b == 0x26 || b == 0x2E || b == 0x36 ||
-                   b == 0x3E || b == 0x64 || b == 0x65 ||
-                   b == 0xF0 || b == 0xF2 || b == 0xF3) {
-            prefix_bytes++;              /* skip but don't track */
+    uint32_t rip = (uint32_t)frame->rip;
+    uint32_t cursor = 0;
+    bool operand_override = false;
+    uint8_t opcode = 0;
+    while (cursor < 15U) {
+        if (!dos_native_fetch_code_byte(vm, &code, rip + cursor, &opcode))
+            goto done;
+        if (opcode == 0x66U) {
+            operand_override = true;
+        } else if (opcode == 0x67U || opcode == 0x26U ||
+                   opcode == 0x2EU || opcode == 0x36U ||
+                   opcode == 0x3EU || opcode == 0x64U ||
+                   opcode == 0x65U || opcode == 0xF2U ||
+                   opcode == 0xF3U) {
+            /* These prefixes do not alter scalar port I/O or CLI/STI. */
         } else {
             break;
         }
+        cursor++;
     }
-    /* op_off = absolute address of the opcode byte (fault_linear is the
-     * first byte of the instruction, which may include prefixes). */
-    uint32_t op_off = fault_linear + prefix_bytes;
-    opc = vm->mem[op_off];
-    if (opc == 0xFF) {
-        if (op_off + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        opc_modrm = vm->mem[op_off + 1];
-        uint8_t reg = (opc_modrm >> 3) & 7;
-        if (reg == 5) opc_is_ff_5 = 1;
-        else if (reg == 3) opc_is_ff_3 = 1;
-        else DOS_NT_EMU_FAIL;
-    } else if (opc == 0x8E) {
-        if (op_off + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        opc_modrm = vm->mem[op_off + 1];
-        opc_is_mov_seg = 1;
-    } else if (opc == 0xC4 || opc == 0xC5) {
-        if (op_off + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        opc_modrm = vm->mem[op_off + 1];
-        if (opc == 0xC4) opc_is_les = 1; else opc_is_lds = 1;
-    } else if (opc != 0xCB && opc != 0xCA && opc != 0xCF && opc != 0xEA) {
-        DOS_NT_EMU_FAIL;
-    }
+    if (cursor >= 15U)
+        goto done;
+    cursor++;
 
-    uint16_t pop_imm  = 0;
-    uint16_t new_ip   = 0;
-    uint16_t new_cs   = 0;
-    uint32_t new_eip  = 0;
-    uint32_t insn_len = 1;
-    int uses_stack    = 1;      /* LRETW/IRET pop from stack */
-    int is_iretd      = 0;
-    int pushes_retaddr = 0;     /* CALL FAR variants */
+    bool default32 = (code.flags_lim & DESC_32BIT) != 0;
+    if (opcode == 0xCDU && vm->dpmi.active) {
+        uint8_t int_num;
+        if (!dos_native_fetch_code_byte(vm, &code, rip + cursor, &int_num))
+            goto done;
+        uint16_t fault_selector = (uint16_t)frame->error_code;
+        if (!(fault_selector & 0x02u) ||
+            (fault_selector >> 3) != int_num)
+            goto done;
 
-    if (opc_is_mov_seg || opc_is_les || opc_is_lds) {
-        /* Compute instruction length: prefixes + opcode + modrm + addr. */
-        uint8_t mod = (opc_modrm >> 6) & 3;
-        uint8_t rm  = opc_modrm & 7;
-        uint32_t len = prefix_bytes + 1 /*opcode*/ + 1 /*modrm*/;
-        if (mod == 0) {
-            if (rm == 6) len += 2;
-        } else if (mod == 1) {
-            len += 1;
-        } else if (mod == 2) {
-            len += 2;
-        }
-        /* Select target segreg:
-         *   MOV Sreg: ModR/M reg field (0=ES,3=DS,4=FS,5=GS).
-         *   LES: ES.  LDS: DS. */
-        uint8_t sreg = opc_is_mov_seg ? ((opc_modrm >> 3) & 7)
-                     : opc_is_les     ? 0
-                     :                  3; /* lds */
-        /* Strategy: treat the failing selector value as a real-mode
-         * segment number and synthesize a 64KB data descriptor whose
-         * base is (sel * 16). DOS4GW often passes raw RM-style segment
-         * values to PM-mode segreg loads when bridging through DPMI
-         * functions (especially during relocation walks). Aliasing all
-         * loads to a single fixed sel kept DOOM stuck in a tight loop
-         * because every cmp es:[bx] dereferenced the same place; with
-         * a per-selector base the dereferences hit different memory
-         * and the loop can actually terminate.
-         *
-         * The base is clamped into [0, total_mem - 0x10000] so we never
-         * generate a descriptor pointing past vm->mem. We use kernel
-         * GDT slot 14 as a single rolling scratch — only one segreg can
-         * be in flight per fault, so reuse is safe across faults. */
-        uint16_t bad_sel = (uint16_t)f->error_code;
-        uint32_t synth_base = (uint32_t)bad_sel * 16u;
-        if (synth_base + 0x10000u > vm->total_mem_size)
-            synth_base = vm->total_mem_size > 0x10000u
-                       ? vm->total_mem_size - 0x10000u : 0;
-        extern uint64_t kernel_gdt[];
-        const int SCRATCH_SLOT = 14;
-        uint64_t scratch_desc =
-              ((uint64_t)0xFFFF)                              /* limit[15:0]   */
-            | ((uint64_t)(synth_base & 0xFFFF) << 16)         /* base[15:0]    */
-            | ((uint64_t)((synth_base >> 16) & 0xFF) << 32)   /* base[23:16]   */
-            | ((uint64_t)0x92 << 40)                          /* P|DPL|S|type=2*/
-            | ((uint64_t)0x00 << 52)                          /* flags+limit hi*/
-            | ((uint64_t)((synth_base >> 24) & 0xFF) << 56);  /* base[31:24]   */
-        kernel_gdt[SCRATCH_SLOT] = scratch_desc;
-        uint16_t safe_sel = (uint16_t)(SCRATCH_SLOT << 3);
-        /* If the synth base was clamped to 0 and the original sel was
-         * also nonsensical, fall back to current DS so we at least have
-         * a writable segment. */
-        if (synth_base == 0 && bad_sel != 0) {
-            uint16_t cpu_ds = (uint16_t)vm->cpu->ds;
-            if (cpu_ds & 0x04) safe_sel = cpu_ds;
-        }
-        /* Load the target segment register NOW. iretq won't restore
-         * ES/DS/FS/GS in same-CPL transitions, so this sticks. */
-        switch (sreg) {
-            case 0: __asm__ volatile ("movw %0, %%es" :: "r"(safe_sel)); break;
-            case 3: __asm__ volatile ("movw %0, %%ds" :: "r"(safe_sel)); break;
-            case 4: __asm__ volatile ("movw %0, %%fs" :: "r"(safe_sel)); break;
-            case 5: __asm__ volatile ("movw %0, %%gs" :: "r"(safe_sel)); break;
-            default: break;
-        }
-        f->rip += len;
-        if (verbose) {
-            serial_puts("[DOS-NT] emu ");
-            serial_puts(opc_is_les ? "0xC4(LES)" :
-                        opc_is_lds ? "0xC5(LDS)" : "0x8E(MOV)");
-            serial_puts(" sreg="); serial_putdec(sreg);
-            serial_puts(" <- 0x");  serial_puthex(safe_sel, 4);
-            serial_puts(" (err=0x"); serial_puthex((uint64_t)f->error_code, 4);
-            serial_puts(") skip len="); serial_putdec(len); serial_puts("\n");
-        }
-        if (kcr3 && saved_cr3 != kcr3)
-            __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
-        return 1;
+        cpu8086_state_t *cpu = &g_native_cpu;
+        vm->cpu = cpu;
+        cpu->cs = (uint16_t)frame->cs;
+        cpu->eip = rip;
+        cpu->ss = (uint16_t)frame->ss;
+        cpu->esp = (uint32_t)frame->rsp;
+        cpu->eflags = (uint32_t)frame->rflags | FLAGS_FIXED | FLAG_IF;
+        cpu->protected_mode = true;
+        cpu->pm_cs_loaded = true;
+        cpu->running = true;
+        cpu->vm = vm;
+
+        uint32_t return_eip = rip + cursor + 1u;
+        if (!default32) return_eip = (uint16_t)return_eip;
+        if (!cpu_deliver_pm_software_interrupt(vm, int_num, return_eip))
+            goto done;
+
+        frame->rip = cpu->eip;
+        frame->cs = cpu->cs;
+        frame->rflags = (cpu->eflags | FLAGS_FIXED | FLAG_IF) &
+                        ~(uint64_t)FLAG_IOPL_MASK;
+        frame->rsp = cpu->esp;
+        frame->ss = cpu->ss;
+        handled = 1;
+        goto done;
     }
 
-    if (opc_is_ff_5 || opc_is_ff_3) {
-        /* FF /5 or /3 with ModR/M. Only handle mod=00 rm=6 (disp16) for now
-         * — the common DOS-tables pattern. Bail on other addressing modes. */
-        uint8_t mod = (opc_modrm >> 6) & 3;
-        uint8_t rm  = opc_modrm & 7;
-        if (mod != 0 || rm != 6) DOS_NT_EMU_FAIL;
-        if (op_off + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        uint16_t disp16 = (uint16_t)vm->mem[op_off + 2]
-                        | ((uint16_t)vm->mem[op_off + 3] << 8);
-        /* Effective address is DS:disp16. Read 4 bytes: IP (2) + CS (2).
-         * DS isn't in the iret frame; grab it from the CPU (isr_common
-         * doesn't clobber DS before calling us). Fall back to vm->cpu->ds
-         * if the current DS doesn't look like a DOOM LDT selector. */
-        uint16_t ds_sel;
-        __asm__ volatile ("mov %%ds, %0" : "=r"(ds_sel));
-        if ((ds_sel & 0x04) == 0) ds_sel = (uint16_t)vm->cpu->ds;
-        uint32_t ds_base = dos_nt_ldt_base(vm, ds_sel);
-        uint32_t ea = ds_base + disp16;
-        if (opc_prefix == 0x66) {
-            /* 32-bit operand: read EIP (4) + CS (2) = 6 bytes at ea. */
-            if (ea + 5 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-            new_eip = (uint32_t)vm->mem[ea]
-                    | ((uint32_t)vm->mem[ea+1] << 8)
-                    | ((uint32_t)vm->mem[ea+2] << 16)
-                    | ((uint32_t)vm->mem[ea+3] << 24);
-            new_cs  = (uint16_t)vm->mem[ea+4] | ((uint16_t)vm->mem[ea+5] << 8);
+    if (frame->error_code != 0)
+        goto done;
+
+    if ((opcode == 0xFAU || opcode == 0xFBU) && vm->dpmi.active) {
+        vm->dpmi.virtual_interrupts_enabled = opcode == 0xFBU;
+        frame->rflags = (frame->rflags | FLAGS_FIXED | FLAG_IF) &
+                        ~(uint64_t)FLAG_IOPL_MASK;
+        frame->rip = default32 ? (uint32_t)(rip + cursor)
+                               : (uint16_t)(rip + cursor);
+        handled = 1;
+        goto done;
+    }
+
+    bool input;
+    bool immediate;
+    uint32_t width;
+    switch (opcode) {
+    case 0xE4:
+        input = true; immediate = true; width = 1; break;
+    case 0xE5:
+        input = true; immediate = true; width = 0; break;
+    case 0xE6:
+        input = false; immediate = true; width = 1; break;
+    case 0xE7:
+        input = false; immediate = true; width = 0; break;
+    case 0xEC:
+        input = true; immediate = false; width = 1; break;
+    case 0xED:
+        input = true; immediate = false; width = 0; break;
+    case 0xEE:
+        input = false; immediate = false; width = 1; break;
+    case 0xEF:
+        input = false; immediate = false; width = 0; break;
+    default:
+        goto done;
+    }
+
+    if (!width)
+        width = (default32 != operand_override) ? 4U : 2U;
+    uint16_t port = (uint16_t)frame->rdx;
+    if (immediate) {
+        uint8_t immediate_port;
+        if (!dos_native_fetch_code_byte(vm, &code, rip + cursor,
+                                        &immediate_port))
+            goto done;
+        port = immediate_port;
+        cursor++;
+    }
+
+    if (input) {
+        if (width == 1U) {
+            frame->rax = (frame->rax & ~0xFFULL) |
+                         dos_io_read8(vm, port);
+        } else if (width == 2U) {
+            frame->rax = (frame->rax & ~0xFFFFULL) |
+                         dos_io_read16(vm, port);
         } else {
-            if (ea + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-            new_ip = (uint16_t)vm->mem[ea]     | ((uint16_t)vm->mem[ea+1] << 8);
-            new_cs = (uint16_t)vm->mem[ea + 2] | ((uint16_t)vm->mem[ea+3] << 8);
+            frame->rax = dos_io_read32(vm, port);
         }
-        insn_len = prefix_bytes + 1 + 1 + 2; /* prefixes + opcode + modrm + disp16 */
-        uses_stack = 0;
-        if (opc_is_ff_3) {
-            /* CALL FAR: push current CS:IP of the byte AFTER this insn.
-             * 16-bit stack: PUSH CS (2B), then PUSH IP (2B). SP -= 4. */
-            uint16_t ret_ip = (uint16_t)((uint32_t)f->rip + insn_len);
-            uint16_t ret_cs = (uint16_t)f->cs;
-            uint32_t ss_base0 = dos_nt_ldt_base(vm, (uint16_t)f->ss);
-            uint32_t sp_off0  = (uint32_t)(f->rsp & 0xFFFF);
-            uint32_t new_sp_off = (sp_off0 - 4) & 0xFFFF;
-            uint32_t stk0 = ss_base0 + new_sp_off;
-            if (stk0 + 3 < vm->total_mem_size) {
-                vm->mem[stk0]     = (uint8_t)(ret_ip);
-                vm->mem[stk0 + 1] = (uint8_t)(ret_ip >> 8);
-                vm->mem[stk0 + 2] = (uint8_t)(ret_cs);
-                vm->mem[stk0 + 3] = (uint8_t)(ret_cs >> 8);
-            }
-            f->rsp = (f->rsp & ~0xFFFFULL) | new_sp_off;
-            pushes_retaddr = 1;
-        }
-    } else if (opc == 0xCA) {
-        if (op_off + 2 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        pop_imm = (uint16_t)vm->mem[op_off + 1]
-                | ((uint16_t)vm->mem[op_off + 2] << 8);
-        insn_len = prefix_bytes + 3;
-    } else if (opc == 0xEA) {
-        /* JMP FAR imm16:imm16 (or imm32:imm16 w/ 66h). */
-        if (opc_prefix == 0x66) {
-            if (op_off + 6 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-            new_eip = (uint32_t)vm->mem[op_off + 1]
-                    | ((uint32_t)vm->mem[op_off + 2] << 8)
-                    | ((uint32_t)vm->mem[op_off + 3] << 16)
-                    | ((uint32_t)vm->mem[op_off + 4] << 24);
-            new_cs  = (uint16_t)vm->mem[op_off + 5]
-                    | ((uint16_t)vm->mem[op_off + 6] << 8);
-            insn_len = prefix_bytes + 7;
-        } else {
-            if (op_off + 4 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-            new_ip  = (uint16_t)vm->mem[op_off + 1]
-                    | ((uint16_t)vm->mem[op_off + 2] << 8);
-            new_cs  = (uint16_t)vm->mem[op_off + 3]
-                    | ((uint16_t)vm->mem[op_off + 4] << 8);
-            insn_len = prefix_bytes + 5;
-        }
-        uses_stack = 0;
-    } else if (opc == 0xCF && opc_prefix == 0x66) {
-        is_iretd = 1;
-        insn_len = prefix_bytes + 1;
-    } else if (opc == 0xCF) {
-        insn_len = prefix_bytes + 1;
-    } else if (opc == 0xCB) {
-        insn_len = prefix_bytes + 1;
+    } else if (width == 1U) {
+        dos_io_write8(vm, port, (uint8_t)frame->rax);
+    } else if (width == 2U) {
+        dos_io_write16(vm, port, (uint16_t)frame->rax);
+    } else {
+        dos_io_write32(vm, port, (uint32_t)frame->rax);
     }
 
-    /* Read IP:CS (:FLAGS) from DOS stack if this opcode pops. */
-    uint32_t ss_base = dos_nt_ldt_base(vm, (uint16_t)f->ss);
-    uint32_t sp_off  = (uint32_t)(f->rsp & 0xFFFF);
-    uint32_t stk     = ss_base + sp_off;
-    uint32_t stack_advance = 0;
-    if (uses_stack) {
-        if (is_iretd) {
-            if (stk + 11 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-            new_eip = (uint32_t)vm->mem[stk]
-                    | ((uint32_t)vm->mem[stk+1] << 8)
-                    | ((uint32_t)vm->mem[stk+2] << 16)
-                    | ((uint32_t)vm->mem[stk+3] << 24);
-            new_cs  = (uint16_t)vm->mem[stk+4]
-                    | ((uint16_t)vm->mem[stk+5] << 8);
-            /* Skip EFLAGS (bytes 8-11) */
-            stack_advance = 12;
-        } else if (opc == 0xCF) {
-            if (stk + 5 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-            new_ip = (uint16_t)vm->mem[stk]     | ((uint16_t)vm->mem[stk+1] << 8);
-            new_cs = (uint16_t)vm->mem[stk + 2] | ((uint16_t)vm->mem[stk+3] << 8);
-            stack_advance = 6;
-        } else {
-            if (stk + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-            new_ip = (uint16_t)vm->mem[stk]     | ((uint16_t)vm->mem[stk+1] << 8);
-            new_cs = (uint16_t)vm->mem[stk + 2] | ((uint16_t)vm->mem[stk+3] << 8);
-            stack_advance = 4 + pop_imm;
-        }
-    }
-    (void)insn_len;
+    frame->rip = default32 ? (uint32_t)(rip + cursor)
+                           : (uint16_t)(rip + cursor);
+    handled = 1;
 
-    /* Pick the effective offset: 32-bit for IRETD / 0x66 0xEA / 0x66 FF/5.
-     * FF /3 CALL FAR uses whichever matches its operand size too. */
-    int use_eip = is_iretd
-               || (opc == 0xEA && opc_prefix == 0x66)
-               || ((opc_is_ff_5 || opc_is_ff_3) && opc_prefix == 0x66);
-    uint32_t eff_ip = use_eip ? new_eip : (uint32_t)new_ip;
-
-    /* Compute target linear via the intended CS's base in DOOM's LDT.
-     * Several conditions force a fallback to "stay in current CS":
-     *   1. new_cs is a GDT selector (TI=0) — DOS user code shouldn't be
-     *      jumping into kernel GDT entries; the offset is more likely a
-     *      DOOM-relative one with a stale/wrong CS push.
-     *   2. tgt_base resolves but the result lands BELOW current CS base —
-     *      that always means the popped CS was bogus.
-     *   3. tgt_base resolves but the result lands ABOVE vm->total_mem_size.
-     * In all those cases, treat eff_ip as a current-CS relative offset
-     * so DOOM stays in its own code segment.  This is the same DOS4GW
-     * quirk the simpler "tgt_base == 0" branch already handled. */
-    uint32_t tgt_base = dos_nt_ldt_base(vm, new_cs);
-    int new_cs_is_gdt = (new_cs != 0) && ((new_cs & 0x04) == 0);
-    int target_cs_unresolved = 0;
-    if (new_cs != 0 && (tgt_base == 0 || new_cs_is_gdt)) {
-        tgt_base = cs_base;
-        target_cs_unresolved = 1;
-    }
-    uint32_t tgt_lin = tgt_base + eff_ip;
-    if (tgt_lin < cs_base || tgt_lin >= vm->total_mem_size) {
-        /* Last-chance: re-base on current CS. */
-        tgt_lin = cs_base + eff_ip;
-        target_cs_unresolved = 1;
-        if (tgt_lin >= vm->total_mem_size) {
-            serial_puts("[emu] FAIL tgt_lin=0x"); serial_puthex(tgt_lin, 8);
-            serial_puts(" out-of-range new_cs=0x");
-            serial_puthex(new_cs, 4);
-            serial_puts(" eff_ip=0x");
-            serial_puthex(eff_ip, 8);
-            serial_puts("\n");
-            DOS_NT_EMU_FAIL;
-        }
-    }
-    uint64_t new_rip_in_current_cs = tgt_lin - cs_base;
-    (void)target_cs_unresolved;
-
-    /* Advance DOS SP by the amount the opcode would have popped. */
-    if (uses_stack) {
-        uint16_t new_sp = (uint16_t)(sp_off + stack_advance);
-        f->rsp = (f->rsp & ~0xFFFFULL) | new_sp;
-    }
-    f->rip = new_rip_in_current_cs;
-
-    serial_puts("[DOS-NT] emu opc=0x");
-    serial_puthex(opc, 2);
-    if (opc_is_ff_5) serial_puts("/5");
-    if (opc_is_ff_3) serial_puts("/3");
-    if (pushes_retaddr) serial_puts(" CALL");
-    if (opc_prefix) { serial_puts(" pfx=0x"); serial_puthex(opc_prefix, 2); }
-    serial_puts(" -> ");
-    serial_puthex(new_cs, 4); serial_puts(":");
-    serial_puthex(eff_ip, 8); serial_puts(" (linear 0x");
-    serial_puthex(tgt_lin, 8); serial_puts(") RIP=0x");
-    serial_puthex(new_rip_in_current_cs, 8);
-    serial_puts("\n");
-    /* Wrap the per-success log only when verbose so the segment-load
-     * loops don't drown out the trace.  The verbose flag was set at the
-     * top of this function. */
-
-    /* Restore CR3 so the IRETQ resumes in DOS CR3. */
-    if (kcr3 && saved_cr3 != kcr3)
+done:
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
         __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
-    return 1;
+    return handled;
+}
+
+static bool dos_native_deliver_irq(dos_vm_t *vm,
+                                   x86_interrupt_frame_t *frame,
+                                   uint8_t irq)
+{
+    if (!vm->dpmi.virtual_interrupts_enabled)
+        return false;
+    uint8_t vector = 0;
+    cpu8086_state_t *cpu = &g_native_cpu;
+    vm->cpu = cpu;
+    cpu->cs = (uint16_t)frame->cs;
+    cpu->eip = (uint32_t)frame->rip;
+    cpu->ss = (uint16_t)frame->ss;
+    cpu->esp = (uint32_t)frame->rsp;
+    cpu->eflags = (uint32_t)frame->rflags | FLAGS_FIXED | FLAG_IF;
+    cpu->protected_mode = true;
+    cpu->pm_cs_loaded = true;
+    cpu->running = true;
+    cpu->vm = vm;
+
+    if (!dos_io_irq_begin(vm, irq, &vector) ||
+        !cpu_deliver_hw_interrupt(vm, vector))
+        return false;
+
+    frame->rip = cpu->eip;
+    frame->cs = cpu->cs;
+    /* The guest's original flags are on its emulated interrupt frame. */
+    frame->rflags = (cpu->eflags | FLAGS_FIXED | FLAG_IF) &
+                    ~(uint64_t)FLAG_IOPL_MASK;
+    frame->rsp = cpu->esp;
+    frame->ss = cpu->ss;
+    return true;
+}
+
+bool dos_native_service_audio_irq(x86_interrupt_frame_t *frame)
+{
+    if (!frame || !g_native_dos_vm || (frame->cs & 3U) != 3U)
+        return false;
+
+    extern uint64_t paging_get_kernel_cr3(void);
+    uint64_t saved_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+
+    dos_vm_t *vm = g_native_dos_vm;
+    uint8_t irq = 0;
+    uint32_t pending = 0;
+    bool delivered = false;
+    if (dos_audio_take_irq(vm, &irq, &pending)) {
+        delivered = dos_native_deliver_irq(vm, frame, irq);
+        if (!delivered)
+            dos_audio_restore_irq(vm, pending);
+    }
+
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
+    return delivered;
+}
+
+bool dos_native_service_timer_irq(x86_interrupt_frame_t *frame)
+{
+    if (!frame || !g_native_dos_vm || (frame->cs & 3U) != 3U)
+        return false;
+
+    extern uint64_t paging_get_kernel_cr3(void);
+    uint64_t saved_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+
+    dos_vm_t *vm = g_native_dos_vm;
+    uint64_t now = idt_get_ticks();
+    uint32_t ticks = (uint32_t)(((now - vm->start_ticks) * 182U) / 1000U);
+    if (ticks != vm->bios_ticks) {
+        vm->bios_ticks = ticks;
+        vm->last_timer_tick = now;
+        dos_mem_write32(vm, 0x46CU, ticks);
+    }
+    if (dos_io_timer_poll(vm))
+        vm->timer_irq_pending = true;
+
+    bool delivered = false;
+    if (vm->timer_irq_pending &&
+        dos_native_deliver_irq(vm, frame, 0U)) {
+        vm->timer_irq_pending = false;
+        delivered = true;
+    }
+
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
+    return delivered;
 }
 
 /* Called from the IDT [pf-ist] probe when a DOS native program faults.
@@ -743,73 +1042,52 @@ int dos_native_emulate_lretw(void *frame_ptr)
 void dos_native_dump_rip(uint16_t cs, uint32_t rip, uint16_t ss_hint,
                          uint64_t frame_rsp)
 {
-    (void)ss_hint; (void)frame_rsp;
     if (!g_native_dos_vm) return;
-    /* Rate-limit: same RIP back-to-back gets sampled instead of dumped
-     * every time. The pf-ist line itself still prints unconditionally
-     * (idt.c handles that); we only suppress this 32-byte dump here. */
-    static uint32_t dump_calls = 0;
-    static uint32_t last_rip   = 0xFFFFFFFFu;
+
+    static uint32_t dump_calls;
+    static uint32_t last_rip = 0xFFFFFFFFu;
     if (rip == last_rip && (++dump_calls & 0x3FF) != 0) return;
     last_rip = rip;
     dump_calls = 0;
+
     extern uint64_t paging_get_kernel_cr3(void);
     uint64_t saved_cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
-    uint64_t kcr3 = paging_get_kernel_cr3();
-    if (kcr3 && saved_cr3 != kcr3)
-        __asm__ volatile ("mov %0, %%cr3" :: "r"(kcr3) : "memory");
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
 
     dos_vm_t *vm = g_native_dos_vm;
-    uint16_t idx = (cs >> 3) & 0x1FFF;
-    if (idx < DPMI_MAX_DESCRIPTORS) {
-        dpmi_descriptor_t *d = &vm->dpmi.ldt[idx];
-        uint32_t base = (uint32_t)d->base_lo
-                      | ((uint32_t)d->base_mid << 16)
-                      | ((uint32_t)d->base_hi  << 24);
+    uint32_t base;
+    if (dos_native_selector_base(vm, cs, &base)) {
         uint64_t linear = (uint64_t)base + rip;
         serial_puts("[pf-ist] linear=0x");
         serial_puthex(linear, 8);
         serial_puts(" bytes:");
-        for (int i = 0; i < 16 &&
-             (linear + i) < vm->total_mem_size; i++) {
+        for (unsigned i = 0; i < 16 && linear + i < vm->total_mem_size; i++) {
             serial_puts(" ");
             serial_puthex(vm->mem[linear + i], 2);
         }
         serial_puts("\n");
-
-        /* Stack dump: the iret frame has the DOS SS:RSP where DOOM was
-         * pushing. Read up to 16 bytes from it to see the caller's
-         * return address pushed by CALL FAR. We can't access the iret
-         * frame from here without more plumbing, so use cpu8086's
-         * stored state as a fallback (pre-transfer cpu->esp). */
-        uint16_t ss_sel = vm->cpu->ss & ~3;
-        uint16_t ss_idx = (ss_sel >> 3) & 0x1FFF;
-        if (ss_idx < DPMI_MAX_DESCRIPTORS) {
-            dpmi_descriptor_t *sd = &vm->dpmi.ldt[ss_idx];
-            uint32_t ss_base = (uint32_t)sd->base_lo
-                             | ((uint32_t)sd->base_mid << 16)
-                             | ((uint32_t)sd->base_hi  << 24);
-            /* Use the iret-frame RSP (passed as frame_rsp) so we see
-             * the actual stack state at fault time, not the snapshot
-             * from before the native transfer. */
-            uint32_t rt_esp = (uint32_t)(frame_rsp & 0xFFFFFFFF);
-            uint64_t sp_linear = (uint64_t)ss_base + rt_esp;
-            serial_puts("[pf-ist] ss_base=0x");
-            serial_puthex(ss_base, 8);
-            serial_puts(" rt_esp=0x");
-            serial_puthex(rt_esp, 8);
-            serial_puts(" stack[0..15]:");
-            for (int i = 0; i < 16 &&
-                 (sp_linear + i) < vm->total_mem_size; i++) {
-                serial_puts(" ");
-                serial_puthex(vm->mem[sp_linear + i], 2);
-            }
-            serial_puts("\n");
-        }
     }
 
-    if (kcr3 && saved_cr3 != kcr3)
+    uint32_t stack_base;
+    if (dos_native_selector_base(vm, ss_hint, &stack_base)) {
+        uint32_t esp = (uint32_t)frame_rsp;
+        uint64_t linear = (uint64_t)stack_base + esp;
+        serial_puts("[pf-ist] ss_base=0x");
+        serial_puthex(stack_base, 8);
+        serial_puts(" esp=0x");
+        serial_puthex(esp, 8);
+        serial_puts(" stack:");
+        for (unsigned i = 0; i < 16 && linear + i < vm->total_mem_size; i++) {
+            serial_puts(" ");
+            serial_puthex(vm->mem[linear + i], 2);
+        }
+        serial_puts("\n");
+    }
+
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
         __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
 }
 
@@ -863,25 +1141,130 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
     cpu->ebp = (uint32_t)regs->rbp;
     cpu->ds  = (uint16_t)regs->ds;
     cpu->es  = (uint16_t)regs->es;
-    cpu->flags = 0x0202;  /* IF=1, fixed bits */
+    cpu->cs  = (uint16_t)regs->iret_cs;
+    cpu->eip = (uint32_t)regs->iret_rip;
+    cpu->ss  = (uint16_t)regs->iret_ss;
+    cpu->esp = (uint32_t)regs->iret_rsp;
+    cpu->eflags = (uint32_t)regs->iret_rflags | FLAGS_FIXED;
     cpu->running = true;
     cpu->protected_mode = true;
     cpu->vm = vm;
+
+    uint8_t reflected_int = 0;
+    bool rewrite_iret = false;
+    bool software_redirected = false;
+    bool host_reflect = int_num == DPMI_DEFAULT_REFLECT_INT &&
+                        dos_dpmi_pm_reflect_source(vm, &reflected_int);
+    bool host_raw_switch = int_num == DPMI_RAW_SWITCH_INT &&
+                           dos_dpmi_pm_stub_source(
+                               vm, DPMI_RAW_SWITCH_OFF);
+    bool host_exception_return = int_num == DPMI_EXCEPTION_RETURN_INT &&
+                                 dos_dpmi_pm_stub_source(
+                                     vm, DPMI_EXCEPTION_RETURN_OFF);
+    bool host_callback_return = int_num == DPMI_CALLBACK_RETURN_INT &&
+                                dos_dpmi_pm_stub_source(
+                                    vm, DPMI_CALLBACK_RETURN_OFF);
+    bool host_private_interrupt = host_reflect || host_raw_switch ||
+                                  host_exception_return ||
+                                  host_callback_return;
+    if (int_num <= 0xFFu && !host_private_interrupt &&
+        cpu_deliver_pm_software_interrupt(vm, (uint8_t)int_num, cpu->eip)) {
+        rewrite_iret = true;
+        software_redirected = true;
+    }
+
+    if (software_redirected) {
+        /* Return from the host gate directly into the client's handler. */
+    } else if (host_reflect) {
+        vm->native_dispatch_depth++;
+        bool reflected = dpmi_dispatch_default_interrupt(
+            vm, reflected_int, 0);
+        vm->native_dispatch_depth--;
+        if (!reflected) {
+            serial_puts("[DPMI] Native default interrupt reflection failed\n");
+            cpu->running = false;
+            cpu->exit_code = -1;
+        }
+    } else if (host_raw_switch) {
+        if (!dpmi_raw_mode_switch(vm) || cpu->protected_mode ||
+            !g_native_interpreter_cpu) {
+            serial_puts("[DOS-NT] PM->RM switch failed\n");
+            cpu->running = false;
+            cpu->exit_code = -1;
+        } else {
+            *g_native_interpreter_cpu = *cpu;
+            g_native_interpreter_cpu->vm = vm;
+            vm->cpu = g_native_interpreter_cpu;
+            dos_native_suspend(vm);
+        }
+    } else if (int_num == 0x101u) {
+        /* Processor exceptions use 0x100 | vector internally so they cannot
+         * be confused with software INT services. Preserve the processor's
+         * return RIP in the DPMI frame; the client handler may adjust it. */
+        rewrite_iret = true;
+        (void)cpu_deliver_exception(vm, 1, cpu->eip, 0, false);
+        if (cpu->running)
+            dos_native_sync_ldt(vm);
+    } else if (host_exception_return) {
+        rewrite_iret = true;
+        if (!dpmi_exception_return_native(vm)) {
+            cpu->running = false;
+            cpu->exit_code = -1;
+        }
+    } else if (host_callback_return) {
+        if (!dpmi_callback_return(vm, false) || cpu->protected_mode ||
+            !g_native_interpreter_cpu) {
+            serial_puts("[DOS-NT] Callback PM->RM return failed\n");
+            cpu->running = false;
+            cpu->exit_code = -1;
+        } else {
+            *g_native_interpreter_cpu = *cpu;
+            g_native_interpreter_cpu->vm = vm;
+            vm->cpu = g_native_interpreter_cpu;
+            dos_native_suspend(vm);
+        }
+    }
 
     /* Log INTs — first 50 verbose, then every 256th to keep noise down */
     static uint32_t native_int_count = 0;
     native_int_count++;
     if (native_int_count < 50 || (native_int_count & 0xFF) == 0) {
-        serial_puts("[DOS32] INT ");
-        serial_puthex(int_num, 2);
+        if (int_num == 0x101u) {
+            serial_puts("[DOS32] EXC ");
+            serial_puthex(1, 2);
+        } else {
+            serial_puts("[DOS32] INT ");
+            serial_puthex(int_num, 2);
+        }
         serial_puts("h AH=");
         serial_puthex(cpu->ah, 2);
         serial_puts(" #"); serial_putdec(native_int_count);
         serial_puts("\n");
     }
 
-    /* Dispatch to existing handlers (dos_api.c, dos_bios.c, etc.) */
-    dos_int_dispatch(vm, (uint8_t)int_num);
+    /* Native exceptions and private transitions were consumed above. */
+    if (!software_redirected && !host_private_interrupt &&
+        int_num != 0x101u) {
+        vm->native_dispatch_depth++;
+        dos_int_dispatch(vm, (uint8_t)int_num);
+        vm->native_dispatch_depth--;
+    }
+    uint8_t effective_int = host_reflect ? reflected_int : (uint8_t)int_num;
+    if (effective_int == 0x67u && !cpu->protected_mode &&
+        (cpu->eflags & FLAG_VM)) {
+        if (!g_native_interpreter_cpu) {
+            serial_puts("[DOS-NT] VCPI PM->V86 switch has no interpreter context\n");
+            cpu->running = false;
+            cpu->exit_code = -1;
+        } else {
+            *g_native_interpreter_cpu = *cpu;
+            g_native_interpreter_cpu->vm = vm;
+            vm->cpu = g_native_interpreter_cpu;
+            dos_native_suspend(vm);
+        }
+    }
+    if (effective_int == 0x31u)
+        dos_native_sync_ldt(vm);
 
     /* Copy results back → native registers */
     regs->rax = cpu->eax;
@@ -894,29 +1277,686 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
     regs->ds  = cpu->ds;
     regs->es  = cpu->es;
 
-    /* Force IF=1 and clear TF in the saved RFLAGS that IRETQ will pop.
-     * DOOM does CLI/STI sequences and POPF runs that occasionally leave
-     * the flags with IF=0; without external IRQ delivery the program
-     * gets stuck in a busy-poll loop with no way to make progress. The
-     * 0x202 base (IF=1 + reserved bit) plus IOPL=3 keeps DOOM able to
-     * issue IN/OUT freely. Preserve other flags (CF/ZF/SF/etc) so DOS
-     * function results are visible to the caller. */
-    regs->iret_rflags = (regs->iret_rflags & ~(uint64_t)0x100ULL) /* clear TF */
-                      | 0x200ULL  /* IF=1 */
-                      | 0x3000ULL /* IOPL=3 */
-                      | 0x002ULL; /* reserved bit 1 */
+    if (rewrite_iret && cpu->running) {
+        regs->iret_rip = cpu->eip;
+        regs->iret_cs = cpu->cs;
+        regs->iret_rflags = (cpu->eflags | FLAGS_FIXED | FLAG_IF) &
+                            ~(uint64_t)FLAG_IOPL_MASK;
+        if (cpu_stack_addr32(cpu))
+            regs->iret_rsp = cpu->esp;
+        else
+            regs->iret_rsp = (regs->iret_rsp & ~0xFFFFULL) | cpu->sp;
+        regs->iret_ss = cpu->ss;
+    } else {
+        /* DOS and DPMI calls return arithmetic status in FLAGS. Preserve the
+         * client's control flags (IF, TF, DF, IOPL) exactly as the CPU would. */
+        const uint64_t status_flags = FLAG_CF | FLAG_PF | FLAG_AF |
+                                      FLAG_ZF | FLAG_SF | FLAG_OF;
+        regs->iret_rflags = (regs->iret_rflags & ~status_flags) |
+                           (cpu->eflags & status_flags) | FLAGS_FIXED;
+    }
 
     /* Handle terminate (INT 20h or INT 21h/4Ch) */
     if (!cpu->running) {
+        if (vm->exec_depth && g_native_interpreter_cpu) {
+            *g_native_interpreter_cpu = *cpu;
+            g_native_interpreter_cpu->vm = vm;
+            vm->cpu = g_native_interpreter_cpu;
+            dos_native_suspend(vm);
+        }
         serial_puts("[DOS32] Program terminated, exit code ");
         serial_puthex(cpu->exit_code, 2);
         serial_puts("\n");
-        /* Halt forever — return-to-shell via setjmp is a separate task. */
-        __asm__ volatile ("cli\nhlt\n");
+        uint64_t *exit_jmpbuf = dos_native_exit_jmpbuf;
+        dos_native_cleanup(vm);
+        extern void x86_tss_reset_ist2(void);
+        x86_tss_reset_ist2();
+        if (exit_jmpbuf) {
+            extern void kern_longjmp(uint64_t *buf, int val);
+            __asm__ volatile ("cli" ::: "memory");
+            kern_longjmp(exit_jmpbuf, 1);
+        }
+        serial_puts("[DOS32] No shell recovery context; halting\n");
+        __asm__ volatile ("cli");
+        for (;;) __asm__ volatile ("hlt");
     }
 
     /* Restore DOS CR3 before returning to ring-3 DOS code. */
     if (kcr3 && saved_cr3 != kcr3) {
         __asm__ volatile ("mov %0, %%cr3" : : "r"(saved_cr3) : "memory");
     }
+}
+
+static void dos_test_descriptor(dpmi_state_t *dpmi, uint16_t selector,
+                                bool code, bool use32)
+{
+    uint16_t index = dpmi_sel_to_index(selector);
+    dpmi_descriptor_t *desc = &dpmi->ldt[index];
+    for (unsigned i = 0; i < sizeof(*desc); i++)
+        ((uint8_t *)desc)[i] = 0;
+    dpmi_desc_set_base(desc, 0);
+    dpmi_desc_set_limit(desc, 0xFFFFu);
+    desc->access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
+                   (code ? (DESC_CODE | DESC_READABLE) : DESC_WRITABLE);
+    if (use32) desc->flags_lim |= DESC_32BIT;
+    dpmi->descriptor_state[index] = DPMI_DESC_MUTABLE;
+}
+
+static int dos_dpmi_exception_frame_selftest(dos_vm_t *vm,
+                                             cpu8086_state_t *cpu,
+                                             bool use32,
+                                             bool stack32)
+{
+    const uint16_t handler_sel = dpmi_index_to_sel(1);
+    const uint16_t stack_sel = dpmi_index_to_sel(2);
+    const uint32_t old_eip = use32 ? 0x00123456u : 0x3456u;
+    const uint32_t old_esp = use32 && !stack32
+                           ? 0x03A48000u
+                           : (use32 ? 0x00008000u : 0x00009000u);
+    const uint32_t old_flags = FLAG_IF | FLAG_DF | FLAGS_FIXED;
+    const bool old_virtual_interrupts = use32 == stack32;
+    int failures = 0;
+
+    dpmi_init(vm);
+    dos_test_descriptor(&vm->dpmi, handler_sel, true, use32);
+    dos_test_descriptor(&vm->dpmi, stack_sel, false, stack32);
+    vm->dpmi.active = true;
+    vm->dpmi.is_32bit = use32;
+    vm->dpmi.virtual_interrupts_enabled = old_virtual_interrupts;
+    vm->dpmi.exception_vectors[1].sel = handler_sel;
+    vm->dpmi.exception_vectors[1].off = use32 ? 0x2000u : 0x0200u;
+
+    cpu8086_init(cpu, vm);
+    cpu->protected_mode = true;
+    cpu->pm_cs_loaded = true;
+    cpu->op_size_32 = use32;
+    cpu->addr_size_32 = use32;
+    cpu->cs = handler_sel;
+    cpu->eip = old_eip;
+    cpu->ss = stack_sel;
+    cpu->esp = old_esp;
+    cpu->eflags = old_flags;
+
+    if (!cpu_deliver_exception(vm, 1, old_eip, 0, false) ||
+        cpu->cs != handler_sel ||
+        cpu->eip != vm->dpmi.exception_vectors[1].off ||
+        vm->dpmi.exception_depth != 1 ||
+        vm->dpmi.virtual_interrupts_enabled ||
+        !(cpu->flags & FLAG_IF))
+        return 1;
+
+    uint16_t host_sel = vm->dpmi.sel_host_code;
+    uint32_t frame = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+    if (use32) {
+        uint32_t expected_esp = stack32
+                              ? old_esp - 32u
+                              : (old_esp & 0xFFFF0000u) |
+                                (uint16_t)((uint16_t)old_esp - 32u);
+        if (cpu->esp != expected_esp ||
+            dos_mem_read32(vm, frame) != DPMI_EXCEPTION_RETURN_OFF ||
+            dos_mem_read32(vm, frame + 4u) != host_sel ||
+            dos_mem_read32(vm, frame + 8u) != 0 ||
+            dos_mem_read32(vm, frame + 12u) != old_eip ||
+            dos_mem_read32(vm, frame + 16u) != handler_sel ||
+            dos_mem_read32(vm, frame + 20u) != old_flags ||
+            dos_mem_read32(vm, frame + 24u) != old_esp ||
+            dos_mem_read32(vm, frame + 28u) != stack_sel)
+            failures++;
+
+        cpu->eip = cpu_pop32(cpu);
+        cpu->cs = (uint16_t)cpu_pop32(cpu);
+        cpu->eip = DPMI_EXCEPTION_RETURN_OFF + 2u;
+        cpu_push32(cpu, cpu->eflags);
+        cpu_push32(cpu, cpu->cs);
+        cpu_push32(cpu, cpu->eip);
+    } else {
+        uint32_t expected_esp = stack32
+                              ? old_esp - 16u
+                              : (old_esp & 0xFFFF0000u) |
+                                (uint16_t)((uint16_t)old_esp - 16u);
+        if (cpu->esp != expected_esp ||
+            dos_mem_read16(vm, frame) != DPMI_EXCEPTION_RETURN_OFF ||
+            dos_mem_read16(vm, frame + 2u) != host_sel ||
+            dos_mem_read16(vm, frame + 4u) != 0 ||
+            dos_mem_read16(vm, frame + 6u) != (uint16_t)old_eip ||
+            dos_mem_read16(vm, frame + 8u) != handler_sel ||
+            dos_mem_read16(vm, frame + 10u) != (uint16_t)old_flags ||
+            dos_mem_read16(vm, frame + 12u) != (uint16_t)old_esp ||
+            dos_mem_read16(vm, frame + 14u) != stack_sel)
+            failures++;
+
+        cpu->ip = cpu_pop16(cpu);
+        cpu->cs = cpu_pop16(cpu);
+        cpu->ip = DPMI_EXCEPTION_RETURN_OFF + 2u;
+        cpu_push16(cpu, cpu->flags);
+        cpu_push16(cpu, cpu->cs);
+        cpu_push16(cpu, cpu->ip);
+    }
+
+    cpu->flags &= ~(FLAG_IF | FLAG_TF);
+    dos_int_dispatch(vm, DPMI_EXCEPTION_RETURN_INT);
+    if (!cpu->running || vm->dpmi.exception_depth != 0 ||
+        cpu->cs != handler_sel || cpu->eip != old_eip ||
+        cpu->ss != stack_sel || cpu->esp != old_esp ||
+        cpu->eflags != old_flags ||
+        vm->dpmi.virtual_interrupts_enabled != old_virtual_interrupts)
+        failures++;
+    return failures;
+}
+
+static int dos_stack_instruction_selftest(dos_vm_t *vm,
+                                          cpu8086_state_t *cpu,
+                                          bool use32,
+                                          bool stack32)
+{
+    const uint16_t code_sel = dpmi_index_to_sel(1);
+    const uint16_t stack_sel = dpmi_index_to_sel(2);
+    const uint32_t code = 0x1000u;
+    const uint32_t body = code + 1u;
+    const uint32_t function = code + 0x30u;
+    const uint32_t top = stack32 ? 0x00009000u : 0x03A49000u;
+    const uint32_t width = use32 ? 4u : 2u;
+    const uint32_t old_bp = use32 && !stack32
+                          ? 0x11227020u : 0x00007020u;
+    const uint32_t marker = use32 ? 0xA1B2C3D4u : 0x0000BEEFu;
+
+    dpmi_init(vm);
+    dos_test_descriptor(&vm->dpmi, code_sel, true, use32);
+    dos_test_descriptor(&vm->dpmi, stack_sel, false, stack32);
+    vm->dpmi.active = true;
+    vm->dpmi.is_32bit = use32;
+
+    cpu8086_init(cpu, vm);
+    cpu->protected_mode = true;
+    cpu->pm_cs_loaded = true;
+    cpu->op_size_32 = use32;
+    cpu->addr_size_32 = use32;
+    cpu->cs = code_sel;
+    cpu->ss = stack_sel;
+    cpu->esp = top;
+    cpu->ebp = old_bp;
+
+    for (uint32_t i = 0; i < 0x50u; i++)
+        vm->mem[code + i] = 0x90;
+
+    vm->mem[code] = 0xCF;             /* IRET, exercised by USE16 */
+    uint32_t p = body;
+    vm->mem[p++] = 0x83;              /* SUB SP/ESP,8 */
+    vm->mem[p++] = 0xEC;
+    vm->mem[p++] = 0x08;
+    vm->mem[p++] = 0xE8;              /* CALL function */
+    if (use32) {
+        uint32_t next = p + 4u;
+        dos_mem_write32(vm, p, function - next);
+        p = next;
+        vm->mem[p++] = 0xB8;          /* MOV EAX,00004C2A */
+        dos_mem_write32(vm, p, 0x00004C2Au);
+        p += 4u;
+    } else {
+        uint32_t next = p + 2u;
+        dos_mem_write16(vm, p, (uint16_t)(function - next));
+        p = next;
+        vm->mem[p++] = 0xB8;          /* MOV AX,4C2A */
+        dos_mem_write16(vm, p, 0x4C2Au);
+        p += 2u;
+    }
+    vm->mem[p++] = 0xCD;
+    vm->mem[p++] = 0x21;
+
+    p = function;
+    vm->mem[p++] = 0xC8;              /* ENTER 32,2 */
+    dos_mem_write16(vm, p, 0x20u);
+    p += 2u;
+    vm->mem[p++] = 0x02;
+    vm->mem[p++] = 0x89;              /* MOV DI/EDI,SP/ESP */
+    vm->mem[p++] = 0xE7;
+    vm->mem[p++] = 0x89;              /* MOV SI/ESI,BP/EBP */
+    vm->mem[p++] = 0xEE;
+    vm->mem[p++] = 0xC9;              /* LEAVE */
+    vm->mem[p++] = 0xC2;              /* RET 8 */
+    dos_mem_write16(vm, p, 8u);
+
+    uint32_t source = stack32 ? old_bp - width
+                              : (uint16_t)(old_bp - width);
+    uint32_t source_addr = dos_addr(vm, stack_sel, source);
+    if (use32)
+        dos_mem_write32(vm, source_addr, marker);
+    else
+        dos_mem_write16(vm, source_addr, (uint16_t)marker);
+
+    if (use32) {
+        cpu->eip = body;
+    } else {
+        cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+        cpu_push16(cpu, code_sel);
+        cpu_push16(cpu, (uint16_t)body);
+        cpu->eip = code;
+    }
+
+    int result = cpu8086_run(vm);
+    uint16_t frame_low = (uint16_t)(top - 8u - width - width);
+    uint32_t frame = use32 && !stack32
+                   ? (top & 0xFFFF0000u) | frame_low
+                   : frame_low;
+    uint16_t local_low = (uint16_t)(frame_low - 2u * width - 0x20u);
+    uint32_t local = use32 && !stack32
+                   ? (top & 0xFFFF0000u) | local_low
+                   : local_low;
+    uint32_t display_marker = dos_addr(vm, stack_sel,
+                                      (uint16_t)(frame_low - width));
+    uint32_t display_frame = dos_addr(vm, stack_sel,
+                                     (uint16_t)(frame_low - 2u * width));
+
+    int failures = 0;
+    if (result != 0x2A || cpu->esp != top || cpu->ebp != old_bp ||
+        cpu->esi != frame || cpu->edi != local)
+        failures++;
+    if (use32) {
+        if (dos_mem_read32(vm, display_marker) != marker ||
+            dos_mem_read32(vm, display_frame) != frame)
+            failures++;
+    } else if (dos_mem_read16(vm, display_marker) != (uint16_t)marker ||
+               dos_mem_read16(vm, display_frame) != (uint16_t)frame) {
+        failures++;
+    }
+    return failures;
+}
+
+static int dos_dpmi_virtual_interrupt_selftest(dos_vm_t *vm,
+                                                cpu8086_state_t *cpu)
+{
+    const uint16_t code_sel = dpmi_index_to_sel(1);
+    const uint16_t stack_sel = dpmi_index_to_sel(2);
+    const uint32_t code = 0x1000u;
+    int failures = 0;
+
+    dpmi_init(vm);
+    dos_test_descriptor(&vm->dpmi, code_sel, true, false);
+    dos_test_descriptor(&vm->dpmi, stack_sel, false, false);
+    vm->dpmi.active = true;
+    vm->dpmi.is_32bit = false;
+    vm->dpmi.pm_vectors[8].sel = code_sel;
+    vm->dpmi.pm_vectors[8].off = 0x1100u;
+
+    cpu8086_init(cpu, vm);
+    cpu->protected_mode = true;
+    cpu->pm_cs_loaded = true;
+    cpu->cs = code_sel;
+    cpu->eip = code;
+    cpu->ss = stack_sel;
+    cpu->esp = 0x8000u;
+    cpu->eflags = FLAGS_FIXED | FLAG_IF;
+
+    vm->dpmi.virtual_interrupts_enabled = false;
+    if (cpu_deliver_hw_interrupt(vm, 8) || cpu->eip != code ||
+        cpu->esp != 0x8000u)
+        failures++;
+
+    vm->dpmi.virtual_interrupts_enabled = true;
+    if (!cpu_deliver_hw_interrupt(vm, 8) ||
+        vm->dpmi.virtual_interrupts_enabled || cpu->eip != 0x1100u ||
+        cpu->esp != 0x7FFAu || !(cpu->flags & FLAG_IF) ||
+        dos_mem_read16(vm, 0x7FFAu) != (uint16_t)code ||
+        dos_mem_read16(vm, 0x7FFCu) != code_sel ||
+        !(dos_mem_read16(vm, 0x7FFEu) & FLAG_IF))
+        failures++;
+
+    /* A hardware vector without a client handler uses a distinct host stub.
+     * Its STI restores virtual IF after the reflected real-mode handler. */
+    vm->dpmi.pm_vectors[8].sel = 0;
+    vm->dpmi.pm_vectors[8].off = 0;
+    cpu8086_init(cpu, vm);
+    cpu->protected_mode = true;
+    cpu->pm_cs_loaded = true;
+    cpu->cs = code_sel;
+    cpu->eip = code;
+    cpu->ss = stack_sel;
+    cpu->esp = 0x8000u;
+    cpu->eflags = FLAGS_FIXED | FLAG_IF;
+    vm->dpmi.virtual_interrupts_enabled = true;
+    vm->timer_irq_pending = false;
+    vm->start_ticks = idt_get_ticks();
+    vm->last_timer_tick = vm->start_ticks;
+
+    const uint16_t rm_irq_segment = 0x0180u;
+    const uint8_t irq_return_program[] = {
+        0xB8, 0x2A, 0x4C,             /* MOV AX,4C2A */
+        0xCD, 0x21                    /* INT 21h */
+    };
+    const uint8_t rm_irq_handler[] = {
+        0xBB, 0x78, 0x56,             /* MOV BX,5678 */
+        0xCF                          /* IRET */
+    };
+    for (unsigned i = 0; i < sizeof(irq_return_program); i++)
+        vm->mem[code + i] = irq_return_program[i];
+    uint32_t rm_irq_address = (uint32_t)rm_irq_segment << 4;
+    for (unsigned i = 0; i < sizeof(rm_irq_handler); i++)
+        vm->mem[rm_irq_address + i] = rm_irq_handler[i];
+    dos_mem_write16(vm, 8u * 4u, 0);
+    dos_mem_write16(vm, 8u * 4u + 2u, rm_irq_segment);
+
+    if (!cpu_deliver_hw_interrupt(vm, 8) ||
+        vm->dpmi.virtual_interrupts_enabled ||
+        cpu->cs != vm->dpmi.sel_host_code ||
+        cpu->eip != DPMI_PM_HW_REFLECT_BASE_OFF +
+                    8u * DPMI_PM_REFLECT_STUB_SIZE)
+        failures++;
+    int default_irq_result = cpu8086_run(vm);
+    if (default_irq_result != 0x2A || cpu->running ||
+        cpu->bx != 0x5678u || cpu->esp != 0x8000u ||
+        !vm->dpmi.virtual_interrupts_enabled || !(cpu->flags & FLAG_IF))
+        failures++;
+
+    cpu8086_init(cpu, vm);
+    cpu->protected_mode = true;
+    cpu->pm_cs_loaded = true;
+    cpu->cs = code_sel;
+    cpu->eip = code;
+    cpu->ss = stack_sel;
+    cpu->esp = 0x8000u;
+    cpu->eflags = FLAGS_FIXED | FLAG_IF;
+    vm->dpmi.virtual_interrupts_enabled = true;
+
+    const uint8_t program[] = {
+        0xFA,                         /* CLI: virtual IF = 0 */
+        0xB8, 0x02, 0x09,             /* MOV AX,0902 */
+        0xCD, 0x31,                   /* INT 31h */
+        0x3D, 0x00, 0x09,             /* CMP AX,0900 */
+        0x75, 0x10,                   /* JNE fail */
+        0xFB,                         /* STI: virtual IF = 1 */
+        0xB8, 0x02, 0x09,             /* MOV AX,0902 */
+        0xCD, 0x31,                   /* INT 31h */
+        0x3D, 0x01, 0x09,             /* CMP AX,0901 */
+        0x75, 0x05,                   /* JNE fail */
+        0xB8, 0x2A, 0x4C,             /* MOV AX,4C2A */
+        0xCD, 0x21,                   /* INT 21h */
+        0xB8, 0x76, 0x4C,             /* fail: MOV AX,4C76 */
+        0xCD, 0x21                    /* INT 21h */
+    };
+    for (unsigned i = 0; i < sizeof(program); i++)
+        vm->mem[code + i] = program[i];
+
+    int result = cpu8086_run(vm);
+    if (result != 0x2A || cpu->running ||
+        !vm->dpmi.virtual_interrupts_enabled ||
+        !(cpu->flags & FLAG_IF))
+        failures++;
+
+    dpmi_init(vm);
+    dos_test_descriptor(&vm->dpmi, code_sel, true, false);
+    dos_test_descriptor(&vm->dpmi, stack_sel, false, false);
+    vm->dpmi.active = true;
+    vm->dpmi.is_32bit = false;
+    vm->dpmi.virtual_interrupts_enabled = true;
+    vm->dpmi.pm_vectors[0x60].sel = code_sel;
+    vm->dpmi.pm_vectors[0x60].off = 0x1200u;
+    vm->dpmi.pm_vectors[0x07].sel = code_sel;
+    vm->dpmi.pm_vectors[0x07].off = 0x1300u;
+
+    cpu8086_init(cpu, vm);
+    cpu->protected_mode = true;
+    cpu->pm_cs_loaded = true;
+    cpu->cs = code_sel;
+    cpu->eip = code;
+    cpu->ss = stack_sel;
+    cpu->esp = 0x8000u;
+    cpu->eflags = FLAGS_FIXED | FLAG_IF;
+
+    const uint8_t vector_program[] = {
+        0xCD, 0x60,                   /* installed software vector */
+        0xCD, 0x07,                   /* low vector disables virtual IF */
+        0xB8, 0x2A, 0x4C,             /* MOV AX,4C2A */
+        0xCD, 0x21                    /* INT 21h */
+    };
+    const uint8_t vector_handler[] = {
+        0xB8, 0x02, 0x09,             /* MOV AX,0902 */
+        0xCD, 0x31,                   /* INT 31h */
+        0x89, 0xC7,                   /* MOV DI,AX */
+        0xBB, 0x78, 0x56,             /* MOV BX,5678 */
+        0xCF                          /* IRET */
+    };
+    const uint8_t low_vector_handler[] = {
+        0xB8, 0x02, 0x09,             /* MOV AX,0902 */
+        0xCD, 0x31,                   /* INT 31h */
+        0x89, 0xC6,                   /* MOV SI,AX */
+        0xFB,                         /* STI */
+        0xBA, 0x34, 0x12,             /* MOV DX,1234 */
+        0xCF                          /* IRET */
+    };
+    for (unsigned i = 0; i < sizeof(vector_program); i++)
+        vm->mem[code + i] = vector_program[i];
+    for (unsigned i = 0; i < sizeof(vector_handler); i++)
+        vm->mem[0x1200u + i] = vector_handler[i];
+    for (unsigned i = 0; i < sizeof(low_vector_handler); i++)
+        vm->mem[0x1300u + i] = low_vector_handler[i];
+
+    result = cpu8086_run(vm);
+    if (result != 0x2A || cpu->running || cpu->bx != 0x5678u ||
+        cpu->di != 0x0901u || cpu->si != 0x0900u || cpu->dx != 0x1234u ||
+        !vm->dpmi.virtual_interrupts_enabled || !(cpu->flags & FLAG_IF))
+        failures++;
+    return failures;
+}
+
+static int dos_dpmi_default_interrupt_selftest(dos_vm_t *vm,
+                                                cpu8086_state_t *cpu)
+{
+    const uint16_t code_sel = dpmi_index_to_sel(1);
+    const uint16_t stack_sel = dpmi_index_to_sel(2);
+    const uint32_t code = 0x1000u;
+    const uint16_t rm_handler_seg = 0x0180u;
+
+    dpmi_init(vm);
+    dos_test_descriptor(&vm->dpmi, code_sel, true, false);
+    dos_test_descriptor(&vm->dpmi, stack_sel, false, false);
+    vm->dpmi.active = true;
+    vm->dpmi.is_32bit = false;
+    vm->dpmi.virtual_interrupts_enabled = true;
+    if (!dpmi_get_host_code_selector(vm))
+        return 1;
+
+    cpu8086_init(cpu, vm);
+    cpu->protected_mode = true;
+    cpu->pm_cs_loaded = true;
+    cpu->cs = code_sel;
+    cpu->eip = code;
+    cpu->ss = stack_sel;
+    cpu->esp = 0x8000u;
+    cpu->ds = stack_sel;
+    cpu->es = code_sel;
+    cpu->eflags = FLAGS_FIXED | FLAG_IF;
+
+    dos_mem_write16(vm, 0x60u * 4u, 0);
+    dos_mem_write16(vm, 0x60u * 4u + 2u, rm_handler_seg);
+
+    const uint8_t program[] = {
+        0xBB, 0x11, 0x11,             /* MOV BX,1111 */
+        0xBA, 0x22, 0x22,             /* MOV DX,2222 */
+        0xF8,                         /* CLC */
+        0xCD, 0x60,                   /* default PM vector -> RM handler */
+        0x73, 0x11,                   /* JNC fail */
+        0x81, 0xFB, 0x78, 0x56,       /* CMP BX,5678 */
+        0x75, 0x0B,                   /* JNE fail */
+        0x81, 0xFA, 0x34, 0x12,       /* CMP DX,1234 */
+        0x75, 0x05,                   /* JNE fail */
+        0xB8, 0x2A, 0x4C,             /* MOV AX,4C2A */
+        0xCD, 0x21,                   /* INT 21h */
+        0xB8, 0x71, 0x4C,             /* fail: MOV AX,4C71 */
+        0xCD, 0x21                    /* INT 21h */
+    };
+    const uint8_t rm_handler[] = {
+        0xBB, 0x78, 0x56,             /* MOV BX,5678 */
+        0xBA, 0x34, 0x12,             /* MOV DX,1234 */
+        0xB8, 0x99, 0x99,             /* MOV AX,9999 */
+        0x8E, 0xD8,                   /* MOV DS,AX */
+        0xB8, 0x88, 0x88,             /* MOV AX,8888 */
+        0x8E, 0xC0,                   /* MOV ES,AX */
+        0x55,                         /* PUSH BP */
+        0x89, 0xE5,                   /* MOV BP,SP */
+        0x83, 0x4E, 0x06, 0x01,       /* OR word [BP+6],1 (saved CF) */
+        0x5D,                         /* POP BP */
+        0xCF                          /* IRET */
+    };
+    for (unsigned i = 0; i < sizeof(program); i++)
+        vm->mem[code + i] = program[i];
+    uint32_t rm_handler_address = (uint32_t)rm_handler_seg << 4;
+    for (unsigned i = 0; i < sizeof(rm_handler); i++)
+        vm->mem[rm_handler_address + i] = rm_handler[i];
+
+    int result = cpu8086_run(vm);
+    if (result != 0x2A || cpu->running || cpu->bx != 0x5678u ||
+        cpu->dx != 0x1234u || cpu->ds != stack_sel ||
+        cpu->es != code_sel || cpu->esp != 0x8000u ||
+        !vm->dpmi.virtual_interrupts_enabled || !(cpu->flags & FLAG_IF))
+        return 1;
+    return 0;
+}
+
+int dos_interrupt_selftest(void)
+{
+    extern void *mem_alloc_pages(uint64_t count);
+    extern void mem_free_pages(void *addr, uint64_t count);
+
+    const uint64_t pages = (DOS_MEM_SIZE + 4095u) / 4096u;
+    uint8_t *memory = (uint8_t *)mem_alloc_pages(pages);
+    if (!memory) return 1;
+    for (uint64_t i = 0; i < pages * 4096u; i++) memory[i] = 0;
+
+    dos_vm_t vm = {0};
+    cpu8086_state_t cpu;
+    vm.mem = memory;
+    vm.total_mem_size = DOS_MEM_SIZE;
+    vm.cpu = &cpu;
+
+    int failures = 0;
+    failures += dos_dpmi_exception_frame_selftest(&vm, &cpu, false, false);
+    failures += dos_dpmi_exception_frame_selftest(&vm, &cpu, false, true);
+    failures += dos_dpmi_exception_frame_selftest(&vm, &cpu, true, false);
+    failures += dos_dpmi_exception_frame_selftest(&vm, &cpu, true, true);
+    failures += dos_stack_instruction_selftest(&vm, &cpu, false, false);
+    failures += dos_stack_instruction_selftest(&vm, &cpu, false, true);
+    failures += dos_stack_instruction_selftest(&vm, &cpu, true, false);
+    failures += dos_stack_instruction_selftest(&vm, &cpu, true, true);
+    failures += dos_dpmi_virtual_interrupt_selftest(&vm, &cpu);
+    failures += dos_dpmi_default_interrupt_selftest(&vm, &cpu);
+
+    /* Execute real-mode HLT and ICEBP. A pending IRQ0 must wake HLT, then
+     * vector 1 must run and IRET to the byte following ICEBP. */
+    for (uint64_t i = 0; i < pages * 4096u; i++) memory[i] = 0;
+    cpu8086_init(&cpu, &vm);
+    vm.start_ticks = idt_get_ticks();
+    vm.last_timer_tick = vm.start_ticks;
+    vm.timer_irq_pending = true;
+    cpu.cs = 0x0100;
+    cpu.ip = 0;
+    cpu.ss = 0x0200;
+    cpu.sp = 0x0800;
+
+    dos_mem_write16(&vm, 1u * 4u, 0);
+    dos_mem_write16(&vm, 1u * 4u + 2u, 0x0120);
+    const uint8_t program[] = {
+        0xFB,                   /* STI */
+        0xF4,                   /* HLT */
+        0xF1,                   /* ICEBP */
+        0xB8, 0x2A, 0x4C,       /* MOV AX,4C2A */
+        0xCD, 0x21              /* INT 21h */
+    };
+    const uint8_t handler[] = {
+        0xBB, 0x78, 0x56,       /* MOV BX,5678 */
+        0xCF                    /* IRET */
+    };
+    for (unsigned i = 0; i < sizeof(program); i++)
+        memory[0x1000u + i] = program[i];
+    for (unsigned i = 0; i < sizeof(handler); i++)
+        memory[0x1200u + i] = handler[i];
+
+    int result = cpu8086_run(&vm);
+    if (result != 0x2A || cpu.bx != 0x5678 || cpu.halted ||
+        vm.timer_irq_pending)
+        failures++;
+
+    /* An unavailable x87 raises #NM at the instruction boundary. The guest
+     * handler advances saved IP by two bytes and returns through IRET. */
+    for (uint64_t i = 0; i < pages * 4096u; i++) memory[i] = 0;
+    cpu8086_init(&cpu, &vm);
+    vm.timer_irq_pending = false;
+    vm.start_ticks = idt_get_ticks();
+    vm.last_timer_tick = vm.start_ticks;
+    cpu.cs = 0x0100;
+    cpu.ip = 0;
+    cpu.ss = 0x0200;
+    cpu.sp = 0x0800;
+
+    dos_mem_write16(&vm, 7U * 4U, 0);
+    dos_mem_write16(&vm, 7U * 4U + 2U, 0x0130);
+    const uint8_t x87_program[] = {
+        0xD9, 0xE8,             /* FLD1 -> #NM */
+        0xB8, 0x2A, 0x4C,       /* MOV AX,4C2A */
+        0xCD, 0x21              /* INT 21h */
+    };
+    const uint8_t nm_handler[] = {
+        0x58,                   /* POP AX (saved IP) */
+        0x05, 0x02, 0x00,       /* ADD AX,2 */
+        0x50,                   /* PUSH AX */
+        0xBB, 0x78, 0x56,       /* MOV BX,5678 */
+        0xCF                    /* IRET */
+    };
+    for (unsigned i = 0; i < sizeof(x87_program); i++)
+        memory[0x1000U + i] = x87_program[i];
+    for (unsigned i = 0; i < sizeof(nm_handler); i++)
+        memory[0x1300U + i] = nm_handler[i];
+
+    result = cpu8086_run(&vm);
+    if (result != 0x2A || cpu.bx != 0x5678 || cpu.running)
+        failures++;
+
+    /* CPUID exposes only the virtual CPU contract implemented above. UD2
+     * must enter vector 6 at its first byte so a guest handler can recover.
+     * A prefixed near Jcc also validates its full 32-bit displacement. */
+    for (uint64_t i = 0; i < pages * 4096u; i++) memory[i] = 0;
+    cpu8086_init(&cpu, &vm);
+    vm.timer_irq_pending = false;
+    vm.start_ticks = idt_get_ticks();
+    vm.last_timer_tick = vm.start_ticks;
+    cpu.cs = 0x0100;
+    cpu.ip = 0;
+    cpu.ss = 0x0200;
+    cpu.sp = 0x0800;
+
+    dos_mem_write16(&vm, 6U * 4U, 0);
+    dos_mem_write16(&vm, 6U * 4U + 2U, 0x0140);
+    const uint8_t cpuid_program[] = {
+        0x66, 0x31, 0xC0,       /* XOR EAX,EAX */
+        0x0F, 0xA2,             /* CPUID leaf 0 */
+        0x66, 0x89, 0xC7,       /* MOV EDI,EAX */
+        0x0F, 0x0B,             /* UD2 -> #UD */
+        0x31, 0xC0,             /* XOR AX,AX (ZF=1) */
+        0x66, 0x0F, 0x84,       /* JZ rel32 */
+        0x05, 0x00, 0x00, 0x00,
+        0xBE, 0xAD, 0xDE,       /* MOV SI,DEAD (bad path) */
+        0xEB, 0x03,             /* JMP exit */
+        0xBE, 0x78, 0x56,       /* MOV SI,5678 (good path) */
+        0xB8, 0x2A, 0x4C,       /* MOV AX,4C2A */
+        0xCD, 0x21              /* INT 21h */
+    };
+    const uint8_t ud_handler[] = {
+        0x58,                   /* POP AX (saved IP) */
+        0x05, 0x02, 0x00,       /* ADD AX,2 */
+        0x50,                   /* PUSH AX */
+        0xBD, 0x78, 0x56,       /* MOV BP,5678 */
+        0xCF                    /* IRET */
+    };
+    for (unsigned i = 0; i < sizeof(cpuid_program); i++)
+        memory[0x1000U + i] = cpuid_program[i];
+    for (unsigned i = 0; i < sizeof(ud_handler); i++)
+        memory[0x1400U + i] = ud_handler[i];
+
+    result = cpu8086_run(&vm);
+    if (result != 0x2A || cpu.edi != 1U || cpu.ebx != 0x7469734FU ||
+        cpu.edx != 0x4D564B6FU || cpu.ecx != 0x20555043U ||
+        cpu.bp != 0x5678 || cpu.si != 0x5678 || cpu.running)
+        failures++;
+
+    mem_free_pages(memory, pages);
+    return failures;
 }

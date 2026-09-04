@@ -98,11 +98,21 @@ void nt_syscall_init(NT_SERVICE_TABLE *table);
 
 /* Release VirtualAlloc regions that belong to a terminating Win32 process. */
 void nt_vm_release_process(ULONG owner_pid);
+/* Configure hardware DEP before the process creates private mappings. */
+void nt_vm_configure_process_dep(ULONG owner_pid, BOOL enabled);
+BOOL nt_vm_process_dep_enabled(ULONG owner_pid);
 void nt_vm_get_stats(uint32_t *entries, uint64_t *private_pages,
                      uint64_t *mapped_pages);
+/* Report the automatic allocation window owned by the current PE process.
+ * Available space is conservative: quarantined ranges below the monotonic
+ * cursor remain unavailable until the allocator gains generation-safe reuse. */
+void nt_vm_get_address_space(SIZE_T *total, SIZE_T *available);
 /* Return the furthest end of a current-process VirtualAlloc reservation that
  * intersects the candidate range, zero when free, or UINT64_MAX if invalid. */
 ULONGLONG nt_vm_range_conflict_end(ULONGLONG base, ULONGLONG size);
+/* Validate that a complete range is committed in VMAs owned by the current
+ * Win32 process and CR3, with logical protection suitable for the access. */
+BOOL nt_vm_user_range_accessible(ULONGLONG base, SIZE_T size, BOOL writable);
 /* Dump VMA ownership/protection metadata for a fatal guest address. */
 void nt_vm_debug_address(uint64_t address);
 
@@ -110,9 +120,15 @@ void nt_vm_debug_address(uint64_t address);
  * a protected bottom page; StackLimit..StackBase is committed PAGE_READWRITE. */
 NTSTATUS nt_vm_allocate_stack(SIZE_T reserve_size, PVOID *allocation_base,
                               PVOID *stack_limit, PVOID *stack_base);
+/* Allocate a region in the current process's PE32 address window even when
+ * the caller itself is executing through the native 64-bit shim path. */
+NTSTATUS nt_vm_allocate_compat32(PVOID *base_address, SIZE_T *region_size,
+                                 ULONG allocation_type, ULONG protect);
 NTSTATUS nt_vm_free_stack(PVOID allocation_base);
+NTSTATUS nt_vm_release_allocation_for_process(ULONG owner_pid,
+                                               PVOID allocation_base);
 NTSTATUS nt_vm_free_stack_for_process(ULONG owner_pid,
-                                      PVOID allocation_base);
+                                       PVOID allocation_base);
 int nt_vm_selftest(void);
 
 /* Thread impersonation state is owned by the NT thread object. ADVAPI32 uses
@@ -125,6 +141,7 @@ BOOL nt_thread_set_impersonation_token(PVOID thread_object,
 /* Close a handle on behalf of a specific Win32 process. Kernel-owned
  * references use this instead of depending on the caller's current TEB. */
 NTSTATUS nt_close_handle_for_process(HANDLE handle, ULONG owner_pid);
+NTSTATUS nt_force_close_handle_for_process(HANDLE handle, ULONG owner_pid);
 
 /* Apply the section object's DACL when DuplicateHandle requests new rights. */
 BOOL nt_section_allows_access_escalation(PVOID section,

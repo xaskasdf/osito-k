@@ -26,6 +26,8 @@ extern void serial_putdec(uint64_t val);
 
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
+extern uint32_t proc_exec_pid(void);
+extern const char *proc_current_name(void);
 
 /* ── Constants ───────────────────────────────────────────────── */
 
@@ -292,12 +294,11 @@ extern void compositor_set_fullscreen(uint32_t window_id, bool fullscreen);
 extern void compositor_signal_dirty(uint32_t window_id);
 extern uint32_t compositor_find_window_by_shm(uint32_t shm_handle);
 
-/* Set before calling shm_create_surface — picked up by compositor_create_window
- * so the window can be cleaned up when the owning process exits. */
-uint32_t shm_surface_owner_pid = 0;
-
 uint32_t shm_create_surface(uint32_t width, uint32_t height, uint32_t flags)
 {
+    if (!width || !height || width > 0xFFFFU || height > 0xFFFFU)
+        return 0;
+
     uint64_t size = (uint64_t)width * height * 4;
     uint32_t handle = shm_create(size, flags);
     if (handle) {
@@ -308,10 +309,14 @@ uint32_t shm_create_surface(uint32_t width, uint32_t height, uint32_t flags)
         }
     }
 
-    if (handle && (flags & 4)) { /* SHM_FLAG_GPU_SCANOUT */
-        shm_set_owner(handle, shm_surface_owner_pid);
+    if (handle && (flags & SHM_FLAG_GPU_SCANOUT)) {
+        uint32_t owner_pid = proc_exec_pid();
+        const char *title = proc_current_name();
+        if (!title || !*title)
+            title = "Application";
+        shm_set_owner(handle, owner_pid);
         uint32_t wid = compositor_create_window(handle, 0, 0, width, height,
-                                                shm_surface_owner_pid, "Doom");
+                                                owner_pid, title);
         if (wid)
             compositor_set_fullscreen(wid, true);
     }

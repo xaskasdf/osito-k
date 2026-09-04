@@ -107,7 +107,7 @@ isr_common:
      * preserved verbatim so the retried instruction uses the right values.
      * If the handler decides to context-switch, it
      * rewrites `fpu_state_ptr` to the incoming process's slot via
-     * `set_current_proc`, and the xrstor64 on exit pulls the *new*
+     * `set_current_proc`, and the matching restore pulls the *new*
      * process's state into the FPU — atomic with the GPR swap a few
      * instructions below. For the boot window before any process exists,
      * `fpu_state_ptr` points at the kernel-default buffer in process.c. */
@@ -120,9 +120,14 @@ isr_common:
     jz     .Lfxsave_done
     test   $0x3F, %rcx
     jnz    .Lfxsave_done
+    cmpl   $0, cpu_xsave_active(%rip)
+    je     .Luse_fxsave
     movl   $0x7, %eax
     xorl   %edx, %edx
     xsave64 (%rcx)
+    jmp    .Lfxsave_done
+.Luse_fxsave:
+    fxsave64 (%rcx)
 .Lfxsave_done:
     pop    %rcx
 
@@ -159,9 +164,14 @@ isr_common:
     jz     .Lskip_fxrstor
     test   $0x3F, %rcx
     jnz    .Lskip_fxrstor
+    cmpl   $0, cpu_xsave_active(%rip)
+    je     .Luse_fxrstor
     movl   $0x7, %eax
     xorl   %edx, %edx
     xrstor64 (%rcx)
+    jmp    .Lskip_fxrstor
+.Luse_fxrstor:
+    fxrstor64 (%rcx)
 .Lskip_fxrstor:
     pop    %rcx
 

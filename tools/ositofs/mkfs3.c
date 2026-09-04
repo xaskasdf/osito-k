@@ -22,9 +22,11 @@ static uint32_t recommended_inode_count(uint32_t total_blocks)
     if (inodes < OSFS3_DEFAULT_INODES) inodes = OSFS3_DEFAULT_INODES;
     if (inodes > OSFS3_MAX_INODES) inodes = OSFS3_MAX_INODES;
 
-    while (inodes > 2U &&
+    inodes -= inodes % OSFS3_INODES_PER_BLOCK;
+    while (inodes >= OSFS3_INODES_PER_BLOCK &&
            OSFS3_FIRST_DATA_BLOCK(inodes) + 1U >= total_blocks)
-        inodes /= 2U;
+        inodes -= OSFS3_INODES_PER_BLOCK;
+
     return inodes;
 }
 
@@ -65,9 +67,17 @@ int main(int argc, char **argv)
     uint32_t first_data = OSFS3_FIRST_DATA_BLOCK(total_inodes);
     uint32_t root_block = first_data;
     if ((device_size >> OSFS3_BLOCK_SHIFT) > OSFS3_BITMAP_BITS ||
-        total_inodes < 2U || total_inodes > OSFS3_MAX_INODES ||
+        !osfs3_valid_inode_count(total_inodes) ||
         total_blocks <= root_block) {
-        fprintf(stderr, "mkfs.ositofs3: unsupported device size\n");
+        if (requested_inodes && !osfs3_valid_inode_count(total_inodes)) {
+            fprintf(stderr,
+                    "mkfs.ositofs3: inode count must be a multiple of %u "
+                    "between %u and %u\n",
+                    OSFS3_INODES_PER_BLOCK, OSFS3_INODES_PER_BLOCK,
+                    OSFS3_MAX_INODES);
+        } else {
+            fprintf(stderr, "mkfs.ositofs3: unsupported device size\n");
+        }
         osfs3_close_device(fd);
         return 1;
     }
@@ -125,6 +135,8 @@ int main(int argc, char **argv)
             root->nlink = 2;
             root->size = OSFS3_BLOCK_SIZE;
             root->atime = root->mtime = root->ctime = super.create_time;
+            root->birth_time = root->ctime;
+            root->flags |= OSFS3_INODE_FLAG_BTIME_VALID;
             root->extent_count = 1;
             root->extents[0].start_block = root_block;
             root->extents[0].block_count = 1;

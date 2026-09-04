@@ -7,6 +7,7 @@
  */
 
 #include "hda.h"
+#include "paging.h"
 
 /* ── External Declarations ─────────────────────────────────────── */
 
@@ -21,11 +22,22 @@ extern void *memcpy(void *dst, const void *src, size_t n);
 
 /* ── Driver State ──────────────────────────────────────────────── */
 
+#define HDA_MAX_CODEC_NODES 128U
+#define HDA_MAX_ROUTE_NODES 16U
+
+typedef struct {
+    uint8_t nid;
+    uint8_t connection_index;
+    uint8_t connection_count;
+} hda_route_step_t;
+
 typedef struct {
     volatile void *bar0;
 
     /* CORB/RIRB */
+    uint64_t  corb_phys;
     uint32_t *corb;
+    uint64_t  rirb_phys;
     uint64_t *rirb;
     uint16_t  corb_wp;
     uint16_t  rirb_rp;
@@ -37,6 +49,14 @@ typedef struct {
     uint8_t   afg_nid;
     uint8_t   dac_nid;
     uint8_t   pin_nid;
+    uint16_t  widget_start;
+    uint16_t  widget_count;
+    uint32_t  widget_caps[HDA_MAX_CODEC_NODES];
+    uint8_t   widget_valid[HDA_MAX_CODEC_NODES];
+    uint32_t  pin_caps;
+    uint32_t  pin_config;
+    hda_route_step_t route[HDA_MAX_ROUTE_NODES];
+    uint8_t   route_len;
 
     /* Stream */
     uint32_t  out_stream_off;
@@ -50,9 +70,14 @@ typedef struct {
     uint16_t  fmt_reg;
 
     /* DMA */
+    uint64_t  bdl_phys;
     hda_bdl_entry_t *bdl;
+    uint64_t  audio_buf_phys;
     int16_t  *audio_buf;
     uint32_t  buf_size;
+    uint32_t  block_bytes;
+    uint32_t  stream_faults;
+    uint32_t  stream_start_failures;
 
     bool      initialized;
     bool      playing;
@@ -81,9 +106,95 @@ static inline void hda_write32(uint32_t off, uint32_t val) {
     mmio_write32((volatile void *)((uint64_t)hda.bar0 + off), val);
 }
 
+static uint32_t hda_stream_ctl_read(uint32_t stream)
+{
+    return hda_read16(stream + HDA_SD_CTL) |
+           ((uint32_t)hda_read8(stream + HDA_SD_CTL + 2U) << 16);
+}
+
+static void hda_stream_ctl_write(uint32_t stream, uint32_t value)
+{
+    hda_write16(stream + HDA_SD_CTL, (uint16_t)value);
+    hda_write8(stream + HDA_SD_CTL + 2U, (uint8_t)(value >> 16));
+}
+
+static bool hda_log_event(uint32_t count)
+{
+    return count <= 4U || (count & (count - 1U)) == 0;
+}
+
+static void hda_report_stream_fault(uint8_t status, uint32_t control,
+                                    uint32_t position)
+{
+    uint32_t count = ++hda.stream_faults;
+    if (!hda_log_event(count))
+        return;
+
+    serial_puts("[HDA] output stream stalled; rearming (status=");
+    serial_puthex(status, 2);
+    serial_puts(" control=");
+    serial_puthex(control, 6);
+    serial_puts(" position=");
+    serial_putdec(position);
+    serial_puts(", fault=");
+    serial_putdec(count);
+    serial_puts(")\n");
+}
+
+static void hda_report_stream_start_failure(uint8_t status,
+                                            uint32_t control)
+{
+    uint32_t count = ++hda.stream_start_failures;
+    if (!hda_log_event(count))
+        return;
+
+    serial_puts("[HDA] output stream failed to start (status=");
+    serial_puthex(status, 2);
+    serial_puts(" control=");
+    serial_puthex(control, 6);
+    serial_puts(", failure=");
+    serial_putdec(count);
+    serial_puts("); retrying on next block\n");
+}
+
 static inline void spin_delay(uint32_t iters) {
     for (volatile uint32_t i = 0; i < iters; i++)
         __asm__ volatile ("pause");
+}
+
+static int hda_stream_reset(uint32_t stream)
+{
+    uint32_t ctl = hda_stream_ctl_read(stream) & ~HDA_SD_CTL_RUN;
+    hda_stream_ctl_write(stream, ctl);
+    for (uint32_t i = 0; i < 10000U; i++) {
+        if (!(hda_stream_ctl_read(stream) & HDA_SD_CTL_RUN))
+            break;
+        spin_delay(100);
+    }
+    if (hda_stream_ctl_read(stream) & HDA_SD_CTL_RUN) {
+        serial_puts("[HDA] Stream failed to stop\n");
+        return -1;
+    }
+
+    hda_stream_ctl_write(stream, ctl | HDA_SD_CTL_SRST);
+    for (uint32_t i = 0; i < 10000U; i++) {
+        if (hda_stream_ctl_read(stream) & HDA_SD_CTL_SRST)
+            break;
+        spin_delay(100);
+    }
+    if (!(hda_stream_ctl_read(stream) & HDA_SD_CTL_SRST)) {
+        serial_puts("[HDA] Stream reset assertion timed out\n");
+        return -1;
+    }
+
+    hda_stream_ctl_write(stream, ctl & ~HDA_SD_CTL_SRST);
+    for (uint32_t i = 0; i < 10000U; i++) {
+        if (!(hda_stream_ctl_read(stream) & HDA_SD_CTL_SRST))
+            return 0;
+        spin_delay(100);
+    }
+    serial_puts("[HDA] Stream reset deassertion timed out\n");
+    return -1;
 }
 
 /* ── CORB/RIRB Init ───────────────────────────────────────────── */
@@ -91,13 +202,17 @@ static inline void spin_delay(uint32_t iters) {
 static int hda_corb_rirb_init(void)
 {
     /* Allocate CORB: 256 entries x 4 bytes = 1KB */
-    hda.corb = (uint32_t *)mem_alloc_aligned(HDA_CORB_ENTRIES * 4, 4096);
-    if (!hda.corb) return -1;
+    hda.corb_phys = (uint64_t)(uintptr_t)mem_alloc_aligned(
+        HDA_CORB_ENTRIES * 4, 4096);
+    if (!hda.corb_phys) return -1;
+    hda.corb = (uint32_t *)PHYS_TO_VIRT(hda.corb_phys);
     memset(hda.corb, 0, HDA_CORB_ENTRIES * 4);
 
     /* Allocate RIRB: 256 entries x 8 bytes = 2KB */
-    hda.rirb = (uint64_t *)mem_alloc_aligned(HDA_RIRB_ENTRIES * 8, 4096);
-    if (!hda.rirb) return -1;
+    hda.rirb_phys = (uint64_t)(uintptr_t)mem_alloc_aligned(
+        HDA_RIRB_ENTRIES * 8, 4096);
+    if (!hda.rirb_phys) return -1;
+    hda.rirb = (uint64_t *)PHYS_TO_VIRT(hda.rirb_phys);
     memset(hda.rirb, 0, HDA_RIRB_ENTRIES * 8);
 
     /* Stop CORB/RIRB if running */
@@ -114,8 +229,8 @@ static int hda_corb_rirb_init(void)
         hda_write8(HDA_CORBSIZE, (corbsize & 0xFC) | 0x01);
 
     /* Set CORB base address */
-    hda_write32(HDA_CORBLBASE, (uint32_t)(uint64_t)hda.corb);
-    hda_write32(HDA_CORBUBASE, (uint32_t)((uint64_t)hda.corb >> 32));
+    hda_write32(HDA_CORBLBASE, (uint32_t)hda.corb_phys);
+    hda_write32(HDA_CORBUBASE, (uint32_t)(hda.corb_phys >> 32));
 
     /* Reset CORB read pointer: set bit 15, wait, clear, wait */
     hda_write16(HDA_CORBRP, (1 << 15));
@@ -142,8 +257,8 @@ static int hda_corb_rirb_init(void)
         hda_write8(HDA_RIRBSIZE, (rirbsize & 0xFC) | 0x01);
 
     /* Set RIRB base address */
-    hda_write32(HDA_RIRBLBASE, (uint32_t)(uint64_t)hda.rirb);
-    hda_write32(HDA_RIRBUBASE, (uint32_t)((uint64_t)hda.rirb >> 32));
+    hda_write32(HDA_RIRBLBASE, (uint32_t)hda.rirb_phys);
+    hda_write32(HDA_RIRBUBASE, (uint32_t)(hda.rirb_phys >> 32));
 
     /* Reset RIRB write pointer */
     hda_write16(HDA_RIRBWP, (1 << 15));
@@ -225,25 +340,309 @@ static int hda_send_verb(uint32_t verb, uint32_t *response)
  * 4-bit verbs:  verb=0x200/0x300 etc, parm=16-bit.
  * Encoding: (CAd << 28) | (NID << 20) | (verb << 8) | parm
  */
-static uint32_t hda_cmd(uint8_t nid, uint32_t verb, uint32_t parm)
+static int hda_cmd_exec(uint8_t nid, uint32_t verb, uint32_t parm,
+                        uint32_t *response)
 {
     uint32_t cmd = ((uint32_t)hda.codec_addr << 28) |
                    ((uint32_t)nid << 20) |
                    ((verb & 0xFFF) << 8) |
                    (parm & 0xFFFF);
-    uint32_t resp = 0;
-    hda_send_verb(cmd, &resp);
-    return resp;
+    return hda_send_verb(cmd, response);
 }
 
-static void hda_detect_format(void);
+static int hda_detect_format(void);
 
 /* ── Codec Discovery ───────────────────────────────────────────── */
+
+static int hda_get_subnodes(uint8_t nid, uint16_t *start_out,
+                            uint16_t *count_out)
+{
+    uint32_t response;
+    if (hda_cmd_exec(nid, HDA_VERB_GET_PARAM, HDA_PARAM_NODE_COUNT,
+                     &response) < 0)
+        return -1;
+
+    uint16_t start = (uint16_t)((response >> 16) & 0x7FFFU);
+    uint16_t count = (uint16_t)(response & 0x7FFFU);
+    if (!count || start >= HDA_MAX_CODEC_NODES ||
+        count > HDA_MAX_CODEC_NODES ||
+        (uint32_t)start + count > HDA_MAX_CODEC_NODES)
+        return -1;
+
+    *start_out = start;
+    *count_out = count;
+    return 0;
+}
+
+static bool hda_widget_is_valid(uint8_t nid)
+{
+    uint16_t value = nid;
+    return value >= hda.widget_start &&
+           value < hda.widget_start + hda.widget_count &&
+           hda.widget_valid[nid] != 0;
+}
+
+static uint8_t hda_widget_type(uint8_t nid)
+{
+    return (uint8_t)((hda.widget_caps[nid] >> 20) & 0x0FU);
+}
+
+static int hda_read_format_caps(uint8_t nid, uint32_t *pcm_out,
+                                uint32_t *formats_out)
+{
+    uint8_t caps_nid = nid;
+    if (nid != hda.afg_nid &&
+        (!(hda.widget_caps[nid] & HDA_WCAP_FORMAT_OVRD)))
+        caps_nid = hda.afg_nid;
+
+    uint32_t pcm;
+    uint32_t formats;
+    if (hda_cmd_exec(caps_nid, HDA_VERB_GET_PARAM, HDA_PARAM_PCM_RATES,
+                     &pcm) < 0 ||
+        hda_cmd_exec(caps_nid, HDA_VERB_GET_PARAM, HDA_PARAM_STREAM_FMTS,
+                     &formats) < 0)
+        return -1;
+
+    *pcm_out = pcm;
+    *formats_out = formats;
+    return 0;
+}
+
+static bool hda_dac_supports_output(uint8_t nid)
+{
+    uint32_t pcm;
+    uint32_t formats;
+    uint32_t wcaps = hda.widget_caps[nid];
+
+    if (hda_widget_type(nid) != HDA_WIDGET_AUD_OUT ||
+        !(wcaps & HDA_WCAP_STEREO) || (wcaps & HDA_WCAP_DIGITAL) ||
+        hda_read_format_caps(nid, &pcm, &formats) < 0)
+        return false;
+
+    return (formats & HDA_STREAM_FMT_PCM) &&
+           (pcm & HDA_RATE_48KHZ) && (pcm & HDA_BITS_16);
+}
+
+static int hda_get_connections(uint8_t nid, uint8_t *connections,
+                               uint32_t capacity)
+{
+    uint32_t list_info;
+    if (!(hda.widget_caps[nid] & HDA_WCAP_CONN_LIST))
+        return 0;
+    if (hda_cmd_exec(nid, HDA_VERB_GET_PARAM, HDA_PARAM_CONN_LIST_LEN,
+                     &list_info) < 0)
+        return -1;
+
+    uint32_t raw_count = HDA_CONN_LIST_LEN(list_info);
+    if (!raw_count)
+        return 0;
+
+    bool long_form = (list_info & HDA_CONN_LIST_LONG) != 0;
+    uint32_t shift = long_form ? 16U : 8U;
+    uint32_t entries_per_response = long_form ? 2U : 4U;
+    uint32_t value_mask = long_form ? 0x7FFFU : 0x7FU;
+    uint32_t range_mask = long_form ? 0x8000U : 0x80U;
+    uint32_t response = 0;
+    uint32_t expanded_count = 0;
+    uint16_t previous = 0;
+
+    for (uint32_t raw_index = 0; raw_index < raw_count; raw_index++) {
+        if ((raw_index % entries_per_response) == 0 &&
+            hda_cmd_exec(nid, HDA_VERB_GET_CONN_LIST, raw_index,
+                         &response) < 0)
+            return -1;
+
+        uint32_t entry = response & (value_mask | range_mask);
+        response >>= shift;
+        uint16_t value = (uint16_t)(entry & value_mask);
+        bool range = raw_count > 1 && (entry & range_mask) != 0;
+
+        if (!value || value >= HDA_MAX_CODEC_NODES)
+            return -1;
+
+        if (range) {
+            if (!previous || previous >= value)
+                return -1;
+            for (uint16_t expanded = previous + 1; expanded <= value;
+                 expanded++) {
+                if (expanded_count >= capacity)
+                    return -1;
+                connections[expanded_count++] = (uint8_t)expanded;
+            }
+        } else {
+            if (expanded_count >= capacity)
+                return -1;
+            connections[expanded_count++] = (uint8_t)value;
+        }
+        previous = value;
+    }
+
+    return (int)expanded_count;
+}
+
+static bool hda_find_route(uint8_t nid, uint8_t depth,
+                           uint8_t visited[HDA_MAX_CODEC_NODES],
+                           hda_route_step_t route[HDA_MAX_ROUTE_NODES],
+                           uint8_t *route_len)
+{
+    if (depth >= HDA_MAX_ROUTE_NODES || !hda_widget_is_valid(nid) ||
+        visited[nid])
+        return false;
+
+    visited[nid] = 1;
+    uint8_t type = hda_widget_type(nid);
+    route[depth].nid = nid;
+    route[depth].connection_index = 0;
+    route[depth].connection_count = 0;
+
+    if (type == HDA_WIDGET_AUD_OUT) {
+        if (hda_dac_supports_output(nid)) {
+            *route_len = depth + 1;
+            return true;
+        }
+        visited[nid] = 0;
+        return false;
+    }
+
+    if (type == HDA_WIDGET_AUD_IN ||
+        (type == HDA_WIDGET_PIN && depth != 0) ||
+        !(hda.widget_caps[nid] & HDA_WCAP_CONN_LIST) ||
+        depth + 1 >= HDA_MAX_ROUTE_NODES) {
+        visited[nid] = 0;
+        return false;
+    }
+
+    uint8_t connections[HDA_MAX_CODEC_NODES];
+    int count = hda_get_connections(nid, connections,
+                                    HDA_MAX_CODEC_NODES);
+    if (count <= 0) {
+        visited[nid] = 0;
+        return false;
+    }
+
+    for (int index = 0; index < count; index++) {
+        uint8_t next = connections[index];
+        if (!hda_widget_is_valid(next) || visited[next])
+            continue;
+        if ((hda.widget_caps[nid] & HDA_WCAP_IN_AMP) && index > 0x0F)
+            continue;
+
+        route[depth].connection_index = (uint8_t)index;
+        route[depth].connection_count = (uint8_t)count;
+        if (hda_find_route(next, depth + 1, visited, route, route_len))
+            return true;
+    }
+
+    visited[nid] = 0;
+    return false;
+}
+
+static int hda_pin_score(uint32_t wcaps, uint32_t pin_caps,
+                         uint32_t config)
+{
+    if (!(pin_caps & HDA_PINCAP_OUT) || (wcaps & HDA_WCAP_DIGITAL) ||
+        HDA_DEFCFG_PORT(config) == HDA_DEFCFG_PORT_NONE)
+        return -1;
+
+    int score;
+    switch (HDA_DEFCFG_DEVICE(config)) {
+    case HDA_DEVICE_SPEAKER:
+        score = 500;
+        break;
+    case HDA_DEVICE_LINE_OUT:
+        score = 400;
+        break;
+    case HDA_DEVICE_HEADPHONE:
+        score = 300;
+        break;
+    case HDA_DEVICE_SPDIF_OUT:
+    case HDA_DEVICE_DIGITAL_OUT:
+        return -1;
+    default:
+        score = 100;
+        break;
+    }
+
+    /* Prefer fixed/internal outputs when no jack-sense policy exists yet. */
+    if (HDA_DEFCFG_PORT(config) == 2)
+        score += 40;
+    else if (HDA_DEFCFG_PORT(config) == 3)
+        score += 30;
+    else
+        score += 20;
+    return score;
+}
+
+static int hda_select_output_route(void)
+{
+    int best_score = -1;
+    uint8_t best_len = 0;
+
+    for (uint16_t value = hda.widget_start;
+         value < hda.widget_start + hda.widget_count; value++) {
+        uint8_t nid = (uint8_t)value;
+        if (!hda.widget_valid[nid] ||
+            hda_widget_type(nid) != HDA_WIDGET_PIN)
+            continue;
+
+        uint32_t pin_caps;
+        uint32_t config;
+        if (hda_cmd_exec(nid, HDA_VERB_GET_PARAM, HDA_PARAM_PIN_CAP,
+                         &pin_caps) < 0 ||
+            hda_cmd_exec(nid, HDA_VERB_GET_CONFIG, 0, &config) < 0)
+            continue;
+
+        int score = hda_pin_score(hda.widget_caps[nid], pin_caps, config);
+        if (score < 0)
+            continue;
+
+        uint8_t visited[HDA_MAX_CODEC_NODES];
+        hda_route_step_t candidate[HDA_MAX_ROUTE_NODES];
+        uint8_t candidate_len = 0;
+        memset(visited, 0, sizeof(visited));
+        memset(candidate, 0, sizeof(candidate));
+        if (!hda_find_route(nid, 0, visited, candidate, &candidate_len))
+            continue;
+
+        if (score > best_score ||
+            (score == best_score && candidate_len < best_len)) {
+            best_score = score;
+            best_len = candidate_len;
+            hda.pin_nid = nid;
+            hda.dac_nid = candidate[candidate_len - 1].nid;
+            hda.pin_caps = pin_caps;
+            hda.pin_config = config;
+            hda.route_len = candidate_len;
+            memcpy(hda.route, candidate,
+                   candidate_len * sizeof(candidate[0]));
+        }
+    }
+
+    if (best_score < 0) {
+        serial_puts("[HDA] No connected analog PCM output route\n");
+        return -1;
+    }
+
+    serial_puts("[HDA] Output route: ");
+    for (uint8_t index = hda.route_len; index > 0; index--) {
+        serial_puts("NID ");
+        serial_putdec(hda.route[index - 1].nid);
+        if (index > 1)
+            serial_puts(" -> ");
+    }
+    serial_puts(" (DAC to pin)\n");
+    return 0;
+}
 
 static int hda_codec_init(void)
 {
     /* Get codec vendor/device ID from root node (NID 0) */
-    uint32_t vendor = hda_cmd(0x00, HDA_VERB_GET_PARAM, HDA_PARAM_VENDOR_ID);
+    uint32_t vendor;
+    if (hda_cmd_exec(0x00, HDA_VERB_GET_PARAM, HDA_PARAM_VENDOR_ID,
+                     &vendor) < 0) {
+        serial_puts("[HDA] Failed to read codec identity\n");
+        return -1;
+    }
     hda.codec_vendor = (vendor >> 16) & 0xFFFF;
     hda.codec_device = vendor & 0xFFFF;
 
@@ -254,14 +653,20 @@ static int hda_codec_init(void)
     serial_puts("\n");
 
     /* Get subordinate node count from root */
-    uint32_t node_count = hda_cmd(0x00, HDA_VERB_GET_PARAM, HDA_PARAM_NODE_COUNT);
-    uint8_t start_nid = (node_count >> 16) & 0xFF;
-    uint8_t num_nodes = node_count & 0xFF;
+    uint16_t start_nid;
+    uint16_t num_nodes;
+    if (hda_get_subnodes(0x00, &start_nid, &num_nodes) < 0) {
+        serial_puts("[HDA] Invalid root node range\n");
+        return -1;
+    }
 
     /* Find Audio Function Group (type 0x01) */
-    for (int i = 0; i < num_nodes; i++) {
-        uint8_t nid = start_nid + i;
-        uint32_t fgt = hda_cmd(nid, HDA_VERB_GET_PARAM, HDA_PARAM_FUNC_GRP_TYPE);
+    for (uint16_t i = 0; i < num_nodes; i++) {
+        uint8_t nid = (uint8_t)(start_nid + i);
+        uint32_t fgt;
+        if (hda_cmd_exec(nid, HDA_VERB_GET_PARAM,
+                         HDA_PARAM_FUNC_GRP_TYPE, &fgt) < 0)
+            continue;
         if ((fgt & 0xFF) == 0x01) {
             hda.afg_nid = nid;
             serial_puts("[HDA] AFG at NID ");
@@ -276,12 +681,18 @@ static int hda_codec_init(void)
     }
 
     /* Power up AFG */
-    hda_cmd(hda.afg_nid, HDA_VERB_SET_POWER, 0x00);  /* D0 */
+    if (hda_cmd_exec(hda.afg_nid, HDA_VERB_SET_POWER, 0x00, NULL) < 0) {
+        serial_puts("[HDA] Failed to power audio function group\n");
+        return -1;
+    }
 
     /* Enumerate AFG widgets */
-    node_count = hda_cmd(hda.afg_nid, HDA_VERB_GET_PARAM, HDA_PARAM_NODE_COUNT);
-    start_nid = (node_count >> 16) & 0xFF;
-    num_nodes = node_count & 0xFF;
+    if (hda_get_subnodes(hda.afg_nid, &start_nid, &num_nodes) < 0) {
+        serial_puts("[HDA] Invalid widget node range\n");
+        return -1;
+    }
+    hda.widget_start = start_nid;
+    hda.widget_count = num_nodes;
 
     serial_puts("[HDA] Widgets: ");
     serial_putdec(num_nodes);
@@ -291,46 +702,35 @@ static int hda_codec_init(void)
     serial_putdec(start_nid + num_nodes - 1);
     serial_puts(")\n");
 
-    /* Walk widgets: find first DAC and first output-capable pin */
-    for (int i = 0; i < num_nodes; i++) {
-        uint8_t nid = start_nid + i;
-        uint32_t wcap = hda_cmd(nid, HDA_VERB_GET_PARAM, HDA_PARAM_AUDIO_WIDGET);
-        uint8_t wtype = (wcap >> 20) & 0xF;
-
-        if (wtype == HDA_WIDGET_AUD_OUT && hda.dac_nid == 0) {
-            hda.dac_nid = nid;
-            serial_puts("[HDA] DAC at NID ");
-            serial_putdec(nid);
-            serial_puts("\n");
-        }
-
-        if (wtype == HDA_WIDGET_PIN && hda.pin_nid == 0) {
-            uint32_t pincap = hda_cmd(nid, HDA_VERB_GET_PARAM, HDA_PARAM_PIN_CAP);
-            if (pincap & (1 << 4)) {  /* Output capable */
-                hda.pin_nid = nid;
-                serial_puts("[HDA] Output pin at NID ");
-                serial_putdec(nid);
-                serial_puts("\n");
-            }
-        }
+    for (uint16_t i = 0; i < num_nodes; i++) {
+        uint8_t nid = (uint8_t)(start_nid + i);
+        uint32_t wcaps;
+        if (hda_cmd_exec(nid, HDA_VERB_GET_PARAM,
+                         HDA_PARAM_AUDIO_WIDGET, &wcaps) < 0)
+            continue;
+        hda.widget_caps[nid] = wcaps;
+        hda.widget_valid[nid] = 1;
     }
 
-    if (hda.dac_nid == 0 || hda.pin_nid == 0) {
-        serial_puts("[HDA] Missing DAC or output pin\n");
+    if (hda_select_output_route() < 0)
         return -1;
-    }
 
-    /* Detect best format from DAC capabilities */
-    hda_detect_format();
+    if (hda_detect_format() < 0)
+        return -1;
 
     return 0;
 }
 
 /* ── Format Auto-Detection ─────────────────────────────────────── */
 
-static void hda_detect_format(void)
+static int hda_detect_format(void)
 {
-    uint32_t pcm = hda_cmd(hda.dac_nid, HDA_VERB_GET_PARAM, HDA_PARAM_PCM_RATES);
+    uint32_t pcm;
+    uint32_t formats;
+    if (hda_read_format_caps(hda.dac_nid, &pcm, &formats) < 0) {
+        serial_puts("[HDA] Failed to read DAC format capabilities\n");
+        return -1;
+    }
 
     /* Log supported rates */
     serial_puts("[HDA] DAC rates:");
@@ -353,53 +753,17 @@ static void hda_detect_format(void)
     if (pcm & HDA_BITS_8)  serial_puts(" 8");
     serial_puts("\n");
 
-    /* Select best sample rate (prefer 48kHz family, highest first) */
-    uint16_t fmt_rate;
-    if (pcm & HDA_RATE_192KHZ) {
-        hda.sample_rate = 192000;
-        fmt_rate = HDA_FMT_BASE_48 | HDA_FMT_MUL_4;
-    } else if (pcm & HDA_RATE_96KHZ) {
-        hda.sample_rate = 96000;
-        fmt_rate = HDA_FMT_BASE_48 | HDA_FMT_MUL_2;
-    } else if (pcm & HDA_RATE_1764KHZ) {
-        hda.sample_rate = 176400;
-        fmt_rate = HDA_FMT_BASE_441 | HDA_FMT_MUL_4;
-    } else if (pcm & HDA_RATE_882KHZ) {
-        hda.sample_rate = 88200;
-        fmt_rate = HDA_FMT_BASE_441 | HDA_FMT_MUL_2;
-    } else if (pcm & HDA_RATE_48KHZ) {
-        hda.sample_rate = 48000;
-        fmt_rate = HDA_FMT_BASE_48 | HDA_FMT_MUL_1;
-    } else if (pcm & HDA_RATE_441KHZ) {
-        hda.sample_rate = 44100;
-        fmt_rate = HDA_FMT_BASE_441 | HDA_FMT_MUL_1;
-    } else {
-        /* Fallback: assume 48kHz */
-        hda.sample_rate = 48000;
-        fmt_rate = HDA_FMT_BASE_48 | HDA_FMT_MUL_1;
+    /* The public API consumes interleaved signed PCM16 frames. Selecting a
+     * wider or faster codec format here would over-read every caller buffer. */
+    if (!(formats & HDA_STREAM_FMT_PCM) ||
+        !(pcm & HDA_RATE_48KHZ) || !(pcm & HDA_BITS_16)) {
+        serial_puts("[HDA] Codec lacks required 48kHz/16-bit PCM output\n");
+        return -1;
     }
 
-    /* Select best bit depth */
-    uint16_t fmt_bits;
-    if (pcm & HDA_BITS_32) {
-        hda.bits_per_sample = 32;
-        fmt_bits = HDA_FMT_32BIT;
-    } else if (pcm & HDA_BITS_24) {
-        hda.bits_per_sample = 24;
-        fmt_bits = HDA_FMT_24BIT;
-    } else if (pcm & HDA_BITS_20) {
-        hda.bits_per_sample = 20;
-        fmt_bits = HDA_FMT_20BIT;
-    } else if (pcm & HDA_BITS_16) {
-        hda.bits_per_sample = 16;
-        fmt_bits = HDA_FMT_16BIT;
-    } else {
-        hda.bits_per_sample = 16;
-        fmt_bits = HDA_FMT_16BIT;
-    }
-
-    /* Build FMT register: rate + bits + stereo */
-    hda.fmt_reg = fmt_rate | HDA_FMT_DIV_1 | fmt_bits | HDA_FMT_STEREO;
+    hda.sample_rate = HDA_SAMPLE_RATE;
+    hda.bits_per_sample = 16;
+    hda.fmt_reg = HDA_FMT_DEFAULT;
 
     serial_puts("[HDA] Selected: ");
     serial_putdec(hda.sample_rate / 1000);
@@ -408,6 +772,7 @@ static void hda_detect_format(void)
     serial_puts("bit stereo (FMT=0x");
     serial_puthex(hda.fmt_reg, 4);
     serial_puts(")\n");
+    return 0;
 }
 
 /* ── Stream Setup ──────────────────────────────────────────────── */
@@ -416,50 +781,54 @@ static int hda_stream_init(void)
 {
     uint32_t sd = hda.out_stream_off;
 
-    /* Stop stream if running */
-    uint32_t ctl = hda_read32(sd + HDA_SD_CTL) & 0x00FFFFFF;
-    ctl &= ~HDA_SD_CTL_RUN;
-    hda_write32(sd + HDA_SD_CTL, ctl);
-    spin_delay(200);
+    if (hda_stream_reset(sd) < 0)
+        return -1;
 
     /* Clear status bits */
     hda_write8(sd + HDA_SD_STS,
                HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE | HDA_SD_STS_DESE);
 
-    /* Allocate audio buffer: 1 second at detected rate/depth/stereo */
-    uint32_t bytes_per_sample = (hda.bits_per_sample + 7) / 8;  /* round up for 20-bit */
-    hda.buf_size = hda.sample_rate * bytes_per_sample * 2;       /* stereo */
-    hda.audio_buf = (int16_t *)mem_alloc_aligned(hda.buf_size, 4096);
-    if (!hda.audio_buf) {
+    /* Two one-second-capacity blocks allow the producer to refill the block
+     * that HDA is not currently consuming. Normal streaming uses much smaller
+     * blocks (typically 10 ms). */
+    hda.buf_size = HDA_BUF_SIZE * HDA_BDL_ENTRIES;
+    hda.audio_buf_phys = (uint64_t)(uintptr_t)mem_alloc_aligned(
+        hda.buf_size, 4096);
+    if (!hda.audio_buf_phys) {
         serial_puts("[HDA] Failed to allocate audio buffer\n");
         return -1;
     }
+    hda.audio_buf = (int16_t *)PHYS_TO_VIRT(hda.audio_buf_phys);
     memset(hda.audio_buf, 0, hda.buf_size);
 
     /* Allocate BDL (128-byte aligned per spec) */
-    hda.bdl = (hda_bdl_entry_t *)mem_alloc_aligned(
+    hda.bdl_phys = (uint64_t)(uintptr_t)mem_alloc_aligned(
         HDA_BDL_ENTRIES * sizeof(hda_bdl_entry_t), 128);
-    if (!hda.bdl) {
+    if (!hda.bdl_phys) {
         serial_puts("[HDA] Failed to allocate BDL\n");
         return -1;
     }
+    hda.bdl = (hda_bdl_entry_t *)PHYS_TO_VIRT(hda.bdl_phys);
     memset(hda.bdl, 0, HDA_BDL_ENTRIES * sizeof(hda_bdl_entry_t));
 
-    /* BDL entry 0: entire audio buffer */
-    hda.bdl[0].addr = (uint64_t)hda.audio_buf;
-    hda.bdl[0].length = hda.buf_size;
-    hda.bdl[0].ioc = 1;
+    uint32_t initial_block = hda.buf_size / HDA_BDL_ENTRIES;
+    for (uint32_t i = 0; i < HDA_BDL_ENTRIES; i++) {
+        hda.bdl[i].addr = hda.audio_buf_phys +
+                          (uint64_t)i * initial_block;
+        hda.bdl[i].length = initial_block;
+        hda.bdl[i].ioc = 0;
+    }
 
     /* Configure stream descriptor */
-    ctl = (uint32_t)hda.stream_id << 20;  /* Stream tag in bits 23:20 */
-    hda_write32(sd + HDA_SD_CTL, ctl);
+    uint32_t ctl = (uint32_t)hda.stream_id << 20;
+    hda_stream_ctl_write(sd, ctl);
 
     hda_write32(sd + HDA_SD_CBL, hda.buf_size);
-    hda_write16(sd + HDA_SD_LVI, 0);  /* 1 BDL entry: LVI = 0 */
+    hda_write16(sd + HDA_SD_LVI, HDA_BDL_ENTRIES - 1);
     hda_write16(sd + HDA_SD_FMT, hda.fmt_reg);
 
-    hda_write32(sd + HDA_SD_BDLPL, (uint32_t)(uint64_t)hda.bdl);
-    hda_write32(sd + HDA_SD_BDLPU, (uint32_t)((uint64_t)hda.bdl >> 32));
+    hda_write32(sd + HDA_SD_BDLPL, (uint32_t)hda.bdl_phys);
+    hda_write32(sd + HDA_SD_BDLPU, (uint32_t)(hda.bdl_phys >> 32));
 
     serial_puts("[HDA] Stream configured (");
     serial_putdec(hda.sample_rate / 1000);
@@ -473,36 +842,91 @@ static int hda_stream_init(void)
 
 /* ── Output Pipeline ───────────────────────────────────────────── */
 
-static void hda_setup_output(void)
+static int hda_unmute_amp(uint8_t nid, bool input, uint8_t index)
 {
+    uint32_t wcaps = hda.widget_caps[nid];
+    uint32_t required_cap = input ? HDA_WCAP_IN_AMP : HDA_WCAP_OUT_AMP;
+    if (!(wcaps & required_cap))
+        return 0;
+
+    uint8_t cap_nid = (wcaps & HDA_WCAP_AMP_OVRD) ? nid : hda.afg_nid;
+    uint32_t amp_caps;
+    if (hda_cmd_exec(cap_nid, HDA_VERB_GET_PARAM,
+                     input ? HDA_PARAM_AMP_IN_CAP : HDA_PARAM_AMP_OUT_CAP,
+                     &amp_caps) < 0)
+        return -1;
+
+    uint8_t zero_db = (uint8_t)(amp_caps & 0x7FU);
+    uint8_t steps = (uint8_t)((amp_caps >> 8) & 0x7FU);
+    if (zero_db > steps)
+        zero_db = steps;
+
+    uint32_t payload = HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT |
+                       HDA_AMP_GAIN(zero_db);
+    if (input)
+        payload |= HDA_AMP_SET_IN | HDA_AMP_INDEX(index);
+    else
+        payload |= HDA_AMP_SET_OUT;
+
+    return hda_cmd_exec(nid, HDA_VERB_SET_AMP, payload, NULL);
+}
+
+static int hda_setup_output(void)
+{
+    /* Power the selected path from converter to pin. */
+    for (uint8_t index = hda.route_len; index > 0; index--) {
+        uint8_t nid = hda.route[index - 1].nid;
+        if ((hda.widget_caps[nid] & HDA_WCAP_POWER) &&
+            hda_cmd_exec(nid, HDA_VERB_SET_POWER, 0x00, NULL) < 0)
+            return -1;
+    }
+    spin_delay(1000);
+
+    /* Program each downstream widget to consume the next route node. */
+    for (uint8_t index = 0; index + 1 < hda.route_len; index++) {
+        hda_route_step_t *step = &hda.route[index];
+        if (step->connection_count > 1 &&
+            hda_widget_type(step->nid) != HDA_WIDGET_AUD_MIX &&
+            hda_cmd_exec(step->nid, HDA_VERB_SET_CONN_SEL,
+                         step->connection_index, NULL) < 0)
+            return -1;
+        if (hda_unmute_amp(step->nid, true,
+                           step->connection_index) < 0)
+            return -1;
+    }
+
     /* Configure DAC converter: stream ID + channel 0 */
-    hda_cmd(hda.dac_nid, HDA_VERB_SET_CONV_CTRL,
-            (hda.stream_id << 4) | 0);
+    if (hda_cmd_exec(hda.dac_nid, HDA_VERB_SET_CONV_CTRL,
+                     hda.stream_id << 4, NULL) < 0)
+        return -1;
 
     /* Set DAC format to match stream */
-    hda_cmd(hda.dac_nid, HDA_VERB_SET_STREAM_FMT, hda.fmt_reg);
-
-    /* Power up DAC */
-    hda_cmd(hda.dac_nid, HDA_VERB_SET_POWER, 0x00);
+    if (hda_cmd_exec(hda.dac_nid, HDA_VERB_SET_STREAM_FMT,
+                     hda.fmt_reg, NULL) < 0)
+        return -1;
 
     /* Enable output on pin */
-    hda_cmd(hda.pin_nid, HDA_VERB_SET_PIN_CTRL, HDA_PIN_OUT_EN);
+    uint32_t pin_control = HDA_PIN_OUT_EN;
+    if (HDA_DEFCFG_DEVICE(hda.pin_config) == HDA_DEVICE_HEADPHONE &&
+        (hda.pin_caps & HDA_PINCAP_HP_DRV))
+        pin_control |= HDA_PIN_HP_EN;
+    if (hda_cmd_exec(hda.pin_nid, HDA_VERB_SET_PIN_CTRL,
+                     pin_control, NULL) < 0)
+        return -1;
 
-    /* Power up pin */
-    hda_cmd(hda.pin_nid, HDA_VERB_SET_POWER, 0x00);
-
-    /* Unmute DAC output amp: output + left + right + max gain */
-    hda_cmd(hda.dac_nid, HDA_VERB_SET_AMP,
-            HDA_AMP_SET_OUT | HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT |
-            HDA_AMP_GAIN(0x7F));
-
-    /* Unmute pin output amp */
-    hda_cmd(hda.pin_nid, HDA_VERB_SET_AMP,
-            HDA_AMP_SET_OUT | HDA_AMP_SET_LEFT | HDA_AMP_SET_RIGHT |
-            HDA_AMP_GAIN(0x7F));
+    for (uint8_t index = hda.route_len; index > 0; index--) {
+        if (hda_unmute_amp(hda.route[index - 1].nid, false, 0) < 0)
+            return -1;
+    }
 
     /* Enable EAPD (external amplifier) if supported */
-    hda_cmd(hda.pin_nid, HDA_VERB_SET_EAPD, 0x02);
+    if ((hda.pin_caps & HDA_PINCAP_EAPD) &&
+        hda_cmd_exec(hda.pin_nid, HDA_VERB_SET_EAPD,
+                     HDA_EAPD_ENABLE, NULL) < 0)
+        return -1;
+
+    serial_puts("[HDA] Output route configured\n");
+    return 0;
 }
 
 /* ── Sine Wave Table ───────────────────────────────────────────── */
@@ -551,7 +975,7 @@ static const int16_t sine_table[256] = {
 int hda_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
 {
     memset(&hda, 0, sizeof(hda));
-    hda.bar0 = (volatile void *)bar0_phys;
+    hda.bar0 = (volatile void *)PHYS_TO_VIRT(bar0_phys);
 
     /* Enable PCI bus master + memory space */
     pci_enable_bus_master(bus, dev, func);
@@ -638,37 +1062,76 @@ int hda_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     if (hda_corb_rirb_init() < 0) return -1;
     if (hda_codec_init() < 0) return -1;
     if (hda_stream_init() < 0) return -1;
+    if (hda_setup_output() < 0) {
+        serial_puts("[HDA] Failed to configure codec output route\n");
+        return -1;
+    }
 
     hda.initialized = true;
     serial_puts("[HDA] Audio initialized OK\n");
     return 0;
 }
 
-void hda_play_buffer(const int16_t *samples, uint32_t num_samples)
+void hda_play_buffer(const int16_t *samples, uint32_t num_frames)
 {
-    if (!hda.initialized) return;
+    if (!hda.initialized || !samples || !num_frames) return;
 
-    uint32_t bps = (hda.bits_per_sample + 7) / 8;  /* bytes per sample */
-    uint32_t bytes = num_samples * bps * 2;         /* stereo */
-    if (bytes > hda.buf_size) bytes = hda.buf_size;
+    uint32_t sd = hda.out_stream_off;
+    uint32_t max_block = hda.buf_size / HDA_BDL_ENTRIES;
+    uint32_t max_frames = max_block / (sizeof(int16_t) * 2);
+    if (num_frames > max_frames)
+        num_frames = max_frames;
+    uint32_t bytes = num_frames * sizeof(int16_t) * 2;
 
-    /* Copy samples to DMA buffer */
+    if (hda.playing) {
+        uint8_t status = hda_read8(sd + HDA_SD_STS);
+        uint32_t control = hda_stream_ctl_read(sd);
+        uint32_t position = hda_read32(sd + HDA_SD_LPIB);
+        uint8_t errors = status & (HDA_SD_STS_FIFOE | HDA_SD_STS_DESE);
+
+        /* Both stream errors stop DMA. RUN can also disappear without a
+         * latched status bit after controller-level recovery. Never keep
+         * feeding a software-only notion of a running stream. */
+        if (errors || !(control & HDA_SD_CTL_RUN)) {
+            hda_report_stream_fault(status, control, position);
+            if (status & (HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE |
+                          HDA_SD_STS_DESE)) {
+                hda_write8(sd + HDA_SD_STS,
+                           status & (HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE |
+                                     HDA_SD_STS_DESE));
+            }
+            hda.playing = false;
+            hda.block_bytes = 0;
+        }
+    }
+
+    if (hda.playing && hda.block_bytes == bytes) {
+        uint32_t position = hda_read32(sd + HDA_SD_LPIB);
+        uint32_t current_slot = position >= bytes ? 1U : 0U;
+        uint32_t target_slot = current_slot ^ 1U;
+        memcpy((uint8_t *)hda.audio_buf + target_slot * bytes,
+               samples, bytes);
+        wmb();
+        return;
+    }
+
+    uint32_t ctl = hda_stream_ctl_read(sd);
+    ctl &= ~HDA_SD_CTL_RUN;
+    hda_stream_ctl_write(sd, ctl);
+    spin_delay(200);
+
     memcpy(hda.audio_buf, samples, bytes);
-    if (bytes < hda.buf_size)
-        memset((uint8_t *)hda.audio_buf + bytes, 0, hda.buf_size - bytes);
-
+    memcpy((uint8_t *)hda.audio_buf + bytes, samples, bytes);
     wmb();
 
-    /* Update BDL and CBL for actual size */
-    uint32_t sd = hda.out_stream_off;
-    hda.bdl[0].length = bytes;
-    hda_write32(sd + HDA_SD_CBL, bytes);
-
-    /* Stop stream before reconfiguring */
-    uint32_t ctl = hda_read32(sd + HDA_SD_CTL) & 0x00FFFFFF;
-    ctl &= ~HDA_SD_CTL_RUN;
-    hda_write32(sd + HDA_SD_CTL, ctl);
-    spin_delay(200);
+    for (uint32_t i = 0; i < HDA_BDL_ENTRIES; i++) {
+        hda.bdl[i].addr = hda.audio_buf_phys + (uint64_t)i * bytes;
+        hda.bdl[i].length = bytes;
+        hda.bdl[i].ioc = 0;
+    }
+    hda.block_bytes = bytes;
+    hda_write32(sd + HDA_SD_CBL, bytes * HDA_BDL_ENTRIES);
+    hda_write16(sd + HDA_SD_LVI, HDA_BDL_ENTRIES - 1);
 
     /* Clear status */
     hda_write8(sd + HDA_SD_STS,
@@ -676,18 +1139,23 @@ void hda_play_buffer(const int16_t *samples, uint32_t num_samples)
 
     /* Set stream tag */
     ctl = (uint32_t)hda.stream_id << 20;
-    hda_write32(sd + HDA_SD_CTL, ctl);
+    hda_stream_ctl_write(sd, ctl);
 
     /* Re-set format (some controllers need this after stop) */
     hda_write16(sd + HDA_SD_FMT, hda.fmt_reg);
 
-    /* Configure codec output pipeline */
-    hda_setup_output();
-
     /* Start stream */
-    ctl = hda_read32(sd + HDA_SD_CTL) & 0x00FFFFFF;
+    ctl = hda_stream_ctl_read(sd);
     ctl |= HDA_SD_CTL_RUN;
-    hda_write32(sd + HDA_SD_CTL, ctl);
+    hda_stream_ctl_write(sd, ctl);
+
+    ctl = hda_stream_ctl_read(sd);
+    if (!(ctl & HDA_SD_CTL_RUN)) {
+        hda.playing = false;
+        hda.block_bytes = 0;
+        hda_report_stream_start_failure(hda_read8(sd + HDA_SD_STS), ctl);
+        return;
+    }
 
     hda.playing = true;
 }
@@ -745,10 +1213,11 @@ void hda_stop(void)
     if (!hda.initialized) return;
 
     uint32_t sd = hda.out_stream_off;
-    uint32_t ctl = hda_read32(sd + HDA_SD_CTL) & 0x00FFFFFF;
+    uint32_t ctl = hda_stream_ctl_read(sd);
     ctl &= ~HDA_SD_CTL_RUN;
-    hda_write32(sd + HDA_SD_CTL, ctl);
+    hda_stream_ctl_write(sd, ctl);
     hda.playing = false;
+    hda.block_bytes = 0;
 }
 
 bool hda_is_ready(void)

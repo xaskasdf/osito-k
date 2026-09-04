@@ -14,7 +14,18 @@ extern void serial_putchar(char c);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void WINAPI SetLastError(DWORD error);
+extern DWORD WINAPI GetCurrentThreadId(void);
 extern ULONG_PTR win32_current_image_base(void);
+extern NTSTATUS win32_publish_loader_image(PPE_IMAGE_INFO info,
+                                           const char *image_name,
+                                           BOOL system_module);
+extern void win32_unpublish_loader_image(ULONG process_id, PVOID image_base);
+extern void win32_update_loader_image_reference(ULONG process_id,
+                                                PVOID image_base,
+                                                ULONG references,
+                                                BOOL pinned);
+extern void win32_set_loader_lock_state(ULONG process_id, DWORD thread_id,
+                                        unsigned depth);
 
 static void dump_seh_chain(const char *label)
 {
@@ -88,35 +99,6 @@ static const char *strip_path(const char *name)
     return last;
 }
 
-#define LIBCEF_PROBE_RVA         0x0355CA10UL
-#define LIBCEF_PROBE_FILE_OFFSET 0x0355C010UL
-#define LIBCEF_PROBE_SIZE        16UL
-
-static BOOL dl_is_libcef(const char *name)
-{
-    return name && dl_stricmp(strip_path(name), "libcef.dll") == 0;
-}
-
-static void dl_probe_libcef_bytes(const char *stage, const BYTE *bytes,
-                                  SIZE_T size, SIZE_T offset)
-{
-    if (!bytes || offset > size || LIBCEF_PROBE_SIZE > size - offset) {
-        serial_puts("[LIBCEF-PROBE] ");
-        serial_puts(stage);
-        serial_puts(" unavailable\n");
-        return;
-    }
-
-    serial_puts("[LIBCEF-PROBE] ");
-    serial_puts(stage);
-    serial_puts(" bytes=");
-    for (SIZE_T i = 0; i < LIBCEF_PROBE_SIZE; i++) {
-        serial_puthex(bytes[offset + i], 2);
-        if (i + 1 < LIBCEF_PROBE_SIZE) serial_putchar(' ');
-    }
-    serial_puts("\n");
-}
-
 /* Return 32 or 64 for a valid x86 PE header, and 0 for malformed/unsupported
  * input. This preflight runs before mapping so a cross-ABI DLL cannot reach
  * relocation, IAT, or TLS setup. */
@@ -159,112 +141,9 @@ int dll_current_process_bitness(void)
 /* ── Module table ──────────────────────────────────────────── */
 
 #define DLL_PTE_PRESENT   (1ULL << 0)
-#define DLL_PTE_WRITABLE  (1ULL << 1)
-#define DLL_PTE_GLOBAL    (1ULL << 8)
 #define DLL_PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
-extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
-extern int paging_set_flags(uint64_t virt, uint64_t flags);
 extern uint64_t *paging_get_pte(uint64_t virt);
-
-static BOOL dl_section_is_text(const IMAGE_SECTION_HEADER *section)
-{
-    static const char name[] = ".text";
-    for (int i = 0; i < 5; i++)
-        if (section->Name[i] != (BYTE)name[i]) return FALSE;
-    return section->Name[5] == 0;
-}
-
-/* Catch the first write behind the observed tier0_s64.dll corruption. The
- * loader has already applied relocations, imports, and CFG fixups here, so
- * .text must remain read-only. Protect the PE VA and physical mirror because
- * kernel shims can access either alias. */
-static void tier0_arm_text_write_trap(const char *dll_name,
-                                      PPE_IMAGE_INFO image)
-{
-    BYTE *base;
-    IMAGE_DOS_HEADER *dos;
-    IMAGE_FILE_HEADER *file_header;
-    IMAGE_SECTION_HEADER *sections;
-    uint64_t nt_offset;
-    uint64_t section_offset;
-
-    if (!image || image->Is32Bit || !image->ImageBase ||
-        (ULONGLONG)(ULONG_PTR)image->ImageBase != image->PreferredBase ||
-        dl_stricmp(strip_path(dll_name), "tier0_s64.dll") != 0)
-        return;
-
-    base = (BYTE *)image->ImageBase;
-    if (image->SizeOfImage < sizeof(IMAGE_DOS_HEADER)) return;
-    dos = (IMAGE_DOS_HEADER *)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) return;
-
-    nt_offset = (uint64_t)(ULONG)dos->e_lfanew;
-    if (nt_offset > image->SizeOfImage - sizeof(ULONG) -
-                    sizeof(IMAGE_FILE_HEADER) ||
-        *(ULONG *)(base + nt_offset) != IMAGE_NT_SIGNATURE)
-        return;
-
-    file_header = (IMAGE_FILE_HEADER *)(base + nt_offset + sizeof(ULONG));
-    section_offset = nt_offset + sizeof(ULONG) + sizeof(IMAGE_FILE_HEADER) +
-                     file_header->SizeOfOptionalHeader;
-    if (file_header->NumberOfSections > 96 ||
-        section_offset > image->SizeOfImage ||
-        (uint64_t)file_header->NumberOfSections *
-            sizeof(IMAGE_SECTION_HEADER) > image->SizeOfImage - section_offset)
-        return;
-    sections = (IMAGE_SECTION_HEADER *)(base + section_offset);
-
-    for (USHORT i = 0; i < file_header->NumberOfSections; i++) {
-        IMAGE_SECTION_HEADER *section = &sections[i];
-        uint64_t section_size;
-        uint64_t page_start;
-        uint64_t page_end;
-        uint64_t protected_pages = 0;
-        uint64_t failures = 0;
-
-        if (!dl_section_is_text(section)) continue;
-        section_size = section->Misc.VirtualSize;
-        if (section->SizeOfRawData > section_size)
-            section_size = section->SizeOfRawData;
-        if (!section_size || section->VirtualAddress >= image->SizeOfImage ||
-            section_size > image->SizeOfImage - section->VirtualAddress)
-            return;
-
-        page_start = ((uint64_t)(ULONG_PTR)base + section->VirtualAddress) &
-                     ~0xFFFULL;
-        page_end = ((uint64_t)(ULONG_PTR)base + section->VirtualAddress +
-                    section_size + 0xFFFULL) & ~0xFFFULL;
-        for (uint64_t page = page_start; page < page_end; page += 4096) {
-            uint64_t *pte = paging_get_pte(page);
-            uint64_t phys;
-            uint64_t flags;
-            if (!pte || !(*pte & DLL_PTE_PRESENT)) {
-                failures++;
-                continue;
-            }
-            phys = *pte & DLL_PTE_ADDR_MASK;
-            flags = (*pte & ~DLL_PTE_ADDR_MASK) & ~DLL_PTE_WRITABLE;
-            if (paging_set_flags(page, flags) != 0)
-                failures++;
-            if (paging_map_page(KERNEL_VBASE + phys, phys,
-                                DLL_PTE_PRESENT | DLL_PTE_GLOBAL) != 0)
-                failures++;
-            protected_pages++;
-        }
-
-        serial_puts("[TIER0-WRITE-TRAP] .text base=0x");
-        serial_puthex(page_start, 16);
-        serial_puts(" size=0x");
-        serial_puthex(page_end - page_start, 16);
-        serial_puts(" pages=");
-        serial_putdec(protected_pages);
-        serial_puts(" failures=");
-        serial_putdec(failures);
-        serial_puts("\n");
-        return;
-    }
-}
 
 static LOADED_MODULE modules[MAX_LOADED_MODULES];
 
@@ -377,6 +256,13 @@ static DLL_PROCESS_STATE *loader_lock_state(ULONG owner_pid, BOOL create)
     return state ? state : &loader_overflow;
 }
 
+static void loader_lock_publish_state(ULONG owner_pid, unsigned depth)
+{
+    win32_set_loader_lock_state(owner_pid,
+                                depth ? GetCurrentThreadId() : 0,
+                                depth);
+}
+
 static void loader_lock_reset(DLL_PROCESS_STATE *state)
 {
     __atomic_store_n(&state->depth, 0, __ATOMIC_RELAXED);
@@ -408,6 +294,7 @@ static void loader_lock_recover_stale(DLL_PROCESS_STATE *state,
     }
 
     loader_lock_reset(state);
+    loader_lock_publish_state(owner_pid, 0);
     __atomic_store_n(&state->held, 0, __ATOMIC_RELEASE);
 
     serial_puts("[DLL-LOCK] recovered stale owner kpid=");
@@ -424,7 +311,9 @@ static void loader_lock_acquire_for(ULONG owner_pid)
     if (__atomic_load_n(&state->held, __ATOMIC_ACQUIRE) == 1 &&
         __atomic_load_n(&state->kernel_pid, __ATOMIC_RELAXED) ==
             kernel_pid) {
-        __atomic_add_fetch(&state->depth, 1, __ATOMIC_RELAXED);
+        unsigned depth =
+            __atomic_add_fetch(&state->depth, 1, __ATOMIC_RELAXED);
+        loader_lock_publish_state(owner_pid, depth);
         return;
     }
 
@@ -441,6 +330,38 @@ static void loader_lock_acquire_for(ULONG owner_pid)
 
     __atomic_store_n(&state->kernel_pid, kernel_pid, __ATOMIC_RELAXED);
     __atomic_store_n(&state->depth, 1, __ATOMIC_RELEASE);
+    loader_lock_publish_state(owner_pid, 1);
+}
+
+static BOOL loader_lock_try_acquire_for(ULONG owner_pid)
+{
+    DLL_PROCESS_STATE *state = loader_lock_state(owner_pid, TRUE);
+    int kernel_pid = proc_current_pid();
+    if (__atomic_load_n(&state->held, __ATOMIC_ACQUIRE) == 1 &&
+        __atomic_load_n(&state->kernel_pid, __ATOMIC_RELAXED) ==
+            kernel_pid) {
+        unsigned depth =
+            __atomic_add_fetch(&state->depth, 1, __ATOMIC_RELAXED);
+        loader_lock_publish_state(owner_pid, depth);
+        return TRUE;
+    }
+
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&state->held, &expected, 1, FALSE,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        if (expected != 1) return FALSE;
+        loader_lock_recover_stale(state, owner_pid);
+        expected = 0;
+        if (!__atomic_compare_exchange_n(&state->held, &expected, 1, FALSE,
+                                         __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+            return FALSE;
+    }
+
+    __atomic_store_n(&state->kernel_pid, kernel_pid, __ATOMIC_RELAXED);
+    __atomic_store_n(&state->depth, 1, __ATOMIC_RELEASE);
+    loader_lock_publish_state(owner_pid, 1);
+    return TRUE;
 }
 
 static void loader_lock_acquire(void)
@@ -457,11 +378,14 @@ static void loader_lock_release_for(ULONG owner_pid)
             proc_current_pid())
         return;
     if (depth > 1) {
-        __atomic_store_n(&state->depth, depth - 1, __ATOMIC_RELAXED);
+        depth--;
+        __atomic_store_n(&state->depth, depth, __ATOMIC_RELAXED);
+        loader_lock_publish_state(owner_pid, depth);
         return;
     }
 
     loader_lock_reset(state);
+    loader_lock_publish_state(owner_pid, 0);
     __atomic_store_n(&state->held, 0, __ATOMIC_RELEASE);
 }
 
@@ -481,7 +405,35 @@ static void loader_lock_abandon_process(ULONG owner_pid)
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
         return;
     loader_lock_reset(state);
+    loader_lock_publish_state(owner_pid, 0);
     __atomic_store_n(&state->held, 0, __ATOMIC_RELEASE);
+}
+
+void dll_loader_lock_enter(void)
+{
+    loader_lock_acquire();
+}
+
+BOOL dll_loader_lock_try_enter(void)
+{
+    return loader_lock_try_acquire_for(dll_current_owner_pid());
+}
+
+BOOL dll_loader_lock_owned_by_current_thread(void)
+{
+    DLL_PROCESS_STATE *state =
+        loader_lock_state(dll_current_owner_pid(), FALSE);
+    return __atomic_load_n(&state->held, __ATOMIC_ACQUIRE) == 1 &&
+           __atomic_load_n(&state->depth, __ATOMIC_ACQUIRE) != 0 &&
+           __atomic_load_n(&state->kernel_pid, __ATOMIC_RELAXED) ==
+               proc_current_pid();
+}
+
+BOOL dll_loader_lock_leave(void)
+{
+    if (!dll_loader_lock_owned_by_current_thread()) return FALSE;
+    loader_lock_release();
+    return TRUE;
 }
 
 static void loader_process_forget(ULONG owner_pid)
@@ -837,12 +789,14 @@ static int module_name_valid(const char *name)
 typedef struct {
     char            name[64];
     shim_resolver_fn resolver;
+    shim_lifecycle_fn lifecycle;
 } SHIM_ENTRY;
 
 static SHIM_ENTRY shims[MAX_SHIMS];
 static int shim_count = 0;
 
-void dll_register_shim(const char *dll_name, shim_resolver_fn resolver)
+void dll_register_shim_ex(const char *dll_name, shim_resolver_fn resolver,
+                          shim_lifecycle_fn lifecycle)
 {
     if (shim_count >= MAX_SHIMS) {
         serial_puts("[DLL] shim registry full: ");
@@ -852,7 +806,13 @@ void dll_register_shim(const char *dll_name, shim_resolver_fn resolver)
     }
     dl_strcpy_lower(shims[shim_count].name, strip_path(dll_name), 64);
     shims[shim_count].resolver = resolver;
+    shims[shim_count].lifecycle = lifecycle;
     shim_count++;
+}
+
+void dll_register_shim(const char *dll_name, shim_resolver_fn resolver)
+{
+    dll_register_shim_ex(dll_name, resolver, NULL);
 }
 
 /* ── Find a shim by DLL name ───────────────────────────────── */
@@ -873,7 +833,7 @@ static const char *dll_shim_provider_name(const char *dll_name,
     return provider;
 }
 
-shim_resolver_fn find_shim(const char *dll_name)
+static SHIM_ENTRY *find_shim_entry(const char *dll_name)
 {
     char lower[64];
     dll_shim_provider_name(dll_name, lower);
@@ -891,7 +851,7 @@ shim_resolver_fn find_shim(const char *dll_name)
 
     for (int i = 0; i < shim_count; i++) {
         if (dl_stricmp(lower, shims[i].name) == 0)
-            return shims[i].resolver;
+            return &shims[i];
 
         /* Also try without .dll extension */
         char shim_noext[64];
@@ -905,10 +865,16 @@ shim_resolver_fn find_shim(const char *dll_name)
         }
 
         if (dl_stricmp(lower_noext, shim_noext) == 0)
-            return shims[i].resolver;
+            return &shims[i];
     }
 
     return NULL;
+}
+
+shim_resolver_fn find_shim(const char *dll_name)
+{
+    SHIM_ENTRY *entry = find_shim_entry(dll_name);
+    return entry ? entry->resolver : NULL;
 }
 
 /* ── Initialize DLL loader ─────────────────────────────────── */
@@ -1033,7 +999,8 @@ LOADED_MODULE *dll_find_module_by_base(PVOID image_base)
             LOADED_MODULE *mod = &modules[current];
             int next = mod->next_owner_index;
             if (module_visible(mod, owner_pid) &&
-                mod->image.ImageBase == image_base)
+                mod->image.ImageBase == image_base &&
+                module_matches_caller_abi(mod))
                 return mod;
             current = next;
         }
@@ -1041,7 +1008,8 @@ LOADED_MODULE *dll_find_module_by_base(PVOID image_base)
     }
     for (int i = 0; i < MAX_LOADED_MODULES; i++) {
         if (module_visible(&modules[i], owner_pid) &&
-            modules[i].image.ImageBase == image_base)
+            modules[i].image.ImageBase == image_base &&
+            module_matches_caller_abi(&modules[i]))
             return &modules[i];
     }
     return NULL;
@@ -1078,6 +1046,81 @@ LOADED_MODULE *dll_find_module_by_address(PVOID address)
     return NULL;
 }
 
+static void dll_copy_module_snapshot(DLL_MODULE_SNAPSHOT_ENTRY *destination,
+                                     const LOADED_MODULE *source)
+{
+    destination->image_base = source->image.ImageBase;
+    destination->image_size = source->image.SizeOfImage;
+    destination->synthetic_shim = source->synthetic_shim;
+    dl_strcpy(destination->name, source->name,
+              sizeof(destination->name));
+    dl_strcpy(destination->path, source->path,
+              sizeof(destination->path));
+}
+
+DWORD dll_snapshot_modules(ULONG owner_pid,
+                           DLL_MODULE_SNAPSHOT_ENTRY *entries,
+                           DWORD capacity)
+{
+    DWORD count = 0;
+    DLL_PROCESS_STATE *state;
+
+    loader_lock_acquire_for(owner_pid);
+    state = loader_process_state(owner_pid, FALSE);
+    if (state) {
+        int current =
+            __atomic_load_n(&state->module_head, __ATOMIC_ACQUIRE);
+        for (int visited = 0;
+             current >= 0 && current < MAX_LOADED_MODULES &&
+             visited < MAX_LOADED_MODULES;
+             visited++) {
+            const LOADED_MODULE *module = &modules[current];
+            current = module->next_owner_index;
+            if (module_visible(module, owner_pid) &&
+                module->image.ImageBase && module->image.SizeOfImage)
+                count++;
+        }
+
+        if (entries && capacity >= count) {
+            DWORD position = count;
+            current = __atomic_load_n(&state->module_head,
+                                      __ATOMIC_ACQUIRE);
+            for (int visited = 0;
+                 current >= 0 && current < MAX_LOADED_MODULES &&
+                 visited < MAX_LOADED_MODULES;
+                 visited++) {
+                const LOADED_MODULE *module = &modules[current];
+                current = module->next_owner_index;
+                if (!module_visible(module, owner_pid) ||
+                    !module->image.ImageBase || !module->image.SizeOfImage)
+                    continue;
+                /* The owner list is newest-first. Fill it backwards so the
+                 * public snapshot follows loader insertion order. */
+                dll_copy_module_snapshot(&entries[--position], module);
+            }
+        }
+    } else {
+        for (int i = 0; i < MAX_LOADED_MODULES; i++) {
+            const LOADED_MODULE *module = &modules[i];
+            if (module_visible(module, owner_pid) &&
+                module->image.ImageBase && module->image.SizeOfImage)
+                count++;
+        }
+        if (entries && capacity >= count) {
+            DWORD position = 0;
+            for (int i = 0; i < MAX_LOADED_MODULES; i++) {
+                const LOADED_MODULE *module = &modules[i];
+                if (!module_visible(module, owner_pid) ||
+                    !module->image.ImageBase || !module->image.SizeOfImage)
+                    continue;
+                dll_copy_module_snapshot(&entries[position++], module);
+            }
+        }
+    }
+    loader_lock_release_for(owner_pid);
+    return count;
+}
+
 void dll_debug_log_address(PVOID address)
 {
     ULONG_PTR value = (ULONG_PTR)address;
@@ -1101,109 +1144,6 @@ void dll_debug_log_address(PVOID address)
     serial_puthex(mod->image.SizeOfImage, 8);
     serial_puts(" owner=");
     serial_putdec(mod->owner_pid);
-    serial_puts("\n");
-}
-
-static BOOL dll_debug_read(ULONG_PTR address, void *dst, SIZE_T size)
-{
-    uint64_t cr3;
-    BYTE *out = (BYTE *)dst;
-
-    if (!address || !dst || address + size < address)
-        return FALSE;
-
-    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-    while (size) {
-        uint64_t phys = paging_translate_in_cr3(cr3, address);
-        if (phys == UINT64_MAX)
-            return FALSE;
-
-        SIZE_T chunk = 0x1000 - (SIZE_T)(phys & 0xFFF);
-        if (chunk > size)
-            chunk = size;
-
-        const BYTE *src = (const BYTE *)PHYS_TO_VIRT(phys);
-        for (SIZE_T i = 0; i < chunk; i++)
-            out[i] = src[i];
-
-        address += chunk;
-        out += chunk;
-        size -= chunk;
-    }
-    return TRUE;
-}
-
-static void dll_debug_put_string(ULONG_PTR address)
-{
-    if (!address) {
-        serial_puts("<null>");
-        return;
-    }
-
-    for (SIZE_T i = 0; i < 256; i++) {
-        char c;
-        if (!dll_debug_read(address + i, &c, 1)) {
-            serial_puts("<unmapped>");
-            return;
-        }
-        if (!c)
-            return;
-        serial_putchar(c);
-    }
-    serial_puts("<truncated>");
-}
-
-void dll_debug_log_delay_failure(PVOID address, PVOID info_ptr)
-{
-    LOADED_MODULE *mod = dll_find_module_by_address(address);
-    if (!mod || dl_stricmp(mod->name, "libcef.dll") != 0)
-        return;
-
-    ULONG_PTR rva = (ULONG_PTR)address - (ULONG_PTR)mod->image.ImageBase;
-    if (rva < 0x59EF805 || rva > 0x59EF809)
-        return;
-
-    ULONG_PTR info_addr = (ULONG_PTR)info_ptr;
-    BYTE info[0x48];
-    if (!dll_debug_read(info_addr, info, sizeof(info))) {
-        serial_puts("[PE64-DELAY] invalid info=0x");
-        serial_puthex(info_addr, 16);
-        serial_puts("\n");
-        return;
-    }
-
-    ULONG_PTR dll_name = *(ULONG_PTR *)(info + 0x18);
-    DWORD by_name = *(DWORD *)(info + 0x20);
-    ULONG_PTR proc = *(ULONG_PTR *)(info + 0x28);
-    ULONG_PTR iat_slot = *(ULONG_PTR *)(info + 0x10);
-    ULONG_PTR module = *(ULONG_PTR *)(info + 0x30);
-    ULONG_PTR resolved = *(ULONG_PTR *)(info + 0x38);
-    DWORD error = *(DWORD *)(info + 0x40);
-    ULONG_PTR iat_value = 0;
-    if (iat_slot)
-        dll_debug_read(iat_slot, &iat_value, sizeof(iat_value));
-
-    serial_puts("[PE64-DELAY] dll='");
-    dll_debug_put_string(dll_name);
-    serial_puts("' ");
-    if (by_name) {
-        serial_puts("symbol='");
-        dll_debug_put_string(proc);
-        serial_puts("'");
-    } else {
-        serial_puts("ordinal=");
-        serial_putdec(proc);
-    }
-    serial_puts(" iat=0x");
-    serial_puthex(iat_slot, 16);
-    serial_puts(" value=0x");
-    serial_puthex(iat_value, 16);
-    serial_puts(" hmod=0x");
-    serial_puthex(module, 16);
-    serial_puts(" pfn=0x");
-    serial_puthex(resolved, 16);
-    serial_puts(" error=");
-    serial_putdec(error);
     serial_puts("\n");
 }
 
@@ -1314,6 +1254,8 @@ static void dl_build_synthetic_shim_image(PVOID image_base, BOOL is_32bit,
     info->PreferredBase = (ULONGLONG)(ULONG_PTR)image_base;
     info->SizeOfImage = DLL_SYNTHETIC_SHIM_IMAGE_SIZE;
     info->Subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI;
+    info->MajorSubsystemVersion = 6;
+    info->MinorSubsystemVersion = 0;
     info->DllCharacteristics = IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE |
                                IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
     info->StackReserve = 0x100000;
@@ -1323,12 +1265,10 @@ static void dl_build_synthetic_shim_image(PVOID image_base, BOOL is_32bit,
 }
 
 static void module_take_reference_locked(LOADED_MODULE *mod,
-                                         BOOL add_reference, BOOL pin,
-                                         const char *operation)
+                                         BOOL add_reference, BOOL pin)
 {
     if (!mod) return;
 
-    int refs_before = mod->ref_count;
     if (pin) {
         mod->pinned = TRUE;
     } else if (add_reference) {
@@ -1337,20 +1277,9 @@ static void module_take_reference_locked(LOADED_MODULE *mod,
         else
             mod->pinned = TRUE;
     }
-
-    if (dl_is_libcef(mod->name) && (add_reference || pin)) {
-        serial_puts("[DLL-CEF-REF] op=");
-        serial_puts(operation);
-        serial_puts(" owner=");
-        serial_putdec(mod->owner_pid);
-        serial_puts(" refs-before=");
-        serial_putdec((uint64_t)(uint32_t)refs_before);
-        serial_puts(" refs-after=");
-        serial_putdec((uint64_t)(uint32_t)mod->ref_count);
-        serial_puts(" pinned=");
-        serial_putdec(mod->pinned ? 1 : 0);
-        serial_puts("\n");
-    }
+    win32_update_loader_image_reference(
+        mod->owner_pid, mod->image.ImageBase,
+        (ULONG)(mod->ref_count > 0 ? mod->ref_count : 0), mod->pinned);
 }
 
 PVOID dll_get_module_handle_ex(const char *name, BOOL add_reference, BOOL pin)
@@ -1358,86 +1287,13 @@ PVOID dll_get_module_handle_ex(const char *name, BOOL add_reference, BOOL pin)
     PVOID image_base = NULL;
     if (!name) return NULL;
 
-    const char *lookup_base = strip_path_bounded(name, 256);
-    static int openal_trace_budget = 24;
-    BOOL trace_openal = lookup_base &&
-        dl_stricmp(lookup_base, "openal32.dll") == 0 &&
-        __atomic_fetch_sub(&openal_trace_budget, 1, __ATOMIC_RELAXED) > 0;
-    BOOL trace_shell =
-        dl_stricmp(strip_path(name), "shell32.dll") == 0;
-    if (trace_shell) {
-        serial_puts("[DLL-SHELL-LOOKUP] get owner=");
-        serial_putdec(dll_current_owner_pid());
-        serial_puts(" image=0x");
-        serial_puthex(win32_current_image_base(), 16);
-        serial_puts(" bits=");
-        serial_putdec((uint64_t)dll_current_process_bitness());
-        serial_puts(" compat=");
-        serial_putdec((uint64_t)(g_compat32_mode ? 1 : 0));
-        serial_puts("\n");
-    }
-
     loader_lock_acquire();
     LOADED_MODULE *mod = dll_find_module(name);
-    if (trace_openal) {
-        ULONG owner_pid = dll_current_owner_pid();
-        serial_puts("[DLL-OPENAL] lookup owner=");
-        serial_putdec(owner_pid);
-        serial_puts(" image=0x");
-        serial_puthex(win32_current_image_base(), 16);
-        serial_puts(" bits=");
-        serial_putdec((uint64_t)dll_current_process_bitness());
-        serial_puts(" compat=");
-        serial_putdec((uint64_t)(g_compat32_mode ? 1 : 0));
-        serial_puts(" result=0x");
-        serial_puthex(mod ? (ULONG_PTR)mod->image.ImageBase : 0, 16);
-        serial_puts("\n");
-
-        if (!mod) {
-            char lower[64];
-            dl_strcpy_lower(lower, lookup_base, sizeof(lower));
-            for (int i = 0; i < MAX_LOADED_MODULES; i++) {
-                LOADED_MODULE *candidate = &modules[i];
-                if (__atomic_load_n(&candidate->state,
-                                    __ATOMIC_ACQUIRE) <= 0 ||
-                    !module_matches_name(candidate, lower))
-                    continue;
-                serial_puts("[DLL-OPENAL] candidate state=");
-                serial_putdec((uint64_t)candidate->state);
-                serial_puts(" owner=");
-                serial_putdec(candidate->owner_pid);
-                serial_puts(" bits=");
-                serial_putdec(candidate->image.Is32Bit ? 32 : 64);
-                serial_puts(" refs=");
-                serial_putdec((uint64_t)candidate->ref_count);
-                serial_puts(" base=0x");
-                serial_puthex((ULONG_PTR)candidate->image.ImageBase, 16);
-                serial_puts(" path='");
-                serial_puts(candidate->path);
-                serial_puts("'\n");
-            }
-        }
-    }
     if (mod) {
-        module_take_reference_locked(mod, add_reference, pin, "name");
+        module_take_reference_locked(mod, add_reference, pin);
         image_base = mod->image.ImageBase;
     }
     loader_lock_release();
-    if (trace_shell) {
-        serial_puts("[DLL-SHELL-LOOKUP] result=0x");
-        serial_puthex((ULONG_PTR)image_base, 16);
-        if (mod) {
-            serial_puts(" state=");
-            serial_putdec((uint64_t)mod->state);
-            serial_puts(" owner=");
-            serial_putdec(mod->owner_pid);
-            serial_puts(" bits=");
-            serial_putdec(mod->image.Is32Bit ? 32 : 64);
-            serial_puts(" refs=");
-            serial_putdec((uint64_t)mod->ref_count);
-        }
-        serial_puts("\n");
-    }
     return image_base;
 }
 
@@ -1455,7 +1311,7 @@ PVOID dll_get_module_handle_by_address(PVOID address, BOOL add_reference,
     LOADED_MODULE *mod = dll_find_module_by_address(address);
     PVOID image_base = NULL;
     if (mod) {
-        module_take_reference_locked(mod, add_reference, pin, "address");
+        module_take_reference_locked(mod, add_reference, pin);
         image_base = mod->image.ImageBase;
     }
     loader_lock_release();
@@ -1465,14 +1321,8 @@ PVOID dll_get_module_handle_by_address(PVOID address, BOOL add_reference,
 PVOID dll_get_shim_module_handle_ex(const char *name, BOOL add_reference,
                                     BOOL pin)
 {
-    BOOL trace_shell = name &&
-        dl_stricmp(strip_path(name), "shell32.dll") == 0;
-    shim_resolver_fn shim = name ? find_shim(name) : NULL;
-    if (trace_shell) {
-        serial_puts("[DLL-SHELL-LOOKUP] shim resolver=0x");
-        serial_puthex((ULONG_PTR)shim, 16);
-        serial_puts("\n");
-    }
+    SHIM_ENTRY *shim_entry = name ? find_shim_entry(name) : NULL;
+    shim_resolver_fn shim = shim_entry ? shim_entry->resolver : NULL;
     if (!name || !shim) return NULL;
 
     char provider[64];
@@ -1481,7 +1331,7 @@ PVOID dll_get_shim_module_handle_ex(const char *name, BOOL add_reference,
     loader_lock_acquire();
     LOADED_MODULE *mod = dll_find_module(name);
     if (mod) {
-        module_take_reference_locked(mod, add_reference, pin, "shim-name");
+        module_take_reference_locked(mod, add_reference, pin);
         PVOID existing = mod->image.ImageBase;
         loader_lock_release();
         return existing;
@@ -1490,8 +1340,6 @@ PVOID dll_get_shim_module_handle_ex(const char *name, BOOL add_reference,
     ULONG owner_pid = dll_current_owner_pid();
     mod = module_reserve(name, owner_pid);
     if (!mod) {
-        if (trace_shell)
-            serial_puts("[DLL-SHELL-LOOKUP] reserve failed\n");
         loader_lock_release();
         return NULL;
     }
@@ -1504,13 +1352,6 @@ PVOID dll_get_shim_module_handle_ex(const char *name, BOOL add_reference,
     PVOID image_base = pe_alloc(NULL, DLL_SYNTHETIC_SHIM_IMAGE_SIZE,
                                 is_32bit);
     if (!image_base) {
-        if (trace_shell) {
-            serial_puts("[DLL-SHELL-LOOKUP] pe_alloc failed bits=");
-            serial_putdec(is_32bit ? 32 : 64);
-            serial_puts(" owner=");
-            serial_putdec(owner_pid);
-            serial_puts("\n");
-        }
         module_release_record(mod);
         loader_lock_release();
         return NULL;
@@ -1518,8 +1359,34 @@ PVOID dll_get_shim_module_handle_ex(const char *name, BOOL add_reference,
 
     dl_build_synthetic_shim_image(image_base, is_32bit, &mod->image);
     mod->synthetic_shim = TRUE;
+    NTSTATUS loader_status = win32_publish_loader_image(
+        &mod->image, mod->name, TRUE);
+    if (!NT_SUCCESS(loader_status)) {
+        pe_free_for_owner(image_base, mod->image.SizeOfImage, owner_pid);
+        module_release_record(mod);
+        loader_lock_release();
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return NULL;
+    }
     __atomic_store_n(&mod->state, 2, __ATOMIC_RELEASE);
-    module_take_reference_locked(mod, add_reference, pin, "shim-create");
+    /* module_reserve() already created the first load reference. Taking a
+     * second one here made a newly created LoadLibrary facade require two
+     * FreeLibrary calls. Existing facades still acquire references above. */
+    if (pin) mod->pinned = TRUE;
+    win32_update_loader_image_reference(
+        owner_pid, image_base, (ULONG)mod->ref_count, mod->pinned);
+
+    if (shim_entry->lifecycle &&
+        !shim_entry->lifecycle(shim_entry->name, image_base,
+                               DLL_PROCESS_ATTACH, NULL)) {
+        win32_unpublish_loader_image(owner_pid, image_base);
+        pe_free_for_owner(image_base, mod->image.SizeOfImage, owner_pid);
+        module_release_record(mod);
+        loader_lock_release();
+        SetLastError(1114); /* ERROR_DLL_INIT_FAILED */
+        return NULL;
+    }
+    mod->initialized = TRUE;
 
 #if !defined(OK_QUIET) || !OK_QUIET
     serial_puts("[DLL] mapped shim module ");
@@ -1565,7 +1432,7 @@ PVOID dll_get_shim_export_thunk(const char *dll_name, PVOID target)
     const char *export_name = NULL;
     uint8_t argc = 0;
     uint8_t callconv = 0;
-    if (win32_abi_target_is_data(dll_name, target))
+    if (win32_abi_resolved_is_data(dll_name, NULL, target))
         return target;
     if (!win32_abi_lookup_target(dll_name, target, &export_name, &argc,
                                  &callconv))
@@ -2000,10 +1867,6 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
     serial_puts(dll_name);
     serial_puts("\n");
 
-    if (dl_is_libcef(dll_name))
-        dl_probe_libcef_bytes("source", file_data, file_size,
-                              LIBCEF_PROBE_FILE_OFFSET);
-
     /* Reserve a stable slot before recursive dependency loading. */
     LOADED_MODULE *mod =
         module_reserve(dll_name, dll_current_owner_pid());
@@ -2023,12 +1886,6 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
         module_release_record(mod);
         return NULL;
     }
-
-    if (dl_is_libcef(dll_name))
-        dl_probe_libcef_bytes("mapped", mod->image.ImageBase,
-                              mod->image.SizeOfImage, LIBCEF_PROBE_RVA);
-
-    tier0_arm_text_write_trap(dll_name, &mod->image);
 
     /* Fill remaining module info (name already set above) */
     mod->dll_main    = (mod->image.IsDLL && mod->image.EntryPointRVA != 0)
@@ -2054,9 +1911,14 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
          * on every INT 0x2E call. See the IAT guard block in compat32.c. */
 
         if (!NT_SUCCESS(compat_st)) {
-            serial_puts("[DLL] WARNING: compat32 IAT patch failed for ");
+            serial_puts("[DLL] compat32 IAT patch failed for ");
             serial_puts(dll_name);
+            serial_puts(": 0x");
+            serial_puthex((uint32_t)compat_st, 8);
             serial_puts("\n");
+            pe_unload(&mod->image);
+            module_release_record(mod);
+            return NULL;
         } else {
             NTSTATUS protect_st =
                 pe_finalize_image_protections(&mod->image);
@@ -2109,48 +1971,6 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
         }
     }
 
-    if (dl_is_libcef(dll_name))
-        dl_probe_libcef_bytes("finalized", mod->image.ImageBase,
-                              mod->image.SizeOfImage, LIBCEF_PROBE_RVA);
-
-    /* Core.dll-specific: pre-allocate GObjRegistrants TArray BEFORE
-     * Core.dll's DllMain runs.  Core.dll's _initterm constructs every
-     * UClass's static class object, each of which calls
-     * GObjRegistrants.Add(this).  If the TArray is in its default zero
-     * state at that moment, the first Add() triggers FArray::Realloc
-     * with bogus Max → corrupted alloc → registrants get dropped or
-     * land in garbage memory.  Pre-allocating a 1024-slot buffer with
-     * sane {Data, Num=0, Max=1024} lets each Add() succeed without
-     * triggering realloc.
-     *
-     * The late pre-alloc in winexec.c (after all preloads) was too
-     * late — Core.dll's _initterm had already run with empty TArray.
-     */
-    if (mod->image.IsDLL && !find_shim(mod->name) &&
-        ((mod->name[0]=='C' && mod->name[1]=='o' && mod->name[2]=='r' && mod->name[3]=='e') ||
-         (mod->name[0]=='c' && mod->name[1]=='o' && mod->name[2]=='r' && mod->name[3]=='e'))) {
-        PVOID gobjreg_ptr = dll_resolve_export(mod,
-            "?GObjRegistrants@UObject@@0V?$TArray@PAVUObject@@@@A", 0, FALSE);
-        if (gobjreg_ptr) {
-            uint32_t *tarray = (uint32_t *)gobjreg_ptr;
-            extern void *mem_alloc_pages(uint64_t count);
-            void *buf = mem_alloc_pages(1);
-            if (buf) {
-                uint64_t pa = (uint64_t)buf;
-                uint8_t *p = (uint8_t *)pa;
-                for (int i = 0; i < 4096; i++) p[i] = 0;
-                tarray[0] = (uint32_t)pa;
-                tarray[1] = 0;
-                tarray[2] = 1024;
-                serial_puts("[DLL-EARLY] Pre-allocated GObjRegistrants BEFORE DllMain: Data=0x");
-                serial_puthex(pa, 8);
-                serial_puts(" Max=1024 @TArray=0x");
-                serial_puthex((uint64_t)(ULONG_PTR)gobjreg_ptr, 8);
-                serial_puts("\n");
-            }
-        }
-    }
-
     /* Call DllMain(DLL_PROCESS_ATTACH) if it has one.
      * Skip DllMain for DLLs that have a registered shim — the shim already
      * provides all CRT/API functions and the real DllMain may crash trying
@@ -2192,38 +2012,6 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
             }
 
             mod->initialized = TRUE;
-        }
-    }
-
-    if (dl_is_libcef(dll_name))
-        dl_probe_libcef_bytes("dllmain", mod->image.ImageBase,
-                              mod->image.SizeOfImage, LIBCEF_PROBE_RVA);
-
-    /* After Window.dll loads, initialize NULL global stubs.
-     * GWindowManager (USubsystem*) and GLogWindow (WLog*) are DATA
-     * exports that stay NULL because DllMain doesn't construct them.
-     * Virtual calls through NULL crash with #PF at address 0. */
-    if (dl_stricmp(mod->name, "window.dll") == 0) {
-        static const char *globals[] = {
-            "?GWindowManager@@3PAVUSubsystem@@A",
-            "?GLogWindow@@3PAVWLog@@A",
-        };
-        for (int gi = 0; gi < 2; gi++) {
-            ULONG owner_pid = dll_current_owner_pid();
-            PVOID addr = dll_resolve_export_any(
-                owner_pid, globals[gi], 0, FALSE);
-            const char *short_name = (gi == 0) ? "GWindowManager" : "GLogWindow";
-            if (addr && *(uint32_t *)(uintptr_t)addr == 0) {
-                uint32_t stub = create_stub_uobject(short_name);
-                if (stub) {
-                    *(uint32_t *)(uintptr_t)addr = stub;
-                    serial_puts("[WIN32] ");
-                    serial_puts(short_name);
-                    serial_puts(" -> 0x");
-                    serial_puthex(stub, 8);
-                    serial_puts("\n");
-                }
-            }
         }
     }
 
@@ -2372,57 +2160,37 @@ BOOL dll_release_module(PVOID requested_base)
         return FALSE;
     }
 
-    BOOL trace_openal = dl_stricmp(mod->name, "openal32.dll") == 0;
-    BOOL trace_cef = dl_is_libcef(mod->name);
-    if (trace_openal || trace_cef) {
-        serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] owner="
-                             : "[DLL-OPENAL] unload owner=");
-        serial_putdec(mod->owner_pid);
-        serial_puts(" refs-before=");
-        serial_putdec((uint64_t)mod->ref_count);
-        serial_puts(" pinned=");
-        serial_putdec(mod->pinned ? 1 : 0);
-        serial_puts(" base=0x");
-        serial_puthex((ULONG_PTR)mod->image.ImageBase, 16);
-        serial_puts("\n");
-    }
-
     if (mod->pinned) {
-        if (trace_openal || trace_cef)
-            serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] retained pinned\n"
-                                  : "[DLL-OPENAL] retained pinned\n");
         loader_lock_release();
         return TRUE;
     }
 
     if (mod->ref_count <= 0) {
-        if (trace_openal || trace_cef)
-            serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] invalid zero refs\n"
-                                  : "[DLL-OPENAL] invalid zero refs\n");
         loader_lock_release();
         return FALSE;
     }
 
     mod->ref_count--;
     if (mod->ref_count > 0) {
-        if (trace_openal || trace_cef) {
-            serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] retained refs="
-                                  : "[DLL-OPENAL] retained refs=");
-            serial_putdec((uint64_t)mod->ref_count);
-            serial_puts("\n");
-        }
+        win32_update_loader_image_reference(
+            mod->owner_pid, mod->image.ImageBase,
+            (ULONG)mod->ref_count, mod->pinned);
         loader_lock_release();
         return TRUE;
     }
-
-    if (trace_openal || trace_cef)
-        serial_puts(trace_cef ? "[DLL-CEF-UNLOAD] releasing image\n"
-                              : "[DLL-OPENAL] releasing image\n");
 
     PVOID image_base = mod->image.ImageBase;
     SIZE_T image_size = mod->image.SizeOfImage;
     ULONG owner_pid = mod->owner_pid;
     BOOL synthetic_shim = mod->synthetic_shim;
+
+    if (synthetic_shim && mod->initialized) {
+        SHIM_ENTRY *shim_entry = find_shim_entry(mod->name);
+        if (shim_entry && shim_entry->lifecycle)
+            shim_entry->lifecycle(shim_entry->name, image_base,
+                                  DLL_PROCESS_DETACH, NULL);
+        mod->initialized = FALSE;
+    }
 
     /* Call DllMain(DLL_PROCESS_DETACH) — skip for PE32 DLLs */
     if (mod->dll_main && mod->initialized && !mod->image.Is32Bit) {
@@ -2436,10 +2204,12 @@ BOOL dll_release_module(PVOID requested_base)
         win64_tls_unregister_image(image_base);
     }
 
-    if (synthetic_shim)
+    if (synthetic_shim) {
+        win32_unpublish_loader_image(owner_pid, image_base);
         pe_free_for_owner(image_base, image_size, owner_pid);
-    else
-        pe_unload(&mod->image);
+    } else {
+        pe_unload_for_owner(&mod->image, owner_pid);
+    }
     module_release_record(mod);
     loader_lock_release();
     return TRUE;
@@ -2471,10 +2241,12 @@ void dll_release_process(ULONG owner_pid)
         /* A crashed process must not re-enter arbitrary DllMain cleanup.
          * The caller releases process-owned static TLS explicitly before
          * entering this image teardown path. */
-        if (image_base && synthetic_shim)
+        if (image_base && synthetic_shim) {
+            win32_unpublish_loader_image(owner_pid, image_base);
             pe_free_for_owner(image_base, image_size, owner_pid);
-        else if (image_base)
-            pe_unload(&mod->image);
+        } else if (image_base) {
+            pe_unload_for_owner(&mod->image, owner_pid);
+        }
         module_release_record(mod);
         released++;
     }
@@ -2486,10 +2258,12 @@ void dll_release_process(ULONG owner_pid)
             PVOID image_base = mod->image.ImageBase;
             SIZE_T image_size = mod->image.SizeOfImage;
             BOOL synthetic_shim = mod->synthetic_shim;
-            if (image_base && synthetic_shim)
+            if (image_base && synthetic_shim) {
+                win32_unpublish_loader_image(owner_pid, image_base);
                 pe_free_for_owner(image_base, image_size, owner_pid);
-            else if (image_base)
-                pe_unload(&mod->image);
+            } else if (image_base) {
+                pe_unload_for_owner(&mod->image, owner_pid);
+            }
             module_release_record(mod);
             released++;
         }
@@ -3138,104 +2912,6 @@ static LOADED_MODULE *dll_try_load_from_fs(const char *dll_name)
     return NULL;
 }
 
-/* appUnwindf shim: suppresses the throw from appError.  Logs the
- * caller EIP + first 4 args. appUnwindf is `void appUnwindf(const TCHAR* fmt, ...)`
- * — arg0 is the wide format string, rest are %-conversion targets.
- * Print each arg both as hex and as a wide string (when the pointer is
- * in PE/heap range), so we can see exactly what error the engine is
- * reporting. */
-static uint64_t WINAPI shim_appUnwindf(uint64_t fmt)
-{
-    (void)fmt;
-    extern void serial_puts(const char *);
-    extern void serial_puthex(uint64_t val, int digits);
-    extern void wdbg_print_wide(uint32_t va);
-    extern uint32_t compat32_get_last_caller_eip(void);
-    extern uint32_t compat32_get_last_stack_args(void);
-    static int count = 0;
-    if (++count <= 20) {
-        uint32_t eip  = compat32_get_last_caller_eip();
-        uint32_t sa   = compat32_get_last_stack_args();
-        serial_puts("[APP] appUnwindf suppressed caller=0x");
-        serial_puthex(eip, 8);
-        if (sa >= 0x100000) {
-            const uint32_t *args = (const uint32_t *)(uintptr_t)sa;
-            for (int i = 0; i < 4; i++) {
-                uint32_t v = args[i];
-                serial_puts(" arg");
-                serial_puthex((uint64_t)i, 1);
-                serial_puts("=0x");
-                serial_puthex(v, 8);
-            }
-            serial_puts("\n");
-            /* Decode wide-string args inline. */
-            for (int i = 0; i < 4; i++) {
-                uint32_t v = args[i];
-                if (v >= 0x10000 && v < 0x80000000u) {
-                    serial_puts("  arg");
-                    serial_puthex((uint64_t)i, 1);
-                    serial_puts("=");
-                    wdbg_print_wide(v);
-                    serial_puts("\n");
-                }
-            }
-        } else {
-            serial_puts("\n");
-        }
-    }
-    return 0;
-}
-
-/* appFailAssert shim: log expression+file+line, then suppress.  Caller
- * EIP identifies the engine function whose check() failed. */
-static uint64_t WINAPI shim_appFailAssert(uint64_t expr, uint64_t file, uint64_t line)
-{
-    extern void serial_puts(const char *);
-    extern void serial_puthex(uint64_t val, int digits);
-    extern void serial_putdec(uint64_t val);
-    extern void serial_putchar(char c);
-    extern uint32_t compat32_get_last_caller_eip(void);
-    static int count = 0;
-    if (++count <= 30) {
-        uint32_t eip = compat32_get_last_caller_eip();
-        serial_puts("[ASSERT] caller=0x");
-        serial_puthex(eip, 8);
-        serial_puts(" line=");
-        serial_putdec((uint64_t)(uint32_t)line);
-        if (expr >= 0x100000) {
-            const char *e = (const char *)(uintptr_t)expr;
-            serial_puts(" expr=\"");
-            for (int k = 0; k < 80 && e[k]; k++) serial_putchar(e[k]);
-            serial_puts("\"");
-        }
-        if (file >= 0x100000) {
-            const char *f = (const char *)(uintptr_t)file;
-            serial_puts(" file=\"");
-            for (int k = 0; k < 80 && f[k]; k++) serial_putchar(f[k]);
-            serial_puts("\"");
-        }
-        serial_puts("\n");
-    }
-    /* Return normally — let the engine continue with stale state via
-     * its SEH-unwind path.  Empirically this reaches 10× more INT 0x2E
-     * before terminal crash than aborting here via proc_exit. */
-    return 0;
-}
-
-/* appRequestExit shim: suppresses exit requests from error handlers.
- * After Browse() fails and throw is suppressed, the engine calls
- * appRequestExit(1) which sets GIsRequestingExit=1. The game loop
- * then exits. By suppressing this, the engine stays in its loop. */
-static uint64_t WINAPI shim_appRequestExit(uint64_t force)
-{
-    (void)force;
-    extern void serial_puts(const char *);
-    static int count = 0;
-    if (++count <= 5)
-        serial_puts("[APP] appRequestExit suppressed\n");
-    return 0;
-}
-
 /* ── Master import resolver ────────────────────────────────── */
 
 PVOID dll_resolve_import(const char *dll_name, const char *func_name,
@@ -3248,55 +2924,6 @@ PVOID dll_resolve_import(const char *dll_name, const char *func_name,
     if (shim) {
         PVOID fn = shim(func_name, ordinal, by_ordinal);
         if (fn) return dll_get_shim_export_thunk(shim_name, fn);
-    }
-
-    /* 1b. Function overrides for PE DLL exports.
-     * Must return a 32-bit INT 0x2E thunk (not raw 64-bit ptr) because
-     * Core.dll is NOT a shim DLL — IAT patcher writes addresses directly
-     * without creating thunks. CC_CDECL because appUnwindf is varargs. */
-    if (func_name && dl_strcmp(func_name, "?appUnwindf@@YAXPBGZZ") == 0) {
-        static uint32_t thunk_addr = 0;
-        if (!thunk_addr) {
-            extern uint32_t compat32_make_thunk_ex(uint64_t target,
-                const char *name, uint8_t num_args, uint8_t callconv);
-            thunk_addr = compat32_make_thunk_ex(
-                (uint64_t)(uintptr_t)shim_appUnwindf,
-                "appUnwindf_shim", 1, 1 /* CC_CDECL */);
-            serial_puts("[DLL] appUnwindf thunk at 0x");
-            serial_puthex((uint64_t)thunk_addr, 8);
-            serial_puts("\n");
-        }
-        return (PVOID)(uintptr_t)thunk_addr;
-    }
-    /* appFailAssert: log + suppress (so engine continues past check() */
-    if (func_name && dl_strcmp(func_name, "?appFailAssert@@YAXPBD0H@Z") == 0) {
-        static uint32_t thunk_addr_assert = 0;
-        if (!thunk_addr_assert) {
-            extern uint32_t compat32_make_thunk_ex(uint64_t target,
-                const char *name, uint8_t num_args, uint8_t callconv);
-            thunk_addr_assert = compat32_make_thunk_ex(
-                (uint64_t)(uintptr_t)shim_appFailAssert,
-                "appFailAssert_shim", 3, 1 /* CC_CDECL */);
-            serial_puts("[DLL] appFailAssert thunk at 0x");
-            serial_puthex((uint64_t)thunk_addr_assert, 8);
-            serial_puts("\n");
-        }
-        return (PVOID)(uintptr_t)thunk_addr_assert;
-    }
-    /* appRequestExit: suppress exit after Browse() error */
-    if (func_name && dl_strcmp(func_name, "?appRequestExit@@YAXH@Z") == 0) {
-        static uint32_t thunk_addr2 = 0;
-        if (!thunk_addr2) {
-            extern uint32_t compat32_make_thunk_ex(uint64_t target,
-                const char *name, uint8_t num_args, uint8_t callconv);
-            thunk_addr2 = compat32_make_thunk_ex(
-                (uint64_t)(uintptr_t)shim_appRequestExit,
-                "appRequestExit_shim", 1, 1 /* CC_CDECL */);
-            serial_puts("[DLL] appRequestExit thunk at 0x");
-            serial_puthex((uint64_t)thunk_addr2, 8);
-            serial_puts("\n");
-        }
-        return (PVOID)(uintptr_t)thunk_addr2;
     }
 
     /* 2. Try loaded PE modules */
@@ -3342,20 +2969,6 @@ PVOID dll_resolve_import(const char *dll_name, const char *func_name,
         PVOID fn = dll_resolve_export_any(
             owner_pid, func_name, ordinal, by_ordinal);
         if (fn) return fn;
-    }
-
-    /* 6. UT99 appPow mangling fallback: SoftDrv imports float version
-     *    (?appPow@@YAMMM@Z) but Core.dll exports double version
-     *    (?appPow@@YANNN@Z). Provide a float wrapper. */
-    if (func_name && strcmp(func_name, "?appPow@@YAMMM@Z") == 0) {
-        /* Search for the double version in loaded modules */
-        ULONG owner_pid = dll_current_owner_pid();
-        PVOID fn = dll_resolve_export_any(
-            owner_pid, "?appPow@@YANNN@Z", 0, FALSE);
-        if (fn) {
-            serial_puts("[DLL] appPow float->double redirect\n");
-            return fn;  /* calling convention compatible (cdecl, x87 float promotion) */
-        }
     }
 
 #ifdef PE_LOADER_TRACE

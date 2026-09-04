@@ -285,6 +285,21 @@ static uint64_t osfs3_now(void)
     return ntp_get_utc ? ntp_get_utc() : superblock.create_time;
 }
 
+static void osfs3_preserve_birth_time(osfs3_inode_t *inode)
+{
+    if (!inode || (inode->flags & OSFS3_INODE_FLAG_BTIME_VALID)) return;
+    inode->birth_time = inode->ctime;
+    inode->flags |= OSFS3_INODE_FLAG_BTIME_VALID;
+}
+
+static void osfs3_touch_directory_nolock(osfs3_inode_t *inode)
+{
+    uint64_t now = osfs3_now();
+    osfs3_preserve_birth_time(inode);
+    inode->mtime = now;
+    inode->ctime = now;
+}
+
 static char osfs3_path_fold(char c)
 {
     if (c == '/') return '\\';
@@ -790,6 +805,8 @@ static bool osfs3_recover_lost_directory_nolock(
     inode->nlink = 2;
     inode->size = OSFS3_BLOCK_SIZE;
     inode->atime = inode->mtime = inode->ctime = osfs3_now();
+    inode->birth_time = inode->ctime;
+    inode->flags |= OSFS3_INODE_FLAG_BTIME_VALID;
     inode->extent_count = 1;
     inode->extents[0].start_block = candidate;
     inode->extents[0].block_count = 1;
@@ -1574,6 +1591,8 @@ static uint32_t osfs3_alloc_inode_nolock(uint16_t mode)
         inode->mode = mode;
         inode->nlink = (mode & OSFS3_S_IFMT) == OSFS3_S_IFDIR ? 2 : 1;
         inode->atime = inode->mtime = inode->ctime = osfs3_now();
+        inode->birth_time = inode->ctime;
+        inode->flags |= OSFS3_INODE_FLAG_BTIME_VALID;
         return ino;
     }
     return 0;
@@ -1743,7 +1762,7 @@ static int osfs3_add_dentry_nolock(uint32_t dir_ino, uint32_t target_ino,
                 block, target_ino, name, type);
             if (result < 0) return -1;
             if (!result) {
-                dir->mtime = osfs3_now();
+                osfs3_touch_directory_nolock(dir);
                 return 0;
             }
         }
@@ -1770,7 +1789,7 @@ static int osfs3_add_dentry_nolock(uint32_t dir_ino, uint32_t target_ino,
     entry->type = type;
     memcpy(entry->name, name, entry->name_len);
     dir->size = (uint64_t)(old_blocks + 1U) * OSFS3_BLOCK_SIZE;
-    dir->mtime = osfs3_now();
+    osfs3_touch_directory_nolock(dir);
     if (osfs3_write_block_raw(block, scratch_block) < 0) {
         osfs3_rollback_growth_nolock(dir, &original);
         return -1;
@@ -1809,7 +1828,7 @@ static int osfs3_remove_dentry_nolock(uint32_t dir_ino, const char *name,
         entry->inode = 0;
     }
     if (osfs3_write_block_raw(location.block, scratch_block) < 0) return -1;
-    inode_table[dir_ino].mtime = osfs3_now();
+    osfs3_touch_directory_nolock(&inode_table[dir_ino]);
     if (removed_ino) *removed_ino = ino;
     return 0;
 }
@@ -2053,6 +2072,16 @@ void *osfs3_find_ci(const char *path)
     return result;
 }
 
+void *osfs3_get_node(int inode_index)
+{
+    if (!mounted || inode_index <= 0 ||
+        inode_index >= (int)superblock.total_inodes)
+        return NULL;
+    uint32_t ino = (uint32_t)inode_index;
+    return path_known[ino] && osfs3_inode_valid(ino)
+        ? &inode_table[ino] : NULL;
+}
+
 void *osfs3_get_file(int inode_index)
 {
     if (!mounted || inode_index <= 0 ||
@@ -2147,10 +2176,99 @@ uint32_t osfs3_file_ctime(const void *file)
     return ino > 0 ? (uint32_t)inode_table[ino].ctime : 0;
 }
 
+uint32_t osfs3_file_atime(const void *file)
+{
+    int ino = osfs3_inode_number(file);
+    return ino > 0 ? (uint32_t)inode_table[ino].atime : 0;
+}
+
 uint32_t osfs3_file_mtime(const void *file)
 {
     int ino = osfs3_inode_number(file);
     return ino > 0 ? (uint32_t)inode_table[ino].mtime : 0;
+}
+
+uint64_t osfs3_volume_id(void)
+{
+    osfs3_spin_lock();
+    uint64_t hash = 0;
+    if (mounted) {
+        hash = 14695981039346656037ULL;
+        for (uint32_t i = 0; i < 16; i++) {
+            hash ^= superblock.uuid[i];
+            hash *= 1099511628211ULL;
+        }
+        if (!(uint32_t)hash) hash ^= hash >> 32;
+        if (!hash) hash = 1;
+    }
+    osfs3_spin_unlock();
+    return hash;
+}
+
+uint64_t osfs3_file_id(const void *file)
+{
+    osfs3_spin_lock();
+    int ino = osfs3_inode_number(file);
+    uint64_t id = mounted && ino > 0 &&
+        osfs3_inode_valid((uint32_t)ino) ? (uint64_t)(uint32_t)ino : 0;
+    osfs3_spin_unlock();
+    return id;
+}
+
+int osfs3_file_get_times(void *file, osfs_file_times_t *times)
+{
+    if (!times) return -1;
+    osfs3_spin_lock();
+    int ino = osfs3_inode_number(file);
+    if (!mounted || ino <= 0 || !osfs3_inode_valid((uint32_t)ino)) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+    const osfs3_inode_t *inode = &inode_table[ino];
+    times->creation = (inode->flags & OSFS3_INODE_FLAG_BTIME_VALID)
+        ? inode->birth_time : inode->ctime;
+    times->access = inode->atime;
+    times->modified = inode->mtime;
+    times->changed = inode->ctime;
+    osfs3_spin_unlock();
+    return 0;
+}
+
+int osfs3_file_set_times(void *file, uint32_t mask,
+                         const osfs_file_times_t *times)
+{
+    if (!times || !mask || (mask & ~OSFS_FILE_TIME_MASK)) return -1;
+    osfs3_spin_lock();
+    int ino_number = osfs3_inode_number(file);
+    if (!mounted || ino_number <= 0 ||
+        !osfs3_inode_valid((uint32_t)ino_number)) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+
+    uint32_t ino = (uint32_t)ino_number;
+    osfs3_inode_t *inode = &inode_table[ino];
+    osfs3_inode_t original = *inode;
+    if (mask & OSFS_FILE_TIME_CREATION) {
+        inode->birth_time = times->creation;
+        inode->flags |= OSFS3_INODE_FLAG_BTIME_VALID;
+    }
+    if (mask & OSFS_FILE_TIME_ACCESS) inode->atime = times->access;
+    if (mask & OSFS_FILE_TIME_MODIFIED) inode->mtime = times->modified;
+    if (mask & OSFS_FILE_TIME_CHANGED) inode->ctime = times->changed;
+    if (memcmp(inode, &original, sizeof(*inode)) == 0) {
+        osfs3_spin_unlock();
+        return 0;
+    }
+
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_ACQ_REL);
+    inode->crc32 = 0;
+    int result = osfs3_persist_inode_nolock(ino);
+    if (!result) result = disk_flush();
+    if (result < 0) *inode = original;
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_RELEASE);
+    osfs3_spin_unlock();
+    return result;
 }
 
 uint64_t osfs3_file_revision(const void *file)
@@ -2642,7 +2760,10 @@ int osfs3_set_size_reserved(void *file, uint64_t size)
     __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_ACQ_REL);
     osfs3_inode_t original = *inode;
     inode->size = size;
-    inode->mtime = osfs3_now();
+    uint64_t now = osfs3_now();
+    osfs3_preserve_birth_time(inode);
+    inode->mtime = now;
+    inode->ctime = now;
     inode->crc32 = 0;
     int result = osfs3_persist_inode_nolock(ino);
     if (!result) result = disk_flush();
@@ -2652,8 +2773,10 @@ int osfs3_set_size_reserved(void *file, uint64_t size)
     return result;
 }
 
-int osfs3_write(void *file, uint64_t offset, const void *buf, uint64_t len)
+int osfs3_write_ex(void *file, uint64_t offset, const void *buf, uint64_t len,
+                   uint32_t io_flags)
 {
+    if (io_flags & ~OSFS_IO_FLAG_MASK) return -1;
     osfs3_spin_lock();
     int ino_number = osfs3_inode_number(file);
     if (!mounted || ino_number <= 0 || (!buf && len) ||
@@ -2695,7 +2818,12 @@ int osfs3_write(void *file, uint64_t offset, const void *buf, uint64_t len)
         goto done;
     }
     if (end > inode->size) inode->size = end;
-    inode->mtime = osfs3_now();
+    uint64_t now = osfs3_now();
+    if (!(io_flags & OSFS_IO_PRESERVE_MTIME)) inode->mtime = now;
+    if (!(io_flags & OSFS_IO_PRESERVE_CTIME)) {
+        osfs3_preserve_birth_time(inode);
+        inode->ctime = now;
+    }
     inode->crc32 = 0;
     result = osfs3_persist_file_update_nolock(ino, inode, &original,
                                                relocated);
@@ -2714,8 +2842,14 @@ done:
     return result;
 }
 
-int osfs3_truncate(void *file, uint64_t size)
+int osfs3_write(void *file, uint64_t offset, const void *buf, uint64_t len)
 {
+    return osfs3_write_ex(file, offset, buf, len, 0);
+}
+
+int osfs3_truncate_ex(void *file, uint64_t size, uint32_t io_flags)
+{
+    if (io_flags & ~OSFS_IO_FLAG_MASK) return -1;
     osfs3_spin_lock();
     int ino_number = osfs3_inode_number(file);
     if (!mounted || ino_number <= 0 ||
@@ -2763,7 +2897,12 @@ int osfs3_truncate(void *file, uint64_t size)
         osfs3_release_tail_nolock(inode, (uint32_t)blocks64);
     }
     inode->size = size;
-    inode->mtime = osfs3_now();
+    uint64_t now = osfs3_now();
+    if (!(io_flags & OSFS_IO_PRESERVE_MTIME)) inode->mtime = now;
+    if (!(io_flags & OSFS_IO_PRESERVE_CTIME)) {
+        osfs3_preserve_birth_time(inode);
+        inode->ctime = now;
+    }
     inode->crc32 = 0;
     result = osfs3_persist_file_update_nolock(ino, inode, &original,
                                                relocated);
@@ -2771,6 +2910,11 @@ done:
     __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_RELEASE);
     osfs3_spin_unlock();
     return result;
+}
+
+int osfs3_truncate(void *file, uint64_t size)
+{
+    return osfs3_truncate_ex(file, size, 0);
 }
 
 int osfs3_mkdir(const char *path)
@@ -2928,7 +3072,10 @@ static int osfs3_rename_dentry_in_place_nolock(uint32_t dir_ino,
     memset(entry->name, 0, entry->rec_len - sizeof(*entry));
     entry->name_len = (uint8_t)new_length;
     memcpy(entry->name, new_name, new_length);
-    return osfs3_write_block_raw(location.block, scratch_block);
+    int result = osfs3_write_block_raw(location.block, scratch_block);
+    if (!result)
+        osfs3_touch_directory_nolock(&inode_table[dir_ino]);
+    return result;
 }
 
 static bool osfs3_path_is_descendant_ci(const char *parent, const char *path)
@@ -2995,6 +3142,7 @@ int osfs3_rename(const char *from, const char *to, bool replace)
                 result = 0;
         }
         if (!result) {
+            osfs3_preserve_birth_time(source_inode);
             source_inode->ctime = osfs3_now();
             bool index_ok =
                 osfs3_index_rename_nolock(source, to_parent, to_name) == 0;
@@ -3049,6 +3197,7 @@ int osfs3_rename(const char *from, const char *to, bool replace)
         osfs3_spin_unlock();
         return -1;
     }
+    osfs3_preserve_birth_time(source_inode);
     source_inode->ctime = osfs3_now();
     bool index_ok = true;
     if (target && osfs3_index_remove_nolock(target) < 0) index_ok = false;
@@ -3074,6 +3223,137 @@ int osfs3_rename(const char *from, const char *to, bool replace)
 uint64_t osfs3_get_size(uint32_t ino)
 {
     return mounted && osfs3_inode_valid(ino) ? inode_table[ino].size : 0;
+}
+
+int osfs3_get_mode(uint32_t ino, uint16_t *mode)
+{
+    if (!mode) return -1;
+    osfs3_spin_lock();
+    if (!mounted || !osfs3_inode_valid(ino)) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+    *mode = inode_table[ino].mode;
+    osfs3_spin_unlock();
+    return 0;
+}
+
+int osfs3_set_mode(uint32_t ino, uint16_t mode)
+{
+    if (mode & ~07777U) return -1;
+    osfs3_spin_lock();
+    if (!mounted || !osfs3_inode_valid(ino)) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+
+    osfs3_inode_t *inode = &inode_table[ino];
+    uint16_t updated = (uint16_t)((inode->mode & OSFS3_S_IFMT) | mode);
+    if (updated == inode->mode) {
+        osfs3_spin_unlock();
+        return 0;
+    }
+
+    osfs3_inode_t original = *inode;
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_ACQ_REL);
+    inode->mode = updated;
+    osfs3_preserve_birth_time(inode);
+    inode->ctime = osfs3_now();
+    inode->crc32 = 0;
+    int result = osfs3_persist_inode_nolock(ino);
+    if (!result) result = disk_flush();
+    if (result < 0) *inode = original;
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_RELEASE);
+    osfs3_spin_unlock();
+    return result;
+}
+
+int osfs3_file_get_mode(const void *file, uint16_t *mode)
+{
+    int ino = osfs3_inode_number(file);
+    return ino > 0 ? osfs3_get_mode((uint32_t)ino, mode) : -1;
+}
+
+int osfs3_file_set_mode(void *file, uint16_t mode)
+{
+    int ino = osfs3_inode_number(file);
+    return ino > 0 ? osfs3_set_mode((uint32_t)ino, mode) : -1;
+}
+
+int osfs3_file_get_dos_attributes(const void *file, uint8_t *attributes)
+{
+    if (!attributes) return -1;
+    osfs3_spin_lock();
+    int ino = osfs3_inode_number(file);
+    if (!mounted || ino <= 0 || !osfs3_inode_valid((uint32_t)ino)) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+
+    const osfs3_inode_t *inode = &inode_table[ino];
+    uint8_t value = 0;
+    if (!(inode->mode & 0222U)) value |= OSFS_DOS_ATTR_READ_ONLY;
+    if (inode->flags & OSFS3_INODE_FLAG_DOS_HIDDEN)
+        value |= OSFS_DOS_ATTR_HIDDEN;
+    if (inode->flags & OSFS3_INODE_FLAG_DOS_SYSTEM)
+        value |= OSFS_DOS_ATTR_SYSTEM;
+    if (osfs3_inode_is_file(inode) &&
+        !(inode->flags & OSFS3_INODE_FLAG_DOS_NOARCH))
+        value |= OSFS_DOS_ATTR_ARCHIVE;
+    *attributes = value;
+    osfs3_spin_unlock();
+    return 0;
+}
+
+int osfs3_file_set_dos_attributes(void *file, uint8_t attributes)
+{
+    if (attributes & ~OSFS_DOS_ATTR_MASK) return -1;
+    osfs3_spin_lock();
+    int ino_number = osfs3_inode_number(file);
+    if (!mounted || ino_number <= 0 ||
+        !osfs3_inode_valid((uint32_t)ino_number)) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+
+    uint32_t ino = (uint32_t)ino_number;
+    osfs3_inode_t *inode = &inode_table[ino];
+    uint16_t permissions = inode->mode & 07777U;
+    if (attributes & OSFS_DOS_ATTR_READ_ONLY)
+        permissions &= (uint16_t)~0222U;
+    else if (!(permissions & 0222U))
+        permissions |= 0200U;
+
+    uint32_t flags = inode->flags &
+        ~(OSFS3_INODE_FLAG_DOS_HIDDEN |
+          OSFS3_INODE_FLAG_DOS_SYSTEM |
+          OSFS3_INODE_FLAG_DOS_NOARCH);
+    if (attributes & OSFS_DOS_ATTR_HIDDEN)
+        flags |= OSFS3_INODE_FLAG_DOS_HIDDEN;
+    if (attributes & OSFS_DOS_ATTR_SYSTEM)
+        flags |= OSFS3_INODE_FLAG_DOS_SYSTEM;
+    if (!(attributes & OSFS_DOS_ATTR_ARCHIVE))
+        flags |= OSFS3_INODE_FLAG_DOS_NOARCH;
+
+    uint16_t mode = (uint16_t)((inode->mode & OSFS3_S_IFMT) | permissions);
+    if (mode == inode->mode && flags == inode->flags) {
+        osfs3_spin_unlock();
+        return 0;
+    }
+
+    osfs3_inode_t original = *inode;
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_ACQ_REL);
+    inode->mode = mode;
+    inode->flags = flags;
+    osfs3_preserve_birth_time(inode);
+    inode->ctime = osfs3_now();
+    inode->crc32 = 0;
+    int result = osfs3_persist_inode_nolock(ino);
+    if (!result) result = disk_flush();
+    if (result < 0) *inode = original;
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_RELEASE);
+    osfs3_spin_unlock();
+    return result;
 }
 
 bool osfs3_is_mounted(void)

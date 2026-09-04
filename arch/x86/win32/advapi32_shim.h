@@ -1,11 +1,8 @@
 /*
  * OsitoK Windows Compatibility Layer — advapi32.dll Shim
  *
- * Provides Registry API (RegOpenKeyEx, RegQueryValueEx, etc.)
- * backed by a simple in-memory key-value store.
- *
- * UT99 reads registry for install path, CD key, and configuration.
- * We pre-populate keys with sensible defaults.
+ * Provides Registry API (RegOpenKeyEx, RegQueryValueEx, etc.) backed by a
+ * kernel-global cache and a persistent, versioned OsitoFS hive.
  */
 
 #ifndef ADVAPI32_SHIM_H
@@ -62,6 +59,7 @@ typedef HCRYPTPROV *PHCRYPTPROV;
 #define ERROR_FILE_NOT_FOUND        2
 #define ERROR_ACCESS_DENIED          5
 #define ERROR_INVALID_HANDLE         6
+#define ERROR_NOT_ENOUGH_MEMORY      8
 #define ERROR_INVALID_PARAMETER      87
 #define ERROR_MORE_DATA             234
 #define ERROR_NO_MORE_ITEMS         259
@@ -80,6 +78,7 @@ LONG WINAPI RegQueryValueExA(HKEY hKey, PCSTR lpValueName, DWORD *lpReserved,
 LONG WINAPI RegSetValueExA(HKEY hKey, PCSTR lpValueName, DWORD Reserved,
                            DWORD dwType, const BYTE *lpData, DWORD cbData);
 LONG WINAPI RegCloseKey(HKEY hKey);
+LONG WINAPI RegFlushKey(HKEY hKey);
 LONG WINAPI RegDeleteValueA(HKEY hKey, PCSTR lpValueName);
 LONG WINAPI RegDeleteKeyA(HKEY hKey, PCSTR lpSubKey);
 LONG WINAPI RegDeleteKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD samDesired,
@@ -134,6 +133,7 @@ LONG WINAPI RegDeleteKeyExW(HKEY hKey, PCWSTR lpSubKey, DWORD samDesired,
  * registry path (e.g. "hklm\\software\\app"). Used by the MSI Registry table. */
 void advapi32_reg_install_set(const char *path_lc_backslash, const char *name,
                              DWORD type, const void *data, DWORD len);
+void advapi32_registry_flush(void);
 
 /* Legacy CryptoAPI provider contexts. The current provider surface supports
  * random generation and keeps contexts isolated by Win32 process. */
@@ -147,6 +147,8 @@ BOOL WINAPI CryptGenRandom(HCRYPTPROV provider, DWORD length, BYTE *buffer);
 BOOL WINAPI CryptReleaseContext(HCRYPTPROV provider, DWORD flags);
 DWORD advapi32_crypto_release_process(DWORD process_id);
 int advapi32_registry_selftest(void);
+void WINAPI MapGenericMask(DWORD *access_mask,
+                           const GENERIC_MAPPING *generic_mapping);
 
 /* ── Shim init / resolve ───────────────────────────────────── */
 

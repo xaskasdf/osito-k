@@ -1,0 +1,26 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+    AddVectoredExceptionHandler
+    CloseHandle
+    CreateProcessA
+    CreateThread
+    DebugBreak
+    EnterCriticalSection
+    ExitProcess
+    FreeLibrary
+    GetCommandLineA
+    GetCurrentThreadId
+    GetExitCodeProcess
+    GetProcessHeap
+    GetStdHandle
+    LoadLibraryA
+    LeaveCriticalSection
+    RaiseException
+    RemoveVectoredExceptionHandler
+    RtlAddFunctionTable
+    RtlDeleteFunctionTable
+    RtlLookupFunctionEntry
+    Sleep
+    TryEnterCriticalSection
+    WaitForSingleObject
+    WriteFile

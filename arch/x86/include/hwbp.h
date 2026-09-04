@@ -12,6 +12,7 @@
 
 #include "types.h"
 #include "stdint.h"
+#include "interrupt.h"
 
 typedef enum {
     HWBP_EXECUTE    = 0,   /* Break on instruction fetch at addr */
@@ -47,8 +48,7 @@ void hwbp_clear_all(void);
 
 /* Called from #DB handler. Returns true if the exception was a HWBP
  * hit (and was handled). */
-struct interrupt_frame;
-bool hwbp_dispatch(struct interrupt_frame *frame);
+bool hwbp_dispatch(x86_interrupt_frame_t *frame);
 
 /* Shell helpers. */
 void hwbp_list(void);

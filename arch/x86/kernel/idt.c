@@ -13,7 +13,11 @@
 #include "../include/paging.h"
 #include "../include/interrupt.h"
 #include "../include/cpu_features.h"
+#include "../include/hwbp.h"
+#include "../include/audio_sched.h"
 #include "../win32/compat32.h"
+#include "../win32/kernel32_shim.h"
+#include "../win32/unwind64.h"
 #include "smp.h"
 
 /* ── External functions ──────────────────────────────────────── */
@@ -58,36 +62,6 @@ static bool debug_read_u64_in_cr3(uint64_t cr3, uint64_t virt,
         *value = *(volatile uint64_t *)PHYS_TO_VIRT(phys);
     if (phys_out)
         *phys_out = phys;
-    return true;
-}
-
-static bool current_win32_exe_is(const char *wanted)
-{
-    extern const char *win32_current_exe_name(void);
-    const char *name = win32_current_exe_name();
-    const char *base = name;
-
-    if (!name || !wanted) return false;
-    for (const char *p = name; *p; p++)
-        if (*p == '\\' || *p == '/') base = p + 1;
-
-    while (*base && *wanted) {
-        char a = *base++;
-        char b = *wanted++;
-        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
-        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
-        if (a != b) return false;
-    }
-    return *base == 0 && *wanted == 0;
-}
-
-static bool current_cr3_range_is_mapped(uint64_t address, uint64_t size)
-{
-    uint64_t cr3;
-    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-    for (uint64_t offset = 0; offset < size; offset += 4096)
-        if (paging_translate_in_cr3(cr3, address + offset) == UINT64_MAX)
-            return false;
     return true;
 }
 
@@ -149,7 +123,6 @@ static void compat32_wait_for_write_retry(uint64_t address)
  * faults are routed to SEH. Only kernel/bootstrap code may temporarily enable
  * write-through, then #DB restores the guard flags. */
 volatile int g_null_page_dirty = 0;
-uint32_t g_base_seh_frame_addr = 0;  /* winexec base SEH frame on PE32 stack */
 
 /* NULL-page cleanup after the narrow kernel/bootstrap write-through path.
  *
@@ -227,17 +200,35 @@ static void compat32_apply_cpu_context(interrupt_frame_t *frame,
                     ((uint64_t)context->eflags & mutable_eflags);
 }
 
+static NTSTATUS win32_exception_code_for_vector(uint64_t vector)
+{
+    switch (vector) {
+    case 0:  return EXCEPTION_INT_DIVIDE_BY_ZERO;
+    case 3:  return EXCEPTION_BREAKPOINT;
+    case 4:  return EXCEPTION_INT_OVERFLOW;
+    case 5:  return EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
+    case 6:  return EXCEPTION_ILLEGAL_INSTRUCTION;
+    case 13:
+    case 14: return EXCEPTION_ACCESS_VIOLATION;
+    default: return STATUS_SUCCESS;
+    }
+}
+
 /* NT delivers user-mode CPU faults to SEH before treating them as process
  * crashes. HotSpot relies on this for safepoint polling pages, where a
  * protection fault is expected control flow. Return 1 when SEH handled the
  * exception, 0 when it was unhandled, and -1 for unsupported vectors. */
 static int compat32_dispatch_cpu_exception(interrupt_frame_t *frame,
-                                           uint64_t vector)
+                                           uint64_t vector,
+                                           NTSTATUS *status_out)
 {
     uint16_t cs = (uint16_t)(frame->cs & 0xFFFF);
-    if ((cs != 0x40 && cs != 0x23) ||
-        (vector != 6 && vector != 13 && vector != 14))
+    NTSTATUS status = win32_exception_code_for_vector(vector);
+    if ((cs != 0x40 && cs != 0x23) || status == STATUS_SUCCESS)
         return -1;
+
+    if (status_out)
+        *status_out = status;
 
     typedef struct {
         uint32_t ExceptionCode;
@@ -254,22 +245,23 @@ static int compat32_dispatch_cpu_exception(interrupt_frame_t *frame,
         ((uint32_t *)&record)[i] = 0;
 
     uint64_t fault_address = 0;
+    uint32_t exception_address = (uint32_t)frame->rip;
+    if (vector == 3 && exception_address)
+        exception_address--;
+
+    record.ExceptionCode = status;
     if (vector == 14) {
         __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_address));
         if (fault_address < 0x1000 && !(frame->error_code & 16) &&
             cs != 0x40)
             return -1;
-        record.ExceptionCode = 0xC0000005; /* STATUS_ACCESS_VIOLATION */
         record.NumberParameters = 2;
         record.ExceptionInformation[0] =
-            (frame->error_code & 2) ? 1 : 0;
+            (frame->error_code & 16) ? 8 :
+            ((frame->error_code & 2) ? 1 : 0);
         record.ExceptionInformation[1] = (uint32_t)fault_address;
-    } else if (vector == 6) {
-        record.ExceptionCode = 0xC000001D; /* STATUS_ILLEGAL_INSTRUCTION */
-    } else {
-        record.ExceptionCode = 0xC0000005; /* STATUS_ACCESS_VIOLATION */
     }
-    record.ExceptionAddress = (uint32_t)frame->rip;
+    record.ExceptionAddress = exception_address;
 
     uint16_t seg_ds, seg_es, seg_fs, seg_gs;
     __asm__ volatile ("movw %%ds, %0" : "=r"(seg_ds));
@@ -285,7 +277,7 @@ static int compat32_dispatch_cpu_exception(interrupt_frame_t *frame,
         .edi = (uint32_t)frame->rdi,
         .ebp = (uint32_t)frame->rbp,
         .esp = (uint32_t)frame->rsp,
-        .eip = (uint32_t)frame->rip,
+        .eip = exception_address,
         .eflags = (uint32_t)frame->rflags,
         .seg_cs = (uint32_t)frame->cs,
         .seg_ss = (uint32_t)frame->ss,
@@ -301,29 +293,8 @@ static int compat32_dispatch_cpu_exception(interrupt_frame_t *frame,
     if (!compat32_seh_dispatch_cpu((PEXCEPTION_RECORD)&record, &context))
         return 0;
 
-    extern uint32_t g_compat32_unwind_eip;
-    extern uint32_t g_compat32_unwind_esp;
-    extern uint32_t g_compat32_unwind_ebp;
-    if (g_compat32_unwind_eip) {
-        frame->rip = g_compat32_unwind_eip;
-        frame->rsp = g_compat32_unwind_esp;
-        frame->rbp = g_compat32_unwind_ebp;
-        extern uint32_t g_compat32_unwind_restore_nonvolatile;
-        if (g_compat32_unwind_restore_nonvolatile) {
-            extern uint32_t g_compat32_unwind_ebx;
-            extern uint32_t g_compat32_unwind_esi;
-            extern uint32_t g_compat32_unwind_edi;
-            frame->rbx = g_compat32_unwind_ebx;
-            frame->rsi = g_compat32_unwind_esi;
-            frame->rdi = g_compat32_unwind_edi;
-            g_compat32_unwind_restore_nonvolatile = 0;
-        }
-        g_compat32_unwind_eip = 0;
-        g_compat32_unwind_esp = 0;
-        g_compat32_unwind_ebp = 0;
-    } else {
-        compat32_apply_cpu_context(frame, &context);
-    }
+    (void)compat32_apply_pending_unwind(&context);
+    compat32_apply_cpu_context(frame, &context);
 
     if (vector == 14 && fault_address >= 0x1000 &&
         (frame->error_code & 3) == 3 &&
@@ -331,6 +302,144 @@ static int compat32_dispatch_cpu_exception(interrupt_frame_t *frame,
         compat32_wait_for_write_retry(fault_address);
 
     return 1;
+}
+
+static void win64_context_from_frame(CONTEXT *context,
+                                     const interrupt_frame_t *frame,
+                                     uint64_t instruction_pointer)
+{
+    BYTE *bytes = (BYTE *)context;
+    for (SIZE_T i = 0; i < sizeof(*context); i++)
+        bytes[i] = 0;
+
+    context->ContextFlags = CONTEXT_FULL;
+    __asm__ volatile ("stmxcsr %0" : "=m"(context->MxCsr));
+    __asm__ volatile ("movw %%ds, %0" : "=r"(context->SegDs));
+    __asm__ volatile ("movw %%es, %0" : "=r"(context->SegEs));
+    __asm__ volatile ("movw %%fs, %0" : "=r"(context->SegFs));
+    __asm__ volatile ("movw %%gs, %0" : "=r"(context->SegGs));
+    context->SegCs = (WORD)frame->cs;
+    context->SegSs = (WORD)frame->ss;
+    context->EFlags = (DWORD)frame->rflags;
+    context->Rax = frame->rax;
+    context->Rcx = frame->rcx;
+    context->Rdx = frame->rdx;
+    context->Rbx = frame->rbx;
+    context->Rsp = frame->rsp;
+    context->Rbp = frame->rbp;
+    context->Rsi = frame->rsi;
+    context->Rdi = frame->rdi;
+    context->R8 = frame->r8;
+    context->R9 = frame->r9;
+    context->R10 = frame->r10;
+    context->R11 = frame->r11;
+    context->R12 = frame->r12;
+    context->R13 = frame->r13;
+    context->R14 = frame->r14;
+    context->R15 = frame->r15;
+    context->Rip = instruction_pointer;
+}
+
+static void win64_apply_cpu_context(interrupt_frame_t *frame,
+                                    const CONTEXT *context)
+{
+    const uint64_t mutable_rflags = 0x00250DD5ULL;
+    frame->rax = context->Rax;
+    frame->rcx = context->Rcx;
+    frame->rdx = context->Rdx;
+    frame->rbx = context->Rbx;
+    frame->rsp = context->Rsp;
+    frame->rbp = context->Rbp;
+    frame->rsi = context->Rsi;
+    frame->rdi = context->Rdi;
+    frame->r8 = context->R8;
+    frame->r9 = context->R9;
+    frame->r10 = context->R10;
+    frame->r11 = context->R11;
+    frame->r12 = context->R12;
+    frame->r13 = context->R13;
+    frame->r14 = context->R14;
+    frame->r15 = context->R15;
+    frame->rip = context->Rip;
+    frame->rflags = (frame->rflags & ~mutable_rflags) |
+                    ((uint64_t)context->EFlags & mutable_rflags);
+}
+
+/* PE64 exceptions follow NT ordering: VEH first, frame handlers second, and
+ * the process-level unhandled filter only after both searches decline. */
+static int win64_dispatch_cpu_exception(interrupt_frame_t *frame,
+                                        uint64_t vector,
+                                        NTSTATUS *status_out)
+{
+    NTSTATUS status = win32_exception_code_for_vector(vector);
+    if ((frame->cs & 0xFFFF) != GDT_SEL_CODE64 ||
+        status == STATUS_SUCCESS)
+        return -1;
+
+    uint64_t exception_address = frame->rip;
+    if (vector == 3) {
+        if (!exception_address)
+            return -1;
+        exception_address--;
+    }
+    if (!win32_user_range_executable(
+            (const void *)(ULONG_PTR)exception_address, 1, FALSE))
+        return -1;
+
+    if (status_out)
+        *status_out = status;
+
+    EXCEPTION_RECORD record;
+    BYTE *record_bytes = (BYTE *)&record;
+    for (SIZE_T i = 0; i < sizeof(record); i++)
+        record_bytes[i] = 0;
+    record.ExceptionCode = status;
+    record.ExceptionAddress = (PVOID)(ULONG_PTR)exception_address;
+    if (vector == 14) {
+        uint64_t fault_address;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_address));
+        record.NumberParameters = 2;
+        record.ExceptionInformation[0] =
+            (frame->error_code & 16) ? 8 :
+            ((frame->error_code & 2) ? 1 : 0);
+        record.ExceptionInformation[1] = fault_address;
+    }
+
+    CONTEXT context;
+    win64_context_from_frame(&context, frame, exception_address);
+    LONG disposition =
+        kernel32_dispatch_vectored_exception(&record, &context);
+    if (disposition == EXCEPTION_CONTINUE_EXECUTION) {
+        win64_apply_cpu_context(frame, &context);
+        return 1;
+    }
+
+    NTSTATUS seh_status =
+        win32_unwind64_dispatch_exception(&record, &context);
+    if (seh_status == STATUS_SUCCESS) {
+        win64_apply_cpu_context(frame, &context);
+        return 1;
+    }
+    if (seh_status != STATUS_UNHANDLED_EXCEPTION) {
+        if (status_out) *status_out = seh_status;
+        return 0;
+    }
+
+    PVOID filter = kernel32_get_unhandled_exception_filter();
+    if (filter && win32_user_range_executable(filter, 1, FALSE)) {
+        EXCEPTION_POINTERS pointers = {
+            .ExceptionRecord = &record,
+            .ContextRecord = &context,
+        };
+        typedef LONG (WINAPI *top_level_filter_fn)(PEXCEPTION_POINTERS);
+        disposition = ((top_level_filter_fn)filter)(&pointers);
+        if (disposition == EXCEPTION_CONTINUE_EXECUTION) {
+            win64_apply_cpu_context(frame, &context);
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 /* ── ISR stub declarations (defined in isr_stubs.S) ──────────── */
@@ -562,16 +671,9 @@ uint64_t *tss_ist2_ptr;  /* = &kernel_tss.ist2, for DOS INT stubs */
 uint64_t *tss_ist3_ptr;  /* = &kernel_tss.ist3, process-owned fault stack */
 
 /* IST1 stack for INT 0x2E — 1MB.
- * int2e_stub.S reserves 16KB per nest (subq $16384). UT99's C++ EH
- * unwind chain re-throws DEEPLY during the boot exception storm (the
- * FName/package recovery throws ~30 C++ exceptions, several nesting via
- * appUnwindf re-throw) → that many nested INT 0x2E entries. 256KB at
- * 32KB/level = only 8 levels: deeper storms walked IST1 BELOW this array
- * into kernel BSS/.text and corrupted it → flaky boot #UD / wild kernel
- * write (CR2 in the kernel-image range, RSP pointing into .text). Adding
- * unrelated kernel BSS shifted what got clobbered and made it
- * deterministic. 1MB at 16KB/level = 64 nesting levels with ample
- * per-level headroom (the kernel call chain per level is ~1-3KB). */
+ * int2e_stub.S reserves 16KB per nested transition. This supports 64 levels
+ * of callback and exception re-entry while retaining ample headroom for the
+ * 1-3KB kernel call chain at each level. */
 #define IST1_STACK_SIZE 1048576
 uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
 
@@ -718,6 +820,11 @@ void x86_tss_reset_ist1(void)
     kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
 }
 
+void x86_tss_reset_ist2(void)
+{
+    kernel_tss.ist2 = (uint64_t)(ist2_stack + IST2_STACK_SIZE);
+}
+
 void x86_tss_reset_ist3(void)
 {
     kernel_tss.ist3 = (uint64_t)(ist3_stack + IST3_STACK_SIZE);
@@ -785,26 +892,12 @@ void idt_set_current_apic_id(uint32_t apic_id)
  */
 void idt_watch_write4(void *addr)
 {
-    uint64_t a = (uint64_t)addr;
-    __asm__ volatile ("mov %0, %%dr0" : : "r"(a));
-    __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
-    /* DR7: L0=1, RW0=01 (write), LEN0=11 (4 bytes) */
-    uint64_t dr7 = (1ULL << 0) | (1ULL << 16) | (3ULL << 18);
-    __asm__ volatile ("mov %0, %%dr7" : : "r"(dr7));
-    serial_puts("[IDT] Watchpoint on 0x");
-    serial_puthex(a, 16);
-    serial_puts("\n");
+    hwbp_set(0, (uint64_t)addr, HWBP_WRITE, HWBP_LEN_4, "idt-write4");
 }
 
 void idt_break_exec(uint64_t addr)
 {
-    __asm__ volatile ("mov %0, %%dr0" : : "r"(addr));
-    __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
-    /* DR7: L0=1, RW0=00 (exec), LEN0=00 (1 byte) */
-    __asm__ volatile ("mov %0, %%dr7" : : "r"((uint64_t)(1ULL << 0)));
-    serial_puts("[IDT] Exec BP at 0x");
-    serial_puthex(addr, 8);
-    serial_puts("\n");
+    hwbp_set(0, addr, HWBP_EXECUTE, HWBP_LEN_1, "idt-exec");
 }
 
 volatile uint32_t *idt_get_apic_base(void) { return apic_base; }
@@ -841,6 +934,7 @@ uint32_t g_swbreak_addr = 0;
 void isr_handler(interrupt_frame_t *frame)
 {
     uint64_t vec = frame->vector;
+    NTSTATUS win32_exception_status = STATUS_SUCCESS;
 
     /* Report fpu_state_ptr corruption (detected by isr_common guard) */
     {
@@ -859,35 +953,40 @@ void isr_handler(interrupt_frame_t *frame)
         }
     }
 
+    /* Native DPMI clients run at CPL3. Privileged port I/O and virtual IF
+     * instructions intentionally fault for host emulation; selector faults
+     * may be repaired after a client edits its LDT. */
+    if (vec == 13) {
+        extern int dos_native_handle_privileged_fault(
+            x86_interrupt_frame_t *frame);
+        extern int dos_native_refresh_selector(uint16_t error_code);
+        if (dos_native_handle_privileged_fault(frame) ||
+            dos_native_refresh_selector((uint16_t)frame->error_code))
+            return;
+    }
+
 #ifdef COMPAT_TRACE
     /* Panorama probe: any exception taken while RSP lies inside IST1 (Win32
      * INT 0x2E) or IST2 (DOS native INTs). A hit on a page fault here is the
      * single line that confirms risk #3 (lower-half identity map dropped
      * in commit f8bd01c) is actually biting inside compat dispatch.
      *
-     * Also covers DOS-native faults when RSP is OUTSIDE both IST windows —
-     * DOOM occasionally faults with its own SS:RSP active, in which case
-     * neither IST zone matches but we still want the surgical emulator
-     * (and the long-jump recovery) to run. The "_dos_active" guard lets
-     * the block enter when a DOS native session is in flight. */
+     * Also covers DOS-native faults when RSP is outside both IST windows.
+     * Session state, rather than a particular selector layout, determines
+     * whether descriptor refresh and shell recovery apply. */
     if (vec < 32) {
         extern uint8_t ist1_stack[];
         extern uint8_t ist2_stack[];
         extern uint64_t *dos_native_exit_jmpbuf;
+        extern int dos_native_session_active(void);
         uint64_t _sp = frame->rsp;
         uint64_t _i1 = (uint64_t)ist1_stack;
         uint64_t _i2 = (uint64_t)ist2_stack;
         const char *_zone = 0;
         if (_sp >= _i1 && _sp < _i1 + 65536)      _zone = "IST1";
         else if (_sp >= _i2 && _sp < _i2 + 32768) _zone = "IST2";
-        /* DOS-active: any LDT-CS fault, OR a fault from one of the
-         * DOS4GW GDT aliases (sel 0x18 / 0x20) we install in DOS-native
-         * mode. Without the GDT-alias arm the emulator wouldn't run for
-         * code that DOS4GW transitioned into via `LJMPW $0x18:$N`. */
-        uint16_t _cs16 = (uint16_t)frame->cs;
         int _dos_active = (dos_native_exit_jmpbuf != 0)
-                       && ((frame->cs & 0x04) ||
-                           _cs16 == 0x18 || _cs16 == 0x20);
+                       && dos_native_session_active();
         if (!_zone && _dos_active) _zone = "DOS";
         if (_zone) {
             /* Rate-limit: when the same RIP keeps faulting (e.g. a
@@ -919,10 +1018,9 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts(" cs=0x"); serial_puthex(frame->cs & 0xFFFF, 4);
             serial_puts("\n");
 
-            /* For DOS native faults with CS = LDT sel, delegate to the
-             * DOS layer to dump the instruction bytes AND the caller's
-             * stack top so we can see who CALL-FAR'd into the bad RIP. */
-            if (frame->cs & 0x04) {
+            /* Resolve CS and SS through the client's current descriptor
+             * tables so diagnostics work for either GDT or LDT selectors. */
+            if (_dos_active) {
                 extern void dos_native_dump_rip(uint16_t cs, uint32_t rip,
                                                 uint16_t ss_hint,
                                                 uint64_t frame_rsp);
@@ -934,16 +1032,9 @@ void isr_handler(interrupt_frame_t *frame)
         pf_ist_skip_log:
             (void)_verbose_pf;
 
-            /* DOS-native #DB (vec=1) recovery: DOOM does
-             *   POPF; INT 21h; PUSHF
-             * with TF=1 in the popped flags. After the INT handler's
-             * IRETQ restores TF, the next instruction triggers a
-             * single-step #DB. We don't have a userspace debugger
-             * attached to DOOM, so just clear TF in the saved RFLAGS
-             * and resume — DOOM keeps running without spurious traps.
-             * Also clear DR6 single-step bit so a subsequent debug
-             * exception doesn't latch on stale state. */
-            if (vec == 1 && (frame->cs & 0x04) /* DOS-native code */) {
+            /* The native backend has no protected-mode debugger endpoint.
+             * Consume a client single-step request and clear its DR6 state. */
+            if (vec == 1 && _dos_active) {
                 frame->rflags &= ~(uint64_t)0x100;  /* TF off */
                 uint64_t dr6 = 0xFFFF0FF0; /* clear B0-B3, BS, BT */
                 __asm__ volatile ("mov %0, %%dr6" :: "r"(dr6));
@@ -953,40 +1044,16 @@ void isr_handler(interrupt_frame_t *frame)
                 return;
             }
 
-            /* DOS4GW surgical recovery — try LRETW software emulation
-             * first (keeps current CS, rewrites RIP to target linear),
-             * then fall back to descriptor promote+retry. Accept LDT
-             * selectors AND the DOS4GW GDT aliases at sel 0x18 / 0x20. */
-            if (vec == 13 && ((frame->cs & 0x04) ||
-                              _cs16 == 0x18 || _cs16 == 0x20)) {
-                extern int dos_native_emulate_lretw(void *frame);
-                if (dos_native_emulate_lretw(frame)) {
-                    return;  /* iretq will land at emulated target */
-                }
-                extern int dos_native_promote_to_code(uint16_t sel);
-                if ((frame->error_code & 0x04) &&
-                    dos_native_promote_to_code((uint16_t)frame->error_code)) {
-                    serial_puts("[pf-ist] promoted sel 0x");
-                    serial_puthex(frame->error_code & 0xFFFF, 4);
-                    serial_puts(" DATA→CODE, resuming\n");
-                    return;  /* retry faulting instruction */
-                }
-            }
-
-            /* If a DOS native program faulted (LDT-CS, DOS4GW GDT
-             * alias, or running on IST2), long-jump back to the shell
-             * instead of halting. Restores kernel CR3 + GDTR. */
-            if ((frame->cs & 0x04) || _cs16 == 0x18 || _cs16 == 0x20
-                || (_zone && _zone[3] == '2')) {
-                extern uint64_t *dos_native_exit_jmpbuf;
-                extern uint64_t paging_get_kernel_cr3(void);
+            /* A fault that cannot be reflected or repaired terminates only
+             * the active DOS session and restores the host machine state. */
+            if (_dos_active) {
+                extern void dos_native_cleanup_active(void);
                 extern void kern_longjmp(uint64_t *buf, int val);
                 if (dos_native_exit_jmpbuf) {
                     serial_puts("[DOS-NT] crash -> long-jump to shell\n");
-                    uint64_t kcr3 = paging_get_kernel_cr3();
-                    if (kcr3) __asm__ volatile ("mov %0, %%cr3"
-                                                 :: "r"(kcr3) : "memory");
                     idt_diag_flush("dos-crash-recover");
+                    dos_native_cleanup_active();
+                    __asm__ volatile ("cli" ::: "memory");
                     kern_longjmp(dos_native_exit_jmpbuf, 2);
                 }
             }
@@ -1015,440 +1082,20 @@ void isr_handler(interrupt_frame_t *frame)
             serial_putdec(exc_count);
             serial_puts("\n");
         }
-        /* STALE-PTR detector: if user-mode code jumped to 0xDEADC0DE
-         * (our VirtualFree MEM_RELEASE tombstone pattern) it means a
-         * pointer that lived inside a freed VA range was read AFTER
-         * the free and used as a code/data pointer.  Logs the calling
-         * context so we know who held the stale ref. */
-        uint32_t rip32 = (uint32_t)frame->rip;
-        if (rip32 == 0xDEADC0DE) {
-            static int stale_count = 0;
-            stale_count++;
-            if (stale_count <= 10) {
-                uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                serial_puts("[STALE-PTR] call/jmp -> 0xDEADC0DE (freed mem) #");
-                serial_putdec(stale_count);
-                serial_puts(" retaddr=0x");
-                serial_puthex((uint64_t)sp[0], 8);
-                serial_puts(" EBP=0x");
-                serial_puthex((uint32_t)frame->rbp, 8);
-                serial_puts(" ESI=0x");
-                serial_puthex((uint32_t)frame->rsi, 8);
-                serial_puts("\n");
-            }
-        } else if (vec == 5) {
-            /* #BR Bound Range in compat32: engine jumped into data (the
-             * byte at RIP is 0x62 = BOUND opcode, but it's actually a
-             * UTF-16 ASCII char or similar data).  This always means
-             * deep state corruption — the engine's vtable/fn-ptr was
-             * pointing to a data buffer.  Skip the chaotic crash dump
-             * and exit the PE process cleanly. */
-            extern void proc_exit(int32_t code);
-            static int br_count = 0;
-            if (++br_count <= 3) {
-                serial_puts("[BR] compat32 #BR at RIP=0x");
-                serial_puthex(rip32, 8);
-                serial_puts(" — proc_exit\n");
-            }
-            proc_exit(0xC0000026 /* STATUS_INVALID_PARAMETER_5 */);
-            /* unreachable */
-        } else if (vec == 14) {
-            /* Data deref of a tombstoned value: CR2 == 0xDEADC0DE
-             * (the engine treated a freed-range word as a pointer). */
-            uint64_t cr2;
-            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-            if ((uint32_t)cr2 == 0xDEADC0DE) {
-                static int stale_deref = 0;
-                stale_deref++;
-                if (stale_deref <= 10) {
-                    serial_puts("[STALE-PTR] deref of 0xDEADC0DE at RIP=0x");
-                    serial_puthex(rip32, 8);
-                    serial_puts(" #");
-                    serial_putdec(stale_deref);
-                    serial_puts("\n");
-                }
-            }
-            /* NX-execute fault in Win32 VA range: engine called through
-             * a function pointer that landed in a non-executable heap
-             * page.  Dump the IAT slot at Engine.dll +0x2A5E08 = the
-             * `UObject::StaticLoadClass` import, which is the value the
-             * 0x103887C0 function loads into EBX and calls.  If the IAT
-             * slot still points to a valid Core.dll .text addr, EBX got
-             * clobbered USER-SIDE between the first and second call —
-             * a virtual call through a corrupt vtable picked a non-ABI-
-             * compliant callee that didn't preserve EBX. */
-            uint32_t err_iexec = (frame->error_code & 0x10);
-            if (err_iexec && rip32 >= 0x40000000 && rip32 < 0x80000000) {
-                static int iat_dump_count = 0;
-                iat_dump_count++;
-                if (iat_dump_count <= 3) {
-                    volatile uint32_t *iat = (volatile uint32_t *)
-                        (uintptr_t)0x105A5E08;
-                    serial_puts("[IAT-PROBE] *0x105A5E08=0x");
-                    serial_puthex((uint32_t)*iat, 8);
-                    serial_puts(" (StaticLoadClass — expected Core.dll .text)");
-                    if ((uint32_t)*iat >= 0x10100000 && (uint32_t)*iat < 0x10300000) {
-                        serial_puts(" -> IAT OK, EBX clobbered USER-SIDE");
-                    } else {
-                        serial_puts(" -> IAT IS CORRUPT");
-                    }
-                    serial_puts("\n");
-                }
-            }
-        }
-    }
-
-    /* UT99-specific recovery for attempts to execute invalid bytecode as
-     * native instructions. Other PE32 programs legitimately load modules and
-     * JIT code above 0x20000000; their faults must reach the SEH dispatcher. */
-    extern int g_compat32_ut99;
-    if ((frame->cs & 0xFFFF) == 0x40 &&
-        g_compat32_ut99 && vec == 6 &&
-        (frame->rip < 0x10000000 || frame->rip >= 0x20000000)) {
-        static int bytecode_fix_count = 0;
-        bytecode_fix_count++;
-        if (bytecode_fix_count <= 10) {
-            serial_puts("[UD-FIX] RIP=0x");
-            serial_puthex((uint32_t)frame->rip, 8);
-            serial_puts(" #");
-            serial_putdec(bytecode_fix_count);
-            serial_puts("\n");
-            /* Full diagnostic for first hit */
-            if (bytecode_fix_count == 1) {
-                serial_puts("  EAX=0x"); serial_puthex((uint32_t)frame->rax, 8);
-                serial_puts(" EBX=0x"); serial_puthex((uint32_t)frame->rbx, 8);
-                serial_puts(" ECX=0x"); serial_puthex((uint32_t)frame->rcx, 8);
-                serial_puts(" EDX=0x"); serial_puthex((uint32_t)frame->rdx, 8);
-                serial_puts("\n  ESI=0x"); serial_puthex((uint32_t)frame->rsi, 8);
-                serial_puts(" EDI=0x"); serial_puthex((uint32_t)frame->rdi, 8);
-                serial_puts(" EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
-                serial_puts(" ESP=0x"); serial_puthex((uint32_t)frame->rsp, 8);
-                uint32_t iat_val = *(volatile uint32_t *)(uintptr_t)0x105A5E08;
-                serial_puts("\n  IAT[5E08]=0x"); serial_puthex(iat_val, 8);
-                uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                serial_puts(" retaddr=0x"); serial_puthex(sp[0], 8);
-                if (sp[0] > 0x10000000 && sp[0] < 0x20000000) {
-                    uint8_t *caller = (uint8_t *)(uintptr_t)(sp[0] - 8);
-                    serial_puts("\n  caller: ");
-                    for (int bi = 0; bi < 12; bi++) {
-                        serial_puthex(caller[bi], 2);
-                        serial_puts(" ");
-                    }
-                }
-                serial_puts("\n");
-            }
-        }
-        uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-        frame->rip = sp32[0];
-        frame->rsp += 4;
-        frame->rax = 0;
-        return;
     }
 
     /* #BP (INT3) — software breakpoint for tracing PE32 execution */
-    /* ConstructObject return trap — patched INT3 at EXE+0xBC72 */
-    if (vec == 3 && (frame->cs & 0xFFFF) == 0x40) {
-        uint32_t rip32 = (uint32_t)frame->rip;
-        /* INT3 advances RIP by 1, so RIP = breakpoint_addr + 1 */
-        uint32_t bp = rip32 - 1;
-        if ((bp & 0xFFFF0000) == 0x10900000 && ((bp & 0xFFFF) == 0xBC72 || (bp & 0xFFFF) == 0xBC81)) {
-            uint32_t off = bp & 0xFFFF;
-            if (off == 0xBC72) {
-                /* After ConstructObject: EAX = result */
-                serial_puts("[BP-BC72] EAX=0x");
-                serial_puthex((uint32_t)frame->rax, 8);
-                uint32_t eax = (uint32_t)frame->rax;
-                serial_puts(eax >= 0x40000000 ? " HEAP✓" : eax >= 0x1C000000 ? " STACK✗" : eax == 0 ? " NULL!" : " ???");
-                serial_puts(" EBP=0x");
-                serial_puthex((uint32_t)frame->rbp, 8);
-                serial_puts("\n");
-                uint8_t *code = (uint8_t *)(uintptr_t)bp;
-                *code = 0x89; /* restore: mov [ebp-0x7a4],eax */
-                frame->rip = bp;
-            } else {
-                /* Before Init: ECX should = [EBP-0x14] = GEngine */
-                uint32_t ebp = (uint32_t)frame->rbp;
-                uint32_t ge_local = *(volatile uint32_t *)(uintptr_t)(ebp - 0x14);
-                serial_puts("[BP-BC81] [EBP-14]=0x");
-                serial_puthex(ge_local, 8);
-                serial_puts(ge_local >= 0x40000000 ? " HEAP✓" : ge_local >= 0x1C000000 ? " STACK✗" : " ???");
-                serial_puts(" EBP=0x");
-                serial_puthex(ebp, 8);
-                serial_puts("\n");
-                uint8_t *code = (uint8_t *)(uintptr_t)bp;
-                *code = 0x8B; /* restore: mov -0x14(%ebp),%ecx */
-                frame->rip = bp;
-            }
-            return;
-        }
-    }
-
-    if (vec == 3 && g_swbreak_addr && (uint32_t)frame->rip == g_swbreak_addr + 1) {
+    if (vec == 3 && g_swbreak_addr &&
+        (uint32_t)frame->rip == g_swbreak_addr + 1) {
         serial_puts("[SWBREAK] Hit at 0x");
         serial_puthex(g_swbreak_addr, 8);
-        /* Dump context based on breakpoint location */
-        if (g_swbreak_addr == 0x10902A40) {
-            /* FMallocWindows::Free — log ptr and caller */
-            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-            serial_puts("\n[FREE] ptr=0x");
-            serial_puthex(sp[1], 8);  /* [ESP+4] after PUSH EBP = Data */
-            serial_puts(" ret=0x");
-            serial_puthex(sp[0], 8);  /* return address */
-            serial_puts(" ECX=0x");
-            serial_puthex((uint32_t)frame->rcx, 8);
-            serial_puts("\n");
-        } else if (g_swbreak_addr == 0x10902750) {
-            /* FMallocWindows::Realloc entry. INT3 is permanent — don't restore.
-             * Log args, restore byte, skip forward, then repatch. */
-            static int realloc_count = 0;
-            realloc_count++;
-            /* thiscall: ECX=this, [ESP+0]=retaddr, [ESP+4]=Data, [ESP+8]=Size, [ESP+12]=Name */
-            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-            uint32_t data = sp[1], sz = sp[2];
-            if (realloc_count <= 5 || sz == 0 || (realloc_count % 500) == 0) {
-                serial_puts("[RA#");
-                serial_putdec(realloc_count);
-                serial_puts("] D=0x");
-                serial_puthex(data, 8);
-                serial_puts(" S=0x");
-                serial_puthex(sz, 8);
-                serial_puts(" ret=0x");
-                serial_puthex(sp[0], 8);
-                serial_puts("\n");
-            }
-            /* Restore byte, execute, then we lose the BP (one-shot per-call chain).
-             * To make it permanent, we'd need TF which doesn't work.
-             * Instead: restore, set addr=0 so iretq goes to real function. */
-            *(uint8_t *)(uintptr_t)g_swbreak_addr = g_swbreak_saved;
-            frame->rip = g_swbreak_addr;
-            /* DON'T clear g_swbreak_addr — the #BP won't fire again since
-             * the byte is restored. But after Realloc returns, WinMain's next
-             * Realloc call won't hit either. This is effectively one-shot. */
-            g_swbreak_addr = 0;  /* prevent future match */
-        } else if (g_swbreak_addr == 0x10909E92) {
-            /* WinMain catch(...) handler — dump GErrorHist */
-            serial_puts("\n[CATCH] WinMain catch(...) handler hit!\n");
-            /* GErrorHist is at IAT 0x10958C60 → points to WCHAR[] buffer */
-            volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x10958C60;
-            uint32_t hist_ptr = *iat;
-            if (hist_ptr > 0x10000 && hist_ptr < 0x7FFFFFFF) {
-                const uint16_t *ws = (const uint16_t *)(uintptr_t)hist_ptr;
-                serial_puts("[CATCH] GErrorHist: \"");
-                for (int k = 0; k < 500 && ws[k]; k++) {
-                    char ch = (char)(ws[k] & 0x7F);
-                    serial_puts((const char[]){ch, 0});
-                }
-                serial_puts("\"\n");
-            } else {
-                serial_puts("[CATCH] GErrorHist ptr=0x");
-                serial_puthex(hist_ptr, 8);
-                serial_puts(" (invalid)\n");
-            }
-        } else if (g_swbreak_addr == 0x10902A6C) {
-            /* FMallocWindows::Free — log ptr being freed */
-            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-            /* thiscall: ECX=this, [ESP+4]=ptr (after the PUSH EBP; MOV EBP,ESP; ...; prologue
-             * but we're at 0x10902A6C which is AFTER prologue, so [EBP+8]=ptr) */
-            static int free_log = 0;
-            free_log++;
-            if (free_log <= 5 || free_log == 100 || free_log == 1000) {
-                uint32_t ebp_val = (uint32_t)frame->rbp;
-                uint32_t ptr = *(uint32_t *)(uintptr_t)(ebp_val + 8);
-                serial_puts(" Free(0x");
-                serial_puthex(ptr, 8);
-                serial_puts(") #");
-                serial_putdec(free_log);
-            }
-            serial_puts("\n");
-        } else if (g_swbreak_addr == 0x10915038) {
-            /* __except handler: dump EBP chain to find what threw */
-            uint32_t ebp = (uint32_t)frame->rbp;
-            serial_puts("\n[EXCEPT] __except handler fired!");
-            serial_puts(" EBP=0x");
-            serial_puthex(ebp, 8);
-            serial_puts(" ESP=0x");
-            serial_puthex(frame->rsp, 8);
-            /* Read [ebp-0x30] which has the exception info */
-            if (ebp > 0x10000) {
-                uint32_t *ebpp = (uint32_t *)(uintptr_t)ebp;
-                serial_puts("\n  [ebp-0x30]=0x");
-                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 0x30), 8);
-                serial_puts(" [ebp-0x2C]=0x");
-                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 0x2C), 8);
-                serial_puts("\n  caller=[ebp+4]=0x");
-                serial_puthex(ebpp[1], 8);
-            }
-            serial_puts("\n");
-        } else if (g_swbreak_addr == 0x10102CA2) {
-            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-            uint32_t ret = sp[0], expr = sp[1], file = sp[2], line = sp[3];
-            serial_puts("\n[ASSERT] ");
-            if (expr) { const char *s = (const char *)(uintptr_t)expr; serial_puts(s); }
-            serial_puts(" @ ");
-            if (file) { const char *s = (const char *)(uintptr_t)file; serial_puts(s); }
-            serial_puts(":");
-            serial_putdec(line);
-            serial_puts("\n");
-        } else if ((g_swbreak_addr >= 0x00454D08 &&
-                    g_swbreak_addr <= 0x00454D8B) ||
-                   (g_swbreak_addr >= 0x004B6210 &&
-                    g_swbreak_addr <= 0x004B674F)) {
-            static const uint32_t steam_bisect[] = {
-                0x00454D08, 0x00454D0F, 0x00454D14,
-                0x004B6210, 0x004B6211, 0x004B631F, 0x004B6417,
-                0x004B6536, 0x004B6602, 0x004B6650, 0x004B66FB,
-                0x004B673E, 0x004B6741, 0x004B674F,
-                0x00454D41, 0x00454D8B
-            };
-            serial_puts(g_swbreak_addr == 0x00454D08 ? " EAX=0x" : " EDI=0x");
-            serial_puthex(g_swbreak_addr == 0x00454D08
-                              ? (uint32_t)frame->rax
-                              : (uint32_t)frame->rdi,
-                          8);
-            if (g_swbreak_addr >= 0x004B6210) {
-                uint32_t ebp = (uint32_t)frame->rbp;
-                serial_puts(" ESP-EBP=");
-                serial_putdec((int32_t)((uint32_t)frame->rsp - ebp));
-                serial_puts(" slots=");
-                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 20), 8);
-                serial_puts("/");
-                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 16), 8);
-                serial_puts("/");
-                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 12), 8);
-            }
-            serial_puts("\n");
-
-            *(uint8_t *)(uintptr_t)g_swbreak_addr = g_swbreak_saved;
-            frame->rip = g_swbreak_addr;
-            for (uint32_t i = 0; i + 1 < sizeof(steam_bisect) / sizeof(steam_bisect[0]); i++) {
-                if (steam_bisect[i] != g_swbreak_addr)
-                    continue;
-                g_swbreak_addr = steam_bisect[i + 1];
-                g_swbreak_saved = *(uint8_t *)(uintptr_t)g_swbreak_addr;
-                *(uint8_t *)(uintptr_t)g_swbreak_addr = 0xCC;
-                return;
-            }
-            g_swbreak_addr = 0;
-            return;
-        } else {
-            serial_puts(" ESP=0x");
-            serial_puthex(frame->rsp, 8);
-            serial_puts("\n");
-        }
-        /* One-shot: restore and continue */
+        serial_puts("\n");
         *(uint8_t *)(uintptr_t)g_swbreak_addr = g_swbreak_saved;
         frame->rip = g_swbreak_addr;
         g_swbreak_addr = 0;
         return;
     }
 
-    /* Native Win32 children currently have no PE64 breakpoint-dispatch path.
-     * Continue past an INT3 while debugging CEF instead of killing the helper
-     * and leaving the parent blocked forever waiting for its service. The CPU
-     * has already advanced RIP past the one-byte instruction. */
-    if (vec == 3 && (frame->cs & 0xFFFF) == 0x38 &&
-        frame->rip >= 0xFFFF800000000000ULL) {
-        extern uint64_t *win32_current_child_jmpbuf(void);
-        if (win32_current_child_jmpbuf()) {
-            const uint8_t *code = (const uint8_t *)(frame->rip - 1);
-            extern void dll_debug_log_address(void *address);
-            serial_puts("[PE64-BP] continued at rip=0x");
-            serial_puthex(frame->rip, 16);
-            serial_puts(" pid=");
-            serial_putdec(proc_current_pid());
-            serial_puts("\n");
-            dll_debug_log_address((void *)(frame->rip - 1));
-            serial_puts("[PE64-BP-BYTES]");
-            for (int i = 0; i < 16; i++) {
-                serial_puts(" ");
-                serial_puthex(code[i], 2);
-            }
-            serial_puts("\n");
-            return;
-        }
-    }
-
-    /* Chromium's official PE64 build uses `int3; ud2; xor eax,eax` for a
-     * NOTREACHED diagnostic with a valid false-return fallback immediately
-     * after the trap pair. Continue only that exact byte signature. */
-    if (vec == 6 && (frame->cs & 0xFFFF) == 0x38 &&
-        frame->rip >= 0xFFFF800000000001ULL) {
-        const uint8_t *code = (const uint8_t *)frame->rip;
-        extern uint64_t *win32_current_child_jmpbuf(void);
-        if (win32_current_child_jmpbuf() && code[-1] == 0xCC &&
-            code[0] == 0x0F && code[1] == 0x0B &&
-            code[2] == 0x31 && code[3] == 0xC0) {
-            serial_puts("[PE64-TRAP] continued fallback at rip=0x");
-            serial_puthex(frame->rip, 16);
-            serial_puts(" pid=");
-            serial_putdec(proc_current_pid());
-            serial_puts("\n");
-            frame->rip += 2;
-            return;
-        }
-    }
-
-    /* UT99 IAT recovery is tied to Engine.dll's fixed PE32 layout. Never
-     * probe those addresses in another process: the exception handler itself
-     * would otherwise fault while trying to diagnose unrelated PE32 code. */
-    if ((vec == 14 || vec == 6 /* #UD */) &&
-        current_win32_exe_is("UnrealTournament.exe")) {
-        uint64_t fault_rip = frame->rip;
-        if (fault_rip >= 0x40000000ULL && fault_rip < 0x80000000ULL &&
-            current_cr3_range_is_mapped(0x105A5000ULL, 7 * 4096ULL)) {
-            uint32_t corrupt = (uint32_t)fault_rip;
-            /* Scan Engine.dll .idata (0x105A5000, 7 pages) */
-            volatile uint32_t *idata = (volatile uint32_t *)(uintptr_t)0x105A5000;
-            for (uint32_t i = 0; i < 7 * 1024; i++) {
-                if (idata[i] == corrupt) {
-                    /* Try to resolve the original value */
-                    extern uint32_t dll_resolve_iat_original(uint32_t iat_va);
-                    uint32_t original = dll_resolve_iat_original(0x105A5000 + i * 4);
-                    if (original && original >= 0x10000000 && original < 0x20000000) {
-                        idata[i] = original;
-                        frame->rip = (uint64_t)original;
-                        if ((uint32_t)frame->rbx == corrupt)
-                            frame->rbx = (uint64_t)original;
-                        if ((uint32_t)frame->rdi == corrupt)
-                            frame->rdi = (uint64_t)original;
-                        /* Add to dynamic guard table */
-                        extern void iat_guard_add(uint32_t addr, uint32_t value);
-                        iat_guard_add(0x105A5000 + i * 4, original);
-                        return;
-                    }
-                }
-            }
-            /* Hardcoded fallback: StaticLoadClass */
-            if (fault_rip == 0x4027C870ULL) {
-                frame->rip = 0x10101820ULL;
-                if ((uint32_t)frame->rbx == 0x4027C870)
-                    frame->rbx = 0x10101820ULL;
-                volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
-                *iat = 0x10101820;
-                return;
-            }
-        }
-    }
-
-    /* UT99 quirk: short-circuit the bogus 2GB rep-movsl in the
-     * Engine.dll memcpy helper at 0x1010723E. The helper is given a
-     * corrupt TArray Max (~537M elements = ~2GB bytes) by a buggy
-     * caller chain. Force ECX=0 to terminate REP MOVSL immediately. */
-    if (vec == 14 &&
-        (frame->rip & 0xFFFFFFFFULL) == 0x1010723EULL &&
-        (frame->rcx & 0xFFFFFFFFULL) > 0x40000ULL) {
-        static uint32_t shortcut_log = 0;
-        if (shortcut_log < 4) {
-            serial_puts("[VA-SHORT] cap rep-movsl @0x1010723E cs=0x");
-            serial_puthex(frame->cs & 0xFFFF, 4);
-            serial_puts(" ecx=0x");
-            serial_puthex(frame->rcx & 0xFFFFFFFFULL, 8);
-            serial_puts(" -> 0\n");
-            shortcut_log++;
-        }
-        frame->rcx = 0;
-        return;
-    }
     /* Diagnostic: log #PF in compat32 CS for any RIP, sampled */
     if (vec == 14 && (frame->cs & 0xFFFF) == 0x40) {
         static uint32_t pf32_log = 0;
@@ -1484,8 +1131,21 @@ void isr_handler(interrupt_frame_t *frame)
 
     /* APIC timer tick */
     if (vec == 32) {
-        /* Present DOS VGA mode 13h vram to the real framebuffer (no-op
-         * unless a native DOS VM is active and in mode 13h). */
+        /* The process scheduler, clock and device deadlines below own BSP
+         * state. APs run only the SMP work-stealing loop; reject a stray or
+         * software timer vector there before it can switch the global CR3 and
+         * process slot out from under the BSP. */
+        if (apic_enabled) {
+            uint32_t current_apic_id =
+                (apic_read(APIC_ID) >> 24) & 0xFFU;
+            if (current_apic_id != bsp_apic_id_global) {
+                apic_write(APIC_EOI, 0);
+                return;
+            }
+        }
+
+        /* Present DOS VGA mode 13h VRAM to the real framebuffer (no-op
+         * unless a DOS VM is bound, in mode 13h, and needs a refresh). */
         extern void dos_vga_mode13_present(void);
         dos_vga_mode13_present();
         /* Base time on elapsed TSC in both timer modes. sched_yield() raises
@@ -1505,22 +1165,6 @@ void isr_handler(interrupt_frame_t *frame)
         /* VDSO: update shared data page (seqlock, ~20 instructions) */
         extern void vdso_update(void);
         vdso_update();
-
-        /* UT99 IAT watchdog: restore Engine.dll StaticLoadClass on every tick.
-         * The Unreal package loader overwrites this between INT 0x2E calls,
-         * so the compat32_dispatch guard alone isn't fast enough. It runs
-         * only for UT99 — without this gate the
-         * watchdog would touch unmapped low VA from any process CR3. */
-        extern int *proc_win32_compat32_mode_slot(void);
-        extern int g_compat32_ut99;
-        if (*proc_win32_compat32_mode_slot() && g_compat32_ut99) {
-            static uint32_t iat_orig = 0;
-            volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
-            if (!iat_orig && *iat >= 0x10100000 && *iat < 0x10200000)
-                iat_orig = *iat;
-            if (iat_orig && *iat != iat_orig)
-                *iat = iat_orig;
-        }
 
 #ifdef COMPAT32_TIMER_DEBUG
         /* Watchdog: log PE32 execution state (enable with -DCOMPAT32_TIMER_DEBUG) */
@@ -1551,10 +1195,30 @@ void isr_handler(interrupt_frame_t *frame)
             kprof_record(frame->rip);
         }
 
+        audio_check_deadline();
+
+        /* Reflect completed Sound Blaster DMA blocks before the scheduler
+         * captures this protected-mode client frame. */
+        bool dos_native_active;
+        {
+            extern bool dos_native_service_audio_irq(
+                x86_interrupt_frame_t *frame);
+            extern bool dos_native_service_timer_irq(
+                x86_interrupt_frame_t *frame);
+            extern int dos_native_session_active(void);
+            if (!dos_native_service_audio_irq(frame))
+                (void)dos_native_service_timer_irq(frame);
+            dos_native_active = dos_native_session_active() != 0;
+        }
+
         /* X-SCHED: preemptive scheduler — check quantum, switch if expired.
          * frame points to saved GPRs on the BSP's IRQ IST. */
         uint64_t interrupted_rip = frame->rip;
-        sched_tick(frame);
+        /* Native DPMI temporarily owns process-global GDT/LDT and DOS IDT
+         * gates. Keep timer/audio IRQs live, but do not switch tasks until
+         * the backend restores the host machine context. */
+        if (!dos_native_active)
+            sched_tick(frame);
 
         /* With no context switch pending, isr_common consumes this live IST
          * frame. A timer tick must not rewrite its return RIP. */
@@ -1578,6 +1242,9 @@ void isr_handler(interrupt_frame_t *frame)
         if (tsc_deadline_mode) {
             extern uint64_t sched_get_next_deadline_us(void);
             uint64_t next_us = sched_get_next_deadline_us();
+            uint64_t audio_us = audio_get_next_deadline_us();
+            if (audio_us && (!next_us || audio_us < next_us))
+                next_us = audio_us;
             if (next_us > 0) {
                 uint64_t deadline = idt_rdtsc() + (tsc_freq * next_us / 1000000);
                 wrmsr(MSR_IA32_TSC_DEADLINE, deadline);
@@ -1646,70 +1313,10 @@ void isr_handler(interrupt_frame_t *frame)
 
     /* #DB Debug exception — hardware watchpoint handler */
     if (vec == 1) {
-        /* Phase 9: dispatch to generic hwbp manager first. If any slot
-         * in the user-visible hwbps[] table is active and DR6 matches,
-         * we've handled it. Otherwise fall through to the PE32-specific
-         * debug path below. */
+        /* Dispatch registered hardware breakpoints before handling an
+         * internal single-step used by the guarded NULL-page path. */
         {
-            extern bool hwbp_dispatch(void *frame);
             if (hwbp_dispatch(frame)) return;
-        }
-
-        static int db_hit_count = 0;
-        uint64_t dr6;
-        __asm__ volatile ("mov %%dr6, %0" : "=r"(dr6));
-
-        if (dr6 & 0x1) {  /* B0: breakpoint 0 hit (dd_vtbl32) */
-            uint64_t dr0;
-            __asm__ volatile ("mov %%dr0, %0" : "=r"(dr0));
-            uint32_t val = *(volatile uint32_t *)dr0;
-
-            if (db_hit_count < 20) {
-                serial_puts("[WP] val=0x");
-                serial_puthex(val, 8);
-                serial_puts(" RIP=0x");
-                serial_puthex(frame->rip, 8);
-                serial_puts("\n");
-            }
-            db_hit_count++;
-
-            __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
-            return;
-        }
-
-        if (dr6 & 0x2) {  /* B1: ConstructObject execution breakpoint */
-            static int bp1_count = 0;
-            bp1_count++;
-
-            serial_puts("[CONSTRUCT-BP] hit #");
-            serial_putdec(bp1_count);
-            serial_puts(" RIP=0x");
-            serial_puthex((uint32_t)frame->rip, 8);
-            serial_puts(" ECX=0x");
-            serial_puthex((uint32_t)frame->rcx, 8);
-            serial_puts(" ESI=0x");
-            serial_puthex((uint32_t)frame->rsi, 8);
-            serial_puts(" ESP=0x");
-            serial_puthex((uint32_t)(frame->rsp & 0xFFFFFFFF), 8);
-            serial_puts("\n");
-
-            /* Dump the UClass* argument (ESI = first pushed arg for
-             * this specific call site at Engine.dll+0x84267) */
-            uint32_t esi = (uint32_t)frame->rsi;
-            if (esi >= 0x10000 && esi < 0x50000000) {
-                /* UClass has name at a known offset. The first few
-                 * dwords might reveal the class identity. */
-                uint32_t *cls = (uint32_t *)(uintptr_t)esi;
-                serial_puts("  UClass[0..3]: 0x");
-                serial_puthex(cls[0], 8);
-                serial_puts(" 0x"); serial_puthex(cls[1], 8);
-                serial_puts(" 0x"); serial_puthex(cls[2], 8);
-                serial_puts(" 0x"); serial_puthex(cls[3], 8);
-                serial_puts("\n");
-            }
-
-            __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
-            return;
         }
 
         /* TF single-step after NULL page write: re-protect + re-zero page 0 */
@@ -1738,456 +1345,34 @@ void isr_handler(interrupt_frame_t *frame)
          * report. Only kernel/bootstrap selectors keep the historical
          * write-through path for early page-table setup. Compat32 PE code
          * falls through to the SEH dispatch below. */
-        if (cr2 < 0x1000 && (frame->error_code & 2) && !(frame->error_code & 16)) {
-            /* Null-pointer writes from PE32 code (CS=0x40).
-             * Route through the normal SEH dispatch at the end of this
-             * function — the engine's __except handlers (including the
-             * appFailAssert crash reporter) catch EXCEPTION_ACCESS_VIOLATION.
-             * Write-through was masking real null-pointer dereference bugs
-             * (e.g. SoftDrv+0x361D4 writing to NULL+0x198 during post-init
-             * rendering), turning them into cascading kernel RIP=0 crashes.
-             *
-             * Kernel/bootstrap code still gets write-through — boot-time
-             * page-table setup touches low addresses legitimately. */
-            int is_compat32 = ((frame->cs & 0xFFFF) == 0x40);
-            uint16_t cs16 = (uint16_t)(frame->cs & 0xFFFF);
-            int is_kernel_context = (cs16 == 0x38 || cs16 == 0x08);
-            if (!is_compat32 && is_kernel_context) {
-                static int nw_count = 0;
-                nw_count++;
-                int is_heap = (frame->cs & 0xFFFF) == 0x40 &&
-                    frame->rip >= 0x40000000 && frame->rip < 0x80000000;
-                if (nw_count <= 5 && (frame->cs & 0xFFFF) == 0x40) {
-                    serial_puts("[NULL-WRITE] RIP=0x");
-                    serial_puthex((uint32_t)frame->rip, 8);
-                    serial_puts(" CR2=0x");
-                    serial_puthex((uint32_t)cr2, 4);
-                    serial_puts(is_heap ? " (heap→SEH)\n" : " (DLL→wt)\n");
-                }
-                /* FMW pool crash (UT.exe 0x109022BE: `mov [edx+4],eax`,
-                 * edx=pool->[0x14]=0). Dump the pool local [ebp-0x18] + fields
-                 * to see if it's a valid pool with FirstMem(+0x14)=NULL or a
-                 * corrupted local. Logged once. */
-                if ((uint32_t)frame->rip == 0x109022BE) {
-                    static int fmw_dumped = 0;
-                    if (!fmw_dumped) {
-                        fmw_dumped = 1;
-                        uint32_t ebp = (uint32_t)frame->rbp;
-                        uint32_t pool = (ebp >= 0x10000 && ebp < 0x80000000)
-                            ? *(volatile uint32_t *)(uintptr_t)(ebp - 0x18) : 0;
-                        serial_puts("[FMW-CRASH] edx=0x");
-                        serial_puthex((uint32_t)frame->rdx, 8);
-                        serial_puts(" ecx=0x"); serial_puthex((uint32_t)frame->rcx, 8);
-                        serial_puts(" pool[ebp-18]=0x"); serial_puthex(pool, 8);
-                        if (pool >= 0x10000 && pool < 0x80000000) {
-                            serial_puts(" +08=0x"); serial_puthex(*(volatile uint32_t *)(uintptr_t)(pool+0x08), 8);
-                            serial_puts(" +14=0x"); serial_puthex(*(volatile uint32_t *)(uintptr_t)(pool+0x14), 8);
-                            serial_puts(" +18=0x"); serial_puthex(*(volatile uint32_t *)(uintptr_t)(pool+0x18), 8);
-                            serial_puts(" +1c=0x"); serial_puthex(*(volatile uint32_t *)(uintptr_t)(pool+0x1c), 8);
-                        }
-                        serial_puts("\n");
-                    }
-                }
-                /* FMW-POOL-SKIP: a NULL-target write (CR2 in the NULL page)
-                 * from UT.exe's FMallocWindows pool manager (Malloc/Free/
-                 * Link/Unlink, ~0x10902000..0x10903400). These are
-                 * `*pool->PrevLink = …`, `*head = …`, `FirstMem->… = …` etc.
-                 * on a pool that isn't linked / has no free blocks (PrevLink
-                 * or FirstMem == NULL). Skipping ONLY the faulting (NULL)
-                 * write — vs the old blanket NOP that also dropped VALID
-                 * writes and corrupted the lists — keeps the list updates
-                 * intact and just no-ops the meaningless NULL store. Decode
-                 * the mov length and advance past it. */
-                if ((uint32_t)cr2 < 0x1000 && (frame->cs & 0xFFFF) == 0x40 &&
-                    (uint32_t)frame->rip >= 0x10902000 &&
-                    (uint32_t)frame->rip <  0x10903400) {
-                    volatile uint8_t *ins = (volatile uint8_t *)(uintptr_t)(uint32_t)frame->rip;
-                    uint8_t op = ins[0];
-                    if (op == 0x89 || op == 0x8B || op == 0x88 ||
-                        op == 0x8A || op == 0xC7) {
-                        uint8_t modrm = ins[1];
-                        int mod = modrm >> 6, rm = modrm & 7;
-                        int len = 2;
-                        if (mod != 3 && rm == 4) len++;          /* SIB */
-                        if (mod == 1) len += 1;                  /* disp8 */
-                        else if (mod == 2) len += 4;             /* disp32 */
-                        else if (mod == 0 && rm == 5) len += 4;  /* disp32 no base */
-                        if (op == 0xC7) len += 4;                /* imm32 */
-                        static int fmw_skip = 0;
-                        if (fmw_skip < 24) {
-                            fmw_skip++;
-                            /* FMW pool alias probe: dump the
-                             * freed block ptr ([ebp+8]), the GMalloc this
-                             * ([ebp-0x28]), the FPoolInfo node ([ebp-0x14]) and
-                             * its pool(+0x10)/PrevLink(+0x1c). The block ptr's
-                             * 64KB slot vs a registered VA-ALLOC base tells us
-                             * whether the PoolIndirect lookup misses because the
-                             * block lives in an unregistered/aliased slot. */
-                            uint32_t ebp = (uint32_t)frame->rbp;
-                            uint32_t blk = 0, thiz = 0, node = 0;
-                            if (ebp >= 0x10000 && ebp < 0x80000000) {
-                                blk  = *(volatile uint32_t *)(uintptr_t)(ebp + 0x08);
-                                thiz = *(volatile uint32_t *)(uintptr_t)(ebp - 0x28);
-                                node = *(volatile uint32_t *)(uintptr_t)(ebp - 0x14);
-                            }
-                            serial_puts("[FMW-POOL-SKIP] @0x");
-                            serial_puthex((uint32_t)frame->rip, 8);
-                            serial_puts(" CR2=0x"); serial_puthex((uint32_t)cr2, 4);
-                            serial_puts(" blk=0x"); serial_puthex(blk, 8);
-                            serial_puts(" slot=0x"); serial_puthex((blk >> 16) & 0xff, 2);
-                            serial_puts(" node=0x"); serial_puthex(node, 8);
-                            if (node >= 0x10000 && node < 0x80000000) {
-                                serial_puts(" pool=0x");
-                                serial_puthex(*(volatile uint32_t *)(uintptr_t)(node + 0x10), 8);
-                                serial_puts(" prevlink=0x");
-                                serial_puthex(*(volatile uint32_t *)(uintptr_t)(node + 0x1c), 8);
-                            }
-                            serial_puts(" this=0x"); serial_puthex(thiz, 8);
-                            serial_puts("\n");
-                        }
-                        frame->rip += len;
-                        if (g_null_page_dirty) null_page_clean();
-                        return;
-                    }
-                }
-                if (is_heap) {
-                    /* Heap code executing data as code → EBX was corrupted
-                     * by a callback, causing call *%ebx to jump to heap data.
-                     * Fix: reload EBX from the IAT entry it was supposed to
-                     * contain, and redirect to the CORRECT function. */
-                    volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
-                    uint32_t correct_fn = *iat;
-                    static int heap_fix_count = 0;
-                    heap_fix_count++;
-
-                    if (heap_fix_count <= 5) {
-                        serial_puts("[HEAP-FIX] EBX=0x");
-                        serial_puthex((uint32_t)frame->rbx, 8);
-                        serial_puts(" → 0x");
-                        serial_puthex(correct_fn, 8);
-                        serial_puts(" RIP was 0x");
-                        serial_puthex((uint32_t)frame->rip, 8);
-                        serial_puts("\n");
-                    }
-
-                    /* Fix EBX and redirect execution to the correct function.
-                     * The PE32 code did `call *%ebx` which jumped to garbage.
-                     * We undo the call: pop the return address from stack,
-                     * fix EBX, and redirect RIP to the correct function.
-                     * The retaddr on stack is the instruction after `call *%ebx`
-                     * in Init() — we leave it there so the function can RET. */
-                    frame->rbx = correct_fn;
-                    frame->rip = correct_fn;
-                    /* EAX was clobbered by executing garbage (add [eax],al).
-                     * Restore EAX to a sane value (0 is safe — it was the
-                     * null pointer that caused the fault). */
-                    frame->rax = 0;
-                    return;  /* resume at the correct function */
-                }
-
-            /* Normal null-page write-through for kernel init / boot path. */
-            paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
-            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-            frame->rflags |= (1ULL << 8);  /* TF bit — re-protect in #DB */
-            g_null_page_dirty = 1;
-            return;
-            } /* end if (!is_compat32) */
-
-            /* compat32 path (CS=0x40): fall through to SEH dispatch at the
-             * end of this function.  The null-page is left read-only+NX;
-             * the guest receives EXCEPTION_ACCESS_VIOLATION which the
-             * engine's __except handler catches and reports properly. */
-        }
-
-        /* The NULL-CALL recovery path below is Win32 PE32 specific: it
-         * reads from `frame->rsp & 0xFFFFFFFF` (truncated 32-bit RSP)
-         * to recover the return address, dispatches to the engine SEH
-         * chain, scans the IAT for redirect candidates, etc. Native
-         * x86_64 SYSCALL-launched code (CS=0x28) with a NULL function pointer
-         * should just take the regular #PF path and die. */
-        if (cr2 < 0x1000 && (frame->error_code & 16) &&
-            ((frame->cs & 0xFFFF) == 0x40 ||
-             (frame->cs & 0xFFFF) == 0x23)) {  /* INSTRUCTION-FETCH on page 0 */
-            /* NULL function pointer call from stale register.
-             * Try IAT redirect first (same technique as BC-REDIRECT):
-             * scan backwards from retaddr to find the IAT load instruction
-             * and redirect to the correct function. */
-            static int null_call_count = 0;
-            null_call_count++;
-
-            /* [RET0-DIAG] Always dump the recent native-shim call ring on the
-             * first few near-NULL instruction-fetch faults, even when the
-             * call-site can't be decoded as `call *disp32(reg)` (e.g. a RET to a
-             * corrupted return address — the char-select-3x crash: RIP=0x13,
-             * stack zeroed). The last shim in the ring is the prime suspect for
-             * a wrong arg-count that over/under-cleaned the caller's stack. */
-            if (null_call_count <= 3) {
-                serial_puts("[RET0-DIAG] near-NULL fetch RIP=0x");
-                serial_puthex(frame->rip & 0xFFFFFFFF, 8);
-                serial_puts(" ESP=0x"); serial_puthex(frame->rsp & 0xFFFFFFFF, 8);
-                serial_puts(" EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
-                serial_puts(" EBX=0x"); serial_puthex((uint32_t)frame->rbx, 8);
-                serial_puts(" ESI=0x"); serial_puthex((uint32_t)frame->rsi, 8);
-                serial_puts("\n  recent stack dwords:");
-                uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                for (int si = 0; si < 12; si++) {
-                    serial_puts(" 0x"); serial_puthex(sp[si], 8);
-                }
-                serial_puts("\n");
-                extern void compat32_dump_recent_calls(void);
-                compat32_dump_recent_calls();
-            }
-
-            /* Diagnostic: for indirect calls (call *offset(reg)), dump
-             * the vtable pointer and the target entry so we can see why
-             * the function pointer is NULL. */
-            if (null_call_count <= 5 && (frame->cs & 0xFFFF) == 0x40) {
-                uint32_t retaddr32 = ((uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF))[0];
-                uint8_t *ca = (uint8_t *)(uintptr_t)(retaddr32 - 6);
-                /* call *disp32(%reg) = FF 92 xx xx xx xx (for edx) */
-                if (ca[0] == 0xFF && (ca[1] & 0xC0) == 0x80) {
-                    uint8_t modrm = ca[1];
-                    uint8_t reg = modrm & 0x07;
-                    uint32_t disp = *(uint32_t *)(ca + 2);
-                    /* Get register value that held the vtable */
-                    uint32_t regvals[8] = {
-                        (uint32_t)frame->rax, (uint32_t)frame->rcx,
-                        (uint32_t)frame->rdx, (uint32_t)frame->rbx,
-                        0/*esp*/, (uint32_t)frame->rbp,
-                        (uint32_t)frame->rsi, (uint32_t)frame->rdi
-                    };
-                    uint32_t vtbl = regvals[reg];
-                    serial_puts("[NULL-DIAG] call *0x");
-                    serial_puthex(disp, 4);
-                    serial_puts("(%");
-                    const char *rn[] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi"};
-                    serial_puts(rn[reg]);
-                    serial_puts(") vtbl=0x"); serial_puthex(vtbl, 8);
-                    serial_puts(" this=0x"); serial_puthex((uint32_t)frame->rdi, 8);
-                    serial_puts(" callsite=0x"); serial_puthex(retaddr32 - 6, 8);
-                    serial_puts(" ret=0x"); serial_puthex(retaddr32, 8);
-                    serial_puts("\n");
-                    /* Dump recent native calls to find the shim that corrupted
-                     * the caller before this NULL virtual call (New-Game crash). */
-                    { extern void compat32_dump_recent_calls(void);
-                      compat32_dump_recent_calls(); }
-                    /* Dump registers and object for Browse call */
-                    if (disp == 0xB0) {
-                        serial_puts("  ECX=0x"); serial_puthex((uint32_t)frame->rcx, 8);
-                        serial_puts(" EDI=0x"); serial_puthex((uint32_t)frame->rdi, 8);
-                        serial_puts(" EDX=0x"); serial_puthex((uint32_t)frame->rdx, 8);
-                        serial_puts(" EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
-                        serial_puts("\n");
-                        /* Dump both EDI and EDX targets */
-                        uint32_t edi_val = (uint32_t)frame->rdi;
-                        uint32_t edx_val = (uint32_t)frame->rdx;
-                        if (edi_val >= 0x1000 && edi_val < 0x50000000) {
-                            uint32_t *o = (uint32_t *)(uintptr_t)edi_val;
-                            serial_puts("  [EDI]="); serial_puthex(o[0], 8);
-                            serial_puts(" [EDI+4]="); serial_puthex(o[1], 8);
-                            serial_puts(" [EDI+44]="); serial_puthex(o[0x44/4], 8);
-                            serial_puts(" [EDI+48]="); serial_puthex(o[0x48/4], 8);
-                            serial_puts("\n");
-                        }
-                        /* Init() caller return address */
-                        uint32_t ebp = (uint32_t)frame->rbp;
-                        if (ebp >= 0x1000 && ebp < 0x50000000) {
-                            uint32_t *fp = (uint32_t *)(uintptr_t)ebp;
-                            serial_puts("  Init caller: [EBP+4]=0x");
-                            serial_puthex(fp[1], 8);
-                            serial_puts(" [EBP]=0x");
-                            serial_puthex(fp[0], 8);
-                            serial_puts("\n");
-                            /* Walk one more frame */
-                            uint32_t caller_ebp = fp[0];
-                            if (caller_ebp >= 0x1000 && caller_ebp < 0x50000000) {
-                                uint32_t *cfp = (uint32_t *)(uintptr_t)caller_ebp;
-                                serial_puts("  Caller's caller: [EBP+4]=0x");
-                                serial_puthex(cfp[1], 8);
-                                serial_puts("\n");
-                            }
-                        }
-                    }
-                    /* Dump registers and stack */
-                    serial_puts("  EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
-                    serial_puts(" ESP=0x"); serial_puthex((uint32_t)(frame->rsp & 0xFFFFFFFF), 8);
-                    serial_puts(" ECX=0x"); serial_puthex((uint32_t)frame->rcx, 8);
-                    serial_puts(" EAX=0x"); serial_puthex((uint32_t)frame->rax, 8);
-                    serial_puts("\n");
-                    /* Dump stack words from ESP upward to find return addresses */
-                    uint32_t esp32 = (uint32_t)(frame->rsp & 0xFFFFFFFF);
-                    if (esp32 >= 0x10000 && esp32 < 0x50000000) {
-                        uint32_t *sp = (uint32_t *)(uintptr_t)esp32;
-                        serial_puts("  STACK:");
-                        for (int i = 0; i < 16; i++) {
-                            if (i % 4 == 0) { serial_puts("\n    +"); serial_puthex(i*4, 2); serial_puts(":"); }
-                            serial_puts(" 0x"); serial_puthex(sp[i], 8);
-                        }
-                        serial_puts("\n");
-                    }
-                    /* Dump vtable entries around the offset */
-                    if (vtbl >= 0x10000000 && vtbl < 0x20000000) {
-                        uint32_t *vt = (uint32_t *)(uintptr_t)vtbl;
-                        int idx = disp / 4;
-                        for (int i = (idx > 2 ? idx - 2 : 0); i <= idx + 2; i++) {
-                            serial_puts("  vt[0x");
-                            serial_puthex(i * 4, 3);
-                            serial_puts("]=0x");
-                            serial_puthex(vt[i], 8);
-                            if (i == idx) serial_puts(" *** NULL TARGET");
-                            serial_puts("\n");
-                        }
-                    }
-
-                    /* Self-referencing vtable (vtbl == this) or NULL vtable
-                     * call from Window.dll stub objects: RET 0 to caller.
-                     * Window.dll calls methods on stub GWindowManager/GLogWindow
-                     * that have no real implementation. Without RET 0, the
-                     * #UD/#GP cascade prevents the engine from reaching Init(). */
-                    {
-                        int is_self_ref = (vtbl == (uint32_t)frame->rdi && vtbl < 0x10000000);
-                        uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                        uint32_t ret = sp[0];
-                        int from_window = (ret >= 0x11100000 && ret < 0x11200000);
-                        if (is_self_ref || from_window) {
-                            frame->rip = ret;
-                            frame->rsp += 4;
-                            frame->rax = 0;
-                            if (g_null_page_dirty) null_page_clean();
-                            return;
-                        }
-                    }
-                }
-            }
-
-            if ((frame->cs & 0xFFFF) == 0x40) {
-                uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                uint32_t retaddr = sp32[0];
-
-                /* BROWSE-FIX removed (Phase 2 bisect: 0 fires; the
-                 * GameEngine vtable is valid now, real Browse runs). */
-
-                /* Stub object NULL-CALL: if retaddr is in Window.dll or
-                 * any DLL that calls methods on our stub UObjects, RET 0.
-                 * These are calls to unimplemented virtual methods on
-                 * GWindowManager/GLogWindow stubs. */
-                if (retaddr >= 0x11100000 && retaddr < 0x11200000) {
-                    frame->rip = retaddr;
-                    frame->rsp += 4;
-                    frame->rax = 0;
-                    if (g_null_page_dirty) null_page_clean();
-                    return;
-                }
-
-                /* NULL-REDIRECT (IAT-disasm rescue) removed (Phase 2
-                 * bisect: 0 fires with Phase 1 ABI fix + ENGINE-PATCH). */
-            }
-
-            if (null_call_count <= 10) {
-                uint32_t retaddr =
-                    ((uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF))[0];
-                serial_puts("[NULL-CALL] RIP=0x");
-                serial_puthex(cr2, 4);
-                serial_puts(" retaddr=0x");
-                serial_puthex(retaddr, 8);
-                serial_puts(" #");
-                serial_putdec(null_call_count);
-                serial_puts("\n");
-
-                /* A NULL indirect call leaves the return address on the stack.
-                 * Preserve the generated call-site bytes and register target so
-                 * JIT/native-wrapper failures can be diagnosed after teardown. */
-                if (retaddr >= 0x10010 && retaddr < 0x80000000) {
-                    const uint8_t *code =
-                        (const uint8_t *)(uintptr_t)(retaddr - 16);
-                    serial_puts("[NULL-CALL-CODE] @0x");
-                    serial_puthex(retaddr - 16, 8);
-                    serial_puts(":");
-                    for (int i = 0; i < 24; i++) {
-                        serial_puts(" ");
-                        serial_puthex(code[i], 2);
-                    }
-                    serial_puts("\n");
-
-                    const uint8_t *call =
-                        (const uint8_t *)(uintptr_t)(retaddr - 2);
-                    if (call[0] == 0xFF &&
-                        (call[1] & 0xF8) == 0xD0) {
-                        uint8_t reg = call[1] & 7;
-                        uint32_t regvals[8] = {
-                            (uint32_t)frame->rax, (uint32_t)frame->rcx,
-                            (uint32_t)frame->rdx, (uint32_t)frame->rbx,
-                            0, (uint32_t)frame->rbp,
-                            (uint32_t)frame->rsi, (uint32_t)frame->rdi
-                        };
-                        const char *rn[] = {
-                            "eax", "ecx", "edx", "ebx",
-                            "esp", "ebp", "esi", "edi"
-                        };
-                        serial_puts("[NULL-CALL-CODE] call *%");
-                        serial_puts(rn[reg]);
-                        serial_puts(" target=0x");
-                        serial_puthex(regvals[reg], 8);
-                        serial_puts("\n");
-                    }
-                }
-            }
-            /* After too many NULL calls, force crash recovery instead of
-             * looping forever. Was 50 — raised to 5000 so UT99 can
-             * survive the bursts of TArray-corruption-driven NULL
-             * iterations during engine init (each FName::Add or
-             * FString::Append on a corrupt array triggers tens of
-             * NULL calls before the engine moves on). 50 was enough
-             * to break out of an infinite GLog/GError tail-loop, but
-             * not enough for normal init flow. */
-            if (null_call_count > 50000) {
-                serial_puts("[NULL-CALL] Too many (#");
-                serial_putdec(null_call_count);
-                serial_puts(") — forcing crash recovery\n");
-                goto compat32_null_recovery;
-            }
-            if ((frame->cs & 0xFFFF) == 0x40 || (frame->cs & 0xFFFF) == 0x23) {
-                /* First NULL-CALL: dispatch to SEH so the engine can show
-                 * its error message and begin graceful shutdown.
-                 * Subsequent NULL-CALLs: simulate RET 0 to let cleanup
-                 * continue — the catch handler writes to NULL during
-                 * StaticShutdownAfterError, re-dirtying page 0, and
-                 * dispatching to SEH again would cause infinite recursion. */
-                /* If SEH chain is corrupt, RET 0 directly — SEH dispatch would
-                 * fail and crash recovery fires. RET 0 lets the engine receive
-                 * NULL from the invalid function call and handle the error. */
-                {
-                    extern uint32_t g_teb32;  /* first field = ExceptionList */
-                    uint32_t seh = g_teb32;
-                    serial_puts("[NULL-CALL] SEH=0x");
-                    serial_puthex(seh, 8);
-                    serial_puts("\n");
-                    if (seh >= 0x10000000 && seh < 0x20000000) {
-                        /* SEH chain corrupt → RET with EAX matching caller's
-                         * comparison register. MSVC code after null-calls often
-                         * does 'cmp eax,esi; sete bl'. Return EAX=ESI so the
-                         * comparison succeeds and the engine takes the "match"
-                         * path instead of the error path. */
-                        uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                        frame->rip = sp32[0];
-                        frame->rsp += 4;
-                        frame->rax = frame->rsi & 0xFFFFFFFF;
-                        if (g_null_page_dirty) null_page_clean();
-                        return;
-                    }
-                }
-                /* First NULL-CALL with valid SEH: re-zero page 0 and dispatch */
-                if (g_null_page_dirty) null_page_clean();
+        if (cr2 < 0x1000 && (frame->error_code & 2) &&
+            !(frame->error_code & 16)) {
+            uint16_t cs = (uint16_t)(frame->cs & 0xFFFF);
+            if (cs == 0x38 || cs == 0x08) {
+                paging_set_flags(
+                    0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
+                __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0)
+                                  : "memory");
+                frame->rflags |= (1ULL << 8);
+                g_null_page_dirty = 1;
+                return;
             }
         }
+
     }
 
     /* Deliver Win32 user exceptions before producing fatal diagnostics.
      * Handled access violations are normal for mechanisms such as HotSpot's
      * safepoint polling page. */
     int compat32_seh_result =
-        compat32_dispatch_cpu_exception(frame, vec);
+        compat32_dispatch_cpu_exception(frame, vec,
+                                        &win32_exception_status);
     if (compat32_seh_result > 0)
+        return;
+
+    int win64_seh_result =
+        win64_dispatch_cpu_exception(frame, vec, &win32_exception_status);
+    if (win64_seh_result > 0)
         return;
 
     /* CPU exception (vectors 0-31) */
@@ -2290,86 +1475,11 @@ void isr_handler(interrupt_frame_t *frame)
                 mem_debug_dump_page(rip_phys);
         }
 
-        /* tier0's page-map decoder leaves enough state in volatile registers
-         * to recover the source metadata slot after its decoded AA pointer
-         * faults. Read through the physical mirror so a bad diagnostic VA
-         * cannot recursively page-fault inside the exception handler. */
-        if (vec == 14 && (frame->cs & 0xFFFF) == 0x38 &&
-            frame->rdx == 0xFFFFAAAAAAAAAA80ULL) {
-            uint64_t cr3;
-            uint64_t target = frame->rsi;
-            uint64_t cache = frame->r10;
-            uint64_t band = (target >> 30) & 0xFULL;
-            uint64_t cache_entry = cache + band * 16;
-            uint64_t key = 0, table = 0, slot = 0;
-            uint64_t slot_value = 0, slot_phys = UINT64_MAX;
-            uint64_t output_value = 0, output_phys = UINT64_MAX;
-            bool cache_ok;
-
-            __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-            cache_ok = debug_read_u64_in_cr3(cr3, cache_entry, &key, NULL) &&
-                       debug_read_u64_in_cr3(cr3, cache_entry + 8,
-                                             &table, NULL);
-            if (cache_ok && table) {
-                slot = table + (((target >> 12) & 0x3FFFFULL) * 8);
-                debug_read_u64_in_cr3(cr3, slot, &slot_value, &slot_phys);
-            }
-            debug_read_u64_in_cr3(cr3, frame->rax, &output_value,
-                                  &output_phys);
-
-            serial_puts("  [TIER0-AA] target=0x");
-            serial_puthex(target, 16);
-            serial_puts(" cache=0x");
-            serial_puthex(cache, 16);
-            serial_puts(" band=");
-            serial_putdec(band);
-            serial_puts("\n  [TIER0-AA] key=0x");
-            serial_puthex(key, 16);
-            serial_puts(" table=0x");
-            serial_puthex(table, 16);
-            serial_puts(" slot=0x");
-            serial_puthex(slot, 16);
-            serial_puts("\n  [TIER0-AA] slot-phys=0x");
-            serial_puthex(slot_phys, 16);
-            serial_puts(" slot-value=0x");
-            serial_puthex(slot_value, 16);
-            serial_puts(" output-phys=0x");
-            serial_puthex(output_phys, 16);
-            serial_puts(" output-value=0x");
-            serial_puthex(output_value, 16);
-            serial_puts("\n");
-            if (slot_phys != UINT64_MAX)
-                mem_debug_dump_page(slot_phys);
-        }
-
-        /* Temporary native PE64 crash probe. Preserve the raw return chain
-         * before recovery tears down the process. Keep all reads within the
-         * current upper-half user stack. */
+        /* Preserve generic module context before recovery tears down a native
+         * PE64 process. */
         if ((frame->cs & 0xFFFF) == 0x38) {
             extern void dll_debug_log_address(void *address);
-            extern void dll_debug_log_delay_failure(void *address,
-                                                     void *info);
             dll_debug_log_address((void *)frame->rip);
-            if (vec == 3) {
-                void *delay_info = (void *)frame->rdx;
-                uint64_t active_cr3;
-                uint64_t saved_delay_info;
-
-                /* libcef's delay-load fatal helper saves its incoming RSI
-                 * after three pushes and a 0x150-byte local frame. The outer
-                 * helper keeps DelayLoadInfo in RSI, so the saved value at
-                 * RSP+0x160 is the original pointer. Read it through the
-                 * active page tables because Win64 stacks live in the lower
-                 * half and cannot be dereferenced through the kernel CR3. */
-                __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
-                if (frame->rsp <= UINT64_MAX - 0x160ULL &&
-                    debug_read_u64_in_cr3(active_cr3, frame->rsp + 0x160ULL,
-                                          &saved_delay_info, NULL))
-                    delay_info = (void *)saved_delay_info;
-
-                dll_debug_log_delay_failure((void *)frame->rip,
-                                            delay_info);
-            }
         }
 
         if ((frame->cs & 0xFFFF) == 0x38 &&
@@ -2841,22 +1951,22 @@ void isr_handler(interrupt_frame_t *frame)
 
             int handled = compat32_seh_dispatch((PEXCEPTION_RECORD)&er64);
             if (handled) {
-                /* Apply unwind globals to the iretq frame.
-                 * int2e_stub.S does this for software exceptions (lines 77-96);
-                 * we must do it here for hardware exceptions since
-                 * isr_stubs.S doesn't check unwind globals. */
-                extern uint32_t g_compat32_unwind_eip;
-                extern uint32_t g_compat32_unwind_esp;
-                extern uint32_t g_compat32_unwind_ebp;
-
-                if (g_compat32_unwind_eip) {
-                    frame->rip = g_compat32_unwind_eip;
-                    frame->rsp = g_compat32_unwind_esp;
-                    frame->rbp = g_compat32_unwind_ebp;
-                    g_compat32_unwind_eip = 0;
-                    g_compat32_unwind_esp = 0;
-                    g_compat32_unwind_ebp = 0;
-                }
+                /* Hardware faults return through the generic ISR, so consume
+                 * this scheduler slot's pending PE32 unwind here. */
+                compat32_cpu_context_t unwind_context = {
+                    .eax = (uint32_t)frame->rax,
+                    .ebx = (uint32_t)frame->rbx,
+                    .ecx = (uint32_t)frame->rcx,
+                    .edx = (uint32_t)frame->rdx,
+                    .esi = (uint32_t)frame->rsi,
+                    .edi = (uint32_t)frame->rdi,
+                    .ebp = (uint32_t)frame->rbp,
+                    .esp = (uint32_t)frame->rsp,
+                    .eip = (uint32_t)frame->rip,
+                    .eflags = (uint32_t)frame->rflags,
+                };
+                if (compat32_apply_pending_unwind(&unwind_context))
+                    compat32_apply_cpu_context(frame, &unwind_context);
 
                 if (vec == 14 && fault_address >= 0x1000 &&
                     (frame->error_code & 3) == 3 &&
@@ -2869,6 +1979,16 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts("  [WIN32] SEH unhandled — falling through to recovery\n");
         }
 compat32_null_recovery:
+        if (win32_exception_status != STATUS_SUCCESS) {
+            extern int win32_terminate_current_child(int32_t status);
+            extern int win32_terminate_current_main(int32_t status);
+            serial_puts("  [WIN32] Unhandled exception status=0x");
+            serial_puthex((uint32_t)win32_exception_status, 8);
+            serial_puts(" - terminating process\n");
+            if (win32_terminate_current_child(win32_exception_status) ||
+                win32_terminate_current_main(win32_exception_status))
+                return;
+        }
         {
             extern uint64_t *win32_current_child_jmpbuf(void);
             extern void kern_longjmp(uint64_t *buf, int val);
@@ -2890,15 +2010,14 @@ compat32_null_recovery:
                 serial_puts("  [WIN32] Crash recovery — returning to shell\n");
                 /* Restore IST1 BEFORE longjmp — longjmp bypasses
                  * int2e_stub's IST1 restore, leaving it corrupted. */
-                x86_tss_reset_ist1();
+                extern void sched_reset_current_compat_ist1(void);
+                sched_reset_current_compat_ist1();
                 uint64_t *jmp = compat32_crash_jmpbuf;
                 compat32_crash_jmpbuf = NULL;
 
-                /* Sanity-check the jmpbuf — UT99 in compat32 shares the
-                 * kernel CR3 and could have wild-written into shell.c's
-                 * static `winexec_jmpbuf[]`. If the saved cr3/rsp/rip
-                 * look bogus, halt cleanly instead of jumping to RIP=0
-                 * with random RSP and triple-faulting in kernel mode. */
+                /* Validate the synchronous launch context before returning to
+                 * it. A corrupted buffer must terminate cleanly rather than
+                 * transfer to an invalid kernel RIP/RSP and triple-fault. */
                 uint64_t s_rsp = jmp[6], s_rip = jmp[7], s_cr3 = jmp[8];
                 serial_puts("  [WIN32] jmpbuf rip=0x"); serial_puthex(s_rip, 16);
                 serial_puts(" rsp=0x"); serial_puthex(s_rsp, 16);
@@ -2987,21 +2106,21 @@ compat32_null_recovery:
         }
 
         /* DOS-native fallback: if a DOS native session is active
-         * (dos_native_exit_jmpbuf is set by `dosrun` before LRETQ to
-         * DOOM), longjmp to the shell instead of halting. The [pf-ist]
+         * (dos_native_exit_jmpbuf is set by `dosrun` before LRETQ),
+         * longjmp to the shell instead of halting. The [pf-ist]
          * probe above only fires when RSP is inside one of our IST
-         * stacks, but DOS-native code can fault with RSP pointing at
-         * DOOM's own SS (stack outside the IST window). Catch that here. */
+         * stacks, but DOS-native code can fault with RSP pointing at its
+         * guest SS (outside the IST window). Catch that here. */
         {
             extern uint64_t *dos_native_exit_jmpbuf;
-            extern uint64_t paging_get_kernel_cr3(void);
+            extern int dos_native_session_active(void);
+            extern void dos_native_cleanup_active(void);
             extern void kern_longjmp(uint64_t *buf, int val);
-            if (dos_native_exit_jmpbuf) {
+            if (dos_native_exit_jmpbuf && dos_native_session_active()) {
                 serial_puts("  [DOS-NT] panic recovery -> long-jump to shell\n");
-                uint64_t kcr3 = paging_get_kernel_cr3();
-                if (kcr3) __asm__ volatile ("mov %0, %%cr3"
-                                             :: "r"(kcr3) : "memory");
                 idt_diag_flush("dos-panic-recover");
+                dos_native_cleanup_active();
+                __asm__ volatile ("cli" ::: "memory");
                 kern_longjmp(dos_native_exit_jmpbuf, 3);
             }
         }

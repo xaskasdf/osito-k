@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO="${OK_REPO:-/mnt/c/Users/xasko/osito-k}"
-STAGE="${OK_STAGE:-/root/osito-run}"
+STAGE="${OK_STAGE:-/root/osito-run-ut99}"
 NVME="${OK_NVME:-$REPO/nvme_ut99.img}"
 MON_HOST="${OK_MON_HOST:-127.0.0.1}"
 MON_PORT="${OK_MON_PORT:-55555}"
@@ -17,6 +17,7 @@ Usage: ut99_debug.sh <command>
 
 Commands:
   launch-gtk   Run UT99 under QEMU/KVM with a visible GTK window and monitor TCP.
+  launch-audio Run UT99 as above with output-only HDA captured to audio.wav.
   status       Show QEMU process, runner output, serial size, and fault summary.
   snap [name]  Capture QEMU framebuffer to arch/x86/build/<name>.png.
   mon <cmd>    Send one raw QEMU HMP monitor command.
@@ -33,7 +34,7 @@ EOF
 }
 
 qemu_pids() {
-    pgrep -f 'qemu-system-x86_64 .*osito-run' 2>/dev/null || true
+    pgrep -f "qemu-system-x86_64 .*$STAGE/" 2>/dev/null || true
 }
 
 cmd_launch_gtk() {
@@ -42,10 +43,21 @@ cmd_launch_gtk() {
     export DISPLAY="${DISPLAY:-:0}"
     export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
     export GDK_BACKEND="${GDK_BACKEND:-x11}"
+    export OK_STAGE="$STAGE"
     export OK_DISPLAY=gtk
     export OK_MONITOR=1
+    export OK_MON_HOST="$MON_HOST"
+    export OK_MON_PORT="$MON_PORT"
     export OK_NVME="$NVME"
+    export OK_NVME_FRESH="${OK_NVME_FRESH:-0}"
+    export OK_NVME_SNAPSHOT="${OK_NVME_SNAPSHOT:-1}"
     exec bash "$REPO/arch/x86/scripts/run-wsl-kvm.sh"
+}
+
+cmd_launch_audio() {
+    export OK_AUDIO=wav
+    export OK_AUDIO_WAV="${OK_AUDIO_WAV:-$STAGE/audio.wav}"
+    cmd_launch_gtk
 }
 
 cmd_status() {
@@ -170,6 +182,7 @@ cmd_stop() {
 
 case "${1:-}" in
     launch-gtk) shift; cmd_launch_gtk "$@" ;;
+    launch-audio) shift; cmd_launch_audio "$@" ;;
     status) shift; cmd_status "$@" ;;
     snap) shift; cmd_snap "$@" ;;
     mon) shift; cmd_mon "$@" ;;

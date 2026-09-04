@@ -348,6 +348,8 @@ static int recover_lost_directory(uint32_t ino, uint32_t parent,
     inode->nlink = 2;
     inode->size = OSFS3_BLOCK_SIZE;
     inode->atime = inode->mtime = inode->ctime = superblock.create_time;
+    inode->birth_time = inode->ctime;
+    inode->flags |= OSFS3_INODE_FLAG_BTIME_VALID;
     inode->extent_count = 1;
     inode->extents[0].start_block = candidate;
     inode->extents[0].block_count = 1;

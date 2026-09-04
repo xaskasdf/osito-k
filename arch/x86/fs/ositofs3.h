@@ -2,6 +2,7 @@
 #define OSITOFS3_H
 
 #include "../include/types.h"
+#include "ositofs_metadata.h"
 
 typedef struct {
     uint32_t directory_inode;
@@ -27,6 +28,7 @@ int      osfs3_dir_cursor_next(osfs3_dir_cursor_t *cursor,
 
 void    *osfs3_find(const char *path);
 void    *osfs3_find_ci(const char *path);
+void    *osfs3_get_node(int inode_index);
 void    *osfs3_get_file(int inode_index);
 void    *osfs3_file_at(uint32_t ordinal);
 int      osfs3_find_first(const char *pattern, int start_inode);
@@ -36,9 +38,22 @@ void     osfs3_file_release(void *file);
 uint64_t osfs3_file_size(const void *file);
 const char *osfs3_file_name(const void *file);
 uint32_t osfs3_file_ctime(const void *file);
+uint32_t osfs3_file_atime(const void *file);
 uint32_t osfs3_file_mtime(const void *file);
+uint64_t osfs3_volume_id(void);
+uint64_t osfs3_file_id(const void *file);
+int      osfs3_file_get_times(void *file, osfs_file_times_t *times);
+int      osfs3_file_set_times(void *file, uint32_t mask,
+                              const osfs_file_times_t *times);
+int      osfs3_file_get_dos_attributes(const void *file,
+                                        uint8_t *attributes);
+int      osfs3_file_set_dos_attributes(void *file, uint8_t attributes);
 uint64_t osfs3_file_revision(const void *file);
 uint64_t osfs3_file_byte_offset(const void *file);
+int      osfs3_get_mode(uint32_t ino, uint16_t *mode);
+int      osfs3_set_mode(uint32_t ino, uint16_t mode);
+int      osfs3_file_get_mode(const void *file, uint16_t *mode);
+int      osfs3_file_set_mode(void *file, uint16_t mode);
 
 int      osfs3_read(uint32_t ino, uint64_t offset, void *buf, uint64_t len);
 uint64_t osfs3_get_size(uint32_t ino);
@@ -49,10 +64,13 @@ int      osfs3_read_file_block(const void *file, uint32_t block_index,
 void    *osfs3_create(const char *path, uint64_t size);
 int      osfs3_write(void *file, uint64_t offset, const void *buf,
                      uint64_t len);
+int      osfs3_write_ex(void *file, uint64_t offset, const void *buf,
+                        uint64_t len, uint32_t io_flags);
 int      osfs3_write_data(void *file, uint64_t offset, const void *buf,
                           uint64_t len);
 int      osfs3_set_size_reserved(void *file, uint64_t size);
 int      osfs3_truncate(void *file, uint64_t size);
+int      osfs3_truncate_ex(void *file, uint64_t size, uint32_t io_flags);
 int      osfs3_rename(const char *from, const char *to, bool replace);
 int      osfs3_delete(const char *path);
 int      osfs3_mkdir(const char *path);

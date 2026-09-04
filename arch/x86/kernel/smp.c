@@ -106,6 +106,7 @@ typedef struct __attribute__((packed)) {
 
 #define APIC_SVR_ENABLE  0x100
 #define APIC_TIMER_PERIODIC 0x20000
+#define APIC_LVT_MASKED     0x10000
 
 /* ICR delivery modes */
 #define ICR_INIT         (5 << 8)
@@ -394,15 +395,14 @@ void smp_ap_entry(uint32_t cpu_index)
         /* Enable LAPIC with spurious vector 0xFF */
         apic_write_reg(apic, APIC_SVR, APIC_SVR_ENABLE | 0xFF);
 
-        /* Start APIC timer — use BSP-calibrated init count for accurate 100Hz.
-         * APs need timer ticks so HLT can wake periodically. The fpu_state_ptr
-         * race is handled in isr_common by checking LAPIC ID. */
-        extern uint32_t idt_get_apic_timer_init(void);
-        uint32_t timer_init = idt_get_apic_timer_init();
-        if (timer_init == 0) timer_init = 625000;
-        apic_write_reg(apic, 0x3E0, 0x03);    /* Divide by 16 */
-        apic_write_reg(apic, 0x320, 0x20020);  /* Periodic, vector 32 */
-        apic_write_reg(apic, 0x380, timer_init);
+        /* Process scheduling and timer-owned services use BSP state. Letting
+         * an AP enter vector 32 races the global process context, CR3 and TSS
+         * cursors while the BSP may be inside a Win32 callback. AP workers are
+         * woken by SMP_IPI_VECTOR, so their LAPIC timer must remain masked. */
+        apic_write_reg(apic, APIC_TIMER_DIV, 0x03);
+        apic_write_reg(apic, APIC_LVT_TIMER,
+                       APIC_LVT_MASKED | 32U);
+        apic_write_reg(apic, APIC_TIMER_INIT, 0);
     }
 
     /* Enable this AP's PMU counters (CR4.PCE + event select MSRs).

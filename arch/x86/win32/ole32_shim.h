@@ -1,6 +1,6 @@
 /*
  * OsitoK Windows Compatibility Layer — ole32.dll Shim
- * OLE/COM infrastructure stubs. Window.dll imports this.
+ * OLE/COM infrastructure and built-in class activation.
  */
 
 #ifndef OLE32_SHIM_H
@@ -9,6 +9,8 @@
 #include "nttypes.h"
 
 typedef LONG HRESULT;
+typedef HRESULT (*OLE32_CLASS_ACTIVATOR)(LPCGUID iid, PVOID outer,
+                                         PVOID output);
 
 #ifndef S_OK
 #define S_OK                        ((HRESULT)0)
@@ -22,7 +24,7 @@ HRESULT WINAPI shim_CoInitializeEx(PVOID reserved, DWORD coinit);
 void    WINAPI shim_CoUninitialize(void);
 HRESULT WINAPI shim_CoCreateInstance(PVOID rclsid, PVOID pUnkOuter,
                                      DWORD dwClsContext, PVOID riid,
-                                     PVOID *ppv);
+                                     PVOID output);
 HRESULT WINAPI shim_CoGetMalloc(DWORD context, PVOID *allocator);
 PVOID   WINAPI shim_CoTaskMemAlloc(SIZE_T size);
 void    WINAPI shim_CoTaskMemFree(PVOID ptr);
@@ -45,5 +47,8 @@ HRESULT WINAPI shim_VariantCopy(PVOID destination, PCVOID source);
 PVOID ole32_shim_init(void);
 PVOID ole32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);
 PVOID oleaut32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);
+HRESULT ole32_register_class(LPCGUID clsid, OLE32_CLASS_ACTIVATOR activate);
+void ole32_release_process(DWORD process_id);
+int ole32_apartment_selftest(void);
 
 #endif /* OLE32_SHIM_H */

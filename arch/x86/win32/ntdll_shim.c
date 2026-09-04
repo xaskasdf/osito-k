@@ -12,8 +12,12 @@
 #include "ntdll_shim.h"
 #include "ntsyscall.h"
 #include "handle.h"
+#include "filelock.h"
 #include "advapi32_shim.h"
 #include "kernel32_shim.h"
+#include "dllloader.h"
+#include "compat32.h"
+#include "unwind64.h"
 #include "win32_abi.h"
 
 extern void *kmalloc(uint64_t size);
@@ -22,7 +26,23 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern DWORD win32_current_process_id(void);
+extern PVOID win32_current_peb_lock(void);
 extern HANDLE_TABLE g_handle_table;
+extern int g_compat32_mode;
+extern int win32_user_range_writable(void *pointer, SIZE_T size,
+                                     BOOL compat32);
+extern int win32_user_range_readable(const void *pointer, SIZE_T size,
+                                     BOOL compat32);
+extern int win32_user_range_executable(const void *pointer, SIZE_T size,
+                                       BOOL compat32);
+extern NTSTATUS ntsync_set_event_for_process(HANDLE event, ULONG owner_pid,
+                                              LONG *previous_state);
+extern BOOL win32_process_cr3(DWORD process_id, uint64_t *out_cr3);
+extern int paging_copy_between_cr3(uint64_t destination_cr3,
+                                   uint64_t destination_address,
+                                   uint64_t source_cr3,
+                                   uint64_t source_address, uint64_t size,
+                                   uint64_t *bytes_copied);
 
 /* ── Rtl* Utilities ─────────────────────────────────────────── */
 
@@ -73,6 +93,76 @@ void NTAPI RtlFreeUnicodeString(PUNICODE_STRING value)
     value->Buffer = NULL;
 }
 
+NTSTATUS NTAPI RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION section)
+{
+    if (!section) return STATUS_INVALID_PARAMETER;
+    InitializeCriticalSection(section);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS NTAPI RtlInitializeCriticalSectionAndSpinCount(
+    PRTL_CRITICAL_SECTION section, ULONG spin_count)
+{
+    if (!section) return STATUS_INVALID_PARAMETER;
+    return InitializeCriticalSectionAndSpinCount(section, spin_count)
+        ? STATUS_SUCCESS : STATUS_NO_MEMORY;
+}
+
+NTSTATUS NTAPI RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION section,
+                                               ULONG spin_count,
+                                               ULONG flags)
+{
+    (void)flags;
+    return RtlInitializeCriticalSectionAndSpinCount(section, spin_count);
+}
+
+NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION section)
+{
+    if (!section) return STATUS_INVALID_PARAMETER;
+    EnterCriticalSection(section);
+    return STATUS_SUCCESS;
+}
+
+BOOL NTAPI RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION section)
+{
+    return section ? TryEnterCriticalSection(section) : FALSE;
+}
+
+NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION section)
+{
+    if (!section) return STATUS_INVALID_PARAMETER;
+    LeaveCriticalSection(section);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION section)
+{
+    if (!section) return STATUS_INVALID_PARAMETER;
+    DeleteCriticalSection(section);
+    return STATUS_SUCCESS;
+}
+
+void NTAPI RtlAcquirePebLock(void)
+{
+    PRTL_CRITICAL_SECTION lock =
+        (PRTL_CRITICAL_SECTION)win32_current_peb_lock();
+    if (lock) EnterCriticalSection(lock);
+}
+
+BOOL NTAPI RtlTryAcquirePebLock(void)
+{
+    PRTL_CRITICAL_SECTION lock =
+        (PRTL_CRITICAL_SECTION)win32_current_peb_lock();
+    return lock ? TryEnterCriticalSection(lock) : FALSE;
+}
+
+void NTAPI RtlReleasePebLock(void)
+{
+    PRTL_CRITICAL_SECTION lock =
+        (PRTL_CRITICAL_SECTION)win32_current_peb_lock();
+    if (lock) LeaveCriticalSection(lock);
+}
+
 NTSTATUS NTAPI RtlUnicodeStringToAnsiString(PSTR dest, PCUNICODE_STRING src,
                                        ULONG dest_size)
 {
@@ -117,15 +207,21 @@ ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status)
     case STATUS_INVALID_PARAMETER:      return 87;     /* ERROR_INVALID_PARAMETER */
     case STATUS_NO_MEMORY:              return 8;      /* ERROR_NOT_ENOUGH_MEMORY */
     case STATUS_INVALID_HANDLE:         return 6;      /* ERROR_INVALID_HANDLE */
+    case STATUS_HANDLE_NOT_CLOSABLE:    return 6;      /* ERROR_INVALID_HANDLE */
     case STATUS_ACCESS_DENIED:          return 5;      /* ERROR_ACCESS_DENIED */
+    case STATUS_INVALID_DEVICE_REQUEST: return 1;      /* ERROR_INVALID_FUNCTION */
     case STATUS_OBJECT_NAME_NOT_FOUND:  return 2;      /* ERROR_FILE_NOT_FOUND */
     case STATUS_OBJECT_PATH_NOT_FOUND:  return 3;      /* ERROR_PATH_NOT_FOUND */
     case STATUS_OBJECT_NAME_EXISTS:     return 183;    /* ERROR_ALREADY_EXISTS */
     case STATUS_OBJECT_NAME_COLLISION:  return 183;    /* ERROR_ALREADY_EXISTS */
     case STATUS_ACCESS_VIOLATION:       return 998;    /* ERROR_NOACCESS */
     case STATUS_NOT_IMPLEMENTED:        return 120;    /* ERROR_CALL_NOT_IMPLEMENTED */
+    case STATUS_NOT_SUPPORTED:          return 50;     /* ERROR_NOT_SUPPORTED */
     case STATUS_INSUFFICIENT_RESOURCES: return 8;      /* ERROR_NOT_ENOUGH_MEMORY */
     case STATUS_END_OF_FILE:            return 38;     /* ERROR_HANDLE_EOF */
+    case STATUS_FILE_LOCK_CONFLICT:     return 33;     /* ERROR_LOCK_VIOLATION */
+    case STATUS_LOCK_NOT_GRANTED:       return 33;     /* ERROR_LOCK_VIOLATION */
+    case STATUS_RANGE_NOT_LOCKED:       return 158;    /* ERROR_NOT_LOCKED */
     case STATUS_CANCELLED:              return 995;    /* ERROR_OPERATION_ABORTED */
     case STATUS_IO_TIMEOUT:             return 121;    /* ERROR_SEM_TIMEOUT */
     case STATUS_CONNECTION_RESET:       return 64;     /* ERROR_NETNAME_DELETED */
@@ -376,6 +472,165 @@ NTSTATUS NTAPI NtWriteFile(HANDLE fh, HANDLE event, PVOID apc_routine,
         (ULONG_PTR)len, (ULONG_PTR)offset, (ULONG_PTR)key
     };
     return sys_NtWriteFile(args);
+}
+
+typedef struct _NTDLL_PENDING_FILE_LOCK {
+    HANDLE event;
+    PIO_STATUS_BLOCK iosb;
+    ULONG owner_pid;
+    BOOL compat32;
+} NTDLL_PENDING_FILE_LOCK;
+
+static void ntdll_store_file_lock_iosb(PIO_STATUS_BLOCK iosb, BOOL compat32,
+                                       NTSTATUS status)
+{
+    if (!iosb)
+        return;
+    if (compat32) {
+        volatile uint32_t *values = (volatile uint32_t *)(PVOID)iosb;
+        values[0] = (uint32_t)status;
+        values[1] = 0;
+    } else {
+        iosb->Status = status;
+        iosb->Information = 0;
+    }
+}
+
+static BOOL ntdll_store_file_lock_iosb_for_owner(
+    PIO_STATUS_BLOCK iosb, ULONG owner_pid, BOOL compat32, NTSTATUS status)
+{
+    if (owner_pid == win32_current_process_id()) {
+        ntdll_store_file_lock_iosb(iosb, compat32, status);
+        return TRUE;
+    }
+
+    uint64_t destination_cr3;
+    uint64_t source_cr3;
+    uint64_t copied = 0;
+    if (!iosb || !win32_process_cr3(owner_pid, &destination_cr3))
+        return FALSE;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(source_cr3));
+
+    if (compat32) {
+        uint32_t values[2] = { (uint32_t)status, 0 };
+        return paging_copy_between_cr3(
+                   destination_cr3, (uint64_t)(ULONG_PTR)iosb,
+                   source_cr3, (uint64_t)(ULONG_PTR)values,
+                   sizeof(values), &copied) == 0 &&
+               copied == sizeof(values);
+    }
+
+    IO_STATUS_BLOCK value;
+    value.Status = status;
+    value.Information = 0;
+    return paging_copy_between_cr3(
+               destination_cr3, (uint64_t)(ULONG_PTR)iosb,
+               source_cr3, (uint64_t)(ULONG_PTR)&value,
+               sizeof(value), &copied) == 0 &&
+           copied == sizeof(value);
+}
+
+static NTSTATUS ntdll_complete_file_lock_for_owner(
+    HANDLE event, PIO_STATUS_BLOCK iosb, ULONG owner_pid, BOOL compat32,
+    NTSTATUS status)
+{
+    (void)ntdll_store_file_lock_iosb_for_owner(
+        iosb, owner_pid, compat32, status);
+    if (event)
+        (void)ntsync_set_event_for_process(event, owner_pid, NULL);
+    return status;
+}
+
+static NTSTATUS ntdll_complete_file_lock(HANDLE event,
+                                         PIO_STATUS_BLOCK iosb,
+                                         NTSTATUS status)
+{
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    return ntdll_complete_file_lock_for_owner(
+        event, iosb, owner_pid, g_compat32_mode ? TRUE : FALSE, status);
+}
+
+static void ntdll_pending_file_lock_complete(PVOID context, NTSTATUS status)
+{
+    NTDLL_PENDING_FILE_LOCK *pending =
+        (NTDLL_PENDING_FILE_LOCK *)context;
+    if (!pending)
+        return;
+    (void)ntdll_complete_file_lock_for_owner(
+        pending->event, pending->iosb, pending->owner_pid,
+        pending->compat32, status);
+    kfree(pending);
+}
+
+NTSTATUS NTAPI NtLockFile(HANDLE file, HANDLE event, PVOID apc_routine,
+                          PVOID apc_context, PIO_STATUS_BLOCK iosb,
+                          PLARGE_INTEGER offset, PLARGE_INTEGER length,
+                          ULONG key, BOOL fail_immediately,
+                          BOOL exclusive)
+{
+    (void)apc_context;
+    if (!iosb || !offset || !length)
+        return STATUS_INVALID_PARAMETER;
+    if (offset->QuadPart < 0 || length->QuadPart < 0)
+        return ntdll_complete_file_lock(NULL, iosb,
+                                        STATUS_INVALID_PARAMETER);
+    if (apc_routine)
+        return ntdll_complete_file_lock(NULL, iosb, STATUS_NOT_SUPPORTED);
+
+    if (event) {
+        NTSTATUS event_status = NtResetEvent(event, NULL);
+        if (!NT_SUCCESS(event_status))
+            return ntdll_complete_file_lock(NULL, iosb, event_status);
+    }
+
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    NTDLL_PENDING_FILE_LOCK *pending = NULL;
+    if (!fail_immediately) {
+        pending = (NTDLL_PENDING_FILE_LOCK *)kmalloc(sizeof(*pending));
+        if (!pending)
+            return ntdll_complete_file_lock(
+                event, iosb, STATUS_INSUFFICIENT_RESOURCES);
+        pending->event = event;
+        pending->iosb = iosb;
+        pending->owner_pid = owner_pid;
+        pending->compat32 = g_compat32_mode ? TRUE : FALSE;
+        /* A completion can race the return from the queueing call. */
+        ntdll_store_file_lock_iosb(iosb, pending->compat32, STATUS_PENDING);
+    }
+
+    NTSTATUS status = nt_file_lock_range_request(
+        file, owner_pid, GetCurrentThreadId(),
+        (ULONGLONG)offset->QuadPart, (ULONGLONG)length->QuadPart, key,
+        fail_immediately ? TRUE : FALSE, exclusive ? TRUE : FALSE, iosb,
+        pending ? ntdll_pending_file_lock_complete : NULL, pending);
+    if (status == STATUS_PENDING)
+        return status;
+    if (pending)
+        kfree(pending);
+    return ntdll_complete_file_lock(event, iosb, status);
+}
+
+NTSTATUS NTAPI NtUnlockFile(HANDLE file, PIO_STATUS_BLOCK iosb,
+                            PLARGE_INTEGER offset, PLARGE_INTEGER length,
+                            ULONG key)
+{
+    if (!iosb || !offset || !length)
+        return STATUS_INVALID_PARAMETER;
+    if (offset->QuadPart < 0 || length->QuadPart < 0) {
+        ntdll_store_file_lock_iosb(
+            iosb, g_compat32_mode ? TRUE : FALSE, STATUS_INVALID_PARAMETER);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    NTSTATUS status = nt_file_unlock_range(
+        file, owner_pid, (ULONGLONG)offset->QuadPart,
+        (ULONGLONG)length->QuadPart, key);
+    ntdll_store_file_lock_iosb(iosb, g_compat32_mode ? TRUE : FALSE, status);
+    return status;
 }
 
 NTSTATUS NTAPI NtClose(HANDLE h)
@@ -951,8 +1206,8 @@ typedef struct {
     PVOID Reserved3[2];
 } PROCESS_BASIC_INFORMATION_WOW64;
 
-_Static_assert(sizeof(NTDLL_INSPECTION_PEB64) == 256,
-               "Chromium partial PEB layout changed");
+_Static_assert(sizeof(NTDLL_INSPECTION_PEB64) == 0x2C8,
+               "native inspection PEB layout changed");
 _Static_assert(sizeof(PROCESS_BASIC_INFORMATION_WOW64) == 88,
                "WOW64 process information layout changed");
 
@@ -1397,46 +1652,161 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern TEB g_teb;
 extern TEB *win64_current_teb(void);
+extern void NTAPI win32_restore_context_asm(PCONTEXT context);
+typedef PVOID (NTAPI *RTL_UNWIND_CONSOLIDATE_CALLBACK)(
+    PEXCEPTION_RECORD record);
+extern PVOID NTAPI win32_unwind64_call_consolidate(
+    PCONTEXT context, RTL_UNWIND_CONSOLIDATE_CALLBACK callback,
+    PEXCEPTION_RECORD record);
 
-/*
- * RtlCaptureContext — snapshot current register state.
- * In our flat model, we capture what we can. The caller typically uses
- * this for exception dispatch or stack walking.
- */
-void NTAPI RtlCaptureContext(PCONTEXT ctx)
+typedef struct __attribute__((aligned(16))) _WIN32_JUMP_BUFFER64 {
+    ULONGLONG Frame;
+    ULONGLONG Rbx;
+    ULONGLONG Rsp;
+    ULONGLONG Rbp;
+    ULONGLONG Rsi;
+    ULONGLONG Rdi;
+    ULONGLONG R12;
+    ULONGLONG R13;
+    ULONGLONG R14;
+    ULONGLONG R15;
+    ULONGLONG Rip;
+    DWORD MxCsr;
+    WORD FpCsr;
+    WORD Spare;
+    M128A Xmm6[10];
+} WIN32_JUMP_BUFFER64;
+
+_Static_assert(sizeof(WIN32_JUMP_BUFFER64) == 0x100,
+               "AMD64 jump buffer size changed");
+_Static_assert(__builtin_offsetof(WIN32_JUMP_BUFFER64, Xmm6) == 0x60,
+               "AMD64 jump buffer XMM offset changed");
+
+static BOOL rtl_restore_target_valid(PCONTEXT context)
 {
-    if (!ctx) return;
+    TEB *teb = win64_current_teb();
+    ULONG_PTR stack_limit = teb ? (ULONG_PTR)teb->StackLimit : 0;
+    ULONG_PTR stack_base = teb ? (ULONG_PTR)teb->StackBase : 0;
+    return context && stack_limit && stack_limit < stack_base &&
+           !(context->Rsp & (sizeof(ULONG_PTR) - 1U)) &&
+           context->Rsp >= stack_limit && context->Rsp <= stack_base &&
+           context->Rip && win32_user_range_executable(
+               (const void *)(ULONG_PTR)context->Rip, 1, FALSE);
+}
 
-    /* Zero the context, then fill what we know */
-    BYTE *p = (BYTE *)ctx;
-    for (SIZE_T i = 0; i < sizeof(CONTEXT); i++) p[i] = 0;
+/* RtlCaptureContext itself is the assembly entry in context64.S. */
+void NTAPI RtlRestoreContext(PCONTEXT context,
+                             PEXCEPTION_RECORD exception_record)
+{
+    if (g_compat32_mode) {
+        NTSTATUS status = compat32_rtl_restore_context(
+            (uint32_t)(ULONG_PTR)context,
+            (uint32_t)(ULONG_PTR)exception_record);
+        if (!NT_SUCCESS(status)) {
+            serial_puts("[SEH32] RtlRestoreContext rejected context\n");
+            RtlRaiseStatus(status);
+        }
+        return;
+    }
 
-    ctx->ContextFlags = CONTEXT_FULL;
+    if (!context || !win32_user_range_writable(
+            context, sizeof(*context), FALSE) ||
+        (exception_record && !win32_user_range_readable(
+            exception_record, sizeof(*exception_record), FALSE))) {
+        serial_puts("[SEH] RtlRestoreContext rejected invalid context\n");
+        RtlRaiseStatus(STATUS_INVALID_PARAMETER);
+        return;
+    }
 
-    /* We can't easily capture registers from C, but we set up
-     * a reasonable context. The important fields for SEH are RSP/RBP/RIP. */
-    /* Use inline asm to grab RSP and RBP */
-#ifndef TEST_HARNESS
-    __asm__ volatile ("movq %%rsp, %0" : "=r"(ctx->Rsp));
-    __asm__ volatile ("movq %%rbp, %0" : "=r"(ctx->Rbp));
-    __asm__ volatile ("movq %%r12, %0" : "=r"(ctx->R12));
-    __asm__ volatile ("movq %%r13, %0" : "=r"(ctx->R13));
-    serial_puts("[RTL-CONTEXT] r12=0x");
-    serial_puthex(ctx->R12, 16);
-    serial_puts(" r13=0x");
-    serial_puthex(ctx->R13, 16);
-    serial_puts("\n");
-#endif
+    if (exception_record &&
+        exception_record->ExceptionCode == (DWORD)STATUS_LONGJUMP &&
+        exception_record->NumberParameters >= 1) {
+        const WIN32_JUMP_BUFFER64 *source =
+            (const WIN32_JUMP_BUFFER64 *)(ULONG_PTR)
+                exception_record->ExceptionInformation[0];
+        WIN32_JUMP_BUFFER64 jump;
+        if (!win32_user_range_readable(source, sizeof(*source), FALSE)) {
+            serial_puts("[SEH] RtlRestoreContext rejected jump buffer\n");
+            RtlRaiseStatus(STATUS_INVALID_PARAMETER);
+            return;
+        }
+        RtlCopyMemory(&jump, source, sizeof(jump));
+        context->Rbx = jump.Rbx;
+        context->Rsp = jump.Rsp;
+        context->Rbp = jump.Rbp;
+        context->Rsi = jump.Rsi;
+        context->Rdi = jump.Rdi;
+        context->R12 = jump.R12;
+        context->R13 = jump.R13;
+        context->R14 = jump.R14;
+        context->R15 = jump.R15;
+        context->Rip = jump.Rip;
+        context->MxCsr = jump.MxCsr;
+        context->FltSave.MxCsr = jump.MxCsr;
+        context->FltSave.ControlWord = jump.FpCsr;
+        RtlCopyMemory(&context->FltSave.XmmRegisters[6], jump.Xmm6,
+                      sizeof(jump.Xmm6));
+    } else if (exception_record &&
+               exception_record->ExceptionCode ==
+                   (DWORD)STATUS_UNWIND_CONSOLIDATE &&
+               exception_record->NumberParameters >= 1) {
+        RTL_UNWIND_CONSOLIDATE_CALLBACK callback =
+            (RTL_UNWIND_CONSOLIDATE_CALLBACK)(ULONG_PTR)
+                exception_record->ExceptionInformation[0];
+        if (!rtl_restore_target_valid(context) ||
+            !win32_user_range_executable((const void *)callback, 1,
+                                         FALSE)) {
+            serial_puts("[SEH] RtlRestoreContext rejected consolidate callback\n");
+            RtlRaiseStatus(STATUS_INVALID_PARAMETER);
+            return;
+        }
+        PVOID continuation = win32_unwind64_call_consolidate(
+            context, callback, exception_record);
+        if (!continuation || !win32_user_range_executable(
+                continuation, 1, FALSE)) {
+            serial_puts("[SEH] RtlRestoreContext rejected consolidate target\n");
+            RtlRaiseStatus(STATUS_INVALID_PARAMETER);
+            return;
+        }
+        context->Rip = (ULONGLONG)(ULONG_PTR)continuation;
+    }
+
+    if (!rtl_restore_target_valid(context)) {
+        serial_puts("[SEH] RtlRestoreContext rejected invalid target\n");
+        RtlRaiseStatus(STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    ULONG_PTR live_flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(live_flags));
+    const DWORD mutable_flags = 0x00250DD5U;
+    context->EFlags = ((DWORD)live_flags & ~mutable_flags) |
+                      (context->EFlags & mutable_flags);
+    context->MxCsr &= 0x0000FFBFU;
+    context->FltSave.MxCsr = context->MxCsr;
+    win32_restore_context_asm(context);
 }
 
 static PVOID NTAPI RtlLookupFunctionEntry_stub(ULONG_PTR control_pc,
                                                 ULONG_PTR *image_base,
                                                 PVOID history_table)
 {
-    (void)control_pc;
-    (void)image_base;
-    (void)history_table;
-    return NULL;
+    return win32_unwind64_lookup_function_entry(
+        control_pc, image_base, (PUNWIND_HISTORY_TABLE)history_table);
+}
+
+static BOOL NTAPI RtlAddFunctionTable_ntdll(PVOID function_table,
+                                             DWORD entry_count,
+                                             ULONGLONG base_address)
+{
+    return win32_unwind64_add_function_table(
+        (PRUNTIME_FUNCTION)function_table, entry_count, base_address);
+}
+
+static BOOL NTAPI RtlDeleteFunctionTable_ntdll(PVOID function_table)
+{
+    return win32_unwind64_delete_function_table(
+        (PRUNTIME_FUNCTION)function_table);
 }
 
 /*
@@ -1448,8 +1818,14 @@ static PVOID NTAPI RtlLookupFunctionEntry_stub(ULONG_PTR control_pc,
  * filter if set, then terminates.
  */
 
-void NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
+void NTAPI win32_rtl_raise_exception_impl(
+    PEXCEPTION_RECORD ExceptionRecord, PCONTEXT context)
 {
+    if (!ExceptionRecord)
+        return;
+
+    NTSTATUS terminal_status = ExceptionRecord->ExceptionCode;
+
     serial_puts("[SEH] RtlRaiseException: code=0x");
     serial_puthex(ExceptionRecord->ExceptionCode, 8);
     serial_puts("\n");
@@ -1468,6 +1844,40 @@ void NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
         }
     }
 
+    if (!g_compat32_mode) {
+        if (!context) {
+            terminal_status = STATUS_INVALID_PARAMETER;
+            goto terminate;
+        }
+        if (!ExceptionRecord->ExceptionAddress)
+            ExceptionRecord->ExceptionAddress =
+                (PVOID)(ULONG_PTR)context->Rip;
+
+        LONG disposition = kernel32_dispatch_vectored_exception(
+            ExceptionRecord, context);
+        if (disposition == EXCEPTION_CONTINUE_EXECUTION) {
+            if (ExceptionRecord->ExceptionFlags & EXCEPTION_NONCONTINUABLE) {
+                terminal_status = STATUS_NONCONTINUABLE_EXCEPTION;
+                goto terminate;
+            }
+            RtlRestoreContext(context, ExceptionRecord);
+            terminal_status = STATUS_INVALID_DISPOSITION;
+            goto terminate;
+        }
+
+        NTSTATUS frame_status = win32_unwind64_dispatch_exception(
+            ExceptionRecord, context);
+        if (frame_status == STATUS_SUCCESS) {
+            RtlRestoreContext(context, ExceptionRecord);
+            terminal_status = STATUS_INVALID_DISPOSITION;
+            goto terminate;
+        }
+        if (frame_status != STATUS_UNHANDLED_EXCEPTION) {
+            terminal_status = frame_status;
+            goto terminate;
+        }
+    }
+
     /* compat32_seh_dispatch already walked the 32-bit SEH chain with
      * the correct 32-bit semantics (4-byte Next + 4-byte Handler). If
      * it returned 0, the chain was traversed and no handler caught the
@@ -1480,99 +1890,167 @@ void NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
 
     /* No handler caught the exception — try unhandled filter */
     PVOID unhandled_filter = kernel32_get_unhandled_exception_filter();
-    if (!g_compat32_mode && unhandled_filter) {
+    if (!g_compat32_mode && unhandled_filter &&
+        win32_user_range_executable(unhandled_filter, 1, FALSE)) {
         serial_puts("[SEH] calling UnhandledExceptionFilter\n");
         EXCEPTION_POINTERS ep;
         ep.ExceptionRecord = ExceptionRecord;
-        ep.ContextRecord   = NULL;
+        ep.ContextRecord   = context;
 
         typedef LONG (WINAPI *uef_fn)(PEXCEPTION_POINTERS);
         uef_fn filter = (uef_fn)unhandled_filter;
         LONG result = filter(&ep);
 
-        if (result == EXCEPTION_CONTINUE_EXECUTION)
-            return;
+        if (result == EXCEPTION_CONTINUE_EXECUTION &&
+            !(ExceptionRecord->ExceptionFlags & EXCEPTION_NONCONTINUABLE)) {
+            RtlRestoreContext(context, ExceptionRecord);
+            terminal_status = STATUS_INVALID_DISPOSITION;
+        } else if (result == EXCEPTION_CONTINUE_EXECUTION) {
+            terminal_status = STATUS_NONCONTINUABLE_EXCEPTION;
+        }
     }
 
-    /* Unhandled C++ throws (0xE06D7363) suppress and continue — UT99's
-     * engine FCriticalError throw cycle would otherwise terminate before
-     * init completes. Combined with IST1 stack at 256KB (vs prior 64KB)
-     * the nested catch chain now fits without overflowing into garbage. */
-    if (ExceptionRecord->ExceptionCode == 0xE06D7363) {
-        serial_puts("[SEH] suppressing unhandled C++ throw (continuing)\n");
-        return;
-    }
-
+terminate:
     serial_puts("[SEH] UNHANDLED EXCEPTION 0x");
-    serial_puthex(ExceptionRecord->ExceptionCode, 8);
+    serial_puthex((DWORD)terminal_status, 8);
     serial_puts(" — terminating\n");
 
+    extern BOOL win32_terminate_current_child(NTSTATUS status);
+    extern BOOL win32_terminate_current_main(NTSTATUS status);
+    if (win32_terminate_current_child(terminal_status) ||
+        win32_terminate_current_main(terminal_status))
+        return;
+
     extern void proc_exit(int32_t code);
-    proc_exit((int32_t)ExceptionRecord->ExceptionCode);
+    proc_exit((int32_t)terminal_status);
 }
 
-/*
- * RtlUnwind — unwind the exception handler chain to a target frame.
- *
- * Calls each handler with EXCEPTION_UNWINDING flag set, then removes
- * frames up to (but not including) TargetFrame.
- */
-void NTAPI RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
-               PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue)
+void NTAPI win32_rtl_raise_status_impl(NTSTATUS status, PCONTEXT context)
 {
-    (void)TargetIp;
-    (void)ReturnValue;
+    EXCEPTION_RECORD record;
+    BYTE *bytes = (BYTE *)&record;
 
-    serial_puts("[SEH] RtlUnwind to frame ");
-    serial_puthex((uint64_t)(ULONG_PTR)TargetFrame, 16);
-    serial_puts("\n");
+    for (SIZE_T i = 0; i < sizeof(record); i++)
+        bytes[i] = 0;
 
-    /* Build unwind exception record if not provided */
-    EXCEPTION_RECORD local_rec;
-    if (!ExceptionRecord) {
-        BYTE *p = (BYTE *)&local_rec;
-        for (SIZE_T i = 0; i < sizeof(EXCEPTION_RECORD); i++) p[i] = 0;
-        local_rec.ExceptionCode  = STATUS_SUCCESS;
-        local_rec.ExceptionFlags = EXCEPTION_UNWINDING;
-        ExceptionRecord = &local_rec;
-    } else {
-        ExceptionRecord->ExceptionFlags |= EXCEPTION_UNWINDING;
+    record.ExceptionCode = status;
+    record.ExceptionFlags = EXCEPTION_NONCONTINUABLE;
+    if (g_compat32_mode) {
+        extern uint32_t compat32_get_last_caller_eip(void);
+        record.ExceptionAddress =
+            (PVOID)(ULONG_PTR)compat32_get_last_caller_eip();
+    } else if (context) {
+        record.ExceptionAddress = (PVOID)(ULONG_PTR)context->Rip;
     }
 
-    /* Walk frames, call handlers with UNWIND flag */
-    TEB *teb = win64_current_teb();
-    PEXCEPTION_REGISTRATION_RECORD frame =
-        (PEXCEPTION_REGISTRATION_RECORD)teb->ExceptionList;
-
-    while (frame && frame != EXCEPTION_CHAIN_END) {
-        if ((PVOID)frame == TargetFrame) {
-            /* Reached target — set as new chain head */
-            teb->ExceptionList = (PVOID)frame;
-            return;
-        }
-
-        PEXCEPTION_REGISTRATION_RECORD next = frame->Next;
-
-        if (frame->Handler) {
-            typedef EXCEPTION_DISPOSITION (WINAPI *seh_handler_fn)(
-                PEXCEPTION_RECORD, PVOID, PCONTEXT, PVOID);
-            seh_handler_fn handler = (seh_handler_fn)frame->Handler;
-            handler(ExceptionRecord, frame, NULL, NULL);
-        }
-
-        /* Remove this frame from chain */
-        teb->ExceptionList = (PVOID)next;
-        frame = next;
-    }
+    /* The PE32 thunk commits a selected SEH transfer after this returns. */
+    win32_rtl_raise_exception_impl(&record, context);
 }
 
-void NTAPI RtlUnwindEx(PVOID TargetFrame, PVOID TargetIp,
-                       PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue,
-                       PCONTEXT ContextRecord, PVOID HistoryTable)
+typedef struct {
+    CONTEXT Context;
+    ULONGLONG Argument5;
+    ULONGLONG Argument6;
+} WIN32_UNWIND_ENTRY;
+
+_Static_assert(__builtin_offsetof(WIN32_UNWIND_ENTRY, Argument5) ==
+                   sizeof(CONTEXT),
+               "unwind entry argument layout changed");
+
+/* context64.S records the import caller before entering compiler-generated
+ * code. The first four API arguments remain in the captured register slots;
+ * the two stack arguments follow the CONTEXT in this private entry record. */
+ULONG_PTR NTAPI win32_rtl_unwind_entry_impl(WIN32_UNWIND_ENTRY *entry,
+                                            BOOL extended)
 {
-    (void)ContextRecord;
-    (void)HistoryTable;
-    RtlUnwind(TargetFrame, TargetIp, ExceptionRecord, ReturnValue);
+    if (!entry) return 0;
+
+    PVOID target_frame = (PVOID)(ULONG_PTR)entry->Context.Rcx;
+    PVOID target_ip = (PVOID)(ULONG_PTR)entry->Context.Rdx;
+    PEXCEPTION_RECORD exception_record =
+        (PEXCEPTION_RECORD)(ULONG_PTR)entry->Context.R8;
+    PVOID return_value = (PVOID)(ULONG_PTR)entry->Context.R9;
+
+    if (g_compat32_mode) {
+        NTSTATUS exit_status = STATUS_SUCCESS;
+        NTSTATUS status = compat32_rtl_unwind(
+            (uint32_t)(ULONG_PTR)target_frame,
+            (uint32_t)(ULONG_PTR)target_ip,
+            (uint32_t)(ULONG_PTR)exception_record,
+            (uint32_t)(ULONG_PTR)return_value,
+            &exit_status);
+        if (!NT_SUCCESS(status)) {
+            win32_rtl_raise_status_impl(status, &entry->Context);
+            return 0;
+        }
+        if (!target_frame) {
+            extern BOOL win32_terminate_current_child(NTSTATUS status);
+            extern BOOL win32_terminate_current_main(NTSTATUS status);
+            if (win32_terminate_current_child(exit_status) ||
+                win32_terminate_current_main(exit_status))
+                return 0;
+            extern void proc_exit(int32_t code);
+            proc_exit((int32_t)exit_status);
+            return 0;
+        }
+        return (ULONG_PTR)return_value;
+    }
+
+    PCONTEXT context = &entry->Context;
+    PUNWIND_HISTORY_TABLE history = NULL;
+    if (extended) {
+        PCONTEXT caller_context =
+            (PCONTEXT)(ULONG_PTR)entry->Argument5;
+        history = (PUNWIND_HISTORY_TABLE)(ULONG_PTR)entry->Argument6;
+        if (!caller_context ||
+            !win32_user_range_writable(caller_context, sizeof(*caller_context),
+                                       FALSE) ||
+            (history && !win32_user_range_writable(
+                            history, sizeof(*history), FALSE))) {
+            win32_rtl_raise_status_impl(STATUS_INVALID_PARAMETER, context);
+            return 0;
+        }
+        *caller_context = *context;
+        context = caller_context;
+    }
+
+    EXCEPTION_RECORD local_record;
+    if (!exception_record) {
+        BYTE *bytes = (BYTE *)&local_record;
+        for (SIZE_T i = 0; i < sizeof(local_record); i++) bytes[i] = 0;
+        local_record.ExceptionCode = STATUS_UNWIND;
+        local_record.ExceptionAddress = (PVOID)(ULONG_PTR)context->Rip;
+        exception_record = &local_record;
+    } else if (!win32_user_range_writable(
+                   exception_record, sizeof(*exception_record), FALSE)) {
+        win32_rtl_raise_status_impl(STATUS_INVALID_PARAMETER, context);
+        return 0;
+    }
+
+    NTSTATUS status = win32_unwind64_unwind_ex(
+        exception_record, context, target_frame, target_ip, return_value,
+        history);
+    if (status != STATUS_SUCCESS) {
+        win32_rtl_raise_status_impl(status, context);
+        return 0;
+    }
+
+    if (!target_frame) {
+        NTSTATUS exit_status = exception_record->ExceptionCode;
+        if (exit_status == STATUS_UNWIND) exit_status = STATUS_SUCCESS;
+        extern BOOL win32_terminate_current_child(NTSTATUS status);
+        extern BOOL win32_terminate_current_main(NTSTATUS status);
+        if (win32_terminate_current_child(exit_status) ||
+            win32_terminate_current_main(exit_status))
+            return 0;
+        extern void proc_exit(int32_t code);
+        proc_exit((int32_t)exit_status);
+        return 0;
+    }
+
+    RtlRestoreContext(context, exception_record);
+    win32_rtl_raise_status_impl(STATUS_INVALID_DISPOSITION, context);
+    return 0;
 }
 
 static PVOID NTAPI RtlVirtualUnwind_stub(
@@ -1580,34 +2058,11 @@ static PVOID NTAPI RtlVirtualUnwind_stub(
     PVOID function_entry, PCONTEXT context, PVOID *handler_data,
     ULONG_PTR *establisher_frame, PVOID context_pointers)
 {
-    (void)handler_type;
-    (void)image_base;
-    (void)control_pc;
-    (void)function_entry;
-    (void)context_pointers;
-
-    if (handler_data) *handler_data = NULL;
-    if (establisher_frame)
-        *establisher_frame = context ? (ULONG_PTR)context->Rsp : 0;
-
-    /* We do not parse PE64 unwind codes yet. Make a bounded leaf-frame
-     * advance so diagnostic stack walkers still make forward progress. */
-    if (context && context->Rsp) {
-        extern uint64_t paging_translate_in_cr3(uint64_t cr3, uint64_t virt);
-        uint64_t cr3;
-        __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-        uint64_t first = context->Rsp & ~0xFFFULL;
-        uint64_t last = (context->Rsp + sizeof(uint64_t) - 1) & ~0xFFFULL;
-        if (paging_translate_in_cr3(cr3, first) != UINT64_MAX &&
-            paging_translate_in_cr3(cr3, last) != UINT64_MAX) {
-            uint64_t return_address = *(const uint64_t *)(ULONG_PTR)context->Rsp;
-            if (return_address) {
-                context->Rip = return_address;
-                context->Rsp += sizeof(uint64_t);
-            }
-        }
-    }
-    return NULL;
+    return win32_unwind64_virtual_unwind(
+        handler_type, image_base, control_pc,
+        (PRUNTIME_FUNCTION)function_entry, context, handler_data,
+        establisher_frame,
+        (PKNONVOLATILE_CONTEXT_POINTERS)context_pointers);
 }
 
 /*
@@ -1617,12 +2072,12 @@ static PVOID NTAPI RtlVirtualUnwind_stub(
 NTSTATUS NTAPI NtRaiseException(PEXCEPTION_RECORD ExceptionRecord,
                            PCONTEXT ContextRecord, BOOL FirstChance)
 {
-    (void)ContextRecord;
     (void)FirstChance;
 
-    if (!ExceptionRecord) return STATUS_INVALID_PARAMETER;
+    if (!ExceptionRecord || (!g_compat32_mode && !ContextRecord))
+        return STATUS_INVALID_PARAMETER;
 
-    RtlRaiseException(ExceptionRecord);
+    win32_rtl_raise_exception_impl(ExceptionRecord, ContextRecord);
     return STATUS_SUCCESS;
 }
 
@@ -1699,6 +2154,92 @@ static NTSTATUS NTAPI LdrGetProcedureAddress(PVOID BaseAddress,
     return STATUS_SUCCESS;
 }
 
+#define LDR_LOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS 0x00000001U
+#define LDR_LOCK_LOADER_LOCK_FLAG_TRY_ONLY        0x00000002U
+#define LDR_UNLOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS 0x00000001U
+#define LDR_LOCK_LOADER_LOCK_DISPOSITION_INVALID           0U
+#define LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED     1U
+#define LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_NOT_ACQUIRED 2U
+
+static volatile ULONG ldr_lock_cookie_sequence;
+
+static void ldr_store_lock_cookie(ULONG_PTR *cookie, ULONG_PTR value)
+{
+    if (g_compat32_mode)
+        *(uint32_t *)(void *)cookie = (uint32_t)value;
+    else
+        *cookie = value;
+}
+
+static ULONG_PTR ldr_make_lock_cookie(void)
+{
+    ULONG sequence = __atomic_add_fetch(&ldr_lock_cookie_sequence, 1,
+                                         __ATOMIC_RELAXED) & 0xFFFFU;
+    if (!sequence)
+        sequence = __atomic_add_fetch(&ldr_lock_cookie_sequence, 1,
+                                      __ATOMIC_RELAXED) & 0xFFFFU;
+    return ((ULONG_PTR)(GetCurrentThreadId() & 0x0FFFU) << 16) | sequence;
+}
+
+static NTSTATUS ldr_status_or_raise(ULONG flags, NTSTATUS status)
+{
+    if (flags & LDR_LOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS)
+        RtlRaiseStatus(status);
+    return status;
+}
+
+static NTSTATUS NTAPI LdrLockLoaderLock(ULONG flags, ULONG *disposition,
+                                        ULONG_PTR *cookie)
+{
+    if (disposition)
+        *disposition = LDR_LOCK_LOADER_LOCK_DISPOSITION_INVALID;
+    if (cookie) ldr_store_lock_cookie(cookie, 0);
+
+    if (flags & ~(LDR_LOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS |
+                  LDR_LOCK_LOADER_LOCK_FLAG_TRY_ONLY))
+        return ldr_status_or_raise(flags, STATUS_INVALID_PARAMETER_1);
+    if (!cookie)
+        return ldr_status_or_raise(flags, STATUS_INVALID_PARAMETER_3);
+
+    BOOL acquired;
+    if (flags & LDR_LOCK_LOADER_LOCK_FLAG_TRY_ONLY)
+        acquired = dll_loader_lock_try_enter();
+    else {
+        dll_loader_lock_enter();
+        acquired = TRUE;
+    }
+
+    if (!acquired) {
+        if (disposition)
+            *disposition =
+                LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_NOT_ACQUIRED;
+        return STATUS_SUCCESS;
+    }
+
+    if (disposition)
+        *disposition = LDR_LOCK_LOADER_LOCK_DISPOSITION_LOCK_ACQUIRED;
+    ldr_store_lock_cookie(cookie, ldr_make_lock_cookie());
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI LdrUnlockLoaderLock(ULONG flags, ULONG_PTR cookie)
+{
+    if (flags & ~LDR_UNLOCK_LOADER_LOCK_FLAG_RAISE_ON_ERRORS)
+        return ldr_status_or_raise(flags, STATUS_INVALID_PARAMETER_1);
+    if (!cookie) return STATUS_SUCCESS;
+
+    ULONG_PTR expected_thread =
+        (ULONG_PTR)(GetCurrentThreadId() & 0x0FFFU) << 16;
+    if ((cookie & 0xF0000000U) ||
+        (cookie & 0x0FFF0000U) != expected_thread ||
+        !dll_loader_lock_owned_by_current_thread())
+        return ldr_status_or_raise(flags, STATUS_INVALID_PARAMETER_2);
+
+    if (!dll_loader_lock_leave())
+        return ldr_status_or_raise(flags, STATUS_INVALID_PARAMETER_2);
+    return STATUS_SUCCESS;
+}
+
 /* ── Export resolution table ────────────────────────────────── */
 
 static const SHIM_EXPORT ntdll_exports[] = {
@@ -1706,6 +2247,8 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "NtCreateFile",              (PVOID)NtCreateFile,              11, CC_STDCALL },
     { "NtReadFile",                (PVOID)NtReadFile,                 9, CC_STDCALL },
     { "NtWriteFile",               (PVOID)NtWriteFile,                9, CC_STDCALL },
+    { "NtLockFile",                (PVOID)NtLockFile,                 10, CC_STDCALL },
+    { "NtUnlockFile",              (PVOID)NtUnlockFile,                5, CC_STDCALL },
     { "NtClose",                   (PVOID)NtClose,                    1, CC_STDCALL },
     { "NtQueryObject",             (PVOID)NtQueryObject,              5, CC_STDCALL },
     { "NtAllocateVirtualMemory",   (PVOID)NtAllocateVirtualMemory,    6, CC_STDCALL },
@@ -1750,6 +2293,8 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "ZwCreateFile",              (PVOID)NtCreateFile,              11, CC_STDCALL },
     { "ZwReadFile",                (PVOID)NtReadFile,                 9, CC_STDCALL },
     { "ZwWriteFile",               (PVOID)NtWriteFile,                9, CC_STDCALL },
+    { "ZwLockFile",                (PVOID)NtLockFile,                 10, CC_STDCALL },
+    { "ZwUnlockFile",              (PVOID)NtUnlockFile,                5, CC_STDCALL },
     { "ZwClose",                   (PVOID)NtClose,                    1, CC_STDCALL },
     { "ZwQueryObject",             (PVOID)NtQueryObject,              5, CC_STDCALL },
     { "ZwQueryInformationFile",    (PVOID)NtQueryInformationFile,     5, CC_STDCALL },
@@ -1765,22 +2310,40 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "RtlInitUnicodeString",      (PVOID)RtlInitUnicodeString,       2, CC_STDCALL },
     { "RtlFormatCurrentUserKeyPath", (PVOID)RtlFormatCurrentUserKeyPath, 1, CC_STDCALL },
     { "RtlFreeUnicodeString",      (PVOID)RtlFreeUnicodeString,       1, CC_STDCALL },
+    { "RtlInitializeCriticalSection", (PVOID)RtlInitializeCriticalSection, 1, CC_STDCALL },
+    { "RtlInitializeCriticalSectionAndSpinCount", (PVOID)RtlInitializeCriticalSectionAndSpinCount, 2, CC_STDCALL },
+    { "RtlInitializeCriticalSectionEx", (PVOID)RtlInitializeCriticalSectionEx, 3, CC_STDCALL },
+    { "RtlEnterCriticalSection",  (PVOID)RtlEnterCriticalSection,    1, CC_STDCALL },
+    { "RtlTryEnterCriticalSection", (PVOID)RtlTryEnterCriticalSection, 1, CC_STDCALL },
+    { "RtlLeaveCriticalSection",  (PVOID)RtlLeaveCriticalSection,    1, CC_STDCALL },
+    { "RtlDeleteCriticalSection", (PVOID)RtlDeleteCriticalSection,   1, CC_STDCALL },
+    { "RtlAcquirePebLock",        (PVOID)RtlAcquirePebLock,          0, CC_STDCALL },
+    { "RtlTryAcquirePebLock",     (PVOID)RtlTryAcquirePebLock,       0, CC_STDCALL },
+    { "RtlReleasePebLock",        (PVOID)RtlReleasePebLock,          0, CC_STDCALL },
     { "RtlCopyMemory",             (PVOID)RtlCopyMemory,              3, CC_STDCALL },
     { "RtlZeroMemory",             (PVOID)RtlZeroMemory,              2, CC_STDCALL },
     { "RtlFillMemory",             (PVOID)RtlFillMemory,              3, CC_STDCALL },
     { "RtlNtStatusToDosError",     (PVOID)RtlNtStatusToDosError,      1, CC_STDCALL },
     /* SEH support */
     { "RtlRaiseException",         (PVOID)RtlRaiseException,          1, CC_STDCALL },
+    { "RtlRaiseStatus",            (PVOID)RtlRaiseStatus,             1, CC_STDCALL },
     { "RtlUnwind",                 (PVOID)RtlUnwind,                  4, CC_STDCALL },
     { "RtlUnwindEx",               (PVOID)RtlUnwindEx,                6, CC_STDCALL },
     { "RtlVirtualUnwind",          (PVOID)RtlVirtualUnwind_stub,      8, CC_STDCALL },
-    { "RtlCaptureContext",         (PVOID)RtlCaptureContext,          1, CC_STDCALL },
+    { "RtlCaptureContext",         (PVOID)RtlCaptureContext,          1,
+                                      CC_STDCALL | CC_CONTEXT_CAPTURE },
+    { "RtlRestoreContext",         (PVOID)RtlRestoreContext,          2, CC_CDECL },
     { "RtlLookupFunctionEntry",    (PVOID)RtlLookupFunctionEntry_stub, 3, CC_STDCALL },
+    { "RtlAddFunctionTable",       (PVOID)RtlAddFunctionTable_ntdll,  3, CC_STDCALL },
+    { "RtlDeleteFunctionTable",    (PVOID)RtlDeleteFunctionTable_ntdll, 1, CC_STDCALL },
+    { "__C_specific_handler",      (PVOID)win32_unwind64_c_specific_handler, 4, CC_STDCALL },
     { "NtRaiseException",          (PVOID)NtRaiseException,           3, CC_STDCALL },
     { "ZwRaiseException",          (PVOID)NtRaiseException,           3, CC_STDCALL },
     /* Loader */
     { "LdrLoadDll",                (PVOID)LdrLoadDll,                 4, CC_STDCALL },
     { "LdrGetProcedureAddress",    (PVOID)LdrGetProcedureAddress,     4, CC_STDCALL },
+    { "LdrLockLoaderLock",         (PVOID)LdrLockLoaderLock,          3, CC_STDCALL },
+    { "LdrUnlockLoaderLock",       (PVOID)LdrUnlockLoaderLock,        2, CC_STDCALL },
     { NULL, NULL, 0, CC_STDCALL }
 };
 

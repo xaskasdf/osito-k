@@ -200,9 +200,9 @@ typedef struct {
     uint64_t  user_strtab_size;  /* bytes */
     uint64_t  user_load_bias;    /* PIE: rip = st_value + bias */
 
-    /* x87 + SSE + AVX state used by isr_common's xsave64/xrstor64.
-     * XCR0 is restricted to 0x7, whose standard-format area is 832 bytes;
-     * keep a rounded, cache-aligned slot for every process. */
+    /* x87 + SSE + AVX state used by isr_common. XSAVE uses the 832-byte
+     * XCR0=0x7 layout; older x86-64 CPUs use its 512-byte FXSAVE prefix.
+     * Keep a rounded, cache-aligned slot for every process. */
     __attribute__((aligned(64))) uint8_t fpu_state[1024];
 
     /* Speculation analysis — populated at ELF load time (spec_analyze.c) */
@@ -255,6 +255,11 @@ static uint64_t *sched_frame_stack_qword1;
 static uint64_t *sched_sleep_deadline;
 static uint32_t sched_sleeping_count;
 static volatile uint32_t sched_tick_active;
+/* Some architecture transitions temporarily make current_proc, its CR3 and
+ * sched_current_idx describe different stages of the same operation. Timer
+ * IRQ work must continue during those intervals, but the scheduler must not
+ * capture a context until the transition publishes a restorable state. */
+static volatile uint32_t sched_preempt_depth;
 static uint32_t sched_nested_yield_logs;
 static uint32_t sched_irq_off_yield_logs;
 static uint32_t sched_irq_off_save_logs;
@@ -262,6 +267,18 @@ static uint32_t sched_irq_off_restore_logs;
 static uint32_t sched_owner_mismatch_logs;
 static uint32_t sched_ist1_guard_logs;
 static uint32_t sched_ist3_guard_logs;
+
+static void sched_preempt_hold(void)
+{
+    __atomic_fetch_add(&sched_preempt_depth, 1, __ATOMIC_ACQ_REL);
+}
+
+static void sched_preempt_release(void)
+{
+    uint32_t depth = __atomic_load_n(&sched_preempt_depth, __ATOMIC_ACQUIRE);
+    if (depth)
+        __atomic_fetch_sub(&sched_preempt_depth, 1, __ATOMIC_ACQ_REL);
+}
 
 static void proc_tables_release(void)
 {
@@ -539,13 +556,14 @@ void exec_cache_release(const char *name)
 }
 
 /* ── Per-process FPU/SSE state ────────────────────────────────
- * `isr_common` uses XSAVE/XRSTOR with mask 0x7 (x87, SSE, AVX).
+ * `isr_common` uses XSAVE/XRSTOR with mask 0x7 (x87, SSE, AVX), or
+ * FXSAVE/FXRSTOR when XSAVE is unavailable.
  * The pointer loaded from `fpu_state_ptr` tracks the
  * currently scheduled process's `fpu_state` field, so an ISR that
  * fires while process A is running saves A's FPU state on entry;
  * if the scheduler chooses to switch to process B inside the C
  * handler, we also rewrite `fpu_state_ptr` to B's slot, and the
- * exit path's `xrstor64` restores B's state on the way out via
+ * exit path restores B's state on the way out via
  * IRETQ. For the boot window (before any process exists) and for
  * kernel threads that never got a process_t, the pointer points
  * at `fpu_state_kernel` below. */
@@ -888,6 +906,38 @@ int sched_alloc_compat_ist1(uint32_t pid)
         return 0;
     }
     return -1;
+}
+
+/* A non-local exit from INT 0x2E bypasses the assembly epilogue that restores
+ * the TSS cursor. Keep a scheduled PE32 task on its private pristine stack;
+ * falling back to the BSP stack while that task can still block would make
+ * its next context save and restore disagree about IST ownership. */
+void sched_reset_current_compat_ist1(void)
+{
+    uint64_t irq_flags;
+    __asm__ volatile ("pushfq; popq %0; cli"
+                      : "=r"(irq_flags) :: "memory");
+
+    bool reset_private = false;
+    int idx = sched_current_idx;
+    if (idx >= 0 && idx < proc_capacity && current_proc == &proctab[idx] &&
+        sched_compat_ist1_phys[idx]) {
+        uint64_t top = (uint64_t)PHYS_TO_VIRT(sched_compat_ist1_phys[idx]) +
+                       COMPAT_IST1_STACK_SIZE;
+        extern uint64_t *tss_ist1_ptr;
+        sched_compat_ist1[idx] = top;
+        if (tss_ist1_ptr)
+            *tss_ist1_ptr = top;
+        reset_private = true;
+    }
+
+    if (!reset_private) {
+        extern void x86_tss_reset_ist1(void);
+        x86_tss_reset_ist1();
+    }
+
+    if (irq_flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
 }
 
 static void proc_release_kernel_stack(process_t *p)
@@ -1296,6 +1346,10 @@ uint64_t proc_launch_prepare(void)
         serial_putdec(exec_parent_proc ? exec_parent_proc->pid : 0);
         serial_puts(blocked_parent ? " BLOCKED" : " (not blocked)");
         serial_puts("\n");
+        /* elf_jump calls us with interrupts disabled. Identity, scheduler slot
+         * and target CR3 are now coherent, so the next timer tick may safely
+         * capture the new image after STI/JMP completes. */
+        sched_preempt_release();
         return exec_target_proc->cr3;
     }
     return current_proc ? current_proc->cr3 : 0;
@@ -1412,6 +1466,20 @@ int32_t proc_tgid_of(void *p)
     if (proc->state == PROC_FREE)
         return 0;
     return (int32_t)proc->tgid;
+}
+
+/* A vfork-style child has its own TGID but deliberately runs in the parent's
+ * address space until execve installs a new CR3. It may fault pages into that
+ * shared address space, but it must not acquire ownership of the parent's
+ * VMAs or free them during exec teardown. */
+bool proc_shares_current_address_space(void *p)
+{
+    if (!current_proc || !p || proc_tgid_of(p) == 0)
+        return false;
+
+    process_t *owner = (process_t *)p;
+    uint64_t cr3 = current_proc->cr3;
+    return cr3 && cr3 != paging_get_kernel_cr3() && owner->cr3 == cr3;
 }
 
 bool proc_is_thread_of(void *p)
@@ -1705,8 +1773,7 @@ void proc_exit(int32_t code)
      * by int2e_stub. kern_longjmp bypasses the stub's IST1 restore (popq).
      * Without this, next INT 0x2E uses stale IST1 → stack corruption. */
     {
-        extern void x86_tss_reset_ist1(void);
-        x86_tss_reset_ist1();
+        sched_reset_current_compat_ist1();
     }
 
     kern_longjmp(exec_jmpbuf, 1);
@@ -1789,6 +1856,12 @@ int proc_exec(const char *filename, int argc, const char **argv)
         vdso_map_process(new_cr3);
         vdso_thunks_map_process(new_cr3);
     }
+
+    /* The loader runs on the parent's live kernel stack while ownership of
+     * mappings and process-local state moves to the child. Keep timer, audio
+     * and IRQ service active, but prevent a scheduler capture until
+     * proc_launch_prepare publishes the child as a complete task. */
+    sched_preempt_hold();
 
     /* Set as current process and pin region registration target */
     process_t *prev = current_proc;
@@ -1881,6 +1954,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
         exec_parent_proc = NULL;
     }
     (void)proc_free(p);
+    sched_preempt_release();
 
     return ret;
 }
@@ -2080,6 +2154,12 @@ static inline bool sched_valid_frame_ss(uint64_t ss)
 void __hot sched_tick(void *frame_ptr)
 {
     if (!sched_enabled || sched_current_idx < 0)
+        return;
+
+    /* Clock, VDSO and audio work run in idt.c before reaching this point.
+     * Only context capture/switching is deferred while an architecture
+     * transition has not yet published a restorable process state. */
+    if (__atomic_load_n(&sched_preempt_depth, __ATOMIC_ACQUIRE))
         return;
 
     /* isr_common filters AP interrupts before they can reach this function. */
@@ -2712,11 +2792,12 @@ void __hot sched_tick(void *frame_ptr)
 static int sched_spawn_with_address_space(const char *name,
                                           void (*entry)(void),
                                           uint64_t cr3, int owns_cr3,
-                                          bool start_blocked)
+                                          bool start_blocked,
+                                          bool share_current_process)
 {
     process_t *address_space_parent = NULL;
-    if (!owns_cr3 && cr3 && cr3 != paging_get_kernel_cr3() &&
-        current_proc && current_proc->cr3 == cr3)
+    if (!owns_cr3 && cr3 && current_proc && current_proc->cr3 == cr3 &&
+        (share_current_process || cr3 != paging_get_kernel_cr3()))
         address_space_parent = current_proc;
 
     process_t *p = proc_alloc(name);
@@ -2798,7 +2879,7 @@ static int sched_spawn_with_address_space(const char *name,
 int sched_spawn(const char *name, void (*entry)(void))
 {
     return sched_spawn_with_address_space(
-        name, entry, paging_get_kernel_cr3(), false, false);
+        name, entry, paging_get_kernel_cr3(), false, false, false);
 }
 
 int sched_spawn_in_address_space(const char *name, void (*entry)(void),
@@ -2808,7 +2889,7 @@ int sched_spawn_in_address_space(const char *name, void (*entry)(void),
         owns_cr3 = false;
     return sched_spawn_with_address_space(name, entry,
                                           cr3 ? cr3 : paging_get_kernel_cr3(),
-                                          owns_cr3, false);
+                                          owns_cr3, false, false);
 }
 
 /* Create a fully initialized scheduler task without making it runnable. The
@@ -2823,7 +2904,20 @@ int sched_spawn_in_address_space_blocked(const char *name,
         owns_cr3 = false;
     return sched_spawn_with_address_space(name, entry,
                                           cr3 ? cr3 : paging_get_kernel_cr3(),
-                                          owns_cr3, true);
+                                          owns_cr3, true, false);
+}
+
+/* Create a blocked task that shares the caller's process identity as well as
+ * its address space. This is distinct from spawning a child process that
+ * happens to use the kernel CR3: Windows threads must retain the leader's
+ * tgid so process-owned VMAs and file descriptors have one lifetime. */
+int sched_spawn_thread_in_address_space_blocked(const char *name,
+                                                 void (*entry)(void),
+                                                 uint64_t cr3)
+{
+    if (!current_proc || !cr3 || current_proc->cr3 != cr3)
+        return -1;
+    return sched_spawn_with_address_space(name, entry, cr3, false, true, true);
 }
 
 /* ── sched_yield: voluntarily give up remaining time slice ────── */
@@ -2876,14 +2970,9 @@ void sched_yield(void)
         return;
     }
     proctab[sched_current_idx].quantum = 0;
-    /* Invoke the timer ISR via software INT instead of waiting for
-     * the next hardware tick. The APIC LVT_TIMER is masked while UT99
-     * (and any other compat32 process) is running so a `hlt` here
-     * would never wake. `int $0x20` runs isr_stub_32 → isr_handler →
-     * sched_tick synchronously, which performs the context switch
-     * exactly as a real timer tick would. After iretq we resume on
-     * whichever process the scheduler picks next (or back to us if
-     * we're still the highest-priority READY process). */
+    /* Invoke the timer ISR synchronously so yielding does not depend on the
+     * next hardware tick. The interrupt follows the normal scheduler path and
+     * resumes whichever READY process is selected. */
     __asm__ volatile ("int $0x20" ::: "memory");
 }
 
@@ -3204,8 +3293,7 @@ int32_t proc_fork(uint64_t child_stack)
     child->fs_base = parent->fs_base;
     child->gs_base = parent->gs_base;
 
-    /* Fork: allocate a NEW fd_table (separate copy for child).
-     * Each inherited pipe fd bumps the corresponding refcounts. */
+    /* Fork: allocate a NEW fd_table (separate copy for child). */
     child->fd_table = kmalloc(sizeof(fd_table_t));
     if (!child->fd_table) {
         proc_transition(child, PROC_FREE);
@@ -3215,18 +3303,6 @@ int32_t proc_fork(uint64_t child_stack)
     child->fd_table->refcount = 1;
     memcpy(child->fd_table->entries, parent->fd_table->entries,
            sizeof(child->fd_table->entries));
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (!child->fd_table->entries[i].open) continue;
-        if (child->fd_table->entries[i].type == FD_TYPE_PIPE &&
-            child->fd_table->entries[i].pipe) {
-            pipe_buf_t *p = (pipe_buf_t *)child->fd_table->entries[i].pipe;
-            if ((child->fd_table->entries[i].oflags & 0x3) == 0)
-                p->read_refs++;
-            else
-                p->write_refs++;
-        }
-    }
-
     child->region_count = 0;
 
     /* Allocate kernel stack for the child via the upper-half mirror. */
@@ -3348,13 +3424,23 @@ int32_t proc_fork(uint64_t child_stack)
         }
     }
 
-    /* The copied table owns independent descriptor references. Delay these
-     * retains until all fallible child allocations have succeeded. */
+    /* The copied table owns independent descriptor references. Delay all
+     * retains until fallible child allocations have succeeded. */
     for (int i = 0; i < MAX_FDS; i++) {
         fd_entry_t *entry = &child->fd_table->entries[i];
-        if (entry->open && entry->type == FD_TYPE_FILE &&
-            entry->node.fs_version == 2)
+        if (!entry->open)
+            continue;
+        if (entry->type == FD_TYPE_PIPE && entry->pipe) {
+            pipe_buf_t *pipe = (pipe_buf_t *)entry->pipe;
+            if ((entry->oflags & 0x3) == 0)
+                pipe->read_refs++;
+            else
+                pipe->write_refs++;
+        } else if (entry->type == FD_TYPE_FILE &&
+                   entry->node.fs_version == 2) {
             osfs2_file_retain(entry->node.data);
+        }
+        fd_device_retain(entry);
     }
 
     /* Set up scheduler state — child inherits parent's QoS class */
@@ -3409,10 +3495,11 @@ int32_t proc_fork(uint64_t child_stack)
      * frame is safe. Released by vfork_release() from proc_execve / proc_exit. */
     child->vforked_parent = parent->pid;
     proc_transition(parent, PROC_BLOCKED);
-    {
-        extern void sched_yield(void);
-        sched_yield();   /* switch to the child; resumes here once released */
-    }
+    /* SYSCALL enters with IF clear, so sched_yield() deliberately refuses the
+     * request.  This handoff is a known sleep point with no IRQ-owned lock:
+     * expose an interruptible frame to the scheduler, switch to the READY
+     * child, then restore the syscall's IF=0 contract when the parent resumes. */
+    __asm__ volatile ("sti; int $0x20; cli" ::: "memory");
 
     /* Parent returns child PID immediately */
     return (int32_t)child->pid;
@@ -4130,7 +4217,8 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
 {
     if (!current_proc) return -ECHILD;
 
-    uint32_t my_pid = current_proc->pid;
+    process_t *waiter = current_proc;
+    uint32_t my_pid = waiter->pid;
     bool has_children = false;
 
     for (int i = 0; i < proc_capacity; i++) {
@@ -4176,7 +4264,7 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
 
     /* Event-driven wait: block this process and let proc_exit() wake us
      * when a child becomes ZOMBIE, instead of polling every tick. */
-    proc_transition(current_proc, PROC_BLOCKED);
+    proc_transition(waiter, PROC_BLOCKED);
     __asm__ volatile ("mfence" ::: "memory");
 
     /* Re-scan immediately: a child may have exited between the initial
@@ -4196,11 +4284,16 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
              * if a child is killed without going through proc_exit(). */
             for (int tries = 0; tries < 10000; tries++) {
                 __asm__ volatile ("sti; hlt; cli" ::: "memory");
-                if (current_proc->state == PROC_READY) break;
+                /* A wake publishes READY, but selecting this task immediately
+                 * advances it to RUNNING before the saved HLT frame resumes. */
+                if (__atomic_load_n(&waiter->state, __ATOMIC_ACQUIRE) !=
+                    PROC_BLOCKED)
+                    break;
             }
         }
     }
-    proc_transition(current_proc, PROC_READY);
+    if (__atomic_load_n(&waiter->state, __ATOMIC_ACQUIRE) != PROC_RUNNING)
+        proc_transition(waiter, PROC_RUNNING);
 
     /* Scan for the zombie child */
     for (int i = 0; i < proc_capacity; i++) {
@@ -4385,6 +4478,14 @@ int proc_execve(const char *path, char *const argv[])
         if (fresh) {
             vdso_map_process(fresh);
             vdso_thunks_map_process(fresh);
+        }
+
+        /* From the CR3 publication below until elf_jump installs the new
+         * stack and entry point, this task cannot be restored independently:
+         * p->cr3 names the new image while the loader still executes under
+         * the kernel CR3. Keep IRQ-side services live but defer scheduling. */
+        sched_preempt_hold();
+        if (fresh) {
             p->cr3 = fresh;
             p->owns_cr3 = true;
             /* NOTE: do NOT free the OLD cr3 here. The switch to `fresh`
@@ -4425,6 +4526,14 @@ int proc_execve(const char *path, char *const argv[])
 
     /* If we get here, exec failed */
     exec_target_proc = NULL;
+    /* Restore the CR3 associated with the process before making it
+     * preemptible again. The old image has already been committed away, but
+     * this keeps the kernel return path and scheduler identity coherent. */
+    if (p->cr3) {
+        extern void paging_switch(uint64_t cr3);
+        paging_switch(p->cr3);
+    }
+    sched_preempt_release();
     serial_puts("[EXECVE] Failed: ");
     serial_puts(path);
     serial_puts("\n");
@@ -4743,8 +4852,8 @@ static void __attribute__((noreturn)) scheduler_idle_thread(void)
         bool timer_masked = apic && (apic[0x320 / 4] & 0x10000U);
 
         if (timer_masked) {
-            /* UT99 owns a lifetime LAPIC mask. A software timer boundary is
-             * required there so blocked timeouts can still become READY. */
+            /* Keep timeout processing alive while a platform or debugger has
+             * temporarily masked the hardware timer. */
             __asm__ volatile ("sti; int $0x20" ::: "memory");
         } else {
             __asm__ volatile ("sti; hlt" ::: "memory");

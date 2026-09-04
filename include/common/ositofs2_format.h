@@ -147,6 +147,12 @@ static inline uint32_t osfs2_format_data_off(uint32_t version) {
 #define OSFS2_FLAG_RAW        (1 << 2)
 #define OSFS2_FLAG_INLINE     (1 << 3)  /* data stored inline in model_name[128] */
 #define OSFS2_FLAG_LONG_NAME  (1 << 4)  /* full name stored in model_name[128] */
+#define OSFS2_FLAG_DOS_HIDDEN (1U << 28)
+#define OSFS2_FLAG_DOS_SYSTEM (1U << 29)
+#define OSFS2_FLAG_DOS_NOARCH (1U << 30)
+#define OSFS2_FLAG_MODE_VALID (1U << 31) /* POSIX permission bits are present */
+#define OSFS2_MODE_SHIFT      16U
+#define OSFS2_MODE_MASK       (07777U << OSFS2_MODE_SHIFT)
 #define OSFS2_INLINE_MAX      128       /* max inline bytes */
 
 /* GGUF quantization types (subset) */
@@ -211,7 +217,7 @@ typedef struct __attribute__((packed)) {
     uint16_t layer_index_slot;       /* Slot in Layer Index Table (0xFFFF = none) */
     uint32_t create_time;            /* Unix epoch seconds (0 = unknown) */
     uint32_t modify_time;            /* Unix epoch seconds (0 = unknown) */
-    uint8_t  reserved[256 - 254];    /* Pad to 256 bytes */
+    uint16_t access_day;             /* Unix day + 1 (0 = unknown) */
 } osfs2_file_t;
 
 _Static_assert(sizeof(osfs2_file_t) == 256, "file entry must be 256 bytes");

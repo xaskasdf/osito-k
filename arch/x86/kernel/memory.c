@@ -49,6 +49,12 @@ static uint64_t total_memory;
 static uint64_t max_tracked_page;  /* highest page ever marked free */
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
+/* Low identity aliases that must remain reachable by the kernel while it
+ * hosts a legacy process in kernel_cr3. Most kernel allocations use the
+ * upper-half direct map; the firmware boot stack is the remaining exception. */
+static uint64_t identity_boot_stack_base;
+static uint64_t identity_boot_stack_limit;
+
 #define PMM_DEBUG_EVENTS 262144
 typedef struct {
     uint64_t sequence;
@@ -335,6 +341,12 @@ void __initk mem_reserve_boot_stack(uint64_t boot_rsp)
         }
     }
 
+    /* Publish the virtual identity reservation after its bounds are complete.
+     * Runtime VA allocators use this instead of duplicating a firmware- or
+     * machine-specific ceiling. The range is immutable after boot. */
+    __atomic_store_n(&identity_boot_stack_base, lo, __ATOMIC_RELAXED);
+    __atomic_store_n(&identity_boot_stack_limit, hi, __ATOMIC_RELEASE);
+
     /* Boot-time diagnostic so the operator can confirm in serial that
      * the top-down PT cursor can no longer reach the live stack. */
     serial_puts("[MEM] reserved top region 0x");
@@ -346,6 +358,56 @@ void __initk mem_reserve_boot_stack(uint64_t boot_rsp)
     serial_puts(", ");
     serial_putdec(reserved);
     serial_puts(" pages)\n");
+}
+
+/* Return the end of a live low-identity reservation intersecting the
+ * candidate range. Zero means free; UINT64_MAX denotes invalid input. This
+ * intentionally does not expose every PMM-reserved page: only aliases that
+ * kernel code still dereferences through their low virtual address belong
+ * here. */
+uint64_t mem_identity_reservation_conflict_end(uint64_t base, uint64_t size)
+{
+    if (!size || base + size < base)
+        return UINT64_MAX;
+
+    uint64_t limit = __atomic_load_n(&identity_boot_stack_limit,
+                                     __ATOMIC_ACQUIRE);
+    uint64_t reserved_base = __atomic_load_n(&identity_boot_stack_base,
+                                             __ATOMIC_RELAXED);
+    if (limit <= reserved_base)
+        return 0;
+
+    uint64_t end = base + size;
+    return base < limit && end > reserved_base ? limit : 0;
+}
+
+/* Query the live low-identity reservation at an address and, when the address
+ * precedes it, return the next reservation base. This mirrors the range-query
+ * contract used by the PE and NT VMA registries. */
+int mem_identity_reservation_query(uint64_t address, uint64_t *base,
+                                   uint64_t *size, uint64_t *next_base)
+{
+    if (base) *base = 0;
+    if (size) *size = 0;
+    if (next_base) *next_base = 0;
+
+    uint64_t limit = __atomic_load_n(&identity_boot_stack_limit,
+                                     __ATOMIC_ACQUIRE);
+    uint64_t reserved_base = __atomic_load_n(&identity_boot_stack_base,
+                                             __ATOMIC_RELAXED);
+    if (limit <= reserved_base)
+        return 0;
+
+    if (address < reserved_base) {
+        if (next_base) *next_base = reserved_base;
+        return 0;
+    }
+    if (address >= limit)
+        return 0;
+
+    if (base) *base = reserved_base;
+    if (size) *size = limit - reserved_base;
+    return 1;
 }
 
 /* ── Allocate physical pages ─────────────────────────────────── */

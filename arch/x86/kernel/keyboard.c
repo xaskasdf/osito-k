@@ -21,6 +21,7 @@ extern bool compositor_is_running(void) __attribute__((weak));
 /* Avoid burning a runnable scheduler slot while the shell waits for input.
  * The weak declaration preserves the early-boot polling fallback. */
 extern int sched_sleep_ticks(uint64_t ticks) __attribute__((weak));
+extern bool sched_is_enabled(void) __attribute__((weak));
 
 /* ── PS/2 ports ──────────────────────────────────────────────── */
 
@@ -238,6 +239,19 @@ void kb_inject_scancode(uint8_t sc)
 /* Read one character (blocking) */
 char kb_getchar(void)
 {
+    bool restore_interrupts = false;
+    if (kb_head == kb_tail && sched_is_enabled && sched_is_enabled()) {
+        uint64_t flags;
+        __asm__ volatile ("pushfq; popq %0" : "=r"(flags));
+        if (!(flags & (1ULL << 9))) {
+            /* Interrupt-gate callers such as syscall and native DPMI enter
+             * with IF clear. Let the scheduler and input producers run while
+             * this blocking operation waits, then restore the caller state. */
+            restore_interrupts = true;
+            __asm__ volatile ("sti" ::: "memory");
+        }
+    }
+
     while (kb_head == kb_tail) {
         /* Only poll USB directly when compositor isn't running.
          * Concurrent xhci_poll() between compositor and shell threads
@@ -253,7 +267,11 @@ char kb_getchar(void)
         {
             extern int serial_getc(void);
             int sc = serial_getc();
-            if (sc >= 0) return (char)sc;
+            if (sc >= 0) {
+                if (restore_interrupts)
+                    __asm__ volatile ("cli" ::: "memory");
+                return (char)sc;
+            }
         }
         /* COM1 RX interrupts are disabled, so wake periodically to poll. A
          * single 10 ms tick keeps console input responsive without issuing
@@ -272,6 +290,8 @@ char kb_getchar(void)
 
     char c = kb_buf[kb_tail];
     kb_tail = (kb_tail + 1) % KB_BUF_SIZE;
+    if (restore_interrupts)
+        __asm__ volatile ("cli" ::: "memory");
     return c;
 }
 
@@ -288,6 +308,18 @@ char kb_trygetchar(void)
 bool kb_has_input(void)
 {
     return kb_head != kb_tail;
+}
+
+/* IBM BIOS INT 16h shift-state layout. The driver tracks Shift as a combined
+ * state, so expose it as left Shift rather than claiming both keys are down. */
+uint8_t kb_get_bios_shift_flags(void)
+{
+    uint8_t flags = 0;
+    if (kb_shift) flags |= 0x02;
+    if (kb_ctrl)  flags |= 0x04;
+    if (kb_alt)   flags |= 0x08;
+    if (kb_caps)  flags |= 0x40;
+    return flags;
 }
 
 /* Flush pending keyboard input — call before exec'ing a new process

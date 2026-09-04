@@ -32,6 +32,15 @@
 #define WIN32_EXPORT_DATA_FLAG 0x80U
 #define WIN32_EXPORT_ABI_MASK  0x7FU
 #define WIN32_EXPORT_CC_MASK   CC_CONVENTION_MASK
+#define WIN32_ABI_ARG_UNUSED   0xFFU
+
+typedef struct {
+    uint8_t stack_argc;
+    uint8_t logical_argc;
+    uint8_t callconv;
+    uint8_t ecx_arg;
+    uint8_t edx_arg;
+} WIN32_ABI_LAYOUT;
 
 /*
  * Co-located export descriptor. `argc` = number of 32-bit stack DWORD slots
@@ -52,6 +61,8 @@ typedef struct {
 #define WX_CDL(name, fn, n)   { name, (void *)(fn), (uint8_t)(n), CC_CDECL }
 #define WX_THIS(name, fn, n)  { name, (void *)(fn), (uint8_t)(n), CC_THISCALL }
 #define WX_DATA(name, ptr)     { name, (void *)(ptr), 0, \
+                                 (uint8_t)(CC_CDECL | WIN32_EXPORT_DATA_FLAG) }
+#define WX_DATA_DYNAMIC(name)  { name, NULL, 0, \
                                  (uint8_t)(CC_CDECL | WIN32_EXPORT_DATA_FLAG) }
 
 /* Register a shim DLL's co-located export table for ABI lookup. Call once per
@@ -75,9 +86,25 @@ int win32_abi_lookup_target(const char *dll_name, const void *target,
                             const char **out_name, uint8_t *out_argc,
                             uint8_t *out_cc);
 
-/* True when a registered resolver target is exported storage rather than an
- * entry point.  Such targets must be written directly to an IAT/GPA result. */
-int win32_abi_target_is_data(const char *dll_name, const void *target);
+/* Resolve the ABI for an already-resolved shim export. The function target is
+ * authoritative when available; the name path covers unresolved optional
+ * imports and MSVC-mangled exports. */
+int win32_abi_lookup_resolved(const char *dll_name, const char *func_name,
+                              const void *target, const char **out_name,
+                              uint8_t *out_argc, uint8_t *out_cc);
+
+/* True when the resolved export is storage rather than an entry point. Target
+ * metadata is authoritative; the name path supports process-local data whose
+ * address is produced dynamically by the DLL resolver. */
+int win32_abi_resolved_is_data(const char *dll_name, const char *func_name,
+                               const void *target);
+
+/* Register native shim implementations that have an executable PE32
+ * implementation in the shared compat runtime. This is an explicit provider
+ * contract; the loader never selects direct implementations by import name. */
+void win32_abi_register_compat32_direct(const void *native_target,
+                                        uint32_t compat32_target);
+uint32_t win32_abi_compat32_direct(const void *native_target);
 
 /* Register and resolve a fixed-signature PE32 bridge for a native variadic
  * shim. The compat dispatcher passes the bridge a pointer to the first
@@ -93,5 +120,9 @@ const void *win32_abi_compat32_bridge(const void *native_target);
  * falls back to [ABI-MISS] rather than a wrong count. Returns 1 on success.
  */
 int msvc_demangle_abi(const char *mangled, uint8_t *out_argc, uint8_t *out_cc);
+int msvc_demangle_abi_layout(const char *mangled,
+                             WIN32_ABI_LAYOUT *out_layout);
+
+int win32_abi_selftest(void);
 
 #endif /* WIN32_ABI_H */

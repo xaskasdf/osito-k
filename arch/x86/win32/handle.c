@@ -18,6 +18,7 @@ static spinlock_t handle_table_lock = SPINLOCK_INIT;
 typedef struct {
     ULONG pid;
     ULONG refs;
+    ULONG flags;
     LONG next;
     BOOL used;
 } HANDLE_OWNER_RECORD;
@@ -82,7 +83,8 @@ static HANDLE_OWNER_RECORD *owner_find_locked(HANDLE_ENTRY *entry, ULONG pid)
     return NULL;
 }
 
-static BOOL owner_add_locked(HANDLE_ENTRY *entry, ULONG pid)
+static BOOL owner_add_locked(HANDLE_ENTRY *entry, ULONG pid,
+                             ULONG initial_flags)
 {
     HANDLE_OWNER_RECORD *owner = owner_find_locked(entry, pid);
     if (owner) {
@@ -100,6 +102,7 @@ static BOOL owner_add_locked(HANDLE_ENTRY *entry, ULONG pid)
         owner->used = TRUE;
         owner->pid = pid;
         owner->refs = 1;
+        owner->flags = initial_flags & HANDLE_USER_FLAG_MASK;
         owner->next = entry->owner_head;
         entry->owner_head = (LONG)i;
         handle_owner_cursor = (i + 1) % MAX_HANDLE_OWNER_RECORDS;
@@ -151,6 +154,7 @@ static NTSTATUS handle_alloc_locked(PHANDLE_TABLE table,
                                     ACCESS_MASK access,
                                     PVOID object,
                                     ULONG owner_pid,
+                                    ULONG handle_flags,
                                     PHANDLE out_handle)
 {
     /* Find first free slot (slot 0 is reserved — handles start at 4) */
@@ -158,7 +162,7 @@ static NTSTATUS handle_alloc_locked(PHANDLE_TABLE table,
         if (table->entries[i].type == OBJ_TYPE_NONE) {
             HANDLE_ENTRY *entry = &table->entries[i];
             entry->owner_head = HANDLE_OWNER_NONE;
-            if (!owner_add_locked(entry, owner_pid))
+            if (!owner_add_locked(entry, owner_pid, handle_flags))
                 return STATUS_INSUFFICIENT_RESOURCES;
             entry->type   = type;
             entry->access = access;
@@ -198,7 +202,37 @@ NTSTATUS handle_alloc_for_process(PHANDLE_TABLE table,
 
     uint64_t flags = handle_lock_irqsave();
     NTSTATUS status = handle_alloc_locked(table, type, access, object,
-                                          owner_pid, out_handle);
+                                          owner_pid, 0, out_handle);
+    handle_unlock_irqrestore(flags);
+    return status;
+}
+
+NTSTATUS handle_open_referenced_object(PHANDLE_TABLE table,
+                                       OBJECT_TYPE_ID type,
+                                       ACCESS_MASK access,
+                                       PVOID object,
+                                       PHANDLE out_handle)
+{
+    if (!table || !out_handle || type == OBJ_TYPE_NONE || !object)
+        return STATUS_INVALID_PARAMETER;
+
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+
+    uint64_t flags = handle_lock_irqsave();
+    BOOL referenced = FALSE;
+    for (ULONG i = 1; i < MAX_HANDLES; i++) {
+        HANDLE_ENTRY *entry = &table->entries[i];
+        if (entry->type == type && entry->object == object && entry->refs) {
+            referenced = TRUE;
+            break;
+        }
+    }
+
+    NTSTATUS status = referenced
+        ? handle_alloc_locked(table, type, access, object, owner_pid, 0,
+                              out_handle)
+        : STATUS_INVALID_HANDLE;
     handle_unlock_irqrestore(flags);
     return status;
 }
@@ -221,9 +255,17 @@ NTSTATUS handle_retain_for_process(PHANDLE_TABLE table, HANDLE handle,
     NTSTATUS status = STATUS_INVALID_HANDLE;
     if (idx != 0 && idx < MAX_HANDLES) {
         HANDLE_ENTRY *entry = &table->entries[idx];
+        ULONG inherited_flags = 0;
+        ULONG source_pid = win32_current_process_id();
+        if (!source_pid) source_pid = 1;
+        HANDLE_OWNER_RECORD *source = owner_find_locked(entry, source_pid);
+        if (!source && idx <= 3)
+            source = owner_find_locked(entry, HANDLE_OWNER_SUBSYSTEM);
+        if (source)
+            inherited_flags = source->flags;
         if (entry->type != OBJ_TYPE_NONE && entry->refs != 0 &&
             entry->refs != 0xFFFFFFFFU &&
-            owner_add_locked(entry, owner_pid)) {
+            owner_add_locked(entry, owner_pid, inherited_flags)) {
             entry->refs++;
             entry->owner_pid = owner_sole_pid_locked(entry);
             status = STATUS_SUCCESS;
@@ -258,6 +300,17 @@ NTSTATUS handle_lookup_for_process(PHANDLE_TABLE table,
                                    OBJECT_TYPE_ID expected_type,
                                    PVOID *out_object)
 {
+    return handle_lookup_access_for_process(table, handle, owner_pid,
+                                            expected_type, out_object, NULL);
+}
+
+NTSTATUS handle_lookup_access_for_process(PHANDLE_TABLE table,
+                                          HANDLE handle,
+                                          ULONG owner_pid,
+                                          OBJECT_TYPE_ID expected_type,
+                                          PVOID *out_object,
+                                          ACCESS_MASK *out_access)
+{
     if (!table || !out_object || !owner_pid)
         return STATUS_INVALID_PARAMETER;
 
@@ -274,8 +327,11 @@ NTSTATUS handle_lookup_for_process(PHANDLE_TABLE table,
             status = STATUS_INVALID_HANDLE;
         else if (expected_type != OBJ_TYPE_NONE && entry->type != expected_type)
             status = STATUS_OBJECT_TYPE_MISMATCH;
-        else
+        else {
             *out_object = entry->object;
+            if (out_access)
+                *out_access = entry->access;
+        }
     }
     handle_unlock_irqrestore(flags);
     return status;
@@ -327,6 +383,54 @@ BOOL handle_query_state(PHANDLE_TABLE table, HANDLE handle, ULONG owner_pid,
     }
     handle_unlock_irqrestore(flags);
     return valid;
+}
+
+NTSTATUS handle_query_flags_for_process(PHANDLE_TABLE table, HANDLE handle,
+                                        ULONG owner_pid, ULONG *out_flags)
+{
+    if (!table || !owner_pid || !out_flags)
+        return STATUS_INVALID_PARAMETER;
+
+    uint64_t irq_flags = handle_lock_irqsave();
+    ULONG idx = HANDLE_TO_INDEX(handle);
+    NTSTATUS status = STATUS_INVALID_HANDLE;
+    if (idx != 0 && idx < MAX_HANDLES) {
+        HANDLE_ENTRY *entry = &table->entries[idx];
+        HANDLE_OWNER_RECORD *owner = owner_find_locked(entry, owner_pid);
+        if (!owner && idx <= 3)
+            owner = owner_find_locked(entry, HANDLE_OWNER_SUBSYSTEM);
+        if (entry->type != OBJ_TYPE_NONE && entry->refs && owner) {
+            *out_flags = owner->flags & HANDLE_USER_FLAG_MASK;
+            status = STATUS_SUCCESS;
+        }
+    }
+    handle_unlock_irqrestore(irq_flags);
+    return status;
+}
+
+NTSTATUS handle_update_flags_for_process(PHANDLE_TABLE table, HANDLE handle,
+                                         ULONG owner_pid, ULONG mask,
+                                         ULONG new_flags)
+{
+    if (!table || !owner_pid ||
+        ((mask | new_flags) & ~HANDLE_USER_FLAG_MASK) != 0)
+        return STATUS_INVALID_PARAMETER;
+
+    uint64_t irq_flags = handle_lock_irqsave();
+    ULONG idx = HANDLE_TO_INDEX(handle);
+    NTSTATUS status = STATUS_INVALID_HANDLE;
+    if (idx != 0 && idx < MAX_HANDLES) {
+        HANDLE_ENTRY *entry = &table->entries[idx];
+        HANDLE_OWNER_RECORD *owner = owner_find_locked(entry, owner_pid);
+        if (!owner && idx <= 3)
+            owner = owner_find_locked(entry, HANDLE_OWNER_SUBSYSTEM);
+        if (entry->type != OBJ_TYPE_NONE && entry->refs && owner) {
+            owner->flags = (owner->flags & ~mask) | (new_flags & mask);
+            status = STATUS_SUCCESS;
+        }
+    }
+    handle_unlock_irqrestore(irq_flags);
+    return status;
 }
 
 NTSTATUS handle_snapshot_for_process(PHANDLE_TABLE table, HANDLE handle,
@@ -391,6 +495,28 @@ BOOL handle_object_referenced(PHANDLE_TABLE table,
     for (ULONG i = 1; i < MAX_HANDLES; i++) {
         HANDLE_ENTRY *entry = &table->entries[i];
         if (entry->type == type && entry->object == object) {
+            referenced = TRUE;
+            break;
+        }
+    }
+    handle_unlock_irqrestore(flags);
+    return referenced;
+}
+
+BOOL handle_object_referenced_for_process(PHANDLE_TABLE table,
+                                          OBJECT_TYPE_ID type,
+                                          PVOID object,
+                                          ULONG owner_pid)
+{
+    if (!table || !object || !owner_pid)
+        return FALSE;
+
+    uint64_t flags = handle_lock_irqsave();
+    BOOL referenced = FALSE;
+    for (ULONG i = 1; i < MAX_HANDLES; i++) {
+        HANDLE_ENTRY *entry = &table->entries[i];
+        if (entry->type == type && entry->object == object && entry->refs &&
+            owner_find_locked(entry, owner_pid)) {
             referenced = TRUE;
             break;
         }
@@ -513,8 +639,6 @@ NTSTATUS handle_duplicate_for_process(PHANDLE_TABLE src_table,
                                       BOOL inherit_handle,
                                       ULONG options)
 {
-    (void)inherit_handle;
-
     if (!src_table || !dst_table || !dst_handle || !source_pid || !target_pid)
         return STATUS_INVALID_PARAMETER;
 
@@ -546,10 +670,10 @@ NTSTATUS handle_duplicate_for_process(PHANDLE_TABLE src_table,
         }
         access = desired_access;
     }
+    ULONG target_flags = inherit_handle ? HANDLE_USER_FLAG_INHERIT : 0;
     status = handle_alloc_locked(dst_table, src_entry->type, access,
-                                 src_entry->object, target_pid, dst_handle);
-    if (NT_SUCCESS(status) && (options & DUPLICATE_CLOSE_SOURCE))
-        handle_close_locked(src_table, src_handle, source_pid, NULL);
+                                 src_entry->object, target_pid, target_flags,
+                                 dst_handle);
 
 out:
     handle_unlock_irqrestore(flags);

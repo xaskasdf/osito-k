@@ -33,12 +33,15 @@ extern BOOL user32_get_window_surface(HANDLE window, void **pixels, int *width,
     __attribute__((weak));
 extern void user32_mark_window_dirty(HANDLE window) __attribute__((weak));
 extern BOOL user32_get_current_display_mode(uint32_t *width, uint32_t *height,
-                                            uint32_t *bpp, uint32_t *frequency)
+                                             uint32_t *bpp, uint32_t *frequency)
     __attribute__((weak));
+extern int ddraw_display_mode_active(void) __attribute__((weak));
+extern void ddraw_get_display_mode(uint32_t *width, uint32_t *height,
+                                   uint32_t *bpp) __attribute__((weak));
 
-#define SCREEN_WIDTH  800
-#define SCREEN_HEIGHT 600
-#define SCREEN_BPP    32
+#define GDI_FALLBACK_SCREEN_WIDTH  640
+#define GDI_FALLBACK_SCREEN_HEIGHT 480
+#define GDI_FALLBACK_SCREEN_BPP    32
 
 /* ── Local helpers ───────────────────────────────────────────── */
 
@@ -66,6 +69,395 @@ static void gdi_memset(void *p, int v, SIZE_T n)
 {
     BYTE *d = (BYTE *)p;
     while (n--) *d++ = (BYTE)v;
+}
+
+#define GDI_FR_PRIVATE  0x10U
+#define GDI_FR_NOT_ENUM 0x20U
+
+typedef enum {
+    GDI_FONT_RESOURCE_PATH,
+    GDI_FONT_RESOURCE_MEMORY
+} GDI_FONT_RESOURCE_KIND;
+
+typedef struct _GDI_FONT_RESOURCE {
+    struct _GDI_FONT_RESOURCE *next;
+    GDI_FONT_RESOURCE_KIND kind;
+    DWORD owner_pid;
+    DWORD flags;
+    DWORD references;
+    DWORD face_count;
+    char *path;
+    BYTE *data;
+    DWORD data_size;
+} GDI_FONT_RESOURCE;
+
+static GDI_FONT_RESOURCE *gdi_font_resources;
+static volatile ULONG gdi_font_resource_lock;
+static uint64_t gdi_font_resource_generation = 1;
+
+static BOOL gdi_font_validate_file(const char *path, DWORD *face_count,
+                                   DWORD *error);
+static BOOL gdi_font_validate_memory(const void *data, DWORD size,
+                                     DWORD *face_count);
+static LONG dwrite_utf16_path_to_utf8(PCWSTR input, char *output,
+                                      UINT capacity);
+static void dwrite_release_system_collection_cache(DWORD process_id);
+
+static void gdi_font_resources_lock(void)
+{
+    while (__atomic_exchange_n(&gdi_font_resource_lock, 1,
+                               __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+}
+
+static void gdi_font_resources_unlock(void)
+{
+    __atomic_store_n(&gdi_font_resource_lock, 0, __ATOMIC_RELEASE);
+}
+
+static DWORD gdi_font_resource_owner(DWORD flags)
+{
+    if (!(flags & GDI_FR_PRIVATE)) return 0;
+    DWORD owner = GetCurrentProcessId();
+    return owner ? owner : 1;
+}
+
+static char gdi_font_path_fold(char value)
+{
+    if (value == '/') return '\\';
+    if (value >= 'A' && value <= 'Z') return value + ('a' - 'A');
+    return value;
+}
+
+static BOOL gdi_font_path_equal(const char *left, const char *right)
+{
+    if (!left || !right) return FALSE;
+    while (*left && *right &&
+           gdi_font_path_fold(*left) == gdi_font_path_fold(*right)) {
+        left++;
+        right++;
+    }
+    return !*left && !*right;
+}
+
+static char *gdi_font_copy_path(const char *path)
+{
+    SIZE_T length = 0;
+    while (path[length]) length++;
+    char *copy = (char *)kmalloc(length + 1);
+    if (!copy) return NULL;
+    gdi_memcpy(copy, path, length + 1);
+    return copy;
+}
+
+static BOOL gdi_font_normalize_path(PCSTR path, char normalized[260])
+{
+    if (!path || !*path || !win32_normalize_path(path, normalized) ||
+        !normalized[0]) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static int gdi_font_resource_add_path(PCSTR path, DWORD flags, PVOID reserved)
+{
+    if (reserved || (flags & ~(GDI_FR_PRIVATE | GDI_FR_NOT_ENUM))) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+
+    char normalized[260];
+    if (!gdi_font_normalize_path(path, normalized)) return 0;
+
+    DWORD faces = 0;
+    DWORD error = 0;
+    if (!gdi_font_validate_file(normalized, &faces, &error)) {
+        SetLastError(error ? error : 11); /* ERROR_BAD_FORMAT */
+        return 0;
+    }
+
+    DWORD owner = gdi_font_resource_owner(flags);
+    gdi_font_resources_lock();
+    for (GDI_FONT_RESOURCE *entry = gdi_font_resources; entry;
+         entry = entry->next) {
+        if (entry->kind != GDI_FONT_RESOURCE_PATH ||
+            entry->owner_pid != owner || entry->flags != flags ||
+            !gdi_font_path_equal(entry->path, normalized))
+            continue;
+        if (entry->references == UINT32_MAX) {
+            gdi_font_resources_unlock();
+            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+            return 0;
+        }
+        entry->references++;
+        DWORD existing_faces = entry->face_count;
+        gdi_font_resources_unlock();
+        SetLastError(0);
+        return (int)existing_faces;
+    }
+    gdi_font_resources_unlock();
+
+    GDI_FONT_RESOURCE *resource =
+        (GDI_FONT_RESOURCE *)kmalloc(sizeof(*resource));
+    char *stored_path = gdi_font_copy_path(normalized);
+    if (!resource || !stored_path) {
+        kfree(resource);
+        kfree(stored_path);
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return 0;
+    }
+    gdi_memset(resource, 0, sizeof(*resource));
+    resource->kind = GDI_FONT_RESOURCE_PATH;
+    resource->owner_pid = owner;
+    resource->flags = flags;
+    resource->references = 1;
+    resource->face_count = faces;
+    resource->path = stored_path;
+
+    gdi_font_resources_lock();
+    for (GDI_FONT_RESOURCE *entry = gdi_font_resources; entry;
+         entry = entry->next) {
+        if (entry->kind != GDI_FONT_RESOURCE_PATH ||
+            entry->owner_pid != owner || entry->flags != flags ||
+            !gdi_font_path_equal(entry->path, normalized))
+            continue;
+        if (entry->references == UINT32_MAX) {
+            gdi_font_resources_unlock();
+            kfree(resource->path);
+            kfree(resource);
+            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+            return 0;
+        }
+        entry->references++;
+        DWORD existing_faces = entry->face_count;
+        gdi_font_resources_unlock();
+        kfree(resource->path);
+        kfree(resource);
+        SetLastError(0);
+        return (int)existing_faces;
+    }
+    resource->next = gdi_font_resources;
+    gdi_font_resources = resource;
+    gdi_font_resource_generation++;
+    gdi_font_resources_unlock();
+    SetLastError(0);
+    return (int)faces;
+}
+
+static BOOL gdi_font_resource_remove_path(PCSTR path, DWORD flags,
+                                          PVOID reserved)
+{
+    if (reserved || (flags & ~(GDI_FR_PRIVATE | GDI_FR_NOT_ENUM))) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    char normalized[260];
+    if (!gdi_font_normalize_path(path, normalized)) return FALSE;
+    DWORD owner = gdi_font_resource_owner(flags);
+
+    GDI_FONT_RESOURCE *removed = NULL;
+    gdi_font_resources_lock();
+    GDI_FONT_RESOURCE **link = &gdi_font_resources;
+    while (*link) {
+        GDI_FONT_RESOURCE *entry = *link;
+        if (entry->kind == GDI_FONT_RESOURCE_PATH &&
+            entry->owner_pid == owner && entry->flags == flags &&
+            gdi_font_path_equal(entry->path, normalized)) {
+            if (--entry->references == 0) {
+                *link = entry->next;
+                removed = entry;
+                gdi_font_resource_generation++;
+            }
+            gdi_font_resources_unlock();
+            if (removed) {
+                kfree(removed->path);
+                kfree(removed);
+            }
+            SetLastError(0);
+            return TRUE;
+        }
+        link = &entry->next;
+    }
+    gdi_font_resources_unlock();
+    SetLastError(2); /* ERROR_FILE_NOT_FOUND */
+    return FALSE;
+}
+
+static HANDLE gdi_font_resource_add_memory(PVOID data, DWORD size,
+                                           PVOID reserved,
+                                           DWORD *font_count)
+{
+    if (font_count) *font_count = 0;
+    if (reserved || !data || !size || !font_count) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return NULL;
+    }
+
+    DWORD faces = 0;
+    if (!gdi_font_validate_memory(data, size, &faces)) {
+        SetLastError(11); /* ERROR_BAD_FORMAT */
+        return NULL;
+    }
+
+    GDI_FONT_RESOURCE *resource =
+        (GDI_FONT_RESOURCE *)kmalloc(sizeof(*resource));
+    BYTE *copy = (BYTE *)kmalloc(size);
+    if (!resource || !copy) {
+        kfree(resource);
+        kfree(copy);
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return NULL;
+    }
+    gdi_memcpy(copy, data, size);
+    gdi_memset(resource, 0, sizeof(*resource));
+    resource->kind = GDI_FONT_RESOURCE_MEMORY;
+    resource->owner_pid = GetCurrentProcessId();
+    if (!resource->owner_pid) resource->owner_pid = 1;
+    resource->references = 1;
+    resource->face_count = faces;
+    resource->data = copy;
+    resource->data_size = size;
+
+    gdi_font_resources_lock();
+    resource->next = gdi_font_resources;
+    gdi_font_resources = resource;
+    gdi_font_resources_unlock();
+
+    *font_count = faces;
+    SetLastError(0);
+    return (HANDLE)resource;
+}
+
+static BOOL gdi_font_resource_remove_memory(HANDLE handle)
+{
+    if (!handle) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+
+    GDI_FONT_RESOURCE *removed = NULL;
+    DWORD owner = GetCurrentProcessId();
+    if (!owner) owner = 1;
+    gdi_font_resources_lock();
+    GDI_FONT_RESOURCE **link = &gdi_font_resources;
+    while (*link) {
+        GDI_FONT_RESOURCE *entry = *link;
+        if (entry == (GDI_FONT_RESOURCE *)handle &&
+            entry->kind == GDI_FONT_RESOURCE_MEMORY &&
+            entry->owner_pid == owner) {
+            *link = entry->next;
+            removed = entry;
+            break;
+        }
+        link = &entry->next;
+    }
+    gdi_font_resources_unlock();
+    if (!removed) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+    kfree(removed->data);
+    kfree(removed);
+    SetLastError(0);
+    return TRUE;
+}
+
+static void gdi_font_resource_free_path_snapshot(char **paths, UINT count)
+{
+    if (!paths) return;
+    for (UINT i = 0; i < count; i++) kfree(paths[i]);
+    kfree(paths);
+}
+
+static uint64_t gdi_font_resource_current_generation(void)
+{
+    gdi_font_resources_lock();
+    uint64_t generation = gdi_font_resource_generation;
+    gdi_font_resources_unlock();
+    return generation;
+}
+
+static BOOL gdi_font_resource_snapshot_paths(DWORD process_id,
+                                             char ***paths_out,
+                                             UINT *count_out,
+                                             uint64_t *generation_out)
+{
+    if (!paths_out || !count_out || !generation_out) return FALSE;
+    *paths_out = NULL;
+    *count_out = 0;
+    if (!process_id) process_id = 1;
+
+    gdi_font_resources_lock();
+    UINT count = 0;
+    for (GDI_FONT_RESOURCE *entry = gdi_font_resources; entry;
+         entry = entry->next) {
+        if (entry->kind == GDI_FONT_RESOURCE_PATH &&
+            !(entry->flags & GDI_FR_NOT_ENUM) &&
+            (!entry->owner_pid || entry->owner_pid == process_id))
+            count++;
+    }
+
+    char **paths = count
+        ? (char **)kmalloc((uint64_t)count * sizeof(*paths)) : NULL;
+    UINT copied = 0;
+    BOOL complete = !count || paths != NULL;
+    for (GDI_FONT_RESOURCE *entry = gdi_font_resources;
+         complete && entry; entry = entry->next) {
+        if (entry->kind != GDI_FONT_RESOURCE_PATH ||
+            (entry->flags & GDI_FR_NOT_ENUM) ||
+            (entry->owner_pid && entry->owner_pid != process_id))
+            continue;
+        if (!(paths[copied] = gdi_font_copy_path(entry->path))) {
+            complete = FALSE;
+            break;
+        }
+        copied++;
+    }
+    *generation_out = gdi_font_resource_generation;
+    gdi_font_resources_unlock();
+
+    if (!complete) {
+        gdi_font_resource_free_path_snapshot(paths, copied);
+        return FALSE;
+    }
+    *paths_out = paths;
+    *count_out = count;
+    return TRUE;
+}
+
+void gdi32_release_process(DWORD process_id)
+{
+    if (!process_id) return;
+    GDI_FONT_RESOURCE *retired = NULL;
+    BOOL catalog_changed = FALSE;
+
+    gdi_font_resources_lock();
+    GDI_FONT_RESOURCE **link = &gdi_font_resources;
+    while (*link) {
+        GDI_FONT_RESOURCE *entry = *link;
+        if (entry->owner_pid != process_id) {
+            link = &entry->next;
+            continue;
+        }
+        *link = entry->next;
+        if (entry->kind == GDI_FONT_RESOURCE_PATH)
+            catalog_changed = TRUE;
+        entry->next = retired;
+        retired = entry;
+    }
+    if (catalog_changed) gdi_font_resource_generation++;
+    gdi_font_resources_unlock();
+
+    while (retired) {
+        GDI_FONT_RESOURCE *next = retired->next;
+        kfree(retired->path);
+        kfree(retired->data);
+        kfree(retired);
+        retired = next;
+    }
+    dwrite_release_system_collection_cache(process_id);
 }
 
 /* ── GDI DC and Bitmap tables ────────────────────────────────── */
@@ -195,6 +587,7 @@ static UINT       gdi_blit_trace_count;
 #define GDI_BI_BITFIELDS      3u
 #define GDI_BI_ALPHABITFIELDS 6u
 #define GDI_DIB_RGB_COLORS    0u
+#define GDI_CBM_INIT          0x04u
 
 #define IS_DC_HANDLE(h)  (((ULONG_PTR)(h) & TAG_MASK) == DC_TAG)
 #define IS_BMP_HANDLE(h) (((ULONG_PTR)(h) & TAG_MASK) == BMP_TAG)
@@ -393,11 +786,39 @@ static int bitmap_slots_used(void)
     return used;
 }
 
-/* Get framebuffer info, falling back to compile-time constants */
+static void get_display_geometry(int *out_w, int *out_h, int *out_bpp)
+{
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t bpp = 0;
+
+    if (user32_get_current_display_mode)
+        user32_get_current_display_mode(&width, &height, &bpp, NULL);
+    else if (ddraw_display_mode_active && ddraw_get_display_mode &&
+             ddraw_display_mode_active())
+        ddraw_get_display_mode(&width, &height, &bpp);
+
+    if (!width && display_get_width) width = display_get_width();
+    if (!height && display_get_height) height = display_get_height();
+    if (!width && fb_get_width) width = fb_get_width();
+    if (!height && fb_get_height) height = fb_get_height();
+
+    if (!width) width = GDI_FALLBACK_SCREEN_WIDTH;
+    if (!height) height = GDI_FALLBACK_SCREEN_HEIGHT;
+    if (!bpp) bpp = GDI_FALLBACK_SCREEN_BPP;
+
+    if (out_w) *out_w = (int)width;
+    if (out_h) *out_h = (int)height;
+    if (out_bpp) *out_bpp = (int)bpp;
+}
+
+/* Get framebuffer info, using the current logical display mode for geometry. */
 static void *get_screen_surface(int *out_w, int *out_h, int *out_pitch)
 {
     void *base = NULL;
-    int w = SCREEN_WIDTH, h = SCREEN_HEIGHT, p = SCREEN_WIDTH * 4;
+    int w = 0, h = 0, bpp = 0;
+    get_display_geometry(&w, &h, &bpp);
+    int p = w * ((bpp + 7) / 8);
 
     if (fb_get_base) {
         uint32_t *fb = fb_get_base();
@@ -427,36 +848,13 @@ static void mark_dc_dirty(GDI_DC *dc)
 int WINAPI GetDeviceCaps(HDC hdc, int index)
 {
     (void)hdc;
-    /* Report the real GOP resolution as the device extent so UT99 keeps the
-     * larger DirectDraw-enumerated modes (it filters modes bigger than this).
-     * BUT once a fullscreen-exclusive SetDisplayMode has happened, NT reports
-     * the CURRENT mode here (HORZRES/VERTRES track the desktop mode) — gate on
-     * ddraw_display_mode_active() so startup enumeration still sees the GOP
-     * size while in-game consumers see the truth after a SetRes. */
-    extern int  ddraw_display_mode_active(void) __attribute__((weak));
-    extern void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
-                __attribute__((weak));
-    uint32_t physical_w = display_get_width ? display_get_width() : 0;
-    uint32_t physical_h = display_get_height ? display_get_height() : 0;
-    if (!physical_w && fb_get_width) physical_w = fb_get_width();
-    if (!physical_h && fb_get_height) physical_h = fb_get_height();
-    int hw = physical_w ? (int)physical_w : SCREEN_WIDTH;
-    int vh = physical_h ? (int)physical_h : SCREEN_HEIGHT;
-    uint32_t mode_bpp = SCREEN_BPP;
-    if (user32_get_current_display_mode) {
-        uint32_t mw = 0, mh = 0;
-        user32_get_current_display_mode(&mw, &mh, &mode_bpp, NULL);
-        if (mw && mh) { hw = (int)mw; vh = (int)mh; }
-    } else if (ddraw_display_mode_active && ddraw_get_display_mode &&
-               ddraw_display_mode_active()) {
-        uint32_t mw = 0, mh = 0;
-        ddraw_get_display_mode(&mw, &mh, &mode_bpp);
-        if (mw && mh) { hw = (int)mw; vh = (int)mh; }
-    }
+    /* NT reports the current logical display mode through the display DC. */
+    int hw = 0, vh = 0, mode_bpp = 0;
+    get_display_geometry(&hw, &vh, &mode_bpp);
     switch (index) {
     case HORZRES:    return hw;
     case VERTRES:    return vh;
-    case BITSPIXEL:  return (int)mode_bpp;
+    case BITSPIXEL:  return mode_bpp;
     case PLANES:     return 1;
     case RASTERCAPS: return 0;
     case TECHNOLOGY: return 1; /* DT_RASDISPLAY */
@@ -570,11 +968,10 @@ HDC WINAPI CreateCompatibleDC(HDC hdc)
         gdi_dcs[idx].bpp    = src->bpp;
         gdi_dcs[idx].pitch  = src->pitch;
     } else {
-        /* Default to screen dimensions */
-        gdi_dcs[idx].width  = SCREEN_WIDTH;
-        gdi_dcs[idx].height = SCREEN_HEIGHT;
-        gdi_dcs[idx].bpp    = 32;
-        gdi_dcs[idx].pitch  = SCREEN_WIDTH * 4;
+        get_display_geometry(&gdi_dcs[idx].width, &gdi_dcs[idx].height,
+                             &gdi_dcs[idx].bpp);
+        gdi_dcs[idx].pitch = gdi_dcs[idx].width *
+                             ((gdi_dcs[idx].bpp + 7) / 8);
     }
     /* surface = NULL — no bitmap selected yet */
 
@@ -1061,13 +1458,15 @@ BOOL gdi32_draw_icon_bitmap(HDC hdc, HBITMAP color_handle,
     return drew;
 }
 
+static HBITMAP gdi_create_dibitmap_impl(HDC hdc, PVOID pbmih, DWORD flInit,
+                                         PVOID pjBits, PVOID pbmi,
+                                         UINT iUsage);
+
 HBITMAP WINAPI CreateDIBitmap(HDC hdc, PVOID pbmih, DWORD flInit,
                               PVOID pjBits, PVOID pbmi, UINT iUsage)
 {
-    (void)hdc; (void)pbmih; (void)flInit;
-    (void)pjBits; (void)pbmi; (void)iUsage;
-    serial_puts("[GDI32] CreateDIBitmap (stub)\n");
-    return (HBITMAP)(ULONG_PTR)(BMP_TAG | 0xFE); /* fake — no slot */
+    return gdi_create_dibitmap_impl(hdc, pbmih, flInit, pjBits, pbmi,
+                                    iUsage);
 }
 
 /* ── Object selection / deletion ─────────────────────────────── */
@@ -2377,6 +2776,135 @@ static BOOL gdi_read_dib_pixel(const GDI_DIB_VIEW *view, int x, int y,
     }
 }
 
+static HBITMAP gdi_create_dibitmap_impl(HDC hdc, PVOID pbmih, DWORD flInit,
+                                         PVOID pjBits, PVOID pbmi,
+                                         UINT iUsage)
+{
+    if (!pbmih || (flInit & ~GDI_CBM_INIT) ||
+        iUsage != GDI_DIB_RGB_COLORS) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return NULL;
+    }
+
+    const BYTE *header = (const BYTE *)pbmih;
+    DWORD header_size = gdi_read_u32(header);
+    if (header_size < 40 || gdi_read_u16(header + 12) != 1) {
+        SetLastError(87);
+        return NULL;
+    }
+
+    int width = (int)(LONG)gdi_read_u32(header + 4);
+    int raw_height = (int)(LONG)gdi_read_u32(header + 8);
+    int height = 0;
+    int header_bpp = (int)gdi_read_u16(header + 14);
+    DWORD compression = gdi_read_u32(header + 16);
+    if (width <= 0 || width > 8192 ||
+        !gdi_abs_i32(raw_height, &height) || height <= 0 || height > 8192 ||
+        (header_bpp != 1 && header_bpp != 4 && header_bpp != 8 &&
+         header_bpp != 16 && header_bpp != 24 && header_bpp != 32) ||
+        (compression != GDI_BI_RGB && compression != GDI_BI_BITFIELDS &&
+         compression != GDI_BI_ALPHABITFIELDS) ||
+        ((compression == GDI_BI_BITFIELDS ||
+          compression == GDI_BI_ALPHABITFIELDS) &&
+         header_bpp != 16 && header_bpp != 32)) {
+        SetLastError(87);
+        return NULL;
+    }
+
+    BOOL initialize = (flInit & GDI_CBM_INIT) != 0;
+    GDI_DIB_VIEW source;
+    if (initialize &&
+        (!pjBits || !pbmi ||
+         !gdi_parse_dib(pbmi, pjBits, iUsage, &source) ||
+         source.width != width || source.height != height)) {
+        SetLastError(87);
+        return NULL;
+    }
+
+    int output_bpp;
+    if (initialize) {
+        /* Keep monochrome masks compact. Indexed palettes and custom
+         * bitfields are converted to the device-neutral 32-bit form so the
+         * bitmap remains self-contained after BITMAPINFO goes out of scope. */
+        output_bpp = source.bpp == 1 ? 1 : 32;
+    } else {
+        GDI_DC *dc = dc_from_handle(hdc);
+        if (!dc) {
+            SetLastError(6); /* ERROR_INVALID_HANDLE */
+            return NULL;
+        }
+        output_bpp = dc->bpp;
+        if (output_bpp != 1 && output_bpp != 8 && output_bpp != 16 &&
+            output_bpp != 24 && output_bpp != 32)
+            output_bpp = 32;
+    }
+
+    uint64_t row_bits = (uint64_t)(uint32_t)width *
+                        (uint64_t)(uint32_t)output_bpp;
+    uint64_t pitch64 = ((row_bits + 31U) / 32U) * 4U;
+    uint64_t bytes64 = pitch64 * (uint64_t)(uint32_t)height;
+    if (!pitch64 || pitch64 > 0x7FFFFFFFULL || !bytes64 ||
+        bytes64 > (uint64_t)(SIZE_T)-1) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return NULL;
+    }
+
+    int idx = alloc_bmp();
+    if (idx < 0) {
+        SetLastError(8);
+        return NULL;
+    }
+    BYTE *pixels = (BYTE *)kmalloc(bytes64);
+    if (!pixels) {
+        gdi_bmps[idx].in_use = 0;
+        SetLastError(8);
+        return NULL;
+    }
+    gdi_memset(pixels, 0, (SIZE_T)bytes64);
+
+    int bottomup = 0;
+    if (initialize && output_bpp == 1) {
+        if ((uint64_t)(uint32_t)source.pitch != pitch64) {
+            kfree(pixels);
+            gdi_bmps[idx].in_use = 0;
+            SetLastError(87);
+            return NULL;
+        }
+        gdi_memcpy(pixels, source.bits, (SIZE_T)bytes64);
+        bottomup = source.top_down ? 0 : 1;
+    } else if (initialize) {
+        for (int y = 0; y < height; y++) {
+            uint32_t *row = (uint32_t *)(pixels + (SIZE_T)y * pitch64);
+            for (int x = 0; x < width; x++) {
+                if (!gdi_read_dib_pixel(&source, x, y, &row[x])) {
+                    kfree(pixels);
+                    gdi_bmps[idx].in_use = 0;
+                    SetLastError(87);
+                    return NULL;
+                }
+            }
+        }
+    }
+
+    GDI_BITMAP *bitmap = &gdi_bmps[idx];
+    bitmap->pixels = pixels;
+    bitmap->width = width;
+    bitmap->height = height;
+    bitmap->bpp = output_bpp;
+    bitmap->pitch = (int)pitch64;
+    bitmap->bottomup = bottomup;
+
+    HBITMAP handle = (HBITMAP)(ULONG_PTR)(BMP_TAG | (uint32_t)idx);
+    serial_puts("[GDI32] CreateDIBitmap ");
+    serial_putdec((uint32_t)width);
+    serial_puts("x");
+    serial_putdec((uint32_t)height);
+    serial_puts("x");
+    serial_putdec((uint32_t)output_bpp);
+    serial_puts(initialize ? " initialized\n" : " empty\n");
+    return handle;
+}
+
 static void gdi_trace_dib_frame(const GDI_DIB_VIEW *view)
 {
     if (!view || gdi_frame_probe_count >= 4 ||
@@ -2649,6 +3177,37 @@ int gdi32_dib_selftest(void)
         0x000000FF, 0x00FFFFFF,
     };
 
+    HBITMAP initialized = CreateDIBitmap(
+        handle, info, GDI_CBM_INIT, top_down, info, GDI_DIB_RGB_COLORS);
+    GDI_BITMAP *initialized_bitmap = bmp_from_handle(initialized);
+    DIB_CHECK(initialized_bitmap != NULL);
+    if (initialized_bitmap) {
+        DIB_CHECK(initialized_bitmap->width == 2 &&
+                  initialized_bitmap->height == 2 &&
+                  initialized_bitmap->bpp == 32 &&
+                  !initialized_bitmap->bottomup);
+        uint32_t *pixels = (uint32_t *)initialized_bitmap->pixels;
+        DIB_CHECK(pixels[0] == 0xFFFF0000u &&
+                  pixels[1] == 0xFF00FF00u &&
+                  pixels[2] == 0xFF0000FFu &&
+                  pixels[3] == 0xFFFFFFFFu);
+        DIB_CHECK(DeleteObject((HGDIOBJ)initialized));
+        DIB_CHECK(!bmp_from_handle(initialized));
+    }
+
+    HBITMAP empty = CreateDIBitmap(handle, info, 0, NULL, NULL,
+                                    GDI_DIB_RGB_COLORS);
+    GDI_BITMAP *empty_bitmap = bmp_from_handle(empty);
+    DIB_CHECK(empty_bitmap != NULL);
+    if (empty_bitmap) {
+        uint32_t *pixels = (uint32_t *)empty_bitmap->pixels;
+        DIB_CHECK(empty_bitmap->bpp == 32 && pixels[0] == 0 &&
+                  pixels[3] == 0);
+        DIB_CHECK(DeleteObject((HGDIOBJ)empty));
+    }
+    DIB_CHECK(!CreateDIBitmap(handle, info, GDI_CBM_INIT, NULL, info,
+                              GDI_DIB_RGB_COLORS));
+
     gdi_memset(destination, 0, sizeof(destination));
     int rows = StretchDIBits_k32(handle, 1, 1, 2, 2, 0, 0, 2, 2,
                                   top_down, info, GDI_DIB_RGB_COLORS,
@@ -2913,43 +3472,76 @@ static HANDLE WINAPI AddFontMemResourceEx_k32(PVOID data, DWORD size,
                                                PVOID reserved,
                                                DWORD *font_count)
 {
-    (void)reserved;
-    if (!data || !size) return NULL;
-    if (font_count) *font_count = 1;
-    return (HANDLE)(ULONG_PTR)0xFA000001u;
+    return gdi_font_resource_add_memory(data, size, reserved, font_count);
+}
+
+static BOOL WINAPI RemoveFontMemResourceEx_k32(HANDLE handle)
+{
+    return gdi_font_resource_remove_memory(handle);
 }
 
 static int WINAPI AddFontResourceA_k32(PCSTR path)
 {
-    return path && *path ? 1 : 0;
+    return gdi_font_resource_add_path(path, 0, NULL);
 }
 
 static int WINAPI AddFontResourceExA_k32(PCSTR path, DWORD flags,
                                           PVOID reserved)
 {
-    (void)flags; (void)reserved;
-    return AddFontResourceA_k32(path);
+    return gdi_font_resource_add_path(path, flags, reserved);
 }
 
 static BOOL WINAPI RemoveFontResourceA_k32(PCSTR path)
 {
-    return path && *path;
+    return gdi_font_resource_remove_path(path, 0, NULL);
+}
+
+static BOOL WINAPI RemoveFontResourceExA_k32(PCSTR path, DWORD flags,
+                                              PVOID reserved)
+{
+    return gdi_font_resource_remove_path(path, flags, reserved);
+}
+
+static int WINAPI AddFontResourceW_k32(PCWSTR path)
+{
+    char utf8[260];
+    if (dwrite_utf16_path_to_utf8(path, utf8, sizeof(utf8)) < 0) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+    return gdi_font_resource_add_path(utf8, 0, NULL);
+}
+
+static BOOL WINAPI RemoveFontResourceW_k32(PCWSTR path)
+{
+    char utf8[260];
+    if (dwrite_utf16_path_to_utf8(path, utf8, sizeof(utf8)) < 0) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    return gdi_font_resource_remove_path(utf8, 0, NULL);
 }
 
 static int WINAPI AddFontResourceExW_k32(PCWSTR path, DWORD flags,
                                           PVOID reserved)
 {
-    (void)flags;
-    (void)reserved;
-    return path && *path ? 1 : 0;
+    char utf8[260];
+    if (dwrite_utf16_path_to_utf8(path, utf8, sizeof(utf8)) < 0) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+    return gdi_font_resource_add_path(utf8, flags, reserved);
 }
 
 static BOOL WINAPI RemoveFontResourceExW_k32(PCWSTR path, DWORD flags,
                                               PVOID reserved)
 {
-    (void)flags;
-    (void)reserved;
-    return path && *path;
+    char utf8[260];
+    if (dwrite_utf16_path_to_utf8(path, utf8, sizeof(utf8)) < 0) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    return gdi_font_resource_remove_path(utf8, flags, reserved);
 }
 
 static int WINAPI SetGraphicsMode_k32(HDC hdc, int mode)
@@ -3851,6 +4443,16 @@ static DWRITE_COLLECTION_STUB dwrite_collection = {
     { dwrite_family_vtbl, &dwrite_collection,
       { dwrite_font_vtbl, NULL } }
 };
+typedef struct _DWRITE_SYSTEM_COLLECTION_CACHE {
+    struct _DWRITE_SYSTEM_COLLECTION_CACHE *next;
+    DWORD owner_pid;
+    uint64_t generation;
+    DWRITE_COLLECTION_STUB *collection;
+} DWRITE_SYSTEM_COLLECTION_CACHE;
+static DWRITE_SYSTEM_COLLECTION_CACHE *dwrite_system_collections;
+static volatile ULONG dwrite_system_collection_lock;
+static LONG dwrite_acquire_system_font_collection(
+    BOOL check_updates, DWRITE_COLLECTION_STUB **collection_out);
 static DWRITE_LOCAL_FONT_LOADER dwrite_local_font_loader = {
     dwrite_local_font_loader_vtbl
 };
@@ -4715,6 +5317,64 @@ static LONG WINAPI dwrite_font_file_Analyze(PVOID self, BOOL *supported,
     return status < 0 ? status : 0;
 }
 
+static BOOL gdi_font_validate_file(const char *path, DWORD *face_count,
+                                   DWORD *error)
+{
+    if (face_count) *face_count = 0;
+    if (error) *error = 11; /* ERROR_BAD_FORMAT */
+    if (!path || !face_count) {
+        if (error) *error = 87; /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    PVOID file = NULL;
+    LONG status = dwrite_create_local_font_file(path, &file);
+    if (status < 0 || !file) {
+        if (error) {
+            *error = status == DWRITE_E_FILENOTFOUND ? 2 :
+                     status == DWRITE_E_OUTOFMEMORY ? 8 : 11;
+        }
+        return FALSE;
+    }
+
+    BOOL supported = FALSE;
+    UINT file_type = 0;
+    UINT face_type = 0;
+    UINT faces = 0;
+    status = dwrite_font_file_Analyze(file, &supported, &file_type,
+                                      &face_type, &faces);
+    dwrite_object_release(file);
+    if (status < 0 || !supported || !faces) {
+        if (error && status == DWRITE_E_OUTOFMEMORY) *error = 8;
+        return FALSE;
+    }
+    *face_count = faces;
+    if (error) *error = 0;
+    return TRUE;
+}
+
+static BOOL gdi_font_validate_memory(const void *data, DWORD size,
+                                     DWORD *face_count)
+{
+    if (face_count) *face_count = 0;
+    if (!data || !face_count || size < 4) return FALSE;
+    const BYTE *header = (const BYTE *)data;
+    UINT tag = dwrite_read_be32(header);
+    if (tag == 0x00010000U || tag == 0x74727565U ||
+        tag == 0x74797031U || tag == 0x4F54544FU) {
+        if (size < 12) return FALSE;
+        *face_count = 1;
+        return TRUE;
+    }
+    if (tag != 0x74746366U || size < 12) return FALSE;
+    UINT faces = dwrite_read_be32(header + 8);
+    if (!faces || faces > 4096 ||
+        (uint64_t)faces * sizeof(UINT) > size - 12U)
+        return FALSE;
+    *face_count = faces;
+    return TRUE;
+}
+
 static LONG WINAPI dwrite_fallback_QueryInterface(PVOID self, LPCGUID iid,
                                                    PVOID *object)
 {
@@ -4736,16 +5396,22 @@ static LONG WINAPI dwrite_fallback_MapCharacters(
     (void)self;
     (void)analysis_source;
     (void)text_position;
-    (void)base_collection;
     (void)base_family_name;
     (void)base_weight;
     (void)base_style;
     (void)base_stretch;
     if (!mapped_length || !mapped_font || !scale) return DWRITE_E_POINTER;
     *mapped_length = text_length;
-    *mapped_font = text_length && dwrite_collection.family_count
-        ? &dwrite_collection.family.font : NULL;
+    DWRITE_COLLECTION_STUB *collection =
+        (DWRITE_COLLECTION_STUB *)base_collection;
+    BOOL release_collection = FALSE;
+    if (!collection && dwrite_acquire_system_font_collection(
+            FALSE, &collection) >= 0)
+        release_collection = TRUE;
+    *mapped_font = text_length && collection && collection->family_count
+        ? &collection->family.font : NULL;
     if (*mapped_font) dwrite_font_AddRef(*mapped_font);
+    if (release_collection) dwrite_collection_Release(collection);
     *scale = 1.0f;
     dwrite_trace("[DWRITE] fallback.MapCharacters\n");
     return 0;
@@ -6199,59 +6865,204 @@ static LONG WINAPI dwrite_factory_CreateFontFace(
     return 0;
 }
 
-static volatile ULONG dwrite_system_font_lock;
 static BOOL dwrite_system_font_missing_reported;
 
-static void dwrite_initialize_system_font_collection(void)
+static void dwrite_system_collections_lock(void)
 {
-    if (dwrite_collection.font_file_count) return;
-    while (__atomic_exchange_n(&dwrite_system_font_lock, 1,
+    while (__atomic_exchange_n(&dwrite_system_collection_lock, 1,
                                __ATOMIC_ACQUIRE))
         __asm__ volatile ("pause");
-    if (dwrite_collection.font_file_count) {
-        __atomic_store_n(&dwrite_system_font_lock, 0, __ATOMIC_RELEASE);
-        return;
+}
+
+static void dwrite_system_collections_unlock(void)
+{
+    __atomic_store_n(&dwrite_system_collection_lock, 0, __ATOMIC_RELEASE);
+}
+
+static BOOL dwrite_try_system_font(const char *path, PVOID *file_out)
+{
+    *file_out = NULL;
+    PVOID file = NULL;
+    if (dwrite_create_local_font_file(path, &file) < 0) return FALSE;
+    BOOL supported = FALSE;
+    UINT file_type = 0, face_type = 0, face_count = 0;
+    LONG status = dwrite_font_file_Analyze(
+        file, &supported, &file_type, &face_type, &face_count);
+    if (status < 0 || !supported || !face_count) {
+        dwrite_object_release(file);
+        return FALSE;
     }
+    *file_out = file;
+    return TRUE;
+}
+
+static LONG dwrite_build_system_font_collection(
+    DWORD process_id, DWRITE_COLLECTION_STUB **collection_out,
+    uint64_t *generation_out)
+{
+    if (!collection_out || !generation_out) return DWRITE_E_POINTER;
+    *collection_out = NULL;
+
+    char **registered_paths = NULL;
+    UINT registered_count = 0;
+    if (!gdi_font_resource_snapshot_paths(
+            process_id, &registered_paths, &registered_count,
+            generation_out))
+        return DWRITE_E_OUTOFMEMORY;
 
     static const char *const candidates[] = {
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\System\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\System\\Program Files\\Steam\\clientui\\fonts\\GoNotoKurrent-Regular.ttf",
-        "C:\\Program Files\\Steam\\clientui\\fonts\\GoNotoKurrent-Regular.ttf",
         NULL
     };
+    PVOID file = NULL;
+    const char *selected_path = NULL;
     for (UINT i = 0; candidates[i]; i++) {
-        PVOID file = NULL;
-        if (dwrite_create_local_font_file(candidates[i], &file) < 0)
-            continue;
-        BOOL supported = FALSE;
-        UINT file_type = 0, face_type = 0, face_count = 0;
-        LONG status = dwrite_font_file_Analyze(
-            file, &supported, &file_type, &face_type, &face_count);
-        if (status < 0 || !supported || !face_count) {
-            dwrite_object_release(file);
-            continue;
-        }
-        PVOID *files = (PVOID *)kmalloc(sizeof(PVOID));
-        if (!files) {
-            dwrite_object_release(file);
+        if (dwrite_try_system_font(candidates[i], &file)) {
+            selected_path = candidates[i];
             break;
         }
-        files[0] = file;
-        dwrite_collection.font_files = files;
-        dwrite_collection.font_file_count = 1;
-        dwrite_collection.family_count = 1;
-        serial_puts("[DWRITE] system font: ");
-        serial_puts(candidates[i]);
-        serial_puts("\n");
-        break;
     }
-    if (!dwrite_collection.font_file_count &&
-        !dwrite_system_font_missing_reported) {
+    for (UINT i = 0; !file && i < registered_count; i++) {
+        if (dwrite_try_system_font(registered_paths[i], &file)) {
+            selected_path = registered_paths[i];
+            break;
+        }
+    }
+
+    DWRITE_COLLECTION_STUB *collection =
+        (DWRITE_COLLECTION_STUB *)kmalloc(sizeof(*collection));
+    PVOID *files = file ? (PVOID *)kmalloc(sizeof(*files)) : NULL;
+    if (!collection || (file && !files)) {
+        dwrite_object_release(file);
+        kfree(files);
+        kfree(collection);
+        gdi_font_resource_free_path_snapshot(
+            registered_paths, registered_count);
+        return DWRITE_E_OUTOFMEMORY;
+    }
+    if (file) files[0] = file;
+    collection->lpVtbl = dwrite_collection_vtbl;
+    collection->refs = 1; /* cache ownership */
+    collection->family_count = file ? 1 : 0;
+    collection->font_file_count = file ? 1 : 0;
+    collection->heap_owned = TRUE;
+    collection->font_files = files;
+    collection->family.lpVtbl = dwrite_family_vtbl;
+    collection->family.collection = collection;
+    collection->family.font.lpVtbl = dwrite_font_vtbl;
+    collection->family.font.family = &collection->family;
+
+    if (selected_path) {
+        serial_puts("[DWRITE] system font: ");
+        serial_puts(selected_path);
+        serial_puts("\n");
+    } else if (!dwrite_system_font_missing_reported) {
         dwrite_system_font_missing_reported = TRUE;
         serial_puts("[DWRITE] no usable system font file found\n");
     }
-    __atomic_store_n(&dwrite_system_font_lock, 0, __ATOMIC_RELEASE);
+
+    gdi_font_resource_free_path_snapshot(registered_paths, registered_count);
+    *collection_out = collection;
+    return 0;
+}
+
+static LONG dwrite_acquire_system_font_collection(
+    BOOL check_updates, DWRITE_COLLECTION_STUB **collection_out)
+{
+    if (!collection_out) return DWRITE_E_POINTER;
+    *collection_out = NULL;
+    DWORD process_id = GetCurrentProcessId();
+    if (!process_id) process_id = 1;
+    uint64_t generation = gdi_font_resource_current_generation();
+
+    dwrite_system_collections_lock();
+    for (DWRITE_SYSTEM_COLLECTION_CACHE *entry = dwrite_system_collections;
+         entry; entry = entry->next) {
+        if (entry->owner_pid == process_id &&
+            (!check_updates || entry->generation == generation)) {
+            *collection_out = entry->collection;
+            dwrite_collection_AddRef(*collection_out);
+            dwrite_system_collections_unlock();
+            return 0;
+        }
+    }
+    dwrite_system_collections_unlock();
+
+    DWRITE_COLLECTION_STUB *built = NULL;
+    LONG status = dwrite_build_system_font_collection(
+        process_id, &built, &generation);
+    if (status < 0) return status;
+    DWRITE_SYSTEM_COLLECTION_CACHE *published =
+        (DWRITE_SYSTEM_COLLECTION_CACHE *)kmalloc(sizeof(*published));
+    if (!published) {
+        dwrite_collection_Release(built);
+        return DWRITE_E_OUTOFMEMORY;
+    }
+    published->owner_pid = process_id;
+    published->generation = generation;
+    published->collection = built;
+    published->next = NULL;
+
+    DWRITE_SYSTEM_COLLECTION_CACHE *stale = NULL;
+    dwrite_system_collections_lock();
+    DWRITE_SYSTEM_COLLECTION_CACHE **link = &dwrite_system_collections;
+    while (*link) {
+        DWRITE_SYSTEM_COLLECTION_CACHE *entry = *link;
+        if (entry->owner_pid != process_id) {
+            link = &entry->next;
+            continue;
+        }
+        if ((!check_updates || entry->generation == generation) &&
+            !stale) {
+            *collection_out = entry->collection;
+            dwrite_collection_AddRef(*collection_out);
+            dwrite_system_collections_unlock();
+            dwrite_collection_Release(built);
+            kfree(published);
+            return 0;
+        }
+        *link = entry->next;
+        entry->next = stale;
+        stale = entry;
+    }
+    published->next = dwrite_system_collections;
+    dwrite_system_collections = published;
+    *collection_out = built;
+    dwrite_collection_AddRef(built); /* caller ownership */
+    dwrite_system_collections_unlock();
+
+    while (stale) {
+        DWRITE_SYSTEM_COLLECTION_CACHE *next = stale->next;
+        dwrite_collection_Release(stale->collection);
+        kfree(stale);
+        stale = next;
+    }
+    return 0;
+}
+
+static void dwrite_release_system_collection_cache(DWORD process_id)
+{
+    DWRITE_SYSTEM_COLLECTION_CACHE *retired = NULL;
+    dwrite_system_collections_lock();
+    DWRITE_SYSTEM_COLLECTION_CACHE **link = &dwrite_system_collections;
+    while (*link) {
+        DWRITE_SYSTEM_COLLECTION_CACHE *entry = *link;
+        if (entry->owner_pid != process_id) {
+            link = &entry->next;
+            continue;
+        }
+        *link = entry->next;
+        entry->next = retired;
+        retired = entry;
+    }
+    dwrite_system_collections_unlock();
+    while (retired) {
+        DWRITE_SYSTEM_COLLECTION_CACHE *next = retired->next;
+        dwrite_collection_Release(retired->collection);
+        kfree(retired);
+        retired = next;
+    }
 }
 
 static LONG WINAPI dwrite_factory_GetSystemFontCollection(PVOID self,
@@ -6259,11 +7070,11 @@ static LONG WINAPI dwrite_factory_GetSystemFontCollection(PVOID self,
                                                           BOOL check_updates)
 {
     (void)self;
-    (void)check_updates;
     if (!collection) return DWRITE_E_POINTER;
-    dwrite_initialize_system_font_collection();
-    *collection = &dwrite_collection;
-    dwrite_collection_AddRef(*collection);
+    *collection = NULL;
+    LONG status = dwrite_acquire_system_font_collection(
+        check_updates, (DWRITE_COLLECTION_STUB **)collection);
+    if (status < 0) return status;
     dwrite_trace("[DWRITE] factory.GetSystemFontCollection\n");
     return 0;
 }
@@ -6525,6 +7336,51 @@ int gdi32_dwrite_selftest(void)
     gdi32_shim_init();
     factory_vtbl = dwrite_factory_vtbl;
 
+    DWORD memory_faces = 0;
+    HANDLE memory_font = AddFontMemResourceEx_k32(
+        stream.data, sizeof(stream.data), NULL, &memory_faces);
+    dwrite_test_check(memory_font != NULL && memory_faces == 1,
+                      "memory font registration validates and reports faces",
+                      &checks, &failures);
+    dwrite_test_check(RemoveFontMemResourceEx_k32(memory_font),
+                      "memory font handle unregisters its resource",
+                      &checks, &failures);
+    dwrite_test_check(!RemoveFontMemResourceEx_k32(memory_font) &&
+                      GetLastError() == 6,
+                      "stale memory font handles are rejected",
+                      &checks, &failures);
+
+    BYTE invalid_font[12] = {0};
+    memory_faces = 9;
+    memory_font = AddFontMemResourceEx_k32(
+        invalid_font, sizeof(invalid_font), NULL, &memory_faces);
+    dwrite_test_check(!memory_font && memory_faces == 0 &&
+                      GetLastError() == 11,
+                      "invalid memory fonts fail without publishing a handle",
+                      &checks, &failures);
+    dwrite_test_check(
+        AddFontResourceA_k32("C:\\__ositok_missing_font__.ttf") == 0 &&
+            GetLastError() == 2,
+        "missing path fonts report file-not-found instead of fake success",
+        &checks, &failures);
+
+    DWRITE_COLLECTION_STUB *system_first = NULL;
+    DWRITE_COLLECTION_STUB *system_second = NULL;
+    LONG system_status = dwrite_acquire_system_font_collection(
+        FALSE, &system_first);
+    dwrite_test_check(system_status == 0 && system_first != NULL,
+                      "system collection publishes an immutable snapshot",
+                      &checks, &failures);
+    system_status = dwrite_acquire_system_font_collection(
+        TRUE, &system_second);
+    dwrite_test_check(system_status == 0 && system_second == system_first,
+                      "unchanged system collection is cached per process",
+                      &checks, &failures);
+    dwrite_object_release(system_second);
+    dwrite_object_release(system_first);
+    DWORD system_owner = GetCurrentProcessId();
+    dwrite_release_system_collection_cache(system_owner ? system_owner : 1);
+
     dwrite_test_check(
         dwrite_cmap_lookup(cmap_format4, sizeof(cmap_format4), 'A') == 7,
         "format 4 cmap maps a codepoint to its glyph",
@@ -6740,9 +7596,13 @@ static const SHIM_EXPORT gdi32_exports[] = {
     { "GetCurrentObject",    (PVOID)GetCurrentObject, 2, CC_STDCALL },
     { "GdiFlush",            (PVOID)GdiFlush_k32, 0, CC_STDCALL },
     { "AddFontMemResourceEx", (PVOID)AddFontMemResourceEx_k32, 4, CC_STDCALL },
+    { "RemoveFontMemResourceEx", (PVOID)RemoveFontMemResourceEx_k32, 1, CC_STDCALL },
     { "AddFontResourceA",    (PVOID)AddFontResourceA_k32, 1, CC_STDCALL },
+    { "AddFontResourceW",    (PVOID)AddFontResourceW_k32, 1, CC_STDCALL },
     { "AddFontResourceExA",  (PVOID)AddFontResourceExA_k32, 3, CC_STDCALL },
     { "RemoveFontResourceA", (PVOID)RemoveFontResourceA_k32, 1, CC_STDCALL },
+    { "RemoveFontResourceW", (PVOID)RemoveFontResourceW_k32, 1, CC_STDCALL },
+    { "RemoveFontResourceExA", (PVOID)RemoveFontResourceExA_k32, 3, CC_STDCALL },
     { "AddFontResourceExW",  (PVOID)AddFontResourceExW_k32, 3, CC_STDCALL },
     { "RemoveFontResourceExW", (PVOID)RemoveFontResourceExW_k32, 3, CC_STDCALL },
     { "CreateRectRgn",       (PVOID)CreateRectRgn, 4, CC_STDCALL },

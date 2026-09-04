@@ -40,6 +40,7 @@ BOOL    WINAPI WriteFile(HANDLE hFile, PCVOID lpBuffer, DWORD nNumberOfBytesToWr
 BOOL    WINAPI CloseHandle(HANDLE hObject);
 
 DWORD   WINAPI GetFileSize(HANDLE hFile, DWORD *lpFileSizeHigh);
+DWORD   WINAPI GetFileType(HANDLE hFile);
 DWORD   WINAPI GetFileAttributesW(PCWSTR lpFileName);
 
 DWORD   WINAPI SetFilePointer(HANDLE hFile, LONG lDistanceToMove,
@@ -55,6 +56,9 @@ BOOL    WINAPI MoveFileW(PCWSTR lpExistingFileName, PCWSTR lpNewFileName);
 /* ── Console API ────────────────────────────────────────────── */
 
 HANDLE  WINAPI GetStdHandle(DWORD nStdHandle);
+BOOL    WINAPI SetStdHandle(DWORD nStdHandle, HANDLE hHandle);
+BOOL    WINAPI AllocConsole(void);
+BOOL    WINAPI FreeConsole(void);
 
 BOOL    WINAPI WriteConsoleA(HANDLE hConsoleOutput, PCVOID lpBuffer,
                       DWORD nNumberOfCharsToWrite,
@@ -93,6 +97,10 @@ HANDLE  WINAPI OpenFileMappingW(DWORD dwDesiredAccess, BOOL bInheritHandle,
 PVOID   WINAPI MapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess,
                     DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow,
                     SIZE_T dwNumberOfBytesToMap);
+PVOID   WINAPI MapViewOfFileEx(HANDLE hFileMappingObject,
+                    DWORD dwDesiredAccess, DWORD dwFileOffsetHigh,
+                    DWORD dwFileOffsetLow, SIZE_T dwNumberOfBytesToMap,
+                    PVOID lpBaseAddress);
 
 BOOL    WINAPI UnmapViewOfFile(PCVOID lpBaseAddress);
 
@@ -151,21 +159,13 @@ BOOL    WINAPI DuplicateHandle(HANDLE hSourceProcessHandle, HANDLE hSourceHandle
                         HANDLE hTargetProcessHandle, PHANDLE lpTargetHandle,
                         DWORD dwDesiredAccess, BOOL bInheritHandle,
                         DWORD dwOptions);
+BOOL    WINAPI GetHandleInformation(HANDLE hObject, DWORD *lpdwFlags);
 BOOL    WINAPI SetHandleInformation(HANDLE hObject, DWORD dwMask, DWORD dwFlags);
 
 BOOL    WINAPI VirtualProtect(PVOID lpAddress, SIZE_T dwSize,
                        DWORD flNewProtect, DWORD *lpflOldProtect);
 
 /* ── Critical Section ───────────────────────────────────────── */
-
-typedef struct _RTL_CRITICAL_SECTION {
-    PVOID       DebugInfo;
-    LONG        LockCount;
-    LONG        RecursionCount;
-    HANDLE      OwningThread;
-    HANDLE      LockSemaphore;
-    ULONG_PTR   SpinCount;
-} RTL_CRITICAL_SECTION, *PRTL_CRITICAL_SECTION, CRITICAL_SECTION, *LPCRITICAL_SECTION;
 
 void WINAPI InitializeCriticalSection(LPCRITICAL_SECTION lpCS);
 BOOL WINAPI InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION lpCS, DWORD dwSpinCount);
@@ -351,6 +351,7 @@ DWORD WINAPI GetSystemDirectoryA(PSTR lpBuffer, DWORD uSize);
 DWORD WINAPI GetSystemDirectoryW(PWSTR lpBuffer, DWORD uSize);
 DWORD WINAPI GetWindowsDirectoryA(PSTR lpBuffer, DWORD uSize);
 DWORD WINAPI GetWindowsDirectoryW(PWSTR lpBuffer, DWORD uSize);
+DWORD WINAPI GetLogicalDrives(void);
 
 /* ── Find File ─────────────────────────────────────────────── */
 
@@ -413,7 +414,13 @@ typedef struct _STARTUPINFOA {
 void   WINAPI GetStartupInfoA(LPSTARTUPINFOA lpStartupInfo);
 BOOL   WINAPI IsDebuggerPresent(void);
 PVOID  WINAPI SetUnhandledExceptionFilter(PVOID lpTopLevelExceptionFilter);
+PVOID  WINAPI AddVectoredExceptionHandler(ULONG first, PVOID handler);
+ULONG  WINAPI RemoveVectoredExceptionHandler(PVOID handle);
 PVOID  kernel32_get_unhandled_exception_filter(void);
+SIZE_T kernel32_snapshot_vectored_exception_handlers(PVOID *handlers,
+                                                      SIZE_T capacity);
+LONG   kernel32_dispatch_vectored_exception(PEXCEPTION_RECORD record,
+                                            PCONTEXT context);
 void   kernel32_release_process_exception_state(DWORD process_id);
 void   WINAPI OutputDebugStringA(PCSTR lpOutputString);
 void   WINAPI RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags,
@@ -445,6 +452,7 @@ LONG WINAPI PathCchCombineEx(PWSTR pszPathOut, SIZE_T cchPathOut,
 LONG WINAPI InterlockedIncrement(volatile LONG *Addend);
 LONG WINAPI InterlockedDecrement(volatile LONG *Addend);
 LONG WINAPI InterlockedExchange(volatile LONG *Target, LONG Value);
+LONG WINAPI InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG WINAPI InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 PVOID WINAPI InterlockedFlushSList(PVOID list_head);
 
@@ -453,12 +461,31 @@ PVOID WINAPI InterlockedFlushSList(PVOID list_head);
 DWORD WINAPI GetPrivateProfileStringA(PCSTR lpAppName, PCSTR lpKeyName,
                                        PCSTR lpDefault, PSTR lpReturnedString,
                                        DWORD nSize, PCSTR lpFileName);
+DWORD WINAPI GetPrivateProfileStringW(PCWSTR lpAppName, PCWSTR lpKeyName,
+                                       PCWSTR lpDefault, PWSTR lpReturnedString,
+                                       DWORD nSize, PCWSTR lpFileName);
 BOOL  WINAPI WritePrivateProfileStringA(PCSTR lpAppName, PCSTR lpKeyName,
                                          PCSTR lpString, PCSTR lpFileName);
+BOOL  WINAPI WritePrivateProfileStringW(PCWSTR lpAppName, PCWSTR lpKeyName,
+                                         PCWSTR lpString, PCWSTR lpFileName);
 UINT  WINAPI GetPrivateProfileIntA(PCSTR lpAppName, PCSTR lpKeyName,
                                     int nDefault, PCSTR lpFileName);
+UINT  WINAPI GetPrivateProfileIntW(PCWSTR lpAppName, PCWSTR lpKeyName,
+                                    int nDefault, PCWSTR lpFileName);
 DWORD WINAPI GetPrivateProfileSectionNamesA(PSTR lpszReturnBuffer,
                                              DWORD nSize, PCSTR lpFileName);
+DWORD WINAPI GetPrivateProfileSectionNamesW(PWSTR lpszReturnBuffer,
+                                             DWORD nSize, PCWSTR lpFileName);
+DWORD WINAPI GetPrivateProfileSectionA(PCSTR lpAppName,
+                                        PSTR lpReturnedString, DWORD nSize,
+                                        PCSTR lpFileName);
+DWORD WINAPI GetPrivateProfileSectionW(PCWSTR lpAppName,
+                                        PWSTR lpReturnedString, DWORD nSize,
+                                        PCWSTR lpFileName);
+BOOL  WINAPI WritePrivateProfileSectionA(PCSTR lpAppName, PCSTR lpString,
+                                          PCSTR lpFileName);
+BOOL  WINAPI WritePrivateProfileSectionW(PCWSTR lpAppName, PCWSTR lpString,
+                                          PCWSTR lpFileName);
 
 /* ── Shim resolution ────────────────────────────────────────── */
 
@@ -476,12 +503,31 @@ DWORD   win32_directory_create_normalized(const char *path);
 void    k32_pipe_service_pending(void);
 NTSTATUS kernel32_inherit_process_environment(DWORD parent_pid,
                                                DWORD child_pid);
+NTSTATUS kernel32_initialize_process_console(DWORD process_id,
+                                              BOOL attached);
+NTSTATUS kernel32_inherit_process_console(DWORD parent_pid,
+                                           DWORD child_pid,
+                                           DWORD creation_flags);
+BOOL    kernel32_query_process_console(DWORD process_id,
+                                       HANDLE *console_handle,
+                                       HANDLE *standard_input,
+                                       HANDLE *standard_output,
+                                       HANDLE *standard_error);
+/* Launch a child without exposing PROCESS_INFORMATION across the native/PE32
+ * ABI boundary. Intended for higher-level Win32 APIs such as ShellExecute. */
+BOOL    kernel32_launch_process_a(PCSTR application, PCSTR command_line,
+                                  PCSTR current_directory);
+/* Internal bounded access to a PE image resource. The returned pointer remains
+ * owned by the loaded module and is valid for the module's lifetime. */
+BOOL    kernel32_resource_data_w(HANDLE module, PCWSTR name, PCWSTR type,
+                                 PCVOID *data, DWORD *size);
 NTSTATUS kernel32_set_process_environment_block(DWORD process_id,
                                                   PCVOID environment,
                                                   BOOL unicode);
 void    kernel32_release_process_environment(DWORD process_id);
 /* Transfer pending Win32 thread-stack cleanup to process-wide VM teardown. */
 void    kernel32_prepare_process_vm_release(DWORD process_id);
+void    kernel32_release_process_waits(DWORD process_id);
 SIZE_T  kernel32_build_environment_block_w(DWORD process_id, PWSTR buffer,
                                            SIZE_T capacity);
 void    k32_power_request_release(PVOID object);

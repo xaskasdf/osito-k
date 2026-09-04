@@ -39,6 +39,12 @@ extern PVOID pe_resolve_import(const char *dll_name, const char *func_name,
                                USHORT ordinal, BOOL by_ordinal);
 extern NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args);
 extern DWORD win32_current_process_id(void);
+extern void nt_vm_configure_process_dep(ULONG owner_pid, BOOL enabled);
+extern BOOL nt_vm_process_dep_enabled(ULONG owner_pid);
+extern NTSTATUS win32_publish_loader_image(PPE_IMAGE_INFO info,
+                                           const char *image_name,
+                                           BOOL system_module);
+extern void win32_unpublish_loader_image(ULONG process_id, PVOID image_base);
 
 static inline void pe_trace(const char *message)
 {
@@ -222,6 +228,8 @@ typedef struct {
     ULONG       SizeOfHeaders;
     ULONG       AddressOfEntryPoint;
     USHORT      Subsystem;
+    USHORT      MajorSubsystemVersion;
+    USHORT      MinorSubsystemVersion;
     USHORT      DllCharacteristics;
     ULONGLONG   SizeOfStackReserve;
     ULONGLONG   SizeOfStackCommit;
@@ -323,6 +331,10 @@ static NTSTATUS pe_parse_headers(const BYTE *file_data, SIZE_T file_size,
         out->SizeOfHeaders       = nt->OptionalHeader.SizeOfHeaders;
         out->AddressOfEntryPoint = nt->OptionalHeader.AddressOfEntryPoint;
         out->Subsystem           = nt->OptionalHeader.Subsystem;
+        out->MajorSubsystemVersion =
+            nt->OptionalHeader.MajorSubsystemVersion;
+        out->MinorSubsystemVersion =
+            nt->OptionalHeader.MinorSubsystemVersion;
         out->DllCharacteristics  = nt->OptionalHeader.DllCharacteristics;
         out->SizeOfStackReserve  = nt->OptionalHeader.SizeOfStackReserve;
         out->SizeOfStackCommit   = nt->OptionalHeader.SizeOfStackCommit;
@@ -342,6 +354,10 @@ static NTSTATUS pe_parse_headers(const BYTE *file_data, SIZE_T file_size,
         out->SizeOfHeaders       = nt->OptionalHeader.SizeOfHeaders;
         out->AddressOfEntryPoint = nt->OptionalHeader.AddressOfEntryPoint;
         out->Subsystem           = nt->OptionalHeader.Subsystem;
+        out->MajorSubsystemVersion =
+            nt->OptionalHeader.MajorSubsystemVersion;
+        out->MinorSubsystemVersion =
+            nt->OptionalHeader.MinorSubsystemVersion;
         out->DllCharacteristics  = nt->OptionalHeader.DllCharacteristics;
         out->SizeOfStackReserve  = nt->OptionalHeader.SizeOfStackReserve;
         out->SizeOfStackCommit   = nt->OptionalHeader.SizeOfStackCommit;
@@ -884,10 +900,15 @@ int pe_protection_selftest(void)
     const SIZE_T image_size = 4 * 4096;
     int checks = 0;
     int failures = 0;
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    BOOL saved_dep_enabled = nt_vm_process_dep_enabled(owner_pid);
     BYTE *base = (BYTE *)pe_alloc(NULL, image_size, FALSE);
     pe_test_expect(base != NULL, "allocate synthetic image", &checks,
                    &failures);
     if (!base) return failures;
+
+    nt_vm_configure_process_dep(owner_pid, TRUE);
 
     pe_memset(base, 0, image_size);
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
@@ -950,6 +971,23 @@ int pe_protection_selftest(void)
                    "unassigned image pages are inaccessible", &checks,
                    &failures);
 
+    nt_vm_configure_process_dep(owner_pid, FALSE);
+    status = pe_finalize_image_protections(&info);
+    pe_test_expect(NT_SUCCESS(status),
+                   "finalize image with legacy DEP policy", &checks,
+                   &failures);
+    status = pe_test_protect(base + 8192, PAGE_READWRITE, &old_protection);
+    pe_test_expect(NT_SUCCESS(status) &&
+                   old_protection == PAGE_EXECUTE_READWRITE,
+                   "legacy PE32 data is executable at hardware level", &checks,
+                   &failures);
+    status = pe_test_protect(base + 12288, PAGE_NOACCESS,
+                             &old_protection);
+    pe_test_expect(NT_SUCCESS(status) && old_protection == PAGE_NOACCESS,
+                   "legacy DEP policy preserves unassigned guard pages",
+                   &checks, &failures);
+
+    nt_vm_configure_process_dep(owner_pid, saved_dep_enabled);
     pe_free(base, image_size);
     serial_puts("[PEPROT-TEST] checks=");
     serial_putdec(checks);
@@ -962,6 +1000,10 @@ int pe_protection_selftest(void)
 static void pe_abort_load(PPE_IMAGE_INFO info, BYTE *image_base,
                           ULONG image_size, BOOL published_executable)
 {
+    ULONG process_id = win32_current_process_id();
+    if (!process_id) process_id = 1;
+    if (image_base)
+        win32_unpublish_loader_image(process_id, image_base);
     if (published_executable) {
         extern void win32_publish_current_image_base(PVOID image_base);
         win32_publish_current_image_base(NULL);
@@ -1035,6 +1077,8 @@ NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
     info->EntryPointRVA      = ph.AddressOfEntryPoint;
     info->EntryPoint         = image_base + ph.AddressOfEntryPoint;
     info->Subsystem          = ph.Subsystem;
+    info->MajorSubsystemVersion = ph.MajorSubsystemVersion;
+    info->MinorSubsystemVersion = ph.MinorSubsystemVersion;
     info->DllCharacteristics = ph.DllCharacteristics;
     info->StackReserve       = ph.SizeOfStackReserve;
     info->StackCommit        = ph.SizeOfStackCommit;
@@ -1050,6 +1094,13 @@ NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
     if (published_executable) {
         extern void win32_publish_current_image_base(PVOID image_base);
         win32_publish_current_image_base(image_base);
+    }
+
+    status = win32_publish_loader_image(info, image_name, FALSE);
+    if (!NT_SUCCESS(status)) {
+        pe_abort_load(info, image_base, size_of_image,
+                      published_executable);
+        return status;
     }
 
     /* Step 6: Resolve imports (from mapped image's data directories) */
@@ -1117,14 +1168,26 @@ NTSTATUS pe_load(const BYTE *file_data, SIZE_T file_size,
 
 void pe_unload(PPE_IMAGE_INFO info)
 {
-    if (info && info->ImageBase) {
-        /* Win32 children currently share the kernel address space. Async
-         * callbacks and shared objects can therefore retain pointers into an
-         * image after process teardown. Reusing those physical pages for a
-         * kernel stack caused live scheduler frames to be overwritten. Keep
-         * successfully loaded images pinned until Win32 has per-process page
-         * tables; pe_load error paths still release unpublished images. */
-        info->ImageBase  = NULL;
-        info->EntryPoint = NULL;
-    }
+    if (!info || !info->ImageBase) return;
+
+    PVOID image_base = info->ImageBase;
+    SIZE_T image_size = info->SizeOfImage;
+    ULONG process_id = win32_current_process_id();
+    if (!process_id) process_id = 1;
+    win32_unpublish_loader_image(process_id, image_base);
+    info->ImageBase = NULL;
+    info->EntryPoint = NULL;
+    pe_free(image_base, image_size);
+}
+
+void pe_unload_for_owner(PPE_IMAGE_INFO info, ULONG owner_pid)
+{
+    if (!info || !info->ImageBase || !owner_pid) return;
+
+    PVOID image_base = info->ImageBase;
+    SIZE_T image_size = info->SizeOfImage;
+    win32_unpublish_loader_image(owner_pid, image_base);
+    info->ImageBase = NULL;
+    info->EntryPoint = NULL;
+    pe_free_for_owner(image_base, image_size, owner_pid);
 }

@@ -53,6 +53,7 @@ char*  WINAPI crt_strrchr(const char *s, int c);
 char*  WINAPI crt_strdup(const char *s);
 SIZE_T WINAPI crt_strcspn(const char *s, const char *reject);
 char*  WINAPI crt_strpbrk(const char *s, const char *accept);
+char*  WINAPI crt_strtok(char *str, const char *delimiters);
 char*  WINAPI crt_strtok_s(char *str, const char *delimiters,
                            char **context);
 
@@ -69,9 +70,11 @@ PVOID WINAPI crt_memchr(PCVOID ptr, int value, SIZE_T n);
 int WINAPI crt_printf(const char *fmt, ...);
 int WINAPI crt_sprintf(char *buf, const char *fmt, ...);
 int WINAPI crt_snprintf(char *buf, SIZE_T size, const char *fmt, ...);
+int WINAPI crt_snwprintf(WCHAR *buf, SIZE_T size, const WCHAR *fmt, ...);
 int WINAPI crt_snprintf_s(char *buf, SIZE_T size, SIZE_T count,
                           const char *fmt, ...);
 int WINAPI crt_fprintf(PVOID stream, const char *fmt, ...);
+int WINAPI crt_fwprintf(PVOID stream, const WCHAR *fmt, ...);
 int WINAPI crt_sscanf(const char *buf, const char *fmt, ...);
 int WINAPI crt_puts(const char *s);
 int WINAPI crt_putchar(int c);
@@ -83,12 +86,17 @@ int WINAPI crt_stdio_common_vswprintf(uint64_t options, WCHAR *buffer,
                                       SIZE_T buffer_count,
                                       const WCHAR *format, PVOID locale,
                                       PVOID arg_list);
+int WINAPI crt_vswprintf_c_l(WCHAR *buffer, SIZE_T buffer_count,
+                              const WCHAR *format, PVOID locale,
+                              PVOID arg_list);
 
 /* ── stdio FILE* ───────────────────────────────────────────── */
 
 typedef struct _CRT_FILE CRT_FILE;
+typedef void (*crt_sighandler_t)(int);
 
 CRT_FILE* WINAPI crt_fopen(const char *path, const char *mode);
+CRT_FILE* WINAPI crt_fdopen(int fd, const char *mode);
 SIZE_T    WINAPI crt_fread(PVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f);
 SIZE_T    WINAPI crt_fwrite(PCVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f);
 int       WINAPI crt_fclose(CRT_FILE *f);
@@ -109,6 +117,11 @@ LONG_PTR  WINAPI crt_get_osfhandle(int fd);
 int       WINAPI crt_open_osfhandle(LONG_PTR handle, int flags);
 int       WINAPI crt_open(const char *path, int flags, int mode);
 int       WINAPI crt_wopen(const WCHAR *path, int flags, int mode);
+int       WINAPI crt_unlink(const char *path);
+int       WINAPI crt_wunlink(const WCHAR *path);
+int       WINAPI crt_rename(const char *old_path, const char *new_path);
+int       WINAPI crt_wrename(const WCHAR *old_path, const WCHAR *new_path);
+int       WINAPI crt_getdrive(void);
 int       WINAPI crt_close(int fd);
 int       WINAPI crt_read(int fd, PVOID buffer, unsigned int count);
 int       WINAPI crt_write(int fd, PCVOID buffer, unsigned int count);
@@ -131,6 +144,12 @@ CRT_FILE* WINAPI crt_acrt_iob_func(unsigned int index);
 int       WINAPI crt_atoi(const char *s);
 long      WINAPI crt_atol(const char *s);
 double    WINAPI crt_atof(const char *s);
+double    WINAPI crt_strtod(const char *s, char **endptr);
+uint64_t  WINAPI crt_strtod_compat32(uint64_t s_arg, uint64_t endptr_arg);
+SIZE_T    WINAPI crt_mbstowcs(WCHAR *destination, const char *source,
+                              SIZE_T count);
+SIZE_T    WINAPI crt_wcstombs(char *destination, const WCHAR *source,
+                              SIZE_T count);
 int       WINAPI crt_abs(int value);
 long      WINAPI crt_strtol(const char *s, char **endptr, int base);
 unsigned long WINAPI crt_strtoul(const char *s, char **endptr, int base);
@@ -162,9 +181,12 @@ int   WINAPI crt_putenv(const char *assignment);
 int   WINAPI crt_wputenv(const WCHAR *assignment);
 int   WINAPI crt_putenv_s(const char *name, const char *value);
 int   WINAPI crt_wputenv_s(const WCHAR *name, const WCHAR *value);
+char*** WINAPI crt_p_environ(void);
 WCHAR*** WINAPI crt_p_wenviron(void);
 char* WINAPI crt_getcwd(char *buffer, int max_length);
 WCHAR* WINAPI crt_wgetcwd(WCHAR *buffer, int max_length);
+char* WINAPI crt_getdcwd(int drive, char *buffer, int max_length);
+WCHAR* WINAPI crt_wgetdcwd(int drive, WCHAR *buffer, int max_length);
 char* WINAPI crt_fullpath(char *absolute, const char *relative,
                           SIZE_T max_length);
 WCHAR* WINAPI crt_wfullpath(WCHAR *absolute, const WCHAR *relative,
@@ -212,6 +234,7 @@ ULONG* WINAPI crt_doserrno(void);
 char** WINAPI crt_sys_errlist(void);
 int*  WINAPI crt_sys_nerr(void);
 char* WINAPI crt_strerror(int error);
+WCHAR* WINAPI crt_wcserror(int error);
 int   WINAPI crt_fpe_flt_rounds(void);
 
 /* ── Time ──────────────────────────────────────────────────── */
@@ -221,10 +244,12 @@ typedef long crt_clock_t;
 
 crt_time_t  WINAPI crt_time(crt_time_t *timer);
 crt_clock_t WINAPI crt_clock(void);
+void        WINAPI crt_ftime(PVOID result);
 void        WINAPI crt_tzset(void);
 LONG*       WINAPI crt_timezone(void);
 int*        WINAPI crt_daylight(void);
 int64_t     WINAPI crt_time64(int64_t *timer);
+char*       WINAPI crt_ctime64(const int64_t *timer);
 int         WINAPI crt_gmtime64_s(PVOID result, const int64_t *timer);
 PVOID       WINAPI crt_localtime64(const int64_t *timer);
 int         WINAPI crt_localtime64_s(PVOID result, const int64_t *timer);
@@ -256,6 +281,7 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler4_common(
     PVOID DispatcherContext);
 
 int  WINAPI crt_XcptFilter(int code, PVOID pointers);
+int  WINAPI crt_CppXcptFilter(int code, PVOID pointers);
 
 /* PE32 non-local jumps are completed by compat32_dispatch, which has the
  * original i386 register file and caller stack. These functions are unique
@@ -281,6 +307,8 @@ typedef void (*_PVFV_DLL)(void);
 typedef int  (*_UserMathErrFunc)(void);
 
 void  WINAPI crt_type_info_dtor(PVOID _this);
+void  WINAPI crt_type_info_dtor_internal(PVOID _this);
+void  WINAPI crt_clean_type_info_names_internal(PVOID root_node);
 void  WINAPI crt_std_type_info_destroy_list(PVOID list_head);
 void  WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo);
 EXCEPTION_DISPOSITION WINAPI crt_CxxFrameHandler(
@@ -294,6 +322,8 @@ int*  WINAPI crt_p_commode(void);
 int*  WINAPI crt_p_fmode(void);
 int   WINAPI crt_set_fmode(int mode);
 int   WINAPI crt_get_fmode(int *mode);
+crt_sighandler_t WINAPI crt_signal(int sig, crt_sighandler_t handler);
+int   WINAPI crt_raise(int sig);
 void  msvcrt_release_process(DWORD process_id);
 void  WINAPI crt_setusermatherr(_UserMathErrFunc handler);
 char* WINAPI crt_acmdln(void);
@@ -307,8 +337,12 @@ void  WINAPI crt_purecall(void);
 
 void    WINAPI crt_terminate(void);
 double  WINAPI crt_CIacos(double x);
+double  WINAPI crt_CIexp(double x);
+double  WINAPI crt_CIlog10(double x);
+double  WINAPI crt_CIsqrt(double x);
 double  WINAPI crt_CIfmod(double x, double y);
 double  WINAPI crt_CIpow(double base, double exp);
+int     WINAPI crt_finite(double x);
 int     WINAPI crt_isnan(double x);
 short   WINAPI crt_dclass(double x);
 short   WINAPI crt_fdclass(float x);
@@ -318,6 +352,9 @@ int     WINAPI crt_stat32(const char *path, PVOID buf);
 int     WINAPI crt_stat32i64(const char *path, PVOID buf);
 int     WINAPI crt_stat64i32(const char *path, PVOID buf);
 int     WINAPI crt_stat64(const char *path, PVOID buf);
+int     WINAPI crt_fstat64(int fd, PVOID buf);
+int     WINAPI crt_chmod(const char *path, int mode);
+int     WINAPI crt_wchmod(const WCHAR *path, int mode);
 int     WINAPI crt_wstat32(const WCHAR *path, PVOID buf);
 int     WINAPI crt_wstat32i64(const WCHAR *path, PVOID buf);
 int     WINAPI crt_wstat64i32(const WCHAR *path, PVOID buf);

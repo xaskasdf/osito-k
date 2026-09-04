@@ -41,6 +41,17 @@ typedef struct _LOADED_MODULE {
     BOOL            pinned;         /* retained until process teardown */
 } LOADED_MODULE;
 
+/* Stable, pointer-free copy used by Toolhelp/PSAPI-style enumerators. The
+ * loader owns no storage referenced by this record after the snapshot call
+ * returns, so unloading a DLL cannot invalidate an in-progress enumeration. */
+typedef struct _DLL_MODULE_SNAPSHOT_ENTRY {
+    PVOID image_base;
+    ULONG image_size;
+    BOOL  synthetic_shim;
+    char  name[64];
+    char  path[260];
+} DLL_MODULE_SNAPSHOT_ENTRY;
+
 /* ── API ───────────────────────────────────────────────────── */
 
 /*
@@ -48,6 +59,13 @@ typedef struct _LOADED_MODULE {
  * Registers built-in shim modules (ntdll, kernel32, msvcrt).
  */
 void dll_loader_init(void);
+
+/* The process loader lock backs PEB.LoaderLock and serializes module-list
+ * mutations, recursive dependency loads, and DLL lifecycle callbacks. */
+void dll_loader_lock_enter(void);
+BOOL dll_loader_lock_try_enter(void);
+BOOL dll_loader_lock_leave(void);
+BOOL dll_loader_lock_owned_by_current_thread(void);
 
 /* Return 32 or 64 from the mapped main executable, or 0 before publication. */
 int dll_current_process_bitness(void);
@@ -97,6 +115,13 @@ LOADED_MODULE *dll_find_module_by_base(PVOID image_base);
 /* Look up a loaded module containing an address in its mapped image. */
 LOADED_MODULE *dll_find_module_by_address(PVOID address);
 
+/* Copy the modules visible to one Win32 process in load order. The return
+ * value is the required entry count. No entries are written unless capacity
+ * is large enough for the complete immutable snapshot. */
+DWORD dll_snapshot_modules(ULONG owner_pid,
+                           DLL_MODULE_SNAPSHOT_ENTRY *entries,
+                           DWORD capacity);
+
 /* Return a loaded module handle, optionally taking a LoadLibrary reference. */
 PVOID dll_get_module_handle(const char *name, BOOL add_reference);
 
@@ -141,8 +166,12 @@ BOOL dll_disable_thread_notifications(PVOID image_base);
  * The resolver function handles export lookups.
  */
 typedef PVOID (*shim_resolver_fn)(const char *func_name, USHORT ordinal, BOOL by_ordinal);
+typedef BOOL (*shim_lifecycle_fn)(const char *dll_name, PVOID module,
+                                  DWORD reason, PVOID reserved);
 
 void dll_register_shim(const char *dll_name, shim_resolver_fn resolver);
+void dll_register_shim_ex(const char *dll_name, shim_resolver_fn resolver,
+                          shim_lifecycle_fn lifecycle);
 
 /* Return TRUE when a DLL name resolves through the built-in shim registry. */
 BOOL dll_is_shim(const char *dll_name);

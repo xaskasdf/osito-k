@@ -37,10 +37,8 @@ int2e_stub:
     /* Update IST1 to well below current RSP.
      * Must leave room for compat32_dispatch + compat32_seh_dispatch +
      * compat32_callback + kern_setjmp call chain (measured ~1-3KB). Nested
-     * INTs push BELOW this. 16KB/level over a 1MB IST1 stack = 64 nesting
-     * levels — UT99's boot C++ exception storm re-throws deeply (>8), so the
-     * old 32KB/level over 256KB (= only 8 levels) overflowed IST1 down into
-     * kernel BSS/code and corrupted it (flaky boot #UD/wild-write). */
+     * INTs push BELOW this. 16KB/level over a 1MB IST1 stack permits 64 nested
+     * transitions while leaving enough room for exception re-entry. */
     movq %rsp, %r10
     subq $16384, %r10
     movq %r10, (%r11)
@@ -67,33 +65,9 @@ int2e_stub:
     movq 144(%rsp), %rsi
     addq $4, %rsi
 
-    /* Stash the user-mode 32-bit EBP (low 32 bits of saved RBP at
-     * offset 72 in the GPR-save area) into a global so the C
-     * dispatcher and shims can walk the user-mode frame chain.
-     * Diagnostic only — used by the VirtualAlloc shim to identify
-     * the caller of FMallocWindows::Realloc. */
-    movq 72(%rsp), %r10
-    movq %r10, g_int2e_user_rbp(%rip)
-
-    /* Also stash ECX (=this for __thiscall), EDX, ESI, EDI for
-     * deep instrumentation of FArray::Realloc and similar engine
-     * methods. Stack offsets per the layout above. */
-    movq 104(%rsp), %r10            /* RCX */
-    movq %r10, g_int2e_user_rcx(%rip)
-    movq  96(%rsp), %r10            /* RDX */
-    movq %r10, g_int2e_user_rdx(%rip)
-    movq  88(%rsp), %r10            /* RSI */
-    movq %r10, g_int2e_user_rsi(%rip)
-    movq  80(%rsp), %r10            /* RDI */
-    movq %r10, g_int2e_user_rdi(%rip)
-    movq 112(%rsp), %r10            /* RBX — used by VA-FARRAY scan to
-                                        catch Engine.dll 0x1033E7D0's
-                                        `EBX + 0xC` FArray pattern */
-    movq %r10, g_int2e_user_rbx(%rip)
-
-    /* The scheduler preserves TSS.IST1 per process, so it is also the
-     * process-local cursor that survives a yield inside the dispatcher. */
-    incl g_int2e_rsp_depth(%rip)
+    /* RDX = saved entry frame. compat32_dispatch copies its i386 register
+     * state into the current scheduler slot before invoking any shim. */
+    movq %rsp, %rdx
 
     and $~0xF, %rsp
     call compat32_dispatch
@@ -102,7 +76,6 @@ int2e_stub:
     movq tss_ist1_ptr(%rip), %r10
     movq (%r10), %rsp
     addq $16384, %rsp
-    decl g_int2e_rsp_depth(%rip)
 
     /* i386 returns 64-bit integers in EDX:EAX. EAX already survives the
      * handler; publish the high half through the saved RDX slot. For ordinary
@@ -112,53 +85,13 @@ int2e_stub:
     shrq $32, %r11
     movq %r11, 96(%rsp)
 
-    /*
-     * C++ EH catch dispatch: if compat32_seh_dispatch found a catch
-     * handler, g_compat32_unwind_eip/esp/ebp are set. Modify the iret
-     * frame to jump to the catch handler with the correct EBP/ESP.
-     */
-    leaq g_compat32_unwind_eip(%rip), %r10
-    movl (%r10), %r11d
-    testl %r11d, %r11d
-    jz .Lno_unwind
+    /* Apply and consume only this scheduler slot's pending SEH/longjmp
+     * transfer, then pop the matching per-thread INT2E context. The helper
+     * returns the shim result unchanged in RAX. */
+    movq %rsp, %rdi
+    movq %rax, %rsi
+    call compat32_int2e_complete
 
-    /* Overwrite iret RIP with catch handler EIP */
-    movq %r11, 120(%rsp)
-    movl $0, (%r10)                  /* clear eip */
-
-    /* Overwrite iret RSP */
-    leaq g_compat32_unwind_esp(%rip), %r10
-    movl (%r10), %r11d
-    movq %r11, 144(%rsp)
-    movl $0, (%r10)                  /* clear esp */
-
-    /* Set EBP in saved register area (RBP is at RSP+72 after 15 pushes + IST1) */
-    leaq g_compat32_unwind_ebp(%rip), %r10
-    movl (%r10), %r11d
-    movq %r11, 72(%rsp)              /* offset 72 = saved RBP */
-    movl $0, (%r10)                  /* clear ebp */
-
-    /* longjmp restores all i386 nonvolatile registers. C++ EH transfers use
-     * the same EIP/ESP/EBP channel but leave this flag clear. */
-    leaq g_compat32_unwind_restore_nonvolatile(%rip), %r10
-    movl (%r10), %r11d
-    testl %r11d, %r11d
-    jz .Lno_unwind
-    movl $0, (%r10)
-
-    leaq g_compat32_unwind_ebx(%rip), %r10
-    movl (%r10), %r11d
-    movq %r11, 112(%rsp)             /* offset 112 = saved RBX */
-
-    leaq g_compat32_unwind_esi(%rip), %r10
-    movl (%r10), %r11d
-    movq %r11, 88(%rsp)              /* offset 88 = saved RSI */
-
-    leaq g_compat32_unwind_edi(%rip), %r10
-    movl (%r10), %r11d
-    movq %r11, 80(%rsp)              /* offset 80 = saved RDI */
-
-.Lno_unwind:
     /* Restore old IST1 from stack */
     movq tss_ist1_ptr(%rip), %r11
     popq (%r11)                      /* TSS.IST1 = saved old value */
@@ -180,6 +113,4 @@ int2e_stub:
     pop %rbx
 
     iretq
-
-/* g_int2e_rsp_depth defined in compat32.c */
 .section .note.GNU-stack,"",%progbits

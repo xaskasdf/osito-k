@@ -49,6 +49,10 @@ NTSTATUS NTAPI NtReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK,
                     PVOID, ULONG, PLARGE_INTEGER, PVOID);
 NTSTATUS NTAPI NtWriteFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK,
                      PVOID, ULONG, PLARGE_INTEGER, PVOID);
+NTSTATUS NTAPI NtLockFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK,
+                          PLARGE_INTEGER, PLARGE_INTEGER, ULONG, BOOL, BOOL);
+NTSTATUS NTAPI NtUnlockFile(HANDLE, PIO_STATUS_BLOCK, PLARGE_INTEGER,
+                            PLARGE_INTEGER, ULONG);
 NTSTATUS NTAPI NtClose(HANDLE);
 NTSTATUS NTAPI NtQueryObject(HANDLE, ULONG, PVOID, ULONG, ULONG *);
 NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE, PVOID *, ULONG_PTR,
@@ -107,6 +111,19 @@ NTSTATUS NTAPI NtUnmapViewOfSection(HANDLE, PVOID);
 void     NTAPI RtlInitUnicodeString(PUNICODE_STRING dest, PCWSTR src);
 NTSTATUS NTAPI RtlFormatCurrentUserKeyPath(PUNICODE_STRING path);
 void     NTAPI RtlFreeUnicodeString(PUNICODE_STRING value);
+NTSTATUS NTAPI RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION section);
+NTSTATUS NTAPI RtlInitializeCriticalSectionAndSpinCount(
+    PRTL_CRITICAL_SECTION section, ULONG spin_count);
+NTSTATUS NTAPI RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION section,
+                                               ULONG spin_count,
+                                               ULONG flags);
+NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION section);
+BOOL     NTAPI RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION section);
+NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION section);
+NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION section);
+void     NTAPI RtlAcquirePebLock(void);
+BOOL     NTAPI RtlTryAcquirePebLock(void);
+void     NTAPI RtlReleasePebLock(void);
 NTSTATUS NTAPI RtlUnicodeStringToAnsiString(PSTR dest, PCUNICODE_STRING src,
                                        ULONG dest_size);
 void     NTAPI RtlCopyMemory(PVOID dest, PCVOID src, SIZE_T length);
@@ -116,12 +133,17 @@ ULONG    NTAPI RtlNtStatusToDosError(NTSTATUS status);
 
 /* SEH support (Phase 17) */
 void     NTAPI RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);
+void     NTAPI RtlRaiseStatus(NTSTATUS status);
 void     NTAPI RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
                     PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue);
 void     NTAPI RtlUnwindEx(PVOID TargetFrame, PVOID TargetIp,
                       PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue,
                       PCONTEXT ContextRecord, PVOID HistoryTable);
 void     NTAPI RtlCaptureContext(PCONTEXT ContextRecord);
+void     NTAPI RtlRestoreContext(PCONTEXT ContextRecord,
+                                 PEXCEPTION_RECORD ExceptionRecord);
+void     NTAPI win32_rtl_raise_exception_impl(
+    PEXCEPTION_RECORD ExceptionRecord, PCONTEXT ContextRecord);
 NTSTATUS NTAPI NtRaiseException(PEXCEPTION_RECORD ExceptionRecord,
                            PCONTEXT ContextRecord, BOOL FirstChance);
 

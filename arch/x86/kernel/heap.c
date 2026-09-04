@@ -45,10 +45,10 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* Block header. The `next`/`prev` slots are only used for free-list
  * linking while the block is FREE. While USED, those 16 bytes are dead
- * space, so we repurpose them as a `(alloc_ra, alloc_ra2)` pair filled
- * by `kmalloc()` from `__builtin_return_address(0/1)`. On double-free
- * the diagnostic in `kfree()` reads them to identify the original
- * allocator's call site (resolved via kallsyms). */
+ * space, so we repurpose them as an allocation call-site pair. The first
+ * address is the immediate caller; the optional second address is zero
+ * unless a caller can provide safe unwind context. Walking frame 1 with
+ * __builtin_return_address(1) is not valid in this optimized kernel. */
 typedef struct block_hdr {
     uint16_t            magic;      /* BLOCK_MAGIC for corruption check */
     uint16_t            flags;      /* BLOCK_FREE or BLOCK_USED */
@@ -350,7 +350,7 @@ static void *_kmalloc_with_ra(uint64_t size, uint64_t alloc_ra, uint64_t alloc_r
 void *kmalloc(uint64_t size)
 {
     uint64_t alloc_ra = (uint64_t)__builtin_return_address(0);
-    uint64_t alloc_ra2 = (uint64_t)__builtin_return_address(1);
+    uint64_t alloc_ra2 = 0;
     uint64_t irq_flags = heap_lock_irqsave();
     void *result = _kmalloc_with_ra(size, alloc_ra, alloc_ra2);
     heap_unlock_irqrestore(irq_flags);
@@ -517,7 +517,7 @@ void *krealloc(void *ptr, uint64_t new_size)
     if (new_size == 0) { kfree(ptr); return NULL; }
 
     uint64_t alloc_ra = (uint64_t)__builtin_return_address(0);
-    uint64_t alloc_ra2 = (uint64_t)__builtin_return_address(1);
+    uint64_t alloc_ra2 = 0;
     uint64_t irq_flags = heap_lock_irqsave();
     void *result = NULL;
     block_hdr_t *block = (block_hdr_t *)((uint8_t *)ptr - sizeof(block_hdr_t));

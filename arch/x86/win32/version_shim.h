@@ -5,9 +5,14 @@
 
 #include "nttypes.h"
 
+DWORD WINAPI shim_GetFileVersionInfoSizeA(PCSTR filename, DWORD *handle);
 DWORD WINAPI shim_GetFileVersionInfoSizeW(PCWSTR filename, DWORD *handle);
+BOOL WINAPI shim_GetFileVersionInfoA(PCSTR filename, DWORD handle,
+                                     DWORD length, PVOID data);
 BOOL WINAPI shim_GetFileVersionInfoW(PCWSTR filename, DWORD handle,
                                      DWORD length, PVOID data);
+BOOL WINAPI shim_VerQueryValueA(PCVOID block, PCSTR sub_block,
+                                PVOID *buffer, UINT *length);
 BOOL WINAPI shim_VerQueryValueW(PCVOID block, PCWSTR sub_block,
                                 PVOID *buffer, UINT *length);
 

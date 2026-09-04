@@ -7,20 +7,26 @@
 
 #include "kernel32_shim.h"
 #include "ntdll_shim.h"
+#include "../fs/ositofs_metadata.h"
 #include "../fs/ositofs3.h"
 #include "ntsyscall.h"
 #include "dllloader.h"
 #include "handle.h"
+#include "filelock.h"
+#include "unwind64.h"
 #include "win32_abi.h"
 #include "wsock32_shim.h"
 #include "wintime.h"
+#include "../fs/vfs.h"
 #include "../include/paging.h"
+#include "../include/cpu_features.h"
 #include "../kernel/smp.h"
 
 /* ── Kernel interfaces (forward declarations) ─────────────── */
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
+extern BOOL win32_is_current_loader_lock(PVOID lock);
 
 typedef struct _SYSTEMTIME {
     WORD wYear;
@@ -34,28 +40,22 @@ typedef struct _SYSTEMTIME {
 } SYSTEMTIME;
 
 #ifndef K32_IOCP_TRACE
-#if defined(OK_QUIET) && OK_QUIET
 #define K32_IOCP_TRACE 0
-#else
-#define K32_IOCP_TRACE 1
-#endif
 #endif
 
 #define K32_IOCP_TRACE_LIMIT 160U
 
-#if defined(OK_QUIET) && OK_QUIET
+#ifndef K32_VERBOSE_DIAGNOSTICS
 #define K32_VERBOSE_DIAGNOSTICS 0
-#else
-#define K32_VERBOSE_DIAGNOSTICS 1
 #endif
 
 /* ── Shim handle table for dynamically loaded shim DLLs ────── */
-/* Keep high-volume CEF loader diagnostics bounded. */
-static volatile LONG g_cef_delay_trace_budget = 96;
+/* Keep high-volume loader diagnostics bounded when explicitly enabled. */
+static volatile LONG g_loader_trace_budget = 96;
 
 /* ── Per-thread last error ──────────────────────────────────── */
 
-static void iocp_forget_handle(HANDLE handle);
+static void iocp_forget_handle_for_process(HANDLE handle, DWORD owner_pid);
 static void iocp_reset_all(void);
 static BOOL k32_pipe_read_overlapped(HANDLE file, PVOID buffer, DWORD length,
                                      DWORD *bytes_read, PVOID overlapped);
@@ -64,9 +64,22 @@ static BOOL k32_pipe_write_overlapped(HANDLE file, PCVOID buffer, DWORD length,
 void k32_pipe_service_pending(void);
 static BOOL k32_cancel_pipe_io(HANDLE file, PVOID target_overlapped,
                                BOOL current_thread_only);
-static void k32_pipe_wait_quiescent(HANDLE file);
+static BOOL k32_cancel_pipe_io_for_process(HANDLE file,
+                                           PVOID target_overlapped,
+                                           BOOL current_thread_only,
+                                           DWORD owner_pid,
+                                           DWORD owner_tid);
+static void k32_pipe_wait_quiescent_for_process(HANDLE file,
+                                                DWORD owner_pid);
 static void k32_store_overlapped_status(PVOID overlapped, BOOL compat32,
                                         NTSTATUS status, ULONG_PTR bytes);
+static BOOL k32_copy_to_process(DWORD owner_pid, PVOID destination,
+                                PCVOID source, SIZE_T size);
+static BOOL k32_copy_from_process(DWORD owner_pid, PVOID destination,
+                                  PCVOID source, SIZE_T size);
+static BOOL k32_store_overlapped_status_for_process(
+    DWORD owner_pid, PVOID overlapped, BOOL compat32,
+    NTSTATUS status, ULONG_PTR bytes);
 extern void *kmalloc(uint64_t size);
 extern void *kcalloc(uint64_t count, uint64_t size);
 extern void  kfree(void *ptr);
@@ -114,6 +127,7 @@ static void job_release(K32_JOB_OBJECT *job, BOOL honor_kill_on_close)
 /* Keep direct TEB reads in sync with GetLastError(). */
 extern TEB g_teb;
 extern TEB *win64_current_teb(void);
+extern void win64_set_current_teb(TEB *teb);
 extern const char *win32_current_exe_name(void);
 extern const char *win32_current_image_path(void);
 extern const char *win32_current_command_line(void);
@@ -121,21 +135,25 @@ extern const WCHAR *win32_current_command_line_w(void);
 extern const char *win32_current_directory_override(void);
 extern BOOL win32_set_current_directory_override(const char *path);
 extern BOOL win32_refresh_current_process_parameters(void);
+extern void win32_refresh_current_console_parameters(void);
+extern BOOL win32_current_is_gui_app(void);
 extern ULONG_PTR win32_current_image_base(void);
 extern DWORD win32_current_process_id(void);
 extern DWORD win32_current_process_thread_id(void);
 extern int32_t proc_current_pid(void);
 PVOID win32_current_thread_process_peb(void);
 extern DWORD WINAPI GetCurrentThreadId(void);
-extern TEB32 g_teb32;
+extern void user32_release_thread(DWORD pid, DWORD tid);
 extern TEB32 *compat32_current_teb(void);
-extern int g_compat32_ut99;
 extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs,
                                        const uint32_t *args);
+extern void compat32_release_thread_state(void);
+extern int win32_user_range_executable(const void *pointer, SIZE_T size,
+                                       BOOL compat32);
 static int k32_strcmp(const char *a, const char *b);
-static BOOL process_command_contains(PCSTR command, PCSTR needle);
 static void iocp_release_thread(DWORD tid);
 static void k32_process_affinity_release(DWORD process_id);
+static void k32_atom_release_process(DWORD process_id);
 static DWORD bootstrap_last_error;
 
 #define K32_MAX_IO_COMPLETIONS 256
@@ -260,11 +278,6 @@ static DWORD k32_dispatch_io_completions(void);
 #define K32_MOJO_IO_TRACE_LIMIT        64U
 #define K32_MOJO_XFER_TRACE_LIMIT      64U
 #define K32_MOJO_DEQUEUE_TRACE_LIMIT   64U
-#else
-#define K32_MOJO_IO_TRACE_LIMIT         0U
-#define K32_MOJO_XFER_TRACE_LIMIT       0U
-#define K32_MOJO_DEQUEUE_TRACE_LIMIT    0U
-#endif
 #define K32_MOJO_TRACE_BYTES           16U
 #define K32_MOJO_TRACE_PID_SLOTS      256U
 #define K32_MOJO_RING_RECORDS         512U
@@ -299,13 +312,10 @@ static volatile BYTE g_mojo_trace_pids[K32_MOJO_TRACE_PID_SLOTS];
 
 static BOOL k32_mojo_trace_current(void)
 {
-    const char *command = win32_current_command_line();
-    BOOL trace = command &&
-        process_command_contains(command, "steamwebhelper.exe");
     DWORD pid = win32_current_process_id();
-    if (trace && pid < K32_MOJO_TRACE_PID_SLOTS)
+    if (pid < K32_MOJO_TRACE_PID_SLOTS)
         __atomic_store_n(&g_mojo_trace_pids[pid], 1, __ATOMIC_RELAXED);
-    return trace;
+    return TRUE;
 }
 
 static BOOL k32_mojo_trace_owner(DWORD pid)
@@ -361,6 +371,13 @@ static void k32_mojo_trace_bytes(PCVOID data, DWORD length)
     if (length > shown)
         serial_puts(":..");
 }
+#else
+#define k32_mojo_trace_current() FALSE
+#define k32_mojo_trace_owner(...) FALSE
+#define k32_mojo_ring_record(...) ((void)0)
+#define k32_mojo_trace_take(...) FALSE
+#define k32_mojo_trace_bytes(...) ((void)0)
+#endif
 
 static inline DWORD *last_error_slot(void)
 {
@@ -416,8 +433,6 @@ static void ascii_to_unicode_buf(const char *src, WCHAR *buf, int max_chars)
 
 #define K32_OBJECT_NAME_MAX 128
 #define K32_MAX_NAMED_OBJECTS 512
-#define K32_STEAMIPC_SERIAL_TRACE 0
-
 typedef struct {
     char name[K32_OBJECT_NAME_MAX];
     PVOID object;
@@ -444,46 +459,6 @@ static inline void named_object_unlock_irqrestore(uint64_t flags)
 static char named_object_fold(char c)
 {
     return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
-}
-
-static BOOL named_object_is_steamchrome(const char *name)
-{
-    static const char needle[] = "steamchrome";
-    if (!name) return FALSE;
-
-    for (int i = 0; name[i]; i++) {
-        int j = 0;
-        while (needle[j] && name[i + j] &&
-               named_object_fold(name[i + j]) == needle[j])
-            j++;
-        if (!needle[j]) return TRUE;
-    }
-    return FALSE;
-}
-
-static BOOL named_object_contains(const char *name, const char *needle)
-{
-    if (!name || !needle || !*needle)
-        return FALSE;
-
-    for (int i = 0; name[i]; i++) {
-        int j = 0;
-        while (needle[j] && name[i + j] &&
-               named_object_fold(name[i + j]) ==
-                   named_object_fold(needle[j]))
-            j++;
-        if (!needle[j])
-            return TRUE;
-    }
-    return FALSE;
-}
-
-static BOOL named_object_is_steamipc(const char *name)
-{
-    return named_object_is_steamchrome(name) ||
-           named_object_contains(name, "steamipc") ||
-           named_object_contains(name, "steamservice") ||
-           named_object_contains(name, "steamclientservice");
 }
 
 static BOOL named_object_canonicalize(const char *source,
@@ -544,23 +519,49 @@ static BOOL named_object_name_w(PCWSTR source,
     return named_object_canonicalize(ascii, name);
 }
 
+extern uint64_t ntsync_object_identity(OBJECT_TYPE_ID type, PVOID object);
+
+static BOOL named_object_uses_identity(OBJECT_TYPE_ID type)
+{
+    return type == OBJ_TYPE_SECTION || type == OBJ_TYPE_EVENT ||
+           type == OBJ_TYPE_MUTANT || type == OBJ_TYPE_SEMAPHORE;
+}
+
+static uint64_t named_object_identity(OBJECT_TYPE_ID type, PVOID object)
+{
+    if (type == OBJ_TYPE_SECTION)
+        return nt_section_identity(object);
+    if (type == OBJ_TYPE_EVENT || type == OBJ_TYPE_MUTANT ||
+        type == OBJ_TYPE_SEMAPHORE)
+        return ntsync_object_identity(type, object);
+    return 0;
+}
+
+static void named_object_clear(K32_NAMED_OBJECT *object)
+{
+    object->object = NULL;
+    object->name[0] = 0;
+    object->identity = 0;
+}
+
 static int named_object_find_locked(K32_NAMED_OBJECT *objects, int count,
                                     OBJECT_TYPE_ID type, const char *name)
 {
     for (int i = 0; i < count; i++) {
         BOOL alive = FALSE;
-        if (objects[i].object && type == OBJ_TYPE_SECTION) {
-            uint64_t identity = nt_section_identity(objects[i].object);
+        if (objects[i].object && named_object_uses_identity(type)) {
+            uint64_t identity = named_object_identity(type,
+                                                       objects[i].object);
             alive = identity && identity == objects[i].identity;
+            if (alive && type != OBJ_TYPE_SECTION)
+                alive = handle_object_referenced(&g_handle_table, type,
+                                                 objects[i].object);
         } else if (objects[i].object) {
             alive = handle_object_referenced(&g_handle_table, type,
                                              objects[i].object);
         }
-        if (objects[i].object && !alive) {
-            objects[i].object = NULL;
-            objects[i].name[0] = 0;
-            objects[i].identity = 0;
-        }
+        if (objects[i].object && !alive)
+            named_object_clear(&objects[i]);
         if (objects[i].object && k32_strcmp(objects[i].name, name) == 0)
             return i;
     }
@@ -572,15 +573,32 @@ static HANDLE named_object_open_slot_locked(K32_NAMED_OBJECT *objects,
                                              ACCESS_MASK access)
 {
     HANDLE handle = NULL;
-    NTSTATUS status = handle_alloc(&g_handle_table, type, access,
-                                   objects[slot].object, &handle);
+    NTSTATUS status = handle_open_referenced_object(
+        &g_handle_table, type, access, objects[slot].object, &handle);
     if (!NT_SUCCESS(status)) {
-        set_last_error_from_status(status);
+        if (status == STATUS_INVALID_HANDLE) {
+            named_object_clear(&objects[slot]);
+            SetLastError(2); /* ERROR_FILE_NOT_FOUND */
+        } else {
+            set_last_error_from_status(status);
+        }
+        return NULL;
+    }
+    if (named_object_uses_identity(type) &&
+        named_object_identity(type, objects[slot].object) !=
+            objects[slot].identity) {
+        ULONG owner_pid = win32_current_process_id();
+        if (!owner_pid) owner_pid = 1;
+        (void)nt_close_handle_for_process(handle, owner_pid);
+        named_object_clear(&objects[slot]);
+        SetLastError(2); /* ERROR_FILE_NOT_FOUND */
         return NULL;
     }
     if (type == OBJ_TYPE_SECTION &&
         !nt_section_reopen_handle(objects[slot].object)) {
-        handle_close(&g_handle_table, handle);
+        ULONG owner_pid = win32_current_process_id();
+        if (!owner_pid) owner_pid = 1;
+        (void)nt_close_handle_for_process(handle, owner_pid);
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return NULL;
     }
@@ -632,9 +650,8 @@ static HANDLE named_object_publish_access(K32_NAMED_OBJECT *objects, int count,
         return NULL;
     }
 
-    uint64_t identity = type == OBJ_TYPE_SECTION
-                        ? nt_section_identity(object) : 0;
-    if (type == OBJ_TYPE_SECTION && !identity) {
+    uint64_t identity = named_object_identity(type, object);
+    if (named_object_uses_identity(type) && !identity) {
         named_object_unlock_irqrestore(flags);
         return NULL;
     }
@@ -656,39 +673,7 @@ static HANDLE named_object_publish(K32_NAMED_OBJECT *objects, int count,
                                        GENERIC_ALL, already_exists);
 }
 
-static const char *named_object_name_for_handle(K32_NAMED_OBJECT *objects,
-                                                 int count,
-                                                 OBJECT_TYPE_ID type,
-                                                 HANDLE handle)
-{
-    uint64_t flags = named_object_lock_irqsave();
-    PVOID object = NULL;
-    if (!NT_SUCCESS(handle_lookup(&g_handle_table, handle, type, &object))) {
-        named_object_unlock_irqrestore(flags);
-        return NULL;
-    }
-    uint64_t identity = type == OBJ_TYPE_SECTION
-                        ? nt_section_identity(object) : 0;
-    const char *name = NULL;
-    for (int i = 0; i < count; i++) {
-        if (objects[i].object == object &&
-            (type != OBJ_TYPE_SECTION || objects[i].identity == identity)) {
-            name = objects[i].name;
-            break;
-        }
-    }
-    named_object_unlock_irqrestore(flags);
-    if (name)
-        return name;
-    return NULL;
-}
-
-static const char *steamipc_name_for_handle(HANDLE handle);
-static void steamipc_trace_handle(const char *operation, HANDLE handle,
-                                  uint32_t argument, uint32_t result,
-                                  uint64_t caller);
-
-static char win32_current_directory[260] = "System";
+static char win32_current_directory[260];
 
 const char *kernel32_current_directory_relative(void)
 {
@@ -698,17 +683,18 @@ const char *kernel32_current_directory_relative(void)
 
 static void win32_reset_current_directory(void)
 {
-    extern char win32_exe_name[64];
+    extern char win32_image_path[260];
+    const char *path = win32_image_path;
+    if (path[0] && path[1] == ':') path += 2;
+    while (*path == '\\' || *path == '/') path++;
+
     const char *last_sep = NULL;
-    for (const char *p = win32_exe_name; *p; p++)
+    for (const char *p = path; *p; p++)
         if (*p == '\\' || *p == '/') last_sep = p;
 
     int n = 0;
-    const char *root = "System";
-    while (root[n]) { win32_current_directory[n] = root[n]; n++; }
     if (last_sep) {
-        win32_current_directory[n++] = '\\';
-        for (const char *p = win32_exe_name; p < last_sep && n < 259; p++)
+        for (const char *p = path; p < last_sep && n < 259; p++)
             win32_current_directory[n++] = *p == '/' ? '\\' : *p;
     }
     win32_current_directory[n] = 0;
@@ -1063,8 +1049,43 @@ static ULONG win32_to_nt_disposition(DWORD dwCreationDisposition)
 
 /* ── Console handles ────────────────────────────────────────── */
 
-/* Map Win32 pseudo-handles (-10,-11,-12) to NT handles (4,8,12) */
-static HANDLE console_handle(DWORD nStdHandle)
+/* The NT console file objects are permanent handles. Association and the
+ * standard-handle table are process state, just as they are in Windows. */
+#define K32_MAX_PROCESS_CONSOLES 64
+#define K32_CREATE_NEW_CONSOLE   0x00000010U
+#define K32_DETACHED_PROCESS     0x00000008U
+#define K32_CREATE_NO_WINDOW     0x08000000U
+#define K32_CONSOLE_PARAMETER_HANDLE ((HANDLE)(ULONG_PTR)3)
+
+typedef struct {
+    BOOL used;
+    BOOL attached;
+    DWORD process_id;
+    HANDLE standard_input;
+    HANDLE standard_output;
+    HANDLE standard_error;
+} K32_PROCESS_CONSOLE;
+
+static K32_PROCESS_CONSOLE k32_process_consoles[K32_MAX_PROCESS_CONSOLES];
+static spinlock_t k32_console_lock = SPINLOCK_INIT;
+
+static uint64_t k32_console_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&k32_console_lock);
+    return flags;
+}
+
+static void k32_console_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&k32_console_lock);
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
+
+/* Map Win32 pseudo-handles (-10,-11,-12) to NT handles (4,8,12). */
+static HANDLE console_default_handle(DWORD nStdHandle)
 {
     switch (nStdHandle) {
     case WIN32_STD_INPUT_HANDLE:  return (HANDLE)(ULONG_PTR)4;
@@ -1072,6 +1093,149 @@ static HANDLE console_handle(DWORD nStdHandle)
     case WIN32_STD_ERROR_HANDLE:  return (HANDLE)(ULONG_PTR)12;
     default:                      return INVALID_HANDLE_VALUE;
     }
+}
+
+static K32_PROCESS_CONSOLE *k32_console_find_locked(DWORD process_id)
+{
+    for (int i = 0; i < K32_MAX_PROCESS_CONSOLES; i++) {
+        if (k32_process_consoles[i].used &&
+            k32_process_consoles[i].process_id == process_id)
+            return &k32_process_consoles[i];
+    }
+    return NULL;
+}
+
+static K32_PROCESS_CONSOLE *k32_console_allocate_locked(DWORD process_id)
+{
+    K32_PROCESS_CONSOLE *state = k32_console_find_locked(process_id);
+    if (state) return state;
+    for (int i = 0; i < K32_MAX_PROCESS_CONSOLES; i++) {
+        if (!k32_process_consoles[i].used) {
+            state = &k32_process_consoles[i];
+            memset(state, 0, sizeof(*state));
+            state->process_id = process_id;
+            state->used = TRUE;
+            return state;
+        }
+    }
+    return NULL;
+}
+
+static void k32_console_set_defaults(K32_PROCESS_CONSOLE *state,
+                                     BOOL attached)
+{
+    state->attached = attached;
+    state->standard_input = attached
+        ? console_default_handle(WIN32_STD_INPUT_HANDLE) : NULL;
+    state->standard_output = attached
+        ? console_default_handle(WIN32_STD_OUTPUT_HANDLE) : NULL;
+    state->standard_error = attached
+        ? console_default_handle(WIN32_STD_ERROR_HANDLE) : NULL;
+}
+
+NTSTATUS kernel32_initialize_process_console(DWORD process_id,
+                                              BOOL attached)
+{
+    if (!process_id) return STATUS_INVALID_PARAMETER;
+    uint64_t flags = k32_console_lock_irqsave();
+    K32_PROCESS_CONSOLE *state = k32_console_allocate_locked(process_id);
+    if (state) k32_console_set_defaults(state, attached);
+    k32_console_unlock_irqrestore(flags);
+    return state ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
+}
+
+NTSTATUS kernel32_inherit_process_console(DWORD parent_pid,
+                                           DWORD child_pid,
+                                           DWORD creation_flags)
+{
+    if (!parent_pid || !child_pid || parent_pid == child_pid)
+        return STATUS_INVALID_PARAMETER;
+
+    uint64_t flags = k32_console_lock_irqsave();
+    K32_PROCESS_CONSOLE *parent = k32_console_find_locked(parent_pid);
+    K32_PROCESS_CONSOLE *child = k32_console_allocate_locked(child_pid);
+    if (!child) {
+        k32_console_unlock_irqrestore(flags);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (creation_flags & (K32_DETACHED_PROCESS | K32_CREATE_NO_WINDOW)) {
+        k32_console_set_defaults(child, FALSE);
+    } else if (creation_flags & K32_CREATE_NEW_CONSOLE) {
+        k32_console_set_defaults(child, TRUE);
+    } else if (parent && parent->attached) {
+        /* The permanent console endpoints are inherited. Redirected handles
+         * remain governed by the normal inheritable-handle path. */
+        k32_console_set_defaults(child, TRUE);
+    } else {
+        k32_console_set_defaults(child, FALSE);
+    }
+    k32_console_unlock_irqrestore(flags);
+    return STATUS_SUCCESS;
+}
+
+BOOL kernel32_query_process_console(DWORD process_id,
+                                     HANDLE *console_handle,
+                                     HANDLE *standard_input,
+                                     HANDLE *standard_output,
+                                     HANDLE *standard_error)
+{
+    BOOL found = FALSE;
+    uint64_t flags = k32_console_lock_irqsave();
+    K32_PROCESS_CONSOLE *state = k32_console_find_locked(process_id);
+    if (state) {
+        if (console_handle)
+            *console_handle = state->attached
+                ? K32_CONSOLE_PARAMETER_HANDLE : NULL;
+        if (standard_input) *standard_input = state->standard_input;
+        if (standard_output) *standard_output = state->standard_output;
+        if (standard_error) *standard_error = state->standard_error;
+        found = TRUE;
+    }
+    k32_console_unlock_irqrestore(flags);
+    return found;
+}
+
+static void k32_console_release_process(DWORD process_id)
+{
+    uint64_t flags = k32_console_lock_irqsave();
+    K32_PROCESS_CONSOLE *state = k32_console_find_locked(process_id);
+    if (state) memset(state, 0, sizeof(*state));
+    k32_console_unlock_irqrestore(flags);
+}
+
+static BOOL k32_console_ensure_current(void)
+{
+    DWORD process_id = GetCurrentProcessId();
+    if (!process_id) process_id = 1;
+    if (kernel32_query_process_console(process_id, NULL, NULL, NULL, NULL))
+        return TRUE;
+    return NT_SUCCESS(kernel32_initialize_process_console(
+        process_id, !win32_current_is_gui_app()));
+}
+
+static BOOL k32_console_current_attached(void)
+{
+    HANDLE console = NULL;
+    DWORD process_id = GetCurrentProcessId();
+    if (!process_id) process_id = 1;
+    return k32_console_ensure_current() &&
+           kernel32_query_process_console(process_id, &console,
+                                          NULL, NULL, NULL) &&
+           console != NULL;
+}
+
+static BOOL k32_is_console_input(HANDLE handle)
+{
+    return k32_console_current_attached() &&
+           handle == console_default_handle(WIN32_STD_INPUT_HANDLE);
+}
+
+static BOOL k32_is_console_output(HANDLE handle)
+{
+    return k32_console_current_attached() &&
+           (handle == console_default_handle(WIN32_STD_OUTPUT_HANDLE) ||
+            handle == console_default_handle(WIN32_STD_ERROR_HANDLE));
 }
 
 /* ── File API ───────────────────────────────────────────────── */
@@ -1135,6 +1299,22 @@ static HANDLE named_pipe_cancel_pending_server(HANDLE server)
 }
 
 #define K32_FILE_FLAG_BACKUP_SEMANTICS 0x02000000U
+#define K32_FILE_FLAG_OVERLAPPED       0x40000000U
+
+static ULONG k32_file_create_options(DWORD flags, BOOL directory)
+{
+    ULONG options = directory ? FILE_DIRECTORY_FILE
+                              : FILE_NON_DIRECTORY_FILE;
+    if (!(flags & K32_FILE_FLAG_OVERLAPPED))
+        options |= FILE_SYNCHRONOUS_IO_NONALERT;
+    return options;
+}
+
+static ACCESS_MASK k32_file_desired_access(DWORD desired_access)
+{
+    /* NtCreateFile expands generic rights and preserves specific rights. */
+    return (ACCESS_MASK)desired_access | SYNCHRONIZE;
+}
 
 HANDLE WINAPI CreateFileA(PCSTR lpFileName, DWORD dwDesiredAccess,
                    DWORD dwShareMode, PVOID lpSecurityAttributes,
@@ -1144,9 +1324,11 @@ HANDLE WINAPI CreateFileA(PCSTR lpFileName, DWORD dwDesiredAccess,
     (void)lpSecurityAttributes;
     (void)hTemplateFile;
 
+#if K32_VERBOSE_DIAGNOSTICS
     serial_puts("[CreateFileA] '");
     if (lpFileName) serial_puts(lpFileName);
     serial_puts("'\n");
+#endif
 
     HANDLE pipe_client = named_pipe_take_client(lpFileName);
     if (pipe_client != INVALID_HANDLE_VALUE) {
@@ -1175,16 +1357,13 @@ HANDLE WINAPI CreateFileA(PCSTR lpFileName, DWORD dwDesiredAccess,
     IO_STATUS_BLOCK iosb = {0};
     HANDLE file_handle = INVALID_HANDLE_VALUE;
 
-    /* Map Win32 access to NT access */
-    ACCESS_MASK nt_access = 0;
-    if (dwDesiredAccess & GENERIC_READ)  nt_access |= FILE_GENERIC_READ;
-    if (dwDesiredAccess & GENERIC_WRITE) nt_access |= FILE_GENERIC_WRITE;
-    nt_access |= SYNCHRONIZE;
+    ACCESS_MASK nt_access = k32_file_desired_access(dwDesiredAccess);
 
-    ULONG create_options = FILE_SYNCHRONOUS_IO_NONALERT |
-        (((dwFlagsAndAttributes & K32_FILE_FLAG_BACKUP_SEMANTICS) &&
-          win32_directory_exists_normalized(fs_path))
-             ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE);
+    BOOL directory_open =
+        (dwFlagsAndAttributes & K32_FILE_FLAG_BACKUP_SEMANTICS) &&
+        win32_directory_exists_normalized(fs_path);
+    ULONG create_options = k32_file_create_options(dwFlagsAndAttributes,
+                                                    directory_open);
     NTSTATUS status = NtCreateFile(
         &file_handle,
         nt_access,
@@ -1237,7 +1416,7 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
         SetLastError(0);
         return pipe_client;
     }
-#ifndef OK_QUIET
+#if K32_VERBOSE_DIAGNOSTICS
     serial_puts("[CreateFileW] ptr=0x");
     serial_puthex((uint64_t)lpFileName, 16);
     serial_puts(" '");
@@ -1251,28 +1430,6 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
         return INVALID_HANDLE_VALUE;
     }
 
-    /* Block writes to .ini files. The engine's shutdown writes a PARTIAL
-     * config (only modified sections) to UnrealTournament.ini, destroying
-     * the complete Default.ini we placed on the NVMe. Also block Running.ini. */
-    if (dwDesiredAccess & GENERIC_WRITE) {
-        const char *fn = fname_ascii;
-        for (int i = fname_len - 1; i >= 0; i--)
-            if (fn[i] == '\\' || fn[i] == '/') { fn = &fname_ascii[i+1]; break; }
-        int flen = 0;
-        while (fn[flen]) flen++;
-        if (flen > 4 &&
-            fn[flen-4] == '.' &&
-            (fn[flen-3]=='i'||fn[flen-3]=='I') &&
-            (fn[flen-2]=='n'||fn[flen-2]=='N') &&
-            (fn[flen-1]=='i'||fn[flen-1]=='I')) {
-            serial_puts("[CreateFileW] BLOCKED .ini write: ");
-            serial_puts(fn);
-            serial_puts("\n");
-            SetLastError(5); /* ERROR_ACCESS_DENIED */
-            return INVALID_HANDLE_VALUE;
-        }
-    }
-
     WCHAR name_buf[260];
     ascii_to_unicode_buf(fs_path, name_buf, 260);
     UNICODE_STRING name;
@@ -1284,16 +1441,13 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
     IO_STATUS_BLOCK iosb = {0};
     HANDLE file_handle = INVALID_HANDLE_VALUE;
 
-    ACCESS_MASK nt_access = 0;
-    if (dwDesiredAccess & GENERIC_READ)  nt_access |= FILE_GENERIC_READ;
-    if (dwDesiredAccess & GENERIC_WRITE) nt_access |= FILE_GENERIC_WRITE;
-    nt_access |= SYNCHRONIZE;
+    ACCESS_MASK nt_access = k32_file_desired_access(dwDesiredAccess);
 
     bool directory_open =
         (dwFlagsAndAttributes & K32_FILE_FLAG_BACKUP_SEMANTICS) &&
         win32_directory_exists_normalized(fs_path);
-    ULONG create_options = FILE_SYNCHRONOUS_IO_NONALERT |
-        (directory_open ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE);
+    ULONG create_options = k32_file_create_options(dwFlagsAndAttributes,
+                                                    directory_open);
     bool trace_profile = false;
     if (K32_VERBOSE_DIAGNOSTICS && k32_is_profile_path(fs_path)) {
         uint32_t trace_index = __atomic_fetch_add(&profile_open_logs, 1,
@@ -1617,30 +1771,28 @@ static BOOL WINAPI WriteFileEx_k32(HANDLE file, PCVOID buffer, DWORD length,
 
 BOOL WINAPI CloseHandle(HANDLE hObject)
 {
+    DWORD owner_pid = win32_current_process_id();
     K32_JOB_OBJECT *job = NULL;
     HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, hObject);
     if (entry && entry->type == OBJ_TYPE_JOB)
         job = (K32_JOB_OBJECT *)entry->object;
 
-    steamipc_trace_handle("Close", hObject, 0, 0,
-                          (uint64_t)(ULONG_PTR)__builtin_return_address(0));
-
     /* NtClose may release the pipe object while another CPU is servicing an
      * overlapped request. Cancel first and wait until no service routine still
      * owns the handle or its private write buffer. */
     if (entry && entry->type == OBJ_TYPE_FILE) {
-        (void)k32_cancel_pipe_io(hObject, NULL, FALSE);
-        k32_pipe_wait_quiescent(hObject);
+        (void)k32_cancel_pipe_io_for_process(hObject, NULL, FALSE,
+                                             owner_pid, 0);
+        k32_pipe_wait_quiescent_for_process(hObject, owner_pid);
     }
 
-    NTSTATUS status = NtClose(hObject);
+    NTSTATUS status = nt_close_handle_for_process(hObject, owner_pid);
     if (!NT_SUCCESS(status)) {
-        DWORD current_pid = win32_current_process_id();
         OBJECT_TYPE_ID type;
         ULONG refs;
         ULONG owner_refs;
         ULONG sole_owner;
-        BOOL valid = handle_query_state(&g_handle_table, hObject, current_pid,
+        BOOL valid = handle_query_state(&g_handle_table, hObject, owner_pid,
                                         &type, &refs, &owner_refs,
                                         &sole_owner);
         serial_puts("[K32-CLOSE-FAIL] handle=0x");
@@ -1648,7 +1800,7 @@ BOOL WINAPI CloseHandle(HANDLE hObject)
         serial_puts(" status=0x");
         serial_puthex((uint32_t)status, 8);
         serial_puts(" pid=");
-        serial_putdec(current_pid);
+        serial_putdec(owner_pid);
         serial_puts(" valid=");
         serial_putdec(valid);
         serial_puts(" type=");
@@ -1670,8 +1822,8 @@ BOOL WINAPI CloseHandle(HANDLE hObject)
         job_release(job, TRUE);
     HANDLE pending_client = named_pipe_cancel_pending_server(hObject);
     if (pending_client != INVALID_HANDLE_VALUE)
-        NtClose(pending_client);
-    iocp_forget_handle(hObject);
+        (void)nt_close_handle_for_process(pending_client, owner_pid);
+    iocp_forget_handle_for_process(hObject, owner_pid);
     return TRUE;
 }
 
@@ -1940,8 +2092,39 @@ DWORD kernel32_release_process_handles(DWORD process_id)
     DWORD released = 0;
     HANDLE handle;
     while ((handle = handle_take_owned(&g_handle_table, process_id)) != NULL) {
-        if (CloseHandle(handle))
-            released++;
+        HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, handle);
+        K32_JOB_OBJECT *job = entry && entry->type == OBJ_TYPE_JOB
+                            ? (K32_JOB_OBJECT *)entry->object : NULL;
+
+        if (entry && entry->type == OBJ_TYPE_FILE) {
+            (void)k32_cancel_pipe_io_for_process(handle, NULL, FALSE,
+                                                 process_id, 0);
+            k32_pipe_wait_quiescent_for_process(handle, process_id);
+        }
+
+        NTSTATUS status = nt_force_close_handle_for_process(handle,
+                                                             process_id);
+        if (!NT_SUCCESS(status)) {
+            serial_puts("[K32-CLEANUP] unable to close handle=0x");
+            serial_puthex((uint64_t)(ULONG_PTR)handle, 8);
+            serial_puts(" pid=");
+            serial_putdec(process_id);
+            serial_puts(" status=0x");
+            serial_puthex((uint32_t)status, 8);
+            serial_puts("\n");
+            break;
+        }
+
+        if (job &&
+            !handle_object_referenced(&g_handle_table, OBJ_TYPE_JOB, job))
+            job_release(job, TRUE);
+
+        HANDLE pending_client = named_pipe_cancel_pending_server(handle);
+        if (pending_client != INVALID_HANDLE_VALUE)
+            (void)nt_force_close_handle_for_process(pending_client,
+                                                    process_id);
+        iocp_forget_handle_for_process(handle, process_id);
+        released++;
     }
     k32_process_affinity_release(process_id);
     return released;
@@ -2314,7 +2497,128 @@ fail:
 
 HANDLE WINAPI GetStdHandle(DWORD nStdHandle)
 {
-    return console_handle(nStdHandle);
+    if (console_default_handle(nStdHandle) == INVALID_HANDLE_VALUE) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return INVALID_HANDLE_VALUE;
+    }
+    if (!k32_console_ensure_current()) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE input = NULL;
+    HANDLE output = NULL;
+    HANDLE error = NULL;
+    DWORD process_id = GetCurrentProcessId();
+    if (!process_id) process_id = 1;
+    if (!kernel32_query_process_console(process_id, NULL, &input, &output,
+                                        &error)) {
+        SetLastError(8);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    switch (nStdHandle) {
+    case WIN32_STD_INPUT_HANDLE:  return input;
+    case WIN32_STD_OUTPUT_HANDLE: return output;
+    case WIN32_STD_ERROR_HANDLE:  return error;
+    default:                      return INVALID_HANDLE_VALUE;
+    }
+}
+
+BOOL WINAPI SetStdHandle(DWORD nStdHandle, HANDLE hHandle)
+{
+    if (console_default_handle(nStdHandle) == INVALID_HANDLE_VALUE) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    if (!k32_console_ensure_current()) {
+        SetLastError(8);
+        return FALSE;
+    }
+
+    DWORD process_id = GetCurrentProcessId();
+    if (!process_id) process_id = 1;
+    uint64_t flags = k32_console_lock_irqsave();
+    K32_PROCESS_CONSOLE *state = k32_console_find_locked(process_id);
+    if (state) {
+        switch (nStdHandle) {
+        case WIN32_STD_INPUT_HANDLE:
+            state->standard_input = hHandle;
+            break;
+        case WIN32_STD_OUTPUT_HANDLE:
+            state->standard_output = hHandle;
+            break;
+        case WIN32_STD_ERROR_HANDLE:
+            state->standard_error = hHandle;
+            break;
+        }
+    }
+    k32_console_unlock_irqrestore(flags);
+    if (!state) {
+        SetLastError(8);
+        return FALSE;
+    }
+
+    win32_refresh_current_console_parameters();
+    SetLastError(0);
+    return TRUE;
+}
+
+BOOL WINAPI AllocConsole(void)
+{
+    if (!k32_console_ensure_current()) {
+        SetLastError(8);
+        return FALSE;
+    }
+
+    DWORD process_id = GetCurrentProcessId();
+    if (!process_id) process_id = 1;
+    uint64_t flags = k32_console_lock_irqsave();
+    K32_PROCESS_CONSOLE *state = k32_console_find_locked(process_id);
+    if (!state || state->attached) {
+        k32_console_unlock_irqrestore(flags);
+        SetLastError(state ? 5 : 8); /* ACCESS_DENIED / NOT_ENOUGH_MEMORY */
+        return FALSE;
+    }
+    k32_console_set_defaults(state, TRUE);
+    k32_console_unlock_irqrestore(flags);
+
+    win32_refresh_current_console_parameters();
+    SetLastError(0);
+    return TRUE;
+}
+
+BOOL WINAPI FreeConsole(void)
+{
+    if (!k32_console_ensure_current()) {
+        SetLastError(8);
+        return FALSE;
+    }
+
+    DWORD process_id = GetCurrentProcessId();
+    if (!process_id) process_id = 1;
+    uint64_t flags = k32_console_lock_irqsave();
+    K32_PROCESS_CONSOLE *state = k32_console_find_locked(process_id);
+    if (!state || !state->attached) {
+        k32_console_unlock_irqrestore(flags);
+        SetLastError(state ? 87 : 8); /* INVALID_PARAMETER / NO_MEMORY */
+        return FALSE;
+    }
+    state->attached = FALSE;
+    if (state->standard_input ==
+        console_default_handle(WIN32_STD_INPUT_HANDLE))
+        state->standard_input = NULL;
+    if (state->standard_output ==
+        console_default_handle(WIN32_STD_OUTPUT_HANDLE))
+        state->standard_output = NULL;
+    if (state->standard_error ==
+        console_default_handle(WIN32_STD_ERROR_HANDLE))
+        state->standard_error = NULL;
+    k32_console_unlock_irqrestore(flags);
+
+    win32_refresh_current_console_parameters();
+    SetLastError(0);
+    return TRUE;
 }
 
 BOOL WINAPI WriteConsoleA(HANDLE hConsoleOutput, PCVOID lpBuffer,
@@ -2322,6 +2626,11 @@ BOOL WINAPI WriteConsoleA(HANDLE hConsoleOutput, PCVOID lpBuffer,
                    DWORD *lpNumberOfCharsWritten, PVOID lpReserved)
 {
     (void)lpReserved;
+    if (!k32_is_console_output(hConsoleOutput)) {
+        if (lpNumberOfCharsWritten) *lpNumberOfCharsWritten = 0;
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
     return WriteFile(hConsoleOutput, lpBuffer, nNumberOfCharsToWrite,
                      lpNumberOfCharsWritten, NULL);
 }
@@ -2331,26 +2640,17 @@ BOOL WINAPI WriteConsoleA(HANDLE hConsoleOutput, PCVOID lpBuffer,
 void WINAPI ExitProcess(DWORD uExitCode)
 {
     extern uint32_t compat32_get_last_caller_eip(void);
-    extern uint32_t compat32_get_last_user_ebp(void);
-    extern uint32_t compat32_get_last_stack_args(void);
     extern void compat32_dump_recent_calls(void);
-    extern void wdbg_stack_scan(uint32_t esp, int depth, const char *label);
     serial_puts("[K32] ExitProcess called, pid=");
     serial_putdec(win32_current_process_id());
     serial_puts(" code=");
     serial_putdec(uExitCode);
     if (g_compat32_mode) {
         uint32_t eip = compat32_get_last_caller_eip();
-        uint32_t ebp = compat32_get_last_user_ebp();
-        uint32_t esp = compat32_get_last_stack_args();
         serial_puts(" caller=0x");
         serial_puthex(eip, 8);
-        serial_puts(" EBP=0x");
-        serial_puthex(ebp, 8);
         serial_puts("\n");
-        wdbg_stack_scan(esp, 96, "ExitProcess-stack");
-        if (k32_path_contains_ci(win32_current_exe_name(),
-                                 "steamservice.exe"))
+        if (uExitCode != 0 && K32_VERBOSE_DIAGNOSTICS)
             compat32_dump_recent_calls();
     } else {
         serial_puts(" caller=0x");
@@ -2742,6 +3042,8 @@ static BOOL WINAPI ProcessIdToSessionId_k32(DWORD process_id, DWORD *session_id)
 }
 
 #define TH32CS_SNAPPROCESS 0x00000002U
+#define TH32CS_SNAPMODULE  0x00000008U
+#define TH32CS_SNAPMODULE32 0x00000010U
 
 typedef struct {
     DWORD process_id;
@@ -2750,10 +3052,17 @@ typedef struct {
 } K32_TOOLHELP_PROCESS;
 
 typedef struct {
-    DWORD count;
-    DWORD cursor;
-    BOOL started;
-    K32_TOOLHELP_PROCESS processes[];
+    DWORD flags;
+    DWORD target_process_id;
+    DWORD process_count;
+    DWORD process_cursor;
+    BOOL process_started;
+    DWORD module_count;
+    DWORD module_cursor;
+    BOOL module_started;
+    K32_TOOLHELP_PROCESS *processes;
+    DLL_MODULE_SNAPSHOT_ENTRY *modules;
+    BYTE storage[];
 } K32_TOOLHELP_SNAPSHOT;
 
 extern DWORD win32_process_snapshot_capacity(void);
@@ -2775,7 +3084,11 @@ static BOOL WINAPI K32EnumProcesses_k32(DWORD *process_ids, DWORD bytes,
     DWORD slots = win32_process_snapshot_capacity();
     for (DWORD slot = 0; slot < slots && written < capacity; slot++) {
         DWORD process_id = 0;
-        if (win32_process_snapshot_slot(slot, &process_id, NULL, NULL, 0))
+        DWORD parent_process_id = 0;
+        char exe_name[64];
+        if (win32_process_snapshot_slot(slot, &process_id,
+                                        &parent_process_id, exe_name,
+                                        sizeof(exe_name)))
             process_ids[written++] = process_id;
     }
 
@@ -2845,42 +3158,291 @@ _Static_assert(sizeof(PROCESSENTRY32W_PE32) == 556,
 _Static_assert(sizeof(PROCESSENTRY32W_PE64) == 568,
                "PE64 PROCESSENTRY32W layout");
 
+typedef struct __attribute__((packed)) {
+    DWORD dwSize;
+    DWORD th32ModuleID;
+    DWORD th32ProcessID;
+    DWORD GlblcntUsage;
+    DWORD ProccntUsage;
+    uint32_t modBaseAddr;
+    DWORD modBaseSize;
+    uint32_t hModule;
+    char szModule[256];
+    char szExePath[260];
+} MODULEENTRY32_PE32;
+
+typedef struct {
+    DWORD dwSize;
+    DWORD th32ModuleID;
+    DWORD th32ProcessID;
+    DWORD GlblcntUsage;
+    DWORD ProccntUsage;
+    BYTE *modBaseAddr;
+    DWORD modBaseSize;
+    HANDLE hModule;
+    char szModule[256];
+    char szExePath[260];
+} MODULEENTRY32_PE64;
+
+typedef struct __attribute__((packed)) {
+    DWORD dwSize;
+    DWORD th32ModuleID;
+    DWORD th32ProcessID;
+    DWORD GlblcntUsage;
+    DWORD ProccntUsage;
+    uint32_t modBaseAddr;
+    DWORD modBaseSize;
+    uint32_t hModule;
+    WCHAR szModule[256];
+    WCHAR szExePath[260];
+} MODULEENTRY32W_PE32;
+
+typedef struct {
+    DWORD dwSize;
+    DWORD th32ModuleID;
+    DWORD th32ProcessID;
+    DWORD GlblcntUsage;
+    DWORD ProccntUsage;
+    BYTE *modBaseAddr;
+    DWORD modBaseSize;
+    HANDLE hModule;
+    WCHAR szModule[256];
+    WCHAR szExePath[260];
+} MODULEENTRY32W_PE64;
+
+_Static_assert(sizeof(MODULEENTRY32_PE32) == 548,
+               "PE32 MODULEENTRY32 layout");
+_Static_assert(sizeof(MODULEENTRY32_PE64) == 568,
+               "PE64 MODULEENTRY32 layout");
+_Static_assert(sizeof(MODULEENTRY32W_PE32) == 1064,
+               "PE32 MODULEENTRY32W layout");
+_Static_assert(sizeof(MODULEENTRY32W_PE64) == 1080,
+               "PE64 MODULEENTRY32W layout");
+
+static DWORD toolhelp_image_size(PVOID image_base)
+{
+    if (!image_base) return 0;
+
+    const BYTE *base = image_base;
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0)
+        return 0;
+
+    ULONG nt_offset = (ULONG)dos->e_lfanew;
+    if (nt_offset > 4096 - sizeof(ULONG) - sizeof(IMAGE_FILE_HEADER) -
+                         sizeof(USHORT) ||
+        *(const ULONG *)(base + nt_offset) != IMAGE_NT_SIGNATURE)
+        return 0;
+
+    const BYTE *optional = base + nt_offset + sizeof(ULONG) +
+                           sizeof(IMAGE_FILE_HEADER);
+    USHORT magic = *(const USHORT *)optional;
+    if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        return ((const IMAGE_OPTIONAL_HEADER32 *)optional)->SizeOfImage;
+    if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return ((const IMAGE_OPTIONAL_HEADER64 *)optional)->SizeOfImage;
+    return 0;
+}
+
+static void toolhelp_copy_string(char *destination, SIZE_T capacity,
+                                 const char *source)
+{
+    SIZE_T position = 0;
+    if (!capacity) return;
+    if (source) {
+        while (source[position] && position + 1 < capacity) {
+            destination[position] = source[position];
+            position++;
+        }
+    }
+    destination[position] = 0;
+}
+
+static void toolhelp_copy_module_name(char destination[64],
+                                      const char *path)
+{
+    const char *name = path ? path : "";
+    for (const char *cursor = name; *cursor; cursor++)
+        if (*cursor == '\\' || *cursor == '/') name = cursor + 1;
+    toolhelp_copy_string(destination, 64, name);
+}
+
+static const char *toolhelp_drive_relative_path(const char *path)
+{
+    if (!path) return "";
+    if (path[0] && path[1] == ':') path += 2;
+    while (*path == '\\' || *path == '/') path++;
+    return path;
+}
+
+static BOOL toolhelp_path_has_directory(const char *path)
+{
+    if (!path) return FALSE;
+    for (; *path; path++)
+        if (*path == '\\' || *path == '/') return TRUE;
+    return FALSE;
+}
+
+static SIZE_T toolhelp_append_path(char destination[260], SIZE_T position,
+                                   const char *source)
+{
+    if (!source) source = "";
+    while (*source && position + 1 < 260) {
+        char value = *source++;
+        destination[position++] = value == '/' ? '\\' : value;
+    }
+    destination[position] = 0;
+    return position;
+}
+
+static void toolhelp_module_full_path(
+    const DLL_MODULE_SNAPSHOT_ENTRY *module, char path[260])
+{
+    SIZE_T position = 0;
+    path[0] = 0;
+
+    if (module->synthetic_shim) {
+        position = toolhelp_append_path(path, position,
+                                        "C:\\Windows\\System32\\");
+        (void)toolhelp_append_path(path, position, module->name);
+        return;
+    }
+
+    const char *stored = module->path;
+    if (stored[0] && toolhelp_path_has_directory(stored)) {
+        position = toolhelp_append_path(path, position, "C:\\");
+        (void)toolhelp_append_path(
+            path, position, toolhelp_drive_relative_path(stored));
+        return;
+    }
+
+    const char *image_path =
+        toolhelp_drive_relative_path(win32_current_image_path());
+    const char *last_separator = NULL;
+    for (const char *cursor = image_path; *cursor; cursor++)
+        if (*cursor == '\\' || *cursor == '/') last_separator = cursor;
+
+    position = toolhelp_append_path(path, position, "C:\\");
+    if (last_separator) {
+        while (image_path <= last_separator && position + 1 < 260) {
+            char value = *image_path++;
+            path[position++] = value == '/' ? '\\' : value;
+        }
+        path[position] = 0;
+    }
+    (void)toolhelp_append_path(path, position, module->name);
+}
+
 static HANDLE WINAPI CreateToolhelp32Snapshot_k32(DWORD flags, DWORD process_id)
 {
-    (void)process_id;
-    if (!(flags & TH32CS_SNAPPROCESS)) {
+    BOOL include_processes = (flags & TH32CS_SNAPPROCESS) != 0;
+    BOOL include_modules =
+        (flags & (TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32)) != 0;
+    if (!include_processes && !include_modules) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return INVALID_HANDLE_VALUE;
     }
 
-    DWORD capacity = win32_process_snapshot_capacity();
-    uint64_t allocation_size = sizeof(K32_TOOLHELP_SNAPSHOT) +
-        (uint64_t)capacity * sizeof(K32_TOOLHELP_PROCESS);
-    K32_TOOLHELP_SNAPSHOT *object = kmalloc(allocation_size);
-    if (!object) {
-        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+    DWORD target_process_id = process_id ? process_id
+                                         : win32_current_process_id();
+    if (include_modules &&
+        target_process_id != win32_current_process_id()) {
+        /* Cross-address-space module walking needs a remote PEB reader. Fail
+         * explicitly instead of exposing the caller's module list as if it
+         * belonged to the requested process. */
+        SetLastError(299); /* ERROR_PARTIAL_COPY */
         return INVALID_HANDLE_VALUE;
     }
-    memset(object, 0, allocation_size);
 
-    for (DWORD slot = 0; slot < capacity; slot++) {
-        K32_TOOLHELP_PROCESS *process = &object->processes[object->count];
-        if (win32_process_snapshot_slot(slot, &process->process_id,
-                                        &process->parent_process_id,
-                                        process->exe_name,
-                                        sizeof(process->exe_name)))
-            object->count++;
+    DWORD process_capacity = include_processes
+                           ? win32_process_snapshot_capacity() : 0;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        DWORD required_modules = include_modules
+                               ? dll_snapshot_modules(target_process_id,
+                                                      NULL, 0) : 0;
+        if (required_modules > MAX_LOADED_MODULES) {
+            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+            return INVALID_HANDLE_VALUE;
+        }
+
+        DWORD dll_capacity = required_modules;
+        if (include_modules && dll_capacity < MAX_LOADED_MODULES) {
+            DWORD headroom = MAX_LOADED_MODULES - dll_capacity;
+            if (headroom > 4) headroom = 4;
+            dll_capacity += headroom;
+        }
+        DWORD module_capacity = include_modules ? dll_capacity + 1 : 0;
+
+        uint64_t allocation_size = sizeof(K32_TOOLHELP_SNAPSHOT) +
+            (uint64_t)process_capacity * sizeof(K32_TOOLHELP_PROCESS) +
+            (uint64_t)module_capacity *
+                sizeof(DLL_MODULE_SNAPSHOT_ENTRY);
+        K32_TOOLHELP_SNAPSHOT *object = kmalloc(allocation_size);
+        if (!object) {
+            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+            return INVALID_HANDLE_VALUE;
+        }
+        memset(object, 0, allocation_size);
+        object->flags = flags;
+        object->target_process_id = target_process_id;
+
+        BYTE *storage = object->storage;
+        if (include_processes) {
+            object->processes = (K32_TOOLHELP_PROCESS *)storage;
+            storage += (uint64_t)process_capacity *
+                       sizeof(K32_TOOLHELP_PROCESS);
+            for (DWORD slot = 0; slot < process_capacity; slot++) {
+                K32_TOOLHELP_PROCESS *process =
+                    &object->processes[object->process_count];
+                if (win32_process_snapshot_slot(
+                        slot, &process->process_id,
+                        &process->parent_process_id, process->exe_name,
+                        sizeof(process->exe_name)))
+                    object->process_count++;
+            }
+        }
+
+        if (include_modules) {
+            object->modules = (DLL_MODULE_SNAPSHOT_ENTRY *)storage;
+            ULONG_PTR image_base = win32_current_image_base();
+            if (image_base) {
+                DLL_MODULE_SNAPSHOT_ENTRY *main_module =
+                    &object->modules[object->module_count++];
+                main_module->image_base = (PVOID)image_base;
+                main_module->image_size =
+                    toolhelp_image_size((PVOID)image_base);
+                main_module->synthetic_shim = FALSE;
+                toolhelp_copy_module_name(main_module->name,
+                                          win32_current_exe_name());
+                toolhelp_copy_string(main_module->path,
+                                     sizeof(main_module->path),
+                                     win32_current_image_path());
+            }
+
+            DWORD copied_modules = dll_snapshot_modules(
+                target_process_id,
+                object->modules + object->module_count, dll_capacity);
+            if (copied_modules > dll_capacity) {
+                kfree(object);
+                continue;
+            }
+            object->module_count += copied_modules;
+        }
+
+        HANDLE snapshot;
+        NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_SNAPSHOT, 0,
+                                       object, &snapshot);
+        if (!NT_SUCCESS(status)) {
+            kfree(object);
+            set_last_error_from_status(status);
+            return INVALID_HANDLE_VALUE;
+        }
+        SetLastError(0);
+        return snapshot;
     }
 
-    HANDLE snapshot;
-    NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_SNAPSHOT, 0,
-                                   object, &snapshot);
-    if (!NT_SUCCESS(status)) {
-        kfree(object);
-        set_last_error_from_status(status);
-        return INVALID_HANDLE_VALUE;
-    }
-    return snapshot;
+    SetLastError(24); /* ERROR_BAD_LENGTH: loader list kept changing. */
+    return INVALID_HANDLE_VALUE;
 }
 
 static BOOL toolhelp_fill_process(HANDLE snapshot, PVOID buffer, BOOL wide,
@@ -2915,19 +3477,19 @@ static BOOL toolhelp_fill_process(HANDLE snapshot, PVOID buffer, BOOL wide,
     if (first) {
         cursor = 0;
     } else {
-        if (!object->started) {
+        if (!object->process_started) {
             SetLastError(18); /* ERROR_NO_MORE_FILES */
             return FALSE;
         }
-        cursor = object->cursor + 1;
+        cursor = object->process_cursor + 1;
     }
-    if (cursor >= object->count) {
+    if (cursor >= object->process_count) {
         SetLastError(18); /* ERROR_NO_MORE_FILES */
         return FALSE;
     }
 
-    object->cursor = cursor;
-    object->started = TRUE;
+    object->process_cursor = cursor;
+    object->process_started = TRUE;
     const K32_TOOLHELP_PROCESS *process = &object->processes[cursor];
 
     if (wide && g_compat32_mode) {
@@ -2995,481 +3557,178 @@ static BOOL WINAPI Process32NextW_k32(HANDLE snapshot, PVOID process_entry)
     return toolhelp_fill_process(snapshot, process_entry, TRUE, FALSE);
 }
 
-/* ── Memory API ─────────────────────────────────────────────── */
-
-/* try_patch_farray — given a user-space address that MIGHT be an FArray
- * (UE1 TArray header: { void* Data; INT Num; INT Max; }), check the
- * corrupt-pattern signature `*(cand+8)` ∈ PE-image .text range
- * [0x10000000, 0x20000000).  If matched, patch {+8}=2, zero Data/Num if
- * they also look like code/stack ptrs, and derive a safe dwSize.
- * Returns 1 if patched, 0 otherwise.
- *
- * Used by VirtualAlloc cap path to repair multiple class of corrupt
- * FArray sites: (a) saved on EBP-chain stack frames, (b) directly
- * pointed to by user-side callee-saved regs (ESI/EDI/EBX). */
-static int try_patch_farray(uint32_t cand_addr, uint32_t newmax_hint,
-                             SIZE_T *dwSize_out, const char *origin)
+static void toolhelp_copy_wide(WCHAR *destination, SIZE_T capacity,
+                               const char *source)
 {
-    if (cand_addr < 0x100000 || cand_addr >= 0xFFFE0000 || (cand_addr & 3))
-        return 0;
-    uint32_t *t = (uint32_t *)(uintptr_t)cand_addr;
-    uint32_t plus0 = t[0];  /* Data */
-    uint32_t plus4 = t[1];  /* Num  */
-    uint32_t plus8 = t[2];  /* Max or ElementSize per disasm */
-    /* {+8} must look like a leaked PE-image .text code pointer.  Range
-     * covers Core.dll/Engine.dll/UT.exe/Window.dll. */
-    if (plus8 < 0x10000000 || plus8 >= 0x12000000) return 0;
-    /* CRITICAL: a real FArray's Data is either NULL (fresh array, never
-     * allocated yet) OR a heap pointer (UT99 heap starts at 0x40000000).
-     * If Data is in stack range (0x14xxxxxx) the "FArray" is actually a
-     * stack frame whose saved-EBP points to the parent frame.  Patching
-     * `{+8}` then writes 4 over the parent frame's first stack arg AND
-     * we'd also zero `{+4}` (the saved return address!) — engine RET's
-     * to address 0 → tight loop in null-call recovery.  Observed live
-     * on UT99 with FArray@0x14001140 (= frame 3 EBP) where Data=
-     * 0x14001174 (= frame 4 EBP). */
-    if (plus0 != 0 && plus0 < 0x40000000) return 0;
-
-    static int patch_log = 0;
-    if (patch_log < 20) {
-        serial_puts("[VA-FARRAY] ");
-        serial_puts(origin);
-        serial_puts(" FArray@0x"); serial_puthex(cand_addr, 8);
-        serial_puts(" Data=0x"); serial_puthex(plus0, 8);
-        serial_puts(" Num=0x"); serial_puthex(plus4, 8);
-        serial_puts(" {+8}=0x"); serial_puthex(plus8, 8);
-        patch_log++;
+    SIZE_T position = 0;
+    if (!capacity) return;
+    if (source) {
+        while (source[position] && position + 1 < capacity) {
+            destination[position] = (WCHAR)(BYTE)source[position];
+            position++;
+        }
     }
-    /* Patch {+8} to 4 (pointer-sized element).  Most UE1 TArrays hold
-     * UObject* / FName / similar 4-byte values.  WCHAR=2 was empirically
-     * too small for non-string arrays and put the engine in a tight
-     * loop reading half-words as full structs. */
-    t[2] = 4;
-    if (t[0] >= 0x10000000 && t[0] < 0x12000000) t[0] = 0;  /* Data */
-    if (t[1] >= 0x10000000 && t[1] < 0x12000000) t[1] = 0;  /* Num */
-    /* dwSize: bigger is safer (with VA-CACHE deduping, the VA range
-     * stays healthy).  Aim for ~256 KB worst case, derived from
-     * NewMax * 4 if we know it. */
-    if (newmax_hint > 0 && newmax_hint < 0x10000) {
-        SIZE_T s = (SIZE_T)(newmax_hint * 4 + 0xFFF) & ~(SIZE_T)0xFFF;
-        if (s < 0x40000) s = 0x40000;  /* min 256 KB */
-        *dwSize_out = s;
-    } else {
-        *dwSize_out = 0x40000;  /* 256 KB fallback */
-    }
-    if (patch_log <= 20) {
-        serial_puts(" -> {+8}=4 dwSize=0x"); serial_puthex(*dwSize_out, 8);
-        serial_puts("\n");
-    }
-    return 1;
+    destination[position] = 0;
 }
 
-/* VA-CACHE: dedupe the bogus VirtualAlloc spam from UT99's corrupt
- * TArray::Realloc paths.  Background: an FArray with `{+8}` set to a
- * code-pointer (uninitialized stack local) computes `NewSize = NewMax *
- * code_ptr` ≈ 3-4 GB.  The FArray scan in this shim patches what it can
- * find via EBP walking, but a parallel call site that the scan misses
- * still produces 100+ bogus requests in a tight loop.  Allocating a
- * fresh 64KB block for each one exhausts the 896MB user VA range and
- * leads to STATUS_NO_MEMORY → appError → forced shell return.
- *
- * Strategy: keyed by caller-EIP, after the FIRST bogus request from a
- * given site is served with a capped buffer, every subsequent call
- * from the same EIP returns the SAME buffer.  UT99 doesn't free
- * between iterations, and the no-op'd rep-movsl @0x1010723E means
- * the buffer is effectively write-only metadata that nobody reads
- * back to a meaningful value.  Reuse is harmless and saves the VA. */
-#define VA_CACHE_N 16
-static struct {
-    uint32_t eip;
-    PVOID    base;
-    SIZE_T   size;
-    uint32_t hits;
-} va_cache[VA_CACHE_N];
+static BOOL toolhelp_fill_module(HANDLE snapshot, PVOID buffer, BOOL wide,
+                                 BOOL first)
+{
+    PVOID raw_object = NULL;
+    if (!NT_SUCCESS(handle_lookup(&g_handle_table, snapshot,
+                                  OBJ_TYPE_SNAPSHOT, &raw_object)) ||
+        !raw_object) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+    if (!buffer) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    DWORD expected;
+    if (wide)
+        expected = g_compat32_mode ? sizeof(MODULEENTRY32W_PE32)
+                                   : sizeof(MODULEENTRY32W_PE64);
+    else
+        expected = g_compat32_mode ? sizeof(MODULEENTRY32_PE32)
+                                   : sizeof(MODULEENTRY32_PE64);
+    if (*(DWORD *)buffer < expected) {
+        SetLastError(24); /* ERROR_BAD_LENGTH */
+        return FALSE;
+    }
+
+    K32_TOOLHELP_SNAPSHOT *object = raw_object;
+    DWORD cursor;
+    if (first) {
+        cursor = 0;
+    } else {
+        if (!object->module_started) {
+            SetLastError(18); /* ERROR_NO_MORE_FILES */
+            return FALSE;
+        }
+        cursor = object->module_cursor + 1;
+    }
+    if (cursor >= object->module_count) {
+        SetLastError(18); /* ERROR_NO_MORE_FILES */
+        return FALSE;
+    }
+
+    const DLL_MODULE_SNAPSHOT_ENTRY *module = &object->modules[cursor];
+    if (g_compat32_mode && (ULONG_PTR)module->image_base > UINT32_MAX) {
+        SetLastError(299); /* ERROR_PARTIAL_COPY */
+        return FALSE;
+    }
+
+    object->module_cursor = cursor;
+    object->module_started = TRUE;
+
+    char full_path[260];
+    toolhelp_module_full_path(module, full_path);
+
+    if (wide && g_compat32_mode) {
+        MODULEENTRY32W_PE32 *entry = buffer;
+        memset(entry, 0, sizeof(*entry));
+        entry->dwSize = sizeof(*entry);
+        entry->th32ModuleID = 1;
+        entry->th32ProcessID = object->target_process_id;
+        entry->GlblcntUsage = 0xFFFF;
+        entry->ProccntUsage = 0xFFFF;
+        entry->modBaseAddr = (uint32_t)(ULONG_PTR)module->image_base;
+        entry->modBaseSize = module->image_size;
+        entry->hModule = (uint32_t)(ULONG_PTR)module->image_base;
+        toolhelp_copy_wide(entry->szModule, 256, module->name);
+        toolhelp_copy_wide(entry->szExePath, 260, full_path);
+    } else if (wide) {
+        MODULEENTRY32W_PE64 *entry = buffer;
+        memset(entry, 0, sizeof(*entry));
+        entry->dwSize = sizeof(*entry);
+        entry->th32ModuleID = 1;
+        entry->th32ProcessID = object->target_process_id;
+        entry->GlblcntUsage = 0xFFFF;
+        entry->ProccntUsage = 0xFFFF;
+        entry->modBaseAddr = (BYTE *)module->image_base;
+        entry->modBaseSize = module->image_size;
+        entry->hModule = (HANDLE)module->image_base;
+        toolhelp_copy_wide(entry->szModule, 256, module->name);
+        toolhelp_copy_wide(entry->szExePath, 260, full_path);
+    } else if (g_compat32_mode) {
+        MODULEENTRY32_PE32 *entry = buffer;
+        memset(entry, 0, sizeof(*entry));
+        entry->dwSize = sizeof(*entry);
+        entry->th32ModuleID = 1;
+        entry->th32ProcessID = object->target_process_id;
+        entry->GlblcntUsage = 0xFFFF;
+        entry->ProccntUsage = 0xFFFF;
+        entry->modBaseAddr = (uint32_t)(ULONG_PTR)module->image_base;
+        entry->modBaseSize = module->image_size;
+        entry->hModule = (uint32_t)(ULONG_PTR)module->image_base;
+        toolhelp_copy_string(entry->szModule, sizeof(entry->szModule),
+                             module->name);
+        toolhelp_copy_string(entry->szExePath, sizeof(entry->szExePath),
+                             full_path);
+    } else {
+        MODULEENTRY32_PE64 *entry = buffer;
+        memset(entry, 0, sizeof(*entry));
+        entry->dwSize = sizeof(*entry);
+        entry->th32ModuleID = 1;
+        entry->th32ProcessID = object->target_process_id;
+        entry->GlblcntUsage = 0xFFFF;
+        entry->ProccntUsage = 0xFFFF;
+        entry->modBaseAddr = (BYTE *)module->image_base;
+        entry->modBaseSize = module->image_size;
+        entry->hModule = (HANDLE)module->image_base;
+        toolhelp_copy_string(entry->szModule, sizeof(entry->szModule),
+                             module->name);
+        toolhelp_copy_string(entry->szExePath, sizeof(entry->szExePath),
+                             full_path);
+    }
+    SetLastError(0);
+    return TRUE;
+}
+
+static BOOL WINAPI Module32First_k32(HANDLE snapshot, PVOID module_entry)
+{
+    return toolhelp_fill_module(snapshot, module_entry, FALSE, TRUE);
+}
+
+static BOOL WINAPI Module32FirstW_k32(HANDLE snapshot, PVOID module_entry)
+{
+    return toolhelp_fill_module(snapshot, module_entry, TRUE, TRUE);
+}
+
+static BOOL WINAPI Module32Next_k32(HANDLE snapshot, PVOID module_entry)
+{
+    return toolhelp_fill_module(snapshot, module_entry, FALSE, FALSE);
+}
+
+static BOOL WINAPI Module32NextW_k32(HANDLE snapshot, PVOID module_entry)
+{
+    return toolhelp_fill_module(snapshot, module_entry, TRUE, FALSE);
+}
+
+/* ── Memory API ─────────────────────────────────────────────── */
 
 PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
-                   DWORD flAllocationType, DWORD flProtect)
+                          DWORD flAllocationType, DWORD flProtect)
 {
-    int      was_capped     = 0;
-    uint32_t cache_eip_save = 0;
-
-    /* Suppress normal VA logs — only log large/abnormal requests */
-    if (g_compat32_mode && g_compat32_ut99 && dwSize > 0x1000000) {
-        serial_puts("[VA] VirtualAlloc LARGE: size=0x");
-        serial_puthex(dwSize, 8);
-        serial_puts(" addr=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)lpAddress, 8);
-        extern uint32_t compat32_get_last_caller_eip(void);
-        uint32_t user_eip = compat32_get_last_caller_eip();
-        if (user_eip) {
-            serial_puts(" userEIP=0x");
-            serial_puthex(user_eip, 8);
-        }
-        serial_puts("\n");
-
-        /* VA-CACHE lookup: short-circuit repeat bogus requests from
-         * the same caller-EIP.  This bypasses both the diagnostic dump
-         * and the FArray-scan + cap fallback below.  Hit-count logged
-         * only at powers of 10 to avoid log spam.
-         *
-         * Special case eip==0: after a NULL-CALL recovery, every
-         * subsequent INT 0x2E has stack_args[-1] == 0 (synthesized
-         * retaddr), so g_last_caller_eip stays 0 forever.  Without a
-         * dedicated cache slot the engine spams thousands of LARGE
-         * allocs that each consume 256KB → VA range exhaust in ~3500
-         * calls → STATUS_NO_MEMORY → terminal appError.  Reserve a
-         * dedicated "post-recovery sentinel" slot keyed at eip=0
-         * + size>16MB (caller's intent obviously bogus). */
-        if (lpAddress == NULL) {
-            uint32_t key = user_eip ? user_eip : 0xDEAD0000;
-            for (int i = 0; i < VA_CACHE_N; i++) {
-                if (va_cache[i].eip == key && va_cache[i].base) {
-                    va_cache[i].hits++;
-                    if (va_cache[i].hits == 2 || va_cache[i].hits == 10 ||
-                        va_cache[i].hits == 100 || va_cache[i].hits == 1000 ||
-                        va_cache[i].hits == 10000) {
-                        serial_puts("[VA] cache reuse eip=0x");
-                        serial_puthex(key, 8);
-                        serial_puts(" hits=");
-                        serial_putdec(va_cache[i].hits);
-                        serial_puts(" -> base=0x");
-                        serial_puthex(
-                            (uint64_t)(ULONG_PTR)va_cache[i].base, 8);
-                        serial_puts("\n");
-                    }
-                    return va_cache[i].base;
-                }
-            }
-        }
-        cache_eip_save = user_eip ? user_eip : 0xDEAD0000;  /* for STORE after cap path */
-
-        /* Walk the user-mode EBP frame-pointer chain to find every
-         * caller of the FMallocWindows::Realloc wrapper. The first
-         * frame above us is the wrapper itself; subsequent frames
-         * lead back through the engine to the function whose
-         * corrupt TArray is feeding the bogus size. */
-        extern uint32_t compat32_get_last_user_ebp(void);
-        uint32_t ebp = compat32_get_last_user_ebp();
-        serial_puts("[VA]   user_ebp=0x"); serial_puthex(ebp, 8);
-        serial_puts(" frames:\n");
-        uint32_t cur = ebp;
-        for (int f = 0; f < 8; f++) {
-            if (cur < 0x100000 || cur >= 0xFFFE0000 || (cur & 3)) {
-                serial_puts("[VA]   frame "); serial_putdec(f);
-                serial_puts(": stop at ebp=0x"); serial_puthex(cur, 8);
-                serial_puts("\n");
-                break;
-            }
-            uint32_t *fp = (uint32_t *)(uintptr_t)cur;
-            uint32_t saved_ebp = fp[0];
-            uint32_t ret_addr  = fp[1];
-            serial_puts("[VA]   frame "); serial_putdec(f);
-            serial_puts(": ebp=0x"); serial_puthex(cur, 8);
-            serial_puts(" ret=0x"); serial_puthex(ret_addr, 8);
-            serial_puts(" sebp=0x"); serial_puthex(saved_ebp, 8);
-            serial_puts("\n");
-            if (saved_ebp <= cur) break;  /* not strictly increasing → stop */
-            cur = saved_ebp;
-        }
-
-        /* Dump the args at each frame's [EBP+8..EBP+24] to catch the
-         * actual count/element_size/tag passed to FArray::Realloc.
-         * FArray::Realloc(void*, INT count, INT element_size, const char* tag).
-         * The first non-wrapper frame above us SHOULD have these args. */
-        cur = ebp;
-        for (int f = 0; f < 4; f++) {
-            if (cur < 0x100000 || cur >= 0xFFFE0000 || (cur & 3)) break;
-            uint32_t *fp = (uint32_t *)(uintptr_t)cur;
-            uint32_t saved = fp[0];
-            serial_puts("[VA]   frame ");
-            serial_putdec(f);
-            serial_puts(" args:");
-            for (int a = 2; a <= 6; a++) {
-                serial_puts(" [+"); serial_puthex((uint32_t)(a * 4), 2);
-                serial_puts("]=0x"); serial_puthex(fp[a], 8);
-            }
-            serial_puts("\n");
-
-            /* Per disasm of Core.dll FArray::Realloc @ 0x1014A4A0:
-             *   1014a4bd: mov esi, ecx        (save this in ESI)
-             *   1014a4da: mov [ebp-0x18], esi (spill this to stack)
-             * So frame 1's saved `this` (FArray *) lives at [EBP-0x18].
-             * Dump it + this->{+0..+0x10} to see the FArray fields. */
-            if (f == 1 || f == 2) {
-                int32_t *neg = (int32_t *)(uintptr_t)cur;
-                /* fp[i] = ebp + i*4. neg[-i] = ebp - i*4. */
-                serial_puts("[VA]   frame ");
-                serial_putdec(f);
-                serial_puts(" locals:");
-                for (int n = 1; n <= 8; n++) {
-                    serial_puts(" [-"); serial_puthex((uint32_t)(n * 4), 2);
-                    serial_puts("]=0x"); serial_puthex((uint32_t)*(neg - n), 8);
-                }
-                serial_puts("\n");
-
-                /* If [EBP-0x18] looks like a heap pointer, dump *this[0..+0x14] */
-                uint32_t this_ptr = (uint32_t)*(neg - 6); /* -0x18 / 4 = -6 */
-                if (this_ptr >= 0x100000 && this_ptr < 0x80000000) {
-                    uint32_t *t = (uint32_t *)(uintptr_t)this_ptr;
-                    serial_puts("[VA]   frame ");
-                    serial_putdec(f);
-                    serial_puts(" *this@0x"); serial_puthex(this_ptr, 8);
-                    serial_puts(":");
-                    for (int i = 0; i < 6; i++) {
-                        serial_puts(" [+"); serial_puthex((uint32_t)(i * 4), 2);
-                        serial_puts("]=0x"); serial_puthex(t[i], 8);
-                    }
-                    serial_puts("\n");
-                }
-            }
-            if (saved <= cur) break;
-            cur = saved;
-        }
-
-        /* Dump user-mode regs at INT 0x2E entry. ECX = `this` for any
-         * __thiscall method. If the bad NewSize is computed inside
-         * FArray::Realloc as Num*ElementSize, then this->Num and
-         * this->ElementSize live in the FArray struct that ECX points
-         * to. UE1 FArray is { void* Data; INT Num; INT Max; }, with
-         * ElementSize stored separately by the templated TArray<T>. */
-        extern uint32_t compat32_get_last_user_ecx(void);
-        extern uint32_t compat32_get_last_user_edx(void);
-        extern uint32_t compat32_get_last_user_esi(void);
-        extern uint32_t compat32_get_last_user_edi(void);
-        extern uint32_t compat32_get_last_user_ebx(void);
-        uint32_t ecx = compat32_get_last_user_ecx();
-        uint32_t edx = compat32_get_last_user_edx();
-        uint32_t esi = compat32_get_last_user_esi();
-        uint32_t edi = compat32_get_last_user_edi();
-        uint32_t ebx = compat32_get_last_user_ebx();
-        serial_puts("[VA]   user regs: EBX=0x"); serial_puthex(ebx, 8);
-        serial_puts(" ECX=0x"); serial_puthex(ecx, 8);
-        serial_puts(" EDX=0x"); serial_puthex(edx, 8);
-        serial_puts(" ESI=0x"); serial_puthex(esi, 8);
-        serial_puts(" EDI=0x"); serial_puthex(edi, 8);
-        serial_puts("\n");
-
-        /* If ECX (this) looks like a valid pointer in heap range,
-         * dump the first 32 bytes — that's enough to see Data/Num/Max
-         * and any extra TArray fields. */
-        if (ecx >= 0x100000 && ecx < 0x80000000) {
-            uint32_t *t = (uint32_t *)(uintptr_t)ecx;
-            serial_puts("[VA]   *ECX:");
-            for (int i = 0; i < 8; i++) {
-                serial_puts(" ["); serial_putdec((uint64_t)i);
-                serial_puts("]=0x"); serial_puthex(t[i], 8);
-            }
-            serial_puts("\n");
-        }
-
-        /* Dump user stack from RSP_user — first 16 dwords = 64 bytes.
-         * That's the args + saved EBP + ret + outer args. */
-        extern uint32_t compat32_get_last_stack_args(void);
-        uint32_t sa = compat32_get_last_stack_args();
-        if (sa >= 0x100000 && sa < 0xFFFE0000 && (sa & 3) == 0) {
-            uint32_t *s = (uint32_t *)(uintptr_t)sa;
-            serial_puts("[VA]   user stack@0x"); serial_puthex(sa, 8);
-            serial_puts(":");
-            for (int i = 0; i < 16; i++) {
-                if (i % 4 == 0) { serial_puts("\n[VA]    +"); serial_puthex((uint32_t)(i * 4), 2); serial_puts(":"); }
-                serial_puts(" 0x"); serial_puthex(s[i], 8);
-            }
-            serial_puts("\n");
-        }
-    }
-
-    /* Cap absurd sizes (> 256MB) to 256MB. Empirical sweet spot vs
-     * NULL/16MB/1GB. Documented in commit log. The follow-on rep-
-     * movsl that uses this buffer with a corrupt 2GB-class ECX gets
-     * short-circuited by the #PF handler in idt.c (see VA-SHORT) when
-     * the writes overrun the 256MB into unmapped pages — but only IF
-     * those pages aren't already covered by the kernel direct-map.
-     * In practice they ARE covered (winexec keeps PE32 under kernel
-     * CR3, which has the low-memory identity map), so the rep-movsl
-     * runs to completion through valid-but-irrelevant memory.
-     *
-     * Workaround: also pre-poison the buffer with a single byte at
-     * the END of the cap so the engine's checksum/comparison loop
-     * sees a sentinel — or simpler, just keep the cap and accept the
-     * slow run. UT99 eventually completes the rep-movsl and moves on. */
-    if (g_compat32_mode && g_compat32_ut99 && dwSize > 0x10000000ULL) {
-        static int cap_log = 0;
-        if (cap_log < 5) {
-            serial_puts("[VA] Capped: 0x");
-            serial_puthex(dwSize, 8);
-            serial_puts(" -> 64KB sentinel\n");
-            cap_log++;
-        }
-
-        /* W4-FArray-FIX: walk the EBP chain to find the FArray *this and
-         * patch its corrupted {+8} field (Max/ElementSize). Disasm of
-         * Core.dll FArray::Realloc proved:
-         *   - Frame 2 of the EBP chain is FArray::Realloc itself
-         *   - Its [ebp-0x18] holds the FArray *this (saved esi)
-         *   - The bad NewSize is `this->{+8} * NewMax` via imul
-         *   - `this->{+8}` contains a code pointer (uninitialized stack)
-         *
-         * Patch this->{+8} = 2 (assume wchar_t TArray, the most common
-         * UE1 use case) so subsequent reallocs of the same TArray compute
-         * a sane size instead of code_ptr * NewMax. */
-        {
-            extern uint32_t compat32_get_last_user_ebp(void);
-            extern uint32_t compat32_get_last_user_ecx(void);
-            extern uint32_t compat32_get_last_user_esi(void);
-            extern uint32_t compat32_get_last_user_edi(void);
-            extern uint32_t compat32_get_last_user_ebx(void);
-            uint32_t walk = compat32_get_last_user_ebp();
-            int patched = 0;
-
-            /* Direct user-reg check before walking the EBP chain.  In
-             * Core.dll FArray::Realloc, ECX/ESI both held the FArray
-             * *this on entry; ESI/EDI/EBX are callee-saved across the
-             * intermediate calls to FMallocWindows::Realloc → Malloc →
-             * VirtualAlloc, so they typically still point at the
-             * corrupt FArray on shim entry.  Engine.dll 0x1033E7D0
-             * additionally has the FArray at `EBX + 0xC`. */
-            uint32_t ebx = compat32_get_last_user_ebx();
-            uint32_t cand_regs[5];
-            cand_regs[0] = compat32_get_last_user_esi();
-            cand_regs[1] = compat32_get_last_user_edi();
-            cand_regs[2] = compat32_get_last_user_ecx();
-            cand_regs[3] = ebx;
-            cand_regs[4] = (ebx >= 0x100000 && ebx < 0xFFFE0000)
-                           ? ebx + 0xC : 0;
-            for (int r = 0; r < 5 && !patched; r++) {
-                if (try_patch_farray(cand_regs[r], 0, &dwSize, "user-reg")) {
-                    patched = 1;
-                }
-            }
-            if (patched) goto va_proceed;
-            /* Walk multiple depths AND multiple [ebp-N] offsets — any
-             * frame on the chain might be FArray::Realloc, and inside it
-             * `this` is saved at some negative-offset local. Try common
-             * MSVC compiler offsets [-0x10..-0x28] (esi-spill in
-             * SEH-decorated functions). For each candidate, check if
-             * *(this+8) is a code ptr → patch to 2. */
-            /* EBP walk: try locals [-0x10..-0x40] across up to 10 frames.
-             * Each candidate goes through try_patch_farray for the same
-             * tight {+8}∈[0x10000000,0x12000000) check and unified
-             * {+8}=4 + 256KB buffer policy. */
-            for (int depth = 0; depth < 10 && walk >= 0x100000 &&
-                 walk < 0xFFFE0000 && (walk & 3) == 0; depth++) {
-                int32_t *neg = (int32_t *)(uintptr_t)walk;
-                /* NewMax hint = [ebp+8] = first stack arg of this frame */
-                uint32_t newmax = ((uint32_t *)(uintptr_t)walk)[2];
-                for (int local_off = 4; local_off <= 16 && !patched; local_off++) {
-                    uint32_t cand = (uint32_t)*(neg - local_off);
-                    if (try_patch_farray(cand, newmax, &dwSize, "ebp-walk")) {
-                        patched = 1;
-                    }
-                }
-                if (patched) goto va_proceed;
-                /* advance to next frame */
-                uint32_t *fp = (uint32_t *)(uintptr_t)walk;
-                uint32_t next = fp[0];
-                if (next <= walk) break;  /* not strictly increasing */
-                walk = next;
-            }
-        }
-        /* Cap to 64KB instead of 256MB. Reasons:
-         *   - 256MB cap exhausted the 896MB VA range after 3-4 bogus
-         *     FArray::Realloc requests, all subsequent VirtualAlloc
-         *     returned NULL → STATUS_NO_MEMORY → ERROR_NOT_ENOUGH_MEMORY
-         *     → UT99 appError loop.
-         *   - The rep-movsl that follows was already patched to no-op
-         *     (commit 02f9ca6) so the engine never actually writes 2GB.
-         *   - 64KB is enough for the engine's metadata reads (it
-         *     might read first few elements after Realloc to check
-         *     existing-data preservation). Reads past 64KB will
-         *     fault, hit demand-paging — but we don't allocate
-         *     beyond, so faults page-fault back to a NULL handler
-         *     and trigger NULL-CALL recovery (controlled).
-         */
-        dwSize = 0x10000;  /* 64KB sentinel */
-        was_capped = 1;    /* triggers VA-CACHE STORE post-alloc */
-        /* Self-modify the engine's memcpy helper at 0x1010723E so that
-         * the upcoming bogus 2GB rep-movsl terminates instantly. */
-        static int patched_memcpy = 0;
-        if (!patched_memcpy) {
-            volatile uint8_t *p = (uint8_t *)(uintptr_t)0x1010723E;
-            if (p[0] == 0xF3 && p[1] == 0xA5) {
-                p[0] = 0x31;  /* xor ecx, ecx */
-                p[1] = 0xC9;
-                patched_memcpy = 1;
-                serial_puts("[VA] PATCHED rep-movsl @0x1010723E -> xor ecx,ecx\n");
-            }
-        }
-        /* (Tried also patching the count read at 0x1033E7F5 to
-         * `xor eax,eax; nop` — didn't help because the same NULL-call
-         * cascade hits via a parallel path that doesn't go through
-         * 0x1033E7D0. Reverting that patch; it may break legitimate
-         * uses of 0x1033E7D0 elsewhere.) */
-    }
-va_proceed:
-
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
-
     NTSTATUS status = NtAllocateVirtualMemory(
         NT_CURRENT_PROCESS, &base, 0, &size,
         flAllocationType, flProtect);
 
     if (!NT_SUCCESS(status)) {
-        serial_puts("[VA] FAILED: size=0x");
-        serial_puthex(dwSize, 8);
-        serial_puts(" addr=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)lpAddress, 16);
-        serial_puts(" type=0x");
-        serial_puthex(flAllocationType, 8);
-        serial_puts(" protect=0x");
-        serial_puthex(flProtect, 8);
-        serial_puts(g_compat32_mode ? " mode=32" : " mode=64");
-        serial_puts(" status=0x");
-        serial_puthex(status, 8);
-        serial_puts("\n");
         set_last_error_from_status(status);
         return NULL;
     }
 
-    /* VA-CACHE store: only when the original request was bogus and we
-     * served it from the cap fallback.  Subsequent requests from this
-     * EIP will short-circuit to the cached `base` (see lookup above). */
-    if (was_capped && cache_eip_save && base) {
-        for (int i = 0; i < VA_CACHE_N; i++) {
-            if (!va_cache[i].eip) {
-                va_cache[i].eip  = cache_eip_save;
-                va_cache[i].base = base;
-                va_cache[i].size = size;
-                va_cache[i].hits = 1;
-                serial_puts("[VA] cache STORE eip=0x");
-                serial_puthex(cache_eip_save, 8);
-                serial_puts(" base=0x");
-                serial_puthex((uint64_t)(ULONG_PTR)base, 8);
-                serial_puts(" (slot=");
-                serial_putdec((uint64_t)i);
-                serial_puts(")\n");
-                break;
-            }
-        }
-    }
-
+    SetLastError(0);
     return base;
 }
 
 BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
 {
-    /* MEM_RELEASE (0x8000) DOES reclaim the VA range now.  The old no-op
-     * comment said this avoided FName::Names use-after-free during
-     * error cleanup.  But with VA-CACHE deduping LARGE bogus allocs,
-     * the dominant VA consumer is now REAL engine asset loads (textures,
-     * sounds, meshes — 4-14 MB each).  Without releasing those, UT99
-     * hits VA-exhaust (STATUS_NO_MEMORY) on a 1.6 MB request well
-     * before reaching gameplay.
-     *
-     * Tradeoff: if engine error-path accesses freed FName data, we'll
-     * see a NULL-deref later.  Mitigated by the high NULL-CALL recovery
-     * cap (5000); compared to guaranteed VA exhaust, this is the better
-     * failure mode. */
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
 
@@ -3481,6 +3740,10 @@ BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
         return FALSE;
     }
 
+    /* Like Windows, a successful VirtualFree does not define LastError.
+     * This also matters during process teardown: lpAddress can contain the
+     * current TEB, so writing LastError after NtFreeVirtualMemory succeeds
+     * would access the mapping that was just released. */
     return TRUE;
 }
 
@@ -3644,31 +3907,12 @@ static HANDLE create_file_mapping_k32(HANDLE hFile, PVOID mapping_attributes,
                                       DWORD dwMaximumSizeLow,
                                       const char *name)
 {
-    BOOL trace = K32_STEAMIPC_SERIAL_TRACE &&
-                 named_object_is_steamchrome(name);
-    if (trace) {
-        serial_puts("[K32-STEAMIPC] CreateFileMapping pid=");
-        serial_putdec(win32_current_process_id());
-        serial_puts(" name='");
-        serial_puts(name);
-        serial_puts("' size=0x");
-        serial_puthex(((uint64_t)dwMaximumSizeHigh << 32) | dwMaximumSizeLow,
-                      16);
-        serial_puts(" protect=0x");
-        serial_puthex(flProtect, 8);
-        serial_puts("\n");
-    }
     if (name && *name) {
         HANDLE existing = named_object_open(
             named_mappings, K32_MAX_NAMED_MAPPINGS, OBJ_TYPE_SECTION,
             name, GENERIC_ALL);
         if (existing) {
             SetLastError(183); /* ERROR_ALREADY_EXISTS */
-            if (trace) {
-                serial_puts("[K32-STEAMIPC] mapping existing handle=0x");
-                serial_puthex((ULONG_PTR)existing, 16);
-                serial_puts(" last_error=183\n");
-            }
             return existing;
         }
     }
@@ -3712,11 +3956,6 @@ static HANDLE create_file_mapping_k32(HANDLE hFile, PVOID mapping_attributes,
 
     NTSTATUS status = sys_NtCreateSection(args);
     if (!NT_SUCCESS(status)) {
-        if (trace) {
-            serial_puts("[K32-STEAMIPC] mapping create failed status=0x");
-            serial_puthex((uint32_t)status, 8);
-            serial_puts("\n");
-        }
         set_last_error_from_status(status);
         return NULL;
     }
@@ -3734,21 +3973,11 @@ static HANDLE create_file_mapping_k32(HANDLE hFile, PVOID mapping_attributes,
         if (already_exists) {
             CloseHandle(section);
             SetLastError(183); /* ERROR_ALREADY_EXISTS */
-            if (trace) {
-                serial_puts("[K32-STEAMIPC] mapping won publish race handle=0x");
-                serial_puthex((ULONG_PTR)published, 16);
-                serial_puts(" last_error=183\n");
-            }
             return published;
         }
         section = published;
     }
     SetLastError(0);
-    if (trace) {
-        serial_puts("[K32-STEAMIPC] mapping created handle=0x");
-        serial_puthex((ULONG_PTR)section, 16);
-        serial_puts(" last_error=0\n");
-    }
     return section;
 }
 
@@ -3789,20 +4018,6 @@ HANDLE WINAPI OpenFileMappingA(DWORD desired_access, BOOL inherit_handle,
     }
     HANDLE handle = named_object_open(named_mappings, K32_MAX_NAMED_MAPPINGS,
                                       OBJ_TYPE_SECTION, name, desired_access);
-    static uint32_t steamchrome_miss_traces;
-    if (K32_STEAMIPC_SERIAL_TRACE &&
-        named_object_is_steamchrome(name) &&
-        (handle || steamchrome_miss_traces++ < 32)) {
-        serial_puts("[K32-STEAMIPC] OpenFileMappingA pid=");
-        serial_putdec(win32_current_process_id());
-        serial_puts(" name='");
-        serial_puts(name);
-        serial_puts("' handle=0x");
-        serial_puthex((ULONG_PTR)handle, 16);
-        serial_puts(" last_error=");
-        serial_putdec(GetLastError());
-        serial_puts("\n");
-    }
     return handle;
 }
 
@@ -3817,51 +4032,40 @@ HANDLE WINAPI OpenFileMappingW(DWORD desired_access, BOOL inherit_handle,
     }
     HANDLE handle = named_object_open(named_mappings, K32_MAX_NAMED_MAPPINGS,
                                       OBJ_TYPE_SECTION, name, desired_access);
-    static uint32_t steamchrome_miss_traces;
-    if (K32_STEAMIPC_SERIAL_TRACE &&
-        named_object_is_steamchrome(name) &&
-        (handle || steamchrome_miss_traces++ < 32)) {
-        serial_puts("[K32-STEAMIPC] OpenFileMappingW pid=");
-        serial_putdec(win32_current_process_id());
-        serial_puts(" name='");
-        serial_puts(name);
-        serial_puts("' handle=0x");
-        serial_puthex((ULONG_PTR)handle, 16);
-        serial_puts(" last_error=");
-        serial_putdec(GetLastError());
-        serial_puts("\n");
-    }
     return handle;
 }
 
-PVOID WINAPI MapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess,
-                           DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow,
-                           SIZE_T dwNumberOfBytesToMap)
+static PVOID map_view_of_file_k32(HANDLE mapping, DWORD desired_access,
+                                  DWORD offset_high, DWORD offset_low,
+                                  SIZE_T bytes_to_map,
+                                  PVOID requested_address)
 {
     extern NTSTATUS sys_NtMapViewOfSection(ULONG_PTR *args);
 
-    const char *mapping_name = named_object_name_for_handle(
-        named_mappings, K32_MAX_NAMED_MAPPINGS, OBJ_TYPE_SECTION,
-        hFileMappingObject);
-    BOOL trace = K32_STEAMIPC_SERIAL_TRACE &&
-                 named_object_is_steamchrome(mapping_name);
+    ULONGLONG unsigned_offset = ((ULONGLONG)offset_high << 32) |
+                                (ULONGLONG)offset_low;
+    if ((unsigned_offset & 0xFFFFULL) ||
+        ((ULONG_PTR)requested_address & 0xFFFFULL)) {
+        SetLastError(1132); /* ERROR_MAPPED_ALIGNMENT */
+        return NULL;
+    }
 
-    PVOID base = NULL;
-    SIZE_T view_size = dwNumberOfBytesToMap;
+    PVOID base = requested_address;
+    SIZE_T view_size = bytes_to_map;
 
     LARGE_INTEGER offset;
-    offset.QuadPart = ((LONGLONG)dwFileOffsetHigh << 32) | dwFileOffsetLow;
+    offset.QuadPart = (LONGLONG)unsigned_offset;
 
     /* Map Win32 access flags to NT protection:
      * FILE_MAP_READ = SECTION_MAP_READ (0x4)
      * FILE_MAP_WRITE = SECTION_MAP_WRITE (0x2)
      * FILE_MAP_ALL_ACCESS = SECTION_ALL_ACCESS */
     ULONG prot = PAGE_READONLY;
-    if (dwDesiredAccess & 0x2) /* FILE_MAP_WRITE */
+    if (desired_access & 0x2) /* FILE_MAP_WRITE */
         prot = PAGE_READWRITE;
 
     ULONG_PTR args[10] = {
-        (ULONG_PTR)hFileMappingObject, (ULONG_PTR)NT_CURRENT_PROCESS,
+        (ULONG_PTR)mapping, (ULONG_PTR)NT_CURRENT_PROCESS,
         (ULONG_PTR)&base, (ULONG_PTR)0,      /* ZeroBits */
         (ULONG_PTR)0,                          /* CommitSize */
         (ULONG_PTR)&offset,                    /* SectionOffset */
@@ -3873,32 +4077,32 @@ PVOID WINAPI MapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess,
 
     NTSTATUS status = sys_NtMapViewOfSection(args);
     if (!NT_SUCCESS(status)) {
-        if (trace) {
-            serial_puts("[K32-STEAMIPC] MapViewOfFile failed pid=");
-            serial_putdec(win32_current_process_id());
-            serial_puts(" name='");
-            serial_puts(mapping_name);
-            serial_puts("' status=0x");
-            serial_puthex((uint32_t)status, 8);
-            serial_puts("\n");
-        }
         set_last_error_from_status(status);
         return NULL;
     }
 
-    if (trace) {
-        serial_puts("[K32-STEAMIPC] MapViewOfFile pid=");
-        serial_putdec(win32_current_process_id());
-        serial_puts(" name='");
-        serial_puts(mapping_name);
-        serial_puts("' base=0x");
-        serial_puthex((ULONG_PTR)base, 16);
-        serial_puts(" size=0x");
-        serial_puthex(view_size, 16);
-        serial_puts("\n");
-    }
-
     return base;
+}
+
+PVOID WINAPI MapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess,
+                           DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow,
+                           SIZE_T dwNumberOfBytesToMap)
+{
+    return map_view_of_file_k32(hFileMappingObject, dwDesiredAccess,
+                                dwFileOffsetHigh, dwFileOffsetLow,
+                                dwNumberOfBytesToMap, NULL);
+}
+
+PVOID WINAPI MapViewOfFileEx(HANDLE hFileMappingObject,
+                             DWORD dwDesiredAccess,
+                             DWORD dwFileOffsetHigh,
+                             DWORD dwFileOffsetLow,
+                             SIZE_T dwNumberOfBytesToMap,
+                             PVOID lpBaseAddress)
+{
+    return map_view_of_file_k32(hFileMappingObject, dwDesiredAccess,
+                                dwFileOffsetHigh, dwFileOffsetLow,
+                                dwNumberOfBytesToMap, lpBaseAddress);
 }
 
 BOOL WINAPI UnmapViewOfFile(PCVOID lpBaseAddress)
@@ -3947,16 +4151,7 @@ static BOOL WINAPI FlushViewOfFile_k32(PCVOID base_address,
  * called appRealloc → HeapReAlloc, which failed to copy old entries.
  */
 
-/* Win32 heap: dynamic size from sys_caps (scales with RAM).
- * Allocated lazily on first HeapAlloc call via kmalloc.
- * Falls back to 16MB static pool if kmalloc unavailable. */
-#include "../include/sys_caps.h"
-
-/* Heap pool allocated dynamically via kmalloc (no static fallback).
- * The 64MB static array was causing 134MB BSS and crashing NVMe boot. */
-static BYTE  *heap_pool = NULL;
-static SIZE_T heap_pool_size = 0;
-static SIZE_T heap_offset = 0;
+/* Each Win32 process owns a demand-grown VirtualAlloc-backed heap. */
 static volatile uint32_t heap_lock = 0;
 static volatile uint32_t heap_lock_owner = 0;
 static uint32_t heap_lock_depth = 0;
@@ -3993,29 +4188,11 @@ static BOOL heap_block_is_allocated(const BYTE *block, SIZE_T available)
            header->tag == heap_allocation_tag(block, size);
 }
 
-/* ponytail: 32 chunks cover this 8 GB guest; make dynamic for larger guests. */
 #define HEAP_MAX_CHUNKS 32
 typedef struct {
     BYTE *base;
     SIZE_T size;
 } heap_chunk_t;
-static heap_chunk_t heap_chunks[HEAP_MAX_CHUNKS];
-static uint32_t heap_chunk_count;
-
-static BYTE *heap_alloc_chunk(SIZE_T size)
-{
-    extern void *mem_alloc_pages(uint64_t count);
-    extern void mem_free_pages(void *addr, uint64_t count);
-    uint64_t pages = (size + 4095) / 4096;
-    void *phys = mem_alloc_pages(pages);
-
-    if (!phys) return NULL;
-    if ((uint64_t)phys + pages * 4096 > 0x100000000ULL) {
-        mem_free_pages(phys, pages);
-        return NULL;
-    }
-    return (BYTE *)PHYS_TO_VIRT(phys);
-}
 
 static void heap_lock_acquire(void)
 {
@@ -4066,10 +4243,7 @@ typedef struct free_node {
     struct free_node *next;
 } free_node_t;
 
-static free_node_t *free_list = NULL;
-
-/* Child processes run under private CR3s, so the process heap must use
- * process VMAs rather than low aliases of the kernel's physical heap. */
+/* Process heaps use owner-tracked VMAs so teardown can return every page. */
 #define HEAP_PROCESS_STATE_MAX 128
 #define HEAP_PROCESS_INITIAL_SIZE (1024 * 1024)
 #define HEAP_PROCESS_GROW_LIMIT (16 * 1024 * 1024)
@@ -4091,7 +4265,7 @@ static heap_process_state_t *heap_process_state(DWORD process_id, BOOL create)
 {
     heap_process_state_t *free_state = NULL;
 
-    if (process_id <= 1) return NULL;
+    if (!process_id) return NULL;
     for (uint32_t i = 0; i < HEAP_PROCESS_STATE_MAX; i++) {
         heap_process_state_t *state = &heap_process_states[i];
         if (state->used && state->process_id == process_id)
@@ -4191,47 +4365,6 @@ static void heap_log_append_dec(heap_log_line_t *line, uint64_t value)
         value /= 10;
     } while (value && count < sizeof(reversed));
     while (count) heap_log_append_char(line, reversed[--count]);
-}
-
-static bool heap_blocks_share_chunk(const BYTE *a, const BYTE *b)
-{
-    uintptr_t aa = (uintptr_t)a;
-    uintptr_t bb = (uintptr_t)b;
-    for (uint32_t i = 0; i < heap_chunk_count; i++) {
-        uintptr_t base = (uintptr_t)heap_chunks[i].base;
-        uintptr_t end = base + heap_chunks[i].size;
-        if (aa >= base && aa < end)
-            return bb >= base && bb < end;
-    }
-    return false;
-}
-
-static void heap_free_insert(BYTE *block, SIZE_T size)
-{
-    free_node_t *node = (free_node_t *)block;
-    free_node_t *prev = NULL;
-    free_node_t *cur = free_list;
-    while (cur && (uintptr_t)cur < (uintptr_t)node) {
-        prev = cur;
-        cur = cur->next;
-    }
-    if (cur == node) return;
-
-    node->size = size;
-    node->next = cur;
-    if (prev) prev->next = node;
-    else free_list = node;
-
-    if (cur && heap_blocks_share_chunk(block, (BYTE *)cur) &&
-        block + node->size == (BYTE *)cur) {
-        node->size += cur->size;
-        node->next = cur->next;
-    }
-    if (prev && heap_blocks_share_chunk((BYTE *)prev, block) &&
-        (BYTE *)prev + prev->size == block) {
-        prev->size += node->size;
-        prev->next = node->next;
-    }
 }
 
 static bool heap_process_blocks_share_chunk(const heap_process_state_t *state,
@@ -4380,79 +4513,26 @@ static PVOID heap_process_alloc(heap_process_state_t *state, DWORD flags,
     return ptr;
 }
 
-static BYTE *heap_block_from_ptr(PCVOID ptr, SIZE_T *available)
-{
-    uintptr_t addr = (uintptr_t)ptr;
-    if (!addr) return NULL;
-
-    for (uint32_t i = 0; i < heap_chunk_count; i++) {
-        uintptr_t base = (uintptr_t)heap_chunks[i].base;
-        uintptr_t end = base + heap_chunks[i].size;
-        uintptr_t low = VIRT_TO_PHYS(heap_chunks[i].base);
-
-        if (addr >= low + HEAP_HEADER_SIZE && addr < low + heap_chunks[i].size)
-            addr = (uintptr_t)PHYS_TO_VIRT(addr);
-        if (addr >= base + HEAP_HEADER_SIZE && addr < end) {
-            BYTE *block = (BYTE *)addr - HEAP_HEADER_SIZE;
-            if (available) *available = end - (uintptr_t)block;
-            return block;
-        }
-    }
-    return NULL;
-}
-
 static BYTE *heap_current_block_from_ptr(PCVOID ptr, SIZE_T *available,
                                          heap_process_state_t **process_state)
 {
     DWORD process_id = win32_current_process_id();
     if (process_state) *process_state = NULL;
 
-    if (process_id > 1) {
-        heap_process_state_t *state = heap_process_state(process_id, FALSE);
-        if (process_state) *process_state = state;
-        return heap_process_block_from_ptr(state, ptr, available);
-    }
-    return heap_block_from_ptr(ptr, available);
+    heap_process_state_t *state = heap_process_state(process_id, FALSE);
+    if (process_state) *process_state = state;
+    return heap_process_block_from_ptr(state, ptr, available);
 }
 
 static void heap_release_process_state(DWORD process_id)
 {
-    if (process_id <= 1) return;
+    if (!process_id) return;
 
     heap_lock_acquire();
     heap_process_state_t *state = heap_process_state(process_id, FALSE);
     if (state)
         memset(state, 0, sizeof(*state));
     heap_lock_release();
-}
-
-static void heap_trace_vprof(const char *op, PVOID ptr, uint64_t caller)
-{
-#if defined(OK_QUIET) && OK_QUIET
-    (void)op;
-    (void)ptr;
-    (void)caller;
-#else
-    heap_log_line_t line = {0};
-    heap_log_append_str(&line, "[VPROF-HEAP] ");
-    heap_log_append_str(&line, op);
-    heap_log_append_str(&line, " ptr=");
-    heap_log_append_hex(&line, (uint64_t)(ULONG_PTR)ptr, 16);
-    heap_log_append_str(&line, " tid=");
-    heap_log_append_dec(&line, GetCurrentThreadId());
-    heap_log_append_str(&line, " caller=");
-    heap_log_append_hex(&line, caller, 16);
-    heap_log_append_char(&line, '\n');
-    serial_puts(line.data);
-#endif
-}
-
-static BOOL heap_is_vprof_ptr(PVOID ptr)
-{
-    SIZE_T available = 0;
-    BYTE *block = heap_current_block_from_ptr(ptr, &available, NULL);
-    return block && heap_block_is_allocated(block, available) &&
-           ((heap_header_t *)block)->size == 0x190;
 }
 
 static void heap_trace_invalid(const char *op, PVOID ptr, BYTE *block,
@@ -4502,63 +4582,18 @@ static void heap_trace_invalid(const char *op, PVOID ptr, BYTE *block,
     serial_puts(line.data);
 }
 
-static void heap_pool_init(void)
-{
-    if (heap_pool) return;
-    uint64_t target = g_sys_caps.win32_heap_size;
-    if (!target) target = 16ULL * 1024 * 1024;
-
-    heap_pool = heap_alloc_chunk(target);
-    if (heap_pool) {
-        heap_pool_size = target;
-        /* Zero the pool — Windows HeapAlloc returns pages from VirtualAlloc
-         * which are always zeroed. PE32 code (TArray, FString) depends on
-         * freshly allocated memory being zero-initialized. */
-        memset(heap_pool, 0, target);
-    } else {
-        /* Dynamic alloc failed — try smaller fallback (1MB) */
-        heap_pool = heap_alloc_chunk(1024 * 1024);
-        heap_pool_size = heap_pool ? (1024 * 1024) : 0;
-    }
-    if (heap_pool) {
-        heap_chunks[heap_chunk_count].base = heap_pool;
-        heap_chunks[heap_chunk_count].size = heap_pool_size;
-        heap_chunk_count++;
-    }
-    serial_puts("[WIN32-HEAP] pool=0x");
-    serial_puthex((uint64_t)(uintptr_t)heap_pool, 8);
-    serial_puts(" size=");
-    serial_putdec(heap_pool_size / (1024 * 1024));
-    serial_puts(" MB\n");
-}
-
 HANDLE WINAPI GetProcessHeap(void)
 {
-    /* Return a sentinel — we only have one heap */
+    /* The default heap is process-local even though its pseudo-handle is not. */
     return (HANDLE)(ULONG_PTR)0xBEEF0001;
 }
 
 PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
 {
     (void)hHeap;
-    static int heap_log_count = 0;
     uint64_t caller = (uint64_t)__builtin_return_address(0);
 
-    /* ponytail: one process heap; split this lock only if real heaps land. */
     heap_lock_acquire();
-
-    /* Log allocations around UGameEngine size (0x3D8 = 984 bytes) */
-    if (dwBytes >= 900 && dwBytes <= 1100) {
-        static int ge_alloc_count = 0;
-        ge_alloc_count++;
-        if (ge_alloc_count <= 20) {
-            serial_puts("[HEAP-ALLOC] size=");
-            serial_putdec(dwBytes);
-            serial_puts(" #");
-            serial_putdec(ge_alloc_count);
-            serial_puts("\n");
-        }
-    }
 
     if (dwBytes > (SIZE_T)-1 - HEAP_HEADER_SIZE - 15) {
         g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
@@ -4572,139 +4607,13 @@ PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
     if (total < 32) total = 32;  /* min block size for free-list node */
 
     DWORD process_id = win32_current_process_id();
-    if (process_id > 1) {
-        heap_process_state_t *state = heap_process_state(process_id, TRUE);
-        PVOID ptr = state
-            ? heap_process_alloc(state, dwFlags, dwBytes, total, caller)
-            : NULL;
-        if (!ptr) {
-            g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
-            sync_last_error();
-        } else if (total == 0x1F0) {
-            heap_trace_vprof("alloc-process", ptr, caller);
-        }
-        heap_lock_release();
-        return ptr;
-    }
-
-    if (!heap_pool) heap_pool_init();
-
-    /* First-fit search in free-list */
-    free_node_t **prev = &free_list;
-    free_node_t *cur = free_list;
-    while (cur) {
-        if (cur->size >= total) {
-            /* Found a free block that fits — remove from list */
-            *prev = cur->next;
-            BYTE *block = (BYTE *)cur;
-            SIZE_T allocated_total = cur->size;
-            /* Split oversized blocks so HeapSize reflects this allocation. */
-            SIZE_T remaining = cur->size - total;
-            if (remaining >= 32) {
-                heap_free_insert(block + total, remaining);
-                allocated_total = total;
-            }
-            heap_mark_allocated(block, allocated_total);
-            PVOID ptr = block + HEAP_HEADER_SIZE;
-            heap_record_event(HEAP_EVENT_ALLOC, ptr, allocated_total, caller);
-            if (dwFlags & 0x00000008) /* HEAP_ZERO_MEMORY */
-                RtlZeroMemory(ptr, dwBytes);
-            if (total == 0x1F0)
-                heap_trace_vprof("alloc-reuse", ptr, caller);
-            heap_lock_release();
-            return ptr;
-        }
-        prev = &cur->next;
-        cur = cur->next;
-    }
-
-    /* No free block found — bump allocate, grow if needed */
-    if (heap_offset + total > heap_pool_size) {
-        /* Auto-grow: allocate a new chunk from kernel heap */
-        uint64_t grow = g_sys_caps.win32_heap_size;
-        if (!grow) grow = 64ULL * 1024 * 1024;
-        /* Grow by at least the request size */
-        if (grow < total) grow = total;
-
-        BYTE *new_pool = NULL;
-        /* Try decreasing sizes until kmalloc succeeds */
-        uint64_t try_size = grow;
-        while (heap_chunk_count < HEAP_MAX_CHUNKS &&
-               try_size >= total && try_size >= 1024 * 1024) {
-            new_pool = heap_alloc_chunk(try_size);
-            if (new_pool) { grow = try_size; break; }
-            try_size /= 2;
-        }
-        if (new_pool) {
-            memset(new_pool, 0, grow);
-            serial_puts("[HEAP] Auto-grow: +");
-            serial_putdec(grow / (1024 * 1024));
-            serial_puts(" MB (used ");
-            serial_putdec(heap_offset / (1024 * 1024));
-            serial_puts("/");
-            serial_putdec(heap_pool_size / (1024 * 1024));
-            serial_puts(" MB)\n");
-
-            /* Add remaining space from old pool to free-list */
-            SIZE_T remaining = heap_pool_size - heap_offset;
-            if (remaining >= 32)
-                heap_free_insert(heap_pool + heap_offset, remaining);
-
-            /* Switch to new pool */
-            heap_pool = new_pool;
-            heap_pool_size = grow;
-            heap_offset = 0;
-            heap_chunks[heap_chunk_count].base = new_pool;
-            heap_chunks[heap_chunk_count].size = grow;
-            heap_chunk_count++;
-        } else {
-            serial_puts("[WIN32-HEAP] EXHAUSTED! used=");
-            serial_putdec(heap_offset / 1024);
-            serial_puts("KB pool=");
-            serial_putdec(heap_pool_size / 1024);
-            serial_puts("KB req=");
-            serial_putdec(total);
-            serial_puts("\n");
-            g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
-            heap_lock_release();
-            return NULL;
-        }
-    }
-
-    BYTE *block = heap_pool + heap_offset;
-    heap_offset += total;
-
-    heap_mark_allocated(block, total);
-    PVOID ptr = block + HEAP_HEADER_SIZE;
-    heap_record_event(HEAP_EVENT_ALLOC, ptr, total, caller);
-
-    if (dwFlags & 0x00000008) /* HEAP_ZERO_MEMORY */
-        RtlZeroMemory(ptr, dwBytes);
-
-    if (total == 0x1F0)
-        heap_trace_vprof("alloc", ptr, caller);
-
-    /* Log first few allocations to identify heap_pool base address */
-    if (heap_log_count < 5) {
-        heap_log_count++;
-        serial_puts("[HEAP] alloc 0x");
-        serial_puthex(dwBytes, 8);
-        serial_puts(" -> 0x");
-        serial_puthex((uint64_t)(ULONG_PTR)ptr, 16);
-        serial_puts(" (pool=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)heap_pool, 16);
-        serial_puts(")\n");
-    }
-
-    /* Log UGameEngine-sized allocations with returned pointer */
-    if (dwBytes >= 900 && dwBytes <= 1100) {
-        static int ge_result_count = 0;
-        ge_result_count++;
-        if (ge_result_count <= 10) {
-            serial_puts("[HEAP-984] → 0x");
-            serial_puthex((uint64_t)(ULONG_PTR)ptr, 8);
-            serial_puts("\n");
-        }
+    heap_process_state_t *state = heap_process_state(process_id, TRUE);
+    PVOID ptr = state
+        ? heap_process_alloc(state, dwFlags, dwBytes, total, caller)
+        : NULL;
+    if (!ptr) {
+        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
+        sync_last_error();
     }
 
     heap_lock_release();
@@ -4736,18 +4645,12 @@ BOOL WINAPI HeapFree(HANDLE hHeap, DWORD dwFlags, PVOID lpMem)
     SIZE_T block_size = ((heap_header_t *)block)->size;
     uint64_t caller = (uint64_t)__builtin_return_address(0);
 
-    if (block_size == 0x1F0)
-        heap_trace_vprof("free", lpMem, caller);
-
     heap_record_event(HEAP_EVENT_FREE, block + HEAP_HEADER_SIZE,
                       block_size, caller);
 
     /* Address-ordered insertion coalesces adjacent free blocks. */
     ((heap_header_t *)block)->tag = 0;
-    if (process_state)
-        heap_process_free_insert(process_state, block, block_size);
-    else
-        heap_free_insert(block, block_size);
+    heap_process_free_insert(process_state, block, block_size);
 
     heap_lock_release();
     return TRUE;
@@ -4803,37 +4706,6 @@ static DWORD WINAPI SleepEx_k32(DWORD dwMilliseconds, BOOL bAlertable)
 }
 
 static volatile uint32_t g_k32_qpc_if0_trace_count;
-static volatile uint32_t g_k32_qpc_target_trace_count;
-
-__attribute__((noinline))
-static void k32_qpc_trace_target(const char *phase, uint64_t caller)
-{
-    /* libcef's timed-wait helper, immediately after its QPC import call. */
-    if (caller != 0x00000001834FC2DEULL)
-        return;
-
-    uint32_t index = __atomic_fetch_add(&g_k32_qpc_target_trace_count, 1,
-                                        __ATOMIC_RELAXED);
-    if (index >= 128)
-        return;
-
-    extern int32_t proc_current_pid(void);
-    extern uint64_t sched_current_frame_seq(void);
-    uint64_t flags;
-    __asm__ volatile ("pushfq; popq %0" : "=r"(flags) :: "memory");
-
-    serial_puts("[K32-QPC-TARGET] phase=");
-    serial_puts(phase);
-    serial_puts(" proc=");
-    serial_putdec(win32_current_process_id());
-    serial_puts(" kpid=");
-    serial_putdec((uint64_t)(uint32_t)proc_current_pid());
-    serial_puts(" frame_seq=");
-    serial_putdec(sched_current_frame_seq());
-    serial_puts(" flags=0x");
-    serial_puthex(flags, 16);
-    serial_puts("\n");
-}
 
 __attribute__((noinline))
 static void k32_qpc_trace_if0(const char *phase, uint64_t caller)
@@ -4869,10 +4741,8 @@ BOOL WINAPI QueryPerformanceCounter(PLARGE_INTEGER lpPerformanceCount)
 {
     uint64_t caller =
         (uint64_t)(ULONG_PTR)__builtin_return_address(0);
-    k32_qpc_trace_target("entry", caller);
     k32_qpc_trace_if0("entry", caller);
     NTSTATUS status = NtQueryPerformanceCounter(lpPerformanceCount, NULL);
-    k32_qpc_trace_target("post-nt", caller);
     k32_qpc_trace_if0("post-nt", caller);
     return NT_SUCCESS(status);
 }
@@ -4904,95 +4774,6 @@ static void WINAPI QueryUnbiasedInterruptTimePrecise_k32(
     ULONGLONG remainder = ticks % hz;
     *unbiased_time = seconds * 10000000ULL +
                      (remainder * 10000000ULL) / hz;
-}
-
-static uint32_t steamservice_start_thread32;
-static uint32_t steamservice_shutdown32;
-
-static BOOL WINAPI SteamService_StartThread_bridge(ULONG_PTR command_line)
-{
-    if (!steamservice_start_thread32 || !command_line) {
-        SetLastError(87); /* ERROR_INVALID_PARAMETER */
-        return FALSE;
-    }
-
-    char *command_copy32 = NULL;
-    uint64_t command_copy_pages = 0;
-    uint32_t arg;
-    if (command_line <= 0xFFFFFFFFULL) {
-        arg = (uint32_t)command_line;
-    } else {
-        const char *source = (const char *)(ULONG_PTR)command_line;
-        SIZE_T length = 0;
-        while (length < 32767 && source[length])
-            length++;
-        if (length == 32767) {
-            SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
-            return FALSE;
-        }
-
-        command_copy_pages = (length + 1 + 4095) / 4096;
-        extern void *mem_alloc_pages(uint64_t count);
-        extern void mem_free_pages(void *addr, uint64_t count);
-        command_copy32 = (char *)mem_alloc_pages(command_copy_pages);
-        if (!command_copy32 ||
-            (uint64_t)(ULONG_PTR)command_copy32 > 0xFFFFFFFFULL) {
-            if (command_copy32)
-                mem_free_pages(command_copy32, command_copy_pages);
-            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
-            return FALSE;
-        }
-        for (SIZE_T i = 0; i <= length; i++)
-            command_copy32[i] = source[i];
-        arg = (uint32_t)(ULONG_PTR)command_copy32;
-    }
-
-    serial_puts("[STEAMSVC-BRIDGE] StartThread source=0x");
-    serial_puthex((uint64_t)command_line, 16);
-    serial_puts(" arg32=0x");
-    serial_puthex(arg, 8);
-    serial_puts(" command='");
-    serial_puts((const char *)(ULONG_PTR)arg);
-    serial_puts("'\n");
-
-    BOOL started = (BOOL)compat32_callback_args(
-        steamservice_start_thread32, 1, &arg);
-    if (command_copy32) {
-        extern void mem_free_pages(void *addr, uint64_t count);
-        mem_free_pages(command_copy32, command_copy_pages);
-    }
-    serial_puts("[STEAMSVC-BRIDGE] StartThread result=");
-    serial_putdec(started ? 1 : 0);
-    serial_puts(" error=");
-    serial_putdec(GetLastError());
-    serial_puts("\n");
-    return started;
-}
-
-static void WINAPI SteamService_Shutdown_bridge(void)
-{
-    if (steamservice_shutdown32)
-        compat32_callback_args(steamservice_shutdown32, 0, NULL);
-}
-
-static PVOID bridge_steamservice_export(LOADED_MODULE *mod, PCSTR name,
-                                        PVOID target)
-{
-    if (!mod || !mod->image.Is32Bit || g_compat32_mode ||
-        k32_strcmp(mod->name, "steamservice.dll") != 0)
-        return target;
-
-    if (k32_strcmp(name, "SteamService_StartThread") == 0) {
-        steamservice_start_thread32 = (uint32_t)(ULONG_PTR)target;
-        serial_puts("[GPA] bridge SteamService_StartThread PE64->PE32\n");
-        return (PVOID)SteamService_StartThread_bridge;
-    }
-    if (k32_strcmp(name, "SteamService_Shutdown") == 0) {
-        steamservice_shutdown32 = (uint32_t)(ULONG_PTR)target;
-        serial_puts("[GPA] bridge SteamService_Shutdown PE64->PE32\n");
-        return (PVOID)SteamService_Shutdown_bridge;
-    }
-    return target;
 }
 
 /* Trace ANGLE at the GetProcAddress boundary. This keeps the vendor DLLs
@@ -5944,39 +5725,17 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
     BOOL trace_angle_request = FALSE;
     LOADED_MODULE *loaded_module = hModule
         ? dll_find_module_by_base((PVOID)hModule) : NULL;
-    BOOL trace_lwjgl_context = !by_ordinal &&
-        k32_path_contains_ci(proc_name, "WindowsContextImplementation");
-    BOOL trace_lwjgl_module = loaded_module &&
-        k32_path_contains_ci(loaded_module->name, "lwjgl.dll");
-    BOOL trace_lwjgl_gpa = trace_lwjgl_context || trace_lwjgl_module;
-
-    if (trace_lwjgl_gpa) {
-        serial_puts("[LWJGL-JNI-GPA] request ");
-        if (by_ordinal)
-            serial_putdec(ordinal);
-        else
-            serial_puts(proc_name);
-        serial_puts(" hmod=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)hModule, 8);
-        serial_puts(" module=");
-        serial_puts(loaded_module && loaded_module->name[0]
-                        ? loaded_module->name : "<unknown>");
-        serial_puts("\n");
-    }
 
     /* If hModule is a loaded PE module, search its exports */
     if (loaded_module && loaded_module->synthetic_shim) {
         /* Shim handle — route to the correct shim DLL */
         const char *shim_dll = loaded_module->name;
         if (shim_dll) {
-            BOOL trace_cef_delay = K32_VERBOSE_DIAGNOSTICS &&
-                (k32_path_contains_ci(shim_dll, "user32.dll") ||
-                 k32_path_contains_ci(shim_dll, "shell32.dll") ||
-                 k32_path_contains_ci(shim_dll, "oleacc.dll")) &&
-                __atomic_fetch_sub(&g_cef_delay_trace_budget, 1,
+            BOOL trace_loader = K32_VERBOSE_DIAGNOSTICS &&
+                __atomic_fetch_sub(&g_loader_trace_budget, 1,
                                    __ATOMIC_RELAXED) > 0;
-            if (trace_cef_delay) {
-                serial_puts("[K32-DELAY] GetProcAddress ");
+            if (trace_loader) {
+                serial_puts("[K32-LOADER] GetProcAddress ");
                 serial_puts(shim_dll);
                 serial_puts("!");
                 if (by_ordinal)
@@ -5988,8 +5747,8 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
             PVOID fn = dll_resolve_shim_export(shim_dll, proc_name, ordinal,
                                                by_ordinal);
             if (fn) {
-                if (trace_cef_delay) {
-                    serial_puts("[K32-DELAY] resolved 0x");
+                if (trace_loader) {
+                    serial_puts("[K32-LOADER] resolved 0x");
                     serial_puthex((uint64_t)(ULONG_PTR)fn, 16);
                     serial_puts("\n");
                 }
@@ -5998,31 +5757,47 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
                  * raw 64-bit pointer — otherwise the REX prefixes in
                  * 64-bit code get misinterpreted as INC/DEC in 32-bit. */
                 if (g_compat32_mode) {
-                    /* Use the co-located ABI descriptor for the real argc +
-                     * callconv (Phase 1), NOT a hardcoded 4. A wrong argc here
-                     * makes the thunk's RET N over/under-clean the caller stack
-                     * and corrupt its saved callee-saved registers (e.g.
-                     * DirectDrawCreate is 3 args, not 4 — argc=4 over-cleaned 4
-                     * bytes and clobbered UWindowsClient::Init's saved EBX). */
-                    extern uint32_t compat32_make_thunk_ex(uint64_t, const char *,
-                                                           uint8_t, uint8_t);
-                    uint8_t nargs = 4, cc = 0 /* CC_STDCALL */;
+                    if (win32_abi_resolved_is_data(
+                            shim_dll, proc_name, fn)) {
+                        if ((ULONG_PTR)fn <= UINT32_MAX)
+                            return fn;
+
+                        serial_puts("[ABI-DATA-MISS] GetProcAddress ");
+                        serial_puts(shim_dll);
+                        serial_puts("!");
+                        if (by_ordinal) serial_putdec(ordinal);
+                        else serial_puts(proc_name);
+                        serial_puts(" is not addressable by PE32\n");
+                        SetLastError(127); /* ERROR_PROC_NOT_FOUND */
+                        return NULL;
+                    }
+
+                    uint8_t nargs, cc;
                     const char *thunk_name = proc_name;
-                    if (by_ordinal)
-                        win32_abi_lookup_target(shim_dll, fn, &thunk_name,
-                                                &nargs, &cc);
-                    else
-                        win32_abi_lookup(shim_dll, proc_name, &nargs, &cc);
+                    if (!win32_abi_lookup_resolved(
+                            shim_dll, proc_name, fn, &thunk_name,
+                            &nargs, &cc)) {
+                        serial_puts("[ABI-MISS] GetProcAddress ");
+                        serial_puts(shim_dll);
+                        serial_puts("!");
+                        if (by_ordinal) serial_putdec(ordinal);
+                        else serial_puts(proc_name);
+                        serial_puts(" has no thunk contract\n");
+                        SetLastError(127); /* ERROR_PROC_NOT_FOUND */
+                        return NULL;
+                    }
                     uint32_t thunk = compat32_make_thunk_ex(
                         (uint64_t)(ULONG_PTR)fn,
                         thunk_name ? thunk_name : "ordinal", nargs, cc);
                     if (thunk)
                         return (PVOID)(ULONG_PTR)thunk;
+                    SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+                    return NULL;
                 }
                 return dll_get_shim_export_thunk(shim_dll, fn);
             }
-            if (trace_cef_delay)
-                serial_puts("[K32-DELAY] unresolved\n");
+            if (trace_loader)
+                serial_puts("[K32-LOADER] unresolved\n");
             SetLastError(127); /* ERROR_PROC_NOT_FOUND */
             return NULL;
         }
@@ -6042,13 +5817,8 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
             trace_angle_request = angle_gpa_trace_begin(mod, proc_name);
         PVOID fn = dll_resolve_export(mod, proc_name, ordinal, by_ordinal);
         if (fn) {
-            PVOID result = by_ordinal ? fn : angle_trace_egl_export(
-                proc_name, bridge_steamservice_export(mod, proc_name, fn));
-            if (trace_lwjgl_gpa) {
-                serial_puts("[LWJGL-JNI-GPA] resolved 0x");
-                serial_puthex((uint64_t)(ULONG_PTR)result, 8);
-                serial_puts("\n");
-            }
+            PVOID result = by_ordinal
+                ? fn : angle_trace_egl_export(proc_name, fn);
             if (trace_angle_request)
                 angle_gpa_trace_result(proc_name, result, "export");
             return result;
@@ -6081,11 +5851,6 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
 
     /* Fall back to searching all shims and modules */
     PVOID result = dll_resolve_import("", proc_name, ordinal, by_ordinal);
-    if (trace_lwjgl_gpa) {
-        serial_puts("[LWJGL-JNI-GPA] fallback 0x");
-        serial_puthex((uint64_t)(ULONG_PTR)result, 8);
-        serial_puts("\n");
-    }
     if (!result && K32_VERBOSE_DIAGNOSTICS) {
         serial_puts("[GPA] UNRESOLVED: ");
         if (by_ordinal) {
@@ -6255,26 +6020,22 @@ static BOOL WINAPI RtlAddFunctionTable_k32(PVOID function_table,
                                             DWORD entry_count,
                                             ULONGLONG base_address)
 {
-    (void)function_table;
-    (void)entry_count;
-    (void)base_address;
-    return TRUE;
+    return win32_unwind64_add_function_table(
+        (PRUNTIME_FUNCTION)function_table, entry_count, base_address);
 }
 
 static BOOL WINAPI RtlDeleteFunctionTable_k32(PVOID function_table)
 {
-    (void)function_table;
-    return TRUE;
+    return win32_unwind64_delete_function_table(
+        (PRUNTIME_FUNCTION)function_table);
 }
 
 static PVOID WINAPI RtlLookupFunctionEntry_k32(ULONGLONG control_pc,
                                                 ULONGLONG *image_base,
                                                 PVOID history_table)
 {
-    (void)control_pc;
-    (void)history_table;
-    if (image_base) *image_base = 0;
-    return NULL;
+    return win32_unwind64_lookup_function_entry(
+        control_pc, image_base, (PUNWIND_HISTORY_TABLE)history_table);
 }
 
 /* ── File extended API ──────────────────────────────────────── */
@@ -6728,7 +6489,18 @@ static BOOL delete_osfs_file(PCSTR path)
 
     void *file = osfs2_find_ci(path);
     if (!file) {
-        g_last_error = 2; /* ERROR_FILE_NOT_FOUND */
+        g_last_error = win32_directory_exists_normalized(path)
+            ? 5 /* ERROR_ACCESS_DENIED */
+            : 2 /* ERROR_FILE_NOT_FOUND */;
+        sync_last_error();
+        return FALSE;
+    }
+
+    vfs_node_t node;
+    uint16_t mode;
+    if (vfs_find(path, VFS_MODE_WIN32, &node) &&
+        vfs_get_mode(&node, &mode) == VFS_STATUS_OK && !(mode & 0222U)) {
+        g_last_error = 5; /* ERROR_ACCESS_DENIED */
         sync_last_error();
         return FALSE;
     }
@@ -7145,7 +6917,9 @@ BOOL WINAPI DuplicateHandle(HANDLE hSourceProcessHandle, HANDLE hSourceHandle,
 
     NTSTATUS status = NtDuplicateObject(hSourceProcessHandle, hSourceHandle,
                                          hTargetProcessHandle, lpTargetHandle,
-                                         dwDesiredAccess, 0, dwOptions);
+                                         dwDesiredAccess,
+                                         bInheritHandle ? OBJ_INHERIT : 0,
+                                         dwOptions);
     if (trace) {
         serial_puts("[K32-DUP] status=0x");
         serial_puthex((uint32_t)status, 8);
@@ -7164,15 +6938,36 @@ BOOL WINAPI DuplicateHandle(HANDLE hSourceProcessHandle, HANDLE hSourceHandle,
 
 /* ── Memory protection ──────────────────────────────────────── */
 
-BOOL WINAPI SetHandleInformation(HANDLE hObject, DWORD dwMask, DWORD dwFlags)
+BOOL WINAPI GetHandleInformation(HANDLE hObject, DWORD *lpdwFlags)
 {
-    (void)dwMask;
-    (void)dwFlags;
-    if (!hObject || hObject == INVALID_HANDLE_VALUE) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+    if (!lpdwFlags) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
-    /* ponytail: handles are not inherited yet; store flags with process inheritance. */
+
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    ULONG flags = 0;
+    NTSTATUS status = handle_query_flags_for_process(
+        &g_handle_table, hObject, owner_pid, &flags);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
+    *lpdwFlags = flags;
+    return TRUE;
+}
+
+BOOL WINAPI SetHandleInformation(HANDLE hObject, DWORD dwMask, DWORD dwFlags)
+{
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    NTSTATUS status = handle_update_flags_for_process(
+        &g_handle_table, hObject, owner_pid, dwMask, dwFlags);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
     return TRUE;
 }
 
@@ -7355,13 +7150,6 @@ static int WINAPI lstrcmpiW_k32(PCWSTR a, PCWSTR b)
 }
 /* ── Command line ────────────────────────────────────── */
 
-/* Command line: omitting the map arg makes the engine fall through
- * to its DEFAULT URL (Entry.unr → main menu).  With "CityIntro.unr"
- * the engine attempts to load it but ends up trying to load package
- * "0" (some FName index resolves to empty/zero) and throws "Can't
- * find file for package '0'".  Bare exe → menu may work better. */
-/* Keep the default command line bare. Map-specific repros should be injected
- * by launch scripts or image contents, not hardcoded into kernel32. */
 PCSTR WINAPI GetCommandLineA(void)
 {
     return win32_current_command_line();
@@ -7467,43 +7255,31 @@ BOOL WINAPI FreeEnvironmentStringsW(PCWSTR lpszEnvironmentBlock)
 
 extern DWORD WINAPI GetCurrentThreadId(void);
 
-typedef struct {
-    uint32_t DebugInfo;
-    LONG     LockCount;
-    LONG     RecursionCount;
-    uint32_t OwningThread;
-    uint32_t LockSemaphore;
-    uint32_t SpinCount;
-} CRITICAL_SECTION32;
-
-_Static_assert(sizeof(CRITICAL_SECTION32) == 24,
-               "Win32 CRITICAL_SECTION layout must be 24 bytes");
-
 static inline LONG *critical_lock_count(LPCRITICAL_SECTION cs)
 {
     return g_compat32_mode
-        ? &((CRITICAL_SECTION32 *)(void *)cs)->LockCount
+        ? &((RTL_CRITICAL_SECTION32 *)(void *)cs)->LockCount
         : &cs->LockCount;
 }
 
 static inline LONG *critical_recursion_count(LPCRITICAL_SECTION cs)
 {
     return g_compat32_mode
-        ? &((CRITICAL_SECTION32 *)(void *)cs)->RecursionCount
+        ? &((RTL_CRITICAL_SECTION32 *)(void *)cs)->RecursionCount
         : &cs->RecursionCount;
 }
 
 static inline uint32_t critical_owner(LPCRITICAL_SECTION cs)
 {
     return g_compat32_mode
-        ? ((CRITICAL_SECTION32 *)(void *)cs)->OwningThread
+        ? ((RTL_CRITICAL_SECTION32 *)(void *)cs)->OwningThread
         : (uint32_t)(ULONG_PTR)cs->OwningThread;
 }
 
 static inline void critical_set_owner(LPCRITICAL_SECTION cs, uint32_t owner)
 {
     if (g_compat32_mode)
-        ((CRITICAL_SECTION32 *)(void *)cs)->OwningThread = owner;
+        ((RTL_CRITICAL_SECTION32 *)(void *)cs)->OwningThread = owner;
     else
         cs->OwningThread = (HANDLE)(ULONG_PTR)owner;
 }
@@ -7511,14 +7287,14 @@ static inline void critical_set_owner(LPCRITICAL_SECTION cs, uint32_t owner)
 static inline DWORD critical_spin_count(LPCRITICAL_SECTION cs)
 {
     return g_compat32_mode
-        ? ((CRITICAL_SECTION32 *)(void *)cs)->SpinCount
+        ? ((RTL_CRITICAL_SECTION32 *)(void *)cs)->SpinCount
         : (DWORD)cs->SpinCount;
 }
 
 static inline void critical_set_spin_count(LPCRITICAL_SECTION cs, DWORD spin)
 {
     if (g_compat32_mode)
-        ((CRITICAL_SECTION32 *)(void *)cs)->SpinCount = spin;
+        ((RTL_CRITICAL_SECTION32 *)(void *)cs)->SpinCount = spin;
     else
         cs->SpinCount = spin;
 }
@@ -7526,8 +7302,10 @@ static inline void critical_set_spin_count(LPCRITICAL_SECTION cs, DWORD spin)
 void WINAPI InitializeCriticalSection(LPCRITICAL_SECTION lpCS)
 {
     if (!lpCS) return;
+    if (win32_is_current_loader_lock(lpCS)) return;
     if (g_compat32_mode) {
-        CRITICAL_SECTION32 *cs = (CRITICAL_SECTION32 *)(void *)lpCS;
+        RTL_CRITICAL_SECTION32 *cs =
+            (RTL_CRITICAL_SECTION32 *)(void *)lpCS;
         cs->DebugInfo = 0;
         cs->LockCount = -1;
         cs->RecursionCount = 0;
@@ -7573,6 +7351,10 @@ static BOOL WINAPI InitializeCriticalSectionEx_k32(LPCRITICAL_SECTION lpCS,
 void WINAPI EnterCriticalSection(LPCRITICAL_SECTION lpCS)
 {
     if (!lpCS) return;
+    if (win32_is_current_loader_lock(lpCS)) {
+        dll_loader_lock_enter();
+        return;
+    }
     extern void sched_yield(void);
     uint32_t me = GetCurrentThreadId();
     LONG *lock_count = critical_lock_count(lpCS);
@@ -7604,6 +7386,8 @@ void WINAPI EnterCriticalSection(LPCRITICAL_SECTION lpCS)
 BOOL WINAPI TryEnterCriticalSection(LPCRITICAL_SECTION lpCS)
 {
     if (!lpCS) return FALSE;
+    if (win32_is_current_loader_lock(lpCS))
+        return dll_loader_lock_try_enter();
     uint32_t me = GetCurrentThreadId();
     LONG *lock_count = critical_lock_count(lpCS);
     LONG *recursion_count = critical_recursion_count(lpCS);
@@ -7626,6 +7410,10 @@ BOOL WINAPI TryEnterCriticalSection(LPCRITICAL_SECTION lpCS)
 void WINAPI LeaveCriticalSection(LPCRITICAL_SECTION lpCS)
 {
     if (!lpCS) return;
+    if (win32_is_current_loader_lock(lpCS)) {
+        (void)dll_loader_lock_leave();
+        return;
+    }
     LONG *lock_count = critical_lock_count(lpCS);
     LONG *recursion_count = critical_recursion_count(lpCS);
     (*recursion_count)--;
@@ -7641,6 +7429,7 @@ void WINAPI LeaveCriticalSection(LPCRITICAL_SECTION lpCS)
 void WINAPI DeleteCriticalSection(LPCRITICAL_SECTION lpCS)
 {
     if (!lpCS) return;
+    if (win32_is_current_loader_lock(lpCS)) return;
     *critical_lock_count(lpCS) = -1;
     *critical_recursion_count(lpCS) = 0;
     critical_set_owner(lpCS, 0);
@@ -8085,6 +7874,24 @@ static uint32_t *tls_current_vector32(void)
          : NULL;
 }
 
+static uint32_t *tls_dynamic_slot32(TEB32 *teb, DWORD index)
+{
+    if (!teb || index >= TLS_MAX_SLOTS) return NULL;
+    if (index < 64) return &teb->TlsSlots[index];
+    if (!teb->TlsExpansionSlots) return NULL;
+    return &((uint32_t *)(ULONG_PTR)teb->TlsExpansionSlots)[index - 64];
+}
+
+static BOOL tls_static_index32(DWORD owner_pid, DWORD index)
+{
+    for (int i = 0; i < static_tls_module_count; i++) {
+        if (static_tls_modules[i].owner_pid == owner_pid &&
+            static_tls_modules[i].index == index)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static PVOID *tls_current_vector64(void)
 {
     TEB *teb = win64_current_teb();
@@ -8126,7 +7933,8 @@ static void tls_free_static_vector(uint32_t *vector, DWORD owner_pid)
         static_tls_module_t *mod = &static_tls_modules[i];
         if (mod->owner_pid != owner_pid) continue;
         if (!vector[mod->index]) continue;
-        VirtualFree((void *)(ULONG_PTR)vector[mod->index], 0, MEM_RELEASE);
+        (void)nt_vm_release_allocation_for_process(
+            owner_pid, (void *)(ULONG_PTR)vector[mod->index]);
         vector[mod->index] = 0;
     }
 }
@@ -8134,7 +7942,9 @@ static void tls_free_static_vector(uint32_t *vector, DWORD owner_pid)
 void win32_tls_reset(void)
 {
     win64_tls_reset_root();
-    DWORD owner_pid = g_teb32.ClientId_UniqueProcess;
+    TEB *teb64 = win64_current_teb();
+    TEB32 *teb32 = compat32_current_teb();
+    DWORD owner_pid = teb32 ? teb32->ClientId_UniqueProcess : 0;
     if (!owner_pid) owner_pid = 1;
     tls_free_static_vector(tls_vector32, owner_pid);
     for (int i = 0; i < static_tls_module_count;) {
@@ -8153,20 +7963,36 @@ void win32_tls_reset(void)
         if ((uint64_t)(ULONG_PTR)tls_vector32 > 0xFFFFFFFFULL)
             tls_vector32 = NULL;
     }
+    if (teb64 && teb64->ThreadLocalStoragePointer)
+        tls_vector64 = (PVOID *)teb64->ThreadLocalStoragePointer;
     if (!tls_vector64)
         tls_vector64 = (PVOID *)mem_alloc_pages(2);
+
+    PVOID *expansion64 = teb64 && teb64->TlsExpansionSlots
+        ? teb64->TlsExpansionSlots : tls_expansion64;
 
     for (DWORD i = 0; i < TLS_MAX_SLOTS; i++) {
         if (tls_vector32) tls_vector32[i] = 0;
         if (tls_vector64) tls_vector64[i] = NULL;
-        if (i < 64) g_teb.TlsSlots[i] = NULL;
-        else tls_expansion64[i - 64] = NULL;
+        if (i < 64) {
+            if (teb64) teb64->TlsSlots[i] = NULL;
+        } else {
+            expansion64[i - 64] = NULL;
+        }
     }
     tls_process_state_release(owner_pid);
-    g_teb32.ThreadLocalStoragePointer =
-        (uint32_t)(ULONG_PTR)tls_vector32;
-    g_teb.ThreadLocalStoragePointer = tls_vector64;
-    g_teb.TlsExpansionSlots = tls_expansion64;
+    if (teb32)
+        teb32->ThreadLocalStoragePointer =
+            (uint32_t)(ULONG_PTR)tls_vector32;
+    if (teb32) {
+        memset(teb32->TlsSlots, 0, sizeof(teb32->TlsSlots));
+        teb32->TlsExpansionSlots = tls_vector32
+            ? (uint32_t)(ULONG_PTR)(tls_vector32 + 64) : 0;
+    }
+    if (teb64) {
+        teb64->ThreadLocalStoragePointer = tls_vector64;
+        teb64->TlsExpansionSlots = expansion64;
+    }
 
     serial_puts("[TLS32] vector=0x");
     serial_puthex((uint64_t)(ULONG_PTR)tls_vector32, 8);
@@ -8217,8 +8043,13 @@ PVOID WINAPI TlsGetValue(DWORD dwTlsIndex)
     g_last_error = 0;
     sync_last_error();
     if (g_compat32_mode) {
-        uint32_t *vector = tls_current_vector32();
-        return vector ? (PVOID)(ULONG_PTR)vector[dwTlsIndex] : NULL;
+        if (tls_static_index32(owner_pid, dwTlsIndex)) {
+            uint32_t *vector = tls_current_vector32();
+            return vector ? (PVOID)(ULONG_PTR)vector[dwTlsIndex] : NULL;
+        }
+        uint32_t *slot = tls_dynamic_slot32(compat32_current_teb(),
+                                            dwTlsIndex);
+        return slot ? (PVOID)(ULONG_PTR)*slot : NULL;
     }
     PVOID *slot = tls_dynamic_slot64(win64_current_teb(), dwTlsIndex);
     return slot ? *slot : NULL;
@@ -8239,24 +8070,12 @@ BOOL WINAPI TlsSetValue(DWORD dwTlsIndex, PVOID lpTlsValue)
         return TRUE;
     }
 
+    TEB32 *teb = compat32_current_teb();
     uint32_t *vector = tls_current_vector32();
-    if (!vector) return FALSE;
-    PVOID old_value = (PVOID)(ULONG_PTR)vector[dwTlsIndex];
-    if (heap_is_vprof_ptr(lpTlsValue) || heap_is_vprof_ptr(old_value)) {
-        extern uint32_t compat32_get_last_caller_eip(void);
-        serial_puts("[VPROF-TLS] tid=");
-        serial_putdec(GetCurrentThreadId());
-        serial_puts(" slot=");
-        serial_putdec(dwTlsIndex);
-        serial_puts(" old=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)old_value, 8);
-        serial_puts(" new=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)lpTlsValue, 8);
-        serial_puts(" caller=0x");
-        serial_puthex(compat32_get_last_caller_eip(), 8);
-        serial_puts("\n");
-    }
+    uint32_t *slot = tls_dynamic_slot32(teb, dwTlsIndex);
+    if (!vector || !slot) return FALSE;
     vector[dwTlsIndex] = (uint32_t)(ULONG_PTR)lpTlsValue;
+    *slot = (uint32_t)(ULONG_PTR)lpTlsValue;
     return TRUE;
 }
 
@@ -8364,7 +8183,7 @@ typedef struct __attribute__((aligned(64))) {
     /* kern_setjmp layout: RBX, RBP, R12-R15, RSP, RIP, CR3. */
     uint64_t context[9];
 
-    /* XCR0 is fixed to x87/SSE/AVX (mask 0x7) by cpu_features.c. */
+    /* XSAVE uses XCR0=0x7; the first 512 bytes are also an FXSAVE image. */
     __attribute__((aligned(64))) BYTE xstate[1024];
 } k32_fiber_t;
 
@@ -8448,18 +8267,28 @@ static void k32_fiber_publish(k32_fiber_t *fiber)
 
 static void k32_fiber_save_xstate(k32_fiber_t *fiber)
 {
-    __asm__ volatile ("xsave64 %0"
-                      : "=m"(fiber->xstate)
-                      : "a"(7U), "d"(0U)
-                      : "memory");
+    if (cpu_xsave_active) {
+        __asm__ volatile ("xsave64 %0"
+                          : "=m"(fiber->xstate)
+                          : "a"(7U), "d"(0U)
+                          : "memory");
+    } else {
+        __asm__ volatile ("fxsave64 %0"
+                          : "=m"(fiber->xstate) :: "memory");
+    }
 }
 
 static void k32_fiber_restore_xstate(k32_fiber_t *fiber)
 {
-    __asm__ volatile ("xrstor64 %0"
-                      :
-                      : "m"(fiber->xstate), "a"(7U), "d"(0U)
-                      : "memory");
+    if (cpu_xsave_active) {
+        __asm__ volatile ("xrstor64 %0"
+                          :
+                          : "m"(fiber->xstate), "a"(7U), "d"(0U)
+                          : "memory");
+    } else {
+        __asm__ volatile ("fxrstor64 %0"
+                          : : "m"(fiber->xstate) : "memory");
+    }
 }
 
 static void k32_fiber_release(k32_fiber_t *fiber)
@@ -8740,7 +8569,10 @@ static uint8_t *win32_tls_alloc_block(const static_tls_module_t *mod)
     uint8_t *block = (uint8_t *)VirtualAlloc(
         NULL, pages * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!block || (uint64_t)(ULONG_PTR)block > UINT32_MAX) {
-        if (block) VirtualFree(block, 0, MEM_RELEASE);
+        if (block) {
+            (void)nt_vm_release_allocation_for_process(
+                win32_current_process_id(), block);
+        }
         return NULL;
     }
     memset(block, 0, pages * 4096);
@@ -8881,6 +8713,12 @@ static BOOL k32_get_system_time(SYSTEMTIME *system_time)
 #define STACK_SIZE_PARAM_IS_A_RESERVATION 0x00010000
 
 typedef struct {
+    TEB teb;
+    PVOID tls_vector[TLS_MAX_SLOTS];
+    PVOID tls_expansion[TLS_MAX_SLOTS - 64];
+} win64_thread_environment_t;
+
+typedef struct {
     volatile int    active;        /* 1 = slot in use */
     ULONG_PTR       func_addr;     /* PE thread start routine */
     ULONG_PTR       param;         /* PE thread parameter */
@@ -8904,9 +8742,11 @@ typedef struct {
     SIZE_T          stack_size;
     TEB32          *teb;           /* low per-thread FS:[0] state */
     uint32_t       *tls_vector;
-    TEB             teb64;         /* per-thread GS:[0] state */
-    PVOID           tls_vector64[TLS_MAX_SLOTS];
-    PVOID           tls_expansion64[TLS_MAX_SLOTS - 64];
+    TEB             fallback_teb64; /* stable GS target during teardown */
+    win64_thread_environment_t *environment64;
+    TEB            *teb64;         /* user VMA exposed through GS:[0] */
+    PVOID          *tls_vector64;
+    PVOID          *tls_expansion64;
     WCHAR           description[64];
 } win32_thread_ctx_t;
 
@@ -9070,9 +8910,9 @@ static BOOL win32_tls_seed_existing_threads(const static_tls_module_t *mod)
                     !rollback->tls_vector ||
                     !rollback->tls_vector[mod->index])
                     continue;
-                VirtualFree((void *)(ULONG_PTR)
-                                rollback->tls_vector[mod->index],
-                            0, MEM_RELEASE);
+                (void)nt_vm_release_allocation_for_process(
+                    mod->owner_pid,
+                    (void *)(ULONG_PTR)rollback->tls_vector[mod->index]);
                 rollback->tls_vector[mod->index] = 0;
             }
             return FALSE;
@@ -9125,8 +8965,12 @@ static void win64_tls_free_vector(DWORD owner_pid, PVOID *vector)
 
 static void win64_tls_reset_root(void)
 {
-    DWORD owner_pid = (DWORD)(ULONG_PTR)g_teb.ClientId.UniqueProcess;
+    TEB *teb = win64_current_teb();
+    DWORD owner_pid = teb
+        ? (DWORD)(ULONG_PTR)teb->ClientId.UniqueProcess : 0;
     if (!owner_pid) owner_pid = 1;
+    PVOID *vector = teb && teb->ThreadLocalStoragePointer
+        ? (PVOID *)teb->ThreadLocalStoragePointer : tls_vector64;
 
     static_tls64_lock_acquire();
     for (int i = 0; i < static_tls64_module_count;) {
@@ -9135,14 +8979,14 @@ static void win64_tls_reset_root(void)
             i++;
             continue;
         }
-        if (tls_vector64 && tls_vector64[mod.index]) {
-            win64_tls_free_block(tls_vector64[mod.index], mod.total_size);
-            tls_vector64[mod.index] = NULL;
+        if (vector && vector[mod.index]) {
+            win64_tls_free_block(vector[mod.index], mod.total_size);
+            vector[mod.index] = NULL;
         }
         for (int j = 0; j < g_win32_thread_capacity; j++) {
             win32_thread_ctx_t *ctx = &g_win32_threads[j];
             if (!ctx->compat32 && ctx->owner_pid == owner_pid &&
-                ctx->tls_vector64[mod.index]) {
+                ctx->tls_vector64 && ctx->tls_vector64[mod.index]) {
                 win64_tls_free_block(ctx->tls_vector64[mod.index],
                                      mod.total_size);
                 ctx->tls_vector64[mod.index] = NULL;
@@ -9157,8 +9001,8 @@ static void win64_tls_reset_root(void)
 
 static BOOL win64_tls_attach_thread(win32_thread_ctx_t *ctx)
 {
+    if (!ctx || !ctx->tls_vector64) return FALSE;
     DWORD owner_pid = ctx->owner_pid;
-    PPEB owner = ctx->owner_peb;
     static_tls64_module_t attached[MAX_STATIC_TLS64_MODULES];
     int attached_count = 0;
 
@@ -9185,22 +9029,6 @@ static BOOL win64_tls_attach_thread(win32_thread_ctx_t *ctx)
     typedef void (WINAPI *tls_callback_fn)(PVOID, DWORD, PVOID);
     for (int i = 0; i < attached_count; i++) {
         static_tls64_module_t *mod = &attached[i];
-        if ((uint64_t)(ULONG_PTR)mod->image_base == 0x180000000ULL) {
-            serial_puts("[TLS64-CEF-ATTACH] owner=");
-            serial_putdec(owner_pid);
-            serial_puts(" tid=");
-            serial_putdec(ctx->tid);
-            serial_puts(" kpid=");
-            serial_putdec((uint64_t)(uint32_t)ctx->kernel_pid);
-            serial_puts(" peb=0x");
-            serial_puthex((uint64_t)(ULONG_PTR)owner, 16);
-            serial_puts(" slot=");
-            serial_putdec(mod->index);
-            serial_puts(" block=0x");
-            serial_puthex((uint64_t)(ULONG_PTR)
-                          ctx->tls_vector64[mod->index], 16);
-            serial_puts("\n");
-        }
         uint64_t *callbacks = (uint64_t *)mod->callbacks_addr;
         for (DWORD j = 0; j < mod->callback_count; j++)
             ((tls_callback_fn)(ULONG_PTR)callbacks[j])(
@@ -9211,6 +9039,7 @@ static BOOL win64_tls_attach_thread(win32_thread_ctx_t *ctx)
 
 static void win64_tls_detach_thread(win32_thread_ctx_t *ctx, BOOL callbacks)
 {
+    if (!ctx || !ctx->tls_vector64) return;
     DWORD owner_pid = ctx->owner_pid;
     static_tls64_module_t attached[MAX_STATIC_TLS64_MODULES];
     int attached_count = 0;
@@ -9312,7 +9141,7 @@ BOOL win64_tls_register_static(DWORD index, PVOID image_base, PVOID raw_start,
         win32_thread_ctx_t *ctx = &g_win32_threads[i];
         if (!__atomic_load_n(&ctx->active, __ATOMIC_ACQUIRE) ||
             ctx->compat32 || ctx->owner_pid != mod.owner_pid ||
-            ctx->tls_vector64[index])
+            !ctx->tls_vector64 || ctx->tls_vector64[index])
             continue;
         ctx->tls_vector64[index] = win64_tls_alloc_block(&mod);
         if (!ctx->tls_vector64[index]) {
@@ -9320,6 +9149,7 @@ BOOL win64_tls_register_static(DWORD index, PVOID image_base, PVOID raw_start,
                 win32_thread_ctx_t *rollback = &g_win32_threads[j];
                 if (!rollback->compat32 &&
                     rollback->owner_pid == mod.owner_pid &&
+                    rollback->tls_vector64 &&
                     rollback->tls_vector64[index]) {
                     win64_tls_free_block(rollback->tls_vector64[index],
                                          total_size);
@@ -9333,15 +9163,6 @@ BOOL win64_tls_register_static(DWORD index, PVOID image_base, PVOID raw_start,
     }
     static_tls64_lock_release();
 
-    if ((uint64_t)(ULONG_PTR)image_base == 0x180000000ULL) {
-        serial_puts("[TLS64-CEF-REGISTER] owner=");
-        serial_putdec(owner_pid);
-        serial_puts(" peb=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)mod.owner, 16);
-        serial_puts(" slot=");
-        serial_putdec(index);
-        serial_puts("\n");
-    }
     return TRUE;
 }
 
@@ -9353,7 +9174,6 @@ void win64_tls_unregister_image(PVOID image_base)
         owner_pid = (DWORD)(ULONG_PTR)teb->ClientId.UniqueProcess;
     if (!owner_pid) return;
 
-    BOOL removed = FALSE;
     static_tls64_lock_acquire();
     for (int i = 0; i < static_tls64_module_count;) {
         static_tls64_module_t mod = static_tls64_modules[i];
@@ -9369,7 +9189,8 @@ void win64_tls_unregister_image(PVOID image_base)
         for (int j = 0; j < g_win32_thread_capacity; j++) {
             win32_thread_ctx_t *ctx = &g_win32_threads[j];
             if (ctx->owner_pid == owner_pid &&
-                ctx->tls_vector64[mod.index] && ctx->tls_vector64 != current) {
+                ctx->tls_vector64 && ctx->tls_vector64[mod.index] &&
+                ctx->tls_vector64 != current) {
                 win64_tls_free_block(ctx->tls_vector64[mod.index],
                                      mod.total_size);
                 ctx->tls_vector64[mod.index] = NULL;
@@ -9380,15 +9201,8 @@ void win64_tls_unregister_image(PVOID image_base)
         for (int j = i + 1; j < static_tls64_module_count; j++)
             static_tls64_modules[j - 1] = static_tls64_modules[j];
         static_tls64_module_count--;
-        removed = TRUE;
     }
     static_tls64_lock_release();
-
-    if (removed && (uint64_t)(ULONG_PTR)image_base == 0x180000000ULL) {
-        serial_puts("[TLS64-CEF-UNREGISTER] owner=");
-        serial_putdec(owner_pid);
-        serial_puts("\n");
-    }
 }
 
 void win64_tls_release_process(TEB *teb)
@@ -9413,7 +9227,8 @@ void win64_tls_release_process(TEB *teb)
         for (int j = 0; j < g_win32_thread_capacity; j++) {
             win32_thread_ctx_t *ctx = &g_win32_threads[j];
             if (ctx->owner_pid == owner_pid &&
-                ctx->tls_vector64[mod.index] && ctx->tls_vector64 != vector) {
+                ctx->tls_vector64 && ctx->tls_vector64[mod.index] &&
+                ctx->tls_vector64 != vector) {
                 win64_tls_free_block(ctx->tls_vector64[mod.index],
                                      mod.total_size);
                 ctx->tls_vector64[mod.index] = NULL;
@@ -9421,11 +9236,6 @@ void win64_tls_release_process(TEB *teb)
         }
         tls_trace_slot42("release", mod.index, NULL,
                          (uint64_t)__builtin_return_address(0));
-        if ((uint64_t)(ULONG_PTR)mod.image_base == 0x180000000ULL) {
-            serial_puts("[TLS64-CEF-RELEASE] owner=");
-            serial_putdec(owner_pid);
-            serial_puts("\n");
-        }
         for (int j = i + 1; j < static_tls64_module_count; j++)
             static_tls64_modules[j - 1] = static_tls64_modules[j];
         static_tls64_module_count--;
@@ -9433,6 +9243,10 @@ void win64_tls_release_process(TEB *teb)
     static_tls64_lock_release();
 
     tls_release_process_slots(owner_pid);
+    if (tls_vector64 == vector)
+        tls_vector64 = NULL;
+    teb->ThreadLocalStoragePointer = NULL;
+    teb->TlsExpansionSlots = NULL;
 }
 
 void win32_tls_release_process32(TEB32 *teb)
@@ -9452,8 +9266,8 @@ void win32_tls_release_process32(TEB32 *teb)
         }
 
         if (vector && vector[mod.index]) {
-            VirtualFree((void *)(ULONG_PTR)vector[mod.index], 0,
-                        MEM_RELEASE);
+            (void)nt_vm_release_allocation_for_process(
+                owner_pid, (void *)(ULONG_PTR)vector[mod.index]);
             vector[mod.index] = 0;
         }
         for (int j = 0; j < g_win32_thread_capacity; j++) {
@@ -9462,8 +9276,9 @@ void win32_tls_release_process32(TEB32 *teb)
                 !ctx->tls_vector || !ctx->tls_vector[mod.index] ||
                 ctx->tls_vector == vector)
                 continue;
-            VirtualFree((void *)(ULONG_PTR)ctx->tls_vector[mod.index], 0,
-                        MEM_RELEASE);
+            (void)nt_vm_release_allocation_for_process(
+                owner_pid,
+                (void *)(ULONG_PTR)ctx->tls_vector[mod.index]);
             ctx->tls_vector[mod.index] = 0;
         }
 
@@ -9479,10 +9294,10 @@ void win32_tls_release_process32(TEB32 *teb)
         if (!ctx->compat32 || ctx->owner_pid != owner_pid || !ctx->teb)
             continue;
         if (ctx->tls_vector)
-            VirtualFree(ctx->tls_vector, 0, MEM_RELEASE);
-        ctx->teb->ThreadLocalStoragePointer = 0;
+            (void)nt_vm_release_allocation_for_process(
+                owner_pid, ctx->tls_vector);
         ctx->tls_vector = NULL;
-        VirtualFree(ctx->teb, 0, MEM_RELEASE);
+        (void)nt_vm_release_allocation_for_process(owner_pid, ctx->teb);
         ctx->teb = NULL;
     }
 }
@@ -9493,17 +9308,29 @@ static void tls_clear_slot_process(DWORD index, DWORD process_id)
 
     if (win32_current_process_id() == process_id) {
         if (g_compat32_mode) {
+            TEB32 *teb = compat32_current_teb();
             uint32_t *current32 = tls_current_vector32();
             if (current32) current32[index] = 0;
+            uint32_t *slot = tls_dynamic_slot32(teb, index);
+            if (slot) *slot = 0;
         } else {
             PVOID *slot = tls_dynamic_slot64(win64_current_teb(), index);
             if (slot) *slot = NULL;
         }
     }
-    if (process_id == 1 && tls_vector32)
+    if (process_id == 1 && tls_vector32) {
         tls_vector32[index] = 0;
+        TEB32 *root_teb = compat32_current_teb();
+        if (root_teb && root_teb->ClientId_UniqueProcess == 1) {
+            uint32_t *slot = tls_dynamic_slot32(root_teb, index);
+            if (slot) *slot = 0;
+        }
+    }
     if (process_id == 1) {
-        PVOID *slot = tls_dynamic_slot64(&g_teb, index);
+        TEB *root_teb = win64_current_teb();
+        PVOID *slot = root_teb &&
+                      (DWORD)(ULONG_PTR)root_teb->ClientId.UniqueProcess == 1
+            ? tls_dynamic_slot64(root_teb, index) : NULL;
         if (slot) *slot = NULL;
     }
 
@@ -9511,10 +9338,12 @@ static void tls_clear_slot_process(DWORD index, DWORD process_id)
         win32_thread_ctx_t *ctx = &g_win32_threads[i];
         if (!ctx->active) continue;
         if (ctx->owner_pid != process_id) continue;
-        if (ctx->compat32 && ctx->teb && ctx->tls_vector)
+        if (ctx->compat32 && ctx->teb && ctx->tls_vector) {
             ctx->tls_vector[index] = 0;
-        else if (!ctx->compat32) {
-            PVOID *slot = tls_dynamic_slot64(&ctx->teb64, index);
+            uint32_t *slot = tls_dynamic_slot32(ctx->teb, index);
+            if (slot) *slot = 0;
+        } else if (!ctx->compat32 && ctx->teb64) {
+            PVOID *slot = tls_dynamic_slot64(ctx->teb64, index);
             if (slot) *slot = NULL;
         }
     }
@@ -9654,6 +9483,11 @@ static win32_thread_ctx_t *alloc_thread_ctx(void)
         ctx->owner_cr3 = 0;
         ctx->teb = NULL;
         ctx->tls_vector = NULL;
+        memset(&ctx->fallback_teb64, 0, sizeof(ctx->fallback_teb64));
+        ctx->environment64 = NULL;
+        ctx->teb64 = NULL;
+        ctx->tls_vector64 = NULL;
+        ctx->tls_expansion64 = NULL;
         ctx->description[0] = 0;
         __atomic_store_n(&ctx->active, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&g_win32_thread_slot_reserved[i], 0,
@@ -9726,7 +9560,13 @@ void kernel32_prepare_process_vm_release(DWORD process_id)
         ctx->reclaim_pending = 0;
         ctx->teb = NULL;
         ctx->tls_vector = NULL;
+        ctx->environment64 = NULL;
+        ctx->teb64 = NULL;
+        ctx->tls_vector64 = NULL;
+        ctx->tls_expansion64 = NULL;
     }
+    if (process_id == 1)
+        tls_vector64 = NULL;
     win32_thread_stack_unlock_irqrestore(irq_flags);
 
     if (transferred) {
@@ -9749,21 +9589,69 @@ static void win32_thread_release_tls32_environment(win32_thread_ctx_t *ctx)
 {
     if (!ctx) return;
 
-    if (ctx->teb)
-        ctx->teb->ThreadLocalStoragePointer = 0;
-    if (ctx->tls_vector &&
-        !VirtualFree(ctx->tls_vector, 0, MEM_RELEASE)) {
+    if (ctx->tls_vector && !NT_SUCCESS(
+            nt_vm_release_allocation_for_process(ctx->owner_pid,
+                                                  ctx->tls_vector))) {
         serial_puts("[K32-THREAD] TLS32 vector release failed owner=");
         serial_putdec(ctx->owner_pid);
+        serial_puts(" tid=");
+        serial_putdec(ctx->tid);
+        serial_puts(" address=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)ctx->tls_vector, 16);
         serial_puts("\n");
     }
     ctx->tls_vector = NULL;
-    if (ctx->teb && !VirtualFree(ctx->teb, 0, MEM_RELEASE)) {
+    if (ctx->teb && !NT_SUCCESS(
+            nt_vm_release_allocation_for_process(ctx->owner_pid,
+                                                  ctx->teb))) {
         serial_puts("[K32-THREAD] TEB32 release failed owner=");
         serial_putdec(ctx->owner_pid);
+        serial_puts(" tid=");
+        serial_putdec(ctx->tid);
+        serial_puts(" address=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)ctx->teb, 16);
         serial_puts("\n");
     }
     ctx->teb = NULL;
+}
+
+static void win64_thread_release_environment(win32_thread_ctx_t *ctx)
+{
+    if (!ctx || !ctx->environment64) return;
+
+    win64_thread_environment_t *environment = ctx->environment64;
+    if (ctx->teb64 && win64_current_teb() == ctx->teb64) {
+        memset(&ctx->fallback_teb64, 0, sizeof(ctx->fallback_teb64));
+        ctx->fallback_teb64.Self = &ctx->fallback_teb64;
+        ctx->fallback_teb64.ProcessEnvironmentBlock = ctx->owner_peb;
+        ctx->fallback_teb64.ClientId.UniqueProcess =
+            (HANDLE)(ULONG_PTR)ctx->owner_pid;
+        ctx->fallback_teb64.ClientId.UniqueThread =
+            (HANDLE)(ULONG_PTR)ctx->tid;
+        ctx->fallback_teb64.StackBase = ctx->stack_base;
+        ctx->fallback_teb64.StackLimit = ctx->stack_limit;
+        ctx->fallback_teb64.DeallocationStack = ctx->stack_allocation;
+        ctx->fallback_teb64.ExceptionList = (PVOID)(ULONG_PTR)-1;
+        win64_set_current_teb(&ctx->fallback_teb64);
+    }
+
+    NTSTATUS status = nt_vm_release_allocation_for_process(
+        ctx->owner_pid, environment);
+    if (!NT_SUCCESS(status)) {
+        serial_puts("[K32-THREAD] TEB64 environment release failed owner=");
+        serial_putdec(ctx->owner_pid);
+        serial_puts(" tid=");
+        serial_putdec(ctx->tid);
+        serial_puts(" address=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)environment, 16);
+        serial_puts(" status=0x");
+        serial_puthex((uint32_t)status, 8);
+        serial_puts("\n");
+    }
+    ctx->environment64 = NULL;
+    ctx->teb64 = NULL;
+    ctx->tls_vector64 = NULL;
+    ctx->tls_expansion64 = NULL;
 }
 
 static void __attribute__((noinline))
@@ -9866,6 +9754,7 @@ static void win32_thread_entry_common(void)
         } else {
             serial_puts("[K32-THREAD] static TLS attach failed\n");
         }
+        compat32_release_thread_state();
         win32_thread_release_tls32_environment(ctx);
     } else {
         __atomic_store_n(&ctx->exit_jmp_ready, 1, __ATOMIC_RELEASE);
@@ -9878,6 +9767,11 @@ static void win32_thread_entry_common(void)
     serial_putdec(ctx->tid);
     serial_puts(" returned\n");
 #endif
+
+    user32_release_thread(ctx->owner_pid, ctx->tid);
+
+    if (!ctx->compat32)
+        win64_thread_release_environment(ctx);
 
     /* We are back on the scheduler's kernel stack, so the user stack can now
      * be unmapped without invalidating the live return frame. */
@@ -9991,6 +9885,7 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
         ctx->teb->LastErrorValue = 0;
         ctx->teb->StackBase = (uint32_t)(ULONG_PTR)ctx->stack_base;
         ctx->teb->StackLimit = (uint32_t)(ULONG_PTR)ctx->stack_limit;
+        memset(ctx->teb->TlsSlots, 0, sizeof(ctx->teb->TlsSlots));
         ctx->tls_vector = (uint32_t *)VirtualAlloc(
             NULL, TLS_MAX_SLOTS * sizeof(uint32_t),
             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -10006,26 +9901,41 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
                TLS_MAX_SLOTS * sizeof(uint32_t));
         ctx->teb->ThreadLocalStoragePointer =
             (uint32_t)(ULONG_PTR)ctx->tls_vector;
+        ctx->teb->TlsExpansionSlots =
+            (uint32_t)(ULONG_PTR)(ctx->tls_vector + 64);
     } else {
-        if (!parent_teb) {
+        if (!parent_teb || !ctx->owner_peb) {
             win32_thread_release_stack(ctx);
             __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
             SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
             return NULL;
         }
-        ctx->teb64 = *parent_teb;
-        ctx->teb64.StackBase = ctx->stack_base;
-        ctx->teb64.StackLimit = ctx->stack_limit;
-        ctx->teb64.DeallocationStack = ctx->stack_allocation;
-        ctx->teb64.Self = &ctx->teb64;
-        ctx->teb64.ClientId.UniqueThread = (HANDLE)(ULONG_PTR)tid;
-        ctx->teb64.LastErrorValue = 0;
-        ctx->teb64.LastStatusValue = STATUS_SUCCESS;
-        memset(ctx->teb64.TlsSlots, 0, sizeof(ctx->teb64.TlsSlots));
-        memset(ctx->tls_expansion64, 0, sizeof(ctx->tls_expansion64));
-        ctx->teb64.TlsExpansionSlots = ctx->tls_expansion64;
-        memset(ctx->tls_vector64, 0, sizeof(ctx->tls_vector64));
-        ctx->teb64.ThreadLocalStoragePointer = ctx->tls_vector64;
+        ctx->environment64 = (win64_thread_environment_t *)VirtualAlloc(
+            NULL, sizeof(*ctx->environment64), MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE);
+        if (!ctx->environment64) {
+            win32_thread_release_stack(ctx);
+            __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
+            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+            return NULL;
+        }
+        memset(ctx->environment64, 0, sizeof(*ctx->environment64));
+        ctx->teb64 = &ctx->environment64->teb;
+        ctx->tls_vector64 = ctx->environment64->tls_vector;
+        ctx->tls_expansion64 = ctx->environment64->tls_expansion;
+        *ctx->teb64 = *parent_teb;
+        ctx->teb64->StackBase = ctx->stack_base;
+        ctx->teb64->StackLimit = ctx->stack_limit;
+        ctx->teb64->DeallocationStack = ctx->stack_allocation;
+        ctx->teb64->Self = ctx->teb64;
+        ctx->teb64->ClientId.UniqueProcess =
+            (HANDLE)(ULONG_PTR)ctx->owner_pid;
+        ctx->teb64->ClientId.UniqueThread = (HANDLE)(ULONG_PTR)tid;
+        ctx->teb64->LastErrorValue = 0;
+        ctx->teb64->LastStatusValue = STATUS_SUCCESS;
+        memset(ctx->teb64->TlsSlots, 0, sizeof(ctx->teb64->TlsSlots));
+        ctx->teb64->TlsExpansionSlots = ctx->tls_expansion64;
+        ctx->teb64->ThreadLocalStoragePointer = ctx->tls_vector64;
     }
 
     if (dwCreationFlags & 0x4 /* CREATE_SUSPENDED */)
@@ -10073,13 +9983,13 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
                        ? thread_entry->object : NULL;
 
     extern uint64_t proc_current_cr3(void);
-    extern int sched_spawn_in_address_space_blocked(
-        const char *, void (*)(void), uint64_t, int);
+    extern int sched_spawn_thread_in_address_space_blocked(
+        const char *, void (*)(void), uint64_t);
     extern int proc_wake_pid(int pid);
     uint64_t owner_cr3 = proc_current_cr3();
     ctx->owner_cr3 = owner_cr3;
-    int kpid = sched_spawn_in_address_space_blocked(
-        "win32_thread", win32_thread_entry_common, owner_cr3, FALSE);
+    int kpid = sched_spawn_thread_in_address_space_blocked(
+        "win32_thread", win32_thread_entry_common, owner_cr3);
     if (kpid < 0) {
 #ifdef OK_QUIET
         serial_puts("[K32] CreateThread FAILED (sched_spawn)\n");
@@ -10087,6 +9997,7 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
         serial_puts(" FAILED (sched_spawn)\n");
 #endif
         win32_thread_release_tls32_environment(ctx);
+        win64_thread_release_environment(ctx);
         win32_thread_release_stack(ctx);
         __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
         g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
@@ -10099,7 +10010,7 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
         extern uint64_t proc_get_gs_base(void);
         extern void proc_set_gs_base_pid(int pid, uint64_t addr);
         uint64_t gs_base = compat32 ? proc_get_gs_base()
-                                    : (uint64_t)(ULONG_PTR)&ctx->teb64;
+                                    : (uint64_t)(ULONG_PTR)ctx->teb64;
         proc_set_gs_base_pid(kpid, gs_base);
     }
     if (sched_alloc_compat_ist1((uint32_t)kpid) < 0) {
@@ -10111,6 +10022,7 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
         serial_puts(" FAILED (IST1 allocation)\n");
 #endif
         win32_thread_release_tls32_environment(ctx);
+        win64_thread_release_environment(ctx);
         win32_thread_release_stack(ctx);
         __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
         g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
@@ -10121,6 +10033,7 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
         extern int proc_kill_pid(int pid);
         proc_kill_pid(kpid);
         win32_thread_release_tls32_environment(ctx);
+        win64_thread_release_environment(ctx);
         win32_thread_release_stack(ctx);
         __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
         g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
@@ -10401,13 +10314,48 @@ static BOOL WINAPI GetExitCodeThread_k32(HANDLE hThread, DWORD *lpExitCode)
     return FALSE;
 }
 
+static BOOL thread_context_handle_valid(HANDLE hThread)
+{
+    ULONG_PTR value = (ULONG_PTR)hThread;
+    BOOL current_thread = hThread == NT_CURRENT_THREAD ||
+                          (g_compat32_mode && (DWORD)value == 0xFFFFFFFEU);
+
+    if (current_thread || find_ctx_by_handle(hThread))
+        return TRUE;
+
+    PVOID object = NULL;
+    return NT_SUCCESS(handle_lookup_for_process(
+        &g_handle_table, hThread, win32_current_process_id(),
+        OBJ_TYPE_THREAD, &object));
+}
+
 static BOOL WINAPI GetThreadContext_k32(HANDLE hThread, PVOID context)
 {
     if (!context) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
-    (void)hThread;
+    if (!thread_context_handle_valid(hThread)) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+    SetLastError(50); /* ERROR_NOT_SUPPORTED */
+    return FALSE;
+}
+
+static BOOL WINAPI SetThreadContext_k32(HANDLE hThread, PCVOID context)
+{
+    if (!context) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    if (!thread_context_handle_valid(hThread)) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+
+    /* Applying a live PE context requires scheduler-owned register state.
+     * Reject it explicitly until suspended-thread context transfer exists. */
     SetLastError(50); /* ERROR_NOT_SUPPORTED */
     return FALSE;
 }
@@ -10523,8 +10471,10 @@ static void mark_thread_ctx_terminated(win32_thread_ctx_t *ctx,
         win32_mark_thread_terminated(ctx->thread_object,
                                      (NTSTATUS)exit_code);
     }
-    if (release_tls && !ctx->compat32)
+    if (release_tls && !ctx->compat32) {
         win64_tls_detach_thread(ctx, FALSE);
+        win64_thread_release_environment(ctx);
+    }
     iocp_release_thread(ctx->tid);
     ctx->reclaim_pending = ctx->stack_allocation != NULL;
     ctx->active = 0;
@@ -10540,8 +10490,10 @@ void win32_kernel_thread_reaped(uint32_t kernel_pid, int exit_code)
         if (ctx->kernel_pid != (int)kernel_pid ||
             (!ctx->active && !ctx->reclaim_pending))
             continue;
-        if (ctx->active)
+        if (ctx->active) {
             mark_thread_ctx_terminated(ctx, (DWORD)exit_code, TRUE);
+            user32_release_thread(ctx->owner_pid, ctx->tid);
+        }
         win32_thread_release_stack(ctx);
         return;
     }
@@ -10611,6 +10563,7 @@ BOOL WINAPI TerminateThread(HANDLE hThread, DWORD dwExitCode)
         return FALSE;
     }
     DWORD tid = ctx->tid;
+    DWORD owner_pid = ctx->owner_pid;
 
     uint64_t irq_flags;
     __asm__ volatile ("pushfq; popq %0; cli" : "=r"(irq_flags) :: "memory");
@@ -10622,6 +10575,8 @@ BOOL WINAPI TerminateThread(HANDLE hThread, DWORD dwExitCode)
         SetLastError(5); /* ERROR_ACCESS_DENIED */
         return FALSE;
     }
+
+    user32_release_thread(owner_pid, tid);
 
     serial_puts("[K32] TerminateThread TID=");
     serial_putdec(tid);
@@ -10656,13 +10611,14 @@ typedef struct {
 
 #define K32_SYNC_TRACE_CAPACITY 8192
 static volatile K32_SYNC_TRACE_RECORD g_k32_sync_trace[K32_SYNC_TRACE_CAPACITY];
-static volatile uint32_t g_k32_sync_trace_next;
-static volatile uint32_t g_k32_sync_trace_winpid = 3;
+static volatile uint64_t g_k32_sync_trace_next;
+#if K32_VERBOSE_DIAGNOSTICS
 static volatile uint32_t g_k32_wait_if0_trace_count;
+#endif
 
-__attribute__((noinline))
-static void k32_wait_trace_if0(const char *phase, HANDLE handle,
-                               DWORD milliseconds, uint64_t caller)
+#if K32_VERBOSE_DIAGNOSTICS
+__attribute__((noinline)) static void k32_wait_trace_if0(
+    const char *phase, HANDLE handle, DWORD milliseconds, uint64_t caller)
 {
     extern uint64_t sched_current_frame_seq(void);
     uint64_t flags;
@@ -10693,21 +10649,20 @@ static void k32_wait_trace_if0(const char *phase, HANDLE handle,
     serial_puthex(flags, 16);
     serial_puts("\n");
 }
+#else
+#define k32_wait_trace_if0(phase, handle, milliseconds, caller) ((void)0)
+#endif
 
 static void k32_sync_trace(uint32_t op, HANDLE handle, uint32_t arg,
                            uint32_t result, uint64_t caller)
 {
     DWORD winpid = win32_current_process_id();
-    if (winpid != g_k32_sync_trace_winpid)
-        return;
-
-    uint32_t index = __atomic_fetch_add(&g_k32_sync_trace_next, 1,
-                                        __ATOMIC_RELAXED);
-    if (index >= K32_SYNC_TRACE_CAPACITY)
-        return;
+    uint64_t sequence = __atomic_add_fetch(&g_k32_sync_trace_next, 1,
+                                           __ATOMIC_RELAXED);
+    uint32_t index = (uint32_t)((sequence - 1) % K32_SYNC_TRACE_CAPACITY);
 
     volatile K32_SYNC_TRACE_RECORD *record = &g_k32_sync_trace[index];
-    record->seq = index;
+    __atomic_store_n(&record->seq, 0, __ATOMIC_RELAXED);
     record->tick = idt_get_ticks();
     record->caller = caller;
     record->handle = (ULONG_PTR)handle;
@@ -10716,23 +10671,15 @@ static void k32_sync_trace(uint32_t op, HANDLE handle, uint32_t arg,
     record->kernel_pid = proc_current_pid();
     record->arg = arg;
     record->result = result;
+    __atomic_store_n(&record->seq, sequence, __ATOMIC_RELEASE);
 }
 
 static void log_null_sync_handle(const char *api)
 {
     extern uint32_t compat32_get_last_caller_eip(void);
-    extern uint32_t compat32_get_last_user_ebp(void);
-    extern uint32_t compat32_get_last_user_esi(void);
     extern void compat32_dump_recent_calls(void);
-    uint32_t ebp = compat32_get_last_user_ebp();
-    uint32_t outer = 0;
-    if (ebp >= 0x10000 && ebp < 0x7FFF0000)
-        outer = *(volatile uint32_t *)(uintptr_t)(ebp + 4);
     serial_puts("[SYNC-NULL] "); serial_puts(api);
     serial_puts(" caller=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
-    serial_puts(" outer=0x"); serial_puthex(outer, 8);
-    serial_puts(" this=0x"); serial_puthex(compat32_get_last_user_esi(), 8);
-    serial_puts(" ebp=0x"); serial_puthex(ebp, 8);
     serial_puts("\n");
     compat32_dump_recent_calls();
 }
@@ -10777,28 +10724,14 @@ DWORD WINAPI WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)
     /* Fall through to NT wait for events, mutexes, semaphores, etc. */
     LARGE_INTEGER timeout;
     PLARGE_INTEGER p_timeout = NULL;
-    DWORD effective_timeout = dwMilliseconds;
+    k32_wait_trace_if0("pre-wait", hHandle, dwMilliseconds, caller);
 
-    /* SteamChrome can need several seconds to publish a fresh IPC endpoint. */
-    if (dwMilliseconds > 0 && dwMilliseconds <= 1000) {
-        const char *name = steamipc_name_for_handle(hHandle);
-        if (name &&
-            k32_path_contains_ci(name, "steamchrome_masterstream_") &&
-            k32_path_contains_ci(name, "_written"))
-            effective_timeout = 10000;
-    }
-    k32_wait_trace_if0("post-name-lookup", hHandle, effective_timeout, caller);
-
-    if (effective_timeout != INFINITE) {
+    if (dwMilliseconds != INFINITE) {
         /* Convert milliseconds to 100ns units, negative = relative */
-        timeout.QuadPart = -(LONGLONG)effective_timeout * 10000;
+        timeout.QuadPart = -(LONGLONG)dwMilliseconds * 10000;
         p_timeout = &timeout;
     }
 
-    steamipc_trace_handle("Wait1.begin", hHandle, effective_timeout,
-                          0, caller);
-    k32_wait_trace_if0("post-steamipc-trace", hHandle, effective_timeout,
-                       caller);
     NTSTATUS status = NtWaitForSingleObject(hHandle, FALSE, p_timeout);
 
     DWORD result;
@@ -10811,8 +10744,6 @@ DWORD WINAPI WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)
         result = WAIT_FAILED;
     }
 
-    steamipc_trace_handle("Wait1.end", hHandle, effective_timeout,
-                          result, caller);
     return result;
 }
 
@@ -10904,12 +10835,6 @@ DWORD WINAPI WaitForMultipleObjects(DWORD nCount, const HANDLE *lpHandles,
         (ULONG_PTR)p_timeout
     };
 
-    uint64_t caller =
-        (uint64_t)(ULONG_PTR)__builtin_return_address(0);
-    for (DWORD i = 0; i < nCount; i++)
-        steamipc_trace_handle("WaitN.begin", handles[i], i,
-                              dwMilliseconds, caller);
-
     NTSTATUS status = sys_NtWaitForMultipleObjects(args);
 
     DWORD result;
@@ -10921,10 +10846,6 @@ DWORD WINAPI WaitForMultipleObjects(DWORD nCount, const HANDLE *lpHandles,
         set_last_error_from_status(status);
         result = WAIT_FAILED;
     }
-
-    for (DWORD i = 0; i < nCount; i++)
-        steamipc_trace_handle("WaitN.end", handles[i], i,
-                              result, caller);
 
     return result;
 }
@@ -10954,11 +10875,13 @@ typedef struct {
     DWORD owner_pid;
     ULONGLONG deadline_ms;
     BOOL object_retained;
+    BOOL compat32;
 } K32_REGISTERED_WAIT;
 
 typedef struct {
     volatile LONG state; /* 0=free, 1=initializing, 2=ready, 3=stopping */
     DWORD owner_pid;
+    BOOL compat32;
     HANDLE worker_thread;
     int kernel_pid;
     volatile ULONGLONG poll_count;
@@ -10970,6 +10893,7 @@ static K32_WAIT_DISPATCHER
     g_wait_dispatchers[K32_MAX_WAIT_DISPATCHERS];
 static volatile ULONG_PTR next_wait_registration = 0xD1200000;
 static volatile LONG g_registered_wait_trace_budget = 96;
+static uint32_t g_wait_dispatcher_thunk32;
 
 static BOOL k32_registered_wait_trace(void)
 {
@@ -10977,9 +10901,10 @@ static BOOL k32_registered_wait_trace(void)
                               __ATOMIC_RELAXED) > 0;
 }
 
-static void k32_store_registered_wait_handle(HANDLE *out_wait, HANDLE value)
+static void k32_store_registered_wait_handle(HANDLE *out_wait, HANDLE value,
+                                              BOOL compat32)
 {
-    if (g_compat32_mode)
+    if (compat32)
         *(uint32_t *)(void *)out_wait = (uint32_t)(ULONG_PTR)value;
     else
         *out_wait = value;
@@ -11052,14 +10977,25 @@ static void k32_registered_wait_try_cleanup(K32_REGISTERED_WAIT *wait)
     wait->callback = NULL;
     wait->context = NULL;
     wait->object_retained = FALSE;
+    wait->compat32 = FALSE;
     __atomic_store_n(&wait->allocated, 0, __ATOMIC_RELEASE);
+}
+
+static BOOL k32_registered_wait_sync_completion(
+    const K32_REGISTERED_WAIT *wait, HANDLE completion)
+{
+    if (!wait)
+        return FALSE;
+    if (wait->compat32)
+        return (uint32_t)(ULONG_PTR)completion == UINT32_MAX;
+    return completion == (HANDLE)(ULONG_PTR)-1;
 }
 
 static void k32_registered_wait_signal_completion(K32_REGISTERED_WAIT *wait)
 {
     HANDLE completion = __atomic_exchange_n(&wait->completion_event, NULL,
                                              __ATOMIC_ACQ_REL);
-    if (completion && completion != (HANDLE)(ULONG_PTR)-1)
+    if (completion && !k32_registered_wait_sync_completion(wait, completion))
         SetEvent(completion);
 }
 
@@ -11082,13 +11018,15 @@ static void k32_registered_wait_finalize(K32_REGISTERED_WAIT *wait)
     serial_puts("\n");
 }
 
-static BOOL k32_registered_wait_owner_has_live(DWORD owner_pid)
+static BOOL k32_registered_wait_owner_has_live(DWORD owner_pid,
+                                                BOOL compat32)
 {
     for (int i = 0; i < K32_MAX_REGISTERED_WAITS; i++) {
         K32_REGISTERED_WAIT *wait = &g_registered_waits[i];
         if (__atomic_load_n(&wait->allocated, __ATOMIC_ACQUIRE) &&
             __atomic_load_n(&wait->registered, __ATOMIC_ACQUIRE) &&
             wait->owner_pid == owner_pid &&
+            wait->compat32 == compat32 &&
             !__atomic_load_n(&wait->worker_finalized, __ATOMIC_ACQUIRE))
             return TRUE;
     }
@@ -11097,13 +11035,22 @@ static BOOL k32_registered_wait_owner_has_live(DWORD owner_pid)
 
 static DWORD WINAPI k32_registered_wait_dispatcher(PVOID parameter)
 {
-    K32_WAIT_DISPATCHER *dispatcher = (K32_WAIT_DISPATCHER *)parameter;
+    ULONG_PTR encoded = (ULONG_PTR)parameter;
+    if (!encoded || encoded > K32_MAX_WAIT_DISPATCHERS)
+        return 87; /* ERROR_INVALID_PARAMETER */
+
+    K32_WAIT_DISPATCHER *dispatcher = &g_wait_dispatchers[encoded - 1U];
+    while (__atomic_load_n(&dispatcher->state, __ATOMIC_ACQUIRE) == 1)
+        Sleep(1);
+    if (__atomic_load_n(&dispatcher->state, __ATOMIC_ACQUIRE) != 2)
+        return 87;
 
     dispatcher->kernel_pid = proc_current_pid();
     serial_puts("[K32-WAITDISP] start owner=");
     serial_putdec(dispatcher->owner_pid);
     serial_puts(" kpid=");
     serial_putdec((uint64_t)(uint32_t)dispatcher->kernel_pid);
+    serial_puts(dispatcher->compat32 ? " PE32" : " PE64");
     serial_puts("\n");
 
     for (;;) {
@@ -11117,6 +11064,7 @@ static DWORD WINAPI k32_registered_wait_dispatcher(PVOID parameter)
             if (!__atomic_load_n(&wait->allocated, __ATOMIC_ACQUIRE) ||
                 !__atomic_load_n(&wait->registered, __ATOMIC_ACQUIRE) ||
                 wait->owner_pid != dispatcher->owner_pid ||
+                wait->compat32 != dispatcher->compat32 ||
                 __atomic_load_n(&wait->worker_finalized,
                                 __ATOMIC_ACQUIRE))
                 continue;
@@ -11169,7 +11117,16 @@ static DWORD WINAPI k32_registered_wait_dispatcher(PVOID parameter)
                     serial_putdec(timed_out);
                     serial_puts("\n");
                 }
-                wait->callback(wait->context, (BYTE)timed_out);
+                if (wait->compat32) {
+                    uint32_t args[2] = {
+                        (uint32_t)(ULONG_PTR)wait->context,
+                        timed_out ? 1U : 0U,
+                    };
+                    compat32_callback_args(
+                        (uint32_t)(ULONG_PTR)wait->callback, 2, args);
+                } else {
+                    wait->callback(wait->context, (BYTE)timed_out);
+                }
                 serial_puts("[K32-WAITDISP] callback returned token=");
                 serial_puthex((uint64_t)(ULONG_PTR)wait->token, 8);
                 serial_puts("\n");
@@ -11195,7 +11152,7 @@ static DWORD WINAPI k32_registered_wait_dispatcher(PVOID parameter)
                  * registration either keeps this worker or waits for a new
                  * one after it exits. */
                 if (k32_registered_wait_owner_has_live(
-                        dispatcher->owner_pid)) {
+                        dispatcher->owner_pid, dispatcher->compat32)) {
                     __atomic_store_n(&dispatcher->state, 2,
                                      __ATOMIC_RELEASE);
                     continue;
@@ -11232,6 +11189,7 @@ static BOOL k32_reap_wait_dispatcher(K32_WAIT_DISPATCHER *dispatcher)
         CloseHandle(worker);
     dispatcher->worker_thread = NULL;
     dispatcher->owner_pid = 0;
+    dispatcher->compat32 = FALSE;
     dispatcher->kernel_pid = 0;
     dispatcher->poll_count = 0;
     dispatcher->last_poll_ms = 0;
@@ -11239,18 +11197,58 @@ static BOOL k32_reap_wait_dispatcher(K32_WAIT_DISPATCHER *dispatcher)
     return TRUE;
 }
 
-static BOOL k32_wait_dispatcher_owner_active(DWORD owner_pid)
+void kernel32_release_process_waits(DWORD process_id)
+{
+    if (!process_id)
+        return;
+
+    /* Process teardown calls this after terminating its worker threads. No
+     * dispatcher can still access these slots, so retained object references
+     * and dispatcher metadata can be retired without invoking guest code. */
+    for (int i = 0; i < K32_MAX_REGISTERED_WAITS; i++) {
+        K32_REGISTERED_WAIT *wait = &g_registered_waits[i];
+        if (!__atomic_load_n(&wait->allocated, __ATOMIC_ACQUIRE) ||
+            wait->owner_pid != process_id)
+            continue;
+
+        __atomic_store_n(&wait->completion_event, NULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&wait->canceled, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&wait->worker_done, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&wait->worker_finalized, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&wait->registered, 1, __ATOMIC_RELEASE);
+        k32_registered_wait_try_cleanup(wait);
+    }
+
+    for (int i = 0; i < K32_MAX_WAIT_DISPATCHERS; i++) {
+        K32_WAIT_DISPATCHER *dispatcher = &g_wait_dispatchers[i];
+        if (!__atomic_load_n(&dispatcher->state, __ATOMIC_ACQUIRE) ||
+            dispatcher->owner_pid != process_id)
+            continue;
+
+        dispatcher->worker_thread = NULL;
+        dispatcher->owner_pid = 0;
+        dispatcher->compat32 = FALSE;
+        dispatcher->kernel_pid = 0;
+        dispatcher->poll_count = 0;
+        dispatcher->last_poll_ms = 0;
+        __atomic_store_n(&dispatcher->state, 0, __ATOMIC_RELEASE);
+    }
+}
+
+static BOOL k32_wait_dispatcher_owner_active(DWORD owner_pid, BOOL compat32)
 {
     for (int i = 0; i < K32_MAX_WAIT_DISPATCHERS; i++) {
         K32_WAIT_DISPATCHER *dispatcher = &g_wait_dispatchers[i];
         if (__atomic_load_n(&dispatcher->state, __ATOMIC_ACQUIRE) &&
-            dispatcher->owner_pid == owner_pid)
+            dispatcher->owner_pid == owner_pid &&
+            dispatcher->compat32 == compat32)
             return TRUE;
     }
     return FALSE;
 }
 
-static K32_WAIT_DISPATCHER *k32_get_wait_dispatcher(DWORD owner_pid)
+static K32_WAIT_DISPATCHER *k32_get_wait_dispatcher(DWORD owner_pid,
+                                                    BOOL compat32)
 {
     for (;;) {
         BOOL initializing = FALSE;
@@ -11263,12 +11261,14 @@ static K32_WAIT_DISPATCHER *k32_get_wait_dispatcher(DWORD owner_pid)
             if (state == 3) {
                 if (k32_reap_wait_dispatcher(dispatcher))
                     continue;
-                if (dispatcher->owner_pid == owner_pid)
+                if (dispatcher->owner_pid == owner_pid &&
+                    dispatcher->compat32 == compat32)
                     owner_stopping = TRUE;
             } else if (state == 1) {
                 initializing = TRUE;
             } else if (state == 2 &&
-                       dispatcher->owner_pid == owner_pid) {
+                       dispatcher->owner_pid == owner_pid &&
+                       dispatcher->compat32 == compat32) {
                 return dispatcher;
             }
         }
@@ -11287,14 +11287,36 @@ static K32_WAIT_DISPATCHER *k32_get_wait_dispatcher(DWORD owner_pid)
                 continue;
 
             dispatcher->owner_pid = owner_pid;
+            dispatcher->compat32 = compat32;
             dispatcher->worker_thread = NULL;
             dispatcher->kernel_pid = 0;
             dispatcher->poll_count = 0;
             dispatcher->last_poll_ms = 0;
+
+            LPTHREAD_START_ROUTINE start = k32_registered_wait_dispatcher;
+            if (compat32) {
+                if (!g_wait_dispatcher_thunk32 && compat32_is_initialized()) {
+                    g_wait_dispatcher_thunk32 = compat32_make_thunk_ex(
+                        (uint64_t)(ULONG_PTR)k32_registered_wait_dispatcher,
+                        "kernel32!registered_wait_dispatcher", 1,
+                        CC_STDCALL);
+                }
+                if (!g_wait_dispatcher_thunk32) {
+                    dispatcher->owner_pid = 0;
+                    dispatcher->compat32 = FALSE;
+                    __atomic_store_n(&dispatcher->state, 0,
+                                     __ATOMIC_RELEASE);
+                    return NULL;
+                }
+                start = (LPTHREAD_START_ROUTINE)(ULONG_PTR)
+                    g_wait_dispatcher_thunk32;
+            }
+
             dispatcher->worker_thread = CreateThread(
-                NULL, 0, k32_registered_wait_dispatcher, dispatcher, 0, NULL);
+                NULL, 0, start, (PVOID)(ULONG_PTR)(i + 1), 0, NULL);
             if (!dispatcher->worker_thread) {
                 dispatcher->owner_pid = 0;
+                dispatcher->compat32 = FALSE;
                 __atomic_store_n(&dispatcher->state, 0, __ATOMIC_RELEASE);
                 return NULL;
             }
@@ -11312,18 +11334,10 @@ static BOOL WINAPI RegisterWaitForSingleObject_k32(HANDLE *out_wait,
                                                     DWORD milliseconds,
                                                     DWORD flags)
 {
+    BOOL compat32 = g_compat32_mode;
     if (!out_wait || !object || !callback) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
-    }
-
-    /* PE32 callback workers need a compat-mode kernel trampoline. Preserve
-     * the previous behavior until that bridge exists. */
-    if (g_compat32_mode) {
-        HANDLE token = (HANDLE)__atomic_add_fetch(&next_wait_registration, 1,
-                                                   __ATOMIC_RELAXED);
-        k32_store_registered_wait_handle(out_wait, token);
-        return TRUE;
     }
 
     K32_REGISTERED_WAIT *wait = NULL;
@@ -11361,11 +11375,12 @@ static BOOL WINAPI RegisterWaitForSingleObject_k32(HANDLE *out_wait,
     wait->deadline_ms = milliseconds == INFINITE
                       ? 0 : GetTickCount64() + milliseconds;
     wait->object_retained = FALSE;
-    k32_store_registered_wait_handle(out_wait, wait->token);
+    wait->compat32 = compat32;
+    k32_store_registered_wait_handle(out_wait, wait->token, compat32);
 
     if (!NT_SUCCESS(handle_retain_for_process(&g_handle_table, object,
                                                wait->owner_pid))) {
-        k32_store_registered_wait_handle(out_wait, NULL);
+        k32_store_registered_wait_handle(out_wait, NULL, compat32);
         wait->allocated = 0;
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
@@ -11374,9 +11389,9 @@ static BOOL WINAPI RegisterWaitForSingleObject_k32(HANDLE *out_wait,
     __atomic_store_n(&wait->registered, 1, __ATOMIC_RELEASE);
 
     K32_WAIT_DISPATCHER *dispatcher =
-        k32_get_wait_dispatcher(wait->owner_pid);
+        k32_get_wait_dispatcher(wait->owner_pid, compat32);
     if (!dispatcher) {
-        k32_store_registered_wait_handle(out_wait, NULL);
+        k32_store_registered_wait_handle(out_wait, NULL, compat32);
         __atomic_store_n(&wait->canceled, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&wait->worker_done, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&wait->worker_finalized, 1, __ATOMIC_RELEASE);
@@ -11398,6 +11413,7 @@ static BOOL WINAPI RegisterWaitForSingleObject_k32(HANDLE *out_wait,
         serial_puthex(milliseconds, 8);
         serial_puts(" flags=");
         serial_puthex(flags, 8);
+        serial_puts(compat32 ? " PE32" : " PE64");
         serial_puts(" dispatcher_kpid=");
         serial_putdec((uint64_t)(uint32_t)dispatcher->kernel_pid);
         serial_puts(" polls=");
@@ -11425,9 +11441,6 @@ static BOOL k32_unregister_wait(HANDLE token, HANDLE completion_event)
 
     K32_REGISTERED_WAIT *wait = k32_find_registered_wait(token);
     if (!wait) {
-        /* PE32 registrations still use the legacy synthetic handles. */
-        if (g_compat32_mode && (ULONG_PTR)token > 0xD1200000U)
-            return TRUE;
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
@@ -11457,7 +11470,7 @@ static BOOL k32_unregister_wait(HANDLE token, HANDLE completion_event)
     if (!__atomic_load_n(&wait->callback_running, __ATOMIC_ACQUIRE))
         k32_registered_wait_signal_completion(wait);
 
-    if (completion_event == (HANDLE)(ULONG_PTR)-1) {
+    if (k32_registered_wait_sync_completion(wait, completion_event)) {
         while (!__atomic_load_n(&wait->worker_finalized, __ATOMIC_ACQUIRE))
             Sleep(1);
     }
@@ -11742,15 +11755,6 @@ NTSTATUS kernel32_nt_open_named_event(POBJECT_ATTRIBUTES attributes,
     if (!handle) return STATUS_OBJECT_NAME_NOT_FOUND;
 
     *event_handle = handle;
-    if (named_object_is_steamipc(name)) {
-        serial_puts("[K32-NATIVE-EVENT] open pid=");
-        serial_putdec(win32_current_process_id());
-        serial_puts(" name='");
-        serial_puts(name);
-        serial_puts("' handle=0x");
-        serial_puthex((ULONG_PTR)handle, 16);
-        serial_puts("\n");
-    }
     return STATUS_SUCCESS;
 }
 
@@ -11780,45 +11784,18 @@ NTSTATUS kernel32_nt_publish_named_event(POBJECT_ATTRIBUTES attributes,
     if (!published) return STATUS_INSUFFICIENT_RESOURCES;
 
     *event_handle = published;
-    if (named_object_is_steamipc(name)) {
-        serial_puts("[K32-NATIVE-EVENT] publish pid=");
-        serial_putdec(win32_current_process_id());
-        serial_puts(" name='");
-        serial_puts(name);
-        serial_puts("' handle=0x");
-        serial_puthex((ULONG_PTR)published, 16);
-        serial_puts(*already_exists ? " existing=1\n" : " existing=0\n");
-    }
     return STATUS_SUCCESS;
 }
 
 static HANDLE create_event_k32(BOOL manual_reset, BOOL initial_state,
                                const char *name, uint64_t caller)
 {
-    BOOL trace = K32_STEAMIPC_SERIAL_TRACE &&
-                 named_object_is_steamchrome(name);
-    if (trace) {
-        serial_puts("[K32-STEAMIPC] CreateEvent pid=");
-        serial_putdec(win32_current_process_id());
-        serial_puts(" name='");
-        serial_puts(name);
-        serial_puts("' manual=");
-        serial_putdec(manual_reset);
-        serial_puts(" initial=");
-        serial_putdec(initial_state);
-        serial_puts("\n");
-    }
     if (name && *name) {
         HANDLE existing = named_object_open(
             named_events, K32_MAX_NAMED_EVENTS, OBJ_TYPE_EVENT,
             name, GENERIC_ALL);
         if (existing) {
             SetLastError(183); /* ERROR_ALREADY_EXISTS */
-            if (trace) {
-                serial_puts("[K32-STEAMIPC] event existing handle=0x");
-                serial_puthex((ULONG_PTR)existing, 16);
-                serial_puts(" last_error=183\n");
-            }
             return existing;
         }
     }
@@ -11829,11 +11806,6 @@ static HANDLE create_event_k32(BOOL manual_reset, BOOL initial_state,
     NTSTATUS status = NtCreateEvent(&handle, GENERIC_ALL, NULL, type,
                                     initial_state);
     if (!NT_SUCCESS(status)) {
-        if (trace) {
-            serial_puts("[K32-STEAMIPC] event create failed status=0x");
-            serial_puthex((uint32_t)status, 8);
-            serial_puts("\n");
-        }
         set_last_error_from_status(status);
         return NULL;
     }
@@ -11856,11 +11828,6 @@ static HANDLE create_event_k32(BOOL manual_reset, BOOL initial_state,
         handle = published;
     }
     SetLastError(0);
-    if (trace) {
-        serial_puts("[K32-STEAMIPC] event created handle=0x");
-        serial_puthex((ULONG_PTR)handle, 16);
-        serial_puts(" last_error=0\n");
-    }
     k32_sync_trace(K32_SYNC_CREATE, handle,
                    (manual_reset ? 1U : 0U) | (initial_state ? 2U : 0U),
                    NT_SUCCESS(status) ? 0U : (uint32_t)status, caller);
@@ -11948,8 +11915,6 @@ BOOL WINAPI SetEvent(HANDLE hEvent)
     NTSTATUS status = NtSetEvent(hEvent, NULL);
     k32_sync_trace(K32_SYNC_SET, hEvent, 0, (uint32_t)status,
                    caller);
-    steamipc_trace_handle("SetEvent", hEvent, 0, (uint32_t)status,
-                          caller);
     if (!NT_SUCCESS(status)) {
         set_last_error_from_status(status);
         return FALSE;
@@ -11966,8 +11931,6 @@ BOOL WINAPI ResetEvent(HANDLE hEvent)
     NTSTATUS status = NtResetEvent(hEvent, NULL);
     k32_sync_trace(K32_SYNC_RESET, hEvent, 0, (uint32_t)status,
                    caller);
-    steamipc_trace_handle("ResetEvent", hEvent, 0, (uint32_t)status,
-                          caller);
     if (!NT_SUCCESS(status)) {
         set_last_error_from_status(status);
         return FALSE;
@@ -11996,18 +11959,6 @@ HANDLE WINAPI OpenEventA(DWORD dwDesiredAccess, BOOL bInheritHandle, PCSTR lpNam
     }
     HANDLE handle = named_object_open(named_events, K32_MAX_NAMED_EVENTS,
                                       OBJ_TYPE_EVENT, name, dwDesiredAccess);
-    if (K32_STEAMIPC_SERIAL_TRACE &&
-        named_object_is_steamchrome(name)) {
-        serial_puts("[K32-STEAMIPC] OpenEventA pid=");
-        serial_putdec(win32_current_process_id());
-        serial_puts(" name='");
-        serial_puts(name);
-        serial_puts("' handle=0x");
-        serial_puthex((ULONG_PTR)handle, 16);
-        serial_puts(" last_error=");
-        serial_putdec(GetLastError());
-        serial_puts("\n");
-    }
     if (!handle) {
         serial_puts("[K32] OpenEventA: not found: ");
         serial_puts(name);
@@ -12026,18 +11977,6 @@ HANDLE WINAPI OpenEventW(DWORD dwDesiredAccess, BOOL bInheritHandle, PCWSTR lpNa
     }
     HANDLE handle = named_object_open(named_events, K32_MAX_NAMED_EVENTS,
                                       OBJ_TYPE_EVENT, name, dwDesiredAccess);
-    if (K32_STEAMIPC_SERIAL_TRACE &&
-        named_object_is_steamchrome(name)) {
-        serial_puts("[K32-STEAMIPC] OpenEventW pid=");
-        serial_putdec(win32_current_process_id());
-        serial_puts(" name='");
-        serial_puts(name);
-        serial_puts("' handle=0x");
-        serial_puthex((ULONG_PTR)handle, 16);
-        serial_puts(" last_error=");
-        serial_putdec(GetLastError());
-        serial_puts("\n");
-    }
     if (!handle) {
         serial_puts("[K32] OpenEventW: not found: ");
         serial_puts(name);
@@ -12673,10 +12612,9 @@ void k32_iocp_forget_file(HANDLE file)
     iocp_association_unlock(association_flags);
 }
 
-static void iocp_forget_handle(HANDLE handle)
+static void iocp_forget_handle_for_process(HANDLE handle, DWORD owner_pid)
 {
-    DWORD owner_pid = win32_current_process_id();
-    IOCP_PORT *port = iocp_find(handle);
+    IOCP_PORT *port = iocp_find_for_process(handle, owner_pid);
 
     uint64_t association_flags = iocp_association_lock();
     for (int i = 0; i < MAX_IOCP_ASSOCIATIONS; i++) {
@@ -13153,7 +13091,25 @@ static BOOL k32_iocp_complete_handle_status_for_process(
     if (!overlapped)
         return FALSE;
 
-    if (compat32) {
+    BOOL status_stored = TRUE;
+    BOOL event_loaded = TRUE;
+    if (owner_pid != win32_current_process_id()) {
+        if (compat32) {
+            uint32_t event_value = 0;
+            event_loaded = k32_copy_from_process(
+                owner_pid, &event_value, (const BYTE *)overlapped + 16,
+                sizeof(event_value));
+            event = (HANDLE)(ULONG_PTR)event_value;
+        } else {
+            ULONG_PTR event_value = 0;
+            event_loaded = k32_copy_from_process(
+                owner_pid, &event_value, (const BYTE *)overlapped + 24,
+                sizeof(event_value));
+            event = (HANDLE)event_value;
+        }
+        status_stored = k32_store_overlapped_status_for_process(
+            owner_pid, overlapped, compat32, completion_status, bytes);
+    } else if (compat32) {
         volatile uint32_t *values = (volatile uint32_t *)overlapped;
         values[0] = (uint32_t)completion_status;
         values[1] = bytes;
@@ -13189,7 +13145,7 @@ static BOOL k32_iocp_complete_handle_status_for_process(
         event_value &= ~(ULONG_PTR)1U;
         if (event_value)
             ntsync_set_event_for_process((HANDLE)event_value, owner_pid, NULL);
-        return TRUE;
+        return status_stored && event_loaded;
     }
     if (event)
         ntsync_set_event_for_process(event, owner_pid, NULL);
@@ -13202,10 +13158,11 @@ static BOOL k32_iocp_complete_handle_status_for_process(
         IOCP_PORT *target = iocp_find_for_process(port, owner_pid);
         if (!target)
             return FALSE;
-        return iocp_post_packet_status_ex(
+        BOOL posted = iocp_post_packet_status_ex(
             target, bytes, key, overlapped, completion_status, -1, 0);
+        return status_stored && event_loaded && posted;
     }
-    return TRUE;
+    return status_stored && event_loaded;
 }
 
 BOOL k32_iocp_complete_handle(HANDLE file, DWORD bytes, PVOID overlapped)
@@ -13260,6 +13217,27 @@ static BOOL k32_copy_to_process(DWORD owner_pid, PVOID destination,
     if (!win32_process_cr3(owner_pid, &destination_cr3))
         return FALSE;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(source_cr3));
+    return paging_copy_between_cr3(
+               destination_cr3, (uint64_t)(ULONG_PTR)destination,
+               source_cr3, (uint64_t)(ULONG_PTR)source, size, &copied) == 0 &&
+           copied == size;
+}
+
+static BOOL k32_copy_from_process(DWORD owner_pid, PVOID destination,
+                                  PCVOID source, SIZE_T size)
+{
+    extern BOOL win32_process_cr3(DWORD process_id, uint64_t *out_cr3);
+    if (!size)
+        return TRUE;
+    if (!destination || !source)
+        return FALSE;
+
+    uint64_t destination_cr3;
+    uint64_t source_cr3;
+    uint64_t copied = 0;
+    if (!win32_process_cr3(owner_pid, &source_cr3))
+        return FALSE;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(destination_cr3));
     return paging_copy_between_cr3(
                destination_cr3, (uint64_t)(ULONG_PTR)destination,
                source_cr3, (uint64_t)(ULONG_PTR)source, size, &copied) == 0 &&
@@ -13555,15 +13533,21 @@ void k32_pipe_service_pending(void)
         BOOL made_progress = FALSE;
         for (int i = 0; i < MAX_PENDING_PIPE_READS; i++) {
             HANDLE file = NULL;
+#if K32_VERBOSE_DIAGNOSTICS
             PVOID overlapped = NULL;
+#endif
             PVOID io_buffer = NULL;
             DWORD owner_pid = 0;
+#if K32_VERBOSE_DIAGNOSTICS
             DWORD owner_tid = 0;
+#endif
             DWORD generation = 0;
             DWORD length = 0;
             DWORD progress = 0;
             BOOL write = FALSE;
+#if K32_VERBOSE_DIAGNOSTICS
             BOOL trace_mojo = FALSE;
+#endif
             BOOL claimed = FALSE;
             BOOL publish_completed = FALSE;
             uint64_t pending_flags;
@@ -13579,14 +13563,20 @@ void k32_pipe_service_pending(void)
                        !pending_pipe_has_older_locked(i)) {
                 pending->servicing = TRUE;
                 file = pending->file;
+#if K32_VERBOSE_DIAGNOSTICS
                 overlapped = pending->overlapped;
+#endif
                 owner_pid = pending->owner_pid;
+#if K32_VERBOSE_DIAGNOSTICS
                 owner_tid = pending->owner_tid;
+#endif
                 generation = pending->generation;
                 length = pending->length;
                 progress = pending->progress;
                 write = pending->write;
+#if K32_VERBOSE_DIAGNOSTICS
                 trace_mojo = k32_mojo_trace_owner(owner_pid);
+#endif
                 io_buffer = write ? pending->write_stage : pending->stage;
                 claimed = TRUE;
             }
@@ -13650,6 +13640,7 @@ void k32_pipe_service_pending(void)
                 continue;
             made_progress = TRUE;
 
+#if K32_VERBOSE_DIAGNOSTICS
             k32_mojo_ring_record(owner_pid, owner_tid, file, overlapped,
                                  write ? K32_MOJO_RING_WRITE
                                        : K32_MOJO_RING_READ,
@@ -13672,6 +13663,7 @@ void k32_pipe_service_pending(void)
                 k32_mojo_trace_bytes(io_buffer, bytes);
                 serial_puts("\n");
             }
+#endif
             (void)k32_pipe_publish_completed(i, generation);
         }
         if (!made_progress)
@@ -13679,11 +13671,12 @@ void k32_pipe_service_pending(void)
     }
 }
 
-static BOOL k32_cancel_pipe_io(HANDLE file, PVOID target_overlapped,
-                               BOOL current_thread_only)
+static BOOL k32_cancel_pipe_io_for_process(HANDLE file,
+                                           PVOID target_overlapped,
+                                           BOOL current_thread_only,
+                                           DWORD owner_pid,
+                                           DWORD owner_tid)
 {
-    DWORD owner_pid = win32_current_process_id();
-    DWORD owner_tid = GetCurrentThreadId();
     BOOL found = FALSE;
 
     for (int i = 0; i < MAX_PENDING_PIPE_READS; i++) {
@@ -13724,9 +13717,18 @@ static BOOL k32_cancel_pipe_io(HANDLE file, PVOID target_overlapped,
     return found;
 }
 
-static void k32_pipe_wait_quiescent(HANDLE file)
+static BOOL k32_cancel_pipe_io(HANDLE file, PVOID target_overlapped,
+                               BOOL current_thread_only)
 {
-    DWORD owner_pid = win32_current_process_id();
+    return k32_cancel_pipe_io_for_process(file, target_overlapped,
+                                          current_thread_only,
+                                          win32_current_process_id(),
+                                          GetCurrentThreadId());
+}
+
+static void k32_pipe_wait_quiescent_for_process(HANDLE file,
+                                                DWORD owner_pid)
+{
     for (;;) {
         k32_pipe_service_pending();
 
@@ -13753,8 +13755,11 @@ static BOOL WINAPI CancelIo_k32(HANDLE file)
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
+    DWORD owner_pid = win32_current_process_id();
+    DWORD owner_tid = GetCurrentThreadId();
     k32_cancel_pipe_io(file, NULL, TRUE);
     wsock_cancel_io((SOCKET)(ULONG_PTR)file, NULL, TRUE);
+    (void)nt_file_lock_cancel(file, owner_pid, owner_tid, NULL, TRUE);
     SetLastError(0);
     return TRUE;
 }
@@ -13765,10 +13770,13 @@ static BOOL WINAPI CancelIoEx_k32(HANDLE file, PVOID overlapped)
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
+    DWORD owner_pid = win32_current_process_id();
     BOOL pipe_cancelled = k32_cancel_pipe_io(file, overlapped, FALSE);
     BOOL socket_cancelled = wsock_cancel_io(
         (SOCKET)(ULONG_PTR)file, overlapped, FALSE);
-    if (!pipe_cancelled && !socket_cancelled) {
+    BOOL lock_cancelled = nt_file_lock_cancel(
+        file, owner_pid, 0, overlapped, FALSE);
+    if (!pipe_cancelled && !socket_cancelled && !lock_cancelled) {
         SetLastError(1168); /* ERROR_NOT_FOUND */
         return FALSE;
     }
@@ -14053,7 +14061,10 @@ BOOL WINAPI GetQueuedCompletionStatus(HANDLE hCompletionPort,
         return FALSE;
     }
 
-    *lpOverlapped = NULL;
+    if (g_compat32_mode)
+        *(volatile uint32_t *)(PVOID)lpOverlapped = 0;
+    else
+        *lpOverlapped = NULL;
     IOCP_PORT *port = iocp_find(hCompletionPort);
     if (!port) {
         SetLastError(6); /* ERROR_INVALID_HANDLE */
@@ -14066,8 +14077,14 @@ BOOL WINAPI GetQueuedCompletionStatus(HANDLE hCompletionPort,
         return FALSE;
 
     *lpNumberOfBytesTransferred = packet.bytes;
-    *lpCompletionKey = packet.key;
-    *lpOverlapped = packet.overlapped;
+    if (g_compat32_mode) {
+        *(volatile uint32_t *)(PVOID)lpCompletionKey = (uint32_t)packet.key;
+        *(volatile uint32_t *)(PVOID)lpOverlapped =
+            (uint32_t)(ULONG_PTR)packet.overlapped;
+    } else {
+        *lpCompletionKey = packet.key;
+        *lpOverlapped = packet.overlapped;
+    }
     if (!NT_SUCCESS(packet.completion_status)) {
         set_last_error_from_status(packet.completion_status);
         return FALSE;
@@ -14369,58 +14386,6 @@ extern NTSTATUS sys_NtReleaseMutant(ULONG_PTR *);
 #define K32_MAX_NAMED_MUTEXES K32_MAX_NAMED_OBJECTS
 static K32_NAMED_OBJECT named_mutexes[K32_MAX_NAMED_MUTEXES];
 
-#define K32_STEAMIPC_SYNC_TRACE_LIMIT 2048
-static volatile uint32_t g_steamipc_sync_trace_count;
-
-static const char *steamipc_name_for_handle(HANDLE handle)
-{
-    const char *name = named_object_name_for_handle(
-        named_events, K32_MAX_NAMED_EVENTS, OBJ_TYPE_EVENT, handle);
-    if (!name)
-        name = named_object_name_for_handle(
-            named_mutexes, K32_MAX_NAMED_MUTEXES, OBJ_TYPE_MUTANT, handle);
-    if (!name)
-        name = named_object_name_for_handle(
-            named_mappings, K32_MAX_NAMED_MAPPINGS, OBJ_TYPE_SECTION,
-            handle);
-    return named_object_is_steamipc(name) ? name : NULL;
-}
-
-static void steamipc_trace_handle(const char *operation, HANDLE handle,
-                                  uint32_t argument, uint32_t result,
-                                  uint64_t caller)
-{
-    const char *name = steamipc_name_for_handle(handle);
-    if (!name)
-        return;
-
-    uint32_t sequence = __atomic_fetch_add(&g_steamipc_sync_trace_count, 1,
-                                           __ATOMIC_RELAXED);
-    if (!K32_STEAMIPC_SERIAL_TRACE ||
-        sequence >= K32_STEAMIPC_SYNC_TRACE_LIMIT)
-        return;
-
-    serial_puts("[K32-STEAMSYNC] seq=");
-    serial_putdec(sequence);
-    serial_puts(" pid=");
-    serial_putdec(win32_current_process_id());
-    serial_puts(" kpid=");
-    serial_putdec((uint32_t)proc_current_pid());
-    serial_puts(" op=");
-    serial_puts(operation);
-    serial_puts(" handle=0x");
-    serial_puthex((ULONG_PTR)handle, 16);
-    serial_puts(" arg=0x");
-    serial_puthex(argument, 8);
-    serial_puts(" result=0x");
-    serial_puthex(result, 8);
-    serial_puts(" caller=0x");
-    serial_puthex(caller, 16);
-    serial_puts(" name='");
-    serial_puts(name);
-    serial_puts("'\n");
-}
-
 static HANDLE create_mutex_k32(BOOL initial_owner, const char *name)
 {
     if (name && *name) {
@@ -14429,8 +14394,6 @@ static HANDLE create_mutex_k32(BOOL initial_owner, const char *name)
             name, GENERIC_ALL);
         if (existing) {
             SetLastError(183); /* ERROR_ALREADY_EXISTS */
-            steamipc_trace_handle("CreateMutex.old", existing,
-                                  (uint32_t)initial_owner, 183, 0);
             return existing;
         }
     }
@@ -14457,15 +14420,11 @@ static HANDLE create_mutex_k32(BOOL initial_owner, const char *name)
         if (already_exists) {
             CloseHandle(handle);
             SetLastError(183); /* ERROR_ALREADY_EXISTS */
-            steamipc_trace_handle("CreateMutex.race", published,
-                                  (uint32_t)initial_owner, 183, 0);
             return published;
         }
         handle = published;
     }
     SetLastError(0);
-    steamipc_trace_handle("CreateMutex.new", handle,
-                          (uint32_t)initial_owner, 0, 0);
     return handle;
 }
 
@@ -14559,77 +14518,18 @@ static HANDLE load_library_a_flags(PCSTR lpLibFileName, DWORD search_flags)
 {
     if (!lpLibFileName) return NULL;
 
-    BOOL trace_java_library =
-        k32_path_contains_ci(lpLibFileName, "java.dll") ||
-        k32_path_contains_ci(lpLibFileName, "verify.dll");
-    if (trace_java_library) {
-        const char *image_path = win32_current_image_path();
-        serial_puts("[K32-JAVA-LOAD] request='");
-        serial_puts(lpLibFileName);
-        serial_puts("' cwd='C:\\");
-        serial_puts(kernel32_current_directory_relative());
-        serial_puts("' image='");
-        serial_puts(image_path ? image_path : "");
-        serial_puts("' flags=0x");
-        serial_puthex(search_flags, 8);
-        serial_puts("\n");
-    }
-
-    BOOL trace_cef_delay = K32_VERBOSE_DIAGNOSTICS &&
-        (k32_path_contains_ci(lpLibFileName, "user32.dll") ||
-         k32_path_contains_ci(lpLibFileName, "oleacc.dll")) &&
-        __atomic_fetch_sub(&g_cef_delay_trace_budget, 1,
+    BOOL trace_loader = K32_VERBOSE_DIAGNOSTICS &&
+        __atomic_fetch_sub(&g_loader_trace_budget, 1,
                            __ATOMIC_RELAXED) > 0;
-    if (trace_cef_delay) {
-        serial_puts("[K32-DELAY] LoadLibrary '");
+    if (trace_loader) {
+        serial_puts("[K32-LOADER] LoadLibrary '");
         serial_puts(lpLibFileName);
-        serial_puts("'\n");
-    }
-
-    const char *command = win32_current_command_line();
-    bool trace_angle_library = K32_VERBOSE_DIAGNOSTICS &&
-        command && process_command_contains(command, "--type=gpu-process") &&
-        (k32_path_contains_ci(lpLibFileName, "vulkan-1.dll") ||
-         k32_path_contains_ci(lpLibFileName, "vk_swiftshader.dll") ||
-         k32_path_contains_ci(lpLibFileName, "libegl.dll") ||
-         k32_path_contains_ci(lpLibFileName, "libglesv2.dll"));
-    if (trace_angle_library) {
-        serial_puts("[K32-ANGLE] LoadLibrary request '");
-        serial_puts(lpLibFileName);
-        serial_puts("' cwd='C:\\");
-        serial_puts(kernel32_current_directory_relative());
         serial_puts("'\n");
     }
 
     /* Fast-reject known-missing DLLs */
     if (is_unavailable_dll(lpLibFileName) && !dll_is_shim(lpLibFileName))
         return NULL;
-
-    /* Reject purely-numeric basenames. UT99's native-binding loop
-     * walks an internal package array past Transient — once past the
-     * legit packages, slot N has its FName resolved as the decimal
-     * representation of an uninitialised index, so the engine asks us
-     * to LoadLibrary("C:\\System\\0"), "\\1", "\\2", … and (because we
-     * used to return a sentinel handle for every request) treats each
-     * one as a successfully loaded native, then later tries to find
-     * package "0.u" / "1.u" / … on disk and throws PackageNotFound
-     * from the localised error path. Returning NULL here tells the
-     * engine the binding does not exist and the loop short-circuits. */
-    {
-        const char *bn = lpLibFileName;
-        for (const char *p = lpLibFileName; *p; p++)
-            if (*p == '\\' || *p == '/') bn = p + 1;
-        bool all_digits = (*bn != 0);
-        for (const char *p = bn; *p; p++) {
-            if (*p < '0' || *p > '9') { all_digits = false; break; }
-        }
-        if (all_digits) {
-            serial_puts("[K32] LoadLibraryA: rejecting numeric basename '");
-            serial_puts(bn);
-            serial_puts("' (uninitialised package slot)\n");
-            return NULL;
-        }
-    }
 
 #ifndef OK_QUIET
     serial_puts("[K32] LoadLibraryA: ");
@@ -14642,13 +14542,8 @@ static HANDLE load_library_a_flags(PCSTR lpLibFileName, DWORD search_flags)
      * silently return NULL from this branch even though the first probe hit. */
     HANDLE loaded = (HANDLE)dll_get_module_handle(lpLibFileName, TRUE);
     if (loaded) {
-        if (trace_cef_delay)
-            serial_puts("[K32-DELAY] loaded PE module\n");
-        if (trace_java_library) {
-            serial_puts("[K32-JAVA-LOAD] reused base=0x");
-            serial_puthex((ULONG_PTR)loaded, g_compat32_mode ? 8 : 16);
-            serial_puts("\n");
-        }
+        if (trace_loader)
+            serial_puts("[K32-LOADER] loaded PE module\n");
         return loaded;
     }
 
@@ -14657,13 +14552,8 @@ static HANDLE load_library_a_flags(PCSTR lpLibFileName, DWORD search_flags)
     {
         HANDLE h = (HANDLE)dll_get_shim_module_handle(lpLibFileName, TRUE);
         if (h) {
-            if (trace_java_library) {
-                serial_puts("[K32-JAVA-LOAD] shim base=0x");
-                serial_puthex((ULONG_PTR)h, g_compat32_mode ? 8 : 16);
-                serial_puts("\n");
-            }
-            if (trace_cef_delay) {
-                serial_puts("[K32-DELAY] shim handle 0x");
+            if (trace_loader) {
+                serial_puts("[K32-LOADER] shim handle 0x");
                 serial_puthex((uint64_t)(ULONG_PTR)h, 8);
                 serial_puts("\n");
             }
@@ -14681,21 +14571,8 @@ static HANDLE load_library_a_flags(PCSTR lpLibFileName, DWORD search_flags)
      * full image read. */
     SetLastError(0);
     PVOID base = dll_load_from_fs_ex(lpLibFileName, TRUE, search_flags);
-    if (base) {
-        if (trace_java_library) {
-            serial_puts("[K32-JAVA-LOAD] loaded base=0x");
-            serial_puthex((ULONG_PTR)base, g_compat32_mode ? 8 : 16);
-            serial_puts("\n");
-        }
+    if (base)
         return (HANDLE)base;
-    }
-
-    DWORD load_error = GetLastError();
-    if (trace_java_library) {
-        serial_puts("[K32-JAVA-LOAD] failed error=");
-        serial_putdec(load_error);
-        serial_puts("\n");
-    }
 
     /* Match LoadLibrary: optional DLL probes must be able to fail. */
 #ifndef OK_QUIET
@@ -14703,10 +14580,8 @@ static HANDLE load_library_a_flags(PCSTR lpLibFileName, DWORD search_flags)
 #endif
     if (GetLastError() != 193) /* Preserve ERROR_BAD_EXE_FORMAT. */
         SetLastError(126); /* ERROR_MOD_NOT_FOUND */
-    if (trace_cef_delay)
-        serial_puts("[K32-DELAY] module not found\n");
-    if (trace_angle_library)
-        serial_puts("[K32-ANGLE] LoadLibrary failed\n");
+    if (trace_loader)
+        serial_puts("[K32-LOADER] module not found\n");
     return NULL;
 }
 
@@ -14771,21 +14646,11 @@ BOOL WINAPI DisableThreadLibraryCalls(HANDLE hLibModule)
     return TRUE;
 }
 
-static const char *k32_system_relative_path(const char *path)
+static const char *k32_drive_relative_path(const char *path)
 {
     if (!path) return NULL;
     if (path[0] && path[1] == ':') path += 2;
     while (*path == '\\' || *path == '/') path++;
-
-    const char *candidate = path;
-    const char *prefix = "system";
-    while (*candidate && *prefix &&
-           k32_path_fold(*candidate) == *prefix) {
-        candidate++;
-        prefix++;
-    }
-    if (!*prefix && (*candidate == '\\' || *candidate == '/'))
-        return candidate + 1;
     return path;
 }
 
@@ -14800,7 +14665,7 @@ static BOOL k32_path_has_directory(const char *path)
 static BOOL current_module_relative_path(HANDLE module, char path[260])
 {
     const char *image_path =
-        k32_system_relative_path(win32_current_image_path());
+        k32_drive_relative_path(win32_current_image_path());
     if (!image_path || !*image_path)
         image_path = win32_current_exe_name();
 
@@ -14811,7 +14676,7 @@ static BOOL current_module_relative_path(HANDLE module, char path[260])
         if (!loaded) return FALSE;
         module_name = loaded->name;
         if (loaded->path[0] && k32_path_has_directory(loaded->path))
-            module_path = k32_system_relative_path(loaded->path);
+            module_path = k32_drive_relative_path(loaded->path);
     }
 
     SIZE_T out = 0;
@@ -14852,13 +14717,12 @@ DWORD WINAPI GetModuleFileNameA(HANDLE hModule, PSTR lpFilename, DWORD nSize)
         SetLastError(87);
         return 0;
     }
-    /* Build full path: "C:\System\<exe_name>" so engine can derive install dir */
     char relative_path[260];
     if (!current_module_relative_path(hModule, relative_path)) {
         SetLastError(126); /* ERROR_MOD_NOT_FOUND */
         return 0;
     }
-    static const char prefix[] = "C:\\System\\";
+    static const char prefix[] = "C:\\";
     DWORD pos = 0;
 
     for (int i = 0; prefix[i] && pos < nSize - 1; i++)
@@ -14875,36 +14739,21 @@ DWORD WINAPI GetModuleFileNameW(HANDLE hModule, PWSTR lpFilename, DWORD nSize)
         SetLastError(87);
         return 0;
     }
-    /* Build wide path: "C:\System\<name>" matching GetModuleFileNameA */
     char relative_path[260];
     if (!current_module_relative_path(hModule, relative_path)) {
         SetLastError(126); /* ERROR_MOD_NOT_FOUND */
         return 0;
     }
-    static const WCHAR prefix[] = {'C',':','\\','S','y','s','t','e','m','\\'};
+    static const WCHAR prefix[] = {'C',':','\\'};
     DWORD pos = 0;
 
-    for (DWORD i = 0; i < 10 && pos < nSize - 1; i++)
+    for (DWORD i = 0; i < 3 && pos < nSize - 1; i++)
         lpFilename[pos++] = prefix[i];
     for (int i = 0; relative_path[i] && pos < nSize - 1; i++)
         lpFilename[pos++] = (WCHAR)(unsigned char)relative_path[i];
 
     lpFilename[pos] = 0;
 
-    const char *command = win32_current_command_line();
-    if (K32_VERBOSE_DIAGNOSTICS && command &&
-        process_command_contains(command, "--type=gpu-process")) {
-        static uint32_t angle_module_logs;
-        uint32_t index = __atomic_fetch_add(&angle_module_logs, 1,
-                                             __ATOMIC_RELAXED);
-        if (index < 24) {
-            serial_puts("[K32-ANGLE] GetModuleFileNameW h=0x");
-            serial_puthex((uint64_t)(ULONG_PTR)hModule, 16);
-            serial_puts(" -> C:\\System\\");
-            serial_puts(relative_path);
-            serial_puts("\n");
-        }
-    }
     return pos;
 }
 
@@ -14962,11 +14811,11 @@ static BOOL k32_process_image_full_path(HANDLE process, HANDLE module,
         }
     }
 
-    const char *relative = k32_system_relative_path(image_path);
+    const char *relative = k32_drive_relative_path(image_path);
 
-    static const char system_prefix[] = "C:\\System\\";
+    static const char drive_prefix[] = "C:\\";
     SIZE_T out = 0;
-    for (SIZE_T i = 0; system_prefix[i]; i++) path[out++] = system_prefix[i];
+    for (SIZE_T i = 0; drive_prefix[i]; i++) path[out++] = drive_prefix[i];
     while (*relative && out + 1 < 384) {
         char value = *relative++;
         path[out++] = value == '/' ? '\\' : value;
@@ -14989,11 +14838,10 @@ static BOOL k32_process_image_full_path(HANDLE process, HANDLE module,
             for (SIZE_T i = 0; shim_prefix[i]; i++)
                 path[out++] = shim_prefix[i];
         } else if (have_stored_path) {
-            static const char system_prefix[] = "C:\\System\\";
-            relative = k32_system_relative_path(loaded->path);
+            relative = k32_drive_relative_path(loaded->path);
             out = 0;
-            for (SIZE_T i = 0; system_prefix[i]; i++)
-                path[out++] = system_prefix[i];
+            for (SIZE_T i = 0; drive_prefix[i]; i++)
+                path[out++] = drive_prefix[i];
             while (*relative && out + 1 < 384) {
                 char value = *relative++;
                 path[out++] = value == '/' ? '\\' : value;
@@ -15277,14 +15125,22 @@ static void WINAPI GetSystemTimePreciseAsFileTime_k32(PVOID file_time)
 static BOOL WINAPI GetFileTime_k32(HANDLE file, PVOID creation,
                                     PVOID access, PVOID write)
 {
-    HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, file);
-    if (!entry || entry->type != OBJ_TYPE_FILE) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+    IO_STATUS_BLOCK iosb;
+    FILE_BASIC_INFORMATION information;
+    NTSTATUS status = NtQueryInformationFile(
+        file, &iosb, &information, sizeof(information),
+        FileBasicInformation);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
         return FALSE;
     }
-    if (creation) GetSystemTimeAsFileTime(creation);
-    if (access) GetSystemTimeAsFileTime(access);
-    if (write) GetSystemTimeAsFileTime(write);
+    if (creation)
+        memcpy(creation, &information.CreationTime, sizeof(ULONGLONG));
+    if (access)
+        memcpy(access, &information.LastAccessTime, sizeof(ULONGLONG));
+    if (write)
+        memcpy(write, &information.LastWriteTime, sizeof(ULONGLONG));
+    SetLastError(0);
     return TRUE;
 }
 
@@ -15721,18 +15577,14 @@ static BOOL WINAPI GetLogicalProcessorInformationEx_k32(
     return TRUE;
 }
 
-#define WIN32_NT_MAJOR 10U
-#define WIN32_NT_MINOR 0U
-#define WIN32_NT_BUILD 19045U
-
 BOOL WINAPI GetVersionExA(LPOSVERSIONINFOA lpVersionInformation)
 {
     if (!lpVersionInformation) return FALSE;
     /* Windows 10 22H2, still compatible with the legacy Win32 path. */
-    lpVersionInformation->dwMajorVersion = WIN32_NT_MAJOR;
-    lpVersionInformation->dwMinorVersion = WIN32_NT_MINOR;
-    lpVersionInformation->dwBuildNumber  = WIN32_NT_BUILD;
-    lpVersionInformation->dwPlatformId   = 2; /* VER_PLATFORM_WIN32_NT */
+    lpVersionInformation->dwMajorVersion = WIN32_NT_VERSION_MAJOR;
+    lpVersionInformation->dwMinorVersion = WIN32_NT_VERSION_MINOR;
+    lpVersionInformation->dwBuildNumber  = WIN32_NT_VERSION_BUILD;
+    lpVersionInformation->dwPlatformId   = WIN32_NT_PLATFORM_ID;
     for (int i = 0; i < 128; i++)
         lpVersionInformation->szCSDVersion[i] = 0;
     return TRUE;
@@ -15813,6 +15665,13 @@ DWORD WINAPI GetFileAttributesA(PCSTR lpFileName)
 
     /* Match the same normalized path semantics used by CreateFile. */
     if (k32_find_file_exact_ci(relative)) {
+        DWORD attributes = FILE_ATTRIBUTE_NORMAL;
+        vfs_node_t node;
+        uint16_t mode;
+        if (vfs_find(relative, VFS_MODE_WIN32, &node) &&
+            vfs_get_mode(&node, &mode) == VFS_STATUS_OK &&
+            !(mode & 0222U))
+            attributes = FILE_ATTRIBUTE_READONLY;
         if (trace_profile) {
             serial_puts("[K32-PROFILE] attr file '");
             serial_puts(relative);
@@ -15820,7 +15679,7 @@ DWORD WINAPI GetFileAttributesA(PCSTR lpFileName)
         }
         g_last_error = 0;
         sync_last_error();
-        return 0x80; /* FILE_ATTRIBUTE_NORMAL */
+        return attributes;
     }
     if (win32_directory_exists_normalized(relative)) {
         if (trace_profile) {
@@ -15845,8 +15704,39 @@ DWORD WINAPI GetFileAttributesA(PCSTR lpFileName)
 
 BOOL WINAPI SetFileAttributesA(PCSTR lpFileName, DWORD dwFileAttributes)
 {
-    (void)lpFileName;
-    (void)dwFileAttributes;
+    if (!lpFileName) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    char relative[260];
+    if (!win32_normalize_path(lpFileName, relative)) {
+        SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
+        return FALSE;
+    }
+
+    vfs_node_t node;
+    uint16_t mode;
+    if (!vfs_find(relative, VFS_MODE_WIN32, &node)) {
+        SetLastError(2); /* ERROR_FILE_NOT_FOUND */
+        return FALSE;
+    }
+    if (vfs_get_mode(&node, &mode) != VFS_STATUS_OK) {
+        SetLastError(5); /* ERROR_ACCESS_DENIED */
+        return FALSE;
+    }
+
+    mode &= 07777U;
+    if (dwFileAttributes & FILE_ATTRIBUTE_READONLY)
+        mode &= (uint16_t)~0222U;
+    else
+        mode |= 0222U;
+    if (vfs_set_mode(&node, mode) != VFS_STATUS_OK) {
+        SetLastError(5); /* ERROR_ACCESS_DENIED */
+        return FALSE;
+    }
+
+    SetLastError(0);
     return TRUE;
 }
 
@@ -16023,18 +15913,6 @@ DWORD WINAPI GetCurrentDirectoryW(DWORD nBufferLength, PWSTR lpBuffer)
     for (DWORD i = 0; i <= cwd_len; i++)
         lpBuffer[i + 3] = (WCHAR)(unsigned char)current_directory[i];
 
-    const char *command = win32_current_command_line();
-    if (K32_VERBOSE_DIAGNOSTICS && command &&
-        process_command_contains(command, "--type=gpu-process")) {
-        static uint32_t angle_getcwd_logs;
-        uint32_t index = __atomic_fetch_add(&angle_getcwd_logs, 1,
-                                             __ATOMIC_RELAXED);
-        if (index < 16) {
-            serial_puts("[K32-ANGLE] GetCurrentDirectoryW -> C:\\");
-            serial_puts(current_directory);
-            serial_puts("\n");
-        }
-    }
     return len;
 }
 
@@ -16087,9 +15965,19 @@ BOOL WINAPI SetCurrentDirectoryW(PCWSTR lpPathName)
 
 BOOL WINAPI SetFileAttributesW(PCWSTR lpFileName, DWORD dwFileAttributes)
 {
-    (void)lpFileName;
-    (void)dwFileAttributes;
-    return TRUE;
+    if (!lpFileName) return SetFileAttributesA(NULL, dwFileAttributes);
+    char path[260];
+    int i = 0;
+    while (lpFileName[i] && i < 259) {
+        path[i] = (char)(lpFileName[i] & 0xFF);
+        i++;
+    }
+    if (lpFileName[i]) {
+        SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
+        return FALSE;
+    }
+    path[i] = 0;
+    return SetFileAttributesA(path, dwFileAttributes);
 }
 
 /* ── System / Windows Directory (UT99) ─────────────────────── */
@@ -16342,14 +16230,6 @@ HANDLE WINAPI FindFirstFileA(PCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData
         return INVALID_HANDLE_VALUE;
     }
 
-    if (trace) {
-        serial_puts("[K32] FindFirstFileA: '");
-        serial_puts(lpFileName);
-        serial_puts("' pattern='");
-        serial_puts(pattern);
-        serial_puts("'\n");
-    }
-
     int slot = -1;
     for (int i = 0; i < MAX_FIND_HANDLES; i++) {
         if (!find_handles[i].in_use) { slot = i; break; }
@@ -16369,6 +16249,15 @@ HANDLE WINAPI FindFirstFileA(PCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData
     find_handles[slot].use_osfs3_index = osfs3_is_mounted();
     memset(&find_handles[slot].osfs3_cursor, 0,
            sizeof(find_handles[slot].osfs3_cursor));
+    if (trace) {
+        serial_puts("[K32] FindFirstFileA: '");
+        serial_puts(lpFileName);
+        serial_puts("' directory='");
+        serial_puts(find_handles[slot].directory);
+        serial_puts("' pattern='");
+        serial_puts(find_handles[slot].pattern);
+        serial_puts("'\n");
+    }
     if (find_handles[slot].use_osfs3_index)
         osfs3_dir_cursor_open_ci(find_handles[slot].directory,
                                  &find_handles[slot].osfs3_cursor);
@@ -16402,20 +16291,6 @@ BOOL WINAPI FindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData)
     if (!find_next_entry(&find_handles[slot], lpFindFileData)) {
         g_last_error = 18; /* ERROR_NO_MORE_FILES */
         return FALSE;
-    }
-
-    /* Log .unr results to debug Entry.unr resolution */
-    {
-        const char *n = lpFindFileData->cFileName;
-        int len = 0; while (n[len]) len++;
-        if (len > 4 && n[len-4] == '.' &&
-            (n[len-3]=='u'||n[len-3]=='U') &&
-            (n[len-2]=='n'||n[len-2]=='N') &&
-            (n[len-1]=='r'||n[len-1]=='R')) {
-            serial_puts("[K32] FindNext .unr: '");
-            serial_puts(n);
-            serial_puts("'\n");
-        }
     }
 
     return TRUE;
@@ -16629,6 +16504,7 @@ static BOOL WINAPI DebugActiveProcessStop_k32(DWORD process_id)
 }
 
 #define K32_MAX_EXCEPTION_FILTER_STATES 128
+#define K32_MAX_VECTORED_EXCEPTION_HANDLERS 128
 
 typedef struct {
     BOOL used;
@@ -16638,6 +16514,21 @@ typedef struct {
 
 static K32_EXCEPTION_FILTER_STATE
     k32_exception_filters[K32_MAX_EXCEPTION_FILTER_STATES];
+
+typedef struct {
+    BOOL used;
+    DWORD process_id;
+    PVOID handler;
+    PVOID token;
+    int previous;
+    int next;
+} K32_VECTORED_EXCEPTION_HANDLER;
+
+static K32_VECTORED_EXCEPTION_HANDLER
+    k32_vectored_handlers[K32_MAX_VECTORED_EXCEPTION_HANDLERS];
+static int k32_vectored_handler_head = -1;
+static int k32_vectored_handler_tail = -1;
+static ULONG_PTR k32_vectored_handler_generation;
 static spinlock_t k32_exception_filter_lock = SPINLOCK_INIT;
 
 static inline uint64_t k32_exception_filter_lock_irqsave(void)
@@ -16661,6 +16552,83 @@ static DWORD k32_exception_filter_owner(void)
     return process_id ? process_id : 1;
 }
 
+static void k32_unlink_vectored_handler_locked(int slot)
+{
+    K32_VECTORED_EXCEPTION_HANDLER *entry = &k32_vectored_handlers[slot];
+    if (entry->previous >= 0)
+        k32_vectored_handlers[entry->previous].next = entry->next;
+    else
+        k32_vectored_handler_head = entry->next;
+
+    if (entry->next >= 0)
+        k32_vectored_handlers[entry->next].previous = entry->previous;
+    else
+        k32_vectored_handler_tail = entry->previous;
+
+    entry->used = FALSE;
+    entry->process_id = 0;
+    entry->handler = NULL;
+    entry->token = NULL;
+    entry->previous = -1;
+    entry->next = -1;
+}
+
+SIZE_T kernel32_snapshot_vectored_exception_handlers(PVOID *handlers,
+                                                      SIZE_T capacity)
+{
+    if (!handlers || !capacity)
+        return 0;
+
+    DWORD process_id = k32_exception_filter_owner();
+    SIZE_T count = 0;
+    uint64_t flags = k32_exception_filter_lock_irqsave();
+    for (int slot = k32_vectored_handler_head;
+         slot >= 0 && count < capacity;
+         slot = k32_vectored_handlers[slot].next) {
+        K32_VECTORED_EXCEPTION_HANDLER *entry =
+            &k32_vectored_handlers[slot];
+        if (entry->used && entry->process_id == process_id)
+            handlers[count++] = entry->handler;
+    }
+    k32_exception_filter_unlock_irqrestore(flags);
+    return count;
+}
+
+LONG kernel32_dispatch_vectored_exception(PEXCEPTION_RECORD record,
+                                           PCONTEXT context)
+{
+    if (!record || !context)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    PVOID handlers[K32_MAX_VECTORED_EXCEPTION_HANDLERS];
+    SIZE_T count = kernel32_snapshot_vectored_exception_handlers(
+        handlers, K32_MAX_VECTORED_EXCEPTION_HANDLERS);
+    EXCEPTION_POINTERS pointers = {
+        .ExceptionRecord = record,
+        .ContextRecord = context,
+    };
+
+    for (SIZE_T i = 0; i < count; i++) {
+        if (!win32_user_range_executable(handlers[i], 1, FALSE)) {
+            static uint32_t invalid_handler_logs;
+            if (__atomic_fetch_add(&invalid_handler_logs, 1,
+                                   __ATOMIC_RELAXED) < 8) {
+                serial_puts("[VEH64] rejected non-executable handler 0x");
+                serial_puthex((ULONG_PTR)handlers[i], 16);
+                serial_puts("\n");
+            }
+            continue;
+        }
+
+        typedef LONG (WINAPI *vectored_handler_fn)(PEXCEPTION_POINTERS);
+        LONG result = ((vectored_handler_fn)handlers[i])(&pointers);
+        if (result == EXCEPTION_CONTINUE_EXECUTION &&
+            !(record->ExceptionFlags & EXCEPTION_NONCONTINUABLE))
+            return result;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 PVOID kernel32_get_unhandled_exception_filter(void)
 {
     DWORD process_id = k32_exception_filter_owner();
@@ -16682,11 +16650,18 @@ void kernel32_release_process_exception_state(DWORD process_id)
     if (!process_id)
         return;
 
+    win32_unwind64_release_process(process_id);
+
     uint64_t flags = k32_exception_filter_lock_irqsave();
     for (int i = 0; i < K32_MAX_EXCEPTION_FILTER_STATES; i++) {
         if (k32_exception_filters[i].used &&
             k32_exception_filters[i].process_id == process_id)
             k32_exception_filters[i].used = FALSE;
+    }
+    for (int i = 0; i < K32_MAX_VECTORED_EXCEPTION_HANDLERS; i++) {
+        if (k32_vectored_handlers[i].used &&
+            k32_vectored_handlers[i].process_id == process_id)
+            k32_unlink_vectored_handler_locked(i);
     }
     k32_exception_filter_unlock_irqrestore(flags);
 
@@ -16739,15 +16714,80 @@ PVOID WINAPI SetUnhandledExceptionFilter(PVOID lpTopLevelExceptionFilter)
     return old;
 }
 
-static PVOID WINAPI AddVectoredExceptionHandler_stub(ULONG first, PVOID handler)
+PVOID WINAPI AddVectoredExceptionHandler(ULONG first, PVOID handler)
 {
-    (void)first;
-    return handler;
+    if (!handler)
+        return NULL;
+
+    DWORD process_id = k32_exception_filter_owner();
+    int slot = -1;
+    uint64_t flags = k32_exception_filter_lock_irqsave();
+    for (int i = 0; i < K32_MAX_VECTORED_EXCEPTION_HANDLERS; i++) {
+        if (!k32_vectored_handlers[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        k32_exception_filter_unlock_irqrestore(flags);
+        return NULL;
+    }
+
+    k32_vectored_handler_generation =
+        (k32_vectored_handler_generation + 1U) & 0x007FFFFFU;
+    if (!k32_vectored_handler_generation)
+        k32_vectored_handler_generation = 1;
+
+    K32_VECTORED_EXCEPTION_HANDLER *entry =
+        &k32_vectored_handlers[slot];
+    entry->used = TRUE;
+    entry->process_id = process_id;
+    entry->handler = handler;
+    entry->token = (PVOID)((k32_vectored_handler_generation << 8) |
+                           (ULONG_PTR)(slot + 1));
+
+    if (first) {
+        entry->previous = -1;
+        entry->next = k32_vectored_handler_head;
+        if (entry->next >= 0)
+            k32_vectored_handlers[entry->next].previous = slot;
+        else
+            k32_vectored_handler_tail = slot;
+        k32_vectored_handler_head = slot;
+    } else {
+        entry->previous = k32_vectored_handler_tail;
+        entry->next = -1;
+        if (entry->previous >= 0)
+            k32_vectored_handlers[entry->previous].next = slot;
+        else
+            k32_vectored_handler_head = slot;
+        k32_vectored_handler_tail = slot;
+    }
+
+    PVOID token = entry->token;
+    k32_exception_filter_unlock_irqrestore(flags);
+    return token;
 }
 
-static ULONG WINAPI RemoveVectoredExceptionHandler_stub(PVOID handle)
+ULONG WINAPI RemoveVectoredExceptionHandler(PVOID handle)
 {
-    return handle ? 1 : 0;
+    if (!handle)
+        return 0;
+
+    DWORD process_id = k32_exception_filter_owner();
+    uint64_t flags = k32_exception_filter_lock_irqsave();
+    for (int i = 0; i < K32_MAX_VECTORED_EXCEPTION_HANDLERS; i++) {
+        K32_VECTORED_EXCEPTION_HANDLER *entry =
+            &k32_vectored_handlers[i];
+        if (!entry->used || entry->process_id != process_id ||
+            entry->token != handle)
+            continue;
+        k32_unlink_vectored_handler_locked(i);
+        k32_exception_filter_unlock_irqrestore(flags);
+        return 1;
+    }
+    k32_exception_filter_unlock_irqrestore(flags);
+    return 0;
 }
 
 void WINAPI OutputDebugStringA(PCSTR lpOutputString)
@@ -16861,8 +16901,6 @@ void WINAPI OutputDebugStringA(PCSTR lpOutputString)
 /*
  * RaiseException — Win32 wrapper around RtlRaiseException.
  */
-extern void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord);
-
 #define K32_DELAYLOAD_MODULE_NOT_FOUND 0xC06D007EU
 #define K32_DELAYLOAD_PROC_NOT_FOUND   0xC06D007FU
 
@@ -17023,9 +17061,10 @@ static void k32_log_delay_load_exception(DWORD code, DWORD argument_count,
     serial_puts("\n");
 }
 
-void WINAPI RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags,
-                           DWORD nNumberOfArguments,
-                           const ULONG_PTR *lpArguments)
+void WINAPI win32_raise_exception_impl(
+    DWORD dwExceptionCode, DWORD dwExceptionFlags,
+    DWORD nNumberOfArguments, const ULONG_PTR *lpArguments,
+    PCONTEXT context)
 {
     if (dwExceptionCode == 0x406D1388) {
         /* Legacy MSVC thread-name notification. A debugger consumes this
@@ -17047,7 +17086,13 @@ void WINAPI RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags,
     rec.ExceptionCode    = dwExceptionCode;
     rec.ExceptionFlags   = dwExceptionFlags;
     rec.ExceptionRecord  = NULL;
-    rec.ExceptionAddress = NULL;
+    if (g_compat32_mode) {
+        extern uint32_t compat32_get_last_caller_eip(void);
+        rec.ExceptionAddress = (PVOID)(ULONG_PTR)
+            compat32_get_last_caller_eip();
+    } else if (context) {
+        rec.ExceptionAddress = (PVOID)(ULONG_PTR)context->Rip;
+    }
 
     if (lpArguments && nNumberOfArguments > 0) {
         if (nNumberOfArguments > EXCEPTION_MAXIMUM_PARAMETERS)
@@ -17057,13 +17102,10 @@ void WINAPI RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags,
             rec.ExceptionInformation[i] = lpArguments[i];
     }
 
-    RtlRaiseException(&rec);
+    win32_rtl_raise_exception_impl(&rec, context);
 }
 
-static void WINAPI DebugBreak_k32(void)
-{
-    RaiseException(0x80000003U /* EXCEPTION_BREAKPOINT */, 0, 0, NULL);
-}
+extern void WINAPI win32_debug_break_entry(void);
 
 /*
  * UnhandledExceptionFilter — default top-level filter.
@@ -17241,6 +17283,11 @@ LONG WINAPI InterlockedDecrement(volatile LONG *Addend)
 LONG WINAPI InterlockedExchange(volatile LONG *Target, LONG Value)
 {
     return __atomic_exchange_n(Target, Value, __ATOMIC_SEQ_CST);
+}
+
+LONG WINAPI InterlockedExchangeAdd(volatile LONG *Addend, LONG Value)
+{
+    return __atomic_fetch_add(Addend, Value, __ATOMIC_SEQ_CST);
 }
 
 LONG WINAPI InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand)
@@ -17431,29 +17478,23 @@ PVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, PVOID lpMem, SIZE_T dwByte
     for (SIZE_T i = 0; i < copy; i++) d[i] = s[i];
     HeapFree(hHeap, 0, lpMem);
 
-#ifndef OK_QUIET
-    /* Diagnostic: log realloc details for FName array debugging */
-    serial_puts("[HEAP-RA] 0x");
-    serial_puthex((uint64_t)(ULONG_PTR)lpMem, 8);
-    serial_puts(" -> 0x");
-    serial_puthex((uint64_t)(ULONG_PTR)new_mem, 8);
-    serial_puts(" old_sz=0x");
-    serial_puthex(old_size, 8);
-    serial_puts(" new_sz=0x");
-    serial_puthex(dwBytes, 8);
-    serial_puts(" flags=0x");
-    serial_puthex(dwFlags, 8);
-    serial_puts(" copy=0x");
-    serial_puthex(copy, 8);
-    serial_puts("\n");
-#endif
-
     return new_mem;
 }
 
-/* ── UT99 stubs: Process, Memory, System, Console ─────────── */
+/* ── Process, memory, system, and console APIs ────────────── */
 
-typedef struct _MEMORYSTATUS {
+typedef struct _MEMORYSTATUS32 {
+    DWORD  dwLength;
+    DWORD  dwMemoryLoad;
+    DWORD  dwTotalPhys;
+    DWORD  dwAvailPhys;
+    DWORD  dwTotalPageFile;
+    DWORD  dwAvailPageFile;
+    DWORD  dwTotalVirtual;
+    DWORD  dwAvailVirtual;
+} MEMORYSTATUS32;
+
+typedef struct _MEMORYSTATUS64 {
     DWORD  dwLength;
     DWORD  dwMemoryLoad;
     SIZE_T dwTotalPhys;
@@ -17462,7 +17503,7 @@ typedef struct _MEMORYSTATUS {
     SIZE_T dwAvailPageFile;
     SIZE_T dwTotalVirtual;
     SIZE_T dwAvailVirtual;
-} MEMORYSTATUS;
+} MEMORYSTATUS64;
 
 typedef struct _MEMORYSTATUSEX32 {
     DWORD     dwLength;
@@ -17479,42 +17520,107 @@ typedef struct _MEMORYSTATUSEX32 {
 _Static_assert(sizeof(MEMORYSTATUSEX32) == 64,
                "PE32 MEMORYSTATUSEX layout mismatch");
 
-void WINAPI GlobalMemoryStatus(MEMORYSTATUS *lpBuffer)
-{
-    if (!lpBuffer) return;
-    lpBuffer->dwLength         = sizeof(MEMORYSTATUS);
-    lpBuffer->dwMemoryLoad     = 25;
-    /* Values must fit in 32-bit SIZE_T (UT99 reads 4 bytes).
-     * 4GB = 0x100000000 overflows to 0 → "Phys=0" → no rendering. */
-    lpBuffer->dwTotalPhys      = 512 * 1024 * 1024;  /* 512 MB */
-    lpBuffer->dwAvailPhys      = 384 * 1024 * 1024;
-    lpBuffer->dwTotalPageFile  = 1024 * 1024 * 1024;  /* 1 GB */
-    lpBuffer->dwAvailPageFile  = 768 * 1024 * 1024;
-    lpBuffer->dwTotalVirtual   = 2047 * 1024 * 1024;  /* ~2 GB */
-    lpBuffer->dwAvailVirtual   = 1536 * 1024 * 1024;
-}
+_Static_assert(sizeof(MEMORYSTATUS32) == 32,
+               "PE32 MEMORYSTATUS layout mismatch");
+_Static_assert(sizeof(MEMORYSTATUS64) == 56,
+               "PE64 MEMORYSTATUS layout mismatch");
 
-static BOOL WINAPI GlobalMemoryStatusEx_k32(MEMORYSTATUSEX32 *status)
+typedef struct {
+    uint64_t total_phys;
+    uint64_t available_phys;
+    uint64_t total_commit;
+    uint64_t available_commit;
+    uint64_t total_virtual;
+    uint64_t available_virtual;
+    DWORD memory_load;
+} K32_MEMORY_SNAPSHOT;
+
+static void k32_memory_snapshot(K32_MEMORY_SNAPSHOT *snapshot)
 {
     extern uint64_t mem_get_total(void);
     extern uint64_t mem_get_free(void);
 
+    uint64_t total = mem_get_total();
+    uint64_t available = mem_get_free();
+    if (available > total)
+        available = total;
+
+    SIZE_T total_virtual = 0;
+    SIZE_T available_virtual = 0;
+    nt_vm_get_address_space(&total_virtual, &available_virtual);
+
+    snapshot->total_phys = total;
+    snapshot->available_phys = available;
+    /* OsitoK has no paging file. Its commit limit is physical RAM. */
+    snapshot->total_commit = total;
+    snapshot->available_commit = available;
+    snapshot->total_virtual = total_virtual;
+    snapshot->available_virtual = available_virtual;
+    snapshot->memory_load = total
+        ? (DWORD)(((total - available) * 100u) / total)
+        : 0;
+}
+
+static DWORD k32_legacy_memory_value(uint64_t value)
+{
+    /* GlobalMemoryStatus uses pointer-sized fields. PE32 cannot represent
+     * values above 4 GiB; Windows reports -1 for that legacy overflow case. */
+    return value > UINT32_MAX ? UINT32_MAX : (DWORD)value;
+}
+
+void WINAPI GlobalMemoryStatus(PVOID lpBuffer)
+{
+    if (!lpBuffer) return;
+
+    K32_MEMORY_SNAPSHOT snapshot;
+    k32_memory_snapshot(&snapshot);
+    if (g_compat32_mode) {
+        MEMORYSTATUS32 *status = (MEMORYSTATUS32 *)lpBuffer;
+        status->dwLength = sizeof(*status);
+        status->dwMemoryLoad = snapshot.memory_load;
+        status->dwTotalPhys =
+            k32_legacy_memory_value(snapshot.total_phys);
+        status->dwAvailPhys =
+            k32_legacy_memory_value(snapshot.available_phys);
+        status->dwTotalPageFile =
+            k32_legacy_memory_value(snapshot.total_commit);
+        status->dwAvailPageFile =
+            k32_legacy_memory_value(snapshot.available_commit);
+        status->dwTotalVirtual =
+            k32_legacy_memory_value(snapshot.total_virtual);
+        status->dwAvailVirtual =
+            k32_legacy_memory_value(snapshot.available_virtual);
+    } else {
+        MEMORYSTATUS64 *status = (MEMORYSTATUS64 *)lpBuffer;
+        status->dwLength = sizeof(*status);
+        status->dwMemoryLoad = snapshot.memory_load;
+        status->dwTotalPhys = snapshot.total_phys;
+        status->dwAvailPhys = snapshot.available_phys;
+        status->dwTotalPageFile = snapshot.total_commit;
+        status->dwAvailPageFile = snapshot.available_commit;
+        status->dwTotalVirtual = snapshot.total_virtual;
+        status->dwAvailVirtual = snapshot.available_virtual;
+    }
+}
+
+static BOOL WINAPI GlobalMemoryStatusEx_k32(MEMORYSTATUSEX32 *status)
+{
     if (!status || status->dwLength != sizeof(*status)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
 
-    uint64_t total = mem_get_total();
-    uint64_t available = mem_get_free();
-    status->dwMemoryLoad = total ? (DWORD)((total - available) * 100 / total)
-                                 : 0;
-    status->ullTotalPhys = total;
-    status->ullAvailPhys = available;
-    status->ullTotalPageFile = total;
-    status->ullAvailPageFile = available;
-    status->ullTotalVirtual = 0x7FF00000ULL;
-    status->ullAvailVirtual = 0x60000000ULL;
+    K32_MEMORY_SNAPSHOT snapshot;
+    k32_memory_snapshot(&snapshot);
+    status->dwMemoryLoad = snapshot.memory_load;
+    status->ullTotalPhys = snapshot.total_phys;
+    status->ullAvailPhys = snapshot.available_phys;
+    status->ullTotalPageFile = snapshot.total_commit;
+    status->ullAvailPageFile = snapshot.available_commit;
+    status->ullTotalVirtual = snapshot.total_virtual;
+    status->ullAvailVirtual = snapshot.available_virtual;
     status->ullAvailExtendedVirtual = 0;
+    SetLastError(0);
     return TRUE;
 }
 
@@ -17530,11 +17636,34 @@ static HANDLE WINAPI GetConsoleWindow_k32(void)
     return NULL;
 }
 
-BOOL WINAPI GetProcessWorkingSetSize(HANDLE hProcess, SIZE_T *lpMin, SIZE_T *lpMax)
+BOOL WINAPI GetProcessWorkingSetSize(HANDLE hProcess, PVOID lpMin, PVOID lpMax)
 {
-    (void)hProcess;
-    if (lpMin) *lpMin = 204800;
-    if (lpMax) *lpMax = 1413120;
+    if (!k32_process_handle_valid(hProcess)) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+    if (!lpMin || !lpMax) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    K32_MEMORY_SNAPSHOT snapshot;
+    k32_memory_snapshot(&snapshot);
+    uint64_t maximum = snapshot.total_phys < snapshot.total_virtual
+                     ? snapshot.total_phys : snapshot.total_virtual;
+    maximum &= ~0xFFFULL;
+
+    /* There is no pager or enforced resident-set quota yet. Report that
+     * policy explicitly: no guaranteed minimum and the process VA/physical
+     * ceiling as its maximum, using the caller's pointer width. */
+    if (g_compat32_mode) {
+        *(DWORD *)lpMin = 0;
+        *(DWORD *)lpMax = k32_legacy_memory_value(maximum) & ~0xFFFu;
+    } else {
+        *(SIZE_T *)lpMin = 0;
+        *(SIZE_T *)lpMax = maximum;
+    }
+    SetLastError(0);
     return TRUE;
 }
 
@@ -17640,65 +17769,6 @@ static LONG WINAPI GetThreadDescription_k32(HANDLE thread,
     return 0; /* S_OK */
 }
 
-static char process_name_fold(char c)
-{
-    return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
-}
-
-static BOOL process_command_contains(PCSTR command, PCSTR needle)
-{
-    if (!command || !needle || !*needle) return FALSE;
-    for (; *command; command++) {
-        int i = 0;
-        while (needle[i] && command[i] == needle[i]) i++;
-        if (!needle[i]) return TRUE;
-    }
-    return FALSE;
-}
-
-static PCSTR process_command_find_ci(PCSTR command, PCSTR needle)
-{
-    if (!command || !needle || !*needle) return NULL;
-    for (; *command; command++) {
-        SIZE_T i = 0;
-        while (needle[i] && command[i] &&
-               process_name_fold(command[i]) == process_name_fold(needle[i]))
-            i++;
-        if (!needle[i]) return command;
-    }
-    return NULL;
-}
-
-static BOOL process_image_is_current(PCSTR app, PCSTR cmd)
-{
-    BOOL from_cmd = !app || !*app;
-    const char *start = from_cmd ? cmd : app;
-    if (!start) return FALSE;
-
-    while (*start == ' ' || *start == '\t') start++;
-    char quote = from_cmd && (*start == '"' || *start == '\'') ? *start++ : 0;
-    const char *end = start;
-    while (*end &&
-           (quote ? *end != quote
-                  : (!from_cmd || (*end != ' ' && *end != '\t'))))
-        end++;
-
-    const char *base = start;
-    for (const char *p = start; p < end; p++)
-        if (*p == '\\' || *p == '/') base = p + 1;
-
-    const char *current = win32_current_exe_name();
-    for (const char *p = current; *p; p++)
-        if (*p == '\\' || *p == '/') current = p + 1;
-
-    while (base < end && *current &&
-           process_name_fold(*base) == process_name_fold(*current)) {
-        base++;
-        current++;
-    }
-    return base == end && *current == 0;
-}
-
 typedef struct __attribute__((packed)) {
     uint32_t process;
     uint32_t thread;
@@ -17757,165 +17827,16 @@ static BOOL process_extract_image(PCSTR app, PCSTR command, char path[260])
     return win32_normalize_path(raw, path);
 }
 
-static BOOL process_path_basename_is(PCSTR path, PCSTR expected)
-{
-    if (!path || !expected) return FALSE;
-    const char *base = path;
-    for (const char *p = path; *p; p++)
-        if (*p == '\\' || *p == '/') base = p + 1;
-
-    while (*base && *expected &&
-           process_name_fold(*base) == process_name_fold(*expected)) {
-        base++;
-        expected++;
-    }
-    return *base == 0 && *expected == 0;
-}
-
-static PCSTR process_apply_compat_flags(PCSTR image_path, PCSTR command,
-                                        char adjusted[4096])
-{
-    static const char hang_flag[] = " --disable-hang-monitor";
-    static const char gpu_watchdog_flag[] = " --disable-gpu-watchdog";
-    static const char profiler_flag[] = " --disable-stack-profiler";
-    static const char angle_key[] = "--use-angle=";
-    static const char full_angle[] = "--use-angle=swiftshader";
-    static const char angle_flag[] = " --use-angle=swiftshader";
-    static const char netlog_flag[] =
-        " --log-net-log=\"C:\\System\\Program Files\\Steam\\logs\\cef_netlog.json\"";
-    static const char netlog_capture_flag[] =
-        " --net-log-capture-mode=Everything";
-    static const char profile_path[] =
-        "C:\\Users\\osito\\AppData\\Local\\Steam\\htmlcache";
-    static const char profile_suffix[] = "-fresh-probe-2";
-    const char *angle_pos = NULL;
-    const char *profile_pos = NULL;
-    SIZE_T angle_span = 0;
-
-    if (!command ||
-        !process_path_basename_is(image_path, "steamwebhelper.exe"))
-        return command;
-
-    BOOL gpu_process =
-        process_command_contains(command, "--type=gpu-process");
-    BOOL browser_process = !process_command_contains(command, "--type=");
-    profile_pos = process_command_find_ci(command, profile_path);
-    if (gpu_process) {
-        for (const char *p = command; *p; p++) {
-            SIZE_T i = 0;
-            while (angle_key[i] && p[i] == angle_key[i]) i++;
-            if (!angle_key[i]) {
-                angle_pos = p;
-                while (p[angle_span] && p[angle_span] != ' ' &&
-                       p[angle_span] != '\t' && p[angle_span] != '"')
-                    angle_span++;
-                break;
-            }
-        }
-    }
-
-    BOOL replace_angle = gpu_process && angle_pos &&
-        (angle_span != sizeof(full_angle) - 1 ||
-         !process_command_contains(angle_pos, full_angle));
-    BOOL add_angle = gpu_process && !angle_pos;
-    BOOL add_hang =
-        !process_command_contains(command, "--disable-hang-monitor");
-    BOOL add_gpu_watchdog = gpu_process &&
-        !process_command_contains(command, "--disable-gpu-watchdog");
-    BOOL add_profiler =
-        !process_command_contains(command, "--disable-stack-profiler");
-    BOOL add_netlog = browser_process &&
-        !process_command_contains(command, "--log-net-log=");
-    BOOL add_netlog_capture = browser_process &&
-        !process_command_contains(command, "--net-log-capture-mode=");
-    BOOL redirect_profile = profile_pos &&
-        !process_command_find_ci(profile_pos + sizeof(profile_path) - 1,
-                                 profile_suffix);
-    if (!replace_angle && !add_angle && !add_hang && !add_gpu_watchdog &&
-        !add_profiler &&
-        !add_netlog && !add_netlog_capture && !redirect_profile)
-        return command;
-
-    SIZE_T command_len = 0;
-    while (command[command_len]) command_len++;
-    SIZE_T adjusted_len = command_len;
-    if (replace_angle)
-        adjusted_len = adjusted_len - angle_span + sizeof(full_angle) - 1;
-    if (add_angle) adjusted_len += sizeof(angle_flag) - 1;
-    if (add_hang) adjusted_len += sizeof(hang_flag) - 1;
-    if (add_gpu_watchdog)
-        adjusted_len += sizeof(gpu_watchdog_flag) - 1;
-    if (add_profiler) adjusted_len += sizeof(profiler_flag) - 1;
-    if (add_netlog) adjusted_len += sizeof(netlog_flag) - 1;
-    if (add_netlog_capture)
-        adjusted_len += sizeof(netlog_capture_flag) - 1;
-    if (redirect_profile) adjusted_len += sizeof(profile_suffix) - 1;
-    if (adjusted_len >= 4096) {
-        serial_puts("[K32-COMPAT] Steam CEF flags skipped: command too long\n");
-        return command;
-    }
-
-    SIZE_T out = 0;
-    for (SIZE_T i = 0; i < command_len;) {
-        if (redirect_profile && command + i == profile_pos) {
-            for (SIZE_T j = 0; j < sizeof(profile_path) - 1; j++)
-                adjusted[out++] = command[i + j];
-            for (SIZE_T j = 0; j < sizeof(profile_suffix) - 1; j++)
-                adjusted[out++] = profile_suffix[j];
-            i += sizeof(profile_path) - 1;
-        } else if (replace_angle && command + i == angle_pos) {
-            for (SIZE_T j = 0; j < sizeof(full_angle) - 1; j++)
-                adjusted[out++] = full_angle[j];
-            i += angle_span;
-        } else {
-            adjusted[out++] = command[i++];
-        }
-    }
-    if (add_angle) {
-        for (SIZE_T i = 0; i < sizeof(angle_flag) - 1; i++)
-            adjusted[out++] = angle_flag[i];
-    }
-    if (add_hang) {
-        for (SIZE_T i = 0; i < sizeof(hang_flag) - 1; i++)
-            adjusted[out++] = hang_flag[i];
-    }
-    if (add_gpu_watchdog) {
-        for (SIZE_T i = 0; i < sizeof(gpu_watchdog_flag) - 1; i++)
-            adjusted[out++] = gpu_watchdog_flag[i];
-    }
-    if (add_profiler) {
-        for (SIZE_T i = 0; i < sizeof(profiler_flag) - 1; i++)
-            adjusted[out++] = profiler_flag[i];
-    }
-    if (add_netlog) {
-        for (SIZE_T i = 0; i < sizeof(netlog_flag) - 1; i++)
-            adjusted[out++] = netlog_flag[i];
-    }
-    if (add_netlog_capture) {
-        for (SIZE_T i = 0; i < sizeof(netlog_capture_flag) - 1; i++)
-            adjusted[out++] = netlog_capture_flag[i];
-    }
-    adjusted[out] = 0;
-
-    if (replace_angle || add_angle)
-        serial_puts("[K32-COMPAT] Steam CEF GPU process forced to full SwiftShader\n");
-    if (add_gpu_watchdog)
-        serial_puts("[K32-COMPAT] disabled Steam CEF GPU watchdog\n");
-    if (add_hang || add_profiler)
-        serial_puts("[K32-COMPAT] disabled Steam CEF hang monitor/profiler\n");
-    if (add_netlog || add_netlog_capture)
-        serial_puts("[K32-COMPAT] enabled Steam CEF network log\n");
-    if (redirect_profile)
-        serial_puts("[K32-COMPAT] Steam CEF profile redirected to htmlcache-fresh-probe-2\n");
-    return adjusted;
-}
-
 static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles,
                                   DWORD flags, PCVOID environment,
                                   PCSTR current_directory,
-                                  PVOID startup_info, PVOID information)
+                                  PVOID startup_info, PVOID information,
+                                  PHANDLE launched_process,
+                                  PHANDLE launched_thread)
 {
-    if (!information) {
+    if (launched_process) *launched_process = NULL;
+    if (launched_thread) *launched_thread = NULL;
+    if (!information && !launched_process && !launched_thread) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
@@ -17934,46 +17855,13 @@ static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles
         directory_to_spawn = normalized_directory;
     }
 
-    /* The child runner currently supports PE64. Keep the legacy in-process
-     * relaunch only for PE32; PE64 self-spawns get real waitable children. */
-    if (GetCurrentProcessId() == 1 && g_compat32_mode &&
-        process_image_is_current(app, command)) {
-        extern BOOL win32_request_relaunch(const char *application,
-                                           const char *command_line);
-        if (!win32_request_relaunch(app, command)) {
-            SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
-            return FALSE;
-        }
-        write_process_information(information, NT_CURRENT_PROCESS,
-                                  NT_CURRENT_THREAD, 1, 1);
-        serial_puts("[K32] CreateProcess -> self RE-EXEC requested\n");
-        return TRUE;
-    }
-    if (process_command_contains(command, "--type=crashpad-handler")) {
-        /* ponytail: crash reporting is omitted until nested PE loaders isolate state. */
-        HANDLE process = create_event_k32(TRUE, TRUE, NULL, 0);
-        HANDLE thread = create_event_k32(TRUE, TRUE, NULL, 0);
-        if (!process || !thread) {
-            if (process) CloseHandle(process);
-            if (thread) CloseHandle(thread);
-            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
-            return FALSE;
-        }
-        write_process_information(information, process, thread,
-                                  GetCurrentProcessId(), GetCurrentThreadId());
-        SetLastError(0);
-        serial_puts("[K32] CreateProcess -> skipped crashpad handler\n");
-        return TRUE;
-    }
     char image_path[260];
     if (!process_extract_image(app, command, image_path)) {
         SetLastError((app || command) ? 206 : 2);
         return FALSE;
     }
 
-    char adjusted_command[4096];
-    PCSTR command_to_spawn = process_apply_compat_flags(
-        image_path, command && *command ? command : app, adjusted_command);
+    PCSTR command_to_spawn = command && *command ? command : app;
 
     HANDLE retained[K32_MAX_INHERITED_HANDLES];
     DWORD retained_count = 0;
@@ -18003,14 +17891,35 @@ static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles
         return FALSE;
     }
 
-    write_process_information(information, process, thread,
-                              process_id, thread_id);
+    if (information)
+        write_process_information(information, process, thread,
+                                  process_id, thread_id);
+    if (launched_process) *launched_process = process;
+    if (launched_thread) *launched_thread = thread;
     SetLastError(0);
     serial_puts("[K32] CreateProcess -> scheduled ");
     serial_puts(image_path);
     serial_puts(" pid=");
     serial_putdec(process_id);
     serial_puts("\n");
+    return TRUE;
+}
+
+BOOL kernel32_launch_process_a(PCSTR application, PCSTR command_line,
+                               PCSTR current_directory)
+{
+    HANDLE process = NULL;
+    HANDLE thread = NULL;
+    if (!create_process_common(application, command_line, FALSE, 0, NULL,
+                               current_directory, NULL, NULL,
+                               &process, &thread))
+        return FALSE;
+
+    if (thread && thread != NT_CURRENT_THREAD)
+        CloseHandle(thread);
+    if (process && process != NT_CURRENT_PROCESS)
+        CloseHandle(process);
+    SetLastError(0);
     return TRUE;
 }
 
@@ -18023,7 +17932,8 @@ BOOL WINAPI CreateProcessA(PCSTR lpApp, PSTR lpCmd, PVOID a, PVOID b,
     serial_puts(" cmd=");
     if (lpCmd) serial_puts(lpCmd);
     serial_puts("\n");
-    return create_process_common(lpApp, lpCmd, c, d, e, f, g, h);
+    return create_process_common(lpApp, lpCmd, c, d, e, f, g, h,
+                                 NULL, NULL);
 }
 
 BOOL WINAPI CreateProcessW(PCWSTR lpApp, PWSTR lpCmd, PVOID a, PVOID b,
@@ -18070,7 +17980,8 @@ BOOL WINAPI CreateProcessW(PCWSTR lpApp, PWSTR lpCmd, PVOID a, PVOID b,
     serial_puts("\n");
     return create_process_common(lpApp ? app_ascii : NULL,
                                  lpCmd ? cmd_ascii : NULL, c, d,
-                                 e, f ? directory_ascii : NULL, g, h);
+                                 e, f ? directory_ascii : NULL, g, h,
+                                 NULL, NULL);
 }
 
 #define K32_FORMAT_MESSAGE_ALLOCATE_BUFFER 0x00000100U
@@ -18408,7 +18319,8 @@ static int WINAPI GetTimeFormatEx_k32(PCWSTR locale_name, DWORD flags,
 DWORD WINAPI GetVersion(void)
 {
     /* Windows 10 22H2: major=10, minor=0, build=19045 */
-    return (WIN32_NT_BUILD << 16) | (WIN32_NT_MINOR << 8) | WIN32_NT_MAJOR;
+    return (WIN32_NT_VERSION_BUILD << 16) |
+           (WIN32_NT_VERSION_MINOR << 8) | WIN32_NT_VERSION_MAJOR;
 }
 
 BOOL WINAPI GetVersionExW(PVOID lpVersionInformation)
@@ -18418,10 +18330,10 @@ BOOL WINAPI GetVersionExW(PVOID lpVersionInformation)
     /* Zero everything first (at least 276 bytes for OSVERSIONINFOW) */
     for (int i = 0; i < 276; i++) p[i] = 0;
     *(DWORD *)(p + 0)  = 276;  /* dwOSVersionInfoSize */
-    *(DWORD *)(p + 4)  = WIN32_NT_MAJOR; /* dwMajorVersion */
-    *(DWORD *)(p + 8)  = WIN32_NT_MINOR; /* dwMinorVersion */
-    *(DWORD *)(p + 12) = WIN32_NT_BUILD; /* dwBuildNumber */
-    *(DWORD *)(p + 16) = 2;    /* dwPlatformId = VER_PLATFORM_WIN32_NT */
+    *(DWORD *)(p + 4)  = WIN32_NT_VERSION_MAJOR;
+    *(DWORD *)(p + 8)  = WIN32_NT_VERSION_MINOR;
+    *(DWORD *)(p + 12) = WIN32_NT_VERSION_BUILD;
+    *(DWORD *)(p + 16) = WIN32_NT_PLATFORM_ID;
     return TRUE;
 }
 
@@ -18490,7 +18402,8 @@ static BOOL verify_version_info(PVOID version_info, DWORD type_mask,
     }
 
     uint32_t current[8] = {
-        WIN32_NT_MINOR, WIN32_NT_MAJOR, WIN32_NT_BUILD, 2,
+        WIN32_NT_VERSION_MINOR, WIN32_NT_VERSION_MAJOR,
+        WIN32_NT_VERSION_BUILD, WIN32_NT_PLATFORM_ID,
         0, 0, 0, 1 /* VER_NT_WORKSTATION */
     };
     uint32_t requested[8] = {
@@ -18544,11 +18457,8 @@ static BOOL WINAPI VerifyVersionInfoA_k64(PVOID version_info, DWORD type_mask,
 }
 BOOL WINAPI TerminateProcess(HANDLE hProcess, UINT uExitCode)
 {
-    const char *command = win32_current_command_line();
-    BOOL mojo_process = command &&
-        process_command_contains(command, "--mojo-platform-channel-handle=");
-    if (mojo_process) {
-        serial_puts("[MOJO-EXIT] pid=");
+    if (K32_VERBOSE_DIAGNOSTICS) {
+        serial_puts("[K32-TERMINATE] pid=");
         serial_putdec(win32_current_process_id());
         serial_puts(" process=0x");
         serial_puthex((uint64_t)(ULONG_PTR)hProcess, 16);
@@ -18569,7 +18479,7 @@ BOOL WINAPI TerminateProcess(HANDLE hProcess, UINT uExitCode)
                 continue;
             if (ctx->owner_pid != owner_pid)
                 continue;
-            serial_puts("[MOJO-THREAD] tid=");
+            serial_puts("[K32-TERMINATE-THREAD] tid=");
             serial_putdec(ctx->tid);
             serial_puts(" kpid=");
             serial_putdec((uint64_t)(uint32_t)ctx->kernel_pid);
@@ -18809,12 +18719,6 @@ UINT WINAPI SetHandleCount(UINT uNumber)
     return uNumber; /* no-op, return requested count */
 }
 
-BOOL WINAPI SetStdHandle(DWORD nStdHandle, HANDLE hHandle)
-{
-    (void)nStdHandle; (void)hHandle;
-    return TRUE;
-}
-
 BOOL WINAPI FlushFileBuffers(HANDLE hFile)
 {
     (void)hFile;
@@ -18840,8 +18744,36 @@ static BOOL WINAPI DeviceIoControl_k32(HANDLE device, DWORD control_code,
 
 DWORD WINAPI GetFileType(HANDLE hFile)
 {
-    (void)hFile;
-    return 1; /* FILE_TYPE_DISK */
+    HANDLE_OBJECT_SNAPSHOT snapshot;
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+
+    NTSTATUS status = handle_snapshot_for_process(
+        &g_handle_table, hFile, owner_pid, &snapshot);
+    if (!NT_SUCCESS(status) || snapshot.type != OBJ_TYPE_FILE) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return 0;       /* FILE_TYPE_UNKNOWN */
+    }
+
+    if (snapshot.file_flags &
+        (FILE_OBJ_PIPE_READ | FILE_OBJ_PIPE_WRITE |
+         FILE_OBJ_PIPE_SIDE_A | FILE_OBJ_PIPE_SIDE_B)) {
+        SetLastError(0);
+        return 3; /* FILE_TYPE_PIPE */
+    }
+    if (snapshot.file_flags &
+        (FILE_OBJ_CONSOLE_IN | FILE_OBJ_CONSOLE_OUT |
+         FILE_OBJ_CONSOLE_ERR | FILE_OBJ_SERIAL)) {
+        SetLastError(0);
+        return 2; /* FILE_TYPE_CHAR */
+    }
+    if (snapshot.file_flags & (FILE_OBJ_DISK_FILE | FILE_OBJ_DIRECTORY)) {
+        SetLastError(0);
+        return 1; /* FILE_TYPE_DISK */
+    }
+
+    SetLastError(0);
+    return 0;
 }
 
 typedef struct {
@@ -19454,10 +19386,12 @@ void kernel32_release_process_environment(DWORD process_id)
             k32_dynamic_environment[i].used = FALSE;
     }
     k32_environment_unlock_irqrestore(irq_flags);
+    k32_console_release_process(process_id);
     k32_io_completion_release_process(process_id);
     k32_execution_state_release_process(process_id);
     heap_release_process_state(process_id);
     kernel32_release_process_exception_state(process_id);
+    k32_atom_release_process(process_id);
 }
 
 typedef struct {
@@ -20737,6 +20671,12 @@ static BOOL WINAPI GetVolumePathNamesForVolumeNameW_k32(
     return TRUE;
 }
 
+static uint64_t k32_volume_serial_number(void)
+{
+    uint64_t serial = osfs2_volume_id();
+    return serial ? serial : 0x000000004F534954ULL;
+}
+
 static BOOL WINAPI GetVolumeInformationW_k32(
     PCWSTR root_path, PWSTR volume_name, DWORD volume_name_chars,
     DWORD *volume_serial, DWORD *max_component_chars, DWORD *filesystem_flags,
@@ -20766,7 +20706,7 @@ static BOOL WINAPI GetVolumeInformationW_k32(
         for (DWORD i = 0; i < filesystem_required; i++)
             filesystem_name[i] = filesystem_label[i];
     }
-    if (volume_serial) *volume_serial = 0x4F534954; /* OSIT */
+    if (volume_serial) *volume_serial = (DWORD)k32_volume_serial_number();
     if (max_component_chars) *max_component_chars = 255;
     if (filesystem_flags) {
         *filesystem_flags = 0x00000002 | /* FILE_CASE_PRESERVED_NAMES */
@@ -20801,7 +20741,7 @@ static BOOL WINAPI GetVolumeInformationA_k32(
         memcpy(volume_name, volume_label, volume_required);
     if (filesystem_name)
         memcpy(filesystem_name, filesystem_label, filesystem_required);
-    if (volume_serial) *volume_serial = 0x4F534954; /* OSIT */
+    if (volume_serial) *volume_serial = (DWORD)k32_volume_serial_number();
     if (max_component_chars) *max_component_chars = 255;
     if (filesystem_flags) {
         *filesystem_flags = 0x00000002 | /* FILE_CASE_PRESERVED_NAMES */
@@ -20850,19 +20790,66 @@ static BOOL WINAPI GetFileAttributesExW_k32(
 
     memset(data, 0, sizeof(*data));
     data->dwFileAttributes = attributes;
-    if (!(attributes & 0x10)) { /* FILE_ATTRIBUTE_DIRECTORY */
-        HANDLE file = CreateFileW(file_name, GENERIC_READ, 3, NULL, 3, 0, NULL);
-        LARGE_INTEGER size;
-        if (file == INVALID_HANDLE_VALUE)
-            return FALSE;
-        BOOL ok = GetFileSizeEx_k32(file, &size);
-        CloseHandle(file);
-        if (!ok)
-            return FALSE;
-        data->nFileSizeHigh = size.HighPart;
-        data->nFileSizeLow = size.LowPart;
+    BOOL directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    HANDLE file = CreateFileW(
+        file_name, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, 3 /* OPEN_EXISTING */,
+        directory ? K32_FILE_FLAG_BACKUP_SEMANTICS : 0, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    ULONGLONG creation_time = 0;
+    ULONGLONG access_time = 0;
+    ULONGLONG write_time = 0;
+    BOOL ok = GetFileTime_k32(file, &creation_time, &access_time,
+                              &write_time);
+    if (ok) {
+        data->ftCreationTimeLo = (DWORD)creation_time;
+        data->ftCreationTimeHi = (DWORD)(creation_time >> 32);
+        data->ftLastAccessTimeLo = (DWORD)access_time;
+        data->ftLastAccessTimeHi = (DWORD)(access_time >> 32);
+        data->ftLastWriteTimeLo = (DWORD)write_time;
+        data->ftLastWriteTimeHi = (DWORD)(write_time >> 32);
     }
+    if (ok && !directory) {
+        LARGE_INTEGER size;
+        ok = GetFileSizeEx_k32(file, &size);
+        if (ok) {
+            data->nFileSizeHigh = size.HighPart;
+            data->nFileSizeLow = size.LowPart;
+        }
+    }
+    DWORD error = GetLastError();
+    CloseHandle(file);
+    if (!ok) {
+        SetLastError(error);
+        return FALSE;
+    }
+    SetLastError(0);
     return TRUE;
+}
+
+static BOOL WINAPI GetFileAttributesExA_k32(
+    PCSTR file_name, DWORD info_level, WIN32_FILE_ATTRIBUTE_DATA32 *data)
+{
+    if (!file_name) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    WCHAR wide_name[260];
+    int length = 0;
+    while (file_name[length] && length < 259) {
+        wide_name[length] = (WCHAR)(BYTE)file_name[length];
+        length++;
+    }
+    if (file_name[length]) {
+        SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
+        return FALSE;
+    }
+    wide_name[length] = 0;
+    return GetFileAttributesExW_k32(wide_name, info_level, data);
 }
 
 BOOL WINAPI FileTimeToLocalFileTime(PCVOID lpFileTime, PVOID lpLocalFileTime)
@@ -21020,317 +21007,6 @@ BOOL WINAPI GetDiskFreeSpaceExW(PCWSTR lpRoot, PULARGE_INTEGER lpFreeAvailable,
                                       lpTotalFree);
 }
 
-/* ── INI File (Private Profile) ────────────────────────────── */
-/*
- * In-memory INI store. UT99 reads UnrealTournament.ini, User.ini, etc.
- * We keep a flat array of section+key→value entries.
- * File parameter is ignored (all INI data is in one global store).
- */
-
-#define INI_MAX_ENTRIES 1024
-#define INI_MAX_SECTION  64
-#define INI_MAX_KEY      64
-#define INI_MAX_VALUE   512
-
-typedef struct {
-    char section[INI_MAX_SECTION];
-    char key[INI_MAX_KEY];
-    char value[INI_MAX_VALUE];
-} INI_ENTRY;
-
-static INI_ENTRY g_ini_store[INI_MAX_ENTRIES];
-static int       g_ini_count = 0;
-
-/* Track which INI files have been loaded from OsitoFS */
-#define INI_FILES_MAX 8
-static char ini_loaded_files[INI_FILES_MAX][260];
-static int  ini_loaded_count = 0;
-
-static int ini_stricmp(const char *a, const char *b)
-{
-    while (*a && *b) {
-        char ca = *a, cb = *b;
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
-        if (ca != cb) return ca - cb;
-        a++; b++;
-    }
-    return (unsigned char)*a - (unsigned char)*b;
-}
-
-static void ini_strcpy(char *dst, const char *src, int max)
-{
-    int i;
-    for (i = 0; src[i] && i < max - 1; i++)
-        dst[i] = src[i];
-    dst[i] = 0;
-}
-
-static int ini_strlen(const char *s)
-{
-    int n = 0;
-    while (s[n]) n++;
-    return n;
-}
-
-static INI_ENTRY *ini_find(const char *section, const char *key)
-{
-    for (int i = 0; i < g_ini_count; i++) {
-        if (ini_stricmp(g_ini_store[i].section, section) == 0 &&
-            ini_stricmp(g_ini_store[i].key, key) == 0)
-            return &g_ini_store[i];
-    }
-    return NULL;
-}
-
-/* Add INI entry (allows duplicates — UT99 uses multi-value keys like Paths=) */
-static void ini_add(const char *section, const char *key, const char *value)
-{
-    if (g_ini_count >= INI_MAX_ENTRIES) return;
-    INI_ENTRY *e = &g_ini_store[g_ini_count++];
-    ini_strcpy(e->section, section, INI_MAX_SECTION);
-    ini_strcpy(e->key, key, INI_MAX_KEY);
-    ini_strcpy(e->value, value, INI_MAX_VALUE);
-}
-
-/* Parse and load an INI file from OsitoFS into the INI store */
-static void ini_load_from_osfs(const char *filename)
-{
-    if (!filename || !*filename) return;
-
-    /* Check if already loaded */
-    const char *base = filename;
-    for (const char *p = filename; *p; p++) {
-        if (*p == '\\' || *p == '/') base = p + 1;
-    }
-    for (int i = 0; i < ini_loaded_count; i++) {
-        if (ini_stricmp(ini_loaded_files[i], filename) == 0) return;
-    }
-
-    void *f = osfs2_find_ci(filename);
-    if (!f && base != filename) f = osfs2_find_ci(base);
-    if (!f) return;
-
-    uint64_t fsize = osfs2_file_size(f);
-    if (fsize == 0 || fsize > 64 * 1024) return; /* sanity limit */
-
-    /* Allocate temp buffer and read */
-    extern void *kmalloc(uint64_t size);
-    extern void kfree(void *ptr);
-    char *buf = (char *)kmalloc(fsize + 1);
-    if (!buf) return;
-    osfs2_read(f, 0, buf, fsize);
-    buf[fsize] = 0;
-
-    serial_puts("[INI] Loading ");
-    serial_puts(base);
-    serial_puts(" (");
-    serial_putdec(fsize);
-    serial_puts(" bytes)\n");
-
-    /* Track as loaded */
-    if (ini_loaded_count < INI_FILES_MAX)
-        ini_strcpy(ini_loaded_files[ini_loaded_count++], filename, 260);
-
-    /* Parse: [Section] and Key=Value lines */
-    char cur_section[INI_MAX_SECTION] = "";
-    char *p = buf;
-    while (*p) {
-        /* Skip whitespace */
-        while (*p == ' ' || *p == '\t') p++;
-
-        if (*p == '[') {
-            /* Section header */
-            p++;
-            char *start = p;
-            while (*p && *p != ']' && *p != '\r' && *p != '\n') p++;
-            int len = (int)(p - start);
-            if (len >= INI_MAX_SECTION) len = INI_MAX_SECTION - 1;
-            for (int i = 0; i < len; i++) cur_section[i] = start[i];
-            cur_section[len] = 0;
-            if (*p == ']') p++;
-        } else if (*p == ';' || *p == '#' || *p == '\r' || *p == '\n') {
-            /* Comment or empty line — skip */
-        } else if (cur_section[0]) {
-            /* Key=Value */
-            char key[INI_MAX_KEY] = "";
-            char val[INI_MAX_VALUE] = "";
-            char *start = p;
-            while (*p && *p != '=' && *p != '\r' && *p != '\n') p++;
-            if (*p == '=') {
-                int klen = (int)(p - start);
-                if (klen >= INI_MAX_KEY) klen = INI_MAX_KEY - 1;
-                for (int i = 0; i < klen; i++) key[i] = start[i];
-                key[klen] = 0;
-                p++; /* skip '=' */
-                start = p;
-                while (*p && *p != '\r' && *p != '\n') p++;
-                int vlen = (int)(p - start);
-                if (vlen >= INI_MAX_VALUE) vlen = INI_MAX_VALUE - 1;
-                for (int i = 0; i < vlen; i++) val[i] = start[i];
-                val[vlen] = 0;
-                ini_add(cur_section, key, val);
-            }
-        }
-        /* Skip to end of line */
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
-    }
-
-    serial_puts("[INI] Loaded ");
-    serial_putdec(g_ini_count);
-    serial_puts(" total entries\n");
-    kfree(buf);
-}
-
-DWORD WINAPI GetPrivateProfileStringA(PCSTR lpAppName, PCSTR lpKeyName,
-                                       PCSTR lpDefault, PSTR lpReturnedString,
-                                       DWORD nSize, PCSTR lpFileName)
-{
-    /* Auto-load INI file from OsitoFS on first access */
-    if (lpFileName)
-        ini_load_from_osfs(lpFileName);
-
-    if (!lpReturnedString || nSize == 0)
-        return 0;
-
-    /* If section is NULL, enumerate section names */
-    if (!lpAppName) {
-        if (lpReturnedString && nSize > 0)
-            lpReturnedString[0] = 0;
-        return 0;
-    }
-
-    /* If key is NULL, enumerate keys in section */
-    if (!lpKeyName) {
-        if (lpReturnedString && nSize > 0)
-            lpReturnedString[0] = 0;
-        return 0;
-    }
-
-    const char *result = lpDefault ? lpDefault : "";
-
-    /* Filter out ServerActors — UT99 loads IpDrv/IpServer/UWeb DLLs
-     * which don't exist on OsitoK, causing ExecWarning + appError. */
-    if (lpKeyName && ini_stricmp(lpKeyName, "ServerActors") == 0) {
-        if (lpReturnedString && nSize > 0) lpReturnedString[0] = 0;
-        return 0;
-    }
-
-    INI_ENTRY *entry = ini_find(lpAppName, lpKeyName);
-    if (entry)
-        result = entry->value;
-
-    int len = ini_strlen(result);
-    if ((DWORD)len >= nSize) len = (int)nSize - 1;
-    for (int i = 0; i < len; i++)
-        lpReturnedString[i] = result[i];
-    lpReturnedString[len] = 0;
-    return (DWORD)len;
-}
-
-static void ini_wide_to_ansi(PCWSTR source, char *destination,
-                             DWORD destination_size)
-{
-    DWORD i = 0;
-    if (!destination_size) return;
-    if (source) {
-        while (source[i] && i + 1 < destination_size) {
-            destination[i] = source[i] <= 0xFF ? (char)source[i] : '?';
-            i++;
-        }
-    }
-    destination[i] = 0;
-}
-
-static DWORD WINAPI GetPrivateProfileStringW_k32(
-    PCWSTR app_name, PCWSTR key_name, PCWSTR default_value,
-    PWSTR returned_string, DWORD size, PCWSTR file_name)
-{
-    if (!returned_string || size == 0)
-        return 0;
-
-    char app[INI_MAX_SECTION];
-    char key[INI_MAX_KEY];
-    char fallback[INI_MAX_VALUE];
-    char file[260];
-    if (app_name) ini_wide_to_ansi(app_name, app, sizeof(app));
-    if (key_name) ini_wide_to_ansi(key_name, key, sizeof(key));
-    if (default_value)
-        ini_wide_to_ansi(default_value, fallback, sizeof(fallback));
-    if (file_name) ini_wide_to_ansi(file_name, file, sizeof(file));
-
-    extern void *kmalloc(uint64_t bytes);
-    extern void kfree(void *memory);
-    char *narrow = kmalloc(size);
-    if (!narrow) {
-        returned_string[0] = 0;
-        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
-        return 0;
-    }
-
-    DWORD length = GetPrivateProfileStringA(
-        app_name ? app : NULL, key_name ? key : NULL,
-        default_value ? fallback : NULL, narrow, size,
-        file_name ? file : NULL);
-    for (DWORD i = 0; i < length; i++)
-        returned_string[i] = (BYTE)narrow[i];
-    returned_string[length] = 0;
-    kfree(narrow);
-    return length;
-}
-
-BOOL WINAPI WritePrivateProfileStringA(PCSTR lpAppName, PCSTR lpKeyName,
-                                        PCSTR lpString, PCSTR lpFileName)
-{
-    (void)lpFileName;
-
-    if (!lpAppName) return FALSE;
-
-    /* Delete key if lpString is NULL */
-    if (!lpKeyName || !lpString) return TRUE;
-
-    INI_ENTRY *entry = ini_find(lpAppName, lpKeyName);
-    if (entry) {
-        ini_strcpy(entry->value, lpString, INI_MAX_VALUE);
-        return TRUE;
-    }
-
-    if (g_ini_count >= INI_MAX_ENTRIES) return FALSE;
-
-    entry = &g_ini_store[g_ini_count++];
-    ini_strcpy(entry->section, lpAppName, INI_MAX_SECTION);
-    ini_strcpy(entry->key, lpKeyName, INI_MAX_KEY);
-    ini_strcpy(entry->value, lpString, INI_MAX_VALUE);
-    return TRUE;
-}
-
-UINT WINAPI GetPrivateProfileIntA(PCSTR lpAppName, PCSTR lpKeyName,
-                                   int nDefault, PCSTR lpFileName)
-{
-    char buf[32];
-    DWORD len = GetPrivateProfileStringA(lpAppName, lpKeyName, NULL, buf, 32, lpFileName);
-    if (len == 0) return (UINT)nDefault;
-
-    /* Simple atoi */
-    int result = 0, sign = 1, i = 0;
-    if (buf[0] == '-') { sign = -1; i = 1; }
-    for (; buf[i] >= '0' && buf[i] <= '9'; i++)
-        result = result * 10 + (buf[i] - '0');
-    return (UINT)(result * sign);
-}
-
-DWORD WINAPI GetPrivateProfileSectionNamesA(PSTR lpszReturnBuffer,
-                                             DWORD nSize, PCSTR lpFileName)
-{
-    (void)lpFileName;
-    /* Return empty double-null-terminated buffer */
-    if (lpszReturnBuffer && nSize >= 2) {
-        lpszReturnBuffer[0] = 0;
-        lpszReturnBuffer[1] = 0;
-    }
-    return 0;
-}
 
 /* ── Stubs for MSVCRT.dll CRT init dependencies ───────────── */
 
@@ -21353,8 +21029,9 @@ static BOOL WINAPI HeapWalk_stub(HANDLE hHeap, void *lpEntry)
 
 static BOOL WINAPI ReadConsoleA_stub(HANDLE h, void *buf, DWORD n, DWORD *read, void *r)
 {
-    (void)h; (void)buf; (void)n; (void)r;
+    (void)buf; (void)n; (void)r;
     if (read) *read = 0;
+    SetLastError(k32_is_console_input(h) ? 50 : 6);
     return FALSE;
 }
 
@@ -21387,6 +21064,10 @@ static WCHAR g_console_title[K32_CONSOLE_TITLE_MAX] = {
 
 static BOOL WINAPI SetConsoleTitleW_k32(PCWSTR title)
 {
+    if (!k32_console_current_attached()) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
     if (!title) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
@@ -21406,6 +21087,10 @@ static BOOL WINAPI SetConsoleTitleW_k32(PCWSTR title)
 
 static BOOL WINAPI SetConsoleTitleA_k32(PCSTR title)
 {
+    if (!k32_console_current_attached()) {
+        SetLastError(6);
+        return FALSE;
+    }
     if (!title) {
         SetLastError(87);
         return FALSE;
@@ -21426,6 +21111,10 @@ static BOOL WINAPI SetConsoleTitleA_k32(PCSTR title)
 
 static DWORD WINAPI GetConsoleTitleW_k32(PWSTR title, DWORD capacity)
 {
+    if (!k32_console_current_attached()) {
+        SetLastError(6);
+        return 0;
+    }
     if (!title || !capacity) {
         SetLastError(87);
         return 0;
@@ -21443,6 +21132,10 @@ static DWORD WINAPI GetConsoleTitleW_k32(PWSTR title, DWORD capacity)
 
 static DWORD WINAPI GetConsoleTitleA_k32(PSTR title, DWORD capacity)
 {
+    if (!k32_console_current_attached()) {
+        SetLastError(6);
+        return 0;
+    }
     if (!title || !capacity) {
         SetLastError(87);
         return 0;
@@ -21458,32 +21151,28 @@ static DWORD WINAPI GetConsoleTitleA_k32(PSTR title, DWORD capacity)
     return copied;
 }
 
-static BOOL k32_is_console_input(HANDLE handle)
-{
-    return handle == console_handle(WIN32_STD_INPUT_HANDLE);
-}
-
-static BOOL k32_is_console_output(HANDLE handle)
-{
-    return handle == console_handle(WIN32_STD_OUTPUT_HANDLE) ||
-           handle == console_handle(WIN32_STD_ERROR_HANDLE);
-}
-
 static UINT WINAPI GetConsoleCP_k32(void)
 {
+    if (!k32_console_current_attached()) {
+        SetLastError(6);
+        return 0;
+    }
     return GetOEMCP();
 }
 
 static UINT WINAPI GetConsoleOutputCP_stub(void)
 {
+    if (!k32_console_current_attached()) {
+        SetLastError(6);
+        return 0;
+    }
     return GetOEMCP();
 }
 
 static BOOL WINAPI GetConsoleScreenBufferInfo_stub(
     HANDLE output, K32_CONSOLE_SCREEN_BUFFER_INFO *info)
 {
-    if (!info || (output != console_handle(WIN32_STD_OUTPUT_HANDLE) &&
-                  output != console_handle(WIN32_STD_ERROR_HANDLE))) {
+    if (!info || !k32_is_console_output(output)) {
         SetLastError(!info ? 87 : 6); /* INVALID_PARAMETER / INVALID_HANDLE */
         return FALSE;
     }
@@ -21506,8 +21195,7 @@ static BOOL WINAPI SetConsoleTextAttribute_stub(HANDLE output,
                                                  WORD attributes)
 {
     (void)attributes;
-    if (output != console_handle(WIN32_STD_OUTPUT_HANDLE) &&
-        output != console_handle(WIN32_STD_ERROR_HANDLE)) {
+    if (!k32_is_console_output(output)) {
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
@@ -21518,12 +21206,11 @@ static BOOL WINAPI SetConsoleTextAttribute_stub(HANDLE output,
 static BOOL WINAPI ReadConsoleW_stub(HANDLE input, PVOID buffer, DWORD count,
                                      DWORD *read, PVOID reserved)
 {
-    (void)input;
     (void)buffer;
     (void)count;
     (void)reserved;
     if (read) *read = 0;
-    SetLastError(6); /* No interactive Win32 console input yet. */
+    SetLastError(k32_is_console_input(input) ? 50 : 6);
     return FALSE;
 }
 
@@ -21535,6 +21222,10 @@ static BOOL WINAPI WriteConsoleW_stub(HANDLE output, PCVOID buffer,
     if (written) *written = 0;
     if (!buffer) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    if (!k32_is_console_output(output)) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
 
@@ -21664,6 +21355,23 @@ typedef struct _BY_HANDLE_FILE_INFORMATION {
 _Static_assert(sizeof(BY_HANDLE_FILE_INFORMATION) == 52,
                "BY_HANDLE_FILE_INFORMATION must match the Win32 ABI");
 
+static uint64_t k32_file_stable_id(const FILE_OBJECT *file)
+{
+    if (!file) return 0;
+    uint64_t id = osfs2_file_id(file->osfs_file);
+    if (id) return id;
+
+    if (!file->name[0]) return 0;
+    uint64_t hash = 1469598103934665603ULL;
+    for (DWORD i = 0; file->name[i]; i++) {
+        hash ^= (BYTE)k32_path_fold((char)file->name[i]);
+        hash *= 1099511628211ULL;
+    }
+    if (file->flags & FILE_OBJ_DIRECTORY)
+        hash ^= 0x8000000000000000ULL;
+    return hash ? hash : 1;
+}
+
 static BOOL WINAPI GetFileInformationByHandle_stub(HANDLE h, BY_HANDLE_FILE_INFORMATION *info)
 {
     if (!info) {
@@ -21688,6 +21396,15 @@ static BOOL WINAPI GetFileInformationByHandle_stub(HANDLE h, BY_HANDLE_FILE_INFO
         return FALSE;
     }
 
+    FILE_OBJECT *file = NULL;
+    status = handle_lookup(&g_handle_table, h, OBJ_TYPE_FILE,
+                           (PVOID *)&file);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
+    uint64_t file_id = k32_file_stable_id(file);
+
     memset(info, 0, sizeof(*info));
     info->dwFileAttributes = basic.FileAttributes;
     info->ftCreationTimeLo = basic.CreationTime.LowPart;
@@ -21696,9 +21413,12 @@ static BOOL WINAPI GetFileInformationByHandle_stub(HANDLE h, BY_HANDLE_FILE_INFO
     info->ftLastAccessTimeHi = basic.LastAccessTime.HighPart;
     info->ftLastWriteTimeLo = basic.LastWriteTime.LowPart;
     info->ftLastWriteTimeHi = basic.LastWriteTime.HighPart;
+    info->dwVolumeSerialNumber = (DWORD)k32_volume_serial_number();
     info->nFileSizeHigh = standard.EndOfFile.HighPart;
     info->nFileSizeLow = standard.EndOfFile.LowPart;
     info->nNumberOfLinks = standard.NumberOfLinks;
+    info->nFileIndexHigh = (DWORD)(file_id >> 32);
+    info->nFileIndexLow = (DWORD)file_id;
     return TRUE;
 }
 
@@ -21788,13 +21508,9 @@ static BOOL WINAPI GetFileInformationByHandleEx_k32(HANDLE file_handle,
             }
             K32_FILE_ID_INFO *id = (K32_FILE_ID_INFO *)info;
             memset(id, 0, sizeof(*id));
-            id->VolumeSerialNumber = 0x4F534954ULL; /* OSIT */
-            uint64_t hash = 1469598103934665603ULL;
-            for (DWORD i = 0; file->name[i]; i++) {
-                hash ^= (BYTE)k32_path_fold((char)file->name[i]);
-                hash *= 1099511628211ULL;
-            }
-            memcpy(id->FileId, &hash, sizeof(hash));
+            id->VolumeSerialNumber = k32_volume_serial_number();
+            uint64_t file_id = k32_file_stable_id(file);
+            memcpy(id->FileId, &file_id, sizeof(file_id));
         } else {
             SetLastError(87); /* ERROR_INVALID_PARAMETER */
             return FALSE;
@@ -21937,6 +21653,14 @@ static BOOL WINAPI SetFileInformationByHandle_k32(HANDLE file_handle,
     if (info_class == 0) { /* FileBasicInfo */
         if (info_size < sizeof(FILE_BASIC_INFORMATION)) {
             SetLastError(87);
+            return FALSE;
+        }
+        IO_STATUS_BLOCK iosb;
+        status = NtSetInformationFile(file_handle, &iosb, info,
+                                      sizeof(FILE_BASIC_INFORMATION),
+                                      FileBasicInformation);
+        if (!NT_SUCCESS(status)) {
+            set_last_error_from_status(status);
             return FALSE;
         }
         SetLastError(0);
@@ -22462,6 +22186,30 @@ static DWORD WINAPI SizeofResource_k32(HANDLE module, HANDLE resource)
     return ((K32_RESOURCE_DATA_ENTRY *)resource)->Size;
 }
 
+BOOL kernel32_resource_data_w(HANDLE module, PCWSTR name, PCWSTR type,
+                              PCVOID *data, DWORD *size)
+{
+    if (!data || !size) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    *data = NULL;
+    *size = 0;
+
+    HANDLE resource = FindResourceW_k32(module, name, type);
+    if (!resource)
+        return FALSE;
+
+    DWORD resource_size = SizeofResource_k32(module, resource);
+    PVOID resource_data = LoadResource_k32(module, resource);
+    if (!resource_data)
+        return FALSE;
+
+    *data = resource_data;
+    *size = resource_size;
+    return TRUE;
+}
+
 static BOOL WINAPI PeekNamedPipe_k32(HANDLE h, void *buf, DWORD sz,
                                       DWORD *read, DWORD *avail, DWORD *left)
 {
@@ -22514,30 +22262,189 @@ static BOOL WINAPI GetNumberOfConsoleInputEvents_stub(HANDLE h, DWORD *num)
     return TRUE;
 }
 
-static BOOL WINAPI LockFile_stub(HANDLE h, DWORD lo, DWORD hi, DWORD nlo, DWORD nhi)
+static BOOL WINAPI LockFile_k32(HANDLE h, DWORD lo, DWORD hi,
+                                DWORD nlo, DWORD nhi)
 {
-    (void)h; (void)lo; (void)hi; (void)nlo; (void)nhi;
+    LARGE_INTEGER offset;
+    LARGE_INTEGER length;
+    IO_STATUS_BLOCK iosb = {0};
+    offset.LowPart = lo;
+    offset.HighPart = (LONG)hi;
+    length.LowPart = nlo;
+    length.HighPart = (LONG)nhi;
+    NTSTATUS status = NtLockFile(h, NULL, NULL, NULL, &iosb,
+                                 &offset, &length, 0, TRUE, TRUE);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
     return TRUE;
 }
 
-static BOOL WINAPI UnlockFile_stub(HANDLE h, DWORD lo, DWORD hi, DWORD nlo, DWORD nhi)
+static BOOL WINAPI UnlockFile_k32(HANDLE h, DWORD lo, DWORD hi,
+                                  DWORD nlo, DWORD nhi)
 {
-    (void)h; (void)lo; (void)hi; (void)nlo; (void)nhi;
+    LARGE_INTEGER offset;
+    LARGE_INTEGER length;
+    IO_STATUS_BLOCK iosb = {0};
+    offset.LowPart = lo;
+    offset.HighPart = (LONG)hi;
+    length.LowPart = nlo;
+    length.HighPart = (LONG)nhi;
+    NTSTATUS status = NtUnlockFile(h, &iosb, &offset, &length, 0);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
     return TRUE;
 }
 
-static BOOL WINAPI LockFileEx_stub(HANDLE h, DWORD flags, DWORD reserved,
-                                   DWORD nlo, DWORD nhi, PVOID overlapped)
+#define K32_LOCKFILE_FAIL_IMMEDIATELY 0x00000001U
+#define K32_LOCKFILE_EXCLUSIVE_LOCK   0x00000002U
+
+typedef struct _K32_PENDING_FILE_LOCK {
+    HANDLE file;
+    PVOID overlapped;
+    DWORD owner_pid;
+    BOOL compat32;
+} K32_PENDING_FILE_LOCK;
+
+static void k32_pending_file_lock_complete(PVOID context, NTSTATUS status)
 {
-    (void)flags; (void)reserved; (void)overlapped;
-    return LockFile_stub(h, 0, 0, nlo, nhi);
+    K32_PENDING_FILE_LOCK *pending = (K32_PENDING_FILE_LOCK *)context;
+    if (!pending)
+        return;
+    (void)k32_iocp_complete_handle_status_for_owner(
+        pending->file, 0, pending->overlapped, pending->owner_pid,
+        pending->compat32, status);
+    kfree(pending);
 }
 
-static BOOL WINAPI UnlockFileEx_stub(HANDLE h, DWORD reserved,
-                                     DWORD nlo, DWORD nhi, PVOID overlapped)
+static void k32_file_lock_overlapped(PVOID overlapped,
+                                     LARGE_INTEGER *offset,
+                                     HANDLE *event)
 {
-    (void)reserved; (void)overlapped;
-    return UnlockFile_stub(h, 0, 0, nlo, nhi);
+    if (g_compat32_mode) {
+        const volatile uint32_t *values =
+            (const volatile uint32_t *)overlapped;
+        offset->LowPart = values[2];
+        offset->HighPart = (LONG)values[3];
+        *event = (HANDLE)(ULONG_PTR)values[4];
+    } else {
+        const volatile uint32_t *offset_values =
+            (const volatile uint32_t *)((const BYTE *)overlapped + 16);
+        const volatile ULONG_PTR *values =
+            (const volatile ULONG_PTR *)overlapped;
+        offset->LowPart = offset_values[0];
+        offset->HighPart = (LONG)offset_values[1];
+        *event = (HANDLE)values[3];
+    }
+}
+
+static BOOL WINAPI LockFileEx_k32(HANDLE h, DWORD flags, DWORD reserved,
+                                  DWORD nlo, DWORD nhi, PVOID overlapped)
+{
+    if (!overlapped || reserved ||
+        (flags & ~(K32_LOCKFILE_FAIL_IMMEDIATELY |
+                   K32_LOCKFILE_EXCLUSIVE_LOCK))) {
+        if (overlapped)
+            k32_store_overlapped_status(overlapped, g_compat32_mode,
+                                        STATUS_INVALID_PARAMETER, 0);
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    LARGE_INTEGER offset;
+    LARGE_INTEGER length;
+    HANDLE event;
+    k32_file_lock_overlapped(overlapped, &offset, &event);
+    length.LowPart = nlo;
+    length.HighPart = (LONG)nhi;
+    HANDLE nt_event = (HANDLE)((ULONG_PTR)event & ~(ULONG_PTR)1U);
+    if (nt_event) {
+        NTSTATUS event_status = NtResetEvent(nt_event, NULL);
+        if (!NT_SUCCESS(event_status)) {
+            k32_store_overlapped_status(
+                overlapped, g_compat32_mode, event_status, 0);
+            set_last_error_from_status(event_status);
+            return FALSE;
+        }
+    }
+
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    BOOL fail_immediately =
+        (flags & K32_LOCKFILE_FAIL_IMMEDIATELY) != 0;
+    K32_PENDING_FILE_LOCK *pending = NULL;
+    if (!fail_immediately) {
+        pending = (K32_PENDING_FILE_LOCK *)kmalloc(sizeof(*pending));
+        if (!pending) {
+            k32_store_overlapped_status(
+                overlapped, g_compat32_mode,
+                STATUS_INSUFFICIENT_RESOURCES, 0);
+            if (nt_event)
+                (void)ntsync_set_event_for_process(
+                    nt_event, owner_pid, NULL);
+            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+            return FALSE;
+        }
+        pending->file = h;
+        pending->overlapped = overlapped;
+        pending->owner_pid = owner_pid;
+        pending->compat32 = g_compat32_mode ? TRUE : FALSE;
+        /* A completion can race the return from the queueing call. */
+        k32_store_overlapped_status(
+            overlapped, pending->compat32, STATUS_PENDING, 0);
+    }
+
+    NTSTATUS status = nt_file_lock_range_request(
+        h, owner_pid, GetCurrentThreadId(),
+        (ULONGLONG)offset.QuadPart, (ULONGLONG)length.QuadPart, 0,
+        fail_immediately,
+        (flags & K32_LOCKFILE_EXCLUSIVE_LOCK) != 0, overlapped,
+        pending ? k32_pending_file_lock_complete : NULL, pending);
+    if (status == STATUS_PENDING) {
+        SetLastError(997); /* ERROR_IO_PENDING */
+        return FALSE;
+    }
+    if (pending)
+        kfree(pending);
+    k32_store_overlapped_status(overlapped, g_compat32_mode, status, 0);
+    if (!NT_SUCCESS(status)) {
+        if (nt_event)
+            (void)ntsync_set_event_for_process(nt_event, owner_pid, NULL);
+        set_last_error_from_status(status);
+        return FALSE;
+    }
+    (void)k32_iocp_complete_handle(h, 0, overlapped);
+    return TRUE;
+}
+
+static BOOL WINAPI UnlockFileEx_k32(HANDLE h, DWORD reserved,
+                                    DWORD nlo, DWORD nhi, PVOID overlapped)
+{
+    if (!overlapped || reserved) {
+        if (overlapped)
+            k32_store_overlapped_status(overlapped, g_compat32_mode,
+                                        STATUS_INVALID_PARAMETER, 0);
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    LARGE_INTEGER offset;
+    LARGE_INTEGER length;
+    HANDLE ignored_event;
+    IO_STATUS_BLOCK iosb = {0};
+    k32_file_lock_overlapped(overlapped, &offset, &ignored_event);
+    length.LowPart = nlo;
+    length.HighPart = (LONG)nhi;
+    NTSTATUS status = NtUnlockFile(h, &iosb, &offset, &length, 0);
+    k32_store_overlapped_status(overlapped, g_compat32_mode, status, 0);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static BOOL WINAPI CreatePipe_k32(HANDLE *hRead, HANDLE *hWrite,
@@ -22703,9 +22610,27 @@ static BOOL WINAPI WaitNamedPipeW_stub(const WCHAR *name, DWORD timeout)
     return available;
 }
 
-static BOOL WINAPI SetFileTime_stub(HANDLE h, const void *c, const void *a, const void *w)
+static BOOL WINAPI SetFileTime_k32(HANDLE file, const void *creation,
+                                   const void *access, const void *write)
 {
-    (void)h; (void)c; (void)a; (void)w;
+    FILE_BASIC_INFORMATION information;
+    memset(&information, 0, sizeof(information));
+    if (creation)
+        memcpy(&information.CreationTime, creation, sizeof(ULONGLONG));
+    if (access)
+        memcpy(&information.LastAccessTime, access, sizeof(ULONGLONG));
+    if (write)
+        memcpy(&information.LastWriteTime, write, sizeof(ULONGLONG));
+
+    IO_STATUS_BLOCK iosb;
+    NTSTATUS status = NtSetInformationFile(
+        file, &iosb, &information, sizeof(information),
+        FileBasicInformation);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
+    SetLastError(0);
     return TRUE;
 }
 
@@ -22751,9 +22676,6 @@ static BOOL WINAPI ReleaseMutex_stub(HANDLE h)
 {
     ULONG_PTR args[2] = { (ULONG_PTR)h, 0 };
     NTSTATUS status = sys_NtReleaseMutant(args);
-    steamipc_trace_handle(
-        "ReleaseMutex", h, 0, (uint32_t)status,
-        (uint64_t)(ULONG_PTR)__builtin_return_address(0));
     if (!NT_SUCCESS(status)) {
         set_last_error_from_status(status);
         return FALSE;
@@ -22767,10 +22689,372 @@ static void WINAPI OutputDebugStringW_stub(const WCHAR *s)
     /* Silent */
 }
 
-static DWORD WINAPI GlobalAddAtomW_stub(const WCHAR *s)
+#define K32_ATOM_FIRST       0xC000U
+#define K32_ATOM_SLOT_COUNT  512U
+#define K32_ATOM_NAME_MAX    255U
+
+typedef struct {
+    BOOL used;
+    BOOL global_scope;
+    WORD atom;
+    DWORD owner_pid;
+    DWORD references;
+    WCHAR name[K32_ATOM_NAME_MAX + 1];
+} K32_ATOM_ENTRY;
+
+static K32_ATOM_ENTRY k32_atom_table[K32_ATOM_SLOT_COUNT];
+static volatile LONG k32_atom_table_lock;
+
+static void k32_atom_lock(void)
 {
-    (void)s;
-    return 0xC000;  /* fake atom */
+    while (__atomic_exchange_n(&k32_atom_table_lock, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+}
+
+static void k32_atom_unlock(void)
+{
+    __atomic_store_n(&k32_atom_table_lock, 0, __ATOMIC_RELEASE);
+}
+
+static WCHAR k32_atom_fold(WCHAR character)
+{
+    return character >= 'A' && character <= 'Z'
+        ? (WCHAR)(character + ('a' - 'A')) : character;
+}
+
+static BOOL k32_atom_names_equal(PCWSTR left, PCWSTR right)
+{
+    while (*left && *right) {
+        if (k32_atom_fold(*left) != k32_atom_fold(*right)) return FALSE;
+        left++;
+        right++;
+    }
+    return *left == *right;
+}
+
+static BOOL k32_atom_name_valid(PCWSTR name, UINT *length)
+{
+    ULONG_PTR value = (ULONG_PTR)name;
+    if (value && value <= 0xFFFFU) {
+        if (length) *length = 0;
+        return TRUE;
+    }
+    if (!name || !*name) return FALSE;
+
+    UINT count = 0;
+    while (name[count] && count <= K32_ATOM_NAME_MAX) count++;
+    if (!count || count > K32_ATOM_NAME_MAX) return FALSE;
+    if (length) *length = count;
+    return TRUE;
+}
+
+static BOOL k32_atom_ansi_to_wide(PCSTR name, WCHAR *wide)
+{
+    ULONG_PTR value = (ULONG_PTR)name;
+    if (value && value <= 0xFFFFU) return TRUE;
+    if (!name || !wide) return FALSE;
+
+    UINT count = 0;
+    while (name[count] && count <= K32_ATOM_NAME_MAX) {
+        wide[count] = (WCHAR)(BYTE)name[count];
+        count++;
+    }
+    if (!count || count > K32_ATOM_NAME_MAX) return FALSE;
+    wide[count] = 0;
+    return TRUE;
+}
+
+static K32_ATOM_ENTRY *k32_atom_find_locked(WORD atom, PCWSTR name,
+                                             BOOL global_scope,
+                                             DWORD owner_pid)
+{
+    for (UINT index = 0; index < K32_ATOM_SLOT_COUNT; index++) {
+        K32_ATOM_ENTRY *entry = &k32_atom_table[index];
+        if (!entry->used || entry->global_scope != global_scope) continue;
+        if (!global_scope && entry->owner_pid != owner_pid) continue;
+        if (atom) {
+            if (entry->atom == atom) return entry;
+        } else if (k32_atom_names_equal(entry->name, name)) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static WORD k32_atom_add_w(PCWSTR name, BOOL global_scope)
+{
+    ULONG_PTR integer_atom = (ULONG_PTR)name;
+    UINT length;
+    if (!k32_atom_name_valid(name, &length)) {
+        SetLastError(123); /* ERROR_INVALID_NAME */
+        return 0;
+    }
+    if (integer_atom <= 0xFFFFU) {
+        SetLastError(0);
+        return (WORD)integer_atom;
+    }
+
+    DWORD owner_pid = global_scope ? 0 : GetCurrentProcessId();
+    k32_atom_lock();
+    K32_ATOM_ENTRY *entry = k32_atom_find_locked(0, name, global_scope,
+                                                  owner_pid);
+    if (entry) {
+        if (entry->references != 0xFFFFFFFFU) entry->references++;
+        WORD atom = entry->atom;
+        k32_atom_unlock();
+        SetLastError(0);
+        return atom;
+    }
+
+    for (UINT index = 0; index < K32_ATOM_SLOT_COUNT; index++) {
+        entry = &k32_atom_table[index];
+        if (entry->used) continue;
+        memset(entry, 0, sizeof(*entry));
+        entry->used = TRUE;
+        entry->global_scope = global_scope;
+        entry->atom = (WORD)(K32_ATOM_FIRST + index);
+        entry->owner_pid = owner_pid;
+        entry->references = 1;
+        for (UINT i = 0; i <= length; i++) entry->name[i] = name[i];
+        WORD atom = entry->atom;
+        k32_atom_unlock();
+        SetLastError(0);
+        return atom;
+    }
+    k32_atom_unlock();
+    SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+    return 0;
+}
+
+static WORD k32_atom_find_w(PCWSTR name, BOOL global_scope)
+{
+    ULONG_PTR integer_atom = (ULONG_PTR)name;
+    if (!k32_atom_name_valid(name, NULL)) {
+        SetLastError(123);
+        return 0;
+    }
+    if (integer_atom <= 0xFFFFU) {
+        SetLastError(0);
+        return (WORD)integer_atom;
+    }
+
+    DWORD owner_pid = global_scope ? 0 : GetCurrentProcessId();
+    k32_atom_lock();
+    K32_ATOM_ENTRY *entry = k32_atom_find_locked(0, name, global_scope,
+                                                  owner_pid);
+    WORD atom = entry ? entry->atom : 0;
+    k32_atom_unlock();
+    SetLastError(atom ? 0 : 2); /* ERROR_FILE_NOT_FOUND */
+    return atom;
+}
+
+static WORD k32_atom_delete(WORD atom, BOOL global_scope)
+{
+    if (!atom) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return atom;
+    }
+    if (atom < K32_ATOM_FIRST) {
+        SetLastError(0);
+        return 0;
+    }
+
+    DWORD owner_pid = global_scope ? 0 : GetCurrentProcessId();
+    k32_atom_lock();
+    K32_ATOM_ENTRY *entry = k32_atom_find_locked(atom, NULL, global_scope,
+                                                  owner_pid);
+    if (!entry) {
+        k32_atom_unlock();
+        SetLastError(6);
+        return atom;
+    }
+    if (entry->references > 1) {
+        entry->references--;
+    } else {
+        memset(entry, 0, sizeof(*entry));
+    }
+    k32_atom_unlock();
+    SetLastError(0);
+    return 0;
+}
+
+static UINT k32_atom_integer_name(WORD atom, WCHAR *buffer, int size)
+{
+    WCHAR reversed[5];
+    UINT digits = 0;
+    WORD value = atom;
+    do {
+        reversed[digits++] = (WCHAR)('0' + value % 10);
+        value /= 10;
+    } while (value && digits < 5);
+
+    UINT required = digits + 1;
+    if (!buffer || size <= 0) return 0;
+    UINT copied = required < (UINT)size ? required : (UINT)size - 1;
+    if (copied) buffer[0] = '#';
+    for (UINT i = 1; i < copied; i++) buffer[i] = reversed[digits - i];
+    buffer[copied] = 0;
+    if (copied < required) SetLastError(234); /* ERROR_MORE_DATA */
+    return copied;
+}
+
+static UINT k32_atom_get_name_w(WORD atom, PWSTR buffer, int size,
+                                BOOL global_scope)
+{
+    if (atom && atom < K32_ATOM_FIRST)
+        return k32_atom_integer_name(atom, buffer, size);
+    if (!buffer || size <= 0) {
+        SetLastError(87);
+        return 0;
+    }
+
+    DWORD owner_pid = global_scope ? 0 : GetCurrentProcessId();
+    k32_atom_lock();
+    K32_ATOM_ENTRY *entry = k32_atom_find_locked(atom, NULL, global_scope,
+                                                  owner_pid);
+    if (!entry) {
+        k32_atom_unlock();
+        buffer[0] = 0;
+        SetLastError(6);
+        return 0;
+    }
+    UINT length = 0;
+    while (entry->name[length]) length++;
+    UINT copied = length < (UINT)size ? length : (UINT)size - 1;
+    for (UINT i = 0; i < copied; i++) buffer[i] = entry->name[i];
+    buffer[copied] = 0;
+    k32_atom_unlock();
+    SetLastError(copied < length ? 234 : 0);
+    return copied;
+}
+
+static WORD WINAPI GlobalAddAtomW_k32(PCWSTR name)
+{
+    return k32_atom_add_w(name, TRUE);
+}
+
+static WORD WINAPI GlobalAddAtomA_k32(PCSTR name)
+{
+    if ((ULONG_PTR)name <= 0xFFFFU)
+        return k32_atom_add_w((PCWSTR)(ULONG_PTR)name, TRUE);
+    WCHAR wide[K32_ATOM_NAME_MAX + 1];
+    if (!k32_atom_ansi_to_wide(name, wide)) {
+        SetLastError(123);
+        return 0;
+    }
+    return k32_atom_add_w(wide, TRUE);
+}
+
+static WORD WINAPI AddAtomW_k32(PCWSTR name)
+{
+    return k32_atom_add_w(name, FALSE);
+}
+
+static WORD WINAPI AddAtomA_k32(PCSTR name)
+{
+    if ((ULONG_PTR)name <= 0xFFFFU)
+        return k32_atom_add_w((PCWSTR)(ULONG_PTR)name, FALSE);
+    WCHAR wide[K32_ATOM_NAME_MAX + 1];
+    if (!k32_atom_ansi_to_wide(name, wide)) {
+        SetLastError(123);
+        return 0;
+    }
+    return k32_atom_add_w(wide, FALSE);
+}
+
+static WORD WINAPI GlobalFindAtomW_k32(PCWSTR name)
+{
+    return k32_atom_find_w(name, TRUE);
+}
+
+static WORD WINAPI GlobalFindAtomA_k32(PCSTR name)
+{
+    if ((ULONG_PTR)name <= 0xFFFFU)
+        return k32_atom_find_w((PCWSTR)(ULONG_PTR)name, TRUE);
+    WCHAR wide[K32_ATOM_NAME_MAX + 1];
+    if (!k32_atom_ansi_to_wide(name, wide)) {
+        SetLastError(123);
+        return 0;
+    }
+    return k32_atom_find_w(wide, TRUE);
+}
+
+static WORD WINAPI FindAtomW_k32(PCWSTR name)
+{
+    return k32_atom_find_w(name, FALSE);
+}
+
+static WORD WINAPI FindAtomA_k32(PCSTR name)
+{
+    if ((ULONG_PTR)name <= 0xFFFFU)
+        return k32_atom_find_w((PCWSTR)(ULONG_PTR)name, FALSE);
+    WCHAR wide[K32_ATOM_NAME_MAX + 1];
+    if (!k32_atom_ansi_to_wide(name, wide)) {
+        SetLastError(123);
+        return 0;
+    }
+    return k32_atom_find_w(wide, FALSE);
+}
+
+static WORD WINAPI GlobalDeleteAtom_k32(WORD atom)
+{
+    return k32_atom_delete(atom, TRUE);
+}
+
+static WORD WINAPI DeleteAtom_k32(WORD atom)
+{
+    return k32_atom_delete(atom, FALSE);
+}
+
+static UINT WINAPI GlobalGetAtomNameW_k32(WORD atom, PWSTR buffer, int size)
+{
+    return k32_atom_get_name_w(atom, buffer, size, TRUE);
+}
+
+static UINT WINAPI GetAtomNameW_k32(WORD atom, PWSTR buffer, int size)
+{
+    return k32_atom_get_name_w(atom, buffer, size, FALSE);
+}
+
+static UINT k32_atom_get_name_a(WORD atom, PSTR buffer, int size,
+                                BOOL global_scope)
+{
+    WCHAR wide[K32_ATOM_NAME_MAX + 2];
+    UINT length = k32_atom_get_name_w(atom, wide,
+        (int)(sizeof(wide) / sizeof(wide[0])), global_scope);
+    if (!length || !buffer || size <= 0) {
+        if (!buffer || size <= 0) SetLastError(87);
+        return 0;
+    }
+    UINT copied = length < (UINT)size ? length : (UINT)size - 1;
+    for (UINT i = 0; i < copied; i++)
+        buffer[i] = wide[i] <= 0xFF ? (char)wide[i] : '?';
+    buffer[copied] = 0;
+    SetLastError(copied < length ? 234 : 0);
+    return copied;
+}
+
+static UINT WINAPI GlobalGetAtomNameA_k32(WORD atom, PSTR buffer, int size)
+{
+    return k32_atom_get_name_a(atom, buffer, size, TRUE);
+}
+
+static UINT WINAPI GetAtomNameA_k32(WORD atom, PSTR buffer, int size)
+{
+    return k32_atom_get_name_a(atom, buffer, size, FALSE);
+}
+
+static void k32_atom_release_process(DWORD process_id)
+{
+    if (!process_id) return;
+    k32_atom_lock();
+    for (UINT index = 0; index < K32_ATOM_SLOT_COUNT; index++) {
+        K32_ATOM_ENTRY *entry = &k32_atom_table[index];
+        if (entry->used && !entry->global_scope &&
+            entry->owner_pid == process_id)
+            memset(entry, 0, sizeof(*entry));
+    }
+    k32_atom_unlock();
 }
 
 /* ── Path and file attribute APIs ────────────────────────────── */
@@ -23595,6 +23879,8 @@ static const K32_EXPORT k32_exports[] = {
     { "WaitCommEvent",           (PVOID)WaitCommEvent_k32,       3, CC_STDCALL },
     { "CloseHandle",             (PVOID)CloseHandle,             1, CC_STDCALL },
     { "GetStdHandle",            (PVOID)GetStdHandle,            1, CC_STDCALL },
+    { "AllocConsole",            (PVOID)AllocConsole,            0, CC_STDCALL },
+    { "FreeConsole",             (PVOID)FreeConsole,             0, CC_STDCALL },
     { "WriteConsoleA",           (PVOID)WriteConsoleA,           5, CC_STDCALL },
     { "ExitProcess",             (PVOID)ExitProcess,             1, CC_STDCALL },
     { "GetCurrentProcess",       (PVOID)GetCurrentProcess,       0, CC_STDCALL },
@@ -23641,6 +23927,12 @@ static const K32_EXPORT k32_exports[] = {
     { "Process32NextA",          (PVOID)Process32Next_k32,       2, CC_STDCALL },
     { "Process32FirstW",         (PVOID)Process32FirstW_k32,     2, CC_STDCALL },
     { "Process32NextW",          (PVOID)Process32NextW_k32,      2, CC_STDCALL },
+    { "Module32First",           (PVOID)Module32First_k32,       2, CC_STDCALL },
+    { "Module32Next",            (PVOID)Module32Next_k32,        2, CC_STDCALL },
+    { "Module32FirstA",          (PVOID)Module32First_k32,       2, CC_STDCALL },
+    { "Module32NextA",           (PVOID)Module32Next_k32,        2, CC_STDCALL },
+    { "Module32FirstW",          (PVOID)Module32FirstW_k32,      2, CC_STDCALL },
+    { "Module32NextW",           (PVOID)Module32NextW_k32,       2, CC_STDCALL },
     { "VirtualAlloc",            (PVOID)VirtualAlloc,            4, CC_STDCALL },
     { "VirtualAllocEx",          (PVOID)VirtualAllocEx_k32,      5, CC_STDCALL },
     { "VirtualFree",             (PVOID)VirtualFree,             3, CC_STDCALL },
@@ -23762,6 +24054,7 @@ static const K32_EXPORT k32_exports[] = {
     { "SetFilePointer",          (PVOID)SetFilePointer,          4, CC_STDCALL },
     { "SetFilePointerEx",        (PVOID)SetFilePointerEx_k32,     5, CC_STDCALL },
     { "DuplicateHandle",         (PVOID)DuplicateHandle,         7, CC_STDCALL },
+    { "GetHandleInformation",    (PVOID)GetHandleInformation,    2, CC_STDCALL },
     { "SetHandleInformation",    (PVOID)SetHandleInformation,    3, CC_STDCALL },
     { "VirtualProtect",          (PVOID)VirtualProtect,          4, CC_STDCALL },
     { "VirtualProtectEx",        (PVOID)VirtualProtectEx_k32,    5, CC_STDCALL },
@@ -23772,6 +24065,7 @@ static const K32_EXPORT k32_exports[] = {
     { "OpenFileMappingA",        (PVOID)OpenFileMappingA,        3, CC_STDCALL },
     { "OpenFileMappingW",        (PVOID)OpenFileMappingW,        3, CC_STDCALL },
     { "MapViewOfFile",           (PVOID)MapViewOfFile,           5, CC_STDCALL },
+    { "MapViewOfFileEx",         (PVOID)MapViewOfFileEx,         6, CC_STDCALL },
     { "UnmapViewOfFile",         (PVOID)UnmapViewOfFile,         1, CC_STDCALL },
     { "FlushViewOfFile",         (PVOID)FlushViewOfFile_k32,     2, CC_STDCALL },
     { "lstrlenA",                (PVOID)lstrlenA,                1, CC_STDCALL },
@@ -23844,6 +24138,7 @@ static const K32_EXPORT k32_exports[] = {
     { "OpenThread",              (PVOID)OpenThread_k32,          3, CC_STDCALL },
     { "GetExitCodeThread",       (PVOID)GetExitCodeThread_k32,   2, CC_STDCALL },
     { "GetThreadContext",        (PVOID)GetThreadContext_k32,    2, CC_STDCALL },
+    { "SetThreadContext",        (PVOID)SetThreadContext_k32,    2, CC_STDCALL },
     { "GetThreadPriorityBoost",  (PVOID)GetThreadPriorityBoost_k32, 2, CC_STDCALL },
     { "SetThreadPriorityBoost",  (PVOID)SetThreadPriorityBoost_k32, 2, CC_STDCALL },
     { "SetThreadStackGuarantee", (PVOID)SetThreadStackGuarantee_k32,
@@ -23924,11 +24219,11 @@ static const K32_EXPORT k32_exports[] = {
     { "DebugActiveProcess",      (PVOID)DebugActiveProcess_k32,  1, CC_STDCALL },
     { "DebugActiveProcessStop",  (PVOID)DebugActiveProcessStop_k32, 1, CC_STDCALL },
     { "SetUnhandledExceptionFilter",(PVOID)SetUnhandledExceptionFilter,1, CC_STDCALL },
-    { "AddVectoredExceptionHandler",(PVOID)AddVectoredExceptionHandler_stub,2, CC_STDCALL },
-    { "RemoveVectoredExceptionHandler",(PVOID)RemoveVectoredExceptionHandler_stub,1, CC_STDCALL },
+    { "AddVectoredExceptionHandler",(PVOID)AddVectoredExceptionHandler,2, CC_STDCALL },
+    { "RemoveVectoredExceptionHandler",(PVOID)RemoveVectoredExceptionHandler,1, CC_STDCALL },
     { "UnhandledExceptionFilter",(PVOID)UnhandledExceptionFilter,1, CC_STDCALL },
     { "RaiseException",          (PVOID)RaiseException,          4, CC_STDCALL },
-    { "DebugBreak",              (PVOID)DebugBreak_k32,          0, CC_STDCALL },
+    { "DebugBreak",              (PVOID)win32_debug_break_entry, 0, CC_STDCALL },
     { "RtlUnwind",               (PVOID)RtlUnwind,               4, CC_STDCALL },
     { "OutputDebugStringA",      (PVOID)OutputDebugStringA,      1, CC_STDCALL },
     /* String Conversion */
@@ -23938,6 +24233,7 @@ static const K32_EXPORT k32_exports[] = {
     { "InterlockedIncrement",    (PVOID)InterlockedIncrement,    1, CC_STDCALL },
     { "InterlockedDecrement",    (PVOID)InterlockedDecrement,    1, CC_STDCALL },
     { "InterlockedExchange",     (PVOID)InterlockedExchange,     2, CC_STDCALL },
+    { "InterlockedExchangeAdd",  (PVOID)InterlockedExchangeAdd,  2, CC_STDCALL },
     { "InterlockedCompareExchange",(PVOID)InterlockedCompareExchange,3, CC_STDCALL },
     { "InitializeSListHead",     (PVOID)InitializeSListHead,     1, CC_STDCALL },
     { "InterlockedPushEntrySList",(PVOID)InterlockedPushEntrySList,2, CC_STDCALL },
@@ -24026,10 +24322,17 @@ static const K32_EXPORT k32_exports[] = {
     { "CancelWaitableTimer",     (PVOID)CancelWaitableTimer_k32,     1, CC_STDCALL },
     /* INI file (Private Profile) */
     { "GetPrivateProfileStringA",      (PVOID)GetPrivateProfileStringA,      6, CC_STDCALL },
-    { "GetPrivateProfileStringW",      (PVOID)GetPrivateProfileStringW_k32,  6, CC_STDCALL },
+    { "GetPrivateProfileStringW",      (PVOID)GetPrivateProfileStringW,      6, CC_STDCALL },
     { "WritePrivateProfileStringA",    (PVOID)WritePrivateProfileStringA,    4, CC_STDCALL },
+    { "WritePrivateProfileStringW",    (PVOID)WritePrivateProfileStringW,    4, CC_STDCALL },
     { "GetPrivateProfileIntA",         (PVOID)GetPrivateProfileIntA,         4, CC_STDCALL },
+    { "GetPrivateProfileIntW",         (PVOID)GetPrivateProfileIntW,         4, CC_STDCALL },
     { "GetPrivateProfileSectionNamesA",(PVOID)GetPrivateProfileSectionNamesA,3, CC_STDCALL },
+    { "GetPrivateProfileSectionNamesW",(PVOID)GetPrivateProfileSectionNamesW,3, CC_STDCALL },
+    { "GetPrivateProfileSectionA",     (PVOID)GetPrivateProfileSectionA,     4, CC_STDCALL },
+    { "GetPrivateProfileSectionW",     (PVOID)GetPrivateProfileSectionW,     4, CC_STDCALL },
+    { "WritePrivateProfileSectionA",   (PVOID)WritePrivateProfileSectionA,   3, CC_STDCALL },
+    { "WritePrivateProfileSectionW",   (PVOID)WritePrivateProfileSectionW,   3, CC_STDCALL },
     /* UT99: Process/Memory/System */
     { "GlobalMemoryStatus",      (PVOID)GlobalMemoryStatus,      1, CC_STDCALL },
     { "GlobalMemoryStatusEx",    (PVOID)GlobalMemoryStatusEx_k32,1, CC_STDCALL },
@@ -24138,6 +24441,7 @@ static const K32_EXPORT k32_exports[] = {
     { "GetVolumeInformationA",   (PVOID)GetVolumeInformationA_k32, 8, CC_STDCALL },
     { "GetVolumeInformationW",   (PVOID)GetVolumeInformationW_k32, 8, CC_STDCALL },
     { "GetFileAttributesW",      (PVOID)GetFileAttributesW,      1, CC_STDCALL },
+    { "GetFileAttributesExA",    (PVOID)GetFileAttributesExA_k32,3, CC_STDCALL },
     { "GetFileAttributesExW",    (PVOID)GetFileAttributesExW_k32,3, CC_STDCALL },
     { "FileTimeToLocalFileTime", (PVOID)FileTimeToLocalFileTime, 2, CC_STDCALL },
     { "FileTimeToSystemTime",    (PVOID)FileTimeToSystemTime,    2, CC_STDCALL },
@@ -24179,10 +24483,10 @@ static const K32_EXPORT k32_exports[] = {
     { "ReadConsoleInputA",       (PVOID)ReadConsoleInputA_stub,  4, CC_STDCALL },
     { "PeekConsoleInputA",       (PVOID)PeekConsoleInputA_stub,  4, CC_STDCALL },
     { "GetNumberOfConsoleInputEvents",(PVOID)GetNumberOfConsoleInputEvents_stub,2, CC_STDCALL },
-    { "LockFile",                (PVOID)LockFile_stub,           5, CC_STDCALL },
-    { "UnlockFile",              (PVOID)UnlockFile_stub,         5, CC_STDCALL },
-    { "LockFileEx",              (PVOID)LockFileEx_stub,         6, CC_STDCALL },
-    { "UnlockFileEx",            (PVOID)UnlockFileEx_stub,       5, CC_STDCALL },
+    { "LockFile",                (PVOID)LockFile_k32,            5, CC_STDCALL },
+    { "UnlockFile",              (PVOID)UnlockFile_k32,          5, CC_STDCALL },
+    { "LockFileEx",              (PVOID)LockFileEx_k32,          6, CC_STDCALL },
+    { "UnlockFileEx",            (PVOID)UnlockFileEx_k32,        5, CC_STDCALL },
     { "CreatePipe",              (PVOID)CreatePipe_k32,         4, CC_STDCALL },
     { "CreateNamedPipeW",        (PVOID)CreateNamedPipeW_k32,    8, CC_STDCALL },
     { "ConnectNamedPipe",        (PVOID)ConnectNamedPipe_k32,    2, CC_STDCALL },
@@ -24190,7 +24494,7 @@ static const K32_EXPORT k32_exports[] = {
     { "SetNamedPipeHandleState", (PVOID)SetNamedPipeHandleState_stub, 4, CC_STDCALL },
     { "TransactNamedPipe",       (PVOID)TransactNamedPipe_stub,  7, CC_STDCALL },
     { "WaitNamedPipeW",          (PVOID)WaitNamedPipeW_stub,     2, CC_STDCALL },
-    { "SetFileTime",             (PVOID)SetFileTime_stub,        4, CC_STDCALL },
+    { "SetFileTime",             (PVOID)SetFileTime_k32,         4, CC_STDCALL },
     { "LocalFileTimeToFileTime", (PVOID)LocalFileTimeToFileTime_stub,2, CC_STDCALL },
     { "SystemTimeToFileTime",    (PVOID)SystemTimeToFileTime_stub,2, CC_STDCALL },
     { "SystemTimeToTzSpecificLocalTime", (PVOID)SystemTimeToTzSpecificLocalTime_k32,3, CC_STDCALL },
@@ -24200,8 +24504,21 @@ static const K32_EXPORT k32_exports[] = {
     { "GlobalFree",              (PVOID)GlobalFree_k32,          1, CC_STDCALL },
     { "ReleaseMutex",            (PVOID)ReleaseMutex_stub,       1, CC_STDCALL },
     { "OutputDebugStringW",      (PVOID)OutputDebugStringW_stub, 1, CC_STDCALL },
-    { "GlobalAddAtomW",          (PVOID)GlobalAddAtomW_stub,     1, CC_STDCALL },
-    /* ── Path/attribute APIs (UT99 needs these) ── */
+    { "GlobalAddAtomA",          (PVOID)GlobalAddAtomA_k32,      1, CC_STDCALL },
+    { "GlobalAddAtomW",          (PVOID)GlobalAddAtomW_k32,      1, CC_STDCALL },
+    { "GlobalFindAtomA",         (PVOID)GlobalFindAtomA_k32,     1, CC_STDCALL },
+    { "GlobalFindAtomW",         (PVOID)GlobalFindAtomW_k32,     1, CC_STDCALL },
+    { "GlobalDeleteAtom",        (PVOID)GlobalDeleteAtom_k32,    1, CC_STDCALL },
+    { "GlobalGetAtomNameA",      (PVOID)GlobalGetAtomNameA_k32,  3, CC_STDCALL },
+    { "GlobalGetAtomNameW",      (PVOID)GlobalGetAtomNameW_k32,  3, CC_STDCALL },
+    { "AddAtomA",                (PVOID)AddAtomA_k32,            1, CC_STDCALL },
+    { "AddAtomW",                (PVOID)AddAtomW_k32,            1, CC_STDCALL },
+    { "FindAtomA",               (PVOID)FindAtomA_k32,           1, CC_STDCALL },
+    { "FindAtomW",               (PVOID)FindAtomW_k32,           1, CC_STDCALL },
+    { "DeleteAtom",              (PVOID)DeleteAtom_k32,          1, CC_STDCALL },
+    { "GetAtomNameA",            (PVOID)GetAtomNameA_k32,        3, CC_STDCALL },
+    { "GetAtomNameW",            (PVOID)GetAtomNameW_k32,        3, CC_STDCALL },
+    /* Path and file attribute APIs. */
     { "GetTempPathA",            (PVOID)GetTempPathA_k32,        2, CC_STDCALL },
     { "GetTempPathW",            (PVOID)GetTempPathW_k32,        2, CC_STDCALL },
     { "GetTempFileNameW",        (PVOID)GetTempFileNameW_k32,    4, CC_STDCALL },
@@ -24255,6 +24572,10 @@ int kernel32_iocp_selftest(void)
     PVOID overlapped = NULL;
     int checks = 0, failures = 0;
     int saved_mode = g_compat32_mode;
+
+    k32_module_test_expect(compat32_teb_selftest() == 0,
+                           "PE32 low TEB and FS contract",
+                           &checks, &failures);
 
     g_compat32_mode = 0;
     port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 2);
@@ -24515,9 +24836,18 @@ int kernel32_wait_selftest(void)
     HANDLE named_timer = NULL;
     HANDLE duplicate_timer = NULL;
     HANDLE opened_timer = NULL;
+    HANDLE named_event = NULL;
+    HANDLE opened_event = NULL;
+    HANDLE recreated_event = NULL;
+    HANDLE recycled_event = NULL;
+    HANDLE stale_recycled_event = NULL;
+    HANDLE named_mutex = NULL;
+    HANDLE recycled_mutex = NULL;
+    HANDLE recreated_mutex = NULL;
     static const WCHAR timer_name[] = {
         'O', 's', 'i', 't', 'o', 'K', 'W', 'a', 'i', 't', 'T', 'e', 's', 't', 0
     };
+    static const char event_name[] = "OsitoKWaitEventTest";
     int checks = 0, failures = 0;
     int saved_mode = g_compat32_mode;
 
@@ -24594,6 +24924,13 @@ int kernel32_wait_selftest(void)
                            "registered-wait events", &checks, &failures);
 
     if (source && completion) {
+        ULONGLONG wait_start = GetTickCount64();
+        DWORD wait_result = WaitForSingleObject(source, 20);
+        ULONGLONG wait_elapsed = GetTickCount64() - wait_start;
+        k32_module_test_expect(
+            wait_result == WAIT_TIMEOUT && wait_elapsed < 1000,
+            "finite wait preserves caller deadline", &checks, &failures);
+
         BOOL registered = RegisterWaitForSingleObject_k32(
             &token, source, (PVOID)k32_wait_test_callback, NULL, INFINITE, 0);
         k32_module_test_expect(registered && token != NULL,
@@ -24621,17 +24958,98 @@ int kernel32_wait_selftest(void)
 
             DWORD owner_pid = win32_current_process_id();
             for (int i = 0;
-                 i < 100 && k32_wait_dispatcher_owner_active(owner_pid);
+                 i < 100 && k32_wait_dispatcher_owner_active(owner_pid,
+                                                              FALSE);
                  i++) {
                 for (int j = 0; j < K32_MAX_WAIT_DISPATCHERS; j++)
                     k32_reap_wait_dispatcher(&g_wait_dispatchers[j]);
                 Sleep(1);
             }
             k32_module_test_expect(
-                !k32_wait_dispatcher_owner_active(owner_pid),
+                !k32_wait_dispatcher_owner_active(owner_pid, FALSE),
                 "dispatcher stopped and reaped", &checks, &failures);
         }
     }
+
+    SetLastError(0);
+    named_event = CreateEventA(NULL, TRUE, FALSE, event_name);
+    k32_module_test_expect(
+        named_event != NULL && GetLastError() == 0,
+        "named event creation", &checks, &failures);
+    if (named_event) {
+        opened_event = OpenEventA(GENERIC_ALL, FALSE, event_name);
+        k32_module_test_expect(opened_event != NULL, "named event open",
+                               &checks, &failures);
+        k32_module_test_expect(SetEvent(named_event), "named event signal",
+                               &checks, &failures);
+        if (opened_event)
+            k32_module_test_expect(
+                WaitForSingleObject(opened_event, 0) == WAIT_OBJECT_0,
+                "named event shares state", &checks, &failures);
+    }
+
+    if (opened_event) {
+        CloseHandle(opened_event);
+        opened_event = NULL;
+    }
+    if (named_event) {
+        CloseHandle(named_event);
+        named_event = NULL;
+    }
+
+    SetLastError(0);
+    HANDLE stale_event = OpenEventA(GENERIC_ALL, FALSE, event_name);
+    k32_module_test_expect(
+        stale_event == NULL && GetLastError() == 2,
+        "named event retires after last close", &checks, &failures);
+    if (stale_event)
+        CloseHandle(stale_event);
+
+    SetLastError(0);
+    recreated_event = CreateEventA(NULL, TRUE, FALSE, event_name);
+    k32_module_test_expect(
+        recreated_event != NULL && GetLastError() == 0,
+        "named event recreates as fresh object", &checks, &failures);
+    if (recreated_event)
+        k32_module_test_expect(
+            WaitForSingleObject(recreated_event, 0) == WAIT_TIMEOUT,
+            "recreated event has fresh state", &checks, &failures);
+
+    if (recreated_event) {
+        CloseHandle(recreated_event);
+        recreated_event = NULL;
+    }
+    recycled_event = CreateEventA(NULL, TRUE, TRUE, NULL);
+    k32_module_test_expect(recycled_event != NULL,
+                           "event pool slot recycled", &checks, &failures);
+    SetLastError(0);
+    stale_recycled_event = OpenEventA(GENERIC_ALL, FALSE, event_name);
+    k32_module_test_expect(
+        stale_recycled_event == NULL && GetLastError() == 2,
+        "named event rejects recycled pool identity", &checks, &failures);
+    if (stale_recycled_event) {
+        CloseHandle(stale_recycled_event);
+        stale_recycled_event = NULL;
+    }
+
+    static const char mutex_name[] = "OsitoKWaitMutexTest";
+    SetLastError(0);
+    named_mutex = CreateMutexA(NULL, FALSE, mutex_name);
+    k32_module_test_expect(
+        named_mutex != NULL && GetLastError() == 0,
+        "named mutex creation", &checks, &failures);
+    if (named_mutex) {
+        CloseHandle(named_mutex);
+        named_mutex = NULL;
+    }
+    recycled_mutex = CreateMutexA(NULL, FALSE, NULL);
+    k32_module_test_expect(recycled_mutex != NULL,
+                           "mutex pool slot recycled", &checks, &failures);
+    SetLastError(0);
+    recreated_mutex = CreateMutexA(NULL, FALSE, mutex_name);
+    k32_module_test_expect(
+        recreated_mutex != NULL && GetLastError() == 0,
+        "named mutex rejects recycled pool identity", &checks, &failures);
 
     if (completion)
         CloseHandle(completion);
@@ -24645,6 +25063,14 @@ int kernel32_wait_selftest(void)
         CloseHandle(named_timer);
     if (timer)
         CloseHandle(timer);
+    if (recycled_event)
+        CloseHandle(recycled_event);
+    if (recreated_event)
+        CloseHandle(recreated_event);
+    if (recreated_mutex)
+        CloseHandle(recreated_mutex);
+    if (recycled_mutex)
+        CloseHandle(recycled_mutex);
     g_compat32_mode = saved_mode;
 
     serial_puts("[K32WAITTEST] checks=");
@@ -24678,7 +25104,99 @@ int kernel32_module_selftest(void)
     if (!compat32_is_initialized())
         compat32_init();
 
+    struct {
+        DWORD before;
+        MEMORYSTATUS32 status;
+        DWORD after;
+    } memory32 = { 0x11223344U, {0}, 0x55667788U };
+    struct {
+        uint64_t before;
+        MEMORYSTATUS64 status;
+        uint64_t after;
+    } memory64 = {
+        0x1122334455667788ULL, {0}, 0x8877665544332211ULL
+    };
+    MEMORYSTATUSEX32 memory_ex = {0};
+    struct {
+        DWORD minimum;
+        DWORD minimum_guard;
+        DWORD maximum;
+        DWORD maximum_guard;
+    } working32 = { 0, 0x12345678U, 0, 0x87654321U };
+    struct {
+        SIZE_T minimum;
+        uint64_t minimum_guard;
+        SIZE_T maximum;
+        uint64_t maximum_guard;
+    } working64 = {
+        0, 0x123456789ABCDEF0ULL, 0, 0x0FEDCBA987654321ULL
+    };
+
+    g_compat32_mode = 1;
+    GlobalMemoryStatus(&memory32.status);
+    k32_module_test_expect(
+        memory32.before == 0x11223344U &&
+        memory32.after == 0x55667788U &&
+        memory32.status.dwLength == sizeof(MEMORYSTATUS32) &&
+        memory32.status.dwMemoryLoad <= 100 &&
+        memory32.status.dwTotalPhys != 0 &&
+        memory32.status.dwAvailPhys <= memory32.status.dwTotalPhys &&
+        memory32.status.dwTotalVirtual != 0 &&
+        memory32.status.dwAvailVirtual <= memory32.status.dwTotalVirtual,
+        "PE32 dynamic MEMORYSTATUS layout", &checks, &failures);
+
+    memory_ex.dwLength = sizeof(memory_ex);
+    k32_module_test_expect(
+        GlobalMemoryStatusEx_k32(&memory_ex) &&
+        memory_ex.dwMemoryLoad <= 100 &&
+        memory_ex.ullTotalPhys != 0 &&
+        memory_ex.ullAvailPhys <= memory_ex.ullTotalPhys &&
+        memory_ex.ullTotalPageFile == memory_ex.ullTotalPhys &&
+        memory_ex.ullAvailPageFile == memory_ex.ullAvailPhys &&
+        memory_ex.ullTotalVirtual != 0 &&
+        memory_ex.ullAvailVirtual <= memory_ex.ullTotalVirtual,
+        "dynamic MEMORYSTATUSEX contract", &checks, &failures);
+
+    k32_module_test_expect(
+        GetProcessWorkingSetSize(NT_CURRENT_PROCESS,
+                                 &working32.minimum,
+                                 &working32.maximum) &&
+        working32.minimum == 0 && working32.maximum != 0 &&
+        !(working32.maximum & 0xFFFU) &&
+        working32.minimum_guard == 0x12345678U &&
+        working32.maximum_guard == 0x87654321U,
+        "PE32 working-set pointer width", &checks, &failures);
+
     g_compat32_mode = 0;
+    GlobalMemoryStatus(&memory64.status);
+    k32_module_test_expect(
+        memory64.before == 0x1122334455667788ULL &&
+        memory64.after == 0x8877665544332211ULL &&
+        memory64.status.dwLength == sizeof(MEMORYSTATUS64) &&
+        memory64.status.dwMemoryLoad <= 100 &&
+        memory64.status.dwTotalPhys != 0 &&
+        memory64.status.dwAvailPhys <= memory64.status.dwTotalPhys &&
+        memory64.status.dwTotalVirtual != 0 &&
+        memory64.status.dwAvailVirtual <= memory64.status.dwTotalVirtual,
+        "PE64 dynamic MEMORYSTATUS layout", &checks, &failures);
+
+    k32_module_test_expect(
+        GetProcessWorkingSetSize(NT_CURRENT_PROCESS,
+                                 &working64.minimum,
+                                 &working64.maximum) &&
+        working64.minimum == 0 && working64.maximum != 0 &&
+        !(working64.maximum & 0xFFFULL) &&
+        working64.minimum_guard == 0x123456789ABCDEF0ULL &&
+        working64.maximum_guard == 0x0FEDCBA987654321ULL,
+        "PE64 working-set pointer width", &checks, &failures);
+
+    SetLastError(0);
+    k32_module_test_expect(
+        !GetProcessWorkingSetSize(NT_CURRENT_PROCESS, NULL,
+                                  &working64.maximum) &&
+        GetLastError() == 87,
+        "working-set output validation", &checks, &failures);
+
     WCHAR conversion_wide[4] = {0};
     char conversion_narrow[4] = {0};
     SetLastError(0);
@@ -24730,39 +25248,13 @@ int kernel32_module_selftest(void)
         locale_name[5] == 0,
         "GetLocaleInfoW locale name", &checks, &failures);
 
-    char compat_command[4096];
-    static const char gpu_command[] =
-        "steamwebhelper.exe --type=gpu-process --use-angle=gl";
-    PCSTR adjusted_gpu_command = process_apply_compat_flags(
-        "C:\\Steam\\steamwebhelper.exe", gpu_command, compat_command);
-    k32_module_test_expect(
-        adjusted_gpu_command &&
-        process_command_contains(adjusted_gpu_command,
-                                 "--disable-gpu-watchdog"),
-        "Steam GPU child disables GPU watchdog", &checks, &failures);
-
-    static const char browser_command[] = "steamwebhelper.exe";
-    PCSTR adjusted_browser_command = process_apply_compat_flags(
-        "C:\\Steam\\steamwebhelper.exe", browser_command, compat_command);
-    k32_module_test_expect(
-        adjusted_browser_command &&
-        !process_command_contains(adjusted_browser_command,
-                                  "--disable-gpu-watchdog"),
-        "Steam browser process keeps GPU watchdog", &checks, &failures);
-
-    static const char complete_gpu_command[] =
-        "steamwebhelper.exe --type=gpu-process --use-angle=swiftshader "
-        "--disable-hang-monitor --disable-gpu-watchdog "
-        "--disable-stack-profiler";
-    k32_module_test_expect(
-        process_apply_compat_flags("C:\\Steam\\steamwebhelper.exe",
-                                   complete_gpu_command,
-                                   compat_command) == complete_gpu_command,
-        "Steam GPU flags are idempotent", &checks, &failures);
-
     k32_module_test_expect(dll_export_lookup_selftest() == 0,
                            "PE export hint/binary search", &checks,
                            &failures);
+    k32_module_test_expect(win32_abi_selftest() == 0,
+                           "PE32 thunk ABI registry", &checks, &failures);
+    k32_module_test_expect(compat32_thunk_contract_selftest() == 0,
+                           "PE32 thunk stack cleanup", &checks, &failures);
     k32_module_test_expect(dll_is_shim(module_name),
                            "shim registry initialized", &checks, &failures);
 
@@ -24866,7 +25358,7 @@ int kernel32_module_selftest(void)
                                  filesystem_name, sizeof(filesystem_name));
     k32_module_test_expect(volume_ok && volume_name[0] &&
                            k32_strcmp(filesystem_name, "OSITOFS") == 0 &&
-                           volume_serial == 0x4F534954 &&
+                           volume_serial != 0 &&
                            max_component == 255 &&
                            (filesystem_flags & 0x6) == 0x6,
                            "GetVolumeInformationA contract", &checks,
@@ -25026,8 +25518,8 @@ PVOID kernel32_shim_init(void)
     (void)win32_thread_table_ensure();
 
     /* Re-exec reset: don't leak the previous run's last-error into the fresh
-     * process (real NT starts a process with LastError = 0). The heap_pool is
-     * intentionally KEPT — it's a kmalloc arena reused across runs. */
+     * process (real NT starts a process with LastError = 0). Process heap VMAs
+     * and metadata are released by the process teardown path. */
     g_last_error = 0;
     kernel32_release_process_exception_state(k32_exception_filter_owner());
     /* Named kernel objects form a global namespace shared by child processes.

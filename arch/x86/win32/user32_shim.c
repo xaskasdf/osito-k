@@ -7,10 +7,12 @@
  */
 
 #include "user32_shim.h"
+#include "kernel32_shim.h"
 #include "compat32.h"
 #include "win32_abi.h"
 #include "dllloader.h"
 #include "../kernel/smp.h"
+#include "../include/boot_info.h"
 #include "../include/paging.h"
 
 _Static_assert(sizeof(POINT) == 8, "Win32 POINT ABI");
@@ -39,65 +41,35 @@ extern HANDLE WINAPI CreateEventA(PVOID attributes, BOOL manual_reset,
 extern BOOL WINAPI CloseHandle(HANDLE handle);
 extern PVOID WINAPI VirtualAlloc(PVOID address, SIZE_T size,
                                  DWORD allocation_type, DWORD protection);
+extern void *kcalloc(uint64_t count, uint64_t size);
 extern NTSTATUS ntsync_set_event_for_process(HANDLE event, ULONG owner_pid,
                                               LONG *previous_state);
+extern NTSTATUS nt_close_handle_for_process(HANDLE handle, ULONG owner_pid);
+extern NTSTATUS nt_vm_release_allocation_for_process(ULONG owner_pid,
+                                                      PVOID allocation_base);
 extern DWORD WINAPI shim_timeGetTime(void);
 extern TEB *win64_current_teb(void);
 extern uint32_t compat32_get_last_caller_eip(void);
+extern void ddraw_present_hook(void) __attribute__((weak));
+extern DWORD ddraw_present_poll_interval(void) __attribute__((weak));
+extern void xhci_poll(void) __attribute__((weak));
+extern bool compositor_is_running(void) __attribute__((weak));
 
 static void msg_read_from(const void *src, MSG *out);
 
-#if defined(OK_QUIET) && OK_QUIET
+#ifndef U32_INPUT_DIAGNOSTICS
 #define U32_INPUT_DIAGNOSTICS 0
-#else
-#define U32_INPUT_DIAGNOSTICS 1
 #endif
 
-/* Diagnostic probes must not fault when guest register state points at a
- * decommitted stack or object. Read through the active address space's page
- * tables and the kernel direct map instead of dereferencing guest VAs. */
-static BOOL u32_diag_read_memory(ULONG_PTR address, void *destination,
-                                 SIZE_T size)
-{
-    if (!address || !destination || !size || address + size < address)
-        return FALSE;
-
-#ifdef TEST_HARNESS
-    const volatile BYTE *source = (const volatile BYTE *)address;
-    BYTE *output = (BYTE *)destination;
-    for (SIZE_T i = 0; i < size; i++)
-        output[i] = source[i];
-    return TRUE;
-#else
-    uint64_t cr3;
-    BYTE *output = (BYTE *)destination;
-    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-
-    while (size) {
-        uint64_t physical = paging_translate_in_cr3(cr3, address);
-        if (physical == UINT64_MAX)
-            return FALSE;
-
-        SIZE_T chunk = 0x1000 - (SIZE_T)(physical & 0xFFF);
-        if (chunk > size)
-            chunk = size;
-        const volatile BYTE *source =
-            (const volatile BYTE *)PHYS_TO_VIRT(physical);
-        for (SIZE_T i = 0; i < chunk; i++)
-            output[i] = source[i];
-
-        address += chunk;
-        output += chunk;
-        size -= chunk;
-    }
-    return TRUE;
+#ifndef U32_API_DIAGNOSTICS
+#define U32_API_DIAGNOSTICS 0
 #endif
-}
 
-static BOOL u32_diag_read_u32(uint32_t address, uint32_t *value)
-{
-    return u32_diag_read_memory((ULONG_PTR)address, value, sizeof(*value));
-}
+#define USER32_FALLBACK_SCREEN_WIDTH  640
+#define USER32_FALLBACK_SCREEN_HEIGHT 480
+
+static int current_mode_cx(void);
+static int current_mode_cy(void);
 
 /* ── OsitoK compositor integration (weak — NULL in test harness) ── */
 extern uint32_t shm_create_surface(uint32_t w, uint32_t h, uint32_t flags)
@@ -167,7 +139,10 @@ static void u32_strcpy(char *dst, const char *src, int max)
 
 /* ── Window class registry ─────────────────────────────────── */
 
-#define MAX_WNDCLASSES 64
+#define WNDCLASS_BLOCK_SIZE 64
+#define WNDCLASS_MAX_BLOCKS 256
+#define MAX_WNDCLASSES (WNDCLASS_BLOCK_SIZE * WNDCLASS_MAX_BLOCKS)
+#define WNDCLASS_ATOM_BASE 0xC000U
 
 typedef struct {
     char        class_name[128];
@@ -183,19 +158,88 @@ typedef struct {
     ULONG_PTR   class_name_ptr;
     HICON       hIconSm;
     DWORD       owner_pid;
+    WORD        slot;
     WORD        atom;
+    int         system_class;
+    int         native_wndproc;
     int         used;
 } WNDCLASS_ENTRY;
 
-static WNDCLASS_ENTRY wndclasses[MAX_WNDCLASSES];
+typedef struct {
+    WNDCLASS_ENTRY entries[WNDCLASS_BLOCK_SIZE];
+} WNDCLASS_BLOCK;
+
+static WNDCLASS_BLOCK *wndclass_blocks[WNDCLASS_MAX_BLOCKS];
 static int wndclass_count = 0;
+
+static LRESULT WINAPI system_class_wndproc(HWND hWnd, DWORD Msg,
+                                            WPARAM wParam, LPARAM lParam);
+static LRESULT WINAPI dialog_class_wndproc(HWND hWnd, DWORD Msg,
+                                            WPARAM wParam, LPARAM lParam);
+
+/* USER32 registers these classes before application code can use them.  The
+ * metadata matches 32-bit and 64-bit NT; cbWndExtra is ABI-stable for these
+ * classes even though it contains pointer-backed control state. */
+static WNDCLASS_ENTRY system_wndclasses[] = {
+    { .class_name = "BUTTON",    .wndproc = system_class_wndproc,
+      .style = 0x0000008B, .cbWndExtra = 8,  .atom = 0x0080,
+      .system_class = 1, .native_wndproc = 1, .used = 1 },
+    { .class_name = "EDIT",      .wndproc = system_class_wndproc,
+      .style = 0x00000088, .cbWndExtra = 8,  .atom = 0x0081,
+      .system_class = 1, .native_wndproc = 1, .used = 1 },
+    { .class_name = "STATIC",    .wndproc = system_class_wndproc,
+      .style = 0x00000088, .cbWndExtra = 8,  .atom = 0x0082,
+      .system_class = 1, .native_wndproc = 1, .used = 1 },
+    { .class_name = "LISTBOX",   .wndproc = system_class_wndproc,
+      .style = 0x00000088, .cbWndExtra = 8,  .atom = 0x0083,
+      .system_class = 1, .native_wndproc = 1, .used = 1 },
+    { .class_name = "SCROLLBAR", .wndproc = system_class_wndproc,
+      .style = 0x00000088, .cbWndExtra = 80, .atom = 0x0084,
+      .system_class = 1, .native_wndproc = 1, .used = 1 },
+    { .class_name = "COMBOBOX",  .wndproc = system_class_wndproc,
+      .style = 0x0000008B, .cbWndExtra = 8,  .atom = 0x0085,
+      .system_class = 1, .native_wndproc = 1, .used = 1 },
+    { .class_name = "MDICLIENT", .wndproc = system_class_wndproc,
+      .style = 0x00000000, .cbWndExtra = 16,
+      .hbrBackground = (HBRUSH)(ULONG_PTR)13,
+      .system_class = 1, .native_wndproc = 1, .used = 1 },
+    { .class_name = "COMBOLBOX", .wndproc = system_class_wndproc,
+      .style = 0x00000808, .cbWndExtra = 8,
+      .system_class = 1, .native_wndproc = 1, .used = 1 },
+    { .class_name = "#32770",    .wndproc = dialog_class_wndproc,
+      .style = 0x00000808, .cbWndExtra = 30, .atom = 0x8002,
+      .system_class = 1, .native_wndproc = 1, .used = 1 },
+};
+
+#define SYSTEM_WNDCLASS_COUNT \
+    (sizeof(system_wndclasses) / sizeof(system_wndclasses[0]))
+
+static WNDCLASS_ENTRY *find_system_class(const char *name)
+{
+    if (!name) return NULL;
+    for (SIZE_T i = 0; i < SYSTEM_WNDCLASS_COUNT; i++)
+        if (u32_stricmp(system_wndclasses[i].class_name, name) == 0)
+            return &system_wndclasses[i];
+    return NULL;
+}
+
+static WNDCLASS_ENTRY *find_system_class_by_atom(WORD atom)
+{
+    for (SIZE_T i = 0; i < SYSTEM_WNDCLASS_COUNT; i++)
+        if (system_wndclasses[i].atom == atom)
+            return &system_wndclasses[i];
+    return NULL;
+}
 
 static WNDCLASS_ENTRY *find_class_for_pid(const char *name, DWORD pid)
 {
     for (int i = 0; i < wndclass_count; i++) {
-        if (wndclasses[i].used && wndclasses[i].owner_pid == pid &&
-            u32_stricmp(wndclasses[i].class_name, name) == 0)
-            return &wndclasses[i];
+        WNDCLASS_BLOCK *block = wndclass_blocks[i / WNDCLASS_BLOCK_SIZE];
+        WNDCLASS_ENTRY *entry = block
+            ? &block->entries[i % WNDCLASS_BLOCK_SIZE] : NULL;
+        if (entry && entry->used && entry->owner_pid == pid &&
+            u32_stricmp(entry->class_name, name) == 0)
+            return entry;
     }
     return NULL;
 }
@@ -205,12 +249,21 @@ static WNDCLASS_ENTRY *find_class(const char *name)
     return find_class_for_pid(name, GetCurrentProcessId());
 }
 
+static WNDCLASS_ENTRY *lookup_class_for_pid(const char *name, DWORD pid)
+{
+    WNDCLASS_ENTRY *entry = find_class_for_pid(name, pid);
+    return entry ? entry : find_system_class(name);
+}
+
 static WNDCLASS_ENTRY *find_class_by_atom_for_pid(WORD atom, DWORD pid)
 {
     for (int i = 0; i < wndclass_count; i++) {
-        if (wndclasses[i].used && wndclasses[i].owner_pid == pid &&
-            wndclasses[i].atom == atom)
-            return &wndclasses[i];
+        WNDCLASS_BLOCK *block = wndclass_blocks[i / WNDCLASS_BLOCK_SIZE];
+        WNDCLASS_ENTRY *entry = block
+            ? &block->entries[i % WNDCLASS_BLOCK_SIZE] : NULL;
+        if (entry && entry->used && entry->owner_pid == pid &&
+            entry->atom == atom)
+            return entry;
     }
     return NULL;
 }
@@ -220,13 +273,103 @@ static WNDCLASS_ENTRY *find_class_by_atom(WORD atom)
     return find_class_by_atom_for_pid(atom, GetCurrentProcessId());
 }
 
+static WNDCLASS_ENTRY *lookup_class_by_atom_for_pid(WORD atom, DWORD pid)
+{
+    WNDCLASS_ENTRY *entry = find_class_by_atom_for_pid(atom, pid);
+    return entry ? entry : find_system_class_by_atom(atom);
+}
+
+static WNDCLASS_ENTRY *lookup_class_by_atom(WORD atom)
+{
+    return lookup_class_by_atom_for_pid(atom, GetCurrentProcessId());
+}
+
+static WNDPROC class_wndproc_for_mode(WNDCLASS_ENTRY *entry)
+{
+    if (!entry || !entry->native_wndproc || !g_compat32_mode)
+        return entry ? entry->wndproc : NULL;
+
+    uint32_t thunk = compat32_make_thunk_ex(
+        (uint64_t)(ULONG_PTR)entry->wndproc,
+        "USER32!NativeClassWndProc", 4, CC_STDCALL);
+    return (WNDPROC)(ULONG_PTR)thunk;
+}
+
 static WNDCLASS_ENTRY *alloc_wndclass(void)
 {
-    for (int i = 0; i < wndclass_count; i++)
-        if (!wndclasses[i].used)
-            return &wndclasses[i];
+    for (int i = 0; i < wndclass_count; i++) {
+        WNDCLASS_BLOCK *block = wndclass_blocks[i / WNDCLASS_BLOCK_SIZE];
+        WNDCLASS_ENTRY *entry = block
+            ? &block->entries[i % WNDCLASS_BLOCK_SIZE] : NULL;
+        if (entry && !entry->used) {
+            memset(entry, 0, sizeof(*entry));
+            entry->slot = (WORD)i;
+            entry->atom = (WORD)(WNDCLASS_ATOM_BASE + i);
+            return entry;
+        }
+    }
     if (wndclass_count >= MAX_WNDCLASSES) return NULL;
-    return &wndclasses[wndclass_count++];
+
+    int slot = wndclass_count;
+    int block_index = slot / WNDCLASS_BLOCK_SIZE;
+    WNDCLASS_BLOCK *block = wndclass_blocks[block_index];
+    if (!block) {
+        block = (WNDCLASS_BLOCK *)kcalloc(1, sizeof(*block));
+        if (!block) return NULL;
+        wndclass_blocks[block_index] = block;
+        serial_puts("[USER32] class registry capacity=");
+        serial_putdec((uint64_t)(block_index + 1) * WNDCLASS_BLOCK_SIZE);
+        serial_puts("\n");
+    }
+
+    WNDCLASS_ENTRY *entry =
+        &block->entries[slot % WNDCLASS_BLOCK_SIZE];
+    wndclass_count++;
+    memset(entry, 0, sizeof(*entry));
+    entry->slot = (WORD)slot;
+    entry->atom = (WORD)(WNDCLASS_ATOM_BASE + slot);
+    return entry;
+}
+
+WORD user32_register_library_class(PCSTR class_name, DWORD style,
+                                   int cb_cls_extra, int cb_wnd_extra,
+                                   HBRUSH background, WNDPROC wndproc)
+{
+    if (!class_name || !class_name[0] || !wndproc)
+        return 0;
+
+    DWORD pid = GetCurrentProcessId();
+    WNDCLASS_ENTRY *entry = find_class_for_pid(class_name, pid);
+    if (entry)
+        return entry->native_wndproc && entry->wndproc == wndproc
+             ? entry->atom : 0;
+
+    entry = alloc_wndclass();
+    if (!entry)
+        return 0;
+
+    u32_strcpy(entry->class_name, class_name, sizeof(entry->class_name));
+    entry->wndproc = wndproc;
+    entry->style = style | CS_GLOBALCLASS;
+    entry->cbClsExtra = cb_cls_extra;
+    entry->cbWndExtra = cb_wnd_extra;
+    entry->hbrBackground = background;
+    entry->owner_pid = pid;
+    entry->native_wndproc = 1;
+    entry->used = 1;
+    return entry->atom;
+}
+
+BOOL user32_unregister_library_class(PCSTR class_name, WNDPROC wndproc)
+{
+    if (!class_name || !wndproc)
+        return FALSE;
+    WNDCLASS_ENTRY *entry = find_class_for_pid(
+        class_name, GetCurrentProcessId());
+    if (!entry || !entry->native_wndproc || entry->wndproc != wndproc)
+        return FALSE;
+    entry->used = 0;
+    return TRUE;
 }
 
 /* ── Window objects ────────────────────────────────────────── */
@@ -238,6 +381,7 @@ static void menu_release_window_menus(HWND window, HMENU menu_bar,
 static void menu_release_process(DWORD pid);
 static void menu_sync_system_window(HWND window);
 static void icon_release_process(DWORD pid);
+static void user_object_release_process(DWORD pid);
 
 typedef struct {
     HWND        handle;
@@ -287,6 +431,22 @@ static int window_count = 0;
 static ULONG_PTR next_hwnd = 0xA0000001;
 static int defer_sync_depth;
 static unsigned show_trace_count;
+
+typedef struct {
+    BOOL used;
+    BOOL modal;
+    BOOL ended;
+    BOOL owner_disabled;
+    HWND window;
+    HWND owner;
+    DLGPROC proc;
+    LONG_PTR result;
+} U32_DIALOG_STATE;
+
+static U32_DIALOG_STATE dialog_states[MAX_WINDOWS];
+
+static U32_DIALOG_STATE *dialog_state_find(HWND window);
+static void dialog_release_window(HWND window);
 
 /* ChangeDisplaySettings owns a logical desktop mode. The physical GOP mode
  * remains fixed; the compositor presents/scales the selected logical mode. */
@@ -589,6 +749,7 @@ static BOOL property_store_name_w(WINDOW_PROPERTY *property, PCWSTR name)
     return FALSE;
 }
 
+#if U32_API_DIAGNOSTICS
 static void property_trace(const char *operation, HWND window,
                            const WINDOW_PROPERTY *property)
 {
@@ -617,6 +778,9 @@ static void property_trace(const char *operation, HWND window,
     serial_puthex(property ? (uint64_t)(ULONG_PTR)property->value : 0, 16);
     serial_puts("\n");
 }
+#else
+#define property_trace(...) ((void)0)
+#endif
 
 static void property_release_window(HWND window)
 {
@@ -624,114 +788,6 @@ static void property_release_window(HWND window)
         if (window_properties[i].used &&
             window_properties[i].window == window)
             window_properties[i] = (WINDOW_PROPERTY){0};
-}
-
-static void trace_swiftshader_wsi(const char *api, uint64_t caller, HWND hwnd,
-                                  const WINDOW *window, const void *output,
-                                  BOOL result)
-{
-    LOADED_MODULE *caller_module = dll_find_module_by_address(
-        (PVOID)(ULONG_PTR)caller);
-    LOADED_MODULE *swiftshader = dll_find_module("vk_swiftshader.dll");
-    BOOL direct = caller_module &&
-                  u32_stricmp(caller_module->name,
-                              "vk_swiftshader.dll") == 0;
-    if (!direct && !swiftshader)
-        return;
-
-    static uint32_t trace_count[256];
-    static uint32_t failure_count[256];
-    DWORD pid = GetCurrentProcessId();
-    uint32_t trace_slot = pid < 256 ? pid : 255;
-    uint32_t event = __atomic_fetch_add(&trace_count[trace_slot], 1,
-                                        __ATOMIC_RELAXED);
-    if (event >= 64 &&
-        (result || __atomic_fetch_add(&failure_count[trace_slot], 1,
-                                     __ATOMIC_RELAXED) >= 64))
-        return;
-
-    serial_puts("[SWIFTSHADER-WSI] ");
-    serial_puts(api);
-    serial_puts(" win_pid=");
-    serial_putdec(pid);
-    serial_puts(" tid=");
-    serial_putdec(GetCurrentThreadId());
-    serial_puts(" hwnd=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)hwnd, 16);
-    serial_puts(" result=");
-    serial_putdec(result ? 1 : 0);
-    serial_puts(" output=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)output, 16);
-    serial_puts(" caller=0x");
-    serial_puthex(caller, 16);
-    serial_puts(" caller_module=");
-    if (caller_module) {
-        uint64_t caller_base =
-            (uint64_t)(ULONG_PTR)caller_module->image.ImageBase;
-        serial_puts(caller_module->name);
-        serial_puts("+0x");
-        serial_puthex(caller - caller_base, 8);
-    } else {
-        serial_puts("<none>");
-    }
-    serial_puts(direct ? " source=direct" : " source=process");
-
-    if (window) {
-        serial_puts(" slot=");
-        serial_putdec((uint64_t)(window - windows));
-        serial_puts(" owner_pid=");
-        serial_putdec(window->owner_pid);
-        serial_puts(" owner_tid=");
-        serial_putdec(window->owner_tid);
-        serial_puts(" size=");
-        serial_putdec((uint64_t)(uint32_t)window->width);
-        serial_puts("x");
-        serial_putdec((uint64_t)(uint32_t)window->height);
-        serial_puts(" used=");
-        serial_putdec(window->used ? 1 : 0);
-        serial_puts(" destroying=");
-        serial_putdec(window->destroying ? 1 : 0);
-        serial_puts(" visible=");
-        serial_putdec(window->visible ? 1 : 0);
-    }
-    serial_puts("\n");
-}
-
-static void trace_lwjgl_window_call(const char *api, uint32_t caller_eip,
-                                    HWND hwnd, BOOL result,
-                                    const RECT *rect, ULONG_PTR value)
-{
-    LOADED_MODULE *caller_module = dll_find_module_by_address(
-        (PVOID)(ULONG_PTR)caller_eip);
-    if (!caller_module ||
-        u32_stricmp(caller_module->name, "lwjgl.dll") != 0)
-        return;
-
-    static uint32_t trace_count;
-    if (__atomic_fetch_add(&trace_count, 1, __ATOMIC_RELAXED) >= 64)
-        return;
-
-    serial_puts("[LWJGL-WIN32] ");
-    serial_puts(api);
-    serial_puts(" eip=0x");
-    serial_puthex(caller_eip, 8);
-    serial_puts(" hwnd=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)hwnd, 8);
-    serial_puts(" result=");
-    serial_putdec(result ? 1 : 0);
-    serial_puts(" value=0x");
-    serial_puthex((uint64_t)value, 8);
-    if (rect) {
-        serial_puts(" rect=");
-        serial_putdec((uint32_t)rect->left);
-        serial_puts(",");
-        serial_putdec((uint32_t)rect->top);
-        serial_puts(",");
-        serial_putdec((uint32_t)rect->right);
-        serial_puts(",");
-        serial_putdec((uint32_t)rect->bottom);
-    }
-    serial_puts("\n");
 }
 
 static int hwnd_insert_token(HWND hwnd)
@@ -1200,7 +1256,10 @@ static BYTE async_pressed[256];
 static BYTE key_state_at_msg[256]; /* snapshot at last PeekMessage/GetMessage retrieval */
 static DWORD mouse_buttons = 0; /* bits 0-4: left, right, middle, X1, X2 */
 static LPARAM message_extra_info;
-static POINT cursor_pos = { 320, 240 };
+static POINT cursor_pos = {
+    USER32_FALLBACK_SCREEN_WIDTH / 2,
+    USER32_FALLBACK_SCREEN_HEIGHT / 2
+};
 
 /* ── Message queue ────────────────────────────────────────── */
 
@@ -1654,6 +1713,34 @@ static void user_hook_release_process(DWORD pid)
     user_hook_unlock_irqrestore(flags);
 }
 
+static void user_hook_release_thread(DWORD pid, DWORD tid)
+{
+    PVOID scratch_page = NULL;
+    uint64_t flags = user_hook_lock_irqsave();
+    for (int i = 0; i < USER_HOOK_SLOTS; i++) {
+        USER_HOOK *hook = &user_hooks[i];
+        if (hook->used &&
+            ((hook->owner_pid == pid && hook->installer_tid == tid) ||
+             hook->target_tid == tid))
+            hook->used = FALSE;
+    }
+    for (int i = 0; i < USER_HOOK_CONTEXT_SLOTS; i++) {
+        USER_HOOK_CONTEXT *context = &user_hook_contexts[i];
+        if (!context->used || context->pid != pid || context->tid != tid)
+            continue;
+        scratch_page = context->scratch_page;
+        context->used = FALSE;
+        context->depth = 0;
+        context->windowpos_depth = 0;
+        context->create_depth = 0;
+        context->scratch_page = NULL;
+    }
+    user_hook_unlock_irqrestore(flags);
+
+    if (scratch_page)
+        (void)nt_vm_release_allocation_for_process(pid, scratch_page);
+}
+
 typedef struct {
     uint32_t lParam;
     uint32_t wParam;
@@ -1755,9 +1842,11 @@ static ULONG_PTR user_timer_set(HWND window, ULONG_PTR event_id,
                                 UINT elapsed, PVOID callback);
 static BOOL user_timer_kill(HWND window, ULONG_PTR event_id);
 static void user_timer_release_window(HWND window);
+static void user_timer_release_thread(DWORD pid, DWORD tid);
 static void user_timer_release_process(DWORD pid);
 static int sent_message_dispatch_current(void);
 static BOOL sent_message_pending(DWORD pid, DWORD tid);
+static void sent_message_release_thread(DWORD pid, DWORD tid);
 static void sent_message_release_process(DWORD pid);
 
 static inline uint64_t msg_lock_irqsave(void)
@@ -1885,6 +1974,34 @@ static void sent_message_release_process(DWORD pid)
         sent_message_unlock_irqrestore(flags);
         if (event)
             ntsync_set_event_for_process(event, sender_pid, NULL);
+    }
+}
+
+static void sent_message_release_thread(DWORD pid, DWORD tid)
+{
+    for (int i = 0; i < SENT_MESSAGE_SLOTS; i++) {
+        HANDLE event_to_close = NULL;
+        HANDLE event_to_signal = NULL;
+        DWORD sender_pid = 0;
+        uint64_t flags = sent_message_lock_irqsave();
+        SENT_MESSAGE *sent = &sent_messages[i];
+        if (sent->state != SENT_MESSAGE_FREE) {
+            if (sent->sender_pid == pid && sent->sender_tid == tid) {
+                event_to_close = sent->completion_event;
+                sent->state = sent->state == SENT_MESSAGE_PROCESSING
+                            ? SENT_MESSAGE_ABANDONED : SENT_MESSAGE_FREE;
+            } else if (sent->target_pid == pid && sent->target_tid == tid) {
+                sent->result = 0;
+                sent->state = SENT_MESSAGE_DONE;
+                event_to_signal = sent->completion_event;
+                sender_pid = sent->sender_pid;
+            }
+        }
+        sent_message_unlock_irqrestore(flags);
+        if (event_to_signal)
+            ntsync_set_event_for_process(event_to_signal, sender_pid, NULL);
+        if (event_to_close)
+            (void)nt_close_handle_for_process(event_to_close, pid);
     }
 }
 
@@ -2055,6 +2172,24 @@ static void msg_wait_event_release_process(DWORD pid)
             msg_wait_events[i].used = FALSE;
     }
     msg_wait_event_unlock_irqrestore(irq_flags);
+}
+
+static void msg_wait_event_release_thread(DWORD pid, DWORD tid)
+{
+    HANDLE event = NULL;
+    uint64_t irq_flags = msg_wait_event_lock_irqsave();
+    for (int i = 0; i < MSG_WAIT_EVENT_SLOTS; i++) {
+        MSG_WAIT_EVENT *entry = &msg_wait_events[i];
+        if (entry->used && entry->pid == pid && entry->tid == tid) {
+            event = entry->event;
+            *entry = (MSG_WAIT_EVENT){0};
+            break;
+        }
+    }
+    msg_wait_event_unlock_irqrestore(irq_flags);
+
+    if (event)
+        (void)nt_close_handle_for_process(event, pid);
 }
 
 #define QS_KEY             0x0001
@@ -2633,6 +2768,24 @@ static void msg_purge_process(DWORD pid)
     msg_unlock_irqrestore(flags);
 }
 
+static void msg_purge_thread(DWORD pid, DWORD tid)
+{
+    uint64_t flags = msg_lock_irqsave();
+    int i = msg_head;
+    while (i != msg_tail) {
+        if (msg_target_pid[i] == pid && msg_target_tid[i] == tid)
+            msg_remove_locked(i);
+        else
+            i = (i + 1) % MSG_QUEUE_SIZE;
+    }
+    for (int i = 0; i < INPUT_SEQUENCE_STATE_SLOTS; i++) {
+        INPUT_SEQUENCE_STATE *state = &input_sequence_states[i];
+        if (state->used && state->pid == pid && state->tid == tid)
+            state->used = FALSE;
+    }
+    msg_unlock_irqrestore(flags);
+}
+
 static BOOL capture_routes_mouse_message(DWORD message)
 {
     return message >= WM_MOUSEMOVE && message <= WM_MOUSEHWHEEL;
@@ -3080,6 +3233,22 @@ static void user_timer_release_process(DWORD pid)
     user_timer_unlock_irqrestore(flags);
 }
 
+static void user_timer_release_thread(DWORD pid, DWORD tid)
+{
+    uint64_t flags = user_timer_lock_irqsave();
+    for (int i = 0; i < USER_TIMER_SLOTS; i++) {
+        USER_TIMER *timer = &user_timers[i];
+        if ((timer->used || timer->posted) && timer->owner_pid == pid &&
+            timer->owner_tid == tid) {
+            timer->used = FALSE;
+            timer->pending = FALSE;
+            timer->posted = FALSE;
+            timer->pending_callback = NULL;
+        }
+    }
+    user_timer_unlock_irqrestore(flags);
+}
+
 /*
  * PS/2 scancode set 1 → Windows virtual key code.
  * Index = scancode (0x00-0x58). Extended keys (0xE0 prefix) handled separately.
@@ -3279,21 +3448,33 @@ static void icon_release_all(void)
 
 static HWND  caret_hwnd = NULL;
 static POINT caret_pos = { 0, 0 };
-/* NT cursor display count starts at 0 (cursor shown). It was 1 here, which
- * broke the count by one: WinDrv SetMouseCapture's single ShowCursor(FALSE)
- * (windrv.bin @0x11106765) yielded 0 instead of -1, so the cursor never
- * counted as "hidden" and mouselook_active()'s cursor_visible<0 leg could
- * never trip. ShowCursor(FALSE) must return -1 on the first call, like NT. */
+/* NT starts the cursor display count at zero when a mouse is installed. */
 static int   cursor_visible = 0;
+static DWORD cursor_visibility_owner_pid;
+static DWORD cursor_visibility_owner_tid;
 static HWND  capture_hwnd = NULL;
 static HWND  focus_hwnd   = NULL;   /* SetFocus / WM_SETFOCUS target */
 static HWND  active_hwnd  = NULL;   /* active/foreground top-level window */
-static int   clip_active  = 0;      /* ClipCursor(rect!=NULL) in effect */
-static RECT  clip_rect    = { 0, 0, 800, 600 };
+static int   clip_active  = 0;
+static DWORD clip_owner_pid;
+static DWORD clip_owner_tid;
+static RECT  clip_rect    = {
+    0, 0, USER32_FALLBACK_SCREEN_WIDTH, USER32_FALLBACK_SCREEN_HEIGHT
+};
 
-/* Relative-delta tracker for the absolute (usb-tablet) pointer while in-game
- * mouse-look. Invalidated whenever we leave mouse-look so re-entry starts
- * fresh (no stale-position jump). */
+typedef struct {
+    BOOL active;
+    DWORD owner_pid;
+    DWORD owner_tid;
+    POINT anchor;
+    DWORD last_warp_ms;
+    UINT matching_warps;
+} RELATIVE_POINTER_STATE;
+
+static RELATIVE_POINTER_STATE relative_pointer;
+
+/* Relative-delta tracker for absolute HID devices while an application uses
+ * the classic clipped/hidden cursor-warp input model. */
 static int   g_abs_prev_valid = 0;
 static int   g_abs_prev_sx = 0, g_abs_prev_sy = 0;
 
@@ -3342,44 +3523,114 @@ static void update_mouse_tracking(HWND target, LPARAM pos_lp, int moved)
     }
 }
 
-static HWND viewport_hwnd(void);
+static HWND input_target(void);
 
-static int is_gameplay_key(int vk)
+static int point_near(POINT point, POINT target, int tolerance)
 {
-    return vk == VK_UP || vk == VK_DOWN ||
-           vk == VK_LEFT || vk == VK_RIGHT ||
-           vk == 'W' || vk == 'A' || vk == 'S' || vk == 'D' ||
-           vk == VK_SPACE || vk == VK_CONTROL || vk == VK_LBUTTON;
+    int dx = point.x - target.x;
+    int dy = point.y - target.y;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    return dx <= tolerance && dy <= tolerance;
+}
+
+static void confine_cursor_point(POINT *point)
+{
+    if (!point || !clip_active)
+        return;
+    if (point->x < clip_rect.left) point->x = clip_rect.left;
+    if (point->y < clip_rect.top) point->y = clip_rect.top;
+    if (point->x >= clip_rect.right) point->x = clip_rect.right - 1;
+    if (point->y >= clip_rect.bottom) point->y = clip_rect.bottom - 1;
+}
+
+static void relative_pointer_reset(void)
+{
+    relative_pointer.active = FALSE;
+    relative_pointer.owner_pid = 0;
+    relative_pointer.owner_tid = 0;
+    relative_pointer.anchor.x = 0;
+    relative_pointer.anchor.y = 0;
+    relative_pointer.last_warp_ms = 0;
+    relative_pointer.matching_warps = 0;
+    g_abs_prev_valid = 0;
 }
 
 static void log_input_prefix(const char *tag)
 {
     serial_puts(tag);
     serial_puts(" focus=0x"); serial_puthex((uint64_t)(ULONG_PTR)focus_hwnd, 8);
-    serial_puts(" vp=0x"); serial_puthex((uint64_t)(ULONG_PTR)viewport_hwnd(), 8);
+    serial_puts(" active=0x"); serial_puthex((uint64_t)(ULONG_PTR)active_hwnd, 8);
+    serial_puts(" target=0x"); serial_puthex((uint64_t)(ULONG_PTR)input_target(), 8);
     serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
     serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)cursor_visible);
     serial_puts(" clip="); serial_putdec((uint64_t)(int64_t)clip_active);
 }
 
-/*
- * In-game mouse-look gate. UT99's UWindowsViewport does NOT call user32
- * SetCapture when it grabs the mouse for mouse-look; instead (see WinDrv
- * SetMouseCapture @0x11106610) it ShowCursor(FALSE) + ClipCursor(rect) +
- * SetCursorPos(center) and then, per WM_MOUSEMOVE, reads the absolute cursor
- * pos, subtracts the recenter origin to get a delta, and SetCursorPos(center)
- * again. So the reliable "we are in mouse-look" signal in our layer is: the
- * cursor is hidden (ShowCursor count < 0) or the cursor is clipped, or an
- * explicit SetCapture is in force. The menu uses none of these (cursor shown,
- * unclipped, uncaptured) → it keeps the absolute path. */
-static int mouselook_active(void)
+/* A hidden or clipped cursor is not by itself a request for relative input.
+ * Enable tablet-to-relative translation only after the foreground owner
+ * recenters the shared cursor, matching the classic Win32 warp input model. */
+static int relative_pointer_mode_active(void)
 {
-    /* Capture is ordinary USER32 routing, not evidence of relative input.
-     * Native window moves, menus, and CEF controls all capture the pointer
-     * while continuing to consume absolute screen coordinates. UT99's
-     * mouse-look is identified by the state it actually establishes: a
-     * hidden cursor and/or ClipCursor. */
-    return (cursor_visible < 0) || clip_active;
+    if (!relative_pointer.active)
+        return 0;
+
+    BOOL owns_clip = clip_active &&
+        clip_owner_pid == relative_pointer.owner_pid;
+    BOOL owns_hidden_cursor = cursor_visible < 0 &&
+        cursor_visibility_owner_pid == relative_pointer.owner_pid &&
+        cursor_visibility_owner_tid == relative_pointer.owner_tid;
+    if (!owns_clip && !owns_hidden_cursor)
+        return 0;
+
+    WINDOW *target = find_window(input_target());
+    return !target || target->owner_pid == relative_pointer.owner_pid;
+}
+
+static void relative_pointer_note_warp(POINT point)
+{
+    DWORD pid = GetCurrentProcessId();
+    DWORD tid = GetCurrentThreadId();
+    DWORD now = shim_timeGetTime();
+    BOOL same_warp = relative_pointer.owner_pid == pid &&
+        relative_pointer.owner_tid == tid &&
+        point_near(point, relative_pointer.anchor, 1) &&
+        (DWORD)(now - relative_pointer.last_warp_ms) <= 250;
+
+    relative_pointer.owner_pid = pid;
+    relative_pointer.owner_tid = tid;
+    relative_pointer.anchor = point;
+    relative_pointer.last_warp_ms = now;
+    relative_pointer.matching_warps = same_warp
+        ? relative_pointer.matching_warps + 1 : 1;
+
+    WINDOW *target = find_window(input_target());
+    BOOL owns_target = !target || target->owner_pid == pid;
+    BOOL owns_clip = clip_active && clip_owner_pid == pid;
+    BOOL owns_hidden_cursor = cursor_visible < 0 &&
+        cursor_visibility_owner_pid == pid &&
+        cursor_visibility_owner_tid == tid;
+    BOOL centered = FALSE;
+
+    if (owns_clip) {
+        POINT center = {
+            clip_rect.left + (clip_rect.right - clip_rect.left) / 2,
+            clip_rect.top + (clip_rect.bottom - clip_rect.top) / 2,
+        };
+        centered = point_near(point, center, 2);
+    } else if (owns_hidden_cursor && target) {
+        int x, y;
+        window_screen_origin(target, &x, &y);
+        POINT center = { x + target->width / 2, y + target->height / 2 };
+        centered = point_near(point, center, 2);
+    }
+
+    relative_pointer.active = owns_target &&
+        ((owns_clip && centered) ||
+         (owns_hidden_cursor &&
+          (centered || relative_pointer.matching_warps >= 2)));
+    if (!relative_pointer.active)
+        g_abs_prev_valid = 0;
 }
 
 static void user32_reset_corrupt_window_state(const char *where)
@@ -3401,7 +3652,9 @@ static void user32_reset_corrupt_window_state(const char *where)
     active_hwnd = NULL;
     capture_hwnd = NULL;
     clip_active = 0;
-    g_abs_prev_valid = 0;
+    clip_owner_pid = 0;
+    clip_owner_tid = 0;
+    relative_pointer_reset();
     msg_head = msg_tail = 0;
     queue_changed_status = 0;
 }
@@ -3422,66 +3675,46 @@ static int win32_input_active(void)
     return g_compat32_mode || window_count > 0;
 }
 
-/* The in-game viewport window handle: the most-recently-created *used* window
- * whose class is UT's viewport window class. Falls back to focus, then to the
- * last used window. This is the window WinDrv's ViewportWndProc is bound to and
- * the one that must receive in-game keyboard + mouse input. */
-static int is_viewport_class(const char *name)
-{
-    /* UT registers "UnrealTournamentUnrealWWindowsViewportWindow" (wide→narrow
-     * may corrupt the first char), so match the stable substring. */
-    if (!name) return 0;
-    const char *needle = "ViewportWindow";
-    for (const char *p = name; *p; p++) {
-        const char *a = p, *b = needle;
-        while (*a && *b && *a == *b) { a++; b++; }
-        if (!*b) return 1;
-    }
-    return 0;
-}
-
-static HWND viewport_hwnd(void)
-{
-    if (!user32_window_state_sane("viewport"))
-        return NULL;
-    for (int i = window_count - 1; i >= 0; i--) {
-        if (windows[i].used && is_viewport_class(windows[i].class_name))
-            return windows[i].handle;
-    }
-    return NULL;
-}
-
 static int u32_input_diagnostics_active(void)
 {
-    /* These probes inspect PE32 registers and fixed UT99 offsets. A stale
-     * compat32 EBP from another process must never be sampled while a PE64
-     * application such as Steam is handling SetCapture. */
+    /* Compat diagnostics are scoped to the active PE32 input queue. */
     return U32_INPUT_DIAGNOSTICS && g_compat32_mode &&
-           viewport_hwnd() != NULL;
+           input_target() != NULL;
 }
 
-/* Keyboard/mouse input target. In-game (mouse-look) the viewport owns input
- * regardless of which UWindow was created last; otherwise honor the focused
- * window (menu/console), then fall back to the last used window. */
+/* Route keyboard and relative pointer input using USER32 state. The focused
+ * child wins, followed by the active top-level window and the topmost visible
+ * window. This keeps routing independent of executable and class names. */
 static HWND input_target(void)
 {
     if (!user32_window_state_sane("target"))
         return NULL;
-    HWND vp = viewport_hwnd();
-    if (mouselook_active() && vp) return vp;
-    if (focus_hwnd && find_window(focus_hwnd)) return focus_hwnd;
-    for (int i = window_count - 1; i >= 0; i--)
-        if (windows[i].used) return windows[i].handle;
-    return vp;
+    WINDOW *focused = find_window(focus_hwnd);
+    /* Focus is a USER32 routing property, not a compositor visibility test.
+     * A caller may focus a window before its first ShowWindow call. */
+    if (focused && !focused->destroying)
+        return focused->handle;
+
+    WINDOW *active = find_window(active_hwnd);
+    if (active && !active->destroying)
+        return active->handle;
+
+    WINDOW *top = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        WINDOW *candidate = &windows[i];
+        if (!candidate->used || candidate->destroying ||
+            !window_should_render(candidate))
+            continue;
+        if (!top || candidate->render_z > top->render_z)
+            top = candidate;
+    }
+    return top ? top->handle : NULL;
 }
 
 static LRESULT dispatch_wndproc(WNDPROC wndproc, HWND hWnd, DWORD Msg,
                                 WPARAM wParam, LPARAM lParam);
 
 /* ── Default screen dimensions ─────────────────────────────── */
-
-#define SCREEN_WIDTH  800
-#define SCREEN_HEIGHT 600
 
 /* ── API Implementations ───────────────────────────────────── */
 
@@ -3550,19 +3783,33 @@ static void wndclass_read(const void *src, WNDCLASSA *out)
 
 WORD WINAPI RegisterClassExA(const WNDCLASSEXA *lpwcx)
 {
-    if (!lpwcx) return 0;
+    if (!lpwcx) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
 
     WNDCLASSEXA wcx;
     wndclassex_read(lpwcx, &wcx);
 
-    if (!wcx.lpszClassName) return 0;
+    if (!wcx.lpszClassName || !wcx.lpszClassName[0]) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
 
     serial_puts("[USER32] RegisterClassExA: ");
     serial_puts(wcx.lpszClassName);
     serial_puts("\n");
 
+    DWORD pid = GetCurrentProcessId();
+    if (find_class_for_pid(wcx.lpszClassName, pid)) {
+        SetLastError(1410); /* ERROR_CLASS_ALREADY_EXISTS */
+        return 0;
+    }
     WNDCLASS_ENTRY *e = alloc_wndclass();
-    if (!e) return 0;
+    if (!e) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return 0;
+    }
     u32_strcpy(e->class_name, wcx.lpszClassName, 128);
     e->wndproc    = wcx.lpfnWndProc;
     e->style      = wcx.style;
@@ -3575,8 +3822,7 @@ WORD WINAPI RegisterClassExA(const WNDCLASSEXA *lpwcx)
     e->menu_name = (ULONG_PTR)wcx.lpszMenuName;
     e->class_name_ptr = (ULONG_PTR)wcx.lpszClassName;
     e->hIconSm = wcx.hIconSm;
-    e->owner_pid  = GetCurrentProcessId();
-    e->atom       = (WORD)((e - wndclasses) + 1);
+    e->owner_pid  = pid;
     e->used       = 1;
 
     return e->atom;
@@ -3584,12 +3830,18 @@ WORD WINAPI RegisterClassExA(const WNDCLASSEXA *lpwcx)
 
 WORD WINAPI RegisterClassA(const WNDCLASSA *lpwcx)
 {
-    if (!lpwcx) return 0;
+    if (!lpwcx) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
 
     WNDCLASSA wca;
     wndclass_read(lpwcx, &wca);
 
-    if (!wca.lpszClassName) return 0;
+    if (!wca.lpszClassName || !wca.lpszClassName[0]) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
 
     WNDCLASSEXA ex;
     BYTE *p = (BYTE *)&ex;
@@ -3607,8 +3859,16 @@ WORD WINAPI RegisterClassA(const WNDCLASSA *lpwcx)
     ex.lpszClassName = wca.lpszClassName;
 
     /* Call internal registration directly (not through thunk) */
+    DWORD pid = GetCurrentProcessId();
+    if (find_class_for_pid(ex.lpszClassName, pid)) {
+        SetLastError(1410); /* ERROR_CLASS_ALREADY_EXISTS */
+        return 0;
+    }
     WNDCLASS_ENTRY *e = alloc_wndclass();
-    if (!e) return 0;
+    if (!e) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return 0;
+    }
     u32_strcpy(e->class_name, ex.lpszClassName, 128);
     e->wndproc    = ex.lpfnWndProc;
     e->style      = ex.style;
@@ -3621,27 +3881,44 @@ WORD WINAPI RegisterClassA(const WNDCLASSA *lpwcx)
     e->menu_name = (ULONG_PTR)ex.lpszMenuName;
     e->class_name_ptr = (ULONG_PTR)ex.lpszClassName;
     e->hIconSm = ex.hIconSm;
-    e->owner_pid  = GetCurrentProcessId();
-    e->atom       = (WORD)((e - wndclasses) + 1);
+    e->owner_pid  = pid;
     e->used       = 1;
     return e->atom;
 }
 
 WORD WINAPI RegisterClassW(PVOID lpwc)
 {
-    if (!lpwc) return 0;
+    if (!lpwc) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
 
     WNDCLASSA wc;
     wndclass_read(lpwc, &wc);
     const uint16_t *class_name = (const uint16_t *)wc.lpszClassName;
-    if (!class_name) return 0;
+    if (!class_name || !class_name[0]) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+
+    char class_a[128] = {0};
+    int class_length;
+    for (class_length = 0; class_length < 127 && class_name[class_length];
+         class_length++)
+        class_a[class_length] = (char)(class_name[class_length] & 0xFF);
+
+    DWORD pid = GetCurrentProcessId();
+    if (find_class_for_pid(class_a, pid)) {
+        SetLastError(1410); /* ERROR_CLASS_ALREADY_EXISTS */
+        return 0;
+    }
 
     WNDCLASS_ENTRY *e = alloc_wndclass();
-    if (!e) return 0;
-    int i;
-    for (i = 0; i < 127 && class_name[i]; i++)
-        e->class_name[i] = (char)(class_name[i] & 0xFF);
-    e->class_name[i] = 0;
+    if (!e) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return 0;
+    }
+    u32_strcpy(e->class_name, class_a, sizeof(e->class_name));
     e->wndproc = wc.lpfnWndProc;
     e->style = wc.style;
     e->cbClsExtra = wc.cbClsExtra;
@@ -3653,8 +3930,7 @@ WORD WINAPI RegisterClassW(PVOID lpwc)
     e->menu_name = (ULONG_PTR)wc.lpszMenuName;
     e->class_name_ptr = (ULONG_PTR)class_name;
     e->hIconSm = NULL;
-    e->owner_pid = GetCurrentProcessId();
-    e->atom = (WORD)((e - wndclasses) + 1);
+    e->owner_pid = pid;
     e->used = 1;
 
     serial_puts("[USER32] RegisterClassW: ");
@@ -3668,7 +3944,7 @@ static WORD WINAPI GetClassWord_u32(HWND hwnd, int index)
     if (index != -32) return 0; /* GCW_ATOM */
     WINDOW *window = find_window(hwnd);
     WNDCLASS_ENTRY *entry = window
-        ? find_class_for_pid(window->class_name, window->owner_pid) : NULL;
+        ? lookup_class_for_pid(window->class_name, window->owner_pid) : NULL;
     return entry ? entry->atom : 0;
 }
 
@@ -3680,7 +3956,7 @@ LONG_PTR WINAPI GetClassLongPtrW(HWND hwnd, int index)
         return 0;
     }
     WNDCLASS_ENTRY *entry =
-        find_class_for_pid(window->class_name, window->owner_pid);
+        lookup_class_for_pid(window->class_name, window->owner_pid);
     if (!entry) return 0;
 
     switch (index) {
@@ -3871,11 +4147,6 @@ static void dispatch_wm_size(WINDOW *w)
     int width = size_type == SIZE_MINIMIZED ? 0 : w->width;
     int height = size_type == SIZE_MINIMIZED ? 0 : w->height;
     if (size_type != SIZE_MINIMIZED && (width <= 0 || height <= 0)) return;
-    /* Probe: every WM_SIZE we synthesize. UE1's ViewportWndProc consumes
-     * LOWORD/HIWORD verbatim into ResizeViewport (windowed branch @0x1110757F)
-     * and treats wParam==0 in fullscreen as "restore SavedWindowRect"
-     * (@0x111074A6) — so an unexpected line here after a SetRes pinpoints a
-     * stale-size feedback into the engine. */
     serial_puts("[USER32] WM_SIZE hwnd=");
     serial_puthex((uint64_t)(ULONG_PTR)w->handle, 8);
     serial_puts(" ");
@@ -4029,8 +4300,8 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     WNDCLASS_ENTRY *cls = NULL;
     if (lpClassName) {
         cls = class_is_atom
-            ? find_class_by_atom_for_pid((WORD)class_value, pid)
-            : find_class_for_pid(lpClassName, pid);
+            ? lookup_class_by_atom_for_pid((WORD)class_value, pid)
+            : lookup_class_for_pid(lpClassName, pid);
     }
     PCSTR class_name = cls ? cls->class_name
                            : (class_is_atom ? NULL : lpClassName);
@@ -4060,26 +4331,25 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
 
     /* MAKEINTATOM is a valid class argument. Resolve it before string access
      * and never substitute a different class when an explicit atom is bad. */
-    if (class_is_atom && !cls) {
-        serial_puts("[USER32]   unknown class atom\n");
+    if (!cls) {
+        serial_puts(class_is_atom
+            ? "[USER32]   unknown class atom\n"
+            : "[USER32]   unknown window class\n");
+        SetLastError(1407); /* ERROR_CANNOT_FIND_WND_CLASS */
         return NULL;
     }
 
-    WNDPROC wndproc = cls ? cls->wndproc : NULL;
-    if (lpClassName && !class_is_atom && !cls) {
-        for (int i = wndclass_count - 1; i >= 0; i--) {
-            if (wndclasses[i].used && wndclasses[i].owner_pid == pid) {
-                wndproc = wndclasses[i].wndproc;
-                break;
-            }
-        }
+    WNDPROC wndproc = class_wndproc_for_mode(cls);
+    if (!wndproc) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return NULL;
     }
 
     /* CW_USEDEFAULT */
     if (X == (int)0x80000000) X = 0;
     if (Y == (int)0x80000000) Y = 0;
-    if (nWidth == (int)0x80000000) nWidth = SCREEN_WIDTH;
-    if (nHeight == (int)0x80000000) nHeight = SCREEN_HEIGHT;
+    if (nWidth == (int)0x80000000) nWidth = current_mode_cx();
+    if (nHeight == (int)0x80000000) nHeight = current_mode_cy();
 
     WINDOW *relation = NULL;
     int message_only = hwnd_is_message(hWndParent);
@@ -4348,6 +4618,9 @@ static void trace_window_release(const char *reason, const WINDOW *w,
 static void release_window(WINDOW *w)
 {
     if (!w || !w->used) return;
+    dialog_release_window(w->handle);
+    extern void comctl32_release_window(DWORD owner_pid, HWND window);
+    comctl32_release_window(w->owner_pid, w->handle);
     user_timer_release_window(w->handle);
     property_release_window(w->handle);
     menu_release_window_menus(w->handle,
@@ -4452,10 +4725,74 @@ BOOL WINAPI DestroyWindow(HWND hWnd)
     return TRUE;
 }
 
+void user32_release_thread(DWORD pid, DWORD tid)
+{
+    if (!pid || !tid)
+        return;
+
+    if (clip_owner_pid == pid && clip_owner_tid == tid) {
+        clip_active = 0;
+        clip_owner_pid = 0;
+        clip_owner_tid = 0;
+    }
+    if (cursor_visibility_owner_pid == pid &&
+        cursor_visibility_owner_tid == tid) {
+        cursor_visible = 0;
+        cursor_visibility_owner_pid = 0;
+        cursor_visibility_owner_tid = 0;
+    }
+    if (relative_pointer.owner_pid == pid &&
+        relative_pointer.owner_tid == tid)
+        relative_pointer_reset();
+
+    msg_purge_thread(pid, tid);
+    sent_message_release_thread(pid, tid);
+    msg_wait_event_release_thread(pid, tid);
+    user_timer_release_thread(pid, tid);
+    user_hook_release_thread(pid, tid);
+
+    for (int i = 0; i < window_count; i++) {
+        WINDOW *window = &windows[i];
+        if (!window->used || window->owner_pid != pid ||
+            window->owner_tid != tid)
+            continue;
+        trace_window_release("thread-exit", window, window->handle,
+                             (uint64_t)(ULONG_PTR)
+                             __builtin_return_address(0));
+        release_window(window);
+    }
+
+    /* Cross-thread ownership is legal. Detach surviving windows from handles
+     * whose owning thread just exited so later traversal cannot dereference a
+     * stale parent or owner. */
+    for (int i = 0; i < window_count; i++) {
+        WINDOW *window = &windows[i];
+        if (!window->used)
+            continue;
+        if (window->parent && !find_window(window->parent))
+            window->parent = NULL;
+        if (window->owner && !find_window(window->owner))
+            window->owner = NULL;
+    }
+    sync_all_window_compositor_state();
+}
+
 void user32_release_process(DWORD pid)
 {
     extern void comctl32_release_process(DWORD owner_pid);
     comctl32_release_process(pid);
+    if (clip_owner_pid == pid) {
+        clip_active = 0;
+        clip_owner_pid = 0;
+        clip_owner_tid = 0;
+    }
+    if (cursor_visibility_owner_pid == pid) {
+        cursor_visible = 0;
+        cursor_visibility_owner_pid = 0;
+        cursor_visibility_owner_tid = 0;
+    }
+    if (relative_pointer.owner_pid == pid)
+        relative_pointer_reset();
     WINDOW *captured = capture_hwnd ? find_window(capture_hwnd) : NULL;
     WINDOW *moving = native_move.window ? find_window(native_move.window) : NULL;
     if (capture_hwnd && (!captured || captured->owner_pid == pid))
@@ -4482,12 +4819,17 @@ void user32_release_process(DWORD pid)
     if (user_display_mode.active && user_display_mode.owner_pid == pid)
         memset(&user_display_mode, 0, sizeof(user_display_mode));
     sync_all_window_compositor_state();
-    for (int i = 0; i < wndclass_count; i++)
-        if (wndclasses[i].used && wndclasses[i].owner_pid == pid)
-            wndclasses[i].used = 0;
+    for (int i = 0; i < wndclass_count; i++) {
+        WNDCLASS_BLOCK *block = wndclass_blocks[i / WNDCLASS_BLOCK_SIZE];
+        WNDCLASS_ENTRY *entry = block
+            ? &block->entries[i % WNDCLASS_BLOCK_SIZE] : NULL;
+        if (entry && entry->used && entry->owner_pid == pid)
+            entry->used = 0;
+    }
     for (int i = 0; i < MAX_DEFER_WINDOW_POS; i++)
         if (defer_window_sets[i].used && defer_window_sets[i].owner_pid == pid)
             defer_window_sets[i].used = 0;
+    user_object_release_process(pid);
     menu_release_process(pid);
 }
 
@@ -4810,33 +5152,65 @@ BOOL WINAPI EndDeferWindowPos(HDWP hWinPosInfo)
     return success;
 }
 
-/* SILENT window geometry sync — called by ddraw's SetDisplayMode to emulate
- * real NT DirectDraw exclusive-fullscreen, where the mode switch itself
- * resizes the device window to cover the new desktop. WinDrv deliberately
- * skips its own MoveWindow for non-OpenGL renderers (windrv.bin gate
- * 0x1110A857-0x1110A87C: class-name compare vs "OpenGLRenderDevice"; the
- * MoveWindow @0x1110A8DA is OpenGL-only) — it trusts DirectDraw to do it.
- * Without this, GetClientRect/GetWindowRect (and our mouse mapping) stay at
- * the PREVIOUS mode after an in-game SetRes. Deliberately NO WM_SIZE: UE1's
- * fullscreen WM_SIZE branch treats wParam==0 (the only value our
- * dispatch_wm_size sends) as "restore SavedWindowRect" (ViewportWndProc
- * @0x111074A6), so an unsolicited WM_SIZE here would actively corrupt the
- * mode change; real ddraw's resize is likewise unobserved by UE1 because
- * HoldCount suppresses it during SetRes. */
-void user32_sync_window_size(HWND hWnd, int w, int h)
+/* DirectDraw owns painting while a cooperative window is exclusive. Geometry
+ * still follows the normal USER32 path so the owner receives the synchronous
+ * WM_WINDOWPOSCHANGING/CHANGED sequence generated by Windows. */
+BOOL user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
+                                         BOOL allow_window_changes,
+                                         int width, int height)
 {
     WINDOW *win = find_window(hWnd);
-    if (!win || w <= 0 || h <= 0) return;
-    win->x = 0;
-    win->y = 0;
-    win->width  = (DWORD)w;
-    win->height = (DWORD)h;
-    sync_window_surface(win, w, h);
-    update_normal_rect(win);
-    sync_all_window_compositor_state();
+    if (!win) return FALSE;
+
+    if (exclusive) {
+        win->paint_pending = 0;
+        win->erase_pending = 0;
+        win->update_rect.left = win->update_rect.top = 0;
+        win->update_rect.right = win->update_rect.bottom = 0;
+    } else if (win->visible && !(win->style & WS_MINIMIZE)) {
+        invalidate_window(win, NULL, TRUE);
+    }
+
+    if (!exclusive || !allow_window_changes)
+        return TRUE;
+    if (width <= 0 || height <= 0)
+        return FALSE;
+
+    BOOL result = SetWindowPos(hWnd, HWND_TOP, 0, 0, width, height,
+                               SWP_NOZORDER | SWP_NOACTIVATE);
+    if (result) {
+        /* The primary surface, rather than GDI, supplies the exclusive frame. */
+        win->paint_pending = 0;
+        win->erase_pending = 0;
+        win->update_rect.left = win->update_rect.top = 0;
+        win->update_rect.right = win->update_rect.bottom = 0;
+    }
+    return result;
 }
 
 /* ── Message Loop ──────────────────────────────────────────── */
+
+static DWORD service_message_pump(void)
+{
+    DWORD poll_interval = 0xFFFFFFFFU;
+
+    if (ddraw_present_hook)
+        ddraw_present_hook();
+    if (ddraw_present_poll_interval) {
+        DWORD ddraw_interval = ddraw_present_poll_interval();
+        if (ddraw_interval && ddraw_interval < poll_interval)
+            poll_interval = ddraw_interval;
+    }
+
+    BOOL compositor_active = compositor_is_running && compositor_is_running();
+    if (xhci_poll && dispatch_depth == 0 && !compositor_active) {
+        xhci_poll();
+        if (poll_interval > 10)
+            poll_interval = 10;
+    }
+
+    return poll_interval;
+}
 
 BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
                           DWORD wMsgFilterMax, DWORD wRemoveMsg)
@@ -4855,28 +5229,9 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
      * messages are exposed to the application. */
     sent_message_dispatch_current();
 
-    /* Present the current software-rendered frame each pump iteration.
-     * SoftDrv keeps its render target Locked and never issues the fullscreen
-     * Flip in our setup, so this is where frames reach the GOP framebuffer. */
-    if (g_compat32_mode) {
-        extern void ddraw_present_hook(void);
-        ddraw_present_hook();
-    }
-
-    /* Poll USB HID so keyboard/mouse reach the win32 input state during a
-     * win32 game's message loop. A foreground win32 process runs with the
-     * APIC timer masked (no preemption), so the compositor kthread that
-     * normally owns USB polling never runs — we must poll here ourselves. */
-    if (g_compat32_mode) {
-        extern void xhci_poll(void) __attribute__((weak));
-        if (xhci_poll && dispatch_depth == 0) xhci_poll();
-    }
-
-    static int peek_log_count = 0;
-    if (peek_log_count < 3) {
-        serial_puts("[USER32] PeekMessageA called\n");
-        peek_log_count++;
-    }
+    /* Software scanout and headless input are properties of the active
+     * backends, not of the caller's pointer width. */
+    (void)service_message_pump();
 
     /* First-ever PeekMessage: bootstrap the queued-state snapshot so GetKeyState
      * has a baseline (otherwise key_state_at_msg is zeroes → all keys "up"). */
@@ -4885,31 +5240,6 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
         if (!boot_snap) {
             for (int ki = 0; ki < 256; ki++) key_state_at_msg[ki] = key_state[ki];
             boot_snap = 1;
-        }
-    }
-
-    /* One-shot: clear GErrorHist on first PeekMessage call.
-     * The engine's init phase triggers null-pointer faults (handled by our
-     * write-through) that set GErrorHist="General protection fault!".
-     * By the time PeekMessage is called, init is done. Clear the error
-     * so Browse() doesn't skip rendering. */
-    {
-        extern const char *win32_current_exe_name(void);
-        static DWORD gerr_cleared_pid = 0;
-        const char *exe_name = win32_current_exe_name();
-        DWORD pid = GetCurrentProcessId();
-        BOOL is_ut99 = g_compat32_mode && exe_name &&
-            (u32_stricmp(exe_name, "UnrealTournament.exe") == 0 ||
-             u32_stricmp(exe_name, "UnrealTournament") == 0);
-        if (is_ut99 && gerr_cleared_pid != pid) {
-            volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
-            volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
-            if (*gerr != 0) {
-                *gerr = 0;
-                *gcrit = 0;
-                serial_puts("[USER32] Cleared GErrorHist at first PeekMessage\n");
-            }
-            gerr_cleared_pid = pid;
         }
     }
 
@@ -4942,7 +5272,7 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
     {
         static int diag_n = 0;
         if (u32_input_diagnostics_active() && diag_n < 180 &&
-            mouselook_active()) {
+            relative_pointer_mode_active()) {
             MSG *src = &retrieved;
             serial_puts("[CAP-MSG] Peek: wm=0x");
             serial_puthex((uint64_t)src->message, 4);
@@ -4954,7 +5284,7 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
                 serial_puts(" lp=0x"); serial_puthex((uint64_t)src->lParam, 8);
             }
             serial_puts(" focus=0x"); serial_puthex((uint64_t)(ULONG_PTR)focus_hwnd, 8);
-            serial_puts(" vp=0x"); serial_puthex((uint64_t)(ULONG_PTR)viewport_hwnd(), 8);
+            serial_puts(" target=0x"); serial_puthex((uint64_t)(ULONG_PTR)input_target(), 8);
             serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
             serial_puts("\n");
             diag_n++;
@@ -5017,18 +5347,7 @@ BOOL WINAPI GetMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
             continue;
 
         extern void sched_yield(void);
-        if (g_compat32_mode) {
-            /* PE32 execution currently masks the periodic APIC tick. Keep
-             * hardware input serviced while this API remains blocked, but do
-             * not expose fabricated messages to the application. */
-            extern void ddraw_present_hook(void);
-            extern void xhci_poll(void) __attribute__((weak));
-            ddraw_present_hook();
-            if (xhci_poll && dispatch_depth == 0)
-                xhci_poll();
-            sched_yield();
-            continue;
-        }
+        DWORD pump_wait_ms = service_message_pump();
 
         if (!queue_event) {
             queue_event = msg_wait_event_for_current_thread();
@@ -5053,6 +5372,9 @@ BOOL WINAPI GetMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
             if (wait_ms == infinite || next_timer_ms < wait_ms)
                 wait_ms = next_timer_ms;
         }
+        if (pump_wait_ms != infinite &&
+            (wait_ms == infinite || pump_wait_ms < wait_ms))
+            wait_ms = pump_wait_ms;
 
         DWORD result = WaitForSingleObject(queue_event, wait_ms);
         if (result == wait_failed)
@@ -5367,7 +5689,7 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
     {
         static int n = 0;
         if (u32_input_diagnostics_active() && n < 180 &&
-            mouselook_active() &&
+            relative_pointer_mode_active() &&
             (m.message == WM_MOUSEMOVE || m.message == WM_KEYDOWN ||
              m.message == WM_KEYUP || m.message == WM_LBUTTONDOWN ||
              m.message == WM_LBUTTONUP || m.message == WM_RBUTTONDOWN ||
@@ -5612,18 +5934,149 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
 
 /* ── Window info ───────────────────────────────────────────── */
 
+static U32_DIALOG_STATE *dialog_state_find(HWND window)
+{
+    if (!window) return NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (dialog_states[i].used && dialog_states[i].window == window)
+            return &dialog_states[i];
+    return NULL;
+}
+
+static U32_DIALOG_STATE *dialog_state_allocate(BOOL modal, HWND owner,
+                                                DLGPROC proc)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        U32_DIALOG_STATE *state = &dialog_states[i];
+        if (state->used) continue;
+        memset(state, 0, sizeof(*state));
+        state->used = TRUE;
+        state->modal = modal;
+        state->owner = owner;
+        state->proc = proc;
+        state->result = -1;
+        return state;
+    }
+    SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+    return NULL;
+}
+
+static void dialog_state_clear(U32_DIALOG_STATE *state)
+{
+    if (state) memset(state, 0, sizeof(*state));
+}
+
+static void dialog_release_window(HWND window)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        U32_DIALOG_STATE *state = &dialog_states[i];
+        if (!state->used) continue;
+        if (state->owner == window) {
+            state->owner = NULL;
+            state->owner_disabled = FALSE;
+        }
+        if (state->window != window) continue;
+        if (state->modal) {
+            if (!state->ended) state->result = -1;
+            state->ended = TRUE;
+            state->window = NULL;
+        } else {
+            dialog_state_clear(state);
+        }
+    }
+}
+
+static LRESULT dialog_default_proc(HWND hWnd, DWORD Msg,
+                                   WPARAM wParam, LPARAM lParam)
+{
+    U32_DIALOG_STATE *state = dialog_state_find(hWnd);
+    switch (Msg) {
+    case WM_INITDIALOG:
+        return TRUE;
+    case WM_CLOSE:
+        if (state && state->modal)
+            EndDialog(hWnd, IDCANCEL);
+        else
+            DestroyWindow(hWnd);
+        return TRUE;
+    case WM_COMMAND: {
+        UINT id = (UINT)(wParam & 0xFFFFU);
+        if (state && state->modal && (id == IDOK || id == IDCANCEL)) {
+            EndDialog(hWnd, (LONG_PTR)id);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            SendMessageA(hWnd, WM_COMMAND, IDCANCEL, 0);
+            return TRUE;
+        }
+        if (wParam == VK_RETURN) {
+            SendMessageA(hWnd, WM_COMMAND, IDOK, 0);
+            return TRUE;
+        }
+        break;
+    }
+    return DefWindowProcA(hWnd, Msg, wParam, lParam);
+}
+
+LRESULT WINAPI DefDlgProcA(HWND hDlg, DWORD msg, WPARAM wParam,
+                            LPARAM lParam)
+{
+    return dialog_default_proc(hDlg, msg, wParam, lParam);
+}
+
+LRESULT WINAPI DefDlgProcW(HWND hDlg, DWORD msg, WPARAM wParam,
+                            LPARAM lParam)
+{
+    return DefDlgProcA(hDlg, msg, wParam, lParam);
+}
+
+static LRESULT WINAPI dialog_class_wndproc(HWND hWnd, DWORD Msg,
+                                            WPARAM wParam, LPARAM lParam)
+{
+    U32_DIALOG_STATE *state = dialog_state_find(hWnd);
+    if (state && state->proc) {
+        LRESULT handled = dispatch_wndproc((WNDPROC)state->proc, hWnd, Msg,
+                                           wParam, lParam);
+        if (handled)
+            return handled;
+    }
+    return dialog_default_proc(hWnd, Msg, wParam, lParam);
+}
+
+static LRESULT WINAPI system_class_wndproc(HWND hWnd, DWORD Msg,
+                                            WPARAM wParam, LPARAM lParam)
+{
+    WINDOW *window = find_window(hWnd);
+    if (window && u32_stricmp(window->class_name, "BUTTON") == 0 &&
+        !(window->style & WS_DISABLED)) {
+        if (Msg == WM_LBUTTONDOWN) {
+            SetFocus(hWnd);
+            return 0;
+        }
+        if (Msg == WM_LBUTTONUP || Msg == BM_CLICK ||
+            (Msg == WM_KEYUP && wParam == VK_SPACE)) {
+            if (window->parent) {
+                WPARAM command = (WPARAM)(
+                    (UINT)(ULONG_PTR)window->menu & 0xFFFFU);
+                command |= (WPARAM)BN_CLICKED << 16;
+                SendMessageA(window->parent, WM_COMMAND, command,
+                             (LPARAM)(ULONG_PTR)hWnd);
+            }
+            return 0;
+        }
+    }
+    return DefWindowProcA(hWnd, Msg, wParam, lParam);
+}
+
 BOOL WINAPI GetClientRect(HWND hWnd, LPRECT lpRect)
 {
-    uint32_t caller_eip = compat32_get_last_caller_eip();
     WINDOW *w = find_window(hWnd);
-    uint64_t caller = (uint64_t)(ULONG_PTR)__builtin_return_address(0);
     BOOL result = w && lpRect ? TRUE : FALSE;
-    trace_swiftshader_wsi("GetClientRect", caller, hWnd, w, lpRect, result);
-    if (!result) {
-        trace_lwjgl_window_call("GetClientRect", caller_eip, hWnd, FALSE,
-                                NULL, 0);
+    if (!result)
         return FALSE;
-    }
     lpRect->left   = 0;
     lpRect->top    = 0;
     lpRect->right  = w->width;
@@ -5631,7 +6084,7 @@ BOOL WINAPI GetClientRect(HWND hWnd, LPRECT lpRect)
     {
         static int n = 0;
         if (u32_input_diagnostics_active() && n < 32 &&
-            mouselook_active()) {
+            relative_pointer_mode_active()) {
             extern uint32_t compat32_get_last_caller_eip(void);
             log_input_prefix("[MOUSE-RECT] GetClientRect");
             serial_puts(" hwnd=0x"); serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
@@ -5645,8 +6098,6 @@ BOOL WINAPI GetClientRect(HWND hWnd, LPRECT lpRect)
             n++;
         }
     }
-    trace_lwjgl_window_call("GetClientRect", caller_eip, hWnd, TRUE,
-                            lpRect, 0);
     return TRUE;
 }
 
@@ -5949,28 +6400,10 @@ static void spi_init_font_w(U32_LOGFONTW *font, int height, int weight)
         font->lfFaceName[i] = (WCHAR)(BYTE)face[i];
 }
 
-static int spi_buf_text(char *buf, int pos, int capacity, const char *text)
-{
-    while (*text && pos + 1 < capacity)
-        buf[pos++] = *text++;
-    return pos;
-}
-
-static int spi_buf_hex(char *buf, int pos, int capacity, uint64_t value,
-                       int digits)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    for (int shift = (digits - 1) * 4;
-         shift >= 0 && pos + 1 < capacity; shift -= 4)
-        buf[pos++] = hex[(value >> shift) & 0xF];
-    return pos;
-}
-
 static void spi_trace_nonclient(char encoding, UINT size, PVOID pv_param,
                                 PVOID local_metrics, uint64_t caller)
 {
     static uint32_t trace_count;
-    static uint32_t cef_target_count;
     if (__atomic_fetch_add(&trace_count, 1, __ATOMIC_RELAXED) >= 64)
         return;
     extern int32_t proc_current_pid(void);
@@ -5998,78 +6431,6 @@ static void spi_trace_nonclient(char encoding, UINT size, PVOID pv_param,
     serial_puthex(tss_ist1_ptr ? *tss_ist1_ptr : 0, 16);
     serial_puts(" caller=0x");
     serial_puthex(caller, 16);
-    LOADED_MODULE *module = dll_find_module_by_address(
-        (PVOID)(ULONG_PTR)caller);
-    if (module && u32_stricmp(module->name, "libcef.dll") == 0 &&
-        module->image.SizeOfImage > 0x0CA2AB7C) {
-        const uint64_t base = (uint64_t)(ULONG_PTR)module->image.ImageBase;
-        const uint64_t caller_rva = caller - base;
-        const uint32_t target_count = caller_rva == 0x0158E240
-            ? __atomic_add_fetch(&cef_target_count, 1, __ATOMIC_RELAXED) : 0;
-        const DWORD tls_index = *(volatile DWORD *)(ULONG_PTR)
-            (base + 0x0C9D2030ULL);
-        TEB *teb = win64_current_teb();
-        PVOID *tls_vector = teb
-                          ? (PVOID *)teb->ThreadLocalStoragePointer : NULL;
-        PVOID tls_block = tls_vector && tls_index < 1024
-                        ? tls_vector[tls_index] : NULL;
-        const uint32_t tls_epoch = tls_block
-                                 ? *(volatile uint32_t *)
-                                     ((BYTE *)tls_block + 4) : 0;
-        const int32_t guard = *(volatile int32_t *)(ULONG_PTR)
-            (base + 0x0CA2AB78ULL);
-        const BYTE initialized = *(volatile BYTE *)(ULONG_PTR)
-            (base + 0x0CA2AB7CULL);
-
-        serial_puts((const char[]){ 10, 0 });
-        serial_puts("[U32-SPI-CEF] base=0x");
-        serial_puthex(base, 16);
-        serial_puts(" rva=0x");
-        serial_puthex(caller_rva, 8);
-        serial_puts(" teb=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)teb, 16);
-        serial_puts(" vector=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)tls_vector, 16);
-        serial_puts(" index=");
-        serial_putdec(tls_index);
-        serial_puts(" block=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)tls_block, 16);
-        serial_puts(" epoch=0x");
-        serial_puthex(tls_epoch, 8);
-        serial_puts(" guard=0x");
-        serial_puthex((uint32_t)guard, 8);
-        serial_puts(" initialized=");
-        serial_putdec(initialized);
-        if (target_count) {
-            serial_puts(" target_count=");
-            serial_putdec(target_count);
-        }
-        if (target_count == 12) {
-            int found = 0;
-            int pos = 0;
-            char line[1280];
-            const uint64_t *stack = (const uint64_t *)(ULONG_PTR)rsp;
-            pos = spi_buf_text(line, pos, sizeof(line),
-                               "[U32-SPI-CEF-STACK]");
-            for (int i = 0; i < 8192 && found < 40; i++) {
-                const uint64_t value = stack[i];
-                if (value < base ||
-                    value >= base + module->image.SizeOfImage)
-                    continue;
-                pos = spi_buf_text(line, pos, sizeof(line), " +");
-                pos = spi_buf_hex(line, pos, sizeof(line),
-                                  (uint64_t)i * 8, 4);
-                pos = spi_buf_text(line, pos, sizeof(line), "=0x");
-                pos = spi_buf_hex(line, pos, sizeof(line),
-                                  value - base, 8);
-                found++;
-            }
-            if (pos + 1 < (int)sizeof(line))
-                line[pos++] = 10;
-            line[pos] = 0;
-            serial_puts(line);
-        }
-    }
     serial_puts("\n");
 }
 
@@ -6397,13 +6758,13 @@ static int screen_cx(void)
 {
     uint32_t w = display_get_width ? display_get_width() : 0;
     if (!w && fb_get_width) w = fb_get_width();
-    return w ? (int)w : SCREEN_WIDTH;
+    return w ? (int)w : USER32_FALLBACK_SCREEN_WIDTH;
 }
 static int screen_cy(void)
 {
     uint32_t h = display_get_height ? display_get_height() : 0;
     if (!h && fb_get_height) h = fb_get_height();
-    return h ? (int)h : SCREEN_HEIGHT;
+    return h ? (int)h : USER32_FALLBACK_SCREEN_HEIGHT;
 }
 
 /* NT semantics: a fullscreen-exclusive DirectDraw SetDisplayMode CHANGES the
@@ -7202,40 +7563,85 @@ _Static_assert(sizeof(DEVMODEW) == 220, "Win32 DEVMODEW ABI");
 #define DEVMODEA_DISPLAY_SIZE 124
 #define DEVMODEW_DISPLAY_SIZE 188
 
-static const struct { uint16_t w, h; } base_display_resolutions[] = {
-    {640, 480}, {800, 600}, {1024, 768},
-};
+extern uint32_t display_get_mode_count(void) __attribute__((weak));
+extern const boot_display_mode_t *display_get_mode(uint32_t index)
+    __attribute__((weak));
 
-static uint32_t display_resolution_count(void)
+static BOOL display_resolution_valid(uint32_t width, uint32_t height)
 {
-    uint32_t physical_w = (uint32_t)screen_cx();
-    uint32_t physical_h = (uint32_t)screen_cy();
-    uint32_t count = sizeof(base_display_resolutions) /
-                     sizeof(base_display_resolutions[0]);
-
-    for (uint32_t i = 0; i < count; i++)
-        if (base_display_resolutions[i].w == physical_w &&
-            base_display_resolutions[i].h == physical_h)
-            return count;
-    return count + 1;
+    return width > 0 && height > 0 && width <= 0x7FFFFFFFU &&
+           height <= 0x7FFFFFFFU;
 }
 
-static BOOL display_resolution_at(uint32_t index, uint32_t *width,
-                                  uint32_t *height)
+static BOOL display_backend_resolution_at(uint32_t wanted,
+                                          uint32_t *width,
+                                          uint32_t *height)
 {
-    uint32_t base_count = sizeof(base_display_resolutions) /
-                          sizeof(base_display_resolutions[0]);
-    if (index < base_count) {
-        *width = base_display_resolutions[index].w;
-        *height = base_display_resolutions[index].h;
-        return TRUE;
+    uint32_t backend_count = display_get_mode_count
+        ? display_get_mode_count() : 0;
+    uint32_t unique = 0;
+
+    if (display_get_mode) {
+        for (uint32_t i = 0; i < backend_count; i++) {
+            const boot_display_mode_t *mode = display_get_mode(i);
+            if (!mode || !display_resolution_valid(mode->width, mode->height))
+                continue;
+
+            BOOL duplicate = FALSE;
+            for (uint32_t previous = 0; previous < i; previous++) {
+                const boot_display_mode_t *candidate =
+                    display_get_mode(previous);
+                if (candidate && candidate->width == mode->width &&
+                    candidate->height == mode->height) {
+                    duplicate = TRUE;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            if (unique++ == wanted) {
+                if (width) *width = mode->width;
+                if (height) *height = mode->height;
+                return TRUE;
+            }
+        }
     }
-    if (index == base_count && display_resolution_count() > base_count) {
-        *width = (uint32_t)screen_cx();
-        *height = (uint32_t)screen_cy();
-        return TRUE;
+
+    /* Some display backends expose only the active scanout and no mode table.
+     * Publish that mode once, unless the firmware table already contained it. */
+    uint32_t active_width = (uint32_t)screen_cx();
+    uint32_t active_height = (uint32_t)screen_cy();
+    if (!display_resolution_valid(active_width, active_height))
+        return FALSE;
+
+    if (display_get_mode) {
+        for (uint32_t i = 0; i < backend_count; i++) {
+            const boot_display_mode_t *mode = display_get_mode(i);
+            if (mode && mode->width == active_width &&
+                mode->height == active_height)
+                return FALSE;
+        }
     }
-    return FALSE;
+
+    if (unique != wanted) return FALSE;
+    if (width) *width = active_width;
+    if (height) *height = active_height;
+    return TRUE;
+}
+
+uint32_t user32_get_display_resolution_count(void)
+{
+    uint32_t count = 0;
+    while (count < BOOT_MAX_DISPLAY_MODES + 1 &&
+           display_backend_resolution_at(count, NULL, NULL))
+        count++;
+    return count;
+}
+
+BOOL user32_get_display_resolution(uint32_t index, uint32_t *width,
+                                   uint32_t *height)
+{
+    if (!width || !height) return FALSE;
+    return display_backend_resolution_at(index, width, height);
 }
 
 static BOOL display_mode_supported(uint32_t width, uint32_t height,
@@ -7246,10 +7652,10 @@ static BOOL display_mode_supported(uint32_t width, uint32_t height,
     if (frequency != 0 && frequency != 1 && frequency != 60)
         return FALSE;
 
-    uint32_t count = display_resolution_count();
+    uint32_t count = user32_get_display_resolution_count();
     for (uint32_t i = 0; i < count; i++) {
         uint32_t candidate_w = 0, candidate_h = 0;
-        if (display_resolution_at(i, &candidate_w, &candidate_h) &&
+        if (user32_get_display_resolution(i, &candidate_w, &candidate_h) &&
             candidate_w == width && candidate_h == height)
             return TRUE;
     }
@@ -7364,12 +7770,13 @@ BOOL WINAPI EnumDisplaySettingsA(const char *device, uint32_t mode, DEVMODEA *dm
     }
 
     /* index = res-major, bpp-minor */
-    const uint32_t nres = display_resolution_count();
+    const uint32_t nres = user32_get_display_resolution_count();
     const uint32_t nbpp = sizeof(bpps) / sizeof(bpps[0]);
     if (mode >= nres * nbpp) return FALSE;
     uint32_t ri = mode / nbpp, bi = mode % nbpp;
     dm->dmBitsPerPel = bpps[bi];
-    return display_resolution_at(ri, &dm->dmPelsWidth, &dm->dmPelsHeight);
+    return user32_get_display_resolution(ri, &dm->dmPelsWidth,
+                                         &dm->dmPelsHeight);
 }
 
 BOOL WINAPI EnumDisplaySettingsW(const WCHAR *device, uint32_t mode, DEVMODEW *dm)
@@ -7402,11 +7809,11 @@ BOOL WINAPI EnumDisplaySettingsW(const WCHAR *device, uint32_t mode, DEVMODEW *d
     }
 
     const uint32_t nbpp = sizeof(bpps) / sizeof(bpps[0]);
-    const uint32_t nres = display_resolution_count();
+    const uint32_t nres = user32_get_display_resolution_count();
     if (mode >= nres * nbpp) return FALSE;
     dm->dmBitsPerPel = bpps[mode % nbpp];
-    return display_resolution_at(mode / nbpp, &dm->dmPelsWidth,
-                                 &dm->dmPelsHeight);
+    return user32_get_display_resolution(mode / nbpp, &dm->dmPelsWidth,
+                                         &dm->dmPelsHeight);
 }
 
 LONG WINAPI ChangeDisplaySettingsExA(const char *device, DEVMODEA *dm,
@@ -7720,7 +8127,6 @@ BOOL WINAPI BringWindowToTop(HWND hWnd)
 
 HWND WINAPI SetFocus(HWND hWnd)
 {
-    uint32_t caller_eip = compat32_get_last_caller_eip();
     HWND old = focus_hwnd;
     /* [CAPDIAG — uncommitted] who flips focus (the capture-flap suspect) */
     {
@@ -7757,83 +8163,696 @@ HWND WINAPI SetFocus(HWND hWnd)
                 dispatch_focus_message(hWnd, WM_SETFOCUS, old);
         }
     }
-    trace_lwjgl_window_call("SetFocus", caller_eip, hWnd, accepted,
-                            NULL, (ULONG_PTR)old);
     return old;
 }
-static HANDLE current_window_station = (HANDLE)(ULONG_PTR)0xD0000002;
-static ULONG_PTR next_window_station = 0xD0000100;
-static ULONG_PTR next_desktop = 0xD0001000;
+#define U32_DESKTOP_WINDOW_HANDLE       ((HWND)(ULONG_PTR)0xD0000001U)
+#define U32_DEFAULT_WINSTA_HANDLE       ((HANDLE)(ULONG_PTR)0xD0000002U)
+#define U32_DEFAULT_DESKTOP_HANDLE      ((HANDLE)(ULONG_PTR)0xD0000003U)
+#define U32_USER_OBJECT_HANDLE_TAG      0xD1000000U
+#define U32_USER_OBJECT_HANDLE_MASK     0xFFF00000U
+#define U32_USER_OBJECT_CAP             64
+#define U32_USER_OBJECT_OPEN_CAP        128
+#define U32_PROCESS_STATION_CAP         64
+#define U32_USER_OBJECT_NAME_CAP        64
 
-HWND WINAPI GetDesktopWindow(void) { return (HWND)(ULONG_PTR)0xD0000001; }
+#define U32_UOI_FLAGS                   1
+#define U32_UOI_NAME                    2
+#define U32_UOI_TYPE                    3
+#define U32_WSF_VISIBLE                 0x0001U
+
+typedef enum {
+    U32_USER_OBJECT_NONE = 0,
+    U32_USER_OBJECT_WINSTA,
+    U32_USER_OBJECT_DESKTOP
+} U32_USER_OBJECT_TYPE;
+
+typedef struct {
+    BOOL fInherit;
+    BOOL fReserved;
+    DWORD dwFlags;
+} U32_USER_OBJECT_FLAGS;
+
+typedef struct {
+    BOOL used;
+    USHORT generation;
+    U32_USER_OBJECT_TYPE type;
+    HANDLE handle;
+    HANDLE station;
+    DWORD flags;
+    DWORD open_refs;
+    BOOL inheritable;
+    WCHAR name[U32_USER_OBJECT_NAME_CAP];
+} U32_USER_OBJECT;
+
+typedef struct {
+    BOOL used;
+    DWORD pid;
+    HANDLE object;
+    DWORD count;
+} U32_USER_OBJECT_OPEN;
+
+typedef struct {
+    BOOL used;
+    DWORD pid;
+    HANDLE station;
+} U32_PROCESS_STATION;
+
+typedef struct {
+    U32_USER_OBJECT_TYPE type;
+    DWORD flags;
+    BOOL inheritable;
+    WCHAR name[U32_USER_OBJECT_NAME_CAP];
+} U32_USER_OBJECT_VIEW;
+
+_Static_assert(sizeof(U32_USER_OBJECT_FLAGS) == 12,
+               "Win32 USEROBJECTFLAGS ABI");
+
+static U32_USER_OBJECT user_objects[U32_USER_OBJECT_CAP];
+static U32_USER_OBJECT_OPEN user_object_opens[U32_USER_OBJECT_OPEN_CAP];
+static U32_PROCESS_STATION process_stations[U32_PROCESS_STATION_CAP];
+static spinlock_t user_object_lock = SPINLOCK_INIT;
+
+static BOOL user_object_handle_equal(HANDLE left, HANDLE right)
+{
+    return (uint32_t)(ULONG_PTR)left == (uint32_t)(ULONG_PTR)right;
+}
+
+static WCHAR user_object_fold_char(WCHAR value)
+{
+    if (value >= 'A' && value <= 'Z')
+        return value + ('a' - 'A');
+    return value;
+}
+
+static BOOL user_object_name_equal(PCWSTR left, PCWSTR right)
+{
+    if (!left || !right)
+        return left == right;
+    for (DWORD i = 0; i < U32_USER_OBJECT_NAME_CAP; i++) {
+        WCHAR a = user_object_fold_char(left[i]);
+        WCHAR b = user_object_fold_char(right[i]);
+        if (a != b)
+            return FALSE;
+        if (!a)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL user_object_copy_name(WCHAR *destination, PCWSTR source)
+{
+    DWORD i = 0;
+    if (source) {
+        while (i + 1 < U32_USER_OBJECT_NAME_CAP && source[i]) {
+            destination[i] = source[i];
+            i++;
+        }
+        if (source[i])
+            return FALSE;
+    }
+    destination[i] = 0;
+    return TRUE;
+}
+
+static void user_object_copy_ascii_name(WCHAR *destination,
+                                        const char *source)
+{
+    DWORD i = 0;
+    while (i + 1 < U32_USER_OBJECT_NAME_CAP && source[i]) {
+        destination[i] = (WCHAR)(BYTE)source[i];
+        i++;
+    }
+    destination[i] = 0;
+}
+
+static DWORD user_object_wide_length(PCWSTR value)
+{
+    DWORD length = 0;
+    while (length < U32_USER_OBJECT_NAME_CAP && value[length])
+        length++;
+    return length;
+}
+
+static U32_USER_OBJECT *user_object_find_locked(HANDLE handle)
+{
+    uint32_t value = (uint32_t)(ULONG_PTR)handle;
+    if ((value & U32_USER_OBJECT_HANDLE_MASK) != U32_USER_OBJECT_HANDLE_TAG)
+        return NULL;
+
+    uint32_t encoded_slot = value & 0xFFU;
+    if (!encoded_slot || encoded_slot > U32_USER_OBJECT_CAP)
+        return NULL;
+
+    U32_USER_OBJECT *object = &user_objects[encoded_slot - 1];
+    if (!object->used || !user_object_handle_equal(object->handle, handle))
+        return NULL;
+    return object;
+}
+
+static U32_USER_OBJECT_TYPE user_object_type_locked(HANDLE handle)
+{
+    if (user_object_handle_equal(handle, U32_DEFAULT_WINSTA_HANDLE))
+        return U32_USER_OBJECT_WINSTA;
+    if (user_object_handle_equal(handle, U32_DEFAULT_DESKTOP_HANDLE))
+        return U32_USER_OBJECT_DESKTOP;
+    U32_USER_OBJECT *object = user_object_find_locked(handle);
+    return object ? object->type : U32_USER_OBJECT_NONE;
+}
+
+static HANDLE user_object_process_station_locked(DWORD pid)
+{
+    for (int i = 0; i < U32_PROCESS_STATION_CAP; i++)
+        if (process_stations[i].used && process_stations[i].pid == pid)
+            return process_stations[i].station;
+    return U32_DEFAULT_WINSTA_HANDLE;
+}
+
+static BOOL user_object_has_station_association_locked(HANDLE station)
+{
+    for (int i = 0; i < U32_PROCESS_STATION_CAP; i++)
+        if (process_stations[i].used &&
+            user_object_handle_equal(process_stations[i].station, station))
+            return TRUE;
+    return FALSE;
+}
+
+static void user_object_maybe_destroy_locked(U32_USER_OBJECT *object)
+{
+    if (!object || !object->used || object->open_refs)
+        return;
+    if (object->type == U32_USER_OBJECT_WINSTA &&
+        user_object_has_station_association_locked(object->handle))
+        return;
+
+    object->used = FALSE;
+    object->handle = NULL;
+    object->station = NULL;
+    object->flags = 0;
+    object->inheritable = FALSE;
+    object->name[0] = 0;
+}
+
+static BOOL user_object_add_open_locked(DWORD pid, HANDLE handle)
+{
+    int free_slot = -1;
+    for (int i = 0; i < U32_USER_OBJECT_OPEN_CAP; i++) {
+        U32_USER_OBJECT_OPEN *open = &user_object_opens[i];
+        if (!open->used) {
+            if (free_slot < 0)
+                free_slot = i;
+            continue;
+        }
+        if (open->pid == pid &&
+            user_object_handle_equal(open->object, handle)) {
+            if (open->count == (DWORD)-1)
+                return FALSE;
+            open->count++;
+            return TRUE;
+        }
+    }
+    if (free_slot < 0)
+        return FALSE;
+
+    user_object_opens[free_slot].used = TRUE;
+    user_object_opens[free_slot].pid = pid;
+    user_object_opens[free_slot].object = handle;
+    user_object_opens[free_slot].count = 1;
+    return TRUE;
+}
+
+static BOOL user_object_remove_open_locked(DWORD pid, HANDLE handle)
+{
+    for (int i = 0; i < U32_USER_OBJECT_OPEN_CAP; i++) {
+        U32_USER_OBJECT_OPEN *open = &user_object_opens[i];
+        if (!open->used || open->pid != pid ||
+            !user_object_handle_equal(open->object, handle))
+            continue;
+        if (--open->count == 0)
+            open->used = FALSE;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static U32_USER_OBJECT *user_object_find_named_locked(
+    U32_USER_OBJECT_TYPE type, PCWSTR name, HANDLE station)
+{
+    if (!name || !name[0])
+        return NULL;
+    for (int i = 0; i < U32_USER_OBJECT_CAP; i++) {
+        U32_USER_OBJECT *object = &user_objects[i];
+        if (!object->used || object->type != type ||
+            !user_object_name_equal(object->name, name))
+            continue;
+        if (type != U32_USER_OBJECT_DESKTOP ||
+            user_object_handle_equal(object->station, station))
+            return object;
+    }
+    return NULL;
+}
+
+static U32_USER_OBJECT *user_object_allocate_locked(
+    U32_USER_OBJECT_TYPE type, PCWSTR name, HANDLE station, DWORD flags,
+    BOOL inheritable)
+{
+    for (int i = 0; i < U32_USER_OBJECT_CAP; i++) {
+        U32_USER_OBJECT *object = &user_objects[i];
+        if (object->used)
+            continue;
+
+        USHORT generation = (USHORT)((object->generation + 1U) & 0x0FFFU);
+        if (!generation)
+            generation = 1;
+        object->generation = generation;
+        object->type = type;
+        object->handle = (HANDLE)(ULONG_PTR)(
+            U32_USER_OBJECT_HANDLE_TAG | ((uint32_t)generation << 8) |
+            (uint32_t)(i + 1));
+        object->station = station;
+        object->flags = flags;
+        object->open_refs = 0;
+        object->inheritable = inheritable;
+        if (!user_object_copy_name(object->name, name)) {
+            object->handle = NULL;
+            object->type = U32_USER_OBJECT_NONE;
+            return NULL;
+        }
+        object->used = TRUE;
+        return object;
+    }
+    return NULL;
+}
+
+static BOOL user_object_attributes_inheritable(PVOID attributes)
+{
+    if (!attributes)
+        return FALSE;
+    if (g_compat32_mode) {
+        const DWORD *fields = (const DWORD *)attributes;
+        return fields[0] >= 12 && fields[2] != 0;
+    }
+
+    typedef struct {
+        DWORD length;
+        PVOID security_descriptor;
+        BOOL inherit_handle;
+    } U32_SECURITY_ATTRIBUTES64;
+    const U32_SECURITY_ATTRIBUTES64 *security =
+        (const U32_SECURITY_ATTRIBUTES64 *)attributes;
+    return security->length >= sizeof(*security) && security->inherit_handle;
+}
+
+static BOOL user_object_snapshot(HANDLE handle, U32_USER_OBJECT_VIEW *view)
+{
+    if (!handle || !view)
+        return FALSE;
+
+    memset(view, 0, sizeof(*view));
+    if (user_object_handle_equal(handle, U32_DEFAULT_WINSTA_HANDLE)) {
+        view->type = U32_USER_OBJECT_WINSTA;
+        view->flags = U32_WSF_VISIBLE;
+        user_object_copy_ascii_name(view->name, "WinSta0");
+        return TRUE;
+    }
+    if (user_object_handle_equal(handle, U32_DEFAULT_DESKTOP_HANDLE)) {
+        view->type = U32_USER_OBJECT_DESKTOP;
+        user_object_copy_ascii_name(view->name, "Default");
+        return TRUE;
+    }
+
+    spin_lock(&user_object_lock);
+    U32_USER_OBJECT *object = user_object_find_locked(handle);
+    if (object) {
+        view->type = object->type;
+        view->flags = object->flags;
+        view->inheritable = object->inheritable;
+        user_object_copy_name(view->name, object->name);
+    }
+    spin_unlock(&user_object_lock);
+    return object != NULL;
+}
+
+static void user_object_reset(void)
+{
+    user_object_lock = SPINLOCK_INIT;
+    for (int i = 0; i < U32_USER_OBJECT_CAP; i++) {
+        user_objects[i].used = FALSE;
+        user_objects[i].open_refs = 0;
+    }
+    for (int i = 0; i < U32_USER_OBJECT_OPEN_CAP; i++)
+        user_object_opens[i].used = FALSE;
+    for (int i = 0; i < U32_PROCESS_STATION_CAP; i++)
+        process_stations[i].used = FALSE;
+}
+
+static void user_object_release_process(DWORD pid)
+{
+    if (!pid)
+        return;
+
+    spin_lock(&user_object_lock);
+    for (int i = 0; i < U32_PROCESS_STATION_CAP; i++)
+        if (process_stations[i].used && process_stations[i].pid == pid)
+            process_stations[i].used = FALSE;
+
+    for (int i = 0; i < U32_USER_OBJECT_OPEN_CAP; i++) {
+        U32_USER_OBJECT_OPEN *open = &user_object_opens[i];
+        if (!open->used || open->pid != pid)
+            continue;
+        U32_USER_OBJECT *object = user_object_find_locked(open->object);
+        if (object) {
+            if (object->open_refs >= open->count)
+                object->open_refs -= open->count;
+            else
+                object->open_refs = 0;
+        }
+        open->used = FALSE;
+    }
+    for (int i = 0; i < U32_USER_OBJECT_CAP; i++)
+        user_object_maybe_destroy_locked(&user_objects[i]);
+    spin_unlock(&user_object_lock);
+}
+
+HWND WINAPI GetDesktopWindow(void) { return U32_DESKTOP_WINDOW_HANDLE; }
 HWND WINAPI GetShellWindow(void) { return GetDesktopWindow(); }
 
 static HANDLE WINAPI GetProcessWindowStation_stub(void)
 {
-    return current_window_station;
+    DWORD pid = GetCurrentProcessId();
+    spin_lock(&user_object_lock);
+    HANDLE station = user_object_process_station_locked(pid);
+    spin_unlock(&user_object_lock);
+    return station;
 }
 
 static HANDLE WINAPI CreateWindowStationW_stub(PCWSTR name, DWORD flags,
                                                  DWORD access, PVOID attrs)
 {
-    (void)name; (void)flags; (void)access; (void)attrs;
-    return (HANDLE)next_window_station++;
+    (void)access;
+    if (flags != 0) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return NULL;
+    }
+
+    WCHAR checked_name[U32_USER_OBJECT_NAME_CAP];
+    if (!user_object_copy_name(checked_name, name)) {
+        SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
+        return NULL;
+    }
+
+    static const WCHAR interactive_name[] = {
+        'W', 'i', 'n', 'S', 't', 'a', '0', 0
+    };
+    DWORD pid = GetCurrentProcessId();
+    BOOL inheritable = user_object_attributes_inheritable(attrs);
+    BOOL existing = FALSE;
+    HANDLE handle = NULL;
+
+    spin_lock(&user_object_lock);
+    U32_USER_OBJECT *object = NULL;
+    if (name && user_object_name_equal(checked_name, interactive_name)) {
+        handle = U32_DEFAULT_WINSTA_HANDLE;
+        existing = TRUE;
+    } else {
+        object = user_object_find_named_locked(U32_USER_OBJECT_WINSTA,
+                                               checked_name, NULL);
+        if (object) {
+            handle = object->handle;
+            existing = TRUE;
+        } else {
+            object = user_object_allocate_locked(
+                U32_USER_OBJECT_WINSTA, checked_name, NULL, 0,
+                inheritable);
+            if (object)
+                handle = object->handle;
+        }
+    }
+
+    if (!handle || !user_object_add_open_locked(pid, handle)) {
+        if (object && !existing)
+            user_object_maybe_destroy_locked(object);
+        spin_unlock(&user_object_lock);
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return NULL;
+    }
+    if (object)
+        object->open_refs++;
+    spin_unlock(&user_object_lock);
+
+    if (existing)
+        SetLastError(183); /* ERROR_ALREADY_EXISTS */
+    return handle;
 }
 
 static BOOL WINAPI SetProcessWindowStation_stub(HANDLE station)
 {
-    if (!station) {
+    DWORD pid = GetCurrentProcessId();
+    spin_lock(&user_object_lock);
+    if (user_object_type_locked(station) != U32_USER_OBJECT_WINSTA) {
+        spin_unlock(&user_object_lock);
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
-    current_window_station = station;
+
+    int existing_slot = -1;
+    int free_slot = -1;
+    for (int i = 0; i < U32_PROCESS_STATION_CAP; i++) {
+        if (process_stations[i].used && process_stations[i].pid == pid) {
+            existing_slot = i;
+            break;
+        }
+        if (!process_stations[i].used && free_slot < 0)
+            free_slot = i;
+    }
+
+    if (user_object_handle_equal(station, U32_DEFAULT_WINSTA_HANDLE)) {
+        if (existing_slot >= 0)
+            process_stations[existing_slot].used = FALSE;
+        spin_unlock(&user_object_lock);
+        return TRUE;
+    }
+    if (existing_slot < 0)
+        existing_slot = free_slot;
+    if (existing_slot < 0) {
+        spin_unlock(&user_object_lock);
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return FALSE;
+    }
+
+    process_stations[existing_slot].used = TRUE;
+    process_stations[existing_slot].pid = pid;
+    process_stations[existing_slot].station = station;
+    spin_unlock(&user_object_lock);
+    return TRUE;
+}
+
+static BOOL user_object_close(HANDLE handle, U32_USER_OBJECT_TYPE type)
+{
+    DWORD pid = GetCurrentProcessId();
+    spin_lock(&user_object_lock);
+    if (user_object_type_locked(handle) != type) {
+        spin_unlock(&user_object_lock);
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+    if (type == U32_USER_OBJECT_WINSTA &&
+        user_object_handle_equal(user_object_process_station_locked(pid),
+                                 handle)) {
+        spin_unlock(&user_object_lock);
+        SetLastError(170); /* ERROR_BUSY */
+        return FALSE;
+    }
+    if (type == U32_USER_OBJECT_DESKTOP &&
+        user_object_handle_equal(handle, U32_DEFAULT_DESKTOP_HANDLE)) {
+        spin_unlock(&user_object_lock);
+        SetLastError(170); /* ERROR_BUSY */
+        return FALSE;
+    }
+    if (!user_object_remove_open_locked(pid, handle)) {
+        spin_unlock(&user_object_lock);
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+
+    U32_USER_OBJECT *object = user_object_find_locked(handle);
+    if (object && object->open_refs)
+        object->open_refs--;
+    user_object_maybe_destroy_locked(object);
+    spin_unlock(&user_object_lock);
     return TRUE;
 }
 
 static BOOL WINAPI CloseWindowStation_stub(HANDLE station)
 {
-    return station != NULL;
+    return user_object_close(station, U32_USER_OBJECT_WINSTA);
 }
 
 static HANDLE WINAPI GetThreadDesktop_stub(DWORD thread_id)
 {
     (void)thread_id;
-    return (HANDLE)(ULONG_PTR)0xD0000001;
+    return U32_DEFAULT_DESKTOP_HANDLE;
 }
 
 static HANDLE WINAPI CreateDesktopW_stub(PCWSTR name, PCWSTR device,
                                           PVOID devmode, DWORD flags,
                                           DWORD access, PVOID attrs)
 {
-    (void)name; (void)device; (void)devmode;
-    (void)flags; (void)access; (void)attrs;
-    return (HANDLE)next_desktop++;
+    (void)access;
+    if (!name || !name[0] || device || devmode || (flags & ~1U)) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return NULL;
+    }
+
+    WCHAR checked_name[U32_USER_OBJECT_NAME_CAP];
+    if (!user_object_copy_name(checked_name, name)) {
+        SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
+        return NULL;
+    }
+
+    static const WCHAR default_name[] = {
+        'D', 'e', 'f', 'a', 'u', 'l', 't', 0
+    };
+    DWORD pid = GetCurrentProcessId();
+    BOOL inheritable = user_object_attributes_inheritable(attrs);
+    BOOL existing = FALSE;
+    HANDLE handle = NULL;
+
+    spin_lock(&user_object_lock);
+    HANDLE station = user_object_process_station_locked(pid);
+    U32_USER_OBJECT *object = NULL;
+    if (user_object_handle_equal(station, U32_DEFAULT_WINSTA_HANDLE) &&
+        user_object_name_equal(checked_name, default_name)) {
+        handle = U32_DEFAULT_DESKTOP_HANDLE;
+        existing = TRUE;
+    } else {
+        object = user_object_find_named_locked(U32_USER_OBJECT_DESKTOP,
+                                               checked_name, station);
+        if (object) {
+            handle = object->handle;
+            existing = TRUE;
+        } else {
+            object = user_object_allocate_locked(
+                U32_USER_OBJECT_DESKTOP, checked_name, station, 0,
+                inheritable);
+            if (object)
+                handle = object->handle;
+        }
+    }
+
+    if (!handle || !user_object_add_open_locked(pid, handle)) {
+        if (object && !existing)
+            user_object_maybe_destroy_locked(object);
+        spin_unlock(&user_object_lock);
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return NULL;
+    }
+    if (object)
+        object->open_refs++;
+    spin_unlock(&user_object_lock);
+
+    if (existing)
+        SetLastError(183); /* ERROR_ALREADY_EXISTS */
+    return handle;
 }
 
 static BOOL WINAPI CloseDesktop_stub(HANDLE desktop)
 {
-    return desktop != NULL;
+    return user_object_close(desktop, U32_USER_OBJECT_DESKTOP);
+}
+
+static BOOL user_object_write_flags(const U32_USER_OBJECT_VIEW *view,
+                                    PVOID info, DWORD length, DWORD *needed)
+{
+    *needed = sizeof(U32_USER_OBJECT_FLAGS);
+    if (!info || length < sizeof(U32_USER_OBJECT_FLAGS)) {
+        SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+        return FALSE;
+    }
+
+    U32_USER_OBJECT_FLAGS *output = (U32_USER_OBJECT_FLAGS *)info;
+    output->fInherit = view->inheritable;
+    output->fReserved = FALSE;
+    output->dwFlags = view->flags;
+    return TRUE;
+}
+
+static BOOL user_object_write_wide(PCWSTR value, PVOID info, DWORD length,
+                                   DWORD *needed)
+{
+    DWORD characters = user_object_wide_length(value) + 1;
+    DWORD required = characters * sizeof(WCHAR);
+    *needed = required;
+    if (!info || length < required) {
+        SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+        return FALSE;
+    }
+    for (DWORD i = 0; i < characters; i++)
+        ((WCHAR *)info)[i] = value[i];
+    return TRUE;
+}
+
+static BOOL user_object_write_ansi(PCWSTR value, PVOID info, DWORD length,
+                                   DWORD *needed)
+{
+    DWORD characters = user_object_wide_length(value) + 1;
+    *needed = characters;
+    if (!info || length < characters) {
+        SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+        return FALSE;
+    }
+    for (DWORD i = 0; i < characters; i++) {
+        WCHAR character = value[i];
+        ((char *)info)[i] = character <= 0xFF ? (char)character : '?';
+    }
+    return TRUE;
+}
+
+static BOOL user_object_information(HANDLE object, int index, PVOID info,
+                                    DWORD length, DWORD *needed, BOOL wide)
+{
+    if (!needed) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    U32_USER_OBJECT_VIEW view;
+    if (!user_object_snapshot(object, &view)) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+    if (index == U32_UOI_FLAGS)
+        return user_object_write_flags(&view, info, length, needed);
+
+    WCHAR type_name[U32_USER_OBJECT_NAME_CAP];
+    PCWSTR value = NULL;
+    if (index == U32_UOI_NAME) {
+        value = view.name;
+    } else if (index == U32_UOI_TYPE) {
+        user_object_copy_ascii_name(
+            type_name, view.type == U32_USER_OBJECT_WINSTA
+                           ? "WindowStation" : "Desktop");
+        value = type_name;
+    } else {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    return wide ? user_object_write_wide(value, info, length, needed)
+                : user_object_write_ansi(value, info, length, needed);
+}
+
+static BOOL WINAPI GetUserObjectInformationA_stub(HANDLE object, int index,
+                                                   PVOID info, DWORD length,
+                                                   DWORD *needed)
+{
+    return user_object_information(object, index, info, length, needed, FALSE);
 }
 
 static BOOL WINAPI GetUserObjectInformationW_stub(HANDLE object, int index,
                                                    PVOID info, DWORD length,
                                                    DWORD *needed)
 {
-    static const WCHAR name[] = { 'W', 'i', 'n', 'S', 't', 'a', '0', 0 };
-    DWORD required = sizeof(name);
-
-    if (!object || index != 2 || !needed) { /* UOI_NAME */
-        SetLastError(87); /* ERROR_INVALID_PARAMETER */
-        return FALSE;
-    }
-    *needed = required;
-    if (!info || length < required) {
-        SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
-        return FALSE;
-    }
-    for (DWORD i = 0; i < required / sizeof(WCHAR); i++)
-        ((WCHAR *)info)[i] = name[i];
-    return TRUE;
+    return user_object_information(object, index, info, length, needed, TRUE);
 }
 HWND WINAPI GetActiveWindow(void)
 {
@@ -7878,12 +8897,14 @@ BOOL WINAPI SetCaretPos(int X, int Y)
 
 BOOL WINAPI SetCursorPos(int X, int Y)
 {
-    cursor_pos.x = X;
-    cursor_pos.y = Y;
+    POINT requested = { X, Y };
+    confine_cursor_point(&requested);
+    cursor_pos = requested;
+    relative_pointer_note_warp(requested);
     {
         static int n = 0;
         if (u32_input_diagnostics_active() && n < 96 &&
-            mouselook_active()) {
+            relative_pointer_mode_active()) {
             extern uint32_t compat32_get_last_caller_eip(void);
             log_input_prefix("[MOUSE-CURSOR] SetCursorPos");
             serial_puts(" x="); serial_putdec((uint64_t)(uint32_t)X);
@@ -7903,7 +8924,7 @@ BOOL WINAPI GetCursorPos(LPPOINT lpPoint)
     {
         static int n = 0;
         if (u32_input_diagnostics_active() && n < 96 &&
-            mouselook_active()) {
+            relative_pointer_mode_active()) {
             extern uint32_t compat32_get_last_caller_eip(void);
             log_input_prefix("[MOUSE-CURSOR] GetCursorPos");
             serial_puts(" x="); serial_putdec((uint64_t)(uint32_t)lpPoint->x);
@@ -7965,41 +8986,39 @@ BOOL WINAPI GetLastInputInfo(PVOID last_input_info)
 
 int WINAPI ShowCursor(BOOL bShow)
 {
+    DWORD pid = GetCurrentProcessId();
+    DWORD tid = GetCurrentThreadId();
+    cursor_visibility_owner_pid = pid;
+    cursor_visibility_owner_tid = tid;
     if (bShow) cursor_visible++;
     else       cursor_visible--;
-    /* [CAPDIAG — uncommitted] trace capture-sequence calls + the
-     * SetMouseCapture caller's return address (guest [ebp+4]). */
-    {
-        static int n = 0;
-        if (u32_input_diagnostics_active() && n++ < 48) {
-            extern uint32_t compat32_get_last_caller_eip(void);
-            extern uint32_t compat32_get_last_user_ebp(void);
-            uint32_t ebp = compat32_get_last_user_ebp();
-            uint32_t ret = 0;
-            BOOL ret_valid = ebp <= UINT32_MAX - sizeof(uint32_t) &&
-                u32_diag_read_u32(ebp + sizeof(uint32_t), &ret);
-            serial_puts("[CAP] ShowCursor("); serial_putdec((uint64_t)(uint32_t)bShow);
-            serial_puts(")->"); serial_putdec((uint64_t)(uint32_t)cursor_visible);
-            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
-            serial_puts(" smc_ret=0x"); serial_puthex(ret, 8);
-            serial_puts(" valid="); serial_putdec(ret_valid);
-            serial_puts("\n");
-        }
-    }
+    if (bShow && cursor_visible >= 0 &&
+        relative_pointer.owner_pid == pid &&
+        relative_pointer.owner_tid == tid &&
+        !(clip_active && clip_owner_pid == pid))
+        relative_pointer_reset();
     return cursor_visible;
 }
 
 BOOL WINAPI ClipCursor(const RECT *lpRect)
 {
-    /* UT99's viewport calls ClipCursor(rect) when entering mouse-look and
-     * ClipCursor(NULL) when releasing it. Track this so the input path knows
-     * whether to deliver relative deltas (in-game) or absolute coords (menu). */
     if (lpRect) {
+        if (lpRect->right <= lpRect->left ||
+            lpRect->bottom <= lpRect->top) {
+            SetLastError(87); /* ERROR_INVALID_PARAMETER */
+            return FALSE;
+        }
         clip_rect = *lpRect;
         clip_active = 1;
+        clip_owner_pid = GetCurrentProcessId();
+        clip_owner_tid = GetCurrentThreadId();
+        confine_cursor_point(&cursor_pos);
     } else {
         clip_active = 0;
+        clip_owner_pid = 0;
+        clip_owner_tid = 0;
     }
+    relative_pointer_reset();
     return TRUE;
 }
 
@@ -8129,99 +9148,6 @@ HWND WINAPI SetCapture(HWND hWnd)
         SendMessageA(old, WM_CAPTURECHANGED, 0, (LPARAM)hWnd);
     if (capture_hwnd == hWnd)
         msg_capture_pending_input(window);
-    /* [CAPDIAG] log + identify SetMouseCapture's CALLER (the
-     * flap driver): we are called from inside WinDrv SetMouseCapture
-     * (0x11106610, std prologue), so guest [ebp+4] = its return address into
-     * Engine/Window.dll — the per-frame capture/release decision site. */
-    {
-        static int n = 0;
-        if (u32_input_diagnostics_active() && n++ < 32) {
-            extern uint32_t compat32_get_last_user_ebp(void);
-            extern uint32_t compat32_get_last_user_esi(void);
-            uint32_t ebp = compat32_get_last_user_ebp();
-            uint32_t ret = 0, f38 = 0, actor = 0, show = 0;
-            uint32_t vp = compat32_get_last_user_esi();
-            uint32_t reads = 0;
-            if (ebp <= UINT32_MAX - sizeof(uint32_t) &&
-                u32_diag_read_u32(ebp + sizeof(uint32_t), &ret))
-                reads |= 1U;
-            if (vp <= UINT32_MAX - 0x38U &&
-                u32_diag_read_u32(vp + 0x38U, &f38))
-                reads |= 2U;
-            if (vp <= UINT32_MAX - 0x30U &&
-                u32_diag_read_u32(vp + 0x30U, &actor)) {
-                reads |= 4U;
-                if (actor <= UINT32_MAX - 0x51CU &&
-                    u32_diag_read_u32(actor + 0x51CU, &show))
-                    reads |= 8U;
-            }
-            serial_puts("[CAP] SetCapture(0x");
-            serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
-            serial_puts(") smc_ret=0x"); serial_puthex(ret, 8);
-            serial_puts(" vp=0x"); serial_puthex(vp, 8);
-            serial_puts(" actor=0x"); serial_puthex(actor, 8);
-            serial_puts(" vp38=0x"); serial_puthex(f38, 4);
-            serial_puts(" show=0x"); serial_puthex(show, 8);
-            serial_puts(" reads=0x"); serial_puthex(reads, 2);
-            serial_puts("\n");
-            /* ── Phase 1 diagnostic: key_state live vs queued delta ── */
-            {
-                int diffs = 0;
-                for (int vk = 0; vk < 256 && diffs < 8; vk++) {
-                    BYTE live = key_state[vk];
-                    BYTE queued = key_state_at_msg[vk];
-                    if ((live & 0x80) != (queued & 0x80)) {
-                        serial_puts("[CAP-KEYDIFF] VK=0x");
-                        serial_puthex((uint64_t)vk, 2);
-                        serial_puts(" live=0x"); serial_puthex((uint64_t)live, 2);
-                        serial_puts(" queued=0x"); serial_puthex((uint64_t)queued, 2);
-                        serial_puts("\n");
-                        diffs++;
-                    }
-                }
-                if (diffs == 0)
-                    serial_puts("[CAP-KEYDIFF] (none — live == queued)\n");
-            }
-            /* [CAPDIAG] one-shot: watch WRITES to viewport+0x38 */
-            {
-                static int armed = 0;
-                if (!armed && ret == 0x10390159 && (reads & 2U)) {
-                    extern int hwbp_set(int slot, uint64_t addr, int cond, int len,
-                                        const char *name);
-                    hwbp_set(0, (uint64_t)vp + 0x38, 1 /*WRITE*/, 3 /*LEN_4*/, "vp38w");
-                    serial_puts("[CAP] HWBP armed on vp+0x38\n");
-                    armed = 1;
-                }
-            }
-            /* [CAPDIAG] one-shot: break whenever WinDrv hands an input event
-             * to Unreal. CauseInputEvent is thiscall:
-             *   ECX=this, stack={ret,key,action,delta/raw}. */
-            {
-                static int cie_armed = 0;
-                if (!cie_armed) {
-                    extern int hwbp_set(int slot, uint64_t addr, int cond, int len,
-                                        const char *name);
-                    hwbp_set(1, 0x11106560ULL, 0 /*EXEC*/, 0 /*LEN_1*/, "cie");
-                    serial_puts("[CAP] HWBP armed on WinDrv!CauseInputEvent\n");
-                    cie_armed = 1;
-                }
-            }
-            /* [CAPDIAG] downstream input probes. UInput::Exec sees bound
-             * commands and recursive alias expansion; 0x10393B05 is the Axis
-             * success path after the action==2/4 store paths. */
-            {
-                static int uinput_armed = 0;
-                if (!uinput_armed) {
-                    extern int hwbp_set(int slot, uint64_t addr, int cond, int len,
-                                        const char *name);
-                    hwbp_set(0, 0x10393B05ULL, 0 /*EXEC*/, 0 /*LEN_1*/, "uiaxpost");
-                    hwbp_set(3, 0x10393800ULL, 0 /*EXEC*/, 0 /*LEN_1*/, "uiexec");
-                    serial_puts("[CAP] HWBP armed on UInput::Exec/Axis branch\n");
-                    uinput_armed = 1;
-                }
-            }
-        }
-    }
     return old;
 }
 
@@ -8534,24 +9460,6 @@ short WINAPI GetKeyState(int nVirtKey)
      * are visible outside individual WM_KEYDOWN dispatch. */
     if (key_state[nVirtKey] & 0x80) result |= (short)0x8000;
     if (key_state[nVirtKey] & 0x01) result |= 0x0001;
-    if (result & (short)0x8000) {
-        static int n = 0;
-        if (n < 256 && is_gameplay_key(nVirtKey))
-        {
-            extern uint32_t compat32_get_last_caller_eip(void);
-            extern uint32_t compat32_get_last_user_esi(void);
-            serial_puts("[KEYSTATE] vk=0x");
-            serial_puthex((uint64_t)(uint32_t)nVirtKey, 2);
-            serial_puts(" r=0x"); serial_puthex((uint64_t)(uint16_t)result, 4);
-            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
-            serial_puts(" esi=0x"); serial_puthex(compat32_get_last_user_esi(), 8);
-            serial_puts(" focus=0x"); serial_puthex((uint64_t)(ULONG_PTR)focus_hwnd, 8);
-            serial_puts(" vp=0x"); serial_puthex((uint64_t)(ULONG_PTR)viewport_hwnd(), 8);
-            serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
-            serial_puts("\n");
-            n++;
-        }
-    }
     return result;
 }
 
@@ -9596,12 +10504,9 @@ BOOL WINAPI RedrawWindow(HWND hWnd, const RECT *lprcUpdate,
 
 BOOL WINAPI SetForegroundWindow(HWND hWnd)
 {
-    uint32_t caller_eip = compat32_get_last_caller_eip();
     WINDOW *w = find_window(hWnd);
     if (!w) {
         SetLastError(1400);
-        trace_lwjgl_window_call("SetForegroundWindow", caller_eip, hWnd,
-                                FALSE, NULL, 0);
         return FALSE;
     }
 
@@ -9612,8 +10517,6 @@ BOOL WINAPI SetForegroundWindow(HWND hWnd)
             compositor_focus_window(root->compositor_id);
     }
     dispatch_wm_activate(w);
-    trace_lwjgl_window_call("SetForegroundWindow", caller_eip, hWnd,
-                            TRUE, NULL, 0);
     return TRUE;
 }
 
@@ -9649,28 +10552,525 @@ BOOL WINAPI AllowSetForegroundWindow(DWORD dwProcessId)
 
 /* ── Dialog stubs ──────────────────────────────────────────── */
 
-HWND WINAPI CreateDialogParamA(HINSTANCE hInstance, PCSTR lpTemplateName,
-                                HWND hWndParent, DLGPROC lpDialogFunc, LPARAM dwInitParam)
+/* Dialog templates are packed resources whose variable-length fields are only
+ * WORD-aligned. Keep reads byte-based so malformed resources cannot escape
+ * their resource extent. */
+#define U32_RT_DIALOG               ((PCWSTR)(ULONG_PTR)5)
+#define U32_DIALOG_INDIRECT_LIMIT   (1024U * 1024U)
+#define U32_DS_SETFONT              0x00000040U
+#define U32_DS_CENTER               0x00000800U
+
+typedef struct {
+    const BYTE *current;
+    SIZE_T remaining;
+} U32_DIALOG_CURSOR;
+
+typedef struct {
+    BOOL present;
+    BOOL ordinal;
+    WORD ordinal_value;
+    const BYTE *text;
+    UINT text_length;
+} U32_DIALOG_FIELD;
+
+typedef struct {
+    BOOL extended;
+    DWORD style;
+    DWORD ex_style;
+    WORD item_count;
+    int16_t x, y, cx, cy;
+    U32_DIALOG_FIELD menu;
+    U32_DIALOG_FIELD class_name;
+    U32_DIALOG_FIELD title;
+} U32_DIALOG_TEMPLATE;
+
+typedef struct {
+    DWORD style;
+    DWORD ex_style;
+    DWORD id;
+    int16_t x, y, cx, cy;
+    U32_DIALOG_FIELD class_name;
+    U32_DIALOG_FIELD title;
+    PCVOID creation_data;
+    WORD creation_size;
+} U32_DIALOG_ITEM;
+
+static BOOL dialog_cursor_take(U32_DIALOG_CURSOR *cursor, SIZE_T size,
+                               void *value)
 {
-    (void)hInstance; (void)lpTemplateName; (void)hWndParent;
-    (void)lpDialogFunc; (void)dwInitParam;
-    serial_puts("[USER32] CreateDialogParamA: stub NULL\n");
-    return NULL;
+    if (!cursor || size > cursor->remaining)
+        return FALSE;
+    if (value && size) memcpy(value, cursor->current, size);
+    cursor->current += size;
+    cursor->remaining -= size;
+    return TRUE;
+}
+
+static BOOL dialog_cursor_word(U32_DIALOG_CURSOR *cursor, WORD *value)
+{
+    return dialog_cursor_take(cursor, sizeof(*value), value);
+}
+
+static BOOL dialog_cursor_dword(U32_DIALOG_CURSOR *cursor, DWORD *value)
+{
+    return dialog_cursor_take(cursor, sizeof(*value), value);
+}
+
+static BOOL dialog_cursor_align_dword(U32_DIALOG_CURSOR *cursor)
+{
+    SIZE_T padding = (SIZE_T)(-(ULONG_PTR)cursor->current) & 3U;
+    return dialog_cursor_take(cursor, padding, NULL);
+}
+
+static BOOL dialog_cursor_field(U32_DIALOG_CURSOR *cursor,
+                                U32_DIALOG_FIELD *field)
+{
+    WORD first;
+    if (!field || !dialog_cursor_word(cursor, &first))
+        return FALSE;
+    memset(field, 0, sizeof(*field));
+    if (!first)
+        return TRUE;
+
+    field->present = TRUE;
+    if (first == 0xFFFFU) {
+        field->ordinal = TRUE;
+        return dialog_cursor_word(cursor, &field->ordinal_value);
+    }
+
+    field->text = cursor->current - sizeof(WORD);
+    field->text_length = 1;
+    for (;;) {
+        WORD character;
+        if (!dialog_cursor_word(cursor, &character))
+            return FALSE;
+        if (!character)
+            return TRUE;
+        if (field->text_length == 0xFFFFU)
+            return FALSE;
+        field->text_length++;
+    }
+}
+
+static BOOL dialog_parse_template(U32_DIALOG_CURSOR *cursor,
+                                  U32_DIALOG_TEMPLATE *dialog)
+{
+    if (!cursor || !dialog) return FALSE;
+    memset(dialog, 0, sizeof(*dialog));
+
+    U32_DIALOG_CURSOR original = *cursor;
+    WORD version, signature;
+    if (!dialog_cursor_word(cursor, &version) ||
+        !dialog_cursor_word(cursor, &signature))
+        return FALSE;
+
+    if (signature == 0xFFFFU) {
+        DWORD help_id;
+        WORD count, x, y, cx, cy;
+        if (version != 1 ||
+            !dialog_cursor_dword(cursor, &help_id) ||
+            !dialog_cursor_dword(cursor, &dialog->ex_style) ||
+            !dialog_cursor_dword(cursor, &dialog->style) ||
+            !dialog_cursor_word(cursor, &count) ||
+            !dialog_cursor_word(cursor, &x) ||
+            !dialog_cursor_word(cursor, &y) ||
+            !dialog_cursor_word(cursor, &cx) ||
+            !dialog_cursor_word(cursor, &cy))
+            return FALSE;
+        (void)help_id;
+        dialog->extended = TRUE;
+        dialog->item_count = count;
+        dialog->x = (int16_t)x;
+        dialog->y = (int16_t)y;
+        dialog->cx = (int16_t)cx;
+        dialog->cy = (int16_t)cy;
+    } else {
+        WORD count, x, y, cx, cy;
+        *cursor = original;
+        if (!dialog_cursor_dword(cursor, &dialog->style) ||
+            !dialog_cursor_dword(cursor, &dialog->ex_style) ||
+            !dialog_cursor_word(cursor, &count) ||
+            !dialog_cursor_word(cursor, &x) ||
+            !dialog_cursor_word(cursor, &y) ||
+            !dialog_cursor_word(cursor, &cx) ||
+            !dialog_cursor_word(cursor, &cy))
+            return FALSE;
+        dialog->item_count = count;
+        dialog->x = (int16_t)x;
+        dialog->y = (int16_t)y;
+        dialog->cx = (int16_t)cx;
+        dialog->cy = (int16_t)cy;
+    }
+
+    if (!dialog_cursor_field(cursor, &dialog->menu) ||
+        !dialog_cursor_field(cursor, &dialog->class_name) ||
+        !dialog_cursor_field(cursor, &dialog->title))
+        return FALSE;
+
+    if (dialog->style & U32_DS_SETFONT) {
+        WORD point_size;
+        U32_DIALOG_FIELD typeface;
+        if (!dialog_cursor_word(cursor, &point_size))
+            return FALSE;
+        if (dialog->extended) {
+            WORD weight;
+            BYTE italic, charset;
+            if (!dialog_cursor_word(cursor, &weight) ||
+                !dialog_cursor_take(cursor, 1, &italic) ||
+                !dialog_cursor_take(cursor, 1, &charset))
+                return FALSE;
+            (void)weight;
+            (void)italic;
+            (void)charset;
+        }
+        (void)point_size;
+        if (!dialog_cursor_field(cursor, &typeface) || typeface.ordinal)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL dialog_parse_item(U32_DIALOG_CURSOR *cursor, BOOL extended,
+                              U32_DIALOG_ITEM *item)
+{
+    if (!cursor || !item || !dialog_cursor_align_dword(cursor))
+        return FALSE;
+    memset(item, 0, sizeof(*item));
+
+    WORD x, y, cx, cy;
+    if (extended) {
+        DWORD help_id;
+        if (!dialog_cursor_dword(cursor, &help_id) ||
+            !dialog_cursor_dword(cursor, &item->ex_style) ||
+            !dialog_cursor_dword(cursor, &item->style) ||
+            !dialog_cursor_word(cursor, &x) ||
+            !dialog_cursor_word(cursor, &y) ||
+            !dialog_cursor_word(cursor, &cx) ||
+            !dialog_cursor_word(cursor, &cy) ||
+            !dialog_cursor_dword(cursor, &item->id))
+            return FALSE;
+        (void)help_id;
+    } else {
+        WORD id;
+        if (!dialog_cursor_dword(cursor, &item->style) ||
+            !dialog_cursor_dword(cursor, &item->ex_style) ||
+            !dialog_cursor_word(cursor, &x) ||
+            !dialog_cursor_word(cursor, &y) ||
+            !dialog_cursor_word(cursor, &cx) ||
+            !dialog_cursor_word(cursor, &cy) ||
+            !dialog_cursor_word(cursor, &id))
+            return FALSE;
+        item->id = id;
+    }
+    item->x = (int16_t)x;
+    item->y = (int16_t)y;
+    item->cx = (int16_t)cx;
+    item->cy = (int16_t)cy;
+
+    if (!dialog_cursor_field(cursor, &item->class_name) ||
+        !dialog_cursor_field(cursor, &item->title) ||
+        !dialog_cursor_word(cursor, &item->creation_size))
+        return FALSE;
+    item->creation_data = item->creation_size ? cursor->current : NULL;
+    return dialog_cursor_take(cursor, item->creation_size, NULL);
+}
+
+static PCSTR dialog_field_to_ansi(const U32_DIALOG_FIELD *field,
+                                  char *buffer, SIZE_T capacity)
+{
+    if (!field || !field->present)
+        return NULL;
+    if (field->ordinal)
+        return (PCSTR)(ULONG_PTR)field->ordinal_value;
+    if (!buffer || !capacity)
+        return NULL;
+
+    SIZE_T copy = field->text_length;
+    if (copy >= capacity) copy = capacity - 1;
+    for (SIZE_T i = 0; i < copy; i++) {
+        WORD character;
+        memcpy(&character, field->text + i * sizeof(WORD), sizeof(character));
+        buffer[i] = character <= 0xFFU ? (char)character : '?';
+    }
+    buffer[copy] = 0;
+    return buffer;
+}
+
+static BOOL dialog_identifier_a_to_w(PCSTR identifier, WCHAR buffer[256],
+                                     PCWSTR *wide)
+{
+    if (!identifier || !wide) {
+        SetLastError(87);
+        return FALSE;
+    }
+    if ((ULONG_PTR)identifier <= 0xFFFFU) {
+        *wide = (PCWSTR)(ULONG_PTR)identifier;
+        return TRUE;
+    }
+    SIZE_T length = 0;
+    while (identifier[length] && length < 255) {
+        buffer[length] = (WCHAR)(BYTE)identifier[length];
+        length++;
+    }
+    if (identifier[length]) {
+        SetLastError(1814); /* ERROR_RESOURCE_NAME_NOT_FOUND */
+        return FALSE;
+    }
+    buffer[length] = 0;
+    *wide = buffer;
+    return TRUE;
+}
+
+static int dialog_dlu_x(int value)
+{
+    return value * 2;
+}
+
+static int dialog_dlu_y(int value)
+{
+    return value * 2;
+}
+
+static HWND dialog_create_template(HINSTANCE instance, PCVOID template_data,
+                                   SIZE_T template_size, HWND parent,
+                                   DLGPROC proc, LPARAM init_param,
+                                   BOOL modal, U32_DIALOG_STATE **state_out)
+{
+    if (state_out) *state_out = NULL;
+    if (!template_data || template_size < 4) {
+        SetLastError(87);
+        return NULL;
+    }
+
+    U32_DIALOG_CURSOR cursor = {
+        .current = (const BYTE *)template_data,
+        .remaining = template_size,
+    };
+    U32_DIALOG_TEMPLATE dialog;
+    if (!dialog_parse_template(&cursor, &dialog)) {
+        SetLastError(1812); /* ERROR_RESOURCE_DATA_NOT_FOUND */
+        return NULL;
+    }
+    if (dialog.item_count >= MAX_WINDOWS) {
+        SetLastError(8);
+        return NULL;
+    }
+
+    char dialog_class[128];
+    char dialog_title[256];
+    PCSTR class_name = dialog_field_to_ansi(&dialog.class_name,
+                                             dialog_class,
+                                             sizeof(dialog_class));
+    PCSTR title = dialog_field_to_ansi(&dialog.title, dialog_title,
+                                        sizeof(dialog_title));
+    if (!class_name) class_name = "#32770";
+
+    int width = dialog_dlu_x(dialog.cx);
+    int height = dialog_dlu_y(dialog.cy);
+    if (width <= 0) width = 1;
+    if (height <= 0) height = 1;
+    int x = dialog_dlu_x(dialog.x);
+    int y = dialog_dlu_y(dialog.y);
+    if (dialog.style & U32_DS_CENTER) {
+        x = (current_mode_cx() - width) / 2;
+        y = (current_mode_cy() - height) / 2;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+    }
+
+    U32_DIALOG_STATE *state = dialog_state_allocate(modal, parent, proc);
+    if (!state) return NULL;
+
+    BOOL requested_visible = (dialog.style & WS_VISIBLE) != 0;
+    DWORD create_style = dialog.style & ~WS_VISIBLE;
+    HWND window = CreateWindowExA(dialog.ex_style, class_name, title,
+        create_style, x, y, width, height, parent, NULL, instance, NULL);
+    if (!window) {
+        dialog_state_clear(state);
+        return NULL;
+    }
+    state->window = window;
+
+    HWND first_enabled = NULL;
+    HWND first_tab = NULL;
+    for (WORD index = 0; index < dialog.item_count; index++) {
+        U32_DIALOG_ITEM item;
+        if (!dialog_parse_item(&cursor, dialog.extended, &item)) {
+            SetLastError(1812);
+            DestroyWindow(window);
+            if (state->used) dialog_state_clear(state);
+            return NULL;
+        }
+
+        char control_class[128];
+        char control_title[256];
+        PCSTR item_class = dialog_field_to_ansi(&item.class_name,
+                                                 control_class,
+                                                 sizeof(control_class));
+        PCSTR item_title = dialog_field_to_ansi(&item.title, control_title,
+                                                 sizeof(control_title));
+        if (!item_class) {
+            SetLastError(1812);
+            DestroyWindow(window);
+            if (state->used) dialog_state_clear(state);
+            return NULL;
+        }
+
+        DWORD item_style = item.style | WS_CHILD;
+        HWND control = CreateWindowExA(item.ex_style, item_class, item_title,
+            item_style, dialog_dlu_x(item.x), dialog_dlu_y(item.y),
+            dialog_dlu_x(item.cx), dialog_dlu_y(item.cy), window,
+            (HMENU)(ULONG_PTR)item.id, instance,
+            (PVOID)item.creation_data);
+        if (!control) {
+            DestroyWindow(window);
+            if (state->used) dialog_state_clear(state);
+            return NULL;
+        }
+        if (!(item_style & WS_DISABLED) && (item_style & WS_VISIBLE)) {
+            if (!first_enabled) first_enabled = control;
+            if (!first_tab && (item_style & WS_TABSTOP)) first_tab = control;
+        }
+    }
+
+    HWND initial_focus = first_tab ? first_tab : first_enabled;
+    LRESULT set_initial_focus = SendMessageA(
+        window, WM_INITDIALOG, (WPARAM)(ULONG_PTR)initial_focus, init_param);
+    if (set_initial_focus && initial_focus && find_window(initial_focus))
+        SetFocus(initial_focus);
+
+    if (find_window(window) && state->used && !state->ended &&
+        (modal || requested_visible))
+        ShowWindow(window, SW_SHOW);
+
+    if (!find_window(window)) {
+        if (state->used && !modal) dialog_state_clear(state);
+        return NULL;
+    }
+
+    serial_puts("[USER32] dialog created hwnd=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)window, 8);
+    serial_puts(" items=");
+    serial_putdec(dialog.item_count);
+    serial_puts(dialog.extended ? " format=extended\n" : " format=standard\n");
+    if (state_out) *state_out = state;
+    return window;
+}
+
+HWND WINAPI CreateDialogIndirectParamA(HINSTANCE hInstance,
+                                        PCVOID lpTemplate,
+                                        HWND hWndParent,
+                                        DLGPROC lpDialogFunc,
+                                        LPARAM dwInitParam)
+{
+    return dialog_create_template(hInstance, lpTemplate,
+        U32_DIALOG_INDIRECT_LIMIT, hWndParent, lpDialogFunc, dwInitParam,
+        FALSE, NULL);
+}
+
+HWND WINAPI CreateDialogIndirectParamW(HINSTANCE hInstance,
+                                        PCVOID lpTemplate,
+                                        HWND hWndParent,
+                                        DLGPROC lpDialogFunc,
+                                        LPARAM dwInitParam)
+{
+    return CreateDialogIndirectParamA(hInstance, lpTemplate, hWndParent,
+                                      lpDialogFunc, dwInitParam);
 }
 
 HWND WINAPI CreateDialogParamW(HINSTANCE hInstance, PCWSTR lpTemplateName,
-                                HWND hWndParent, DLGPROC lpDialogFunc, LPARAM dwInitParam)
+                                HWND hWndParent, DLGPROC lpDialogFunc,
+                                LPARAM dwInitParam)
 {
-    (void)hInstance; (void)lpTemplateName; (void)hWndParent;
-    (void)lpDialogFunc; (void)dwInitParam;
-    serial_puts("[USER32] CreateDialogParamW: stub NULL\n");
-    return NULL;
+    PCVOID data;
+    DWORD size;
+    if (!kernel32_resource_data_w(hInstance, lpTemplateName, U32_RT_DIALOG,
+                                  &data, &size))
+        return NULL;
+    return dialog_create_template(hInstance, data, size, hWndParent,
+                                  lpDialogFunc, dwInitParam, FALSE, NULL);
+}
+
+HWND WINAPI CreateDialogParamA(HINSTANCE hInstance, PCSTR lpTemplateName,
+                                HWND hWndParent, DLGPROC lpDialogFunc,
+                                LPARAM dwInitParam)
+{
+    WCHAR name_buffer[256];
+    PCWSTR wide_name;
+    if (!dialog_identifier_a_to_w(lpTemplateName, name_buffer, &wide_name))
+        return NULL;
+    return CreateDialogParamW(hInstance, wide_name, hWndParent,
+                              lpDialogFunc, dwInitParam);
 }
 
 BOOL WINAPI EndDialog(HWND hDlg, LONG_PTR nResult)
 {
-    (void)hDlg; (void)nResult;
+    U32_DIALOG_STATE *state = dialog_state_find(hDlg);
+    if (!state || !state->modal || state->ended) {
+        SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
+        return FALSE;
+    }
+    state->result = nResult;
+    state->ended = TRUE;
+    ShowWindow(hDlg, SW_HIDE);
     return TRUE;
+}
+
+static HWND dialog_next_tab_item(HWND dialog, HWND current)
+{
+    int current_index = -1;
+    for (int i = 0; i < window_count; i++)
+        if (windows[i].used && windows[i].handle == current)
+            current_index = i;
+
+    for (int step = 1; step <= window_count; step++) {
+        int index = (current_index + step) % window_count;
+        WINDOW *candidate = &windows[index];
+        if (candidate->used && candidate->parent == dialog &&
+            (candidate->style & WS_TABSTOP) &&
+            (candidate->style & WS_VISIBLE) &&
+            !(candidate->style & WS_DISABLED))
+            return candidate->handle;
+    }
+    return NULL;
+}
+
+BOOL WINAPI IsDialogMessageA(HWND hDlg, LPMSG lpMsg)
+{
+    if (!dialog_state_find(hDlg) || !lpMsg) {
+        SetLastError(!lpMsg ? 87 : 1400);
+        return FALSE;
+    }
+
+    MSG message;
+    msg_read_from(lpMsg, &message);
+    if (message.hwnd != hDlg && !IsChild(hDlg, message.hwnd))
+        return FALSE;
+
+    if (message.message == WM_KEYDOWN) {
+        if (message.wParam == VK_TAB) {
+            HWND next = dialog_next_tab_item(hDlg, GetFocus());
+            if (next) SetFocus(next);
+            return TRUE;
+        }
+        if (message.wParam == VK_ESCAPE) {
+            SendMessageA(hDlg, WM_COMMAND, IDCANCEL, 0);
+            return TRUE;
+        }
+        if (message.wParam == VK_RETURN) {
+            SendMessageA(hDlg, WM_COMMAND, IDOK, 0);
+            return TRUE;
+        }
+    }
+
+    TranslateMessage(lpMsg);
+    DispatchMessageA(lpMsg);
+    return TRUE;
+}
+
+BOOL WINAPI IsDialogMessageW(HWND hDlg, LPMSG lpMsg)
+{
+    return IsDialogMessageA(hDlg, lpMsg);
 }
 
 HWND WINAPI GetDlgItem(HWND hDlg, int nIDDlgItem)
@@ -9783,7 +11183,7 @@ HWND WINAPI FindWindowExA(HWND hWndParent, HWND hWndChildAfter,
     PCSTR class_name = lpszClass;
     if (lpszClass && (ULONG_PTR)lpszClass <= 0xFFFF) {
         WNDCLASS_ENTRY *entry =
-            find_class_by_atom((WORD)(ULONG_PTR)lpszClass);
+            lookup_class_by_atom((WORD)(ULONG_PTR)lpszClass);
         if (!entry) return NULL;
         class_name = entry->class_name;
     }
@@ -10146,7 +11546,7 @@ BOOL WINAPI EnumThreadWindows(DWORD dwThreadId, WNDENUMPROC lpfn,
  * that gives it focus. Capture and UT99 mouse-look remain explicit overrides. */
 static HWND mouse_input_target(void)
 {
-    if (mouselook_active())
+    if (relative_pointer_mode_active())
         return input_target();
     if (capture_hwnd && find_window(capture_hwnd))
         return capture_hwnd;
@@ -10233,21 +11633,6 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
     HWND target = input_target();
     if (!target) return;
 
-    if (is_gameplay_key(vk)) {
-        static int n = 0;
-        if (n < 160) {
-            log_input_prefix("[KEY-IN]");
-            serial_puts(" sc=0x"); serial_puthex((uint64_t)scancode, 2);
-            serial_puts(" ext="); serial_putdec((uint64_t)(uint32_t)extended);
-            serial_puts(" up="); serial_putdec((uint64_t)(uint32_t)key_up);
-            serial_puts(" vk=0x"); serial_puthex((uint64_t)vk, 2);
-            serial_puts(" state=0x"); serial_puthex((uint64_t)key_state[vk], 2);
-            serial_puts(" target=0x"); serial_puthex((uint64_t)(ULONG_PTR)target, 8);
-            serial_puts("\n");
-            n++;
-        }
-    }
-
     /* Build lParam: scancode in bits 16-23, extended flag in bit 24,
      * previous state in bit 30, transition state in bit 31 */
     LPARAM lp = ((LPARAM)scancode << 16) | 1; /* repeat count = 1 */
@@ -10283,19 +11668,19 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
     if (screen_height < 1) screen_height = 1;
     if (cursor_pos.x >= screen_width)  cursor_pos.x = screen_width - 1;
     if (cursor_pos.y >= screen_height) cursor_pos.y = screen_height - 1;
+    confine_cursor_point(&cursor_pos);
 
     DWORD old_buttons = mouse_buttons;
     mouse_buttons = buttons;
 
-    /* The relative-delta accumulation above is already what UE1's recenter
-     * math expects (cursor_pos = recenter_origin + delta). */
+    /* A warp-based consumer observes anchor plus the physical delta. */
     HWND target = mouse_input_target();
 
     /* ── Phase 1 diagnostic: WM_MOUSEMOVE routing during capture ── */
     {
         static int diag_n = 0;
         int cap = (capture_hwnd != NULL);
-        int ml  = (cursor_visible < 0) || clip_active;
+        int ml  = relative_pointer_mode_active();
         if (diag_n < 60 && (cap || ml)) {
             serial_puts("[CAP-MOUSE] dx="); serial_putdec((uint64_t)(int64_t)dx);
             serial_puts(" dy="); serial_putdec((uint64_t)(int64_t)dy);
@@ -10371,12 +11756,12 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
 /* Desktop/UI bridge for a relative HID. input_events.c has already applied
  * acceleration and clamped screen_x/screen_y for the compositor. Seed the
  * relative emitter so it lands on that exact point while retaining raw HID
- * deltas for captured/recenter-based mouse-look. */
+ * deltas for a detected cursor-warp input mode. */
 void win32_post_mouse_screen(int screen_x, int screen_y,
                              int raw_dx, int raw_dy,
                              DWORD buttons, short wheel_delta)
 {
-    if (mouselook_active()) {
+    if (relative_pointer_mode_active()) {
         win32_post_mouse_event(raw_dx, raw_dy, buttons, wheel_delta);
         return;
     }
@@ -10388,16 +11773,13 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
 }
 
 /* Absolute-pointer path (QEMU usb-tablet / any HID_INPUT_ABS mouse). ax/ay are
- * raw logical coordinates in [lmin,lmax]; scale into the top window's client
- * space (UT's 640x480 viewport), set cursor_pos (so GetCursorPos is accurate for
- * UWindow's polled menu cursor), and emit WM_MOUSEMOVE + button transitions.
- * Bridges the xHCI mouse to the Win32 layer (previously unwired → dead mouse). */
+ * raw logical coordinates in [lmin,lmax]. */
 void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 {
     g_last_input_time = shim_timeGetTime();
     int tw = current_mode_cx(), th = current_mode_cy();
-    if (tw < 1) tw = SCREEN_WIDTH;
-    if (th < 1) th = SCREEN_HEIGHT;
+    if (tw < 1) tw = USER32_FALLBACK_SCREEN_WIDTH;
+    if (th < 1) th = USER32_FALLBACK_SCREEN_HEIGHT;
     /* A live DirectDraw present may scale a smaller source (for example
      * 640x480) over the physical screen. Only then use its source space;
      * ddraw_get_display_size returns 0/0 for ordinary USER32/GDI apps. */
@@ -10418,16 +11800,9 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
     int nx, ny, moved;
     int rel_dx = 0, rel_dy = 0;
 
-    if (mouselook_active()) {
-        /* In-game mouse-look. UE1 recenters the cursor every frame via
-         * SetCursorPos and reads (cursor_pos - recenter_origin) as the delta.
-         * A QEMU usb-tablet is an ABSOLUTE device, so derive a relative delta
-         * from the previous tablet sample and ADD it to cursor_pos (which the
-         * engine just reset to the recenter origin via our SetCursorPos). This
-         * makes GetCursorPos return the recenter origin and each WM_MOUSEMOVE
-         * carry origin+delta — exactly what WinDrv's recenter math expects.
-         * We must NOT snap cursor_pos to the absolute sample (that destroys the
-         * delta and yields "viewport not connected" / dead mouse-look). */
+    if (relative_pointer_mode_active()) {
+        /* A cursor-warp consumer expects movement around its last anchor. An
+         * absolute HID therefore needs conversion to sample deltas. */
         int dx = 0, dy = 0;
         if (g_abs_prev_valid) { dx = sx - g_abs_prev_sx; dy = sy - g_abs_prev_sy; }
         g_abs_prev_sx = sx; g_abs_prev_sy = sy; g_abs_prev_valid = 1;
@@ -10436,15 +11811,12 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 
         nx = cursor_pos.x + dx;
         ny = cursor_pos.y + dy;
-        /* Keep within client bounds; the engine's SetCursorPos(center) recenter
-         * keeps us away from the edges in practice. */
+        /* Keep within the active logical display; ClipCursor is applied below. */
         if (nx < 0) nx = 0; else if (nx >= tw) nx = tw - 1;
         if (ny < 0) ny = 0; else if (ny >= th) ny = th - 1;
         moved = (dx != 0 || dy != 0);
     } else {
-        /* Menu / UI: absolute path (unchanged — keeps the working menu mouse).
-         * Invalidate the relative tracker so re-entering mouse-look doesn't
-         * inject a spurious jump from a stale tablet position. */
+        /* Ordinary UI consumes the absolute device coordinates directly. */
         g_abs_prev_valid = 0;
         nx = sx; ny = sy;
         moved = (nx != cursor_pos.x) || (ny != cursor_pos.y);
@@ -10452,13 +11824,16 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 
     cursor_pos.x = nx;
     cursor_pos.y = ny;
+    confine_cursor_point(&cursor_pos);
+    nx = cursor_pos.x;
+    ny = cursor_pos.y;
     HWND target = mouse_input_target();
 
     /* ── Phase 1 diagnostic: abs-path WM_MOUSEMOVE during capture ── */
     {
         static int diag_n = 0;
         int cap = (capture_hwnd != NULL);
-        int ml  = mouselook_active();
+        int ml  = relative_pointer_mode_active();
         if (u32_input_diagnostics_active() && diag_n < 160 && (cap || ml)) {
             serial_puts("[CAP-MOUSE-ABS] x="); serial_putdec((uint64_t)nx);
             serial_puts(" y="); serial_putdec((uint64_t)ny);
@@ -10928,7 +12303,10 @@ HWND WINAPI CreateWindowExW(DWORD dwExStyle, PCWSTR lpClassName,
 
 WORD WINAPI RegisterClassExW(PVOID lpwcx)
 {
-    if (!lpwcx) return 0;
+    if (!lpwcx) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
 
     /* Pointer layout matches WNDCLASSEXA; only the strings are wide. */
     WNDCLASSEXA wcx;
@@ -10940,14 +12318,27 @@ WORD WINAPI RegisterClassExW(PVOID lpwcx)
         for (int i = 0; i < 127 && class_name[i]; i++)
             classA[i] = (char)(class_name[i] & 0xFF);
 
+    if (!classA[0]) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+
     serial_puts("[USER32] RegisterClassExW: ");
     serial_puts(classA);
     serial_puts(" wndproc=0x");
     serial_puthex((uint64_t)(uintptr_t)wcx.lpfnWndProc, 16);
     serial_puts("\n");
 
+    DWORD pid = GetCurrentProcessId();
+    if (find_class_for_pid(classA, pid)) {
+        SetLastError(1410); /* ERROR_CLASS_ALREADY_EXISTS */
+        return 0;
+    }
     WNDCLASS_ENTRY *e = alloc_wndclass();
-    if (!e) return 0;
+    if (!e) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return 0;
+    }
     u32_strcpy(e->class_name, classA, 128);
     e->wndproc = wcx.lpfnWndProc;
     e->style = wcx.style;
@@ -10960,51 +12351,121 @@ WORD WINAPI RegisterClassExW(PVOID lpwcx)
     e->menu_name = (ULONG_PTR)wcx.lpszMenuName;
     e->class_name_ptr = (ULONG_PTR)class_name;
     e->hIconSm = wcx.hIconSm;
-    e->owner_pid = GetCurrentProcessId();
-    e->atom = (WORD)(0xC101 + (e - wndclasses));
+    e->owner_pid = pid;
     e->used = 1;
     return e->atom;
 }
 
-static BOOL get_class_info(PCSTR class_name, PVOID lpwcx)
+static WNDCLASS_ENTRY *find_class_for_query(HINSTANCE instance,
+                                             PCSTR class_name, WORD atom,
+                                             BOOL class_is_atom)
 {
-    if (!class_name || (uintptr_t)class_name < 0x10000) return FALSE;
-    WNDCLASS_ENTRY *e = find_class(class_name);
-    if (!e) return FALSE;
+    DWORD pid = GetCurrentProcessId();
+    WNDCLASS_ENTRY *global = NULL;
 
-    if (lpwcx) {
-        if (g_compat32_mode) {
-            uint32_t *p = (uint32_t *)lpwcx;
-            for (int i = 0; i < 12; i++) p[i] = 0;
-            p[0] = 48;
-            p[1] = e->style;
-            p[2] = (uint32_t)(ULONG_PTR)e->wndproc;
-            p[3] = (uint32_t)e->cbClsExtra;
-            p[4] = (uint32_t)e->cbWndExtra;
-            p[5] = (uint32_t)(ULONG_PTR)e->hInstance;
-            p[6] = (uint32_t)(ULONG_PTR)e->hIcon;
-            p[7] = (uint32_t)(ULONG_PTR)e->hCursor;
-            p[8] = (uint32_t)(ULONG_PTR)e->hbrBackground;
-            p[9] = (uint32_t)e->menu_name;
-            p[10] = (uint32_t)e->class_name_ptr;
-            p[11] = (uint32_t)(ULONG_PTR)e->hIconSm;
-        } else {
-            WNDCLASSEXA *out = (WNDCLASSEXA *)lpwcx;
-            BYTE *bytes = (BYTE *)out;
-            for (SIZE_T i = 0; i < sizeof(*out); i++) bytes[i] = 0;
-            out->cbSize = sizeof(*out);
-            out->style = e->style;
-            out->lpfnWndProc = e->wndproc;
-            out->cbClsExtra = e->cbClsExtra;
-            out->cbWndExtra = e->cbWndExtra;
-            out->hInstance = e->hInstance;
-            out->hIcon = e->hIcon;
-            out->hCursor = e->hCursor;
-            out->hbrBackground = e->hbrBackground;
-            out->lpszMenuName = (PCSTR)e->menu_name;
-            out->lpszClassName = (PCSTR)e->class_name_ptr;
-            out->hIconSm = e->hIconSm;
+    for (int i = 0; i < wndclass_count; i++) {
+        WNDCLASS_BLOCK *block = wndclass_blocks[i / WNDCLASS_BLOCK_SIZE];
+        WNDCLASS_ENTRY *entry = block
+            ? &block->entries[i % WNDCLASS_BLOCK_SIZE] : NULL;
+        if (!entry)
+            continue;
+        if (!entry->used || entry->owner_pid != pid)
+            continue;
+        if (class_is_atom) {
+            if (entry->atom != atom)
+                continue;
+        } else if (u32_stricmp(entry->class_name, class_name) != 0) {
+            continue;
         }
+        if (entry->hInstance == instance)
+            return entry;
+        if ((entry->style & 0x00004000U) && !global) /* CS_GLOBALCLASS */
+            global = entry;
+    }
+
+    if (global)
+        return global;
+    if (instance)
+        return NULL;
+    return class_is_atom ? find_system_class_by_atom(atom)
+                         : find_system_class(class_name);
+}
+
+static void log_class_lookup_miss(PCSTR class_name, WORD atom,
+                                  BOOL class_is_atom)
+{
+    serial_puts("[USER32] class lookup miss: ");
+    if (class_is_atom) {
+        serial_puts("atom #");
+        serial_puthex(atom, 4);
+    } else {
+        serial_puts("'");
+        serial_puts(class_name ? class_name : "<null>");
+        serial_puts("'");
+    }
+    serial_puts(" pid=");
+    serial_putdec(GetCurrentProcessId());
+    serial_puts(" registered=");
+    serial_putdec((uint64_t)wndclass_count);
+    serial_puts("\n");
+}
+
+static HCURSOR class_cursor(WNDCLASS_ENTRY *entry)
+{
+    if (!entry || entry->hCursor || !entry->system_class)
+        return entry ? entry->hCursor : NULL;
+    ULONG_PTR resource = u32_stricmp(entry->class_name, "EDIT") == 0
+        ? 32513U /* IDC_IBEAM */ : 32512U /* IDC_ARROW */;
+    return LoadCursorA(NULL, (PCSTR)resource);
+}
+
+static BOOL write_class_info_ex(WNDCLASS_ENTRY *entry,
+                                ULONG_PTR class_name, PVOID output)
+{
+    UINT expected_size = g_compat32_mode ? 48U : (UINT)sizeof(WNDCLASSEXA);
+    if (!entry || !output || *(const UINT *)output != expected_size) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+
+    WNDPROC wndproc = class_wndproc_for_mode(entry);
+    if (!wndproc) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return FALSE;
+    }
+    HCURSOR cursor = class_cursor(entry);
+
+    if (g_compat32_mode) {
+        uint32_t *p = (uint32_t *)output;
+        for (int i = 0; i < 12; i++) p[i] = 0;
+        p[0] = expected_size;
+        p[1] = entry->style;
+        p[2] = (uint32_t)(ULONG_PTR)wndproc;
+        p[3] = (uint32_t)entry->cbClsExtra;
+        p[4] = (uint32_t)entry->cbWndExtra;
+        p[5] = (uint32_t)(ULONG_PTR)entry->hInstance;
+        p[6] = (uint32_t)(ULONG_PTR)entry->hIcon;
+        p[7] = (uint32_t)(ULONG_PTR)cursor;
+        p[8] = (uint32_t)(ULONG_PTR)entry->hbrBackground;
+        p[9] = (uint32_t)entry->menu_name;
+        p[10] = (uint32_t)class_name;
+        p[11] = (uint32_t)(ULONG_PTR)entry->hIconSm;
+    } else {
+        WNDCLASSEXA *out = (WNDCLASSEXA *)output;
+        BYTE *bytes = (BYTE *)out;
+        for (SIZE_T i = 0; i < sizeof(*out); i++) bytes[i] = 0;
+        out->cbSize = expected_size;
+        out->style = entry->style;
+        out->lpfnWndProc = wndproc;
+        out->cbClsExtra = entry->cbClsExtra;
+        out->cbWndExtra = entry->cbWndExtra;
+        out->hInstance = entry->hInstance;
+        out->hIcon = entry->hIcon;
+        out->hCursor = cursor;
+        out->hbrBackground = entry->hbrBackground;
+        out->lpszMenuName = (PCSTR)entry->menu_name;
+        out->lpszClassName = (PCSTR)class_name;
+        out->hIconSm = entry->hIconSm;
     }
     return TRUE;
 }
@@ -11025,43 +12486,156 @@ typedef struct {
 static BOOL WINAPI GetClassInfoW_k32(HINSTANCE hInstance, PCWSTR class_name,
                                       WNDCLASSW_K32 *out)
 {
-    if (!class_name || !out || (ULONG_PTR)class_name < 0x10000) return FALSE;
-
-    char narrow[128];
-    int i = 0;
-    while (i < 127 && class_name[i]) {
-        narrow[i] = (char)(class_name[i] & 0xFF);
-        i++;
+    ULONG_PTR value = (ULONG_PTR)class_name;
+    if (!value || !out) {
+        SetLastError(87);
+        return FALSE;
     }
-    narrow[i] = 0;
+    BOOL is_atom = value <= 0xFFFF;
+    char narrow[128] = {0};
+    if (!is_atom) {
+        int i = 0;
+        while (i < 127 && class_name[i]) {
+            narrow[i] = (char)(class_name[i] & 0xFF);
+            i++;
+        }
+    }
+    WNDCLASS_ENTRY *entry = find_class_for_query(
+        hInstance, narrow, (WORD)value, is_atom);
+    if (!entry) {
+        log_class_lookup_miss(narrow, (WORD)value, is_atom);
+        SetLastError(1411); /* ERROR_CLASS_DOES_NOT_EXIST */
+        return FALSE;
+    }
 
-    WNDCLASS_ENTRY *entry = find_class(narrow);
-    if (!entry) return FALSE;
-    BYTE *bytes = (BYTE *)out;
-    for (SIZE_T j = 0; j < sizeof(*out); j++) bytes[j] = 0;
-    out->style = entry->style;
-    out->lpfnWndProc = entry->wndproc;
-    out->cbWndExtra = entry->cbWndExtra;
-    out->hInstance = hInstance;
-    out->lpszClassName = class_name;
+    WNDPROC wndproc = class_wndproc_for_mode(entry);
+    if (!wndproc) {
+        SetLastError(8);
+        return FALSE;
+    }
+    HCURSOR cursor = class_cursor(entry);
+    if (g_compat32_mode) {
+        uint32_t *p = (uint32_t *)out;
+        for (int i = 0; i < 10; i++) p[i] = 0;
+        p[0] = entry->style;
+        p[1] = (uint32_t)(ULONG_PTR)wndproc;
+        p[2] = (uint32_t)entry->cbClsExtra;
+        p[3] = (uint32_t)entry->cbWndExtra;
+        p[4] = (uint32_t)(ULONG_PTR)entry->hInstance;
+        p[5] = (uint32_t)(ULONG_PTR)entry->hIcon;
+        p[6] = (uint32_t)(ULONG_PTR)cursor;
+        p[7] = (uint32_t)(ULONG_PTR)entry->hbrBackground;
+        p[8] = (uint32_t)entry->menu_name;
+        p[9] = (uint32_t)value;
+    } else {
+        BYTE *bytes = (BYTE *)out;
+        for (SIZE_T i = 0; i < sizeof(*out); i++) bytes[i] = 0;
+        out->style = entry->style;
+        out->lpfnWndProc = wndproc;
+        out->cbClsExtra = entry->cbClsExtra;
+        out->cbWndExtra = entry->cbWndExtra;
+        out->hInstance = entry->hInstance;
+        out->hIcon = entry->hIcon;
+        out->hCursor = cursor;
+        out->hbrBackground = entry->hbrBackground;
+        out->lpszMenuName = (PCWSTR)entry->menu_name;
+        out->lpszClassName = class_name;
+    }
+    return TRUE;
+}
+
+static BOOL WINAPI GetClassInfoA_k32(HINSTANCE hInstance, PCSTR class_name,
+                                      WNDCLASSA *out)
+{
+    ULONG_PTR value = (ULONG_PTR)class_name;
+    if (!value || !out) {
+        SetLastError(87);
+        return FALSE;
+    }
+    BOOL is_atom = value <= 0xFFFF;
+    WNDCLASS_ENTRY *entry = find_class_for_query(
+        hInstance, is_atom ? NULL : class_name, (WORD)value, is_atom);
+    if (!entry) {
+        log_class_lookup_miss(class_name, (WORD)value, is_atom);
+        SetLastError(1411);
+        return FALSE;
+    }
+
+    WNDPROC wndproc = class_wndproc_for_mode(entry);
+    if (!wndproc) {
+        SetLastError(8);
+        return FALSE;
+    }
+    HCURSOR cursor = class_cursor(entry);
+    if (g_compat32_mode) {
+        uint32_t *p = (uint32_t *)out;
+        for (int i = 0; i < 10; i++) p[i] = 0;
+        p[0] = entry->style;
+        p[1] = (uint32_t)(ULONG_PTR)wndproc;
+        p[2] = (uint32_t)entry->cbClsExtra;
+        p[3] = (uint32_t)entry->cbWndExtra;
+        p[4] = (uint32_t)(ULONG_PTR)entry->hInstance;
+        p[5] = (uint32_t)(ULONG_PTR)entry->hIcon;
+        p[6] = (uint32_t)(ULONG_PTR)cursor;
+        p[7] = (uint32_t)(ULONG_PTR)entry->hbrBackground;
+        p[8] = (uint32_t)entry->menu_name;
+        p[9] = (uint32_t)value;
+    } else {
+        BYTE *bytes = (BYTE *)out;
+        for (SIZE_T i = 0; i < sizeof(*out); i++) bytes[i] = 0;
+        out->style = entry->style;
+        out->lpfnWndProc = wndproc;
+        out->cbClsExtra = entry->cbClsExtra;
+        out->cbWndExtra = entry->cbWndExtra;
+        out->hInstance = entry->hInstance;
+        out->hIcon = entry->hIcon;
+        out->hCursor = cursor;
+        out->hbrBackground = entry->hbrBackground;
+        out->lpszMenuName = (PCSTR)entry->menu_name;
+        out->lpszClassName = class_name;
+    }
     return TRUE;
 }
 
 BOOL WINAPI GetClassInfoExA(HINSTANCE hInstance, PCSTR lpszClass, PVOID lpwcx)
 {
-    (void)hInstance;
-    return get_class_info(lpszClass, lpwcx);
+    ULONG_PTR value = (ULONG_PTR)lpszClass;
+    if (!value || !lpwcx) {
+        SetLastError(87);
+        return FALSE;
+    }
+    BOOL is_atom = value <= 0xFFFF;
+    WNDCLASS_ENTRY *entry = find_class_for_query(
+        hInstance, is_atom ? NULL : lpszClass, (WORD)value, is_atom);
+    if (!entry) {
+        log_class_lookup_miss(lpszClass, (WORD)value, is_atom);
+        SetLastError(1411);
+        return FALSE;
+    }
+    return write_class_info_ex(entry, value, lpwcx);
 }
 
 BOOL WINAPI GetClassInfoExW(HINSTANCE hInstance, PCWSTR lpszClass, PVOID lpwcx)
 {
-    (void)hInstance;
-    if (!lpszClass || (uintptr_t)lpszClass < 0x10000) return FALSE;
-
+    ULONG_PTR value = (ULONG_PTR)lpszClass;
+    if (!value || !lpwcx) {
+        SetLastError(87);
+        return FALSE;
+    }
+    BOOL is_atom = value <= 0xFFFF;
     char class_name[128] = {0};
-    for (int i = 0; i < 127 && lpszClass[i]; i++)
-        class_name[i] = (char)(lpszClass[i] & 0xFF);
-    return get_class_info(class_name, lpwcx);
+    if (!is_atom) {
+        for (int i = 0; i < 127 && lpszClass[i]; i++)
+            class_name[i] = (char)(lpszClass[i] & 0xFF);
+    }
+    WNDCLASS_ENTRY *entry = find_class_for_query(
+        hInstance, class_name, (WORD)value, is_atom);
+    if (!entry) {
+        log_class_lookup_miss(class_name, (WORD)value, is_atom);
+        SetLastError(1411);
+        return FALSE;
+    }
+    return write_class_info_ex(entry, value, lpwcx);
 }
 LONG WINAPI GetWindowLongW(HWND hWnd, int nIndex)
 {
@@ -11087,10 +12661,7 @@ LONG_PTR WINAPI SetWindowLongPtrW(HWND hWnd, int nIndex,
 BOOL WINAPI IsWindow(HWND hWnd)
 {
     WINDOW *w = find_window(hWnd);
-    BOOL result = w ? TRUE : FALSE;
-    trace_swiftshader_wsi("IsWindow", (uint64_t)(ULONG_PTR)
-                          __builtin_return_address(0), hWnd, w, NULL, result);
-    return result;
+    return w ? TRUE : FALSE;
 }
 
 BOOL WINAPI IsIconic(HWND hWnd)
@@ -11275,22 +12846,111 @@ DWORD WINAPI GetSysColor(int nIndex)
 
 /* ── Dialog box stubs ──────────────────────────────────────── */
 
-LONG_PTR WINAPI DialogBoxParamA(HINSTANCE hInstance, PCSTR lpTemplateName,
-                                 HWND hWndParent, PVOID lpDialogFunc, LPARAM dwInitParam)
+static LONG_PTR dialog_box_template(HINSTANCE instance, PCVOID template_data,
+                                    SIZE_T template_size, HWND parent,
+                                    DLGPROC proc, LPARAM init_param)
 {
-    (void)hInstance; (void)lpTemplateName; (void)hWndParent;
-    (void)lpDialogFunc; (void)dwInitParam;
-    serial_puts("[USER32] DialogBoxParamA: stub -1\n");
-    return -1;
+    BOOL owner_disabled = parent && find_window(parent) &&
+                          IsWindowEnabled(parent);
+    if (owner_disabled)
+        EnableWindow(parent, FALSE);
+
+    U32_DIALOG_STATE *state = NULL;
+    HWND dialog = dialog_create_template(instance, template_data,
+        template_size, parent, proc, init_param, TRUE, &state);
+    if (!dialog || !state) {
+        if (owner_disabled && find_window(parent))
+            EnableWindow(parent, TRUE);
+        return -1;
+    }
+    state->owner_disabled = owner_disabled;
+
+    BOOL preserve_quit = FALSE;
+    int quit_code = 0;
+    while (state->used && !state->ended && state->window) {
+        MSG message64;
+        uint32_t message32[7];
+        LPMSG message_buffer = g_compat32_mode
+            ? (LPMSG)(void *)message32 : &message64;
+        BOOL status = GetMessageA(message_buffer, NULL, 0, 0);
+        if (status == (BOOL)-1) {
+            state->result = -1;
+            state->ended = TRUE;
+            break;
+        }
+        if (!status) {
+            MSG quit_message;
+            msg_read_from(message_buffer, &quit_message);
+            preserve_quit = TRUE;
+            quit_code = (int)quit_message.wParam;
+            state->result = -1;
+            state->ended = TRUE;
+            break;
+        }
+        if (!IsDialogMessageA(dialog, message_buffer)) {
+            TranslateMessage(message_buffer);
+            DispatchMessageA(message_buffer);
+        }
+    }
+
+    LONG_PTR result = state->result;
+    HWND owner = state->owner;
+    BOOL restore_owner = state->owner_disabled;
+    if (state->window && find_window(state->window))
+        DestroyWindow(state->window);
+    if (restore_owner && owner && find_window(owner)) {
+        EnableWindow(owner, TRUE);
+        SetForegroundWindow(owner);
+    }
+    dialog_state_clear(state);
+    if (preserve_quit)
+        PostQuitMessage(quit_code);
+    return result;
+}
+
+LONG_PTR WINAPI DialogBoxIndirectParamA(HINSTANCE hInstance,
+                                         PCVOID lpTemplate,
+                                         HWND hWndParent,
+                                         DLGPROC lpDialogFunc,
+                                         LPARAM dwInitParam)
+{
+    return dialog_box_template(hInstance, lpTemplate,
+        U32_DIALOG_INDIRECT_LIMIT, hWndParent, lpDialogFunc, dwInitParam);
+}
+
+LONG_PTR WINAPI DialogBoxIndirectParamW(HINSTANCE hInstance,
+                                         PCVOID lpTemplate,
+                                         HWND hWndParent,
+                                         DLGPROC lpDialogFunc,
+                                         LPARAM dwInitParam)
+{
+    return DialogBoxIndirectParamA(hInstance, lpTemplate, hWndParent,
+                                   lpDialogFunc, dwInitParam);
 }
 
 LONG_PTR WINAPI DialogBoxParamW(HINSTANCE hInstance, PCWSTR lpTemplateName,
-                                 HWND hWndParent, PVOID lpDialogFunc, LPARAM dwInitParam)
+                                 HWND hWndParent, DLGPROC lpDialogFunc,
+                                 LPARAM dwInitParam)
 {
-    (void)hInstance; (void)lpTemplateName; (void)hWndParent;
-    (void)lpDialogFunc; (void)dwInitParam;
-    serial_puts("[USER32] DialogBoxParamW: stub -1\n");
-    return -1;
+    PCVOID data;
+    DWORD size;
+    if (!kernel32_resource_data_w(hInstance, lpTemplateName, U32_RT_DIALOG,
+                                  &data, &size))
+        return -1;
+    return dialog_box_template(hInstance, data, size, hWndParent,
+                               lpDialogFunc, dwInitParam);
+}
+
+LONG_PTR WINAPI DialogBoxParamA(HINSTANCE hInstance, PCSTR lpTemplateName,
+                                 HWND hWndParent, DLGPROC lpDialogFunc,
+                                 LPARAM dwInitParam)
+{
+    WCHAR name_buffer[256];
+    PCWSTR wide_name;
+    if (!dialog_identifier_a_to_w(lpTemplateName, name_buffer, &wide_name))
+        return -1;
+    return DialogBoxParamW(hInstance, wide_name, hWndParent,
+                           lpDialogFunc, dwInitParam);
 }
 
 /* ── Menu stubs ────────────────────────────────────────────── */
@@ -11722,7 +13382,7 @@ static void menu_sync_system_locked(U32_MENU *menu, WINDOW *window)
     BOOL minimized = (window->style & WS_MINIMIZE) != 0;
     BOOL maximized = (window->style & WS_MAXIMIZE) != 0;
     WNDCLASS_ENTRY *window_class =
-        find_class_for_pid(window->class_name, window->owner_pid);
+        lookup_class_for_pid(window->class_name, window->owner_pid);
     menu_set_auto_disabled(menu_find_direct_command(menu, SC_RESTORE),
                            !minimized && !maximized);
     menu_set_auto_disabled(menu_find_direct_command(menu, SC_MOVE), maximized);
@@ -12409,19 +14069,9 @@ DWORD WINAPI GetMessagePos(void)
 
 HWND WINAPI GetFocus(void)
 {
-    /* WinDrv gates its ENTIRE in-game input path on GetFocus()==viewport hWnd:
-     * UpdateInput's GetKeyState press loop only emits IST_Press when focused
-     * (windrv.bin cmp @0x11106F33) and SetMouseCapture's OnlyFocus check bails
-     * before SetCapture/ShowCursor(0)/recenter (@0x1110665C). The old
-     * unconditional NULL therefore killed in-game movement keys AND mouse-look
-     * capture. NT semantics: while our (only) app is active, some window of it
-     * has keyboard focus — serve the tracked focus window, falling back to the
-     * foreground window; NULL only when the process has no windows at all. */
-    HWND vp = viewport_hwnd();
-    HWND r = (mouselook_active() && vp) ? vp :
-             ((focus_hwnd && find_window(focus_hwnd)) ? focus_hwnd
-                                                       : GetForegroundWindow());
-    /* [CAPDIAG — uncommitted] sample what the engine's focus gate sees */
+    WINDOW *focused = find_window(focus_hwnd);
+    HWND r = (focused && !focused->destroying) ? focused->handle
+                                               : GetForegroundWindow();
     {
         static uint32_t n = 0;
         if (u32_input_diagnostics_active() && (n++ & 0x3FF) == 0) {
@@ -12436,8 +14086,7 @@ HWND WINAPI GetFocus(void)
 BOOL WINAPI IsWindowVisible(HWND hWnd)
 {
     WINDOW *w = find_window(hWnd);
-    if (!w || w->message_only) return FALSE;
-    return window_style_is_visible(w);
+    return w && !w->message_only && window_style_is_visible(w);
 }
 
 int WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cPoints)
@@ -12477,7 +14126,7 @@ int WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cP
     {
         static int n = 0;
         if (u32_input_diagnostics_active() && n < 32 &&
-            mouselook_active()) {
+            relative_pointer_mode_active()) {
             extern uint32_t compat32_get_last_caller_eip(void);
             log_input_prefix("[MOUSE-RECT] MapWindowPoints");
             serial_puts(" from=0x"); serial_puthex((uint64_t)(ULONG_PTR)hWndFrom, 8);
@@ -13140,7 +14789,11 @@ static BOOL wm_test_wide_is(PCWSTR text, const char *ascii)
 
 int user32_window_model_selftest(void)
 {
+    enum { WM_TEST_CLASS_BURST = 96 };
     static const char class_name[] = "OsitoWindowModelTest";
+    static const WCHAR listbox_class_w[] = {
+        'L', 'I', 'S', 'T', 'B', 'O', 'X', 0
+    };
     static const WCHAR property_name_w[] = {
         'O', 's', 'i', 't', 'o', '.', 'P', 'r', 'o', 'p', 0
     };
@@ -13153,6 +14806,10 @@ int user32_window_model_selftest(void)
         .lpszClassName = class_name,
     };
     WNDCLASSEXA class_info = {0};
+    WNDCLASSEXA system_class_info = {0};
+    WNDCLASSEXA system_atom_info = {0};
+    WNDCLASSA system_basic_info = {0};
+    uint32_t system_class_info32[12] = {48};
     HWND parent = NULL, child_a = NULL, child_b = NULL, grandchild = NULL;
     HWND grandchild_b = NULL;
     HWND popup_a = NULL, popup_b = NULL, other = NULL;
@@ -13160,6 +14817,8 @@ int user32_window_model_selftest(void)
     HMENU system_menu = NULL, reset_system_menu = NULL;
     int checks = 0, failures = 0;
     WORD atom = 0;
+    WORD burst_atoms[WM_TEST_CLASS_BURST] = {0};
+    char burst_names[WM_TEST_CLASS_BURST][32];
     char formatted_name[32];
 
     serial_puts("[WMTEST] starting USER32 window-model test\n");
@@ -13192,12 +14851,90 @@ int user32_window_model_selftest(void)
                    GetSystemMetricsForDpi(SM_CXCURSOR, 192) == 64,
                    "mouse and cursor metrics", &checks, &failures);
 
+    system_class_info.cbSize = sizeof(system_class_info);
+    wm_test_expect(GetClassInfoExW(NULL, listbox_class_w,
+                                  &system_class_info) &&
+                   system_class_info.style == 0x00000088 &&
+                   system_class_info.lpfnWndProc != NULL &&
+                   system_class_info.cbClsExtra == 0 &&
+                   system_class_info.cbWndExtra == 8 &&
+                   system_class_info.hInstance == NULL &&
+                   (ULONG_PTR)system_class_info.lpszClassName ==
+                       (ULONG_PTR)listbox_class_w,
+                   "predefined LISTBOX class metadata",
+                   &checks, &failures);
+
+    system_atom_info.cbSize = sizeof(system_atom_info);
+    wm_test_expect(GetClassInfoExA(NULL, (PCSTR)(ULONG_PTR)0x0083,
+                                  &system_atom_info) &&
+                   system_atom_info.style == 0x00000088 &&
+                   system_atom_info.lpfnWndProc != NULL &&
+                   (ULONG_PTR)system_atom_info.lpszClassName == 0x0083,
+                   "predefined LISTBOX class atom",
+                   &checks, &failures);
+
+    wm_test_expect(GetClassInfoA_k32(NULL, "LISTBOX",
+                                    &system_basic_info) &&
+                   system_basic_info.style == 0x00000088 &&
+                   system_basic_info.lpfnWndProc != NULL &&
+                   system_basic_info.cbWndExtra == 8 &&
+                   system_basic_info.hInstance == NULL,
+                   "GetClassInfoA system-class layout",
+                   &checks, &failures);
+
+    if (!compat32_is_initialized())
+        compat32_init();
+    g_compat32_mode = 1;
+    BOOL compat_system_class = GetClassInfoExW(
+        NULL, listbox_class_w, system_class_info32);
+    g_compat32_mode = 0;
+    wm_test_expect(compat_system_class && system_class_info32[0] == 48 &&
+                   system_class_info32[1] == 0x00000088 &&
+                   system_class_info32[2] != 0 &&
+                   system_class_info32[3] == 0 &&
+                   system_class_info32[4] == 8 &&
+                   system_class_info32[5] == 0,
+                   "PE32 WNDCLASSEX system-class layout and thunk",
+                   &checks, &failures);
+
+    SetLastError(0);
+    HWND invalid_class_window = CreateWindowExA(
+        0, "OsitoMissingWindowClass", "invalid", 0,
+        0, 0, 32, 32, NULL, NULL, NULL, NULL);
+    wm_test_expect(!invalid_class_window && GetLastError() == 1407,
+                   "unknown class rejected without WndProc fallback",
+                   &checks, &failures);
+
     wm_test_destroy_count = 0;
     wm_test_ncdestroy_count = 0;
     atom = RegisterClassA(&window_class);
     wm_test_expect(atom != 0, "RegisterClassA", &checks, &failures);
     if (!atom)
         goto cleanup;
+
+    SetLastError(0);
+    wm_test_expect(RegisterClassA(&window_class) == 0 &&
+                   GetLastError() == 1410,
+                   "duplicate class reports ERROR_CLASS_ALREADY_EXISTS",
+                   &checks, &failures);
+
+    int burst_registered = 0;
+    for (int i = 0; i < WM_TEST_CLASS_BURST; i++) {
+        WNDCLASSA burst_class = window_class;
+        wsprintfA_k32(burst_names[i], "OsitoClassBurst%u",
+                      (ULONG_PTR)i, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        burst_class.lpszClassName = burst_names[i];
+        burst_atoms[i] = RegisterClassA(&burst_class);
+        if (!burst_atoms[i])
+            break;
+        burst_registered++;
+    }
+    wm_test_expect(burst_registered == WM_TEST_CLASS_BURST,
+                   "class registry grows beyond one 64-entry block",
+                   &checks, &failures);
+    for (int i = 0; i < burst_registered; i++)
+        UnregisterClassA((PCSTR)(ULONG_PTR)burst_atoms[i],
+                         window_class.hInstance);
 
     class_info.cbSize = sizeof(class_info);
     wm_test_expect(GetClassInfoExA(window_class.hInstance, class_name,
@@ -13751,11 +15488,16 @@ int user32_input_selftest(void)
     uint64_t saved_input_sequence =
         msg_last_input_sequence(test_pid, test_tid);
     int saved_cursor_visible = cursor_visible;
+    DWORD saved_cursor_visibility_owner_pid = cursor_visibility_owner_pid;
+    DWORD saved_cursor_visibility_owner_tid = cursor_visibility_owner_tid;
     int saved_abs_prev_valid = g_abs_prev_valid;
     int saved_abs_prev_sx = g_abs_prev_sx;
     int saved_abs_prev_sy = g_abs_prev_sy;
     RECT saved_clip_rect = clip_rect;
     int saved_clip_active = clip_active;
+    DWORD saved_clip_owner_pid = clip_owner_pid;
+    DWORD saved_clip_owner_tid = clip_owner_tid;
+    RELATIVE_POINTER_STATE saved_relative_pointer = relative_pointer;
     LPARAM saved_extra = message_extra_info;
     DWORD saved_last_error = GetLastError();
     HWND saved_focus = focus_hwnd;
@@ -13800,6 +15542,12 @@ int user32_input_selftest(void)
     SetFocus(window);
     capture_hwnd = NULL;
     cursor_visible = 0;
+    cursor_visibility_owner_pid = 0;
+    cursor_visibility_owner_tid = 0;
+    clip_active = 0;
+    clip_owner_pid = 0;
+    clip_owner_tid = 0;
+    relative_pointer_reset();
     mouse_buttons = 0;
     ValidateRect(window, NULL);
     msg_purge_process(GetCurrentProcessId());
@@ -13940,11 +15688,46 @@ int user32_input_selftest(void)
                       observed_clip.bottom == requested_clip.bottom,
                       "ClipCursor/GetClipCursor round trip",
                       &checks, &failures);
+    input_test_expect(!relative_pointer_mode_active(),
+                      "confinement alone keeps absolute input",
+                      &checks, &failures);
+    SetCursorPos(1000, -10);
+    POINT confined_cursor = { 0 };
+    input_test_expect(GetCursorPos(&confined_cursor) &&
+                      confined_cursor.x == requested_clip.right - 1 &&
+                      confined_cursor.y == requested_clip.top,
+                      "SetCursorPos obeys ClipCursor bounds",
+                      &checks, &failures);
+    POINT clip_center = {
+        requested_clip.left +
+            (requested_clip.right - requested_clip.left) / 2,
+        requested_clip.top +
+            (requested_clip.bottom - requested_clip.top) / 2,
+    };
+    SetCursorPos(clip_center.x, clip_center.y);
+    input_test_expect(relative_pointer_mode_active(),
+                      "center warp enables relative tablet translation",
+                      &checks, &failures);
     input_test_expect(ClipCursor(NULL) && GetClipCursor(&observed_clip) &&
                       observed_clip.left == 0 && observed_clip.top == 0 &&
                       observed_clip.right == current_mode_cx() &&
                       observed_clip.bottom == current_mode_cy(),
                       "released clip reports desktop bounds",
+                      &checks, &failures);
+    input_test_expect(!relative_pointer_mode_active(),
+                      "released confinement disables relative translation",
+                      &checks, &failures);
+    input_test_expect(ShowCursor(FALSE) == -1 &&
+                      !relative_pointer_mode_active(),
+                      "hidden cursor alone keeps absolute input",
+                      &checks, &failures);
+    SetCursorPos(current_mode_cx() / 2, current_mode_cy() / 2);
+    input_test_expect(relative_pointer_mode_active(),
+                      "hidden center warp enables relative translation",
+                      &checks, &failures);
+    input_test_expect(ShowCursor(TRUE) == 0 &&
+                      !relative_pointer_mode_active(),
+                      "restored cursor disables relative translation",
                       &checks, &failures);
     ShowWindow(window, SW_SHOWNA);
     SetFocus(window);
@@ -14000,7 +15783,7 @@ int user32_input_selftest(void)
                       (short)((message.lParam >> 16) & 0xFFFF) == 77 - 500,
                       "capture retargets queued hardware release",
                       &checks, &failures);
-    input_test_expect(!mouselook_active() &&
+    input_test_expect(!relative_pointer_mode_active() &&
                       mouse_input_target() == capture_window,
                       "ordinary capture stays on absolute input path",
                       &checks, &failures);
@@ -14230,11 +16013,16 @@ cleanup:
     msg_note_retrieval(test_pid, test_tid, saved_retrieved_source,
                        saved_input_sequence);
     cursor_visible = saved_cursor_visible;
+    cursor_visibility_owner_pid = saved_cursor_visibility_owner_pid;
+    cursor_visibility_owner_tid = saved_cursor_visibility_owner_tid;
     g_abs_prev_valid = saved_abs_prev_valid;
     g_abs_prev_sx = saved_abs_prev_sx;
     g_abs_prev_sy = saved_abs_prev_sy;
     clip_rect = saved_clip_rect;
     clip_active = saved_clip_active;
+    clip_owner_pid = saved_clip_owner_pid;
+    clip_owner_tid = saved_clip_owner_tid;
+    relative_pointer = saved_relative_pointer;
     message_extra_info = saved_extra;
     focus_hwnd = saved_focus && find_window(saved_focus) ? saved_focus : NULL;
     active_hwnd = saved_active && find_window(saved_active)
@@ -14243,6 +16031,294 @@ cleanup:
     SetLastError(saved_last_error);
 
     serial_puts("[INPUTTEST] checks=");
+    serial_putdec((uint64_t)checks);
+    serial_puts(" failures=");
+    serial_putdec((uint64_t)failures);
+    serial_puts("\n");
+    return failures;
+}
+
+typedef struct {
+    BYTE data[512];
+    SIZE_T length;
+    BOOL failed;
+} DIALOG_TEST_BUILDER;
+
+static void dialog_test_put(DIALOG_TEST_BUILDER *builder, PCVOID data,
+                            SIZE_T size)
+{
+    if (!builder || builder->failed ||
+        size > sizeof(builder->data) - builder->length) {
+        if (builder) builder->failed = TRUE;
+        return;
+    }
+    memcpy(builder->data + builder->length, data, size);
+    builder->length += size;
+}
+
+static void dialog_test_byte(DIALOG_TEST_BUILDER *builder, BYTE value)
+{
+    dialog_test_put(builder, &value, sizeof(value));
+}
+
+static void dialog_test_word(DIALOG_TEST_BUILDER *builder, WORD value)
+{
+    dialog_test_put(builder, &value, sizeof(value));
+}
+
+static void dialog_test_dword(DIALOG_TEST_BUILDER *builder, DWORD value)
+{
+    dialog_test_put(builder, &value, sizeof(value));
+}
+
+static void dialog_test_string(DIALOG_TEST_BUILDER *builder,
+                               const char *text)
+{
+    if (!text) {
+        dialog_test_word(builder, 0);
+        return;
+    }
+    while (*text)
+        dialog_test_word(builder, (WORD)(BYTE)*text++);
+    dialog_test_word(builder, 0);
+}
+
+static void dialog_test_ordinal(DIALOG_TEST_BUILDER *builder, WORD ordinal)
+{
+    dialog_test_word(builder, 0xFFFFU);
+    dialog_test_word(builder, ordinal);
+}
+
+static void dialog_test_align(DIALOG_TEST_BUILDER *builder)
+{
+    while (builder->length & 3U)
+        dialog_test_byte(builder, 0);
+}
+
+static void dialog_test_build_extended(DIALOG_TEST_BUILDER *builder)
+{
+    memset(builder, 0, sizeof(*builder));
+    dialog_test_word(builder, 1);
+    dialog_test_word(builder, 0xFFFFU);
+    dialog_test_dword(builder, 0); /* help ID */
+    dialog_test_dword(builder, 0); /* extended style */
+    dialog_test_dword(builder, WS_POPUP | WS_CAPTION | WS_SYSMENU |
+                               WS_VISIBLE | U32_DS_SETFONT | U32_DS_CENTER);
+    dialog_test_word(builder, 2); /* controls */
+    dialog_test_word(builder, 0);
+    dialog_test_word(builder, 0);
+    dialog_test_word(builder, 100);
+    dialog_test_word(builder, 50);
+    dialog_test_word(builder, 0); /* menu */
+    dialog_test_word(builder, 0); /* default dialog class */
+    dialog_test_string(builder, "Dialog contract");
+    dialog_test_word(builder, 8);   /* point size */
+    dialog_test_word(builder, 400); /* weight */
+    dialog_test_byte(builder, 0);   /* italic */
+    dialog_test_byte(builder, 1);   /* charset */
+    dialog_test_string(builder, "MS Shell Dlg");
+
+    dialog_test_align(builder);
+    dialog_test_dword(builder, 0);
+    dialog_test_dword(builder, 0);
+    dialog_test_dword(builder, WS_CHILD | WS_VISIBLE);
+    dialog_test_word(builder, 4);
+    dialog_test_word(builder, 4);
+    dialog_test_word(builder, 90);
+    dialog_test_word(builder, 12);
+    dialog_test_dword(builder, 100);
+    dialog_test_ordinal(builder, 0x0082); /* STATIC */
+    dialog_test_string(builder, "Ready");
+    dialog_test_word(builder, 0);
+
+    dialog_test_align(builder);
+    dialog_test_dword(builder, 0);
+    dialog_test_dword(builder, 0);
+    dialog_test_dword(builder, WS_CHILD | WS_VISIBLE | WS_TABSTOP);
+    dialog_test_word(builder, 35);
+    dialog_test_word(builder, 25);
+    dialog_test_word(builder, 30);
+    dialog_test_word(builder, 14);
+    dialog_test_dword(builder, IDOK);
+    dialog_test_ordinal(builder, 0x0080); /* BUTTON */
+    dialog_test_string(builder, "OK");
+    dialog_test_word(builder, 0);
+}
+
+static void dialog_test_build_standard(DIALOG_TEST_BUILDER *builder)
+{
+    memset(builder, 0, sizeof(*builder));
+    dialog_test_dword(builder, WS_POPUP);
+    dialog_test_dword(builder, 0);
+    dialog_test_word(builder, 0);
+    dialog_test_word(builder, 2);
+    dialog_test_word(builder, 3);
+    dialog_test_word(builder, 40);
+    dialog_test_word(builder, 20);
+    dialog_test_word(builder, 0);
+    dialog_test_word(builder, 0);
+    dialog_test_string(builder, "Standard dialog");
+}
+
+static int dialog_test_init_count;
+static int dialog_test_command_count;
+static BOOL dialog_test_focus_valid;
+static HWND dialog_test_modal_owner;
+static BOOL dialog_test_owner_disabled;
+static BOOL dialog_test_end_succeeded;
+
+static ULONG_PTR WINAPI dialog_test_modeless_proc(HWND dialog, DWORD message,
+                                                   WPARAM wparam,
+                                                   LPARAM lparam)
+{
+    if (message == WM_INITDIALOG) {
+        dialog_test_init_count++;
+        dialog_test_focus_valid =
+            (HWND)(ULONG_PTR)wparam == GetDlgItem(dialog, IDOK) &&
+            lparam == (LPARAM)0x12345678;
+        return TRUE;
+    }
+    if (message == WM_COMMAND && (UINT)(wparam & 0xFFFFU) == IDOK) {
+        dialog_test_command_count++;
+        return lparam == (LPARAM)(ULONG_PTR)GetDlgItem(dialog, IDOK);
+    }
+    return FALSE;
+}
+
+static ULONG_PTR WINAPI dialog_test_modal_proc(HWND dialog, DWORD message,
+                                                WPARAM wparam,
+                                                LPARAM lparam)
+{
+    (void)wparam;
+    if (message == WM_INITDIALOG) {
+        dialog_test_init_count++;
+        dialog_test_owner_disabled = dialog_test_modal_owner &&
+            !IsWindowEnabled(dialog_test_modal_owner) &&
+            lparam == (LPARAM)0x55AA;
+        dialog_test_end_succeeded = EndDialog(dialog, 42);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void dialog_test_expect(BOOL condition, const char *name,
+                               int *checks, int *failures)
+{
+    (*checks)++;
+    if (condition) return;
+    (*failures)++;
+    serial_puts("[DIALOG-TEST] FAIL: ");
+    serial_puts(name);
+    serial_puts("\n");
+}
+
+int user32_dialog_selftest(void)
+{
+    int checks = 0, failures = 0;
+    DIALOG_TEST_BUILDER extended;
+    DIALOG_TEST_BUILDER standard;
+    HWND modeless = NULL;
+    HWND standard_window = NULL;
+    HWND owner = NULL;
+
+    serial_puts("[DIALOG-TEST] starting USER32 dialog test\n");
+    if (g_compat32_mode) {
+        serial_puts("[DIALOG-TEST] FAIL: PE32 callback active\n");
+        return 1;
+    }
+
+    dialog_test_build_extended(&extended);
+    dialog_test_expect(!extended.failed, "extended template builder",
+                       &checks, &failures);
+
+    dialog_test_init_count = 0;
+    dialog_test_command_count = 0;
+    dialog_test_focus_valid = FALSE;
+    modeless = CreateDialogIndirectParamW(
+        NULL, extended.data, NULL, dialog_test_modeless_proc,
+        (LPARAM)0x12345678);
+    HWND static_control = modeless ? GetDlgItem(modeless, 100) : NULL;
+    HWND button = modeless ? GetDlgItem(modeless, IDOK) : NULL;
+    WCHAR class_name[16] = {0};
+    WCHAR static_text[16] = {0};
+    RECT client = {0};
+    if (modeless) {
+        GetClassNameW(modeless, class_name,
+                      (int)(sizeof(class_name) / sizeof(class_name[0])));
+        if (static_control)
+            GetWindowTextW(static_control, static_text,
+                           (int)(sizeof(static_text) /
+                                 sizeof(static_text[0])));
+        GetClientRect(modeless, &client);
+    }
+    dialog_test_expect(modeless && dialog_state_find(modeless) &&
+                       dialog_test_init_count == 1 &&
+                       dialog_test_focus_valid && GetFocus() == button,
+                       "modeless creation, init and focus",
+                       &checks, &failures);
+    dialog_test_expect(wm_test_wide_is(class_name, "#32770") &&
+                       static_control && button &&
+                       GetDlgCtrlID(static_control) == 100 &&
+                       GetDlgCtrlID(button) == IDOK &&
+                       wm_test_wide_is(static_text, "Ready"),
+                       "resource classes, IDs and titles",
+                       &checks, &failures);
+    dialog_test_expect(client.right == 200 && client.bottom == 100 &&
+                       IsWindowVisible(modeless),
+                       "dialog-unit geometry and visibility",
+                       &checks, &failures);
+    if (button) SendMessageA(button, BM_CLICK, 0, 0);
+    dialog_test_expect(dialog_test_command_count == 1,
+                       "button command notification",
+                       &checks, &failures);
+    SetLastError(0);
+    dialog_test_expect(!EndDialog(modeless, 9) && GetLastError() == 1400,
+                       "EndDialog rejects modeless windows",
+                       &checks, &failures);
+    if (modeless) DestroyWindow(modeless);
+    dialog_test_expect(!IsWindow(modeless) && !IsWindow(static_control) &&
+                       !IsWindow(button) && !dialog_state_find(modeless),
+                       "modeless tree and state teardown",
+                       &checks, &failures);
+    modeless = NULL;
+
+    dialog_test_build_standard(&standard);
+    standard_window = CreateDialogIndirectParamA(
+        NULL, standard.data, NULL, NULL, 0);
+    dialog_test_expect(!standard.failed && standard_window &&
+                       dialog_state_find(standard_window),
+                       "standard template parsing", &checks, &failures);
+    if (standard_window) DestroyWindow(standard_window);
+    standard_window = NULL;
+
+    BYTE truncated[8] = { 1, 0, 0xFF, 0xFF, 0, 0, 0, 0 };
+    SetLastError(0);
+    dialog_test_expect(!dialog_create_template(
+                           NULL, truncated, sizeof(truncated), NULL, NULL, 0,
+                           FALSE, NULL) && GetLastError() == 1812,
+                       "truncated template rejected", &checks, &failures);
+
+    owner = CreateWindowExA(0, "STATIC", "dialog-owner",
+                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                            10, 10, 160, 100, NULL, NULL, NULL, NULL);
+    dialog_test_modal_owner = owner;
+    dialog_test_owner_disabled = FALSE;
+    dialog_test_end_succeeded = FALSE;
+    dialog_test_init_count = 0;
+    LONG_PTR modal_result = owner ? DialogBoxIndirectParamW(
+        NULL, extended.data, owner, dialog_test_modal_proc,
+        (LPARAM)0x55AA) : -1;
+    dialog_test_expect(owner && modal_result == 42 &&
+                       dialog_test_init_count == 1 &&
+                       dialog_test_owner_disabled &&
+                       dialog_test_end_succeeded &&
+                       IsWindowEnabled(owner),
+                       "modal result and owner restoration",
+                       &checks, &failures);
+
+    if (owner) DestroyWindow(owner);
+    dialog_test_modal_owner = NULL;
+    serial_puts("[DIALOG-TEST] checks=");
     serial_putdec((uint64_t)checks);
     serial_puts(" failures=");
     serial_putdec((uint64_t)failures);
@@ -14259,6 +16335,7 @@ static const SHIM_EXPORT user32_exports[] = {
     { "RegisterClassW",     (PVOID)RegisterClassW, 1, CC_STDCALL },
     { "UnregisterClassA",   (PVOID)UnregisterClassA, 2, CC_STDCALL },
     { "UnregisterClassW",   (PVOID)UnregisterClassW_k32, 2, CC_STDCALL },
+    { "GetClassInfoA",      (PVOID)GetClassInfoA_k32, 3, CC_STDCALL },
     { "GetClassInfoW",      (PVOID)GetClassInfoW_k32, 3, CC_STDCALL },
     { "GetClassWord",       (PVOID)GetClassWord_u32, 2, CC_STDCALL },
     { "GetClassLongPtrW",   (PVOID)GetClassLongPtrW, 2, CC_STDCALL },
@@ -14305,6 +16382,10 @@ static const SHIM_EXPORT user32_exports[] = {
     { "PostMessageA",       (PVOID)PostMessageA, 4, CC_STDCALL },
     { "SendMessageA",       (PVOID)SendMessageA, 4, CC_STDCALL },
     { "DefWindowProcA",     (PVOID)DefWindowProcA, 4, CC_STDCALL },
+    { "DefDlgProcA",        (PVOID)DefDlgProcA, 4, CC_STDCALL },
+    { "DefDlgProcW",        (PVOID)DefDlgProcW, 4, CC_STDCALL },
+    { "IsDialogMessageA",   (PVOID)IsDialogMessageA, 2, CC_STDCALL },
+    { "IsDialogMessageW",   (PVOID)IsDialogMessageW, 2, CC_STDCALL },
     /* Window info */
     { "GetClientRect",      (PVOID)GetClientRect, 2, CC_STDCALL },
     { "GetWindowRect",      (PVOID)GetWindowRect, 2, CC_STDCALL },
@@ -14393,6 +16474,7 @@ static const SHIM_EXPORT user32_exports[] = {
     { "GetThreadDesktop",   (PVOID)GetThreadDesktop_stub, 1, CC_STDCALL },
     { "SetProcessWindowStation", (PVOID)SetProcessWindowStation_stub, 1, CC_STDCALL },
     { "CreateDesktopW",     (PVOID)CreateDesktopW_stub, 6, CC_STDCALL },
+    { "GetUserObjectInformationA", (PVOID)GetUserObjectInformationA_stub, 5, CC_STDCALL },
     { "GetUserObjectInformationW", (PVOID)GetUserObjectInformationW_stub, 5, CC_STDCALL },
     { "GetActiveWindow",    (PVOID)GetActiveWindow, 0, CC_STDCALL },
     /* Cursor / input */
@@ -14484,6 +16566,10 @@ static const SHIM_EXPORT user32_exports[] = {
     /* Dialog */
     { "CreateDialogParamA", (PVOID)CreateDialogParamA, 5, CC_STDCALL },
     { "CreateDialogParamW", (PVOID)CreateDialogParamW, 5, CC_STDCALL },
+    { "CreateDialogIndirectParamA", (PVOID)CreateDialogIndirectParamA,
+      5, CC_STDCALL },
+    { "CreateDialogIndirectParamW", (PVOID)CreateDialogIndirectParamW,
+      5, CC_STDCALL },
     { "EndDialog",          (PVOID)EndDialog, 2, CC_STDCALL },
     { "GetDlgItem",         (PVOID)GetDlgItem, 2, CC_STDCALL },
     { "GetDlgItemInt",      (PVOID)GetDlgItemInt, 4, CC_STDCALL },
@@ -14561,6 +16647,10 @@ static const SHIM_EXPORT user32_exports[] = {
     /* Dialog box */
     { "DialogBoxParamA",    (PVOID)DialogBoxParamA, 5, CC_STDCALL },
     { "DialogBoxParamW",    (PVOID)DialogBoxParamW, 5, CC_STDCALL },
+    { "DialogBoxIndirectParamA", (PVOID)DialogBoxIndirectParamA,
+      5, CC_STDCALL },
+    { "DialogBoxIndirectParamW", (PVOID)DialogBoxIndirectParamW,
+      5, CC_STDCALL },
     /* Menu */
     { "CreateMenu",         (PVOID)CreateMenu, 0, CC_STDCALL },
     { "CreatePopupMenu",    (PVOID)CreatePopupMenu, 0, CC_STDCALL },
@@ -14662,7 +16752,11 @@ PVOID user32_shim_init(void)
         defer_window_sets[i].used = 0;
     process_dpi_context = (HANDLE)(LONG_PTR)-2;
     thread_dpi_context = NULL;
-    for (int i = 0; i < MAX_WINDOWS; i++) windows[i].used = 0;
+    user_object_reset();
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        windows[i].used = 0;
+        dialog_states[i].used = FALSE;
+    }
     for (int i = 0; i < MAX_WINDOWS; i++) {
         imm_associations[i].window = NULL;
         imm_associations[i].context = NULL;
@@ -14719,10 +16813,20 @@ PVOID user32_shim_init(void)
     native_move.pointer_offset_x = 0;
     native_move.pointer_offset_y = 0;
     clip_active = 0;
-    g_abs_prev_valid = 0;
-    cursor_visible = 0;   /* NT display count starts at 0 (ShowCursor(FALSE) -> -1) */
+    clip_owner_pid = 0;
+    clip_owner_tid = 0;
+    relative_pointer_reset();
+    cursor_visible = 0;
+    cursor_visibility_owner_pid = 0;
+    cursor_visibility_owner_tid = 0;
     current_cursor = NULL;
-    cursor_pos.x = 320; cursor_pos.y = 240;
+    int cursor_width = current_mode_cx();
+    int cursor_height = current_mode_cy();
+    if (cursor_width < 1) cursor_width = USER32_FALLBACK_SCREEN_WIDTH;
+    if (cursor_height < 1) cursor_height = USER32_FALLBACK_SCREEN_HEIGHT;
+    cursor_pos.x = cursor_width / 2;
+    cursor_pos.y = cursor_height / 2;
+    clip_rect = (RECT){ 0, 0, cursor_width, cursor_height };
     caret_hwnd = NULL;
     caret_pos.x = caret_pos.y = 0;
     return (PVOID)user32_exports;

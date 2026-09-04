@@ -10,6 +10,7 @@
 
 #include "wdbg.h"
 #include "compat32.h"
+#include "dllloader.h"
 #include "../include/paging.h"
 
 extern void serial_puts(const char *s);
@@ -67,27 +68,47 @@ static void hex_to_str(uint32_t v, char *out)
     out[10] = 0;
 }
 
+static const char *format_module_offset(const char *name, uint32_t base,
+                                        uint32_t va, char *buf, int bufsz)
+{
+    uint32_t off = va - base;
+    int p = 0;
+    while (name && name[p] && p < bufsz - 12) {
+        buf[p] = name[p];
+        p++;
+    }
+    buf[p++] = '+';
+    buf[p++] = '0';
+    buf[p++] = 'x';
+    static const char hex[] = "0123456789ABCDEF";
+    int started = 0;
+    for (int j = 7; j >= 0; j--) {
+        uint8_t nibble = (off >> (j * 4)) & 0xF;
+        if (nibble || started || j == 0) {
+            buf[p++] = hex[nibble];
+            started = 1;
+        }
+    }
+    buf[p] = 0;
+    return buf;
+}
+
 const char *wdbg_symbolize(uint32_t va, char *buf, int bufsz)
 {
     if (bufsz < 16) { if (bufsz > 0) buf[0] = 0; return buf; }
+
+    LOADED_MODULE *loaded =
+        dll_find_module_by_address((PVOID)(uintptr_t)va);
+    if (loaded) {
+        uint32_t base = (uint32_t)(uintptr_t)loaded->image.ImageBase;
+        return format_module_offset(loaded->name, base, va, buf, bufsz);
+    }
+
     for (int i = 0; i < g_module_count; i++) {
         wdbg_module_t *m = &g_modules[i];
         if (!m->used) continue;
-        if (va >= m->base && va < m->base + m->size) {
-            uint32_t off = va - m->base;
-            int p = 0;
-            while (m->name[p] && p < bufsz - 12) { buf[p] = m->name[p]; p++; }
-            buf[p++] = '+';
-            buf[p++] = '0'; buf[p++] = 'x';
-            static const char hex[] = "0123456789ABCDEF";
-            int started = 0;
-            for (int j = 7; j >= 0; j--) {
-                uint8_t nibble = (off >> (j * 4)) & 0xF;
-                if (nibble || started || j == 0) { buf[p++] = hex[nibble]; started = 1; }
-            }
-            buf[p] = 0;
-            return buf;
-        }
+        if (va >= m->base && va - m->base < m->size)
+            return format_module_offset(m->name, m->base, va, buf, bufsz);
     }
     hex_to_str(va, buf);
     return buf;
@@ -124,9 +145,6 @@ int wdbg_addr_hook(uint32_t va_start, uint32_t va_end,
     return idx;
 }
 
-/* Forward decl — values populated by int2e_stub.S each entry */
-extern uint64_t g_int2e_user_rbp;
-
 void wdbg_check_caller(uint32_t ret_addr, uint32_t *stack_args)
 {
     if (g_hook_count == 0 || !stack_args) return;
@@ -152,27 +170,17 @@ void wdbg_check_caller(uint32_t ret_addr, uint32_t *stack_args)
         if (ret_addr >= h->va_start && ret_addr <= h->va_end) {
             h->hit_count++;
             uint32_t esp = (uint32_t)(uintptr_t)stack_args;
-            uint32_t ebp = (uint32_t)g_int2e_user_rbp;
+            uint32_t ebp = compat32_get_last_user_ebp();
             h->cb(ret_addr, esp, ebp, stack_args);
         }
     }
 }
 
-/* ── FName resolver ─────────────────────────────────────────── */
-
-static uint32_t g_fname_tarray_va = 0x10295D30;  /* UT99 default */
-static int g_fname_entry_name_off = 8;            /* FNameEntry.Name @+8 */
-
-void wdbg_fname_set_array(uint32_t va) { g_fname_tarray_va = va; }
-
 static int va_readable(uint32_t va, int bytes)
 {
-    /* Coarse readability check: must be inside known module ranges
-     * or known heap/IAT zones. For now, accept anything in
-     * [0x10000, 0x80000000) — bare-metal compat32 mapping. */
-    if (va < 0x10000 || bytes <= 0) return 0;
+    if (!va || bytes <= 0) return 0;
     uint32_t end = va + (uint32_t)bytes - 1U;
-    if (end < va || end >= 0x80000000U) return 0;
+    if (end < va) return 0;
 
     uint64_t cr3 = proc_current_cr3();
     if (!cr3) return 0;
@@ -184,62 +192,6 @@ static int va_readable(uint32_t va, int bytes)
         page += 0x1000ULL;
     }
     return 1;
-}
-
-const char *wdbg_fname_resolve(uint32_t idx)
-{
-    if (!va_readable(g_fname_tarray_va, 12)) return "<no-arr>";
-    volatile uint32_t *t = (volatile uint32_t *)(uintptr_t)g_fname_tarray_va;
-    uint32_t data = t[0];
-    uint32_t num  = t[1];
-    if (data == 0) return "<null>";
-    if (idx >= num) return "<oob>";
-    if (!va_readable(data + idx * 4, 4)) return "<bad-arr>";
-    uint32_t entry = *(volatile uint32_t *)(uintptr_t)(data + idx * 4);
-    if (entry == 0) return "<nullent>";
-    if (!va_readable(entry + g_fname_entry_name_off, 1)) return "<bad-ent>";
-    return (const char *)(uintptr_t)(entry + g_fname_entry_name_off);
-}
-
-/* ── UObject inspector ──────────────────────────────────────── */
-
-static int g_uobj_off_outer = 16;
-static int g_uobj_off_name  = 20;
-static int g_uobj_off_class = 24;
-
-void wdbg_uobject_set_offsets(int outer, int name, int klass)
-{
-    g_uobj_off_outer = outer;
-    g_uobj_off_name  = name;
-    g_uobj_off_class = klass;
-}
-
-void wdbg_uobject_dump(uint32_t obj_va, const char *label)
-{
-    serial_puts("[WDBG/UObj] ");
-    if (label) { serial_puts(label); serial_puts(" "); }
-    if (obj_va == 0) { serial_puts("<null>\n"); return; }
-    if (!va_readable(obj_va, 32)) {
-        serial_puts("<unread va=0x");
-        serial_puthex(obj_va, 8);
-        serial_puts(">\n");
-        return;
-    }
-    serial_puts("va="); serial_puthex(obj_va, 8);
-
-    uint32_t name_idx = *(volatile uint32_t *)(uintptr_t)(obj_va + g_uobj_off_name);
-    uint32_t klass    = *(volatile uint32_t *)(uintptr_t)(obj_va + g_uobj_off_class);
-    uint32_t outer    = *(volatile uint32_t *)(uintptr_t)(obj_va + g_uobj_off_outer);
-
-    serial_puts(" name="); serial_puts(wdbg_fname_resolve(name_idx));
-    serial_puts(" (idx=");  serial_putdec((uint64_t)name_idx);
-    serial_puts(") cls="); serial_puthex(klass, 8);
-    if (klass && va_readable(klass + g_uobj_off_name, 4)) {
-        uint32_t cls_name_idx = *(volatile uint32_t *)(uintptr_t)(klass + g_uobj_off_name);
-        serial_puts("("); serial_puts(wdbg_fname_resolve(cls_name_idx)); serial_puts(")");
-    }
-    serial_puts(" outer="); serial_puthex(outer, 8);
-    serial_puts("\n");
 }
 
 /* ── Stack walker ──────────────────────────────────────────── */
@@ -273,15 +225,15 @@ void wdbg_stack_walk(uint32_t ebp, int depth, const char *label)
 /* ── Stack scanner ─────────────────────────────────────────── */
 
 /* Returns 1 if `va` looks like a CALL-return address: it's in a
- * registered module AND the 5 bytes immediately before it are
+ * loaded or manually registered module AND the bytes immediately before it are
  * `E8 ?? ?? ?? ??` (relative CALL) or `FF ?? ...` (indirect CALL). */
 static int looks_like_retaddr(uint32_t va)
 {
-    /* Must land inside a registered module. */
-    int in_module = 0;
+    int in_module =
+        dll_find_module_by_address((PVOID)(uintptr_t)va) != NULL;
     for (int i = 0; i < g_module_count; i++) {
         wdbg_module_t *m = &g_modules[i];
-        if (m->used && va >= m->base && va < m->base + m->size) {
+        if (m->used && va >= m->base && va - m->base < m->size) {
             in_module = 1;
             break;
         }
@@ -374,399 +326,13 @@ void wdbg_print_wide(uint32_t va)
     serial_puts("\"");
 }
 
-/* ── Default hooks ─────────────────────────────────────────── */
-
-/*
- * Throw-helper region hook — Core.dll @0x1014BD10.
- *
- * Since the throw is NORETURN, we cannot observe a ret_addr equal to
- * the throw helper itself. Instead, we hook the *enclosing* function
- * (GetPackageLinker or its caller — UE1 typical layout puts the
- * package lookup in a ~0x200 byte function). The first time an
- * INT2E originates from somewhere in this range, dump full state.
- *
- * Range chosen: 0x1014BB00..0x1014BE00 — empirical estimate for the
- * function containing the throw at 0x1014BD10. Adjust after first
- * run shows the actual ret_addrs.
- */
-static int g_throw_hook_fired = 0;
-
-static void throw_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
-                              const uint32_t *stack_args)
-{
-    /* Throttle: dump first 5 hits with full detail, then count silently */
-    g_throw_hook_fired++;
-    if (g_throw_hook_fired > 5) {
-        if ((g_throw_hook_fired % 1000) == 0) {
-            serial_puts("[WDBG/throw] still firing: hits=");
-            serial_putdec((uint64_t)g_throw_hook_fired);
-            serial_puts("\n");
-        }
-        return;
-    }
-
-    char sym[64], sym2[64];
-    serial_puts("[WDBG/throw#");
-    serial_putdec((uint64_t)g_throw_hook_fired);
-    serial_puts("] ret_va=");
-    serial_puts(wdbg_symbolize(va, sym, sizeof sym));
-    serial_puts(" esp="); serial_puthex(esp, 8);
-    serial_puts(" ebp="); serial_puthex(ebp, 8);
-    serial_puts("\n");
-
-    /* Empirical post-disasm layout at INT2E inside CxxThrowException:
-     *   stack_args[0] = exc-object pointer (FFileException*)
-     *   stack_args[1] = throwInfo (0x1017D4B0)
-     *   stack_args[2] = exc vtbl (0x10278FF4) — was the helper's local slot
-     *   stack_args[3] = RET_helper — caller of the throw helper @0x1014BD10
-     *   stack_args[4+] = caller's locals/args
-     *
-     * Surface stack_args[3] explicitly — that's the gold.
-     */
-    serial_puts("[WDBG/throw#");
-    serial_putdec((uint64_t)g_throw_hook_fired);
-    serial_puts("] throw-caller=");
-    serial_puts(wdbg_symbolize(stack_args[3], sym2, sizeof sym2));
-    serial_puts(" exc-obj="); serial_puthex(stack_args[0], 8);
-    serial_puts(" exc-vtbl="); serial_puthex(stack_args[2], 8);
-    serial_puts("\n");
-
-    /* Full args window for forensics. */
-    serial_puts("[WDBG/throw#");
-    serial_putdec((uint64_t)g_throw_hook_fired);
-    serial_puts("] args: ");
-    for (int i = 0; i < 8; i++) {
-        if (!va_readable(esp + i * 4, 4)) break;
-        serial_puts("[+"); serial_putdec((uint64_t)(i * 4));
-        serial_puts("]="); serial_puthex(stack_args[i], 8);
-        serial_puts(" ");
-    }
-    serial_puts("\n");
-
-    /* Engine state at throw time. */
-    extern uint64_t g_int2e_user_rcx, g_int2e_user_rdx;
-    extern uint64_t g_int2e_user_rsi, g_int2e_user_rdi, g_int2e_user_rbx;
-    serial_puts("[WDBG/throw#");
-    serial_putdec((uint64_t)g_throw_hook_fired);
-    serial_puts("] regs: ECX="); serial_puthex((uint32_t)g_int2e_user_rcx, 8);
-    serial_puts(" EDX="); serial_puthex((uint32_t)g_int2e_user_rdx, 8);
-    serial_puts(" EBX="); serial_puthex((uint32_t)g_int2e_user_rbx, 8);
-    serial_puts(" ESI="); serial_puthex((uint32_t)g_int2e_user_rsi, 8);
-    serial_puts(" EDI="); serial_puthex((uint32_t)g_int2e_user_rdi, 8);
-    serial_puts("\n");
-
-    /* Dump the FFileException object @ stack_args[0]. Layout in UE1
-     * typically has:
-     *   +0  vtbl
-     *   +4..  inherited FException::Msg ANSICHAR[1024] OR a pointer
-     *   +N  filename / errno / context
-     * Probe both ANSI in-place and a possible pointer at +4. */
-    uint32_t exc = stack_args[0];
-    if (va_readable(exc, 16)) {
-        serial_puts("[WDBG/throw#");
-        serial_putdec((uint64_t)g_throw_hook_fired);
-        serial_puts("] exc-obj+0..+12: ");
-        for (int i = 0; i < 4; i++) {
-            uint32_t w = *(volatile uint32_t *)(uintptr_t)(exc + i * 4);
-            serial_puts("[+"); serial_putdec((uint64_t)(i * 4));
-            serial_puts("]="); serial_puthex(w, 8); serial_puts(" ");
-        }
-        serial_puts("\n");
-        /* Try reading exc+4 as inline ANSI string (FException::Msg) */
-        serial_puts("[WDBG/throw#");
-        serial_putdec((uint64_t)g_throw_hook_fired);
-        serial_puts("] exc-msg-inline=");
-        wdbg_print_ansi(exc + 4);
-        serial_puts("\n");
-    }
-
-    /* Stack scan: Epic/UE1 omits frame pointer in Release, so the
-     * EBP-chain walk usually finds nothing. The scanner reads N
-     * dwords above esp and prints any that look like CALL retaddrs.
-     * This is how we find upstream callers without frame pointers. */
-    wdbg_stack_scan(esp, 64, "throw-stack");
-    (void)ebp;
-}
-
-/*
- * Upstream-caller hook: 0x10159000..0x1015A000 — the function body
- * around Core.dll+0x599AB (the dominant throw caller from the first
- * run). When the engine makes a thunk call from within this region,
- * dump full local state so we can see what FName / UPackage / path
- * is being constructed just before the throw fires.
- */
-static int g_upstream_hook_fired = 0;
-
-static void upstream_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
-                                  const uint32_t *stack_args)
-{
-    g_upstream_hook_fired++;
-    /* First 20 hits with full detail, then count silently */
-    if (g_upstream_hook_fired > 20) {
-        if ((g_upstream_hook_fired % 5000) == 0) {
-            serial_puts("[WDBG/up] still firing: hits=");
-            serial_putdec((uint64_t)g_upstream_hook_fired);
-            serial_puts("\n");
-        }
-        return;
-    }
-
-    char sym[64];
-    serial_puts("[WDBG/up#");
-    serial_putdec((uint64_t)g_upstream_hook_fired);
-    serial_puts("] inside=");
-    serial_puts(wdbg_symbolize(va, sym, sizeof sym));
-    serial_puts(" esp="); serial_puthex(esp, 8);
-    serial_puts(" ebp="); serial_puthex(ebp, 8);
-    serial_puts("\n");
-
-    /* Engine state at thunk call site within the upstream function:
-     * ECX is typically `this` (thiscall convention used everywhere in
-     * UE1), EDX/EBX/ESI/EDI are local register vars. */
-    extern uint64_t g_int2e_user_rcx, g_int2e_user_rdx;
-    extern uint64_t g_int2e_user_rsi, g_int2e_user_rdi, g_int2e_user_rbx;
-    uint32_t ecx = (uint32_t)g_int2e_user_rcx;
-    uint32_t edx = (uint32_t)g_int2e_user_rdx;
-    uint32_t ebx = (uint32_t)g_int2e_user_rbx;
-    uint32_t esi = (uint32_t)g_int2e_user_rsi;
-    uint32_t edi = (uint32_t)g_int2e_user_rdi;
-    serial_puts("[WDBG/up#");
-    serial_putdec((uint64_t)g_upstream_hook_fired);
-    serial_puts("] regs: ECX="); serial_puthex(ecx, 8);
-    serial_puts(" EDX="); serial_puthex(edx, 8);
-    serial_puts(" EBX="); serial_puthex(ebx, 8);
-    serial_puts(" ESI="); serial_puthex(esi, 8);
-    serial_puts(" EDI="); serial_puthex(edi, 8);
-    serial_puts("\n");
-
-    /* Args window — first 6 dwords above the thunk-call RET. These
-     * are the args the engine just passed to the thunked import
-     * (kernel32/msvcrt/...). Common: file name pointer for CreateFile,
-     * wstring pointer for MultiByteToWideChar, etc. */
-    serial_puts("[WDBG/up#");
-    serial_putdec((uint64_t)g_upstream_hook_fired);
-    serial_puts("] args: ");
-    for (int i = 0; i < 6; i++) {
-        if (!va_readable(esp + i * 4, 4)) break;
-        serial_puts("[+"); serial_putdec((uint64_t)(i * 4));
-        serial_puts("]="); serial_puthex(stack_args[i], 8);
-        serial_puts(" ");
-    }
-    serial_puts("\n");
-
-    /* Try interpreting each register as a UObject or a string. */
-    if (ecx >= 0x10000 && ecx < 0x80000000u && va_readable(ecx, 32)) {
-        wdbg_uobject_dump(ecx, "ECX-as-UObject");
-    }
-
-    /* Args as candidate strings — common for path/name args. */
-    for (int i = 0; i < 4; i++) {
-        if (!va_readable(esp + i * 4, 4)) break;
-        uint32_t a = stack_args[i];
-        if (a >= 0x10000 && a < 0x80000000u && va_readable(a, 2)) {
-            /* Heuristic: if first byte is printable ASCII, treat as
-             * ANSI; if second byte is 0 and first is printable,
-             * treat as wide. */
-            uint8_t b0 = *(volatile uint8_t *)(uintptr_t)a;
-            uint8_t b1 = *(volatile uint8_t *)(uintptr_t)(a + 1);
-            if (b0 >= 0x20 && b0 < 0x7F) {
-                serial_puts("[WDBG/up#");
-                serial_putdec((uint64_t)g_upstream_hook_fired);
-                serial_puts("] arg"); serial_putdec((uint64_t)i);
-                serial_puts(b1 == 0 ? "-wstr=" : "-astr=");
-                if (b1 == 0) wdbg_print_wide(a);
-                else         wdbg_print_ansi(a);
-                serial_puts("\n");
-            }
-        }
-        /* Small int < 0x10000 — candidate FName index. */
-        else if (a > 0 && a < 0x10000) {
-            serial_puts("[WDBG/up#");
-            serial_putdec((uint64_t)g_upstream_hook_fired);
-            serial_puts("] arg"); serial_putdec((uint64_t)i);
-            serial_puts("-as-FName=");
-            serial_puts(wdbg_fname_resolve(a));
-            serial_puts("\n");
-        }
-    }
-
-    wdbg_stack_walk(ebp, 4, "up-callers");
-}
-
-/*
- * UT.exe-exit hook — 0x10922000..0x10922400.
- *
- * The K32 log shows ExitProcess is called from UT.exe+0x221BA with
- * an exit code that's a stack address (EBP-0xC8 local var). This
- * means the engine reaches some "quit" path with an uninitialized
- * local. Hook the surrounding function body to see what's happening
- * just before the exit call.
- */
-static int g_exit_hook_fired = 0;
-
-static void __attribute__((unused))
-exit_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
-                 const uint32_t *stack_args)
-{
-    g_exit_hook_fired++;
-    if (g_exit_hook_fired > 30) {
-        if ((g_exit_hook_fired % 5000) == 0) {
-            serial_puts("[WDBG/exit] still firing: hits=");
-            serial_putdec((uint64_t)g_exit_hook_fired);
-            serial_puts("\n");
-        }
-        return;
-    }
-    char sym[64];
-    serial_puts("[WDBG/exit#");
-    serial_putdec((uint64_t)g_exit_hook_fired);
-    serial_puts("] inside=");
-    serial_puts(wdbg_symbolize(va, sym, sizeof sym));
-    serial_puts(" esp="); serial_puthex(esp, 8);
-    serial_puts(" ebp="); serial_puthex(ebp, 8);
-    serial_puts("\n");
-
-    extern uint64_t g_int2e_user_rcx, g_int2e_user_rdx;
-    extern uint64_t g_int2e_user_rsi, g_int2e_user_rdi, g_int2e_user_rbx;
-    serial_puts("[WDBG/exit#");
-    serial_putdec((uint64_t)g_exit_hook_fired);
-    serial_puts("] regs: ECX="); serial_puthex((uint32_t)g_int2e_user_rcx, 8);
-    serial_puts(" EDX="); serial_puthex((uint32_t)g_int2e_user_rdx, 8);
-    serial_puts(" EBX="); serial_puthex((uint32_t)g_int2e_user_rbx, 8);
-    serial_puts(" ESI="); serial_puthex((uint32_t)g_int2e_user_rsi, 8);
-    serial_puts(" EDI="); serial_puthex((uint32_t)g_int2e_user_rdi, 8);
-    serial_puts("\n");
-
-    /* Show the args being passed to whatever thunk is being called. */
-    serial_puts("[WDBG/exit#");
-    serial_putdec((uint64_t)g_exit_hook_fired);
-    serial_puts("] args: ");
-    for (int i = 0; i < 6; i++) {
-        if (!va_readable(esp + i * 4, 4)) break;
-        serial_puts("[+"); serial_putdec((uint64_t)(i * 4));
-        serial_puts("]="); serial_puthex(stack_args[i], 8);
-        serial_puts(" ");
-    }
-    serial_puts("\n");
-
-    wdbg_stack_scan(esp, 80, "exit-stack");
-}
-
-/*
- * UT.exe+0x4756 caller hunt. The stack-scan from the throw region
- * identified UT.exe+0x4756 as the topmost frame on the
- * "Failed to load '0'" → "Failed to load ''" → " .GameEngine"
- * cascade. Hook the surrounding basic block so every thunk call
- * made from there dumps:
- *   - the symbolized ret_va (which thunk),
- *   - arg0..arg5 (the LoadObject path takes the package/class/name
- *     wide-strings as args),
- *   - arg0 + ECX + EDX rendered as wide-strings when they look like
- *     pointers (LoadObject's first wstring arg is typically the
- *     package, and ECX is the `this`).
- */
-static int g_ut_hook_fired = 0;
-
-static void ut_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
-                            const uint32_t *stack_args)
-{
-    g_ut_hook_fired++;
-    if (g_ut_hook_fired > 20) {
-        if ((g_ut_hook_fired % 5000) == 0) {
-            serial_puts("[WDBG/ut] still firing: hits=");
-            serial_putdec((uint64_t)g_ut_hook_fired);
-            serial_puts("\n");
-        }
-        return;
-    }
-    (void)ebp;
-    char sym[64];
-    serial_puts("[WDBG/ut#");
-    serial_putdec((uint64_t)g_ut_hook_fired);
-    serial_puts("] inside=");
-    serial_puts(wdbg_symbolize(va, sym, sizeof sym));
-
-    extern uint64_t g_int2e_user_rcx, g_int2e_user_rdx;
-    uint32_t ecx = (uint32_t)g_int2e_user_rcx;
-    uint32_t edx = (uint32_t)g_int2e_user_rdx;
-    serial_puts(" ECX="); serial_puthex(ecx, 8);
-    serial_puts(" EDX="); serial_puthex(edx, 8);
-    serial_puts("\n");
-
-    serial_puts("[WDBG/ut#");
-    serial_putdec((uint64_t)g_ut_hook_fired);
-    serial_puts("] args:");
-    for (int i = 0; i < 6; i++) {
-        if (!va_readable(esp + i * 4, 4)) break;
-        serial_puts(" ["); serial_putdec((uint64_t)i); serial_puts("]=");
-        serial_puthex(stack_args[i], 8);
-    }
-    serial_puts("\n");
-
-    /* Each arg / ECX / EDX rendered as wide-string when it looks
-     * like a pointer to readable memory. wdbg_print_wide handles
-     * NULL / unreadable / unterminated safely. */
-    uint32_t cands[8];
-    cands[0] = ecx;
-    cands[1] = edx;
-    for (int i = 0; i < 6; i++)
-        cands[2 + i] = va_readable(esp + i * 4, 4) ? stack_args[i] : 0;
-    static const char *labels[8] = {
-        "ECX", "EDX", "arg0", "arg1", "arg2", "arg3", "arg4", "arg5"
-    };
-    for (int i = 0; i < 8; i++) {
-        uint32_t a = cands[i];
-        if (a < 0x10000 || a >= 0x80000000u) continue;
-        if (!va_readable(a, 4)) continue;
-        uint16_t w0 = *(volatile uint16_t *)(uintptr_t)a;
-        /* Heuristic: a wide-string starts with a printable ASCII
-         * (0x20..0x7E) low byte and the high byte is 0. */
-        if ((w0 & 0xFF) >= 0x20 && (w0 & 0xFF) < 0x7F && (w0 >> 8) == 0) {
-            serial_puts("[WDBG/ut#");
-            serial_putdec((uint64_t)g_ut_hook_fired);
-            serial_puts("] "); serial_puts(labels[i]); serial_puts("=");
-            wdbg_print_wide(a);
-            serial_puts("\n");
-        }
-    }
-}
-
 void wdbg_init(void)
 {
-    /* Pre-register UT99 module ranges (empirically observed). These
-     * can be overwritten later by pe.c's actual load addresses. */
-    wdbg_register_module("Core.dll",   0x10100000, 0x00200000);
-    wdbg_register_module("Engine.dll", 0x10300000, 0x00200000);
-    wdbg_register_module("UT.exe",     0x10900000, 0x00200000);
-
-    /* Hook on the throw-helper region — fires inside CxxThrowException
-     * because the helper @0x1014BD10 calls it via msvcrt thunk. Gives
-     * us the post-disasm view: who called the throw helper. */
-    wdbg_addr_hook(0x1014BB00, 0x1014BF00,
-                   throw_caller_dump,
-                   "throw-helper-region");
-
-    /* Upstream-caller hook — Core.dll +0x59000..+0x5A000. Quiet now
-     * that throws are fixed (0 hits with FNAME canonical fix). Kept
-     * registered in case throws ever return — would surface
-     * immediately. */
-    wdbg_addr_hook(0x10159000, 0x1015A000,
-                   upstream_caller_dump,
-                   "upstream-0x599AB-region");
-
-    /* UT.exe exit hook intentionally disabled on real hardware. It is a
-     * noisy UT99-only diagnostic and can fault while reading the compat32
-     * stack during unrelated DLL/IAT work, masking the actual process state. */
-
-    /* UT.exe+0x4700..0x4800 — basic block around 0x4756 identified
-     * by the throw-helper stack scan as the topmost frame on the
-     * "Failed to load '0'" cascade. Hook dumps every thunk call from
-     * here so we can see exactly what string argument UT.exe is
-     * passing to Core.dll when the engine asks for the missing
-     * package. */
-    wdbg_addr_hook(0x10904700, 0x10904800,
-                   ut_caller_dump,
-                   "UT-loadcaller-0x4756-region");
-
-    serial_puts("[WDBG] init: 3 modules, 3 hooks registered\n");
+    for (int i = 0; i < WDBG_MAX_MODULES; i++)
+        g_modules[i].used = 0;
+    for (int i = 0; i < WDBG_MAX_HOOKS; i++)
+        g_hooks[i].used = 0;
+    g_module_count = 0;
+    g_hook_count = 0;
+    serial_puts("[WDBG] ready: loader-backed symbols, no default hooks\n");
 }

@@ -18,6 +18,8 @@
 /* EXE ImageBase — used by GetModuleHandleA(NULL) */
 ULONG_PTR g_exe_image_base;
 static USHORT g_exe_subsystem;
+static USHORT g_exe_subsystem_major_version;
+static USHORT g_exe_subsystem_minor_version;
 #include "advapi32_shim.h"
 #include "scm.h"
 #include "user32_shim.h"
@@ -37,6 +39,7 @@ static USHORT g_exe_subsystem;
 #include "crypt32_shim.h"
 #include "comctl32_shim.h"
 #include "comdlg32_shim.h"
+#include "richedit_shim.h"
 #include "compat32.h"
 #include "win32_abi.h"
 #include "handle.h"
@@ -277,7 +280,12 @@ static int pe_allocation_conflict_snapshot(uint64_t base, uint64_t size)
         return 1;
 
     uint64_t cr3 = pe_va_cr3();
-    if (cr3 && cr3 != paging_get_kernel_cr3()) {
+    if (cr3 == paging_get_kernel_cr3()) {
+        extern uint64_t mem_identity_reservation_conflict_end(
+            uint64_t candidate, uint64_t candidate_size);
+        if (mem_identity_reservation_conflict_end(base, size))
+            return 1;
+    } else if (cr3) {
         uint64_t mapped_end =
             paging_first_mapped_end_in_cr3(cr3, base, size);
         if (mapped_end)
@@ -316,6 +324,29 @@ BOOL pe_va_query_range(ULONGLONG address, ULONGLONG *base,
     if (size) *size = found_size;
     if (next_base) *next_base = next;
     return found_size ? TRUE : FALSE;
+}
+
+BOOL pe_va_range_contains(ULONGLONG base, ULONGLONG size)
+{
+    uint64_t end = base + size;
+    if (!size || end < base)
+        return FALSE;
+
+    DWORD owner_pid = pe_va_owner();
+    uint64_t owner_cr3 = pe_va_cr3();
+    int count = __atomic_load_n(&pe_va_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < count; i++) {
+        uint64_t range_base = pe_va_ranges[i].base;
+        uint64_t range_size = __atomic_load_n(&pe_va_ranges[i].size,
+                                               __ATOMIC_ACQUIRE);
+        uint64_t range_end = range_base + range_size;
+        if (!range_size || pe_va_ranges[i].owner_pid != owner_pid ||
+            pe_va_ranges[i].cr3 != owner_cr3 || range_end < range_base)
+            continue;
+        if (base >= range_base && end <= range_end)
+            return TRUE;
+    }
+    return FALSE;
 }
 
 static void pe_va_record(uint64_t base, uint64_t size, uint64_t cr3,
@@ -745,11 +776,205 @@ _Static_assert(__builtin_offsetof(WIN32_RTL_USER_PROCESS_PARAMETERS32,
                                   Environment) == 0x48,
                "Win32 process parameters environment offset changed");
 
+typedef struct __attribute__((packed)) {
+    uint32_t Flink;
+    uint32_t Blink;
+} WIN32_LIST_ENTRY32;
+
+typedef struct __attribute__((packed)) {
+    ULONG Length;
+    BYTE Initialized;
+    BYTE Reserved1[3];
+    uint32_t SsHandle;
+    WIN32_LIST_ENTRY32 InLoadOrderModuleList;
+    WIN32_LIST_ENTRY32 InMemoryOrderModuleList;
+    WIN32_LIST_ENTRY32 InInitializationOrderModuleList;
+    uint32_t EntryInProgress;
+    BYTE ShutdownInProgress;
+    BYTE Reserved2[3];
+    uint32_t ShutdownThreadId;
+} WIN32_PEB_LDR_DATA32;
+
+typedef struct __attribute__((packed)) {
+    WIN32_LIST_ENTRY32 InLoadOrderLinks;
+    WIN32_LIST_ENTRY32 InMemoryOrderLinks;
+    WIN32_LIST_ENTRY32 InInitializationOrderLinks;
+    uint32_t DllBase;
+    uint32_t EntryPoint;
+    ULONG SizeOfImage;
+    WIN32_UNICODE_STRING32 FullDllName;
+    WIN32_UNICODE_STRING32 BaseDllName;
+    ULONG Flags;
+    USHORT LoadCount;
+    USHORT TlsIndex;
+    WIN32_LIST_ENTRY32 HashLinks;
+    ULONG TimeDateStamp;
+    uint32_t EntryPointActivationContext;
+    uint32_t PatchInformation;
+    WIN32_LIST_ENTRY32 ForwarderLinks;
+    WIN32_LIST_ENTRY32 ServiceTagLinks;
+    WIN32_LIST_ENTRY32 StaticLinks;
+    uint32_t ContextInformation;
+    uint32_t OriginalBase;
+    int64_t LoadTime;
+    ULONG BaseNameHashValue;
+    ULONG LoadReason;
+    ULONG ImplicitPathOptions;
+    ULONG ReferenceCount;
+    ULONG DependentLoadFlags;
+    BYTE SigningLevel;
+    BYTE Reserved[0x1B];
+} WIN32_LDR_DATA_TABLE_ENTRY32;
+
+_Static_assert(sizeof(WIN32_PEB_LDR_DATA32) == 0x30,
+               "Win32 PEB loader data size changed");
+_Static_assert(__builtin_offsetof(WIN32_PEB_LDR_DATA32,
+                                  InLoadOrderModuleList) == 0x0C,
+               "Win32 loader list head offset changed");
+_Static_assert(__builtin_offsetof(WIN32_LDR_DATA_TABLE_ENTRY32,
+                                  DllBase) == 0x18,
+               "Win32 loader DllBase offset changed");
+_Static_assert(__builtin_offsetof(WIN32_LDR_DATA_TABLE_ENTRY32,
+                                  FullDllName) == 0x24,
+               "Win32 loader full-name offset changed");
+_Static_assert(__builtin_offsetof(WIN32_LDR_DATA_TABLE_ENTRY32,
+                                  BaseDllName) == 0x2C,
+               "Win32 loader base-name offset changed");
+_Static_assert(sizeof(WIN32_LDR_DATA_TABLE_ENTRY32) == 0xA8,
+               "Win32 loader entry size changed");
+
+#define WIN32_LDR_MODULE_CAPACITY (MAX_LOADED_MODULES + 1)
+
+_Static_assert(WIN32_LDR_MODULE_CAPACITY <= 0xFFFFU,
+               "Win32 loader slots must fit in the stable order index");
+
+typedef struct {
+    WIN32_LDR_DATA_TABLE_ENTRY32 entry;
+    WCHAR full_name[WIN32_PROCESS_IMAGE_PATH_CAP];
+    WCHAR base_name[64];
+    BOOL used;
+} WIN32_LDR_MODULE32;
+
+typedef struct {
+    ULONG Length;
+    BYTE Initialized;
+    BYTE Reserved1[3];
+    PVOID SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+    LIST_ENTRY InInitializationOrderModuleList;
+    PVOID EntryInProgress;
+    BYTE ShutdownInProgress;
+    BYTE Reserved2[7];
+    HANDLE ShutdownThreadId;
+} WIN64_PEB_LDR_DATA;
+
+typedef struct {
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    ULONG Reserved0;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+    ULONG Flags;
+    USHORT LoadCount;
+    USHORT TlsIndex;
+    LIST_ENTRY HashLinks;
+    ULONG TimeDateStamp;
+    ULONG Reserved1;
+    PVOID EntryPointActivationContext;
+    PVOID Lock;
+    PVOID DdagNode;
+    LIST_ENTRY NodeModuleLink;
+    PVOID LoadContext;
+    PVOID ParentDllBase;
+    PVOID SwitchBackContext;
+    BYTE BaseAddressIndexNode[0x18];
+    BYTE MappingInfoIndexNode[0x18];
+    ULONG_PTR OriginalBase;
+    LARGE_INTEGER LoadTime;
+    ULONG BaseNameHashValue;
+    ULONG LoadReason;
+    ULONG ImplicitPathOptions;
+    ULONG ReferenceCount;
+    ULONG DependentLoadFlags;
+    BYTE SigningLevel;
+    BYTE Reserved2[3];
+} WIN64_LDR_DATA_TABLE_ENTRY;
+
+_Static_assert(sizeof(WIN64_PEB_LDR_DATA) == 0x58,
+               "Win64 PEB loader data size changed");
+_Static_assert(__builtin_offsetof(WIN64_PEB_LDR_DATA,
+                                  InLoadOrderModuleList) == 0x10,
+               "Win64 loader list head offset changed");
+_Static_assert(__builtin_offsetof(WIN64_LDR_DATA_TABLE_ENTRY,
+                                  DllBase) == 0x30,
+               "Win64 loader DllBase offset changed");
+_Static_assert(__builtin_offsetof(WIN64_LDR_DATA_TABLE_ENTRY,
+                                  FullDllName) == 0x48,
+               "Win64 loader full-name offset changed");
+_Static_assert(__builtin_offsetof(WIN64_LDR_DATA_TABLE_ENTRY,
+                                  BaseDllName) == 0x58,
+               "Win64 loader base-name offset changed");
+_Static_assert(__builtin_offsetof(WIN64_LDR_DATA_TABLE_ENTRY,
+                                  ReferenceCount) == 0x114,
+               "Win64 loader reference-count offset changed");
+_Static_assert(sizeof(WIN64_LDR_DATA_TABLE_ENTRY) == 0x120,
+               "Win64 loader entry size changed");
+
+typedef struct {
+    WIN64_LDR_DATA_TABLE_ENTRY entry;
+    WCHAR full_name[WIN32_PROCESS_IMAGE_PATH_CAP];
+    WCHAR base_name[64];
+    BOOL used;
+} WIN64_LDR_MODULE;
+
+typedef struct {
+    RTL_CRITICAL_SECTION peb_lock;
+    RTL_CRITICAL_SECTION loader_lock;
+    WIN64_PEB_LDR_DATA loader_data;
+    USHORT loader_order[WIN32_LDR_MODULE_CAPACITY];
+    USHORT loader_count;
+    USHORT loader_reserved;
+    WIN64_LDR_MODULE loader_modules[WIN32_LDR_MODULE_CAPACITY];
+} WIN64_LOADER_PROCESS_BLOCK;
+
+#define WIN64_PEB_STORAGE_SIZE 0x1000U
+#define WIN64_TLS_SLOT_CAPACITY 1024U
+
+typedef struct {
+    TEB teb;
+    PEB peb;
+    BYTE peb_padding[WIN64_PEB_STORAGE_SIZE - sizeof(PEB)];
+    RTL_USER_PROCESS_PARAMETERS process_parameters;
+    PVOID process_heaps[1];
+    WCHAR image_path_w[WIN32_PROCESS_IMAGE_PATH_CAP];
+    WCHAR command_line_w[WIN32_CHILD_COMMAND_LINE_CAP];
+    WCHAR current_directory_w[WIN32_PROCESS_IMAGE_PATH_CAP];
+    WCHAR dll_path_w[WIN32_PROCESS_DLL_PATH_CAP];
+    WCHAR desktop_info_w[WIN32_PROCESS_DESKTOP_CAP];
+    WCHAR environment_w[WIN32_PROCESS_ENVIRONMENT_CAP];
+    PVOID tls_vector[WIN64_TLS_SLOT_CAPACITY];
+    PVOID tls_expansion[WIN64_TLS_SLOT_CAPACITY - 64];
+    WIN64_LOADER_PROCESS_BLOCK loader;
+} WIN64_PROCESS_BLOCK;
+
+_Static_assert(__builtin_offsetof(WIN64_PROCESS_BLOCK, peb) ==
+                   TEB64_STORAGE_SIZE,
+               "Win64 PEB must follow the two-page TEB");
+_Static_assert(__builtin_offsetof(WIN64_PROCESS_BLOCK,
+                                  process_parameters) ==
+                   TEB64_STORAGE_SIZE + WIN64_PEB_STORAGE_SIZE,
+               "Win64 process parameters must not overlap the PEB page");
+
 typedef struct {
     TEB32 teb;
-    BYTE teb_padding[0x100 - sizeof(TEB32)];
+    BYTE teb_padding[TEB32_STORAGE_SIZE - sizeof(TEB32)];
     PEB32 peb;
-    BYTE peb_padding[0x120 - 0x100 - sizeof(PEB32)];
+    BYTE peb_padding[PEB32_STORAGE_SIZE - sizeof(PEB32)];
     WIN32_RTL_USER_PROCESS_PARAMETERS32 process_parameters;
     uint32_t process_heaps[1];
     char image_path[260];
@@ -762,10 +987,22 @@ typedef struct {
     WCHAR dll_path_w[WIN32_PROCESS_DLL_PATH_CAP];
     WCHAR desktop_info_w[WIN32_PROCESS_DESKTOP_CAP];
     WCHAR environment_w[WIN32_PROCESS_ENVIRONMENT_CAP];
+    RTL_CRITICAL_SECTION32 peb_lock;
+    RTL_CRITICAL_SECTION32 loader_lock;
+    WIN32_PEB_LDR_DATA32 loader_data;
+    USHORT loader_order[WIN32_LDR_MODULE_CAPACITY];
+    USHORT loader_count;
+    USHORT loader_reserved;
+    WIN32_LDR_MODULE32 loader_modules[WIN32_LDR_MODULE_CAPACITY];
 } WIN32_COMPAT_PROCESS_BLOCK;
 
-_Static_assert(__builtin_offsetof(WIN32_COMPAT_PROCESS_BLOCK, peb) == 0x100,
-               "Win32 PEB must remain at TEB page offset 0x100");
+_Static_assert(__builtin_offsetof(WIN32_COMPAT_PROCESS_BLOCK, peb) ==
+                   TEB32_STORAGE_SIZE,
+               "Win32 PEB must start on the page after the TEB");
+_Static_assert(__builtin_offsetof(WIN32_COMPAT_PROCESS_BLOCK,
+                                  process_parameters) ==
+                   TEB32_STORAGE_SIZE + PEB32_STORAGE_SIZE,
+               "Win32 process parameters must not overlap the PEB page");
 
 static RTL_USER_PROCESS_PARAMETERS g_process_parameters;
 static WCHAR g_image_path_w[WIN32_PROCESS_IMAGE_PATH_CAP];
@@ -775,6 +1012,8 @@ static WCHAR g_dll_path_w[WIN32_PROCESS_DLL_PATH_CAP];
 static WCHAR g_desktop_info_w[WIN32_PROCESS_DESKTOP_CAP];
 static WCHAR g_environment_w[WIN32_PROCESS_ENVIRONMENT_CAP];
 static PVOID g_process_heaps[1];
+static WIN32_COMPAT_PROCESS_BLOCK *g_main_compat_environment32;
+static WIN64_PROCESS_BLOCK *g_main_environment64;
 
 typedef struct {
     BOOL used;
@@ -784,6 +1023,8 @@ typedef struct {
     ULONG parent_process_id;
     ULONG thread_id;
     USHORT subsystem;
+    USHORT subsystem_major_version;
+    USHORT subsystem_minor_version;
     PVOID process_object;
     PVOID thread_object;
     HANDLE process_handle;
@@ -805,19 +1046,41 @@ typedef struct {
     PVOID process_heaps[1];
     PEB peb;
     TEB teb;
+    WIN64_PROCESS_BLOCK *environment64;
     PVOID *tls_vector;
     WIN32_COMPAT_PROCESS_BLOCK *compat_environment32;
     PEB32 *peb32;
     TEB32 *teb32;
     uint32_t *tls_vector32;
-    PVOID saved_spew_output;
-    BOOL saved_spew_output_valid;
+    WIN64_LOADER_PROCESS_BLOCK *loader_environment64;
     HANDLE inherited_handles[WIN32_CHILD_INHERITED_HANDLE_CAP];
     DWORD inherited_handle_count;
     uint64_t exit_jmpbuf[9];
 } WIN32_CHILD_CONTEXT;
 
 static WIN32_CHILD_CONTEXT g_win32_children[MAX_WIN32_CHILDREN];
+
+static PPEB win32_child_peb(WIN32_CHILD_CONTEXT *child)
+{
+    if (!child) return NULL;
+    return child->environment64 ? &child->environment64->peb : &child->peb;
+}
+
+static TEB *win32_child_teb(WIN32_CHILD_CONTEXT *child)
+{
+    if (!child) return NULL;
+    return child->environment64 ? &child->environment64->teb : &child->teb;
+}
+
+static PPEB win64_main_peb(void)
+{
+    return g_main_environment64 ? &g_main_environment64->peb : &g_peb;
+}
+
+static TEB *win64_main_teb(void)
+{
+    return g_main_environment64 ? &g_main_environment64->teb : &g_teb;
+}
 
 typedef struct {
     volatile BOOL active;
@@ -863,7 +1126,8 @@ static WIN32_CHILD_CONTEXT *win32_current_child(void)
         for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
             WIN32_CHILD_CONTEXT *child = &g_win32_children[i];
             if (__atomic_load_n(&child->used, __ATOMIC_ACQUIRE) &&
-                process_peb == &child->peb)
+                (process_peb == win32_child_peb(child) ||
+                 process_peb == &child->peb))
                 return child;
         }
     }
@@ -882,16 +1146,59 @@ static WIN32_CHILD_CONTEXT *win32_current_child(void)
     return NULL;
 }
 
-static BOOL win32_ascii_prefix_ci(const char *text, const char *prefix)
+static void win32_apply_console_parameters(
+    PRTL_USER_PROCESS_PARAMETERS parameters, DWORD process_id)
 {
-    while (*prefix) {
-        char a = *text++;
-        char b = *prefix++;
-        if (a >= 'a' && a <= 'z') a -= 'a' - 'A';
-        if (b >= 'a' && b <= 'z') b -= 'a' - 'A';
-        if (a != b) return FALSE;
+    HANDLE console = NULL;
+    HANDLE input = NULL;
+    HANDLE output = NULL;
+    HANDLE error = NULL;
+    (void)kernel32_query_process_console(process_id, &console, &input,
+                                         &output, &error);
+    parameters->ConsoleHandle = console;
+    parameters->StandardInput = input;
+    parameters->StandardOutput = output;
+    parameters->StandardError = error;
+}
+
+static void win32_apply_console_parameters32(
+    WIN32_RTL_USER_PROCESS_PARAMETERS32 *parameters, DWORD process_id)
+{
+    HANDLE console = NULL;
+    HANDLE input = NULL;
+    HANDLE output = NULL;
+    HANDLE error = NULL;
+    (void)kernel32_query_process_console(process_id, &console, &input,
+                                         &output, &error);
+    parameters->ConsoleHandle = (uint32_t)(ULONG_PTR)console;
+    parameters->StandardInput = (uint32_t)(ULONG_PTR)input;
+    parameters->StandardOutput = (uint32_t)(ULONG_PTR)output;
+    parameters->StandardError = (uint32_t)(ULONG_PTR)error;
+}
+
+void win32_refresh_current_console_parameters(void)
+{
+    WIN32_CHILD_CONTEXT *child = win32_current_child();
+    if (child) {
+        PRTL_USER_PROCESS_PARAMETERS parameters = child->environment64
+            ? &child->environment64->process_parameters
+            : &child->process_parameters;
+        win32_apply_console_parameters(parameters,
+                                       child->process_id);
+        if (child->compat_environment32)
+            win32_apply_console_parameters32(
+                &child->compat_environment32->process_parameters,
+                child->process_id);
+        return;
     }
-    return TRUE;
+
+    PRTL_USER_PROCESS_PARAMETERS parameters = g_main_environment64
+        ? &g_main_environment64->process_parameters
+        : &g_process_parameters;
+    win32_apply_console_parameters(parameters, 1);
+    if (g_main_compat_environment32)
+        win32_apply_console_parameters32(
+            &g_main_compat_environment32->process_parameters, 1);
 }
 
 static BOOL win32_wide_append_ascii(WCHAR *destination, SIZE_T capacity,
@@ -912,13 +1219,13 @@ static BOOL win32_wide_append_ascii(WCHAR *destination, SIZE_T capacity,
 static BOOL win32_build_image_path_w(const char *relative, WCHAR *destination,
                                       SIZE_T capacity)
 {
-    static const char prefix[] = "C:\\System\\";
     SIZE_T length = 0;
     if (!relative) relative = "";
-    if (relative[0] && relative[1] == ':') relative += 2;
+    if (relative[0] && relative[1] == ':')
+        return win32_wide_append_ascii(destination, capacity, &length,
+                                        relative, TRUE);
     while (*relative == '\\' || *relative == '/') relative++;
-    if (win32_ascii_prefix_ci(relative, "System\\")) relative += 7;
-    return win32_wide_append_ascii(destination, capacity, &length, prefix,
+    return win32_wide_append_ascii(destination, capacity, &length, "C:\\",
                                     TRUE) &&
            win32_wide_append_ascii(destination, capacity, &length, relative,
                                     TRUE);
@@ -984,26 +1291,551 @@ static void win32_init_unicode_string32(WIN32_UNICODE_STRING32 *string,
     string->Buffer = (uint32_t)(ULONG_PTR)buffer;
 }
 
-static BOOL win32_populate_compat_process_block(WIN32_CHILD_CONTEXT *child,
-                                                 BOOL reset)
+static WIN32_COMPAT_PROCESS_BLOCK *win32_compat_block_for_process(
+    DWORD process_id)
 {
-    WIN32_COMPAT_PROCESS_BLOCK *block = child->compat_environment32;
+    if (process_id == 1 && g_main_compat_environment32)
+        return g_main_compat_environment32;
+
+    for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
+        WIN32_CHILD_CONTEXT *child = &g_win32_children[i];
+        if (__atomic_load_n(&child->used, __ATOMIC_ACQUIRE) &&
+            child->process_id == process_id)
+            return child->compat_environment32;
+    }
+    return NULL;
+}
+
+static WIN64_LOADER_PROCESS_BLOCK *win64_loader_block_for_process(
+    DWORD process_id)
+{
+    if (process_id == 1 && g_main_environment64)
+        return &g_main_environment64->loader;
+
+    for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
+        WIN32_CHILD_CONTEXT *child = &g_win32_children[i];
+        if (__atomic_load_n(&child->used, __ATOMIC_ACQUIRE) &&
+            child->process_id == process_id)
+            return child->loader_environment64;
+    }
+    return NULL;
+}
+
+static WIN32_LIST_ENTRY32 *win32_loader_head32(
+    WIN32_COMPAT_PROCESS_BLOCK *block, unsigned list)
+{
+    if (list == 0) return &block->loader_data.InLoadOrderModuleList;
+    if (list == 1) return &block->loader_data.InMemoryOrderModuleList;
+    return &block->loader_data.InInitializationOrderModuleList;
+}
+
+static WIN32_LIST_ENTRY32 *win32_loader_link32(
+    WIN32_LDR_MODULE32 *module, unsigned list)
+{
+    if (list == 0) return &module->entry.InLoadOrderLinks;
+    if (list == 1) return &module->entry.InMemoryOrderLinks;
+    return &module->entry.InInitializationOrderLinks;
+}
+
+static uint32_t win32_loader_pointer32(const void *pointer)
+{
+    return (uint32_t)(ULONG_PTR)pointer;
+}
+
+static LIST_ENTRY *win64_loader_head(WIN64_LOADER_PROCESS_BLOCK *block,
+                                     unsigned list)
+{
+    if (list == 0) return &block->loader_data.InLoadOrderModuleList;
+    if (list == 1) return &block->loader_data.InMemoryOrderModuleList;
+    return &block->loader_data.InInitializationOrderModuleList;
+}
+
+static LIST_ENTRY *win64_loader_link(WIN64_LDR_MODULE *module,
+                                     unsigned list)
+{
+    if (list == 0) return &module->entry.InLoadOrderLinks;
+    if (list == 1) return &module->entry.InMemoryOrderLinks;
+    return &module->entry.InInitializationOrderLinks;
+}
+
+static void win32_initialize_loader32(WIN32_COMPAT_PROCESS_BLOCK *block)
+{
+    if (!block) return;
+
+    memset(&block->peb_lock, 0, sizeof(block->peb_lock));
+    block->peb_lock.LockCount = -1;
+    memset(&block->loader_lock, 0, sizeof(block->loader_lock));
+    block->loader_lock.LockCount = -1;
+    memset(&block->loader_data, 0, sizeof(block->loader_data));
+    block->loader_count = 0;
+    block->loader_data.Length = sizeof(block->loader_data);
+    block->loader_data.Initialized = TRUE;
+
+    for (unsigned list = 0; list < 3; list++) {
+        WIN32_LIST_ENTRY32 *head = win32_loader_head32(block, list);
+        head->Flink = win32_loader_pointer32(head);
+        head->Blink = win32_loader_pointer32(head);
+    }
+    block->peb.FastPebLock = win32_loader_pointer32(&block->peb_lock);
+    block->peb.Ldr = win32_loader_pointer32(&block->loader_data);
+    block->peb.LoaderLock = win32_loader_pointer32(&block->loader_lock);
+}
+
+static void win64_initialize_loader(PPEB peb,
+                                    WIN64_LOADER_PROCESS_BLOCK *block)
+{
+    if (!peb || !block) return;
+
+    memset(block, 0, sizeof(*block));
+    block->peb_lock.LockCount = -1;
+    block->loader_lock.LockCount = -1;
+    block->loader_data.Length = sizeof(block->loader_data);
+    block->loader_data.Initialized = TRUE;
+    for (unsigned list = 0; list < 3; list++) {
+        LIST_ENTRY *head = win64_loader_head(block, list);
+        head->Flink = head;
+        head->Blink = head;
+    }
+    peb->FastPebLock = &block->peb_lock;
+    peb->Ldr = &block->loader_data;
+    peb->LoaderLock = &block->loader_lock;
+}
+
+PVOID win32_current_peb_lock(void)
+{
+    DWORD process_id = win32_current_process_id();
+    if (!process_id) process_id = 1;
+
+    WIN32_COMPAT_PROCESS_BLOCK *block =
+        win32_compat_block_for_process(process_id);
+    if (block) return &block->peb_lock;
+
+    WIN64_LOADER_PROCESS_BLOCK *block64 =
+        win64_loader_block_for_process(process_id);
+    return block64 ? &block64->peb_lock : NULL;
+}
+
+BOOL win32_is_current_loader_lock(PVOID lock)
+{
+    if (!lock) return FALSE;
+    DWORD process_id = win32_current_process_id();
+    if (!process_id) process_id = 1;
+    WIN32_COMPAT_PROCESS_BLOCK *block =
+        win32_compat_block_for_process(process_id);
+    if (block && lock == (PVOID)&block->loader_lock) return TRUE;
+    WIN64_LOADER_PROCESS_BLOCK *block64 =
+        win64_loader_block_for_process(process_id);
+    return block64 && lock == (PVOID)&block64->loader_lock;
+}
+
+void win32_set_loader_lock_state(ULONG process_id, DWORD thread_id,
+                                 unsigned depth)
+{
+    WIN32_COMPAT_PROCESS_BLOCK *block =
+        win32_compat_block_for_process(process_id);
+    LONG recursion = depth > 0x7FFFFFFFU
+        ? 0x7FFFFFFF : (LONG)depth;
+    if (block) {
+        RTL_CRITICAL_SECTION32 *lock = &block->loader_lock;
+        __atomic_store_n(&lock->OwningThread, depth ? thread_id : 0,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&lock->RecursionCount, recursion, __ATOMIC_RELAXED);
+        __atomic_store_n(&lock->LockCount, depth ? recursion - 1 : -1,
+                         __ATOMIC_RELEASE);
+    }
+
+    WIN64_LOADER_PROCESS_BLOCK *block64 =
+        win64_loader_block_for_process(process_id);
+    if (block64) {
+        RTL_CRITICAL_SECTION *lock = &block64->loader_lock;
+        __atomic_store_n(&lock->OwningThread,
+                         depth ? (HANDLE)(ULONG_PTR)thread_id : NULL,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&lock->RecursionCount, recursion, __ATOMIC_RELAXED);
+        __atomic_store_n(&lock->LockCount, depth ? recursion - 1 : -1,
+                         __ATOMIC_RELEASE);
+    }
+}
+
+static const char *win32_loader_base_name(const char *path)
+{
+    const char *base = path ? path : "";
+    for (const char *cursor = base; *cursor; cursor++) {
+        if (*cursor == '\\' || *cursor == '/') base = cursor + 1;
+    }
+    return base;
+}
+
+static BOOL win32_loader_fill_names32(WIN32_LDR_MODULE32 *module,
+                                      const char *image_name,
+                                      BOOL system_module)
+{
+    const char *base_name = win32_loader_base_name(image_name);
+    if (!base_name[0]) base_name = "<image>";
+
+    if (system_module) {
+        SIZE_T length = 0;
+        if (!win32_wide_append_ascii(
+                module->full_name, WIN32_PROCESS_IMAGE_PATH_CAP, &length,
+                "C:\\Windows\\System32\\", TRUE) ||
+            !win32_wide_append_ascii(
+                module->full_name, WIN32_PROCESS_IMAGE_PATH_CAP, &length,
+                base_name, TRUE))
+            return FALSE;
+    } else if (!win32_build_image_path_w(
+                   image_name, module->full_name,
+                   WIN32_PROCESS_IMAGE_PATH_CAP)) {
+        return FALSE;
+    }
+
+    if (!win32_copy_ascii_w(base_name, module->base_name,
+                            sizeof(module->base_name) /
+                                sizeof(module->base_name[0])))
+        return FALSE;
+
+    win32_init_unicode_string32(&module->entry.FullDllName,
+                                module->full_name);
+    win32_init_unicode_string32(&module->entry.BaseDllName,
+                                module->base_name);
+    return TRUE;
+}
+
+static BOOL win64_loader_fill_names(WIN64_LDR_MODULE *module,
+                                    const char *image_name,
+                                    BOOL system_module)
+{
+    const char *base_name = win32_loader_base_name(image_name);
+    if (!base_name[0]) base_name = "<image>";
+
+    if (system_module) {
+        SIZE_T length = 0;
+        if (!win32_wide_append_ascii(
+                module->full_name, WIN32_PROCESS_IMAGE_PATH_CAP, &length,
+                "C:\\Windows\\System32\\", TRUE) ||
+            !win32_wide_append_ascii(
+                module->full_name, WIN32_PROCESS_IMAGE_PATH_CAP, &length,
+                base_name, TRUE))
+            return FALSE;
+    } else if (!win32_build_image_path_w(
+                   image_name, module->full_name,
+                   WIN32_PROCESS_IMAGE_PATH_CAP)) {
+        return FALSE;
+    }
+
+    if (!win32_copy_ascii_w(base_name, module->base_name,
+                            sizeof(module->base_name) /
+                                sizeof(module->base_name[0])))
+        return FALSE;
+
+    win32_init_unicode_string(&module->entry.FullDllName,
+                              module->full_name);
+    win32_init_unicode_string(&module->entry.BaseDllName,
+                              module->base_name);
+    return TRUE;
+}
+
+static void win32_loader_append32(WIN32_COMPAT_PROCESS_BLOCK *block,
+                                  USHORT slot)
+{
+    WIN32_LDR_MODULE32 *module = &block->loader_modules[slot];
+    for (unsigned list = 0; list < 3; list++) {
+        WIN32_LIST_ENTRY32 *head = win32_loader_head32(block, list);
+        WIN32_LIST_ENTRY32 *node = win32_loader_link32(module, list);
+        WIN32_LIST_ENTRY32 *tail = head;
+        if (block->loader_count) {
+            USHORT tail_slot =
+                block->loader_order[block->loader_count - 1];
+            tail = win32_loader_link32(
+                &block->loader_modules[tail_slot], list);
+        }
+
+        node->Flink = win32_loader_pointer32(head);
+        node->Blink = win32_loader_pointer32(tail);
+        tail->Flink = win32_loader_pointer32(node);
+        head->Blink = win32_loader_pointer32(node);
+    }
+
+    block->loader_order[block->loader_count++] = slot;
+}
+
+static void win32_loader_remove32(WIN32_COMPAT_PROCESS_BLOCK *block,
+                                  USHORT slot)
+{
+    USHORT position = block->loader_count;
+    for (USHORT i = 0; i < block->loader_count; i++) {
+        if (block->loader_order[i] == slot) {
+            position = i;
+            break;
+        }
+    }
+
+    if (position < block->loader_count) {
+        for (unsigned list = 0; list < 3; list++) {
+            WIN32_LIST_ENTRY32 *head = win32_loader_head32(block, list);
+            WIN32_LIST_ENTRY32 *previous = position
+                ? win32_loader_link32(
+                      &block->loader_modules[
+                          block->loader_order[position - 1]], list)
+                : head;
+            WIN32_LIST_ENTRY32 *next = position + 1 < block->loader_count
+                ? win32_loader_link32(
+                      &block->loader_modules[
+                          block->loader_order[position + 1]], list)
+                : head;
+            previous->Flink = win32_loader_pointer32(next);
+            next->Blink = win32_loader_pointer32(previous);
+        }
+
+        for (USHORT i = position + 1; i < block->loader_count; i++)
+            block->loader_order[i - 1] = block->loader_order[i];
+        block->loader_count--;
+        block->loader_order[block->loader_count] = 0;
+    }
+
+    memset(&block->loader_modules[slot], 0,
+           sizeof(block->loader_modules[slot]));
+}
+
+static void win64_loader_append(WIN64_LOADER_PROCESS_BLOCK *block,
+                                USHORT slot)
+{
+    WIN64_LDR_MODULE *module = &block->loader_modules[slot];
+    for (unsigned list = 0; list < 3; list++) {
+        LIST_ENTRY *head = win64_loader_head(block, list);
+        LIST_ENTRY *node = win64_loader_link(module, list);
+        LIST_ENTRY *tail = head;
+        if (block->loader_count) {
+            USHORT tail_slot =
+                block->loader_order[block->loader_count - 1];
+            tail = win64_loader_link(
+                &block->loader_modules[tail_slot], list);
+        }
+
+        node->Flink = head;
+        node->Blink = tail;
+        tail->Flink = node;
+        head->Blink = node;
+    }
+    block->loader_order[block->loader_count++] = slot;
+}
+
+static void win64_loader_remove(WIN64_LOADER_PROCESS_BLOCK *block,
+                                USHORT slot)
+{
+    USHORT position = block->loader_count;
+    for (USHORT i = 0; i < block->loader_count; i++) {
+        if (block->loader_order[i] == slot) {
+            position = i;
+            break;
+        }
+    }
+
+    if (position < block->loader_count) {
+        for (unsigned list = 0; list < 3; list++) {
+            LIST_ENTRY *head = win64_loader_head(block, list);
+            LIST_ENTRY *previous = position
+                ? win64_loader_link(
+                      &block->loader_modules[
+                          block->loader_order[position - 1]], list)
+                : head;
+            LIST_ENTRY *next = position + 1 < block->loader_count
+                ? win64_loader_link(
+                      &block->loader_modules[
+                          block->loader_order[position + 1]], list)
+                : head;
+            previous->Flink = next;
+            next->Blink = previous;
+        }
+
+        for (USHORT i = position + 1; i < block->loader_count; i++)
+            block->loader_order[i - 1] = block->loader_order[i];
+        block->loader_count--;
+        block->loader_order[block->loader_count] = 0;
+    }
+
+    memset(&block->loader_modules[slot], 0,
+           sizeof(block->loader_modules[slot]));
+}
+
+static NTSTATUS win64_publish_loader_image(
+    WIN64_LOADER_PROCESS_BLOCK *block, PPE_IMAGE_INFO info,
+    const char *image_name, BOOL system_module)
+{
+    if (!block) return STATUS_SUCCESS;
+
+    for (USHORT slot = 0; slot < WIN32_LDR_MODULE_CAPACITY; slot++) {
+        WIN64_LDR_MODULE *module = &block->loader_modules[slot];
+        if (module->used && module->entry.DllBase == info->ImageBase)
+            return STATUS_SUCCESS;
+    }
+
+    USHORT slot = 0;
+    if (info->IsDLL) {
+        slot = 1;
+        while (slot < WIN32_LDR_MODULE_CAPACITY &&
+               block->loader_modules[slot].used)
+            slot++;
+        if (slot == WIN32_LDR_MODULE_CAPACITY ||
+            block->loader_count == WIN32_LDR_MODULE_CAPACITY)
+            return STATUS_NO_MEMORY;
+    } else if (block->loader_modules[0].used) {
+        win64_loader_remove(block, 0);
+    }
+
+    WIN64_LDR_MODULE *module = &block->loader_modules[slot];
+    memset(module, 0, sizeof(*module));
+    module->entry.DllBase = info->ImageBase;
+    module->entry.EntryPoint = info->EntryPoint;
+    module->entry.SizeOfImage = info->SizeOfImage;
+    module->entry.LoadCount = info->IsDLL ? 1 : 0xFFFFU;
+    module->entry.OriginalBase = (ULONG_PTR)info->PreferredBase;
+    module->entry.ReferenceCount = 1;
+    if (!win64_loader_fill_names(module, image_name, system_module)) {
+        memset(module, 0, sizeof(*module));
+        return STATUS_NAME_TOO_LONG;
+    }
+    module->used = TRUE;
+    win64_loader_append(block, slot);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS win32_publish_loader_image(PPE_IMAGE_INFO info,
+                                    const char *image_name,
+                                    BOOL system_module)
+{
+    if (!info || !info->ImageBase || !info->SizeOfImage)
+        return STATUS_INVALID_PARAMETER;
+
+    DWORD process_id = win32_current_process_id();
+    if (!process_id) process_id = 1;
+    if (!info->Is32Bit) {
+        return win64_publish_loader_image(
+            win64_loader_block_for_process(process_id), info,
+            image_name, system_module);
+    }
+    WIN32_COMPAT_PROCESS_BLOCK *block =
+        win32_compat_block_for_process(process_id);
+    /* Loader self-tests can construct PE32 facades without running a PE32
+     * process. There is no guest PEB to publish into in that case. */
+    if (!block) return STATUS_SUCCESS;
+
+    uint32_t image_base = (uint32_t)(ULONG_PTR)info->ImageBase;
+    for (USHORT slot = 0; slot < WIN32_LDR_MODULE_CAPACITY; slot++) {
+        WIN32_LDR_MODULE32 *module = &block->loader_modules[slot];
+        if (module->used && module->entry.DllBase == image_base)
+            return STATUS_SUCCESS;
+    }
+
+    USHORT slot = 0;
+    if (info->IsDLL) {
+        slot = 1;
+        while (slot < WIN32_LDR_MODULE_CAPACITY &&
+               block->loader_modules[slot].used)
+            slot++;
+        if (slot == WIN32_LDR_MODULE_CAPACITY ||
+            block->loader_count == WIN32_LDR_MODULE_CAPACITY)
+            return STATUS_NO_MEMORY;
+    } else if (block->loader_modules[0].used) {
+        win32_loader_remove32(block, 0);
+    }
+
+    WIN32_LDR_MODULE32 *module = &block->loader_modules[slot];
+    memset(module, 0, sizeof(*module));
+    module->entry.DllBase = image_base;
+    module->entry.EntryPoint = (uint32_t)(ULONG_PTR)info->EntryPoint;
+    module->entry.SizeOfImage = info->SizeOfImage;
+    module->entry.LoadCount = info->IsDLL ? 1 : 0xFFFFU;
+    module->entry.OriginalBase = (uint32_t)info->PreferredBase;
+    module->entry.ReferenceCount = 1;
+    if (!win32_loader_fill_names32(module, image_name, system_module)) {
+        memset(module, 0, sizeof(*module));
+        return STATUS_NAME_TOO_LONG;
+    }
+    module->used = TRUE;
+    win32_loader_append32(block, slot);
+    return STATUS_SUCCESS;
+}
+
+void win32_unpublish_loader_image(ULONG process_id, PVOID image_base)
+{
+    if (!process_id || !image_base) return;
+    WIN32_COMPAT_PROCESS_BLOCK *block =
+        win32_compat_block_for_process(process_id);
+    if (block) {
+        uint32_t base32 = (uint32_t)(ULONG_PTR)image_base;
+        for (USHORT slot = 0; slot < WIN32_LDR_MODULE_CAPACITY; slot++) {
+            WIN32_LDR_MODULE32 *module = &block->loader_modules[slot];
+            if (module->used && module->entry.DllBase == base32) {
+                win32_loader_remove32(block, slot);
+                return;
+            }
+        }
+    }
+
+    WIN64_LOADER_PROCESS_BLOCK *block64 =
+        win64_loader_block_for_process(process_id);
+    if (!block64) return;
+    for (USHORT slot = 0; slot < WIN32_LDR_MODULE_CAPACITY; slot++) {
+        WIN64_LDR_MODULE *module = &block64->loader_modules[slot];
+        if (module->used && module->entry.DllBase == image_base) {
+            win64_loader_remove(block64, slot);
+            return;
+        }
+    }
+}
+
+void win32_update_loader_image_reference(ULONG process_id, PVOID image_base,
+                                         ULONG references, BOOL pinned)
+{
+    if (!process_id || !image_base) return;
+    WIN32_COMPAT_PROCESS_BLOCK *block =
+        win32_compat_block_for_process(process_id);
+    if (block) {
+        uint32_t base32 = (uint32_t)(ULONG_PTR)image_base;
+        for (USHORT slot = 0; slot < WIN32_LDR_MODULE_CAPACITY; slot++) {
+            WIN32_LDR_MODULE32 *module = &block->loader_modules[slot];
+            if (!module->used || module->entry.DllBase != base32) continue;
+            module->entry.LoadCount = pinned || references > 0xFFFEU
+                ? 0xFFFFU : (USHORT)references;
+            module->entry.ReferenceCount = pinned ? 0xFFFFFFFFU : references;
+            return;
+        }
+    }
+
+    WIN64_LOADER_PROCESS_BLOCK *block64 =
+        win64_loader_block_for_process(process_id);
+    if (!block64) return;
+    for (USHORT slot = 0; slot < WIN32_LDR_MODULE_CAPACITY; slot++) {
+        WIN64_LDR_MODULE *module = &block64->loader_modules[slot];
+        if (!module->used || module->entry.DllBase != image_base) continue;
+        module->entry.LoadCount = pinned || references > 0xFFFEU
+            ? 0xFFFFU : (USHORT)references;
+        module->entry.ReferenceCount = pinned ? 0xFFFFFFFFU : references;
+        return;
+    }
+}
+
+static BOOL win32_populate_compat_process_block_data(
+    WIN32_COMPAT_PROCESS_BLOCK *block, DWORD process_id,
+    const char *image_path, const char *exe_name, const char *command_line,
+    const char *current_directory, BOOL reset)
+{
     if (!block) return FALSE;
 
-    if (!win32_copy_ascii(child->image_path, block->image_path,
+    if (!win32_copy_ascii(image_path, block->image_path,
                           sizeof(block->image_path)) ||
-        !win32_copy_ascii(child->exe_name, block->exe_name,
+        !win32_copy_ascii(exe_name, block->exe_name,
                           sizeof(block->exe_name)) ||
-        !win32_copy_ascii(child->command_line, block->command_line,
+        !win32_copy_ascii(command_line, block->command_line,
                           sizeof(block->command_line)) ||
-        !win32_copy_ascii(child->current_directory, block->current_directory,
+        !win32_copy_ascii(current_directory, block->current_directory,
                           sizeof(block->current_directory)) ||
-        !win32_build_image_path_w(child->image_path, block->image_path_w,
+        !win32_build_image_path_w(image_path, block->image_path_w,
                                   WIN32_PROCESS_IMAGE_PATH_CAP) ||
-        !win32_copy_ascii_w(child->command_line, block->command_line_w,
+        !win32_copy_ascii_w(command_line, block->command_line_w,
                             WIN32_CHILD_COMMAND_LINE_CAP) ||
         !win32_build_current_directory_w(
-            child->current_directory, block->current_directory_w,
+            current_directory, block->current_directory_w,
             WIN32_PROCESS_IMAGE_PATH_CAP) ||
         !win32_copy_ascii_w("WinSta0\\Default", block->desktop_info_w,
                             WIN32_PROCESS_DESKTOP_CAP))
@@ -1023,7 +1855,7 @@ static BOOL win32_populate_compat_process_block(WIN32_CHILD_CONTEXT *child,
         return FALSE;
 
     SIZE_T environment_chars = kernel32_build_environment_block_w(
-        child->process_id, block->environment_w,
+        process_id, block->environment_w,
         WIN32_PROCESS_ENVIRONMENT_CAP);
     if (environment_chars < 2 ||
         environment_chars > WIN32_PROCESS_ENVIRONMENT_CAP)
@@ -1036,6 +1868,7 @@ static BOOL win32_populate_compat_process_block(WIN32_CHILD_CONTEXT *child,
     parameters->MaximumLength = sizeof(*parameters);
     parameters->Length = sizeof(*parameters);
     parameters->Flags = RTL_USER_PROC_PARAMS_NORMALIZED;
+    win32_apply_console_parameters32(parameters, process_id);
     win32_init_unicode_string32(&parameters->CurrentDirectory.DosPath,
                                 block->current_directory_w);
     parameters->CurrentDirectory.Handle = 0;
@@ -1050,12 +1883,22 @@ static BOOL win32_populate_compat_process_block(WIN32_CHILD_CONTEXT *child,
                                 block->desktop_info_w);
     parameters->EnvironmentSize = environment_chars * sizeof(WCHAR);
     parameters->EnvironmentVersion = environment_version + 1;
-    parameters->ProcessGroupId = child->process_id;
+    parameters->ProcessGroupId = process_id;
     parameters->LoaderThreads = 1;
     block->process_heaps[0] = 0xBEEF0001U;
     block->peb.ProcessParameters = (uint32_t)(ULONG_PTR)parameters;
     block->peb.ProcessHeap = block->process_heaps[0];
     return TRUE;
+}
+
+static BOOL win32_populate_compat_process_block(WIN32_CHILD_CONTEXT *child,
+                                                 BOOL reset)
+{
+    if (!child) return FALSE;
+    return win32_populate_compat_process_block_data(
+        child->compat_environment32, child->process_id,
+        child->image_path, child->exe_name, child->command_line,
+        child->current_directory, reset);
 }
 
 static BOOL win32_populate_process_parameters(
@@ -1099,6 +1942,7 @@ static BOOL win32_populate_process_parameters(
     parameters->MaximumLength = sizeof(*parameters);
     parameters->Length = sizeof(*parameters);
     parameters->Flags = RTL_USER_PROC_PARAMS_NORMALIZED;
+    win32_apply_console_parameters(parameters, process_id);
     win32_init_unicode_string(&parameters->CurrentDirectory.DosPath,
                               current_directory_w);
     parameters->CurrentDirectory.Handle = NULL;
@@ -1117,7 +1961,10 @@ static BOOL win32_populate_process_parameters(
 
 static void win32_initialize_peb(PPEB peb,
                                  PRTL_USER_PROCESS_PARAMETERS parameters,
-                                 PVOID image_base, PVOID process_heaps[1])
+                                 PVOID image_base, PVOID process_heaps[1],
+                                 USHORT subsystem,
+                                 USHORT subsystem_major_version,
+                                 USHORT subsystem_minor_version)
 {
     extern uint32_t smp_cpu_count(void);
     memset(peb, 0, sizeof(*peb));
@@ -1133,6 +1980,46 @@ static void win32_initialize_peb(PPEB peb,
     peb->MaximumNumberOfHeaps = 1;
     peb->ProcessHeaps = process_heaps;
     peb->GdiSharedHandleTable = ntdll_shared_gdi_table();
+    peb->OSMajorVersion = WIN32_NT_VERSION_MAJOR;
+    peb->OSMinorVersion = WIN32_NT_VERSION_MINOR;
+    peb->OSBuildNumber = WIN32_NT_VERSION_BUILD;
+    peb->OSPlatformId = WIN32_NT_PLATFORM_ID;
+    peb->ImageSubsystem = subsystem;
+    peb->ImageSubsystemMajorVersion = subsystem_major_version;
+    peb->ImageSubsystemMinorVersion = subsystem_minor_version;
+    peb->ActiveProcessAffinityMask = peb->NumberOfProcessors >= 64
+        ? UINT64_MAX : ((1ULL << peb->NumberOfProcessors) - 1ULL);
+}
+
+static void win32_initialize_peb32(
+    PEB32 *peb, WIN32_RTL_USER_PROCESS_PARAMETERS32 *parameters,
+    uint32_t image_base, uint32_t process_heaps[1], USHORT subsystem,
+    USHORT subsystem_major_version, USHORT subsystem_minor_version)
+{
+    extern uint32_t smp_cpu_count(void);
+    uint32_t processors = smp_cpu_count();
+    if (!processors) processors = 1;
+
+    memset(peb, 0, sizeof(*peb));
+    process_heaps[0] = 0xBEEF0001U;
+    peb->ImageBaseAddress = image_base;
+    peb->ProcessParameters = (uint32_t)(ULONG_PTR)parameters;
+    peb->ProcessHeap = process_heaps[0];
+    peb->NumberOfProcessors = processors;
+    peb->HeapSegmentReserve = 64U * 1024U * 1024U;
+    peb->HeapSegmentCommit = 64U * 1024U;
+    peb->NumberOfHeaps = 1;
+    peb->MaximumNumberOfHeaps = 1;
+    peb->ProcessHeaps = (uint32_t)(ULONG_PTR)process_heaps;
+    peb->OSMajorVersion = WIN32_NT_VERSION_MAJOR;
+    peb->OSMinorVersion = WIN32_NT_VERSION_MINOR;
+    peb->OSBuildNumber = WIN32_NT_VERSION_BUILD;
+    peb->OSPlatformId = WIN32_NT_PLATFORM_ID;
+    peb->ImageSubsystem = subsystem;
+    peb->ImageSubsystemMajorVersion = subsystem_major_version;
+    peb->ImageSubsystemMinorVersion = subsystem_minor_version;
+    peb->ActiveProcessAffinityMask = processors >= 32
+        ? UINT32_MAX : ((1U << processors) - 1U);
 }
 
 BOOL win32_refresh_current_process_parameters(void)
@@ -1140,39 +2027,78 @@ BOOL win32_refresh_current_process_parameters(void)
     extern BOOL nt_process_set_peb(PVOID process_object, const PEB *source);
     WIN32_CHILD_CONTEXT *child = win32_current_child();
     if (child) {
-        if (!child->peb.ProcessParameters) return TRUE;
+        PPEB peb = win32_child_peb(child);
+        PRTL_USER_PROCESS_PARAMETERS parameters = child->environment64
+            ? &child->environment64->process_parameters
+            : &child->process_parameters;
+        WCHAR *image_path_w = child->environment64
+            ? child->environment64->image_path_w : child->image_path_w;
+        WCHAR *command_line_w = child->environment64
+            ? child->environment64->command_line_w : child->command_line_w;
+        WCHAR *current_directory_w = child->environment64
+            ? child->environment64->current_directory_w
+            : child->current_directory_w;
+        WCHAR *dll_path_w = child->environment64
+            ? child->environment64->dll_path_w : child->dll_path_w;
+        WCHAR *desktop_info_w = child->environment64
+            ? child->environment64->desktop_info_w : child->desktop_info_w;
+        WCHAR *environment_w = child->environment64
+            ? child->environment64->environment_w : child->environment_w;
+        if (!peb->ProcessParameters) return TRUE;
         if (!win32_populate_process_parameters(
-                &child->process_parameters,
-                child->image_path_w, WIN32_PROCESS_IMAGE_PATH_CAP,
-                child->command_line_w, WIN32_CHILD_COMMAND_LINE_CAP,
-                child->current_directory_w, WIN32_PROCESS_IMAGE_PATH_CAP,
-                child->dll_path_w, WIN32_PROCESS_DLL_PATH_CAP,
-                child->desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
-                child->environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
+                parameters,
+                image_path_w, WIN32_PROCESS_IMAGE_PATH_CAP,
+                command_line_w, WIN32_CHILD_COMMAND_LINE_CAP,
+                current_directory_w, WIN32_PROCESS_IMAGE_PATH_CAP,
+                dll_path_w, WIN32_PROCESS_DLL_PATH_CAP,
+                desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
+                environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
                 child->process_id, child->image_path, child->command_line,
                 child->current_directory, FALSE))
             return FALSE;
         if (child->compat_environment32 &&
             !win32_populate_compat_process_block(child, FALSE))
             return FALSE;
-        return nt_process_set_peb(child->process_object, &child->peb);
+        return nt_process_set_peb(child->process_object, peb);
     }
 
-    if (!g_peb.ProcessParameters) return TRUE;
+    PPEB peb = win64_main_peb();
+    PRTL_USER_PROCESS_PARAMETERS parameters = g_main_environment64
+        ? &g_main_environment64->process_parameters : &g_process_parameters;
+    WCHAR *image_path_w = g_main_environment64
+        ? g_main_environment64->image_path_w : g_image_path_w;
+    WCHAR *command_line_w = g_main_environment64
+        ? g_main_environment64->command_line_w : g_command_line_w;
+    WCHAR *current_directory_w = g_main_environment64
+        ? g_main_environment64->current_directory_w : g_current_directory_w;
+    WCHAR *dll_path_w = g_main_environment64
+        ? g_main_environment64->dll_path_w : g_dll_path_w;
+    WCHAR *desktop_info_w = g_main_environment64
+        ? g_main_environment64->desktop_info_w : g_desktop_info_w;
+    WCHAR *environment_w = g_main_environment64
+        ? g_main_environment64->environment_w : g_environment_w;
+    if (!peb->ProcessParameters) return TRUE;
     extern char win32_image_path[260];
+    extern char win32_exe_name[64];
     extern char win32_command_line[4096];
     if (!win32_populate_process_parameters(
-            &g_process_parameters,
-            g_image_path_w, WIN32_PROCESS_IMAGE_PATH_CAP,
-            g_command_line_w, WIN32_CHILD_COMMAND_LINE_CAP,
-            g_current_directory_w, WIN32_PROCESS_IMAGE_PATH_CAP,
-            g_dll_path_w, WIN32_PROCESS_DLL_PATH_CAP,
-            g_desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
-            g_environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
+            parameters,
+            image_path_w, WIN32_PROCESS_IMAGE_PATH_CAP,
+            command_line_w, WIN32_CHILD_COMMAND_LINE_CAP,
+            current_directory_w, WIN32_PROCESS_IMAGE_PATH_CAP,
+            dll_path_w, WIN32_PROCESS_DLL_PATH_CAP,
+            desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
+            environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
             1, win32_image_path, win32_command_line,
             kernel32_current_directory_relative(), FALSE))
         return FALSE;
-    return nt_process_set_peb(NULL, &g_peb);
+    if (g_main_compat_environment32 &&
+        !win32_populate_compat_process_block_data(
+            g_main_compat_environment32, 1, win32_image_path,
+            win32_exe_name, win32_command_line,
+            kernel32_current_directory_relative(), FALSE))
+        return FALSE;
+    return nt_process_set_peb(NULL, peb);
 }
 
 TEB *win64_current_teb(void)
@@ -1185,11 +2111,58 @@ TEB *win64_current_teb(void)
     return &g_teb;
 }
 
+void win64_set_current_teb(TEB *teb)
+{
+    uint64_t teb_addr = (uint64_t)(ULONG_PTR)teb;
+#ifndef TEST_HARNESS
+    __asm__ volatile (
+        "mov $0xC0000101, %%ecx\n"
+        "mov %0, %%rax\n"
+        "mov %0, %%rdx\n"
+        "shr $32, %%rdx\n"
+        "wrmsr\n"
+        :
+        : "r"(teb_addr)
+        : "rax", "rcx", "rdx", "memory"
+    );
+    {
+        extern void proc_set_gs_base(uint64_t addr);
+        proc_set_gs_base(teb_addr);
+    }
+#else
+    #include <asm/prctl.h>
+    extern int arch_prctl(int code, unsigned long addr);
+    arch_prctl(ARCH_SET_GS, (unsigned long)teb_addr);
+#endif
+}
+
+static void win64_reset_bootstrap_teb(void)
+{
+    memset(&g_teb, 0, sizeof(g_teb));
+    g_teb.Self = &g_teb;
+    g_teb.ProcessEnvironmentBlock = &g_peb;
+    g_teb.ClientId.UniqueProcess = (HANDLE)(ULONG_PTR)1;
+    g_teb.ClientId.UniqueThread = (HANDLE)(ULONG_PTR)1;
+    g_teb.ExceptionList = (PVOID)(ULONG_PTR)-1;
+    win64_set_current_teb(&g_teb);
+}
+
+void win64_initialize_bootstrap_thread(void)
+{
+    if (g_teb.Self == &g_teb &&
+        g_teb.ProcessEnvironmentBlock == &g_peb)
+        return;
+
+    win64_reset_bootstrap_teb();
+}
+
 const char *win32_current_exe_name(void)
 {
     WIN32_CHILD_CONTEXT *child = win32_current_child();
     if (child) return child->compat_environment32
         ? child->compat_environment32->exe_name : child->exe_name;
+    if (g_main_compat_environment32)
+        return g_main_compat_environment32->exe_name;
     extern char win32_exe_name[64];
     return win32_exe_name;
 }
@@ -1206,6 +2179,8 @@ const char *win32_current_image_path(void)
     WIN32_CHILD_CONTEXT *child = win32_current_child();
     if (child) return child->compat_environment32
         ? child->compat_environment32->image_path : child->image_path;
+    if (g_main_compat_environment32)
+        return g_main_compat_environment32->image_path;
     extern char win32_image_path[260];
     return win32_image_path;
 }
@@ -1215,6 +2190,8 @@ const char *win32_current_command_line(void)
     WIN32_CHILD_CONTEXT *child = win32_current_child();
     if (child) return child->compat_environment32
         ? child->compat_environment32->command_line : child->command_line;
+    if (g_main_compat_environment32)
+        return g_main_compat_environment32->command_line;
     extern char win32_command_line[4096];
     return win32_command_line;
 }
@@ -1222,9 +2199,17 @@ const char *win32_current_command_line(void)
 const WCHAR *win32_current_command_line_w(void)
 {
     WIN32_CHILD_CONTEXT *child = win32_current_child();
-    if (child) return child->compat_environment32
-        ? child->compat_environment32->command_line_w
-        : child->command_line_w;
+    if (child) {
+        if (child->compat_environment32)
+            return child->compat_environment32->command_line_w;
+        if (child->environment64)
+            return child->environment64->command_line_w;
+        return child->command_line_w;
+    }
+    if (g_main_compat_environment32)
+        return g_main_compat_environment32->command_line_w;
+    if (g_main_environment64)
+        return g_main_environment64->command_line_w;
     return g_command_line_w[0] ? g_command_line_w : NULL;
 }
 
@@ -1256,7 +2241,7 @@ BOOL win32_set_current_directory_override(const char *path)
 ULONG_PTR win32_current_image_base(void)
 {
     WIN32_CHILD_CONTEXT *child = win32_current_child();
-    if (child) return (ULONG_PTR)child->peb.ImageBaseAddress;
+    if (child) return (ULONG_PTR)win32_child_peb(child)->ImageBaseAddress;
     return g_exe_image_base;
 }
 
@@ -1267,12 +2252,14 @@ void win32_publish_current_image_base(PVOID image_base)
     WIN32_CHILD_CONTEXT *child = win32_current_child();
     if (child) {
         child->peb.ImageBaseAddress = image_base;
+        win32_child_peb(child)->ImageBaseAddress = image_base;
         (void)nt_process_set_image_base(child->process_object, image_base);
         return;
     }
 
     g_exe_image_base = (ULONG_PTR)image_base;
     g_peb.ImageBaseAddress = image_base;
+    win64_main_peb()->ImageBaseAddress = image_base;
     (void)nt_process_set_image_base(NULL, image_base);
 }
 
@@ -1341,7 +2328,7 @@ void win32_main_termination_checkpoint(void)
 #ifndef TEST_HARNESS
     extern int32_t proc_current_pid(void);
     extern void kern_longjmp(uint64_t *buf, int val);
-    extern void x86_tss_reset_ist1(void);
+    extern void sched_reset_current_compat_ist1(void);
     NTSTATUS status = g_win32_main.exit_status;
     __atomic_store_n(&g_win32_main.exit_requested, FALSE, __ATOMIC_RELEASE);
     serial_puts("[WINEXEC-EXIT] delivered to main kpid=");
@@ -1352,7 +2339,7 @@ void win32_main_termination_checkpoint(void)
     serial_puts(" status=0x");
     serial_puthex((uint32_t)status, 8);
     serial_puts("\n");
-    x86_tss_reset_ist1();
+    sched_reset_current_compat_ist1();
     kern_longjmp(g_win32_main.exit_jmpbuf, 2);
     __builtin_unreachable();
 #endif
@@ -1476,84 +2463,178 @@ uint64_t *win32_current_child_jmpbuf(void)
  * The 64-bit TEB has 8-byte pointers, so offsets are all wrong for 32-bit code.
  * Example: 32-bit TEB.Self is at +0x18, but 64-bit TEB.Self is at +0x30.
  */
-static PEB32  g_peb32;
-TEB32  g_teb32;  /* non-static: accessed by ntdll_shim.c for SEH/LastError */
+/* Native shims can query LastError while no PE32 task is active. The guest
+ * never receives this bootstrap TEB: every live PE32 TEB is low-mapped. */
+TEB32 g_teb32 = { .ExceptionList = UINT32_MAX };
 
-static BOOL setup_environment(PVOID image_base, int is32bit)
+static TEB32 *win32_main_teb32(void)
+{
+    return g_main_compat_environment32
+        ? &g_main_compat_environment32->teb : NULL;
+}
+
+static PEB32 *win32_main_peb32(void)
+{
+    return g_main_compat_environment32
+        ? &g_main_compat_environment32->peb : NULL;
+}
+
+static BOOL setup_main_compat_environment32(void)
+{
+    extern char win32_image_path[260];
+    extern char win32_exe_name[64];
+    extern char win32_command_line[4096];
+
+    PVOID allocation = NULL;
+    SIZE_T allocation_size = sizeof(WIN32_COMPAT_PROCESS_BLOCK);
+    NTSTATUS status = nt_vm_allocate_compat32(
+        &allocation, &allocation_size, MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE);
+    if (!NT_SUCCESS(status) || !allocation ||
+        (uint64_t)(ULONG_PTR)allocation +
+            sizeof(WIN32_COMPAT_PROCESS_BLOCK) > UINT32_MAX) {
+        if (allocation)
+            (void)nt_vm_release_allocation_for_process(1, allocation);
+        return FALSE;
+    }
+
+    WIN32_COMPAT_PROCESS_BLOCK *block =
+        (WIN32_COMPAT_PROCESS_BLOCK *)allocation;
+    memset(block, 0, sizeof(*block));
+    if (!win32_populate_compat_process_block_data(
+            block, 1, win32_image_path, win32_exe_name,
+            win32_command_line, kernel32_current_directory_relative(),
+            TRUE)) {
+        (void)nt_vm_release_allocation_for_process(1, allocation);
+        return FALSE;
+    }
+
+    win32_initialize_peb32(&block->peb, &block->process_parameters,
+                           0, block->process_heaps, g_exe_subsystem,
+                           g_exe_subsystem_major_version,
+                           g_exe_subsystem_minor_version);
+    win32_initialize_loader32(block);
+    block->teb.ExceptionList = UINT32_MAX;
+    block->teb.Self = (uint32_t)(ULONG_PTR)&block->teb;
+    block->teb.ClientId_UniqueProcess = 1;
+    block->teb.ClientId_UniqueThread = 1;
+    block->teb.ProcessEnvironmentBlock =
+        (uint32_t)(ULONG_PTR)&block->peb;
+
+    g_main_compat_environment32 = block;
+    compat32_setup_teb(&block->teb);
+    win32_tls_reset();
+
+    if (compat32_current_teb() != &block->teb ||
+        block->teb.Self != (uint32_t)(ULONG_PTR)&block->teb ||
+        block->teb.ProcessEnvironmentBlock !=
+            (uint32_t)(ULONG_PTR)&block->peb) {
+        compat32_setup_teb(NULL);
+        g_main_compat_environment32 = NULL;
+        (void)nt_vm_release_allocation_for_process(1, allocation);
+        return FALSE;
+    }
+
+    serial_puts("[WINEXEC] low TEB32=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)&block->teb, 8);
+    serial_puts(" PEB32=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)&block->peb, 8);
+    serial_puts(" params=0x");
+    serial_puthex(block->peb.ProcessParameters, 8);
+    serial_puts("\n");
+    return TRUE;
+}
+
+static BOOL setup_environment(PVOID image_base, BOOL initialize_loader64)
 {
     extern BOOL nt_process_set_peb(PVOID process_object, const PEB *source);
     extern char win32_image_path[260];
     extern char win32_command_line[4096];
 
+    WIN64_PROCESS_BLOCK *environment = NULL;
+    PRTL_USER_PROCESS_PARAMETERS parameters = &g_process_parameters;
+    PVOID *process_heaps = g_process_heaps;
+    WCHAR *image_path_w = g_image_path_w;
+    WCHAR *command_line_w = g_command_line_w;
+    WCHAR *current_directory_w = g_current_directory_w;
+    WCHAR *dll_path_w = g_dll_path_w;
+    WCHAR *desktop_info_w = g_desktop_info_w;
+    WCHAR *environment_w = g_environment_w;
+    PPEB peb = &g_peb;
+    TEB *teb = &g_teb;
+
+    memset(&g_peb, 0, sizeof(g_peb));
     memset(&g_teb, 0, sizeof(g_teb));
+    g_main_environment64 = NULL;
+    if (initialize_loader64) {
+        environment = (WIN64_PROCESS_BLOCK *)VirtualAlloc(
+            NULL, sizeof(*environment), MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE);
+        if (!environment)
+            return FALSE;
+        memset(environment, 0, sizeof(*environment));
+        g_main_environment64 = environment;
+        parameters = &environment->process_parameters;
+        process_heaps = environment->process_heaps;
+        image_path_w = environment->image_path_w;
+        command_line_w = environment->command_line_w;
+        current_directory_w = environment->current_directory_w;
+        dll_path_w = environment->dll_path_w;
+        desktop_info_w = environment->desktop_info_w;
+        environment_w = environment->environment_w;
+        peb = &environment->peb;
+        teb = &environment->teb;
+    }
+
     if (!win32_populate_process_parameters(
-            &g_process_parameters,
-            g_image_path_w, WIN32_PROCESS_IMAGE_PATH_CAP,
-            g_command_line_w, WIN32_CHILD_COMMAND_LINE_CAP,
-            g_current_directory_w, WIN32_PROCESS_IMAGE_PATH_CAP,
-            g_dll_path_w, WIN32_PROCESS_DLL_PATH_CAP,
-            g_desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
-            g_environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
+            parameters, image_path_w, WIN32_PROCESS_IMAGE_PATH_CAP,
+            command_line_w, WIN32_CHILD_COMMAND_LINE_CAP,
+            current_directory_w, WIN32_PROCESS_IMAGE_PATH_CAP,
+            dll_path_w, WIN32_PROCESS_DLL_PATH_CAP,
+            desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
+            environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
             1, win32_image_path, win32_command_line,
             kernel32_current_directory_relative(), TRUE))
-        return FALSE;
-    win32_initialize_peb(&g_peb, &g_process_parameters, image_base,
-                         g_process_heaps);
-    if (!nt_process_set_peb(NULL, &g_peb)) return FALSE;
-    if (!nt_process_set_image_path(NULL, win32_image_path)) return FALSE;
+        goto fail;
+    win32_initialize_peb(peb, parameters, image_base, process_heaps,
+                         g_exe_subsystem, g_exe_subsystem_major_version,
+                         g_exe_subsystem_minor_version);
+    if (environment)
+        win64_initialize_loader(peb, &environment->loader);
+    if (!nt_process_set_peb(NULL, peb) ||
+        !nt_process_set_image_path(NULL, win32_image_path))
+        goto fail;
 
-    g_teb.Self                       = &g_teb;
-    g_teb.ProcessEnvironmentBlock    = &g_peb;
-    g_teb.ClientId.UniqueProcess     = (HANDLE)(ULONG_PTR)1;
-    g_teb.ClientId.UniqueThread      = (HANDLE)(ULONG_PTR)1;
-    g_teb.LastErrorValue             = 0;
-    g_teb.ExceptionList              = (PVOID)(ULONG_PTR)-1; /* empty SEH chain */
+    teb->Self = teb;
+    teb->ProcessEnvironmentBlock = peb;
+    teb->ClientId.UniqueProcess = (HANDLE)(ULONG_PTR)1;
+    teb->ClientId.UniqueThread = (HANDLE)(ULONG_PTR)1;
+    teb->LastErrorValue = 0;
+    teb->ExceptionList = (PVOID)(ULONG_PTR)-1;
+    if (environment) {
+        teb->ThreadLocalStoragePointer = environment->tls_vector;
+        teb->TlsExpansionSlots = environment->tls_expansion;
+    }
+    win64_set_current_teb(teb);
 
-    if (is32bit) {
-        /*
-         * TEB32/PEB32 already pre-initialized before pe_load().
-         * Just update the image base address (now known) and log.
-         */
-        g_peb32.ImageBaseAddress = (uint32_t)(ULONG_PTR)image_base;
-
-        serial_puts("[WINEXEC] TEB32 at 0x");
-        serial_puthex((uint64_t)(ULONG_PTR)&g_teb32, 16);
-        serial_puts(" PEB32 at 0x");
-        serial_puthex((uint64_t)(ULONG_PTR)&g_peb32, 16);
+    if (environment) {
+        serial_puts("[WINEXEC] user TEB64=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)teb, 16);
+        serial_puts(" PEB64=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)peb, 16);
+        serial_puts(" params=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)parameters, 16);
         serial_puts("\n");
     }
-
-    /*
-     * Windows stores TEB pointer in GS:0x30 (x86-64).
-     * Set GS base to point to our TEB structure.
-     * On OsitoK, we use MSR_GS_BASE (0xC0000101).
-     */
-#ifndef TEST_HARNESS
-    uint64_t teb_addr = (uint64_t)&g_teb;
-    __asm__ volatile (
-        "mov $0xC0000101, %%ecx\n"   /* MSR_GS_BASE */
-        "mov %0, %%rax\n"
-        "mov %0, %%rdx\n"
-        "shr $32, %%rdx\n"
-        "wrmsr\n"
-        :
-        : "r"(teb_addr)
-        : "rax", "rcx", "rdx"
-    );
-    {
-        extern void proc_set_gs_base(uint64_t addr);
-        proc_set_gs_base(teb_addr);
-    }
-#else
-    /* In test harness mode on Linux, use arch_prctl to set GS base.
-     * This is needed for PE code that accesses TEB via gs:0 (e.g., SEH). */
-    {
-        #include <asm/prctl.h>
-        extern int arch_prctl(int code, unsigned long addr);
-        arch_prctl(ARCH_SET_GS, (unsigned long)&g_teb);
-    }
-#endif
     return TRUE;
+
+fail:
+    if (environment) {
+        g_main_environment64 = NULL;
+        (void)nt_vm_release_allocation_for_process(1, environment);
+    }
+    win64_reset_bootstrap_teb();
+    return FALSE;
 }
 
 NTSTATUS win64_attach_tls(PE_IMAGE_INFO *info)
@@ -1673,21 +2754,10 @@ NTSTATUS win64_attach_tls(PE_IMAGE_INFO *info)
     return STATUS_SUCCESS;
 }
 
-/* ── Pre-load all DLLs from filesystem ──────────────────────── */
-/*
- * Load all .dll files from OsitoFS before the EXE entry point runs.
- * This ensures all native UE1 classes (IMPLEMENT_CLASS) are registered
- * during _initterm, so ProcessRegistrants() finds them all.
- * Without this, dynamic LoadLibrary fails due to FName corruption
- * (VirtualAlloc identity-map recycling bug).
- */
-extern void     *osfs2_find(const char *name);
+/* Filesystem access used by the PE image loader. */
 extern void     *osfs2_find_ci(const char *name);
 extern int       osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern uint64_t  osfs2_file_size(void *file);
-extern uint32_t  osfs2_file_count(void);
-extern void     *osfs2_file_by_index(uint32_t idx);
-extern const char *osfs2_file_name(void *file);
 
 static void win32_child_run(WIN32_CHILD_CONTEXT *child);
 
@@ -1779,85 +2849,11 @@ BOOL win32_process_snapshot_slot(DWORD slot, DWORD *process_id,
     return TRUE;
 }
 
-static BOOL child_string_contains(const char *text, const char *needle)
-{
-    if (!text || !needle || !*needle) return FALSE;
-    for (; *text; text++) {
-        SIZE_T i = 0;
-        while (needle[i] && text[i] == needle[i]) i++;
-        if (!needle[i]) return TRUE;
-    }
-    return FALSE;
-}
-
-static void child_preload_swiftshader(WIN32_CHILD_CONTEXT *child)
-{
-    static const char dll_name[] = "vk_swiftshader.dll";
-    char path[320];
-    SIZE_T prefix = 0;
-
-    if (!child_string_contains(child->command_line, "--type=gpu-process") ||
-        !child_string_contains(child->command_line,
-                               "--use-angle=swiftshader"))
-        return;
-
-    for (SIZE_T i = 0; child->image_path[i]; i++)
-        if (child->image_path[i] == '\\' || child->image_path[i] == '/')
-            prefix = i + 1;
-    if (!prefix || 3 + prefix + sizeof(dll_name) > sizeof(path)) {
-        serial_puts("[WINEXEC-CHILD] SwiftShader preload path too long\n");
-        return;
-    }
-
-    path[0] = 'C';
-    path[1] = ':';
-    path[2] = '\\';
-    for (SIZE_T i = 0; i < prefix; i++) path[3 + i] = child->image_path[i];
-    for (SIZE_T i = 0; i < sizeof(dll_name); i++)
-        path[3 + prefix + i] = dll_name[i];
-
-    HANDLE module = LoadLibraryA(path);
-    serial_puts("[WINEXEC-CHILD] SwiftShader preload ");
-    if (module) {
-        serial_puts("ok base=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)module, 16);
-    } else {
-        serial_puts("failed error=");
-        serial_putdec(GetLastError());
-    }
-    serial_puts("\n");
-}
-
-static void child_save_shared_dll_state(WIN32_CHILD_CONTEXT *child)
-{
-    LOADED_MODULE *tier0 = dll_find_module("tier0_s64.dll");
-    if (!tier0) return;
-
-    typedef PVOID (WINAPI *get_spew_fn)(void);
-    get_spew_fn get_spew = (get_spew_fn)dll_resolve_export(
-        tier0, "GetSpewOutputFunc", 0, FALSE);
-    if (!get_spew) return;
-
-    child->saved_spew_output = get_spew();
-    child->saved_spew_output_valid = TRUE;
-}
-
-static void child_restore_shared_dll_state(WIN32_CHILD_CONTEXT *child)
-{
-    if (!child->saved_spew_output_valid) return;
-
-    LOADED_MODULE *tier0 = dll_find_module("tier0_s64.dll");
-    typedef void (WINAPI *set_spew_fn)(PVOID);
-    set_spew_fn set_spew = tier0 ? (set_spew_fn)dll_resolve_export(
-        tier0, "SpewOutputFunc", 0, FALSE) : NULL;
-    if (set_spew) {
-        set_spew(child->saved_spew_output);
-        serial_puts("[WINEXEC-CHILD] restored tier0 spew callback\n");
-    }
-    child->saved_spew_output_valid = FALSE;
-}
-
-static int child_image_bitness(const BYTE *data, uint64_t size)
+static int child_image_bitness(const BYTE *data, uint64_t size,
+                               USHORT *subsystem,
+                               USHORT *subsystem_major_version,
+                               USHORT *subsystem_minor_version,
+                               USHORT *dll_characteristics)
 {
     if (!data || size < sizeof(IMAGE_DOS_HEADER)) return 0;
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)data;
@@ -1869,13 +2865,45 @@ static int child_image_bitness(const BYTE *data, uint64_t size)
     BYTE *nt = (BYTE *)data + nt_offset;
     if (*(ULONG *)nt != IMAGE_NT_SIGNATURE) return 0;
     PIMAGE_FILE_HEADER file = (PIMAGE_FILE_HEADER)(nt + sizeof(ULONG));
-    USHORT magic = *(USHORT *)(nt + sizeof(ULONG) + sizeof(IMAGE_FILE_HEADER));
+    uint64_t optional_offset = nt_offset + sizeof(ULONG) +
+                               sizeof(IMAGE_FILE_HEADER);
+    USHORT magic = *(USHORT *)(data + optional_offset);
     if (file->Machine == IMAGE_FILE_MACHINE_I386 &&
-        magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        if (file->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER32) ||
+            optional_offset > size ||
+            sizeof(IMAGE_OPTIONAL_HEADER32) > size - optional_offset)
+            return 0;
+        PIMAGE_OPTIONAL_HEADER32 optional =
+            (PIMAGE_OPTIONAL_HEADER32)(data + optional_offset);
+        if (subsystem)
+            *subsystem = optional->Subsystem;
+        if (subsystem_major_version)
+            *subsystem_major_version = optional->MajorSubsystemVersion;
+        if (subsystem_minor_version)
+            *subsystem_minor_version = optional->MinorSubsystemVersion;
+        if (dll_characteristics)
+            *dll_characteristics = optional->DllCharacteristics;
         return 32;
+    }
     if (file->Machine == IMAGE_FILE_MACHINE_AMD64 &&
-        magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        if (file->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+            optional_offset > size ||
+            sizeof(IMAGE_OPTIONAL_HEADER64) > size - optional_offset)
+            return 0;
+        PIMAGE_OPTIONAL_HEADER64 optional =
+            (PIMAGE_OPTIONAL_HEADER64)(data + optional_offset);
+        if (subsystem)
+            *subsystem = optional->Subsystem;
+        if (subsystem_major_version)
+            *subsystem_major_version = optional->MajorSubsystemVersion;
+        if (subsystem_minor_version)
+            *subsystem_minor_version = optional->MinorSubsystemVersion;
+        if (dll_characteristics)
+            *dll_characteristics = optional->DllCharacteristics;
         return 64;
+    }
     return 0;
 }
 
@@ -1886,10 +2914,17 @@ static void child_free_compat_environment32(WIN32_CHILD_CONTEXT *child)
         VirtualFree(child->tls_vector32, 0, MEM_RELEASE);
     if (child->compat_environment32)
         VirtualFree(child->compat_environment32, 0, MEM_RELEASE);
+    if (child->environment64)
+        (void)nt_vm_release_allocation_for_process(
+            child->process_id, child->environment64);
+    else if (child->loader_environment64)
+        VirtualFree(child->loader_environment64, 0, MEM_RELEASE);
     child->tls_vector32 = NULL;
     child->compat_environment32 = NULL;
     child->peb32 = NULL;
     child->teb32 = NULL;
+    child->environment64 = NULL;
+    child->loader_environment64 = NULL;
 }
 
 static NTSTATUS setup_child_environment(WIN32_CHILD_CONTEXT *child,
@@ -1899,7 +2934,7 @@ static NTSTATUS setup_child_environment(WIN32_CHILD_CONTEXT *child,
                                         BOOL compat32)
 {
     extern BOOL nt_process_set_peb(PVOID process_object, const PEB *source);
-    void *tls_phys = mem_alloc_pages(4);
+    void *tls_phys = compat32 ? mem_alloc_pages(4) : NULL;
     child->tls_vector = tls_phys ? (PVOID *)PHYS_TO_VIRT(tls_phys) : NULL;
     child->tls_vector32 = compat32
         ? (uint32_t *)VirtualAlloc(NULL, 4096,
@@ -1911,12 +2946,22 @@ static NTSTATUS setup_child_environment(WIN32_CHILD_CONTEXT *child,
             NULL, sizeof(WIN32_COMPAT_PROCESS_BLOCK),
             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
         : NULL;
-    child->teb32 = compat32
+    child->environment64 = !compat32
+        ? (WIN64_PROCESS_BLOCK *)VirtualAlloc(
+            NULL, sizeof(WIN64_PROCESS_BLOCK),
+            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        : NULL;
+    child->loader_environment64 = child->environment64
+        ? &child->environment64->loader : NULL;
+    if (child->environment64)
+        child->tls_vector = child->environment64->tls_vector;
+    child->teb32 = child->compat_environment32
         ? &child->compat_environment32->teb : NULL;
-    child->peb32 = compat32
+    child->peb32 = child->compat_environment32
         ? &child->compat_environment32->peb : NULL;
-    if (!child->tls_vector ||
-        (compat32 && (!child->tls_vector32 || !child->compat_environment32 ||
+    if ((!compat32 && !child->environment64) ||
+        (compat32 && (!child->tls_vector || !child->tls_vector32 ||
+         !child->compat_environment32 ||
          (uint64_t)(ULONG_PTR)child->tls_vector32 > UINT32_MAX ||
          (uint64_t)(ULONG_PTR)child->compat_environment32 +
              sizeof(WIN32_COMPAT_PROCESS_BLOCK) > UINT32_MAX))) {
@@ -1925,68 +2970,114 @@ static NTSTATUS setup_child_environment(WIN32_CHILD_CONTEXT *child,
         child->tls_vector = NULL;
         return STATUS_NO_MEMORY;
     }
-    memset(child->tls_vector, 0, 4 * 4096);
+    if (compat32)
+        memset(child->tls_vector, 0, 4 * 4096);
     if (child->tls_vector32)
         memset(child->tls_vector32, 0, 4096);
     if (child->compat_environment32)
         memset(child->compat_environment32, 0,
                sizeof(*child->compat_environment32));
+    if (child->environment64)
+        memset(child->environment64, 0, sizeof(*child->environment64));
     memset(&child->peb, 0, sizeof(child->peb));
     memset(&child->teb, 0, sizeof(child->teb));
 
+    PRTL_USER_PROCESS_PARAMETERS parameters = child->environment64
+        ? &child->environment64->process_parameters
+        : &child->process_parameters;
+    PVOID *process_heaps = child->environment64
+        ? child->environment64->process_heaps : child->process_heaps;
+    WCHAR *image_path_w = child->environment64
+        ? child->environment64->image_path_w : child->image_path_w;
+    WCHAR *command_line_w = child->environment64
+        ? child->environment64->command_line_w : child->command_line_w;
+    WCHAR *current_directory_w = child->environment64
+        ? child->environment64->current_directory_w
+        : child->current_directory_w;
+    WCHAR *dll_path_w = child->environment64
+        ? child->environment64->dll_path_w : child->dll_path_w;
+    WCHAR *desktop_info_w = child->environment64
+        ? child->environment64->desktop_info_w : child->desktop_info_w;
+    WCHAR *environment_w = child->environment64
+        ? child->environment64->environment_w : child->environment_w;
+    PPEB peb = win32_child_peb(child);
+    TEB *teb = win32_child_teb(child);
+
     if (!win32_populate_process_parameters(
-            &child->process_parameters,
-            child->image_path_w, WIN32_PROCESS_IMAGE_PATH_CAP,
-            child->command_line_w, WIN32_CHILD_COMMAND_LINE_CAP,
-            child->current_directory_w, WIN32_PROCESS_IMAGE_PATH_CAP,
-            child->dll_path_w, WIN32_PROCESS_DLL_PATH_CAP,
-            child->desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
-            child->environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
+            parameters,
+            image_path_w, WIN32_PROCESS_IMAGE_PATH_CAP,
+            command_line_w, WIN32_CHILD_COMMAND_LINE_CAP,
+            current_directory_w, WIN32_PROCESS_IMAGE_PATH_CAP,
+            dll_path_w, WIN32_PROCESS_DLL_PATH_CAP,
+            desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
+            environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
             child->process_id, child->image_path, child->command_line,
             child->current_directory, TRUE)) {
-        mem_free_pages(tls_phys, 4);
+        if (tls_phys) mem_free_pages(tls_phys, 4);
         child_free_compat_environment32(child);
         child->tls_vector = NULL;
         return STATUS_NO_MEMORY;
     }
     if (compat32 && !win32_populate_compat_process_block(child, TRUE)) {
-        mem_free_pages(tls_phys, 4);
+        if (tls_phys) mem_free_pages(tls_phys, 4);
         child_free_compat_environment32(child);
         child->tls_vector = NULL;
         return STATUS_NO_MEMORY;
     }
-    win32_initialize_peb(&child->peb, &child->process_parameters, image_base,
-                         child->process_heaps);
-    if (!nt_process_set_peb(child->process_object, &child->peb)) {
-        mem_free_pages(tls_phys, 4);
+    if (compat32) {
+        win32_initialize_peb32(child->peb32,
+                               &child->compat_environment32->process_parameters,
+                               (uint32_t)(ULONG_PTR)image_base,
+                               child->compat_environment32->process_heaps,
+                               child->subsystem,
+                               child->subsystem_major_version,
+                               child->subsystem_minor_version);
+        win32_initialize_loader32(child->compat_environment32);
+    }
+    win32_initialize_peb(peb, parameters, image_base, process_heaps,
+                         child->subsystem,
+                         child->subsystem_major_version,
+                         child->subsystem_minor_version);
+    if (!compat32)
+        win64_initialize_loader(peb, child->loader_environment64);
+    if (!nt_process_set_peb(child->process_object, peb)) {
+        if (tls_phys) mem_free_pages(tls_phys, 4);
         child_free_compat_environment32(child);
         child->tls_vector = NULL;
         return STATUS_UNSUCCESSFUL;
     }
     if (!nt_process_set_image_path(child->process_object,
                                    child->image_path)) {
-        mem_free_pages(tls_phys, 4);
+        if (tls_phys) mem_free_pages(tls_phys, 4);
         child_free_compat_environment32(child);
         child->tls_vector = NULL;
         return STATUS_UNSUCCESSFUL;
     }
-    child->teb.Self = &child->teb;
-    child->teb.ProcessEnvironmentBlock = &child->peb;
-    child->teb.ClientId.UniqueProcess =
+    teb->Self = teb;
+    teb->ProcessEnvironmentBlock = peb;
+    teb->ClientId.UniqueProcess =
         (HANDLE)(ULONG_PTR)child->process_id;
-    child->teb.ClientId.UniqueThread =
+    teb->ClientId.UniqueThread =
         (HANDLE)(ULONG_PTR)child->thread_id;
-    child->teb.StackBase = stack_top;
-    child->teb.StackLimit = stack_base;
-    child->teb.DeallocationStack = stack_base;
-    child->teb.ExceptionList = (PVOID)(ULONG_PTR)-1;
-    child->teb.ThreadLocalStoragePointer = child->tls_vector;
-    child->teb.TlsExpansionSlots =
-        child->tls_vector + (2 * 4096 / sizeof(PVOID));
+    teb->StackBase = stack_top;
+    teb->StackLimit = stack_base;
+    teb->DeallocationStack = stack_base;
+    teb->ExceptionList = (PVOID)(ULONG_PTR)-1;
+    teb->ThreadLocalStoragePointer = child->tls_vector;
+    teb->TlsExpansionSlots = child->environment64
+        ? child->environment64->tls_expansion
+        : child->tls_vector + (2 * 4096 / sizeof(PVOID));
+
+    if (child->environment64) {
+        child->peb = *peb;
+        child->teb = *teb;
+        child->teb.Self = &child->teb;
+        child->teb.ProcessEnvironmentBlock = &child->peb;
+        child->teb.ThreadLocalStoragePointer = NULL;
+        child->teb.TlsExpansionSlots = NULL;
+    }
 
     if (compat32) {
-        child->peb32->BeingDebugged = 0;
-        child->peb32->ImageBaseAddress = (uint32_t)(ULONG_PTR)image_base;
         child->teb32->ExceptionList = UINT32_MAX;
         child->teb32->StackBase = (uint32_t)(ULONG_PTR)stack_top;
         child->teb32->StackLimit = (uint32_t)(ULONG_PTR)stack_base;
@@ -1995,27 +3086,24 @@ static NTSTATUS setup_child_environment(WIN32_CHILD_CONTEXT *child,
         child->teb32->ClientId_UniqueThread = child->thread_id;
         child->teb32->ThreadLocalStoragePointer =
             (uint32_t)(ULONG_PTR)child->tls_vector32;
+        child->teb32->TlsExpansionSlots =
+            (uint32_t)(ULONG_PTR)(child->tls_vector32 + 64);
         child->teb32->ProcessEnvironmentBlock =
             (uint32_t)(ULONG_PTR)child->peb32;
     }
 
-#ifndef TEST_HARNESS
-    uint64_t teb_addr = (uint64_t)(ULONG_PTR)&child->teb;
-    __asm__ volatile (
-        "mov $0xC0000101, %%ecx\n"
-        "mov %0, %%rax\n"
-        "mov %0, %%rdx\n"
-        "shr $32, %%rdx\n"
-        "wrmsr\n"
-        : : "r"(teb_addr) : "rax", "rcx", "rdx", "memory"
-    );
-    {
-        extern void proc_set_gs_base(uint64_t addr);
-        proc_set_gs_base(teb_addr);
-    }
-#endif
+    win64_set_current_teb(teb);
     if (compat32)
         compat32_setup_teb(child->teb32);
+    else {
+        serial_puts("[WINEXEC-CHILD] user TEB64=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)teb, 16);
+        serial_puts(" PEB64=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)peb, 16);
+        serial_puts(" params=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)parameters, 16);
+        serial_puts("\n");
+    }
     return STATUS_SUCCESS;
 }
 
@@ -2078,7 +3166,7 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
     uint64_t file_pages = (file_size + 4095) / 4096;
     void *file_phys = file_pages ? mem_alloc_pages(file_pages) : NULL;
     BYTE *file_data = file_phys ? (BYTE *)PHYS_TO_VIRT(file_phys) : NULL;
-    PE_IMAGE_INFO info;
+    PE_IMAGE_INFO info = {0};
     PVOID stack_allocation = NULL;
     PVOID stack_limit = NULL;
     PVOID stack_base = NULL;
@@ -2093,13 +3181,31 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
         child->exit_status = STATUS_NO_MEMORY;
         goto done;
     }
-    int image_bits = child_image_bitness(file_data, file_size);
+    USHORT image_subsystem = 0;
+    USHORT image_subsystem_major_version = 0;
+    USHORT image_subsystem_minor_version = 0;
+    USHORT image_dll_characteristics = 0;
+    int image_bits = child_image_bitness(file_data, file_size,
+                                         &image_subsystem,
+                                         &image_subsystem_major_version,
+                                         &image_subsystem_minor_version,
+                                         &image_dll_characteristics);
     if (!image_bits) {
         child->exit_status = STATUS_INVALID_IMAGE_FORMAT;
         serial_puts("[WINEXEC-CHILD] unsupported PE image\n");
         goto done;
     }
     compat32 = image_bits == 32;
+    child->subsystem = image_subsystem;
+    child->subsystem_major_version = image_subsystem_major_version;
+    child->subsystem_minor_version = image_subsystem_minor_version;
+    BOOL dep_enabled = !compat32 ||
+        (image_dll_characteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT);
+    nt_vm_configure_process_dep(child->process_id, dep_enabled);
+    serial_puts("[WIN32-DEP] pid=");
+    serial_putdec(child->process_id);
+    serial_puts(compat32 ? " PE32 " : " PE64 ");
+    serial_puts(dep_enabled ? "enabled\n" : "legacy OptIn disabled\n");
     if (compat32) {
         extern int sched_alloc_compat_ist1(uint32_t pid);
         if (sched_alloc_compat_ist1((uint32_t)child->kernel_pid) < 0) {
@@ -2109,8 +3215,6 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
         compat32_init();
     }
     g_compat32_mode = compat32 ? 1 : 0;
-
-    child_save_shared_dll_state(child);
 
     child->exit_status = setup_child_environment(child, NULL, NULL, NULL,
                                                   compat32);
@@ -2133,9 +3237,28 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
     }
 
     win32_publish_current_image_base(info.ImageBase);
+    PPEB child_peb = win32_child_peb(child);
+    child_peb->ImageBaseAddress = info.ImageBase;
+    child_peb->ImageSubsystem = info.Subsystem;
+    child_peb->ImageSubsystemMajorVersion = info.MajorSubsystemVersion;
+    child_peb->ImageSubsystemMinorVersion = info.MinorSubsystemVersion;
+    child->peb = *child_peb;
+    {
+        extern BOOL nt_process_set_peb(PVOID process_object,
+                                       const PEB *source);
+        if (!nt_process_set_peb(child->process_object, child_peb)) {
+            child->exit_status = STATUS_UNSUCCESSFUL;
+            goto done;
+        }
+    }
     if (compat32) {
         child->peb32->ImageBaseAddress =
             (uint32_t)(ULONG_PTR)info.ImageBase;
+        child->peb32->ImageSubsystem = info.Subsystem;
+        child->peb32->ImageSubsystemMajorVersion =
+            info.MajorSubsystemVersion;
+        child->peb32->ImageSubsystemMinorVersion =
+            info.MinorSubsystemVersion;
         child->exit_status = compat32_patch_iat(&info);
         if (NT_SUCCESS(child->exit_status))
             child->exit_status = pe_finalize_image_protections(&info);
@@ -2158,9 +3281,6 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
     serial_puthex((uint64_t)(ULONG_PTR)info.EntryPoint, 16);
     serial_puts("\n");
 
-    if (!compat32)
-        child_preload_swiftshader(child);
-
     uint64_t stack_size = info.StackReserve;
     if (stack_size < 65536) stack_size = 65536;
     if (stack_size > 8ULL * 1024 * 1024) stack_size = 8ULL * 1024 * 1024;
@@ -2177,6 +3297,10 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
     stack_top = (BYTE *)((ULONG_PTR)stack_top & ~0xFULL);
 
     win32_publish_current_image_base(info.ImageBase);
+    TEB *child_teb = win32_child_teb(child);
+    child_teb->StackBase = stack_base;
+    child_teb->StackLimit = stack_limit;
+    child_teb->DeallocationStack = stack_allocation;
     child->teb.StackBase = stack_base;
     child->teb.StackLimit = stack_limit;
     child->teb.DeallocationStack = stack_allocation;
@@ -2191,23 +3315,12 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
         child->exit_ready = TRUE;
         if (compat32) {
             uint32_t sp32 = (uint32_t)(ULONG_PTR)stack_top;
-            uint32_t *sp = (uint32_t *)(ULONG_PTR)sp32;
-            extern uint32_t crt_get_base_seh_thunk(void);
-            uint32_t handler = crt_get_base_seh_thunk();
-            if (handler) {
-                sp -= 3;
-                sp[0] = child->teb32->ExceptionList;
-                sp[1] = handler;
-                sp[2] = 0;
-                child->teb32->ExceptionList = (uint32_t)(ULONG_PTR)sp;
-                sp32 = (uint32_t)(ULONG_PTR)sp;
-            }
             compat32_enter((uint32_t)(ULONG_PTR)info.EntryPoint, sp32);
         } else {
             child->exit_status = win64_attach_tls(&info);
         }
         if (!compat32 && NT_SUCCESS(child->exit_status)) {
-            win64_call_child_entry(info.EntryPoint, stack_top, &child->peb,
+            win64_call_child_entry(info.EntryPoint, stack_top, child_peb,
                                    info.Subsystem == IMAGE_SUBSYSTEM_NATIVE);
             child->exit_status = STATUS_SUCCESS;
         }
@@ -2246,7 +3359,7 @@ done:
         extern int win32_terminate_process_threads(PPEB owner,
                                                     DWORD exit_code);
         int stopped = win32_terminate_process_threads(
-            &child->peb, (DWORD)child->exit_status);
+            win32_child_peb(child), (DWORD)child->exit_status);
         if (stopped) {
             serial_puts("[WINEXEC-CHILD] stopped owned threads=");
             serial_putdec((uint64_t)stopped);
@@ -2254,9 +3367,12 @@ done:
         }
     }
 
+    kernel32_release_process_waits(child->process_id);
+
     wsock_release_process(child->process_id);
     advapi32_crypto_release_process(child->process_id);
     advapi32_service_release_process(child->process_id);
+    advapi32_registry_flush();
 
     {
         extern DWORD kernel32_release_process_handles(DWORD process_id);
@@ -2271,6 +3387,7 @@ done:
     child->inherited_handle_count = 0;
 
     oleacc_release_process(child->process_id);
+    ole32_release_process(child->process_id);
     shell32_release_process(child->process_id);
     opengl32_release_process((DWORD)child->kernel_pid);
     user32_release_process(child->process_id);
@@ -2278,13 +3395,12 @@ done:
     /* Static TLS ownership belongs to the child PID, not to whichever thread
      * performs cleanup. Release it while the child's TEB and DLL metadata are
      * both authoritative, then discard the private images. */
-    child_restore_shared_dll_state(child);
     if (compat32 && child->tls_vector32) {
         extern void win32_tls_release_process32(TEB32 *teb);
         win32_tls_release_process32(child->teb32);
-    } else if (child->tls_vector) {
+    } else if (child->environment64) {
         extern void win64_tls_release_process(TEB *teb);
-        win64_tls_release_process(&child->teb);
+        win64_tls_release_process(win32_child_teb(child));
     }
     dll_release_process(child->process_id);
     nt_process_complete_child(child->process_object, child->thread_object,
@@ -2294,13 +3410,19 @@ done:
     serial_puts(" status=0x");
     serial_puthex((uint32_t)child->exit_status, 8);
     serial_puts("\n");
-    child_free_compat_environment32(child);
-    if (child->tls_vector) {
+    if (compat32 && child->tls_vector) {
         mem_free_pages((void *)VIRT_TO_PHYS(child->tls_vector), 4);
         child->tls_vector = NULL;
     }
-    if (image_loaded) pe_unload(&info);
+    if (image_loaded)
+        pe_unload_for_owner(&info, child->process_id);
     if (file_phys) mem_free_pages(file_phys, file_pages);
+    /* Keep the compat TEB mapped until every Win32-facing unload operation
+     * has completed. VirtualFree of this block is the final API call allowed
+     * to consult the child's LastError slot. */
+    if (!compat32 && child->environment64)
+        win64_set_current_teb(&child->teb);
+    child_free_compat_environment32(child);
     nt_vm_release_process(child->process_id);
     kernel32_release_process_environment(child->process_id);
     __atomic_store_n(&child->used, FALSE, __ATOMIC_RELEASE);
@@ -2453,13 +3575,15 @@ BOOL win32_terminate_child(HANDLE process_handle, NTSTATUS status)
             extern int win32_terminate_process_threads(PPEB owner,
                                                         DWORD exit_code);
             int stopped = win32_terminate_process_threads(
-                &child->peb, (DWORD)status);
+                win32_child_peb(child), (DWORD)status);
             serial_puts("[WINEXEC-TERM] forced pid=");
             serial_putdec(child->process_id);
             serial_puts(" stopped_threads=");
             serial_putdec((uint64_t)(uint32_t)stopped);
             serial_puts("\n");
         }
+
+        kernel32_release_process_waits(child->process_id);
 
         extern int proc_kill_pid(int pid);
         child->exit_ready = FALSE;
@@ -2469,8 +3593,11 @@ BOOL win32_terminate_child(HANDLE process_handle, NTSTATUS status)
         if (child->kernel_pid > 0) proc_kill_pid(child->kernel_pid);
         if (child->kernel_pid > 0)
             opengl32_release_process((DWORD)child->kernel_pid);
+        ddraw_release_process(child->process_id);
         wsock_release_process(child->process_id);
+        ole32_release_process(child->process_id);
         advapi32_crypto_release_process(child->process_id);
+        advapi32_registry_flush();
         kernel32_release_process_environment(child->process_id);
         __atomic_store_n(&child->used, FALSE, __ATOMIC_RELEASE);
         return TRUE;
@@ -2549,6 +3676,11 @@ NTSTATUS win32_spawn_child(const char *image_path, const char *command_line,
         child->inherited_handles[child->inherited_handle_count++] =
             inherited_handles[i];
     }
+
+    status = kernel32_inherit_process_console(
+        child->parent_process_id, child->process_id, creation_flags);
+    if (!NT_SUCCESS(status))
+        goto fail_child;
 
     if (environment) {
         status = kernel32_set_process_environment_block(
@@ -2631,104 +3763,128 @@ fail:
     return status;
 }
 
-static int str_ends_with_dll(const char *s)
-{
-    int len = 0;
-    while (s[len]) len++;
-    if (len < 4) return 0;
-    char c0 = s[len-4], c1 = s[len-3], c2 = s[len-2], c3 = s[len-1];
-    if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
-    if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-    if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-    if (c3 >= 'A' && c3 <= 'Z') c3 += 32;
-    return c0 == '.' && c1 == 'd' && c2 == 'l' && c3 == 'l';
-}
+/* DLLs are loaded from the executable import graph and by LoadLibrary.
+ * Scanning the whole filesystem here would run unrelated DllMain routines
+ * before the process entry point, unlike the Windows loader. */
 
-/* Case-insensitive equality for short DLL names. */
-static int dll_name_ieq(const char *a, const char *b)
+static void win32_cleanup_main_process(PE_IMAGE_INFO *info,
+                                       PVOID stack_allocation,
+                                       BOOL compat32,
+                                       NTSTATUS exit_status)
 {
-    while (*a && *b) {
-        char ca = *a, cb = *b;
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
-        if (ca != cb) return 0;
-        a++; b++;
+    const DWORD process_id = 1;
+    PPEB process_peb = win64_main_peb();
+    TEB *process_teb = win64_main_teb();
+
+    /* A compat32 non-local exit restores RIP/RSP but not the segment state or
+     * APIC timer mask changed by compat32_enter(). Teardown can block while
+     * workers stop, so make the root task schedulable before touching them. */
+    if (compat32) {
+        __asm__ volatile (
+            "mov $0x30, %%ax\n"
+            "mov %%ax, %%ds\n"
+            "mov %%ax, %%es\n"
+            "mov %%ax, %%ss\n"
+            ::: "ax", "memory"
+        );
+        extern volatile uint32_t *idt_get_apic_base(void);
+        volatile uint32_t *apic = idt_get_apic_base();
+        if (apic)
+            apic[0x320 / 4] &= ~0x10000U;
     }
-    return *a == 0 && *b == 0;
-}
 
-/* Render-device plugin DLLs must NOT be preloaded: their _initterm static
- * initializers do engine-level work (object loading, large allocations) that
- * needs FName/GObj to be live — but the EXE's appInit (which runs
- * FName::StaticInit + ProcessRegistrants) hasn't executed during preload.
- * Preloading OpenGlDrv crashed mid-_initterm at a "Loading objects..." site,
- * so preload never completed and the EXE entry was never reached. In real
- * Windows these load via LoadLibrary AFTER appInit, when the engine selects a
- * renderer — our dll_load runs their _initterm then, with the engine up. */
-static int is_deferred_render_dll(const char *name)
-{
-    static const char *deferred[] = {
-        "OpenGlDrv.dll", "D3DDrv.dll", "GlideDrv.dll",
-        "MeTaLDrv.dll", "SoftDrv.dll", 0
-    };
-    for (int i = 0; deferred[i]; i++)
-        if (dll_name_ieq(name, deferred[i])) return 1;
-    return 0;
-}
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(flags));
+    if (!(flags & (1ULL << 9)))
+        __asm__ volatile ("sti" ::: "memory");
 
-static void winexec_preload_dlls(void)
-{
-    uint32_t count = osfs2_file_count();
-    int loaded = 0;
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    if (kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(kernel_cr3) : "memory");
 
-    serial_puts("[WINEXEC] pre-loading DLLs from filesystem...\n");
+    /* Multimedia callbacks can re-enter guest code. Ask their dispatcher to
+     * stop gracefully before force-retiring any remaining process threads. */
+    winmm_release_process(process_id);
 
-    for (uint32_t i = 0; i < count; i++) {
-        void *f = osfs2_file_by_index(i);
-        if (!f) continue;
-        const char *name = osfs2_file_name(f);
-        if (!name || !str_ends_with_dll(name)) continue;
-
-        /* Skip if already loaded (import DLLs or shim DLLs) */
-        if (dll_find_module(name)) continue;
-
-        /* Defer render-device plugins to runtime LoadLibrary (see above). */
-        if (is_deferred_render_dll(name)) {
-            serial_puts("[WINEXEC] preload SKIP (render device, load on demand): ");
-            serial_puts(name);
-            serial_puts("\n");
-            continue;
-        }
-
-        uint64_t fsize = osfs2_file_size(f);
-        if (fsize == 0) continue;
-
-        serial_puts("[WINEXEC] preload: ");
-        serial_puts(name);
-        serial_puts(" (");
-        serial_putdec(fsize / 1024);
-        serial_puts(" KB)...\n");
-
-        uint64_t pages = (fsize + 0xFFF) / 4096;
-        uint8_t *buf = (uint8_t *)mem_alloc_pages(pages);
-        if (!buf) continue;
-
-        osfs2_read(f, 0, buf, fsize);
-        dll_load(name, (const BYTE *)buf, (SIZE_T)fsize);
-        serial_puts("[WINEXEC] preload done: ");
-        serial_puts(name);
+    extern int win32_terminate_process_threads(PPEB owner, DWORD exit_code);
+    int stopped = win32_terminate_process_threads(
+        process_peb, (DWORD)exit_status);
+    if (stopped) {
+        serial_puts("[WINEXEC] stopped owned threads=");
+        serial_putdec((uint64_t)stopped);
         serial_puts("\n");
-        loaded++;
-        /* Intentionally leak temp buffer — freeing pages allows
-         * mem_alloc_pages to recycle them for VirtualAlloc, which
-         * zero-fills, potentially corrupting live PE32 heap data
-         * (FName::Names entries, UClass objects, etc.) */
-        loaded++;
     }
 
-    serial_puts("[WINEXEC] preloaded ");
-    serial_puthex(loaded, 2);
-    serial_puts(" DLLs\n");
+    kernel32_release_process_waits(process_id);
+
+    wsock_release_process(process_id);
+    advapi32_crypto_release_process(process_id);
+    advapi32_service_release_process(process_id);
+    advapi32_registry_flush();
+
+    extern DWORD kernel32_release_process_handles(DWORD process_id);
+    DWORD released_handles = kernel32_release_process_handles(process_id);
+    if (released_handles) {
+        serial_puts("[WINEXEC] closed owned handles=");
+        serial_putdec(released_handles);
+        serial_puts("\n");
+    }
+
+    oleacc_release_process(process_id);
+    shell32_release_process(process_id);
+    opengl32_release_process((DWORD)proc_current_tgid());
+    user32_release_process(process_id);
+
+    /* Stop native backends and discard cached guest pointers before static
+     * TLS and module images cease to be valid. nt_vm_release_process() repeats
+     * these calls defensively, so each release routine remains idempotent. */
+    ddraw_release_process(process_id);
+    dinput8_release_process(process_id);
+    dsound_release_process(process_id);
+    ole32_release_process(process_id);
+    msvcrt_release_process(process_id);
+
+    if (compat32 && g_main_compat_environment32) {
+        extern void win32_tls_release_process32(TEB32 *teb);
+        win32_tls_release_process32(&g_main_compat_environment32->teb);
+    } else {
+        extern void win64_tls_release_process(TEB *teb);
+        win64_tls_release_process(process_teb);
+    }
+    dll_release_process(process_id);
+
+    if (stack_allocation) {
+        NTSTATUS stack_status = nt_vm_free_stack(stack_allocation);
+        if (!NT_SUCCESS(stack_status)) {
+            serial_puts("[WINEXEC] stack release failed status=0x");
+            serial_puthex((uint32_t)stack_status, 8);
+            serial_puts("\n");
+        }
+    }
+    if (info && info->ImageBase)
+        pe_unload_for_owner(info, process_id);
+
+    if (g_main_compat_environment32) {
+        compat32_setup_teb(NULL);
+        g_main_compat_environment32 = NULL;
+    }
+    if (!compat32 && g_main_environment64) {
+        win64_reset_bootstrap_teb();
+        g_main_environment64 = NULL;
+    }
+    g_compat32_mode = 0;
+
+    nt_vm_release_process(process_id);
+    kernel32_release_process_environment(process_id);
+
+    g_exe_image_base = 0;
+    g_exe_subsystem = 0;
+    g_exe_subsystem_major_version = 0;
+    g_exe_subsystem_minor_version = 0;
+    g_peb.ImageBaseAddress = NULL;
+    g_teb.StackBase = NULL;
+    g_teb.StackLimit = NULL;
+    g_teb.DeallocationStack = NULL;
 }
 
 /* ── Main execution entry ───────────────────────────────────── */
@@ -2745,28 +3901,75 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
 {
     serial_puts("\n=== OsitoK Windows Compatibility Layer ===\n");
 
+    USHORT image_subsystem = 0;
+    USHORT image_subsystem_major_version = 0;
+    USHORT image_subsystem_minor_version = 0;
+    USHORT image_dll_characteristics = 0;
+    int image_bits = child_image_bitness(file_data, file_size,
+                                         &image_subsystem,
+                                         &image_subsystem_major_version,
+                                         &image_subsystem_minor_version,
+                                         &image_dll_characteristics);
+    if (image_bits != 32 && image_bits != 64) {
+        serial_puts("[WINEXEC] unsupported PE image\n");
+        return -1;
+    }
+    BOOL compat32 = image_bits == 32;
+    g_exe_subsystem = image_subsystem;
+    g_exe_subsystem_major_version = image_subsystem_major_version;
+    g_exe_subsystem_minor_version = image_subsystem_minor_version;
+
     /* A completed main PE may leave private VirtualAlloc/section mappings in
      * the shell's kernel CR3. Release them before assigning owner PID 1 to the
      * next run; resetting tracker metadata would leak both PTEs and pages. */
+    if (g_main_compat_environment32) {
+        compat32_setup_teb(NULL);
+        g_main_compat_environment32 = NULL;
+    }
+    if (g_main_environment64) {
+        win64_reset_bootstrap_teb();
+        g_main_environment64 = NULL;
+    }
     wsock_release_process(1);
+    ole32_release_process(1);
     advapi32_crypto_release_process(1);
     nt_vm_release_process(1);
+    kernel32_release_process_environment(1);
     opengl32_release_process((DWORD)proc_current_tgid());
 
-    /* A previous PE32 process may have left the shared shim mode selected. */
-    g_compat32_mode = 0;
+    BOOL dep_enabled = !compat32 ||
+        (image_dll_characteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT);
+    nt_vm_configure_process_dep(1, dep_enabled);
+    serial_puts("[WIN32-DEP] pid=1");
+    serial_puts(compat32 ? " PE32 " : " PE64 ");
+    serial_puts(dep_enabled ? "enabled\n" : "legacy OptIn disabled\n");
+
+    /* Import resolution and dependency DllMain calls happen inside pe_load().
+     * Select the process ABI before initializing shims or entering the loader. */
+    g_compat32_mode = compat32 ? 1 : 0;
 
     /* Initialize subsystems */
     NT_SERVICE_TABLE ssdt;
     nt_syscall_init(&ssdt);
     ntdll_shim_init();
     kernel32_shim_init();
+    if (!NT_SUCCESS(kernel32_initialize_process_console(
+            1, image_subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI))) {
+        serial_puts("[WINEXEC] failed to initialize console state\n");
+        g_compat32_mode = 0;
+        g_exe_subsystem = 0;
+        g_exe_subsystem_major_version = 0;
+        g_exe_subsystem_minor_version = 0;
+        return -1;
+    }
     msvcrt_shim_init();
     shell32_shim_init();  /* release tray-owned icon copies before user32 */
     user32_shim_init();   /* re-exec: window/input/activation state reset */
     oleacc_shim_init();
     ddraw_shim_init();    /* re-exec: surfaces/COM proxies/display-mode reset */
     dinput8_shim_init();  /* re-exec: DirectInput COM32 thunks are process-local */
+    dsound_shim_init();   /* publish the DirectSound COM class provider */
+    winmm_shim_init();    /* process-local multimedia timer callback bridge */
     opengl32_shim_init(); /* re-exec: WGL query contexts reset */
     libusb_shim_init();   /* native xHCI owns USB; SDL sees an empty bus */
 
@@ -2825,11 +4028,16 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     dll_register_shim("wintrust.dll", wintrust_resolve);
     dll_register_shim("comctl32.dll", comctl32_resolve);
     dll_register_shim("comdlg32.dll", comdlg32_resolve);
+    dll_register_shim_ex("riched32.dll", richedit_resolve,
+                         richedit_module_event);
+    dll_register_shim_ex("riched20.dll", richedit_resolve,
+                         richedit_module_event);
+    dll_register_shim_ex("msftedit.dll", richedit_resolve,
+                         richedit_module_event);
     dll_register_shim("libusb-1.0.dll", libusb_resolve);
 
-    /* Phase 1: register each shim's co-located ABI table (argc + callconv
-     * derived from the prototype) so the IAT thunk's RET N comes from the
-     * real signature, not the name-keyed guess_num_args default-4. */
+    /* Register each shim's co-located ABI table (argc + callconv derived
+     * from the prototype) so every IAT thunk uses its export contract. */
     {
         win32_abi_reset();
         extern const WIN32_EXPORT *ntdll_abi_table(int *);
@@ -2929,7 +4137,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
      * published. Give the direct winexec task its private syscall/fault stacks
      * now; CreateProcess and CreateThread perform the same setup in their own
      * launch paths. */
-    if (child_image_bitness(file_data, file_size) == 32) {
+    if (compat32) {
         extern int32_t proc_current_pid(void);
         extern int sched_alloc_compat_ist1(uint32_t pid);
         int32_t pid = proc_current_pid();
@@ -2942,62 +4150,29 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puts("\n");
     }
 
-    compat32_init();
-
-    /* Create base SEH handler thunk (needs thunk pool from compat32_init) */
-    {
-        extern void crt_install_base_seh_thunk(void);
-        crt_install_base_seh_thunk();
-    }
+    if (compat32)
+        compat32_init();
 
     /* Native DLL entry points execute during pe_load(). Establish GS, the
      * live PEB and normalized process parameters before the loader can call
      * any of them. win32_tls_reset() below then installs the fresh TLS vectors
      * into this TEB without erasing the ABI fields. */
-    if (!setup_environment(NULL, FALSE)) {
+    if (!setup_environment(NULL, !compat32)) {
         serial_puts("[WINEXEC] failed to initialize process environment\n");
         g_compat32_mode = 0;
         return -1;
     }
 
-    /*
-     * Pre-initialize TEB32/PEB32 and set FS base BEFORE pe_load().
-     *
-     * pe_load() recursively loads DLLs and calls DllMain via compat32
-     * callbacks. DllMain's CRT startup code registers SEH handlers:
-     *   push dword ptr fs:[0]   ; save current ExceptionList
-     *   mov  fs:[0], esp        ; install new handler
-     *
-     * If FS_BASE isn't pointing to g_teb32 yet, fs:[0] reads garbage
-     * from whatever address FS_BASE points to (0 or stale kernel TLS).
-     * That garbage gets saved as the "previous" SEH chain link.
-     * Later, SEH unwind restores it: mov fs:[0], eax → ExceptionList
-     * becomes the garbage value (e.g. 0x6), corrupting the SEH chain.
-     *
-     * Fix: set up TEB32 with ExceptionList=0xFFFFFFFF and point
-     * FS_BASE to it before any 32-bit code executes.
-     */
-    {
-        uint8_t *p;
-
-        p = (uint8_t *)&g_peb32;
-        for (int i = 0; i < (int)sizeof(g_peb32); i++) p[i] = 0;
-        g_peb32.BeingDebugged = 0;
-        g_peb32.ProcessHeap   = 0xBEEF0001;
-
-        p = (uint8_t *)&g_teb32;
-        for (int i = 0; i < (int)sizeof(g_teb32); i++) p[i] = 0;
-        g_teb32.Self                    = (uint32_t)(ULONG_PTR)&g_teb32;
-        g_teb32.ProcessEnvironmentBlock = (uint32_t)(ULONG_PTR)&g_peb32;
-        g_teb32.ClientId_UniqueProcess  = 1;
-        g_teb32.ClientId_UniqueThread   = 1;
-        g_teb32.LastErrorValue          = 0;
-        g_teb32.ExceptionList           = 0xFFFFFFFF; /* empty SEH chain */
-
+    /* DLL entry points execute inside pe_load(). Install the process's real
+     * low TEB/PEB before any PE32 CRT can touch FS:[0] or FS:[0x30]. */
+    if (compat32) {
+        if (!setup_main_compat_environment32()) {
+            serial_puts("[WINEXEC] failed to allocate low PE32 environment\n");
+            g_compat32_mode = 0;
+            return -1;
+        }
+    } else {
         win32_tls_reset();
-        compat32_setup_teb(&g_teb32);
-
-        serial_puts("[WINEXEC] TEB32 pre-initialized, FS base set\n");
     }
 
     serial_puts("[WINEXEC] loading PE...\n");
@@ -3011,12 +4186,30 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puts("[WINEXEC] PE load failed: ");
         serial_puthex((uint64_t)status, 8);
         serial_puts("\n");
-        g_compat32_mode = 0;
+        win32_cleanup_main_process(&info, NULL, compat32, status);
         return -1;
     }
 
     win32_publish_current_image_base(info.ImageBase);
     g_exe_subsystem = info.Subsystem;
+    g_exe_subsystem_major_version = info.MajorSubsystemVersion;
+    g_exe_subsystem_minor_version = info.MinorSubsystemVersion;
+    PPEB main_peb = win64_main_peb();
+    main_peb->ImageBaseAddress = info.ImageBase;
+    main_peb->ImageSubsystem = info.Subsystem;
+    main_peb->ImageSubsystemMajorVersion = info.MajorSubsystemVersion;
+    main_peb->ImageSubsystemMinorVersion = info.MinorSubsystemVersion;
+    g_peb = *main_peb;
+    {
+        extern BOOL nt_process_set_peb(PVOID process_object,
+                                       const PEB *source);
+        if (!nt_process_set_peb(NULL, main_peb)) {
+            serial_puts("[WINEXEC] failed to publish loaded PEB\n");
+            win32_cleanup_main_process(&info, NULL, compat32,
+                                       STATUS_UNSUCCESSFUL);
+            return -1;
+        }
+    }
     serial_puts("[WINEXEC] PE loaded successfully\n");
     serial_puts("[WINEXEC] subsystem: ");
     serial_puthex(info.Subsystem, 4);
@@ -3024,7 +4217,15 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                 ? " (console)\n" : " (other)\n");
 
     if (info.Is32Bit)
-        g_peb32.ImageBaseAddress = (uint32_t)(ULONG_PTR)info.ImageBase;
+    {
+        win32_main_peb32()->ImageBaseAddress =
+            (uint32_t)(ULONG_PTR)info.ImageBase;
+        win32_main_peb32()->ImageSubsystem = info.Subsystem;
+        win32_main_peb32()->ImageSubsystemMajorVersion =
+            info.MajorSubsystemVersion;
+        win32_main_peb32()->ImageSubsystemMinorVersion =
+            info.MinorSubsystemVersion;
+    }
     serial_puts("[WINEXEC] PEB/TEB initialized, GS base set\n");
 
     /* For PE32 (i386): patch EXE IAT and set up FS:TEB */
@@ -3036,8 +4237,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         NTSTATUS compat_st = compat32_patch_iat(&info);
         if (!NT_SUCCESS(compat_st)) {
             serial_puts("[WINEXEC] compat32 IAT patch failed\n");
-            pe_unload(&info);
-            g_compat32_mode = 0;
+            win32_cleanup_main_process(&info, NULL, compat32, compat_st);
             return -1;
         }
 
@@ -3046,8 +4246,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             serial_puts("[WINEXEC] final protection setup failed: 0x");
             serial_puthex((uint32_t)compat_st, 8);
             serial_puts("\n");
-            pe_unload(&info);
-            g_compat32_mode = 0;
+            win32_cleanup_main_process(&info, NULL, compat32, compat_st);
             return -1;
         }
 
@@ -3056,16 +4255,15 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             serial_puts("[WINEXEC] compat32 TLS setup failed: 0x");
             serial_puthex((uint32_t)compat_st, 8);
             serial_puts("\n");
-            pe_unload(&info);
-            g_compat32_mode = 0;
+            win32_cleanup_main_process(&info, NULL, compat32, compat_st);
             return -1;
         }
 
         /* Set FS base for 32-bit TEB access (Windows i386 uses FS:0) */
-        compat32_setup_teb(&g_teb32);
+        compat32_setup_teb(win32_main_teb32());
 
         serial_puts("[WINEXEC] TEB32.ExceptionList after setup = 0x");
-        serial_puthex(g_teb32.ExceptionList, 8);
+        serial_puthex(win32_main_teb32()->ExceptionList, 8);
         serial_puts("\n");
     } else {
         NTSTATUS tls_st = pe_finalize_image_protections(&info);
@@ -3073,8 +4271,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             serial_puts("[WINEXEC] final protection setup failed: 0x");
             serial_puthex((uint32_t)tls_st, 8);
             serial_puts("\n");
-            pe_unload(&info);
-            g_compat32_mode = 0;
+            win32_cleanup_main_process(&info, NULL, compat32, tls_st);
             return -1;
         }
 
@@ -3083,223 +4280,11 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             serial_puts("[WINEXEC] PE64 TLS setup failed: 0x");
             serial_puthex((uint32_t)tls_st, 8);
             serial_puts("\n");
-            pe_unload(&info);
-            g_compat32_mode = 0;
+            win32_cleanup_main_process(&info, NULL, compat32, tls_st);
             return -1;
         }
     }
 
-    /* UT99 pre-loads all engine DLLs to register native classes.
-     * Force the GMalloc stub during preload: UE1 IMPLEMENT_CLASS constructors
-     * call appMalloc, but FMallocWindows::Init (appInit) hasn't run, so the
-     * real allocator's Heap is NULL and would fault. The stub routes to the
-     * same HeapAlloc pool, so the handoff to the real allocator is seamless. */
-    extern char win32_exe_name[64];
-    if (dll_name_ieq(win32_exe_name, "UnrealTournament.exe")) {
-        extern int g_gmalloc_preload_phase;
-        g_gmalloc_preload_phase = 1;
-        winexec_preload_dlls();
-        g_gmalloc_preload_phase = 0;
-    }
-
-    /* ── Diagnostic: inspect UE1 GAutoRegister linked list ─────── */
-    {
-        LOADED_MODULE *core = dll_find_module("Core.dll");
-        if (!core) { serial_puts("[DIAG] Core.dll not found!\n"); }
-        else {
-            PVOID ar_ptr = dll_resolve_export(core,
-                "?GAutoRegister@UObject@@0PAV1@A", 0, FALSE);
-            PVOID uobj_psc = dll_resolve_export(core,
-                "?PrivateStaticClass@UObject@@0VUClass@@A", 0, FALSE);
-            /* GetSuperClass: read first few bytes to find SuperField offset */
-            PVOID gsc_fn = dll_resolve_export(core,
-                "?GetSuperClass@UClass@@QBEPAV1@XZ", 0, FALSE);
-
-            serial_puts("\n[DIAG] === GAutoRegister Inspection ===\n");
-            serial_puts("[DIAG] GAutoRegister @");
-            serial_puthex((uint64_t)(ULONG_PTR)ar_ptr, 8);
-            serial_puts("\n[DIAG] UObject::PrivateStaticClass @");
-            serial_puthex((uint64_t)(ULONG_PTR)uobj_psc, 8);
-            serial_puts("\n");
-
-            /* Disassemble GetSuperClass to find SuperField offset.
-             * Expected: mov eax,[ecx+XX]; ret  →  8B 41 XX C3 */
-            int super_offset = -1;
-            if (gsc_fn) {
-                uint8_t *code = (uint8_t *)gsc_fn;
-                serial_puts("[DIAG] GetSuperClass bytes:");
-                for (int b = 0; b < 8; b++) {
-                    serial_puts(" ");
-                    serial_puthex(code[b], 2);
-                }
-                serial_puts("\n");
-                if (code[0] == 0x8B && code[1] == 0x41) {
-                    super_offset = (int)(int8_t)code[2];
-                } else if (code[0] == 0x8B && code[1] == 0x81) {
-                    super_offset = *(int32_t *)(code + 2);
-                }
-                if (super_offset >= 0) {
-                    serial_puts("[DIAG] SuperField offset = +0x");
-                    serial_puthex(super_offset, 2);
-                    serial_puts("\n");
-                }
-            }
-
-            if (ar_ptr) {
-                uint32_t head = *(uint32_t *)ar_ptr;
-                serial_puts("[DIAG] GAutoRegister head = 0x");
-                serial_puthex(head, 8);
-                serial_puts("\n");
-
-                if (head == 0) {
-                    serial_puts("[DIAG] ** NULL — NO classes! **\n");
-                } else {
-                    /* Discover next offset */
-                    uint32_t first_vt = *(uint32_t *)(ULONG_PTR)head;
-                    int next_off = -1;
-                    for (int off = 4; off <= 32; off += 4) {
-                        uint32_t v = *(uint32_t *)((ULONG_PTR)head + off);
-                        if (v >= 0x100000 && v < 0x12000000
-                            && v != first_vt && v != head) {
-                            uint32_t pv = *(uint32_t *)(ULONG_PTR)v;
-                            if (pv == first_vt) { next_off = off; break; }
-                        }
-                    }
-                    serial_puts("[DIAG] next_off=+0x");
-                    serial_puthex(next_off >= 0 ? next_off : 0xFF, 2);
-                    serial_puts("\n");
-
-                    /* Count entries and find UObject's class */
-                    uint32_t cur = head;
-                    int total = 0;
-                    int uobj_idx = -1;
-                    uint32_t uobj_addr = uobj_psc
-                        ? (uint32_t)(ULONG_PTR)uobj_psc : 0;
-
-                    while (cur && total < 5000) {
-                        if (cur == uobj_addr) uobj_idx = total;
-                        total++;
-                        if (next_off < 0) break;
-                        uint32_t n = *(uint32_t *)((ULONG_PTR)cur + next_off);
-                        if (n == 0 || n < 0x1000) break;
-                        /* Validate: same vtable? */
-                        uint32_t nv = *(uint32_t *)(ULONG_PTR)n;
-                        if (nv != first_vt) break;
-                        cur = n;
-                    }
-
-                    serial_puts("[DIAG] total=");
-                    serial_putdec(total);
-                    serial_puts(" UObject_idx=");
-                    if (uobj_idx >= 0) serial_putdec(uobj_idx);
-                    else serial_puts("NOT_FOUND");
-                    serial_puts("\n");
-
-                    /* Dump UObject's PrivateStaticClass fields */
-                    if (uobj_psc) {
-                        uint8_t *p = (uint8_t *)uobj_psc;
-                        serial_puts("[DIAG] UObject UClass dump:\n");
-                        for (int j = 0; j < 64; j += 4) {
-                            uint32_t v = *(uint32_t *)(p + j);
-                            serial_puts("[DIAG]   +0x");
-                            serial_puthex(j, 2);
-                            serial_puts(": 0x");
-                            serial_puthex(v, 8);
-                            if (j == 0) serial_puts(" (vtable)");
-                            if (super_offset >= 0 && j == super_offset)
-                                serial_puts(" (SuperField)");
-                            if (j == 0x1C) serial_puts(" (flags?)");
-                            serial_puts("\n");
-                        }
-                    }
-
-                    /* Dump 3 entries: first, middle, last */
-                    int show_idx[] = {0, total/2, total-1};
-                    for (int si = 0; si < 3; si++) {
-                        int target = show_idx[si];
-                        cur = head;
-                        for (int k = 0; k < target && next_off >= 0; k++) {
-                            uint32_t n = *(uint32_t *)((ULONG_PTR)cur + next_off);
-                            if (n == 0 || n < 0x1000) break;
-                            cur = n;
-                        }
-                        serial_puts("[DIAG] entry[");
-                        serial_putdec(target);
-                        serial_puts("] @0x");
-                        serial_puthex(cur, 8);
-                        serial_puts(":\n");
-                        uint8_t *p = (uint8_t *)(ULONG_PTR)cur;
-                        for (int j = 0; j < 48; j += 4) {
-                            uint32_t v = *(uint32_t *)(p + j);
-                            serial_puts("[DIAG]   +0x");
-                            serial_puthex(j, 2);
-                            serial_puts(": 0x");
-                            serial_puthex(v, 8);
-                            if (super_offset >= 0 && j == super_offset)
-                                serial_puts(" <SuperField>");
-                            serial_puts("\n");
-                        }
-                    }
-                }
-            }
-            serial_puts("[DIAG] === End ===\n\n");
-        }
-    }
-
-    /*
-     * Pre-allocate GObjRegistrants TArray buffer ONLY if dllloader.c didn't
-     * already pre-allocate via Core.dll's DllMain hook (typical case).
-     *
-     * Previous bug: unconditional re-allocation here was DESTRUCTIVE — by
-     * this point Engine.dll/Window.dll/etc. had run their C++ static
-     * initializers and registered UClass entries (UGameEngine etc.) into
-     * GObjRegistrants @ dllloader's buffer (0x01FF6000). Overwriting
-     * tarray[0..2] with a fresh empty buffer (0x01F74000, Num=0) orphaned
-     * those entries. The engine's later ProcessRegistrants then iterated
-     * an empty list → no UClass("GameEngine") registered in GObj →
-     * StaticLoadClass("Engine.GameEngine") fails → "Failed to load
-     * 'None None.GameEngine'" cascade.
-     *
-     * Fix: only allocate if tarray[0] is NULL (i.e. dllloader didn't run
-     * yet, e.g. running a PE that doesn't load Core.dll).
-     */
-    {
-        LOADED_MODULE *core = dll_find_module("Core.dll");
-        if (core) {
-            PVOID gobjreg_ptr = dll_resolve_export(core,
-                "?GObjRegistrants@UObject@@0V?$TArray@PAVUObject@@@@A", 0, FALSE);
-            if (gobjreg_ptr) {
-                uint32_t *tarray = (uint32_t *)gobjreg_ptr;
-                if (tarray[0] == 0) {
-                    /* Not pre-allocated yet — allocate a fallback buffer. */
-                    void *buf = mem_alloc_pages(1);
-                    if (buf) {
-                        uint64_t pa = (uint64_t)buf;
-                        uint8_t *p = (uint8_t *)pa;
-                        for (int i = 0; i < 4096; i++) p[i] = 0;
-                        tarray[0] = (uint32_t)pa;
-                        tarray[1] = 0;
-                        tarray[2] = 1024;
-                        serial_puts("[WINEXEC] Pre-allocated GObjRegistrants (fallback): "
-                                    "Data=0x");
-                        serial_puthex(pa, 8);
-                        serial_puts(" Max=1024 @TArray=0x");
-                        serial_puthex((uint64_t)(ULONG_PTR)gobjreg_ptr, 8);
-                        serial_puts("\n");
-                    }
-                } else {
-                    serial_puts("[WINEXEC] GObjRegistrants already populated by "
-                                "dllloader: Data=0x");
-                    serial_puthex((uint64_t)tarray[0], 8);
-                    serial_puts(" Num=");
-                    serial_putdec((uint64_t)tarray[1]);
-                    serial_puts(" Max=");
-                    serial_putdec((uint64_t)tarray[2]);
-                    serial_puts(" — preserving DLL static-init registrants\n");
-                }
-            }
-        }
-    }
 
     /* Allocate user stack — MUST be zeroed.
      * On Windows, stack pages come from VirtualAlloc (MEM_COMMIT) which
@@ -3317,8 +4302,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                                   &stack_limit, &stack_base);
     if (!NT_SUCCESS(status)) {
         serial_puts("[WINEXEC] failed to allocate stack\n");
-        pe_unload(&info);
-        g_compat32_mode = 0;
+        win32_cleanup_main_process(&info, NULL, compat32, status);
         return -1;
     }
 
@@ -3338,9 +4322,14 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     stack_top = (uint8_t *)((uint64_t)stack_top & ~0xFULL);
 
     if (info.Is32Bit) {
-        g_teb32.StackBase = (uint32_t)(ULONG_PTR)stack_base;
-        g_teb32.StackLimit = (uint32_t)(ULONG_PTR)stack_usable;
+        TEB32 *teb32 = win32_main_teb32();
+        teb32->StackBase = (uint32_t)(ULONG_PTR)stack_base;
+        teb32->StackLimit = (uint32_t)(ULONG_PTR)stack_usable;
     } else {
+        TEB *teb = win64_main_teb();
+        teb->StackBase = stack_base;
+        teb->StackLimit = stack_usable;
+        teb->DeallocationStack = stack_allocation;
         g_teb.StackBase = stack_base;
         g_teb.StackLimit = stack_usable;
         g_teb.DeallocationStack = stack_allocation;
@@ -3348,7 +4337,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
 
     if (info.Is32Bit) {
         serial_puts("[WINEXEC] TEB32.ExceptionList before EXE entry = 0x");
-        serial_puthex(g_teb32.ExceptionList, 8);
+        serial_puthex(win32_main_teb32()->ExceptionList, 8);
         serial_puts("\n");
 
         /* Hardware watchpoint on TEB32 removed — was causing #GP
@@ -3359,30 +4348,6 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     serial_puthex((uint64_t)info.EntryPoint, 16);
     if (info.Is32Bit) serial_puts(" (32-bit compat mode)");
     serial_puts("\n");
-
-    /* Dump UGameEngine class hierarchy BEFORE EXE entry.
-     * ConstructObject fails because SuperField may be NULL at this point. */
-    if ((uint32_t)(uintptr_t)info.ImageBase == 0x10900000u) {
-        volatile uint32_t *ge_cls = (volatile uint32_t *)(uintptr_t)0x105928A0;
-        volatile uint32_t *ue_iat = (volatile uint32_t *)(uintptr_t)0x10958D74;
-        serial_puts("[DIAG] Before EXE: UGameEngine::SC SuperField=0x");
-        serial_puthex(ge_cls[0x28/4], 8);
-        serial_puts(" UEngine::SC(IAT)=0x");
-        serial_puthex(*ue_iat, 8);
-        serial_puts("\n");
-
-        /* Patch INT3 at EXE+0xBC72 (after ConstructObject) and at
-         * EXE+0xBC81 (load GEngine into ECX before Init call). */
-        uint8_t *bp1 = (uint8_t *)((uintptr_t)info.ImageBase + 0xBC72);
-        uint8_t *bp2 = (uint8_t *)((uintptr_t)info.ImageBase + 0xBC81);
-        serial_puts("[DIAG] INT3 at 0x");
-        serial_puthex((uint64_t)(uintptr_t)bp1, 8);
-        serial_puts(" + 0x");
-        serial_puthex((uint64_t)(uintptr_t)bp2, 8);
-        serial_puts("\n");
-        bp1[0] = 0xCC;
-        bp2[0] = 0xCC;
-    }
 
     /*
      * Windows CUI entry point signature:
@@ -3399,48 +4364,6 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         /* PE32 (i386): enter 32-bit compatibility mode */
         uint32_t entry32 = (uint32_t)(ULONG_PTR)info.EntryPoint;
         uint32_t sp32    = (uint32_t)(ULONG_PTR)stack_top;
-
-        /* Install permanent base SEH frame on PE stack.
-         * This sits at the bottom of the chain and survives all
-         * stack corruption from inner frames (WinDrv.dll bug). */
-        {
-            extern uint32_t crt_get_base_seh_thunk(void);
-            uint32_t handler = crt_get_base_seh_thunk();
-            if (handler) {
-                uint32_t *sp = (uint32_t *)(uintptr_t)sp32;
-                sp -= 3;
-                sp[0] = g_teb32.ExceptionList; /* Next = current head */
-                sp[1] = handler;               /* Handler = catch-all */
-                sp[2] = 0;                     /* Scope/state = 0 */
-                g_teb32.ExceptionList = (uint32_t)(uintptr_t)sp;
-                extern uint32_t g_base_seh_frame_addr;
-                g_base_seh_frame_addr = (uint32_t)(uintptr_t)sp;
-                sp32 = (uint32_t)(uintptr_t)sp;
-                serial_puts("[WINEXEC] Base SEH frame at 0x");
-                serial_puthex((uint32_t)(uintptr_t)sp, 8);
-                serial_puts(" handler=0x");
-                serial_puthex(handler, 8);
-                serial_puts("\n");
-            }
-        }
-
-        /* Clear GErrorHist and GIsCriticalError before WinMain.
-         * DLL _initterm callbacks trigger null-pointer faults (handled by our
-         * null-page write handler), which cause the engine's error handler to
-         * set GErrorHist="General protection fault!". If GErrorHist is set when
-         * the engine tries to Browse() a map, it skips rendering → error exit.
-         * Clear both so the engine starts fresh. */
-        if ((uint32_t)(uintptr_t)info.ImageBase == 0x10900000u) {
-            /* GErrorHist: Core.dll + RVA 0xE3474 (TCHAR[1024], wide string) */
-            volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
-            /* GIsCriticalError: Core.dll + RVA 0xE568C (INT, flag) */
-            volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
-            if (*gerr != 0 || *gcrit != 0) {
-                *gerr = 0;   /* Clear error string */
-                *gcrit = 0;  /* Clear critical error flag */
-                serial_puts("[WINEXEC] Cleared GErrorHist + GIsCriticalError\n");
-            }
-        }
 
         /* Install a process-local exit context. compat32_enter never returns;
          * NtTerminateProcess reaches this context after restoring long mode. */
@@ -3461,105 +4384,15 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                                  __ATOMIC_RELEASE);
                 __atomic_store_n(&g_win32_main.exit_requested, FALSE,
                                  __ATOMIC_RELEASE);
-                /* NtTerminateProcess returned here — PE process has exited.
-                 *
-                 * Two cleanup steps before we let the scheduler see
-                 * this kernel context again:
-                 *
-                 * (1) Restore 64-bit kernel data segments. compat32_enter
-                 *     set DS/ES/SS to GDT_SEL_DATA32 (0x48) for the PE
-                 *     lifetime. proc_exit longjmped back, restoring
-                 *     RIP/RSP but NOT segment selectors. If we don't
-                 *     fix them, the next scheduler tick observes PID 1
-                 *     with SS=0x48 and bails with "[SCHED] CORRUPT PID 1",
-                 *     leaving the shell unschedulable.
-                 *
-                 * (2) Re-enable the APIC LVT timer. compat32_enter
-                 *     masked it for the entire PE lifetime; without
-                 *     re-enabling, the preemptive scheduler can't tick
-                 *     and `desktop` (which sched_spawns a compositor
-                 *     thread) never runs because PID 1 never yields. */
-                __asm__ volatile (
-                    "mov $0x30, %%ax\n"
-                    "mov %%ax, %%ds\n"
-                    "mov %%ax, %%es\n"
-                    "mov %%ax, %%ss\n"
-                    ::: "ax"
-                );
-
-                /* Reap any orphan win32 threads spawned by the PE via
-                 * CreateThread. Why this is necessary: if we leave
-                 * them schedulable, the scheduler will dispatch them
-                 * and they'll re-enter compat32_callback_args, which
-                 * re-masks the APIC LVT timer (the entire-PE-lifetime
-                 * mask from compat32_enter). The callback path
-                 * deliberately doesn't unmask on the way out
-                 * (compat32.c:1294), so any subsequent kernel
-                 * `hlt`-wait — including compositor's
-                 * display_wait_vblank — would deadlock forever.
-                 *
-                 * proc_kill_pid runs the full proc_free cleanup so
-                 * the slot is reusable for the next PE invocation,
-                 * not left as a permanent ZOMBIE. */
-                {
-                    typedef struct {
-                        int      kernel_pid;
-                        uint32_t tid;
-                        ULONG_PTR func_addr;
-                    } win32_orphan_info_t;
-                    extern int proc_kill_pid(int pid);
-                    extern int win32_collect_orphan_threads(
-                        win32_orphan_info_t *out, int max);
-
-                    win32_orphan_info_t orphans[48];
-                    int n = win32_collect_orphan_threads(orphans, 48);
-                    for (int i = 0; i < n; i++) {
-                        int rc = proc_kill_pid(orphans[i].kernel_pid);
-                        serial_puts(rc == 0
-                            ? "[winexec] reaped orphan PE thread tid="
-                            : "[winexec] FAILED to reap orphan PE thread tid=");
-                        serial_putdec((uint64_t)orphans[i].tid);
-                        serial_puts(" pid=");
-                        serial_putdec((uint64_t)orphans[i].kernel_pid);
-                        serial_puts(" entry=0x");
-                        serial_puthex(orphans[i].func_addr, 16);
-                        serial_puts("\n");
-                    }
-                }
-
-                {
-                    extern volatile uint32_t *idt_get_apic_base(void);
-                    volatile uint32_t *apic = idt_get_apic_base();
-                    if (apic) apic[0x320/4] &= ~0x10000u;  /* LVT_TIMER &= ~MASKED */
-                }
-                __asm__ volatile ("sti");
-                g_compat32_mode = 0;
-                opengl32_release_process((DWORD)proc_current_tgid());
-                user32_shim_init();
-                ddraw_shim_init();
-                dinput8_shim_init();
                 serial_puts("[WINEXEC] PE process exited, code=");
                 serial_putdec((uint32_t)exit_status);
-                serial_puts(" (SS restored, APIC re-enabled)\n");
-                wsock_release_process(1);
-                advapi32_crypto_release_process(1);
-                (void)nt_vm_free_stack(stack_allocation);
-                pe_unload(&info);
-                g_compat32_mode = 0;
+                serial_puts("\n");
+                win32_cleanup_main_process(&info, stack_allocation,
+                                           compat32, exit_status);
                 return (int32_t)exit_status;
             }
             __atomic_store_n(&g_win32_main.active, TRUE,
                              __ATOMIC_RELEASE);
-        }
-
-        /* HWBP bisect instrumentation removed (Phase 2 cleanup) -- the
-         * EDI-clobber root cause it isolated is fixed; see git history. */
-        if (entry32 == 0x0054D26Du) {
-            extern uint8_t g_swbreak_saved;
-            extern uint32_t g_swbreak_addr;
-            g_swbreak_addr = 0x00454D08u;
-            g_swbreak_saved = *(uint8_t *)(uintptr_t)g_swbreak_addr;
-            *(uint8_t *)(uintptr_t)g_swbreak_addr = 0xCC;
         }
 
         compat32_enter(entry32, sp32);
@@ -3585,34 +4418,13 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             serial_putdec((uint32_t)exit_status);
             serial_puts("\n");
 
-            {
-                extern int win32_terminate_process_threads(PPEB owner,
-                                                            DWORD exit_code);
-                int stopped = win32_terminate_process_threads(
-                    &g_peb, (DWORD)exit_status);
-                if (stopped) {
-                    serial_puts("[WINEXEC] stopped owned PE64 threads=");
-                    serial_putdec((uint64_t)stopped);
-                    serial_puts("\n");
-                }
-            }
-
-            wsock_release_process(1);
-            advapi32_crypto_release_process(1);
-            opengl32_release_process((DWORD)proc_current_tgid());
-            {
-                extern uint64_t paging_get_kernel_cr3(void);
-                __asm__ volatile ("mov %0, %%cr3" : :
-                                  "r"(paging_get_kernel_cr3()) : "memory");
-            }
-            (void)nt_vm_free_stack(stack_allocation);
-            pe_unload(&info);
-            g_compat32_mode = 0;
+            win32_cleanup_main_process(&info, stack_allocation,
+                                       compat32, exit_status);
             return (int32_t)exit_status;
         }
         __atomic_store_n(&g_win32_main.active, TRUE, __ATOMIC_RELEASE);
 
-        win64_call_child_entry(info.EntryPoint, stack_top, &g_peb,
+        win64_call_child_entry(info.EntryPoint, stack_top, win64_main_peb(),
                                info.Subsystem == IMAGE_SUBSYSTEM_NATIVE);
     }
 
@@ -3621,19 +4433,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     __atomic_store_n(&g_win32_main.exit_requested, FALSE, __ATOMIC_RELEASE);
     serial_puts("[WINEXEC] PE entry returned\n");
 
-    /* Restore kernel CR3 */
-    {
-        extern uint64_t paging_get_kernel_cr3(void);
-        __asm__ volatile ("mov %0, %%cr3" : : "r"(paging_get_kernel_cr3()) : "memory");
-    }
-
-    /* Cleanup */
-    wsock_release_process(1);
-    advapi32_crypto_release_process(1);
-    opengl32_release_process((DWORD)proc_current_tgid());
-    (void)nt_vm_free_stack(stack_allocation);
-    pe_unload(&info);
-
-    g_compat32_mode = 0;
+    win32_cleanup_main_process(&info, stack_allocation,
+                               compat32, STATUS_SUCCESS);
     return 0;
 }

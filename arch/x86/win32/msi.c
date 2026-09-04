@@ -606,6 +606,7 @@ int msi_install(msi_db_t *db, const char *pkg_name)
             serial_puts(" "); serial_puts(key); serial_puts("\n");
             apply_registry(root, key, nm, val);
         }
+        advapi32_registry_flush();
     }
 
     installer_manifest_commit();
