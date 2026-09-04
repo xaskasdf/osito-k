@@ -57,6 +57,8 @@ extern uint32_t proc_count_active(void);
 extern void xhci_poll(void) __attribute__((weak));
 extern bool user32_activate_compositor_window(uint32_t window_id)
     __attribute__((weak));
+extern void user32_deactivate_compositor_windows(void)
+    __attribute__((weak));
 
 
 /* ── CMOS RTC helpers ──────────────────────────────────────── */
@@ -117,6 +119,12 @@ typedef struct {
     uint8_t  flags;
     char     title[MAX_TITLE_LEN];
 } window_t;
+
+typedef struct {
+    uint32_t x, y;
+    uint32_t width, height;
+    bool sampled_scale;
+} fullscreen_layout_t;
 
 /* ── Compositor State ────────────────────────────────────────── */
 
@@ -201,11 +209,56 @@ static int16_t  comp_wheel_accum;
 
 /* ── Window Management ───────────────────────────────────────── */
 
+static int compositor_topmost_visible_window(void)
+{
+    int best = -1;
+    uint32_t best_z = 0;
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        window_t *w = &windows[i];
+        if ((w->flags & (WND_ACTIVE | WND_VISIBLE)) !=
+                (WND_ACTIVE | WND_VISIBLE) ||
+            (w->flags & WND_MINIMIZED))
+            continue;
+        if (best < 0 || w->z_order >= best_z) {
+            best = i;
+            best_z = w->z_order;
+        }
+    }
+    return best;
+}
+
+static void compositor_select_focus(int selected)
+{
+    bool changed = focused_window != selected;
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        uint8_t old_flags = windows[i].flags;
+        windows[i].flags &= (uint8_t)~WND_FOCUSED;
+        if (i == selected && (windows[i].flags & WND_ACTIVE))
+            windows[i].flags |= WND_FOCUSED;
+        if (old_flags != windows[i].flags)
+            changed = true;
+    }
+
+    if (selected < 0 || selected >= MAX_WINDOWS ||
+        !(windows[selected].flags & WND_ACTIVE))
+        selected = -1;
+    focused_window = selected;
+    if (selected >= 0)
+        focused_demo_idx = -1;
+    if (changed)
+        compositor_request_frame();
+}
+
 /* Register a new window. Returns window ID or 0 on failure. */
-uint32_t compositor_create_window(uint32_t shm_handle,
-                                  int16_t x, int16_t y,
-                                  uint16_t width, uint16_t height,
-                                  uint32_t pid, const char *title)
+static uint32_t compositor_create_window_internal(uint32_t shm_handle,
+                                                  int16_t x, int16_t y,
+                                                  uint16_t width,
+                                                  uint16_t height,
+                                                  uint32_t pid,
+                                                  const char *title,
+                                                  bool activate)
 {
     /* Find free slot */
     window_t *w = NULL;
@@ -246,9 +299,8 @@ uint32_t compositor_create_window(uint32_t shm_handle,
     }
     w->title[j] = '\0';
 
-    /* Focus new window */
-    focused_window = slot;
-    w->flags |= WND_FOCUSED;
+    if (activate)
+        compositor_select_focus(slot);
 
     serial_puts("[COMP] Window created: id=");
     serial_putdec(w->id);
@@ -267,16 +319,44 @@ uint32_t compositor_create_window(uint32_t shm_handle,
     return w->id;
 }
 
+uint32_t compositor_create_window(uint32_t shm_handle,
+                                  int16_t x, int16_t y,
+                                  uint16_t width, uint16_t height,
+                                  uint32_t pid, const char *title)
+{
+    return compositor_create_window_internal(shm_handle, x, y, width, height,
+                                             pid, title, true);
+}
+
+/* USER32 creates hidden controls and child surfaces before deciding which
+ * top-level window owns the foreground. Do not let allocation itself steal
+ * compositor focus; USER32 will activate the correct root explicitly. */
+uint32_t compositor_create_window_inactive(uint32_t shm_handle,
+                                           int16_t x, int16_t y,
+                                           uint16_t width, uint16_t height,
+                                           uint32_t pid, const char *title)
+{
+    return compositor_create_window_internal(shm_handle, x, y, width, height,
+                                             pid, title, false);
+}
+
 /* Destroy a window */
 void compositor_destroy_window(uint32_t window_id)
 {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if ((windows[i].flags & WND_ACTIVE) && windows[i].id == window_id) {
+            bool was_focused = focused_window == i ||
+                               (windows[i].flags & WND_FOCUSED);
             compositor_request_frame();
             if (windows[i].shm_handle)
                 shm_unmap(windows[i].shm_handle);
             windows[i].flags = 0;
-            if (focused_window == i) focused_window = -1;
+            if (was_focused) {
+                int fallback = compositor_topmost_visible_window();
+                compositor_select_focus(fallback);
+                if (fallback < 0)
+                    focused_demo_idx = 0;
+            }
             serial_puts("[COMP] Window destroyed: id=");
             serial_putdec(window_id);
             serial_puts("\n");
@@ -295,6 +375,12 @@ void compositor_set_visible(uint32_t window_id, bool visible)
             windows[i].flags |= WND_VISIBLE;
         else
             windows[i].flags &= (uint8_t)~WND_VISIBLE;
+        if (!visible && focused_window == i) {
+            int fallback = compositor_topmost_visible_window();
+            compositor_select_focus(fallback);
+            if (fallback < 0)
+                focused_demo_idx = 0;
+        }
         if (windows[i].flags != old_flags)
             compositor_request_frame();
         return;
@@ -348,18 +434,14 @@ void compositor_focus_window(uint32_t window_id)
 {
     int selected = -1;
     for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (!(windows[i].flags & WND_ACTIVE))
-            continue;
-        windows[i].flags &= (uint8_t)~WND_FOCUSED;
-        if (windows[i].id == window_id)
+        if ((windows[i].flags & WND_ACTIVE) &&
+            windows[i].id == window_id) {
             selected = i;
+            break;
+        }
     }
-    if (selected >= 0) {
-        windows[selected].flags |= WND_FOCUSED;
-        focused_window = selected;
-        focused_demo_idx = -1;
-        compositor_request_frame();
-    }
+    if (selected >= 0)
+        compositor_select_focus(selected);
 }
 
 void compositor_set_position(uint32_t window_id, int16_t x, int16_t y)
@@ -538,6 +620,85 @@ void compositor_set_fullscreen(uint32_t window_id, bool fullscreen)
             return;
         }
     }
+}
+
+static bool compositor_fullscreen_layout(const window_t *window,
+                                         uint32_t output_width,
+                                         uint32_t output_height,
+                                         fullscreen_layout_t *layout)
+{
+    if (!window || !layout || !window->width || !window->height ||
+        !output_width || !output_height)
+        return false;
+
+    uint32_t source_width = window->width;
+    uint32_t source_height = window->height;
+    uint32_t width;
+    uint32_t height;
+
+    if (source_width == output_width && source_height == output_height) {
+        width = output_width;
+        height = output_height;
+        layout->sampled_scale = false;
+    } else if ((window->flags & WND_USER32) ||
+               source_width > output_width ||
+               source_height > output_height) {
+        if ((uint64_t)source_width * output_height >=
+            (uint64_t)source_height * output_width) {
+            width = output_width;
+            height = (uint32_t)(((uint64_t)source_height * output_width) /
+                                source_width);
+        } else {
+            height = output_height;
+            width = (uint32_t)(((uint64_t)source_width * output_height) /
+                               source_height);
+        }
+        if (!width) width = 1;
+        if (!height) height = 1;
+        layout->sampled_scale = true;
+    } else {
+        uint32_t scale_x = output_width / source_width;
+        uint32_t scale_y = output_height / source_height;
+        uint32_t scale = scale_x < scale_y ? scale_x : scale_y;
+        width = source_width * scale;
+        height = source_height * scale;
+        layout->sampled_scale = false;
+    }
+
+    layout->x = (output_width - width) / 2;
+    layout->y = (output_height - height) / 2;
+    layout->width = width;
+    layout->height = height;
+    return true;
+}
+
+bool compositor_get_fullscreen_content_rect(uint32_t window_id,
+                                            int32_t *x, int32_t *y,
+                                            uint32_t *width,
+                                            uint32_t *height)
+{
+    uint32_t output_width = display_get_width();
+    uint32_t output_height = display_get_height();
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        window_t *window = &windows[i];
+        uint8_t required = WND_ACTIVE | WND_VISIBLE | WND_FULLSCREEN;
+        if (window->id != window_id ||
+            (window->flags & required) != required ||
+            (window->flags & WND_MINIMIZED))
+            continue;
+
+        fullscreen_layout_t layout;
+        if (!compositor_fullscreen_layout(window, output_width,
+                                          output_height, &layout))
+            return false;
+        if (x) *x = (int32_t)layout.x;
+        if (y) *y = (int32_t)layout.y;
+        if (width) *width = layout.width;
+        if (height) *height = layout.height;
+        return true;
+    }
+    return false;
 }
 
 void compositor_set_user32_managed(uint32_t window_id, bool managed)
@@ -979,10 +1140,10 @@ static int managed_window_by_pid(uint32_t owner_pid)
 
 static void focus_demo_window(int index)
 {
-    for (int i = 0; i < MAX_WINDOWS; i++)
-        windows[i].flags &= (uint8_t)~WND_FOCUSED;
-    focused_window = -1;
+    compositor_select_focus(-1);
     focused_demo_idx = index;
+    if (user32_deactivate_compositor_windows)
+        user32_deactivate_compositor_windows();
     gui_desktop_show_window(index);
     compositor_request_frame();
 }
@@ -1161,11 +1322,11 @@ static void process_mouse_input(void)
         }
 
         int hit = hit_test_demo_window(cx, cy);
-        focused_demo_idx = hit;  /* -1 if missed all windows */
 
         if (hit >= 0) {
             int count;
             gui_win_desc_t *dw = gui_desktop_get_windows(&count);
+            focus_demo_window(hit);
 
             /* Check traffic-light buttons first */
             int btn = hit_test_buttons(&dw[hit], cx, cy);
@@ -1333,6 +1494,10 @@ static bool __hot compositor_render_frame(void)
         if (!_sw || !_sh || _sp < _sw || win->surface_height < _sh)
             continue;
 
+        fullscreen_layout_t _layout;
+        if (!compositor_fullscreen_layout(win, w, h, &_layout))
+            continue;
+
         /* Direct scanout: source matches screen exactly */
         if (_sw == w && _sh == h) {
             if (_sp == w) {
@@ -1350,23 +1515,16 @@ static bool __hot compositor_render_frame(void)
 
         /* Pixel-perfect: largest integer scale that fits within the screen.
          * For DOOM 320×200 on 1024×768: scale=3 → 960×600, centered. */
-        /* A source larger than the scanout must be downscaled. Forcing an
-         * integer scale of one makes the centering subtraction underflow and
-         * sends the compositor outside its backbuffer. */
-        if (_sw > w || _sh > h) {
-            uint32_t _dw, _dh;
-            if ((uint64_t)_sw * h >= (uint64_t)_sh * w) {
-                _dw = w;
-                _dh = (uint32_t)(((uint64_t)_sh * w) / _sw);
-            } else {
-                _dh = h;
-                _dw = (uint32_t)(((uint64_t)_sw * h) / _sh);
-            }
-            if (!_dw) _dw = 1;
-            if (!_dh) _dh = 1;
-
-            uint32_t _ox = (w - _dw) / 2;
-            uint32_t _oy = (h - _dh) / 2;
+        /* USER32 fullscreen represents a display-mode switch and should fill
+         * the physical output while preserving aspect ratio, even when the
+         * ratio requires a fractional scale (640x480 on 1280x800, for
+         * example). Native SHM clients retain pixel-perfect integer scaling.
+         * Oversized sources always use this path to avoid centering underflow. */
+        if (_layout.sampled_scale) {
+            uint32_t _dw = _layout.width;
+            uint32_t _dh = _layout.height;
+            uint32_t _ox = _layout.x;
+            uint32_t _oy = _layout.y;
             uint64_t _xstep = ((uint64_t)_sw << 32) / _dw;
             uint64_t _ystep = ((uint64_t)_sh << 32) / _dh;
 
@@ -1392,14 +1550,10 @@ static bool __hot compositor_render_frame(void)
             return true;
         }
 
-        uint32_t _scx = w / _sw;
-        uint32_t _scy = h / _sh;
-        uint32_t _sc  = (_scx < _scy) ? _scx : _scy;
-
-        uint32_t _dw = _sw * _sc;
-        uint32_t _dh = _sh * _sc;
-        uint32_t _ox = (w - _dw) / 2;
-        uint32_t _oy = (h - _dh) / 2;
+        uint32_t _dw = _layout.width;
+        uint32_t _ox = _layout.x;
+        uint32_t _oy = _layout.y;
+        uint32_t _sc = _dw / _sw;
 
         /* Clear letterbox/pillarbox borders to black */
         memset(back, 0, (uint64_t)p * h * 4);
@@ -1623,8 +1777,10 @@ void compositor_thread(void)
         {
             extern bool input_game_mode;
             for (int _i = 0; _i < MAX_WINDOWS; _i++) {
-                if ((windows[_i].flags & (WND_ACTIVE | WND_FULLSCREEN)) ==
-                    (WND_ACTIVE | WND_FULLSCREEN)) {
+                if ((windows[_i].flags &
+                     (WND_ACTIVE | WND_VISIBLE | WND_FULLSCREEN)) ==
+                    (WND_ACTIVE | WND_VISIBLE | WND_FULLSCREEN) &&
+                    !(windows[_i].flags & WND_MINIMIZED)) {
                     has_fullscreen = true;
                     if (!(windows[_i].flags & WND_USER32))
                         has_direct_input_fullscreen = true;
@@ -1759,9 +1915,15 @@ void compositor_thread(void)
             serial_puts("[COMP] FS->desktop: force refresh\n");
             extern void display_force_refresh(void);
             display_force_refresh();
-            /* Game exited — restore focus to terminal */
-            focused_demo_idx = 0;
-            gui_desktop_raise_window(0);
+            /* A surviving managed window may simply have restored its display
+             * mode. Keep its foreground ownership; only return to the terminal
+             * when no visible managed focus remains. */
+            if (focused_window < 0 || focused_window >= MAX_WINDOWS ||
+                (windows[focused_window].flags &
+                 (WND_ACTIVE | WND_VISIBLE)) !=
+                    (WND_ACTIVE | WND_VISIBLE) ||
+                (windows[focused_window].flags & WND_MINIMIZED))
+                focus_demo_window(0);
         }
         comp_was_fullscreen = has_fullscreen;
 
@@ -1810,9 +1972,7 @@ void compositor_focus_terminal(void)
     if (!__atomic_load_n(&compositor_running, __ATOMIC_ACQUIRE))
         return;
 
-    focused_demo_idx = 0;
-    gui_desktop_show_window(0);
-    compositor_request_frame();
+    focus_demo_window(0);
     display_mark_dirty();
 }
 

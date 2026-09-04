@@ -80,6 +80,9 @@ extern void     shm_destroy(uint32_t handle) __attribute__((weak));
 extern uint32_t compositor_create_window(uint32_t shm_handle,
     int16_t x, int16_t y, uint16_t width, uint16_t height,
     uint32_t pid, const char *title) __attribute__((weak));
+extern uint32_t compositor_create_window_inactive(uint32_t shm_handle,
+    int16_t x, int16_t y, uint16_t width, uint16_t height,
+    uint32_t pid, const char *title) __attribute__((weak));
 extern void compositor_destroy_window(uint32_t window_id) __attribute__((weak));
 extern void compositor_signal_dirty(uint32_t window_id)   __attribute__((weak));
 extern void compositor_set_visible(uint32_t window_id, bool visible)
@@ -103,6 +106,9 @@ extern void compositor_set_user32_managed(uint32_t window_id, bool managed)
     __attribute__((weak));
 extern void compositor_focus_window(uint32_t window_id)
     __attribute__((weak));
+extern bool compositor_get_fullscreen_content_rect(
+    uint32_t window_id, int32_t *x, int32_t *y,
+    uint32_t *width, uint32_t *height) __attribute__((weak));
 extern bool compositor_replace_surface(uint32_t window_id, uint32_t shm_handle,
     uint16_t width, uint16_t height) __attribute__((weak));
 
@@ -424,6 +430,7 @@ typedef struct {
     void       *shm_pixels;        /* mapped shm surface pointer */
     int         surface_width;     /* allocated backing width / row stride */
     int         surface_height;    /* allocated backing height */
+    int         directdraw_exclusive;
 } WINDOW;
 
 static WINDOW windows[MAX_WINDOWS];
@@ -1071,10 +1078,31 @@ static BOOL window_should_render(const WINDOW *w)
     current = w;
     for (int depth = 0; current && current->owner && depth < MAX_WINDOWS; depth++) {
         current = find_window(current->owner);
-        if (!current || (current->style & WS_MINIMIZE))
+        if (!current || !window_style_is_visible(current) ||
+            (current->style & WS_MINIMIZE))
             return current ? FALSE : TRUE;
     }
     return TRUE;
+}
+
+static BOOL window_can_receive_input(const WINDOW *w)
+{
+    const WINDOW *current = w;
+
+    if (!w || !w->used || w->destroying)
+        return FALSE;
+    for (int depth = 0; current && depth < MAX_WINDOWS; depth++) {
+        if (current->style & WS_DISABLED)
+            return FALSE;
+        current = current->parent ? find_window(current->parent) : NULL;
+    }
+    return TRUE;
+}
+
+static BOOL window_can_activate(const WINDOW *w)
+{
+    return window_can_receive_input(w) && window_should_render(w) && !w->parent &&
+           !(w->style & WS_CHILD) && !(w->ex_style & WS_EX_NOACTIVATE);
 }
 
 static BOOL window_is_taskbar_candidate(const WINDOW *w)
@@ -1131,10 +1159,19 @@ static BOOL window_should_be_fullscreen(const WINDOW *w)
     int screen_x, screen_y;
 
     if (!w || !w->used || w->destroying || w->message_only ||
-        !user_display_mode.active || !user_display_mode.fullscreen ||
-        w->owner_pid != user_display_mode.owner_pid)
+        !window_should_render(w) || w->parent || (w->style & WS_CHILD))
         return FALSE;
-    if (w->parent || (w->style & WS_CHILD) || !(w->style & WS_POPUP))
+
+    /* DirectDraw exclusive cooperative mode is independently sufficient to
+     * own scanout. Legacy applications commonly call SetDisplayMode without
+     * ChangeDisplaySettings, so tying this state only to the latter leaves a
+     * live exclusive viewport composited as an ordinary desktop window. */
+    if (w->directdraw_exclusive)
+        return TRUE;
+
+    if (!user_display_mode.active || !user_display_mode.fullscreen ||
+        w->owner_pid != user_display_mode.owner_pid ||
+        !(w->style & WS_POPUP))
         return FALSE;
 
     window_screen_origin(w, &screen_x, &screen_y);
@@ -3455,6 +3492,7 @@ static DWORD cursor_visibility_owner_tid;
 static HWND  capture_hwnd = NULL;
 static HWND  focus_hwnd   = NULL;   /* SetFocus / WM_SETFOCUS target */
 static HWND  active_hwnd  = NULL;   /* active/foreground top-level window */
+static BOOL  user32_foreground_active;
 static int   clip_active  = 0;
 static DWORD clip_owner_pid;
 static DWORD clip_owner_tid;
@@ -3650,6 +3688,7 @@ static void user32_reset_corrupt_window_state(const char *where)
     window_count = 0;
     focus_hwnd = NULL;
     active_hwnd = NULL;
+    user32_foreground_active = FALSE;
     capture_hwnd = NULL;
     clip_active = 0;
     clip_owner_pid = 0;
@@ -3669,10 +3708,9 @@ static int user32_window_state_sane(const char *where)
 
 static int win32_input_active(void)
 {
-    extern int g_compat32_mode;
     if (!user32_window_state_sane("input"))
         return 0;
-    return g_compat32_mode || window_count > 0;
+    return user32_foreground_active && input_target() != NULL;
 }
 
 static int u32_input_diagnostics_active(void)
@@ -3687,25 +3725,23 @@ static int u32_input_diagnostics_active(void)
  * window. This keeps routing independent of executable and class names. */
 static HWND input_target(void)
 {
-    if (!user32_window_state_sane("target"))
+    if (!user32_window_state_sane("target") ||
+        !user32_foreground_active)
         return NULL;
     WINDOW *focused = find_window(focus_hwnd);
-    /* Focus is a USER32 routing property, not a compositor visibility test.
-     * A caller may focus a window before its first ShowWindow call. */
-    if (focused && !focused->destroying)
+    if (window_can_receive_input(focused))
         return focused->handle;
 
     WINDOW *active = find_window(active_hwnd);
-    if (active && !active->destroying)
+    if (window_can_activate(active))
         return active->handle;
 
     WINDOW *top = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         WINDOW *candidate = &windows[i];
-        if (!candidate->used || candidate->destroying ||
-            !window_should_render(candidate))
+        if (!window_can_activate(candidate))
             continue;
-        if (!top || candidate->render_z > top->render_z)
+        if (!top || root_is_above(candidate, top))
             top = candidate;
     }
     return top ? top->handle : NULL;
@@ -4230,6 +4266,31 @@ static void dispatch_focus_message(HWND target, DWORD message, HWND other)
     dispatch_window_message(w, message, (WPARAM)(ULONG_PTR)other, 0);
 }
 
+static void dispatch_wm_deactivate(WINDOW *next)
+{
+    WINDOW *previous = find_window(active_hwnd);
+    HWND old_focus = focus_hwnd;
+    HWND next_handle = next ? next->handle : NULL;
+    DWORD next_tid = next ? next->owner_tid : 0;
+
+    active_hwnd = NULL;
+    focus_hwnd = NULL;
+    user32_foreground_active = FALSE;
+
+    if (previous && previous->wndproc) {
+        previous = window_root(previous, NULL);
+        if (previous && previous->wndproc) {
+            dispatch_window_message(previous, WM_ACTIVATEAPP, 0,
+                                    (LPARAM)next_tid);
+            dispatch_window_message(previous, WM_NCACTIVATE, 0, 0);
+            dispatch_window_message(previous, WM_ACTIVATE, 0,
+                                    (LPARAM)(ULONG_PTR)next_handle);
+        }
+    }
+    if (old_focus)
+        dispatch_focus_message(old_focus, WM_KILLFOCUS, next_handle);
+}
+
 /* Tell the engine its window is the active, focused foreground app. UE1's
  * UWindowsViewport gates realtime rendering on activation: without these
  * messages the viewport renders one init frame then idles (no per-frame
@@ -4241,7 +4302,9 @@ static void dispatch_wm_activate(WINDOW *w)
     w = window_root(w, NULL);
     if (!w || !w->wndproc) return;
 
-    WINDOW *previous = find_window(active_hwnd);
+    WINDOW *previous = user32_foreground_active
+        ? find_window(active_hwnd) : NULL;
+    BOOL changed = !user32_foreground_active || previous != w;
 
     if (previous && previous != w && previous->wndproc) {
         dispatch_window_message(previous, WM_ACTIVATEAPP, 0,
@@ -4252,13 +4315,17 @@ static void dispatch_wm_activate(WINDOW *w)
     }
 
     active_hwnd = w->handle;
+    user32_foreground_active = TRUE;
+    if (w->compositor_id && compositor_focus_window &&
+        window_should_render(w))
+        compositor_focus_window(w->compositor_id);
     /* Keep the shim focus state coherent with the messages we deliver: on NT
      * the window that receives WM_SETFOCUS IS the GetFocus() window. We used
      * to send WM_SETFOCUS here yet leave focus_hwnd NULL, so GetFocus()
      * contradicted the activation forever after — WinDrv gates its whole
      * in-game input path (UpdateInput key poll @0x11106F33, SetMouseCapture
      * OnlyFocus bail @0x1110665C) on GetFocus()==viewport hWnd. */
-    if (previous != w) {
+    if (changed) {
         dispatch_window_message(w, WM_ACTIVATEAPP, 1,
                                 previous ? (LPARAM)previous->owner_tid : 0);
         dispatch_window_message(w, WM_NCACTIVATE, 1, 0);
@@ -4284,6 +4351,61 @@ static void dispatch_wm_activate(WINDOW *w)
     serial_puts(preserve_descendant
         ? "[USER32] dispatched WM_ACTIVATEAPP/ACTIVATE; kept child focus\n"
         : "[USER32] dispatched WM_ACTIVATEAPP/ACTIVATE/SETFOCUS\n");
+}
+
+static WINDOW *activation_candidate(HWND preferred)
+{
+    WINDOW *candidate = window_root(find_window(preferred), NULL);
+    if (window_can_activate(candidate))
+        return candidate;
+
+    candidate = NULL;
+    for (int i = 0; i < window_count; i++) {
+        WINDOW *current = &windows[i];
+        if (!window_can_activate(current))
+            continue;
+        if (!candidate || root_is_above(current, candidate))
+            candidate = current;
+    }
+    return candidate;
+}
+
+static void repair_user32_activation(HWND preferred)
+{
+    if (!user32_foreground_active)
+        return;
+
+    WINDOW *active = window_root(find_window(active_hwnd), NULL);
+    if (window_can_activate(active)) {
+        WINDOW *focused = find_window(focus_hwnd);
+        BOOL valid_focus = window_can_receive_input(focused) &&
+                           window_should_render(focused) &&
+                           window_root(focused, NULL) == active;
+        if (!valid_focus) {
+            HWND old_focus = focus_hwnd;
+            focus_hwnd = active->handle;
+            if (old_focus && old_focus != active->handle)
+                dispatch_focus_message(old_focus, WM_KILLFOCUS,
+                                       active->handle);
+            if (old_focus != active->handle)
+                dispatch_focus_message(active->handle, WM_SETFOCUS,
+                                       old_focus);
+        }
+        if (active->compositor_id && compositor_focus_window)
+            compositor_focus_window(active->compositor_id);
+        return;
+    }
+
+    WINDOW *next = activation_candidate(preferred);
+    dispatch_wm_deactivate(next);
+    if (next)
+        dispatch_wm_activate(next);
+}
+
+void user32_deactivate_compositor_windows(void)
+{
+    if (user32_foreground_active || active_hwnd || focus_hwnd)
+        dispatch_wm_deactivate(NULL);
 }
 
 HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
@@ -4424,7 +4546,8 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
         place_window_in_z_order(w, (dwStyle & WS_CHILD) ? HWND_BOTTOM : HWND_TOP);
 
     /* OsitoK compositor: create backing shm surface + register window */
-    if (!message_only && shm_create_surface && compositor_create_window &&
+    if (!message_only && shm_create_surface &&
+        (compositor_create_window_inactive || compositor_create_window) &&
         nWidth > 0 && nHeight > 0) {
         uint32_t sh = shm_create_surface((uint32_t)nWidth, (uint32_t)nHeight,
                                           SHM_FLAG_CPU_WRITE | SHM_FLAG_CPU_READ);
@@ -4436,10 +4559,17 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
             w->surface_height = nHeight;
             int screen_x, screen_y;
             window_screen_origin(w, &screen_x, &screen_y);
-            w->compositor_id = compositor_create_window(sh,
-                (int16_t)screen_x, (int16_t)screen_y,
-                (uint16_t)nWidth, (uint16_t)nHeight,
-                pid, window_name ? window_name : "");
+            if (compositor_create_window_inactive) {
+                w->compositor_id = compositor_create_window_inactive(
+                    sh, (int16_t)screen_x, (int16_t)screen_y,
+                    (uint16_t)nWidth, (uint16_t)nHeight,
+                    pid, window_name ? window_name : "");
+            } else {
+                w->compositor_id = compositor_create_window(
+                    sh, (int16_t)screen_x, (int16_t)screen_y,
+                    (uint16_t)nWidth, (uint16_t)nHeight,
+                    pid, window_name ? window_name : "");
+            }
             sync_all_window_compositor_state();
             serial_puts("[USER32]   compositor wid=");
             serial_puthex(w->compositor_id, 4);
@@ -4536,6 +4666,8 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
         }
 
         if (!nc_result || create_result == -1) {
+            BOOL repair_activation = user32_foreground_active;
+            HWND preferred = w->owner;
             if (nc_result && w->wndproc)
                 dispatch_wndproc(w->wndproc, w->handle, WM_NCDESTROY, 0, 0);
             trace_window_release("create-failure", w, w->handle,
@@ -4543,6 +4675,8 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
                                  __builtin_return_address(0));
             release_window(w);
             sync_all_window_compositor_state();
+            if (repair_activation)
+                repair_user32_activation(preferred);
             return NULL;
         }
     }
@@ -4557,6 +4691,8 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
         if (w->wndproc)
             dispatch_wndproc(w->wndproc, w->handle, WM_SHOWWINDOW, TRUE, 0);
         invalidate_window(w, NULL, TRUE);
+        if (window_can_activate(w))
+            dispatch_wm_activate(w);
     }
 
     return w->handle;
@@ -4719,9 +4855,14 @@ BOOL WINAPI DestroyWindow(HWND hWnd)
         SetLastError(5); /* ERROR_ACCESS_DENIED */
         return FALSE;
     }
+    WINDOW *root = window_root(w, NULL);
+    HWND preferred = root ? root->owner : NULL;
+    BOOL repair_activation = user32_foreground_active;
     destroy_window_tree(w, 0, hWnd,
                         (uint64_t)(ULONG_PTR)__builtin_return_address(0));
     sync_all_window_compositor_state();
+    if (repair_activation)
+        repair_user32_activation(preferred);
     return TRUE;
 }
 
@@ -4729,6 +4870,10 @@ void user32_release_thread(DWORD pid, DWORD tid)
 {
     if (!pid || !tid)
         return;
+
+    BOOL repair_activation = user32_foreground_active;
+    WINDOW *active = window_root(find_window(active_hwnd), NULL);
+    HWND preferred = active ? active->owner : NULL;
 
     if (clip_owner_pid == pid && clip_owner_tid == tid) {
         clip_active = 0;
@@ -4775,10 +4920,15 @@ void user32_release_thread(DWORD pid, DWORD tid)
             window->owner = NULL;
     }
     sync_all_window_compositor_state();
+    if (repair_activation)
+        repair_user32_activation(preferred);
 }
 
 void user32_release_process(DWORD pid)
 {
+    BOOL repair_activation = user32_foreground_active;
+    WINDOW *active = window_root(find_window(active_hwnd), NULL);
+    HWND preferred = active ? active->owner : NULL;
     extern void comctl32_release_process(DWORD owner_pid);
     comctl32_release_process(pid);
     if (clip_owner_pid == pid) {
@@ -4819,6 +4969,8 @@ void user32_release_process(DWORD pid)
     if (user_display_mode.active && user_display_mode.owner_pid == pid)
         memset(&user_display_mode, 0, sizeof(user_display_mode));
     sync_all_window_compositor_state();
+    if (repair_activation)
+        repair_user32_activation(preferred);
     for (int i = 0; i < wndclass_count; i++) {
         WNDCLASS_BLOCK *block = wndclass_blocks[i / WNDCLASS_BLOCK_SIZE];
         WNDCLASS_ENTRY *entry = block
@@ -4838,6 +4990,9 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
     WINDOW *w = find_window(hWnd);
     if (!w) return FALSE;
 
+    BOOL repair_activation = user32_foreground_active;
+    WINDOW *root = window_root(w, NULL);
+    HWND preferred = root ? root->owner : NULL;
     int was_visible = w->visible;
     DWORD old_state = w->style & (WS_MINIMIZE | WS_MAXIMIZE);
     int activates = nCmdShow != SW_SHOWNOACTIVATE &&
@@ -4925,7 +5080,10 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
             invalidate_window(w, NULL, TRUE);
     }
 
-    if (activates && w->visible && !w->parent) {
+    if (repair_activation)
+        repair_user32_activation(preferred);
+
+    if (activates && window_can_activate(w)) {
         place_window_in_z_order(w, HWND_TOP);
         dispatch_wm_activate(w);
     }
@@ -5161,6 +5319,10 @@ BOOL user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
 {
     WINDOW *win = find_window(hWnd);
     if (!win) return FALSE;
+    if (exclusive && allow_window_changes && (width <= 0 || height <= 0))
+        return FALSE;
+
+    win->directdraw_exclusive = exclusive != FALSE;
 
     if (exclusive) {
         win->paint_pending = 0;
@@ -5171,10 +5333,10 @@ BOOL user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
         invalidate_window(win, NULL, TRUE);
     }
 
-    if (!exclusive || !allow_window_changes)
+    if (!exclusive || !allow_window_changes) {
+        sync_all_window_compositor_state();
         return TRUE;
-    if (width <= 0 || height <= 0)
-        return FALSE;
+    }
 
     BOOL result = SetWindowPos(hWnd, HWND_TOP, 0, 0, width, height,
                                SWP_NOZORDER | SWP_NOACTIVATE);
@@ -5185,6 +5347,8 @@ BOOL user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
         win->update_rect.left = win->update_rect.top = 0;
         win->update_rect.right = win->update_rect.bottom = 0;
     }
+    if (!result)
+        sync_all_window_compositor_state();
     return result;
 }
 
@@ -7946,18 +8110,11 @@ BOOL WINAPI GetLayeredWindowAttributes(HWND hWnd, DWORD *crKey,
 
 HWND WINAPI GetForegroundWindow(void)
 {
+    if (!user32_foreground_active)
+        return NULL;
     WINDOW *active = find_window(active_hwnd);
-    if (active)
+    if (active && !active->destroying)
         return window_root(active, NULL)->handle;
-
-    WINDOW *focused = find_window(focus_hwnd);
-    if (focused)
-        return window_root(focused, NULL)->handle;
-
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (windows[i].used && windows[i].visible && !windows[i].parent)
-            return windows[i].handle;
-    }
     return NULL;
 }
 
@@ -8140,27 +8297,38 @@ HWND WINAPI SetFocus(HWND hWnd)
             serial_puts("\n");
         }
     }
+    WINDOW *target = hWnd ? find_window(hWnd) : NULL;
     /* Only track real windows we know about; NULL clears focus. */
-    BOOL accepted = hWnd == NULL || find_window(hWnd);
+    BOOL accepted = hWnd == NULL || target;
     if (accepted) {
-        focus_hwnd = hWnd;
-        if (hWnd) {
-            WINDOW *focused = find_window(hWnd);
-            WINDOW *root = window_root(focused, NULL);
-            if (root)
-                active_hwnd = root->handle;
+        HWND current = focus_hwnd;
+        if (target) {
+            WINDOW *root = window_root(target, NULL);
+            WINDOW *active = window_root(find_window(active_hwnd), NULL);
+            if (!user32_foreground_active || active != root) {
+                /* Seed the requested descendant before WM_ACTIVATE so a
+                 * synchronous activation callback does not introduce an
+                 * artificial root SETFOCUS/KILLFOCUS pair. */
+                focus_hwnd = hWnd;
+                dispatch_wm_activate(root);
+            } else if (root && root->compositor_id &&
+                       compositor_focus_window && window_should_render(root)) {
+                compositor_focus_window(root->compositor_id);
+            }
         }
+
+        focus_hwnd = hWnd;
         /* NT delivers WM_KILLFOCUS to the loser and WM_SETFOCUS to the gainer.
          * UE1 re-arms input/capture on WM_SETFOCUS and releases on
          * WM_KILLFOCUS (ViewportWndProc focus cases near 0x1110715D/
          * 0x11107223); WinDrv itself calls SetFocus at OpenWindow
          * (0x11105AAD), in its WndProc (0x111071C5) and at ResizeViewport
          * (0x1110A25C), so mode changes depend on these messages flowing. */
-        if (old != hWnd) {
-            if (old)
-                dispatch_focus_message(old, WM_KILLFOCUS, hWnd);
+        if (current != hWnd) {
+            if (current)
+                dispatch_focus_message(current, WM_KILLFOCUS, hWnd);
             if (hWnd)
-                dispatch_focus_message(hWnd, WM_SETFOCUS, old);
+                dispatch_focus_message(hWnd, WM_SETFOCUS, current);
         }
     }
     return old;
@@ -8856,6 +9024,8 @@ static BOOL WINAPI GetUserObjectInformationW_stub(HANDLE object, int index,
 }
 HWND WINAPI GetActiveWindow(void)
 {
+    if (!user32_foreground_active)
+        return NULL;
     WINDOW *active = find_window(active_hwnd);
     return active ? window_root(active, NULL)->handle : NULL;
 }
@@ -10511,11 +10681,8 @@ BOOL WINAPI SetForegroundWindow(HWND hWnd)
     }
 
     WINDOW *root = window_root(w, NULL);
-    if (root) {
+    if (root)
         place_window_in_z_order(root, HWND_TOP);
-        if (root->compositor_id && compositor_focus_window)
-            compositor_focus_window(root->compositor_id);
-    }
     dispatch_wm_activate(w);
     return TRUE;
 }
@@ -10529,7 +10696,9 @@ BOOL user32_activate_compositor_window(uint32_t compositor_id)
             break;
         }
     }
-    if (!target || !window_is_taskbar_candidate(target))
+    if (!target || target->destroying || target->message_only ||
+        target->parent || (target->style & (WS_CHILD | WS_DISABLED)) ||
+        (target->ex_style & WS_EX_NOACTIVATE))
         return FALSE;
 
     if (target->style & WS_MINIMIZE)
@@ -10537,6 +10706,8 @@ BOOL user32_activate_compositor_window(uint32_t compositor_id)
     else if (!target->visible)
         ShowWindow(target->handle, SW_SHOW);
 
+    if (!window_can_activate(target))
+        return FALSE;
     return SetForegroundWindow(target->handle);
 }
 
@@ -11753,6 +11924,51 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
     }
 }
 
+static int map_fullscreen_axis(int physical, int offset,
+                               uint32_t content_extent,
+                               int logical_extent)
+{
+    if (logical_extent <= 1 || content_extent <= 1)
+        return 0;
+
+    int relative = physical - offset;
+    if (relative <= 0)
+        return 0;
+    if ((uint32_t)relative >= content_extent)
+        return logical_extent - 1;
+
+    int value = (int)(((int64_t)relative * logical_extent) /
+                      content_extent);
+    return value < logical_extent ? value : logical_extent - 1;
+}
+
+static BOOL map_fullscreen_pointer(int physical_x, int physical_y,
+                                   int *logical_x, int *logical_y)
+{
+    if (!logical_x || !logical_y ||
+        !compositor_get_fullscreen_content_rect ||
+        !user32_foreground_active)
+        return FALSE;
+
+    WINDOW *root = window_root(find_window(active_hwnd), NULL);
+    if (!root || !root->compositor_id || root->width <= 0 ||
+        root->height <= 0)
+        return FALSE;
+
+    int32_t left = 0;
+    int32_t top = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (!compositor_get_fullscreen_content_rect(root->compositor_id,
+                                                &left, &top,
+                                                &width, &height))
+        return FALSE;
+
+    *logical_x = map_fullscreen_axis(physical_x, left, width, root->width);
+    *logical_y = map_fullscreen_axis(physical_y, top, height, root->height);
+    return TRUE;
+}
+
 /* Desktop/UI bridge for a relative HID. input_events.c has already applied
  * acceleration and clamped screen_x/screen_y for the compositor. Seed the
  * relative emitter so it lands on that exact point while retaining raw HID
@@ -11766,10 +11982,23 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
         return;
     }
 
-    cursor_pos.x = screen_x - raw_dx;
-    cursor_pos.y = screen_y - raw_dy;
+    int current_x = screen_x;
+    int current_y = screen_y;
+    int previous_x = screen_x - raw_dx;
+    int previous_y = screen_y - raw_dy;
+    if (map_fullscreen_pointer(screen_x, screen_y,
+                               &current_x, &current_y)) {
+        (void)map_fullscreen_pointer(screen_x - raw_dx,
+                                     screen_y - raw_dy,
+                                     &previous_x, &previous_y);
+    }
+
+    cursor_pos.x = previous_x;
+    cursor_pos.y = previous_y;
     g_abs_prev_valid = 0;
-    win32_post_mouse_event(raw_dx, raw_dy, buttons, wheel_delta);
+    win32_post_mouse_event(current_x - previous_x,
+                           current_y - previous_y,
+                           buttons, wheel_delta);
 }
 
 /* Absolute-pointer path (QEMU usb-tablet / any HID_INPUT_ABS mouse). ax/ay are
@@ -11777,23 +12006,42 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
 void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 {
     g_last_input_time = shim_timeGetTime();
+    int physical_width = screen_cx();
+    int physical_height = screen_cy();
+    if (physical_width < 1)
+        physical_width = USER32_FALLBACK_SCREEN_WIDTH;
+    if (physical_height < 1)
+        physical_height = USER32_FALLBACK_SCREEN_HEIGHT;
+
     int tw = current_mode_cx(), th = current_mode_cy();
     if (tw < 1) tw = USER32_FALLBACK_SCREEN_WIDTH;
     if (th < 1) th = USER32_FALLBACK_SCREEN_HEIGHT;
-    /* A live DirectDraw present may scale a smaller source (for example
-     * 640x480) over the physical screen. Only then use its source space;
-     * ddraw_get_display_size returns 0/0 for ordinary USER32/GDI apps. */
-    extern void ddraw_get_display_size(unsigned *w, unsigned *h) __attribute__((weak));
-    if (ddraw_get_display_size) {
-        unsigned dw = 0, dh = 0; ddraw_get_display_size(&dw, &dh);
-        if (dw && dh) { tw = (int)dw; th = (int)dh; }
-    }
 
     int range = lmax - lmin;
     if (range <= 0) range = 1;
-    /* Scale the absolute tablet coordinate into client space. */
-    int sx = (int)(((int64_t)(ax - lmin) * (tw - 1)) / range);
-    int sy = (int)(((int64_t)(ay - lmin) * (th - 1)) / range);
+    int physical_x = (int)(((int64_t)(ax - lmin) *
+                            (physical_width - 1)) / range);
+    int physical_y = (int)(((int64_t)(ay - lmin) *
+                            (physical_height - 1)) / range);
+    if (physical_x < 0) physical_x = 0;
+    else if (physical_x >= physical_width) physical_x = physical_width - 1;
+    if (physical_y < 0) physical_y = 0;
+    else if (physical_y >= physical_height) physical_y = physical_height - 1;
+
+    /* Invert the compositor's actual fullscreen projection. This preserves
+     * correct hit testing through letterbox/pillarbox borders. The fallback
+     * retains logical display-mode coordinates when no compositor is linked. */
+    int sx = physical_x;
+    int sy = physical_y;
+    if (!map_fullscreen_pointer(physical_x, physical_y, &sx, &sy) &&
+        (tw != physical_width || th != physical_height)) {
+        sx = physical_width > 1
+            ? (int)(((int64_t)physical_x * (tw - 1)) /
+                    (physical_width - 1)) : 0;
+        sy = physical_height > 1
+            ? (int)(((int64_t)physical_y * (th - 1)) /
+                    (physical_height - 1)) : 0;
+    }
     if (sx < 0) sx = 0; else if (sx >= tw) sx = tw - 1;
     if (sy < 0) sy = 0; else if (sy >= th) sy = th - 1;
 
@@ -14034,6 +14282,9 @@ BOOL WINAPI EnableWindow(HWND hWnd, BOOL bEnable)
     }
     BOOL was_disabled = (w->style & WS_DISABLED) != 0;
     BOOL will_disable = !bEnable;
+    BOOL repair_activation = user32_foreground_active;
+    WINDOW *root = window_root(w, NULL);
+    HWND preferred = root ? root->owner : NULL;
     if (was_disabled != will_disable) {
         if (will_disable)
             w->style |= WS_DISABLED;
@@ -14041,8 +14292,8 @@ BOOL WINAPI EnableWindow(HWND hWnd, BOOL bEnable)
             w->style &= ~WS_DISABLED;
         if (w->wndproc)
             dispatch_wndproc(w->wndproc, hWnd, WM_ENABLE, bEnable, 0);
-        if (will_disable && focus_hwnd == hWnd)
-            SetFocus(NULL);
+        if (will_disable && repair_activation)
+            repair_user32_activation(preferred);
     }
     return was_disabled;
 }
@@ -14070,8 +14321,8 @@ DWORD WINAPI GetMessagePos(void)
 HWND WINAPI GetFocus(void)
 {
     WINDOW *focused = find_window(focus_hwnd);
-    HWND r = (focused && !focused->destroying) ? focused->handle
-                                               : GetForegroundWindow();
+    HWND r = user32_foreground_active && focused && !focused->destroying
+        ? focused->handle : NULL;
     {
         static uint32_t n = 0;
         if (u32_input_diagnostics_active() && (n++ & 0x3FF) == 0) {
@@ -14220,6 +14471,10 @@ HWND WINAPI SetParent(HWND hWndChild, HWND hWndNewParent)
 HWND WINAPI SetActiveWindow(HWND hWnd)
 {
     HWND prev = GetActiveWindow();
+    if (!hWnd) {
+        user32_deactivate_compositor_windows();
+        return prev;
+    }
     WINDOW *w = find_window(hWnd);
     if (w)
         dispatch_wm_activate(w);
@@ -14812,7 +15067,8 @@ int user32_window_model_selftest(void)
     uint32_t system_class_info32[12] = {48};
     HWND parent = NULL, child_a = NULL, child_b = NULL, grandchild = NULL;
     HWND grandchild_b = NULL;
-    HWND popup_a = NULL, popup_b = NULL, other = NULL;
+    HWND popup_a = NULL, popup_b = NULL, other = NULL, transient = NULL;
+    HWND directdraw_window = NULL;
     HMENU popup_menu = NULL, popup_submenu = NULL;
     HMENU system_menu = NULL, reset_system_menu = NULL;
     int checks = 0, failures = 0;
@@ -15369,12 +15625,25 @@ int user32_window_model_selftest(void)
                    "foreground APIs preserve child focus", &checks,
                    &failures);
 
+    ShowWindow(child_a, SW_HIDE);
+    wm_test_expect(GetFocus() == parent && GetActiveWindow() == parent &&
+                   input_target() == parent,
+                   "hidden focused child repairs input target", &checks,
+                   &failures);
+    ShowWindow(child_a, SW_SHOWNA);
+    SetFocus(child_a);
+
     ShowWindow(parent, SW_HIDE);
-    wm_test_expect(!IsWindowVisible(child_a),
-                   "ancestor visibility propagation", &checks, &failures);
+    wm_test_expect(!IsWindowVisible(child_a) &&
+                   GetActiveWindow() == other && GetFocus() == other &&
+                   input_target() == other,
+                   "hidden active hierarchy transfers foreground", &checks,
+                   &failures);
     ShowWindow(parent, SW_SHOWNA);
-    wm_test_expect(IsWindowVisible(grandchild),
-                   "ancestor visibility restoration", &checks, &failures);
+    wm_test_expect(IsWindowVisible(grandchild) &&
+                   GetActiveWindow() == other && GetFocus() == other,
+                   "nonactivating show preserves foreground", &checks,
+                   &failures);
 
     WINDOWPLACEMENT placement = { .length = sizeof(WINDOWPLACEMENT) };
     wm_test_expect(GetWindowPlacement(parent, &placement) &&
@@ -15391,6 +15660,66 @@ int user32_window_model_selftest(void)
     placement.showCmd = SW_RESTORE;
     wm_test_expect(SetWindowPlacement(parent, &placement) && !IsIconic(parent),
                    "SetWindowPlacement restore", &checks, &failures);
+
+    directdraw_window = CreateWindowExA(0, class_name, "wm-ddraw",
+        WS_POPUP | WS_VISIBLE, 40, 50, 320, 200,
+        NULL, NULL, NULL, NULL);
+    wm_test_expect(directdraw_window != NULL,
+                   "create DirectDraw cooperative window", &checks,
+                   &failures);
+    if (directdraw_window) {
+        WINDOW *directdraw = find_window(directdraw_window);
+        wm_test_expect(
+            user32_configure_directdraw_window(directdraw_window, TRUE,
+                                               FALSE, 0, 0) &&
+            directdraw && directdraw->directdraw_exclusive &&
+            directdraw->x == 40 && directdraw->y == 50 &&
+            directdraw->width == 320 && directdraw->height == 200 &&
+            window_should_be_fullscreen(directdraw),
+            "exclusive DirectDraw mode without geometry change",
+            &checks, &failures);
+        wm_test_expect(
+            user32_configure_directdraw_window(directdraw_window, TRUE,
+                                               TRUE, 640, 480) &&
+            directdraw->x == 0 && directdraw->y == 0 &&
+            directdraw->width == 640 && directdraw->height == 480 &&
+            window_should_be_fullscreen(directdraw),
+            "exclusive DirectDraw mode updates viewport geometry",
+            &checks, &failures);
+        wm_test_expect(
+            user32_configure_directdraw_window(directdraw_window, FALSE,
+                                               FALSE, 0, 0) &&
+            !directdraw->directdraw_exclusive &&
+            !window_should_be_fullscreen(directdraw),
+            "normal DirectDraw mode releases fullscreen ownership",
+            &checks, &failures);
+        if (DestroyWindow(directdraw_window))
+            directdraw_window = NULL;
+        else
+            wm_test_expect(FALSE, "destroy DirectDraw cooperative window",
+                           &checks, &failures);
+        wm_test_destroy_count = 0;
+        wm_test_ncdestroy_count = 0;
+    }
+
+    transient = CreateWindowExA(0, class_name, "wm-thread-transient",
+        WS_POPUP | WS_VISIBLE, 260, 220, 80, 50,
+        parent, NULL, NULL, NULL);
+    wm_test_expect(transient != NULL && GetActiveWindow() == transient,
+                   "visible owned popup becomes active", &checks, &failures);
+    if (transient) {
+        WINDOW *transient_window = find_window(transient);
+        DWORD fake_tid = GetCurrentThreadId() ^ 0x40000000U;
+        if (transient_window)
+            transient_window->owner_tid = fake_tid;
+        user32_release_thread(GetCurrentProcessId(), fake_tid);
+        wm_test_expect(!IsWindow(transient) &&
+                       GetActiveWindow() == parent && GetFocus() == parent &&
+                       input_target() == parent,
+                       "thread teardown restores owned-window foreground",
+                       &checks, &failures);
+        transient = NULL;
+    }
 
     wm_test_expect(SetParent(child_b, NULL) == parent,
                    "SetParent previous parent", &checks, &failures);
@@ -15425,6 +15754,8 @@ cleanup:
     if (IsWindow(grandchild_b)) DestroyWindow(grandchild_b);
     if (IsWindow(popup_a)) DestroyWindow(popup_a);
     if (IsWindow(popup_b)) DestroyWindow(popup_b);
+    if (IsWindow(directdraw_window)) DestroyWindow(directdraw_window);
+    if (IsWindow(transient)) DestroyWindow(transient);
     if (IsWindow(other)) DestroyWindow(other);
     if (atom) UnregisterClassA(class_name, NULL);
 
@@ -15502,6 +15833,7 @@ int user32_input_selftest(void)
     DWORD saved_last_error = GetLastError();
     HWND saved_focus = focus_hwnd;
     HWND saved_active = active_hwnd;
+    BOOL saved_foreground_active = user32_foreground_active;
     HWND window = NULL;
     HWND capture_window = NULL;
     WORD atom = 0;
@@ -15513,6 +15845,17 @@ int user32_input_selftest(void)
         serial_puts("[INPUTTEST] FAIL: cannot run during a PE32 callback\n");
         return 1;
     }
+
+    input_test_expect(
+        map_fullscreen_axis(0, 107, 1066, 640) == 0 &&
+        map_fullscreen_axis(107, 107, 1066, 640) == 0 &&
+        map_fullscreen_axis(640, 107, 1066, 640) == 320 &&
+        map_fullscreen_axis(1172, 107, 1066, 640) == 639 &&
+        map_fullscreen_axis(1279, 107, 1066, 640) == 639 &&
+        map_fullscreen_axis(400, 0, 800, 480) == 240 &&
+        map_fullscreen_axis(799, 0, 800, 480) == 479,
+        "fullscreen pointer inverts aspect-fit projection",
+        &checks, &failures);
 
     for (int i = 0; i < 256; i++) {
         saved_keys[i] = key_state[i];
@@ -16027,6 +16370,7 @@ cleanup:
     focus_hwnd = saved_focus && find_window(saved_focus) ? saved_focus : NULL;
     active_hwnd = saved_active && find_window(saved_active)
         ? saved_active : NULL;
+    user32_foreground_active = saved_foreground_active && active_hwnd;
     g_compat32_mode = 0;
     SetLastError(saved_last_error);
 
@@ -16808,6 +17152,7 @@ PVOID user32_shim_init(void)
     /* Re-exec resets input and activation state. */
     focus_hwnd = NULL;
     active_hwnd = NULL;
+    user32_foreground_active = FALSE;
     capture_hwnd = NULL;
     native_move.window = NULL;
     native_move.pointer_offset_x = 0;

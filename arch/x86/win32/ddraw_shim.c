@@ -765,6 +765,9 @@ struct DDRAW_PROCESS_STATE {
     DDSurface *present_surface;
 };
 
+static BOOL ddraw_is_exclusive(const DDRAW_PROCESS_STATE *state);
+static BOOL ddraw_logical_mode_active(const DDRAW_PROCESS_STATE *state);
+
 static DDRAW_PROCESS_STATE ddraw_processes[DDRAW_PROCESS_SLOTS];
 static volatile uint32_t ddraw_state_lock;
 static volatile uint32_t ddraw_surface_uniqueness;
@@ -1299,14 +1302,16 @@ static void ddraw_wait_for_vblank(DWORD flags)
 void ddraw_get_display_size(uint32_t *w, uint32_t *h)
 {
     DWORD owner_pid = win32_current_process_id();
-    uint32_t active_w = g_present_owner_pid == owner_pid
-        ? g_present_src_w : 0;
-    uint32_t active_h = g_present_owner_pid == owner_pid
-        ? g_present_src_h : 0;
     DDRAW_PROCESS_STATE *state = ddraw_current_state(FALSE);
-    if ((!active_w || !active_h) && state && state->mode_set) {
-        active_w = state->display_width;
-        active_h = state->display_height;
+    uint32_t active_w = 0;
+    uint32_t active_h = 0;
+    if (ddraw_logical_mode_active(state)) {
+        active_w = g_present_owner_pid == owner_pid ? g_present_src_w : 0;
+        active_h = g_present_owner_pid == owner_pid ? g_present_src_h : 0;
+        if (!active_w || !active_h) {
+            active_w = state->display_width;
+            active_h = state->display_height;
+        }
     }
     if (w) *w = active_w;
     if (h) *h = active_h;
@@ -1343,7 +1348,7 @@ void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
 int ddraw_display_mode_active(void)
 {
     DDRAW_PROCESS_STATE *state = ddraw_current_state(FALSE);
-    return state ? state->mode_set : 0;
+    return ddraw_logical_mode_active(state);
 }
 
 /* Per-frame present hook for software renderers that retain a surface lock
@@ -2427,6 +2432,11 @@ static BOOL ddraw_is_exclusive(const DDRAW_PROCESS_STATE *state)
         (state->cooperative_flags &
          (DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN)) ==
         (DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN);
+}
+
+static BOOL ddraw_logical_mode_active(const DDRAW_PROCESS_STATE *state)
+{
+    return state && state->mode_set && ddraw_is_exclusive(state);
 }
 
 static BOOL ddraw_resolution_supported(DWORD width, DWORD height)
@@ -3772,6 +3782,23 @@ int ddraw_selftest(void)
         { 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 }
     };
     int failures = 0;
+
+    DDRAW_PROCESS_STATE mode_state;
+    dd_memset(&mode_state, 0, sizeof(mode_state));
+    mode_state.mode_set = 1;
+    mode_state.cooperative_flags = DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN;
+    ddraw_selftest_expect(ddraw_logical_mode_active(&mode_state),
+                          "exclusive display mode is logically active",
+                          &failures);
+    mode_state.cooperative_flags = DDSCL_NORMAL;
+    ddraw_selftest_expect(!ddraw_logical_mode_active(&mode_state),
+                          "normal cooperation releases logical mode",
+                          &failures);
+    mode_state.cooperative_flags = DDSCL_EXCLUSIVE | DDSCL_FULLSCREEN;
+    mode_state.mode_set = 0;
+    ddraw_selftest_expect(!ddraw_logical_mode_active(&mode_state),
+                          "exclusive cooperation requires display mode",
+                          &failures);
 
     ddraw_selftest_expect(
         dd_version_from_iid(&dd_iid_directdraw) == DDRAW_IFACE_1,
