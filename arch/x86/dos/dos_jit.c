@@ -11,15 +11,12 @@
  */
 
 #include "cpu8086.h"
+#include "dos_hostmem.h"
 #include "dos_jit.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
-
-/* Memory allocation */
-extern void *mem_alloc_pages(uint64_t count);
-extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* Interrupt dispatch (dos_int.c) */
 extern void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num);
@@ -112,9 +109,9 @@ void jit_init(jit_state_t *jit)
 {
     jit_memset(jit, 0, sizeof(jit_state_t));
 
-    /* Allocate executable code cache — bare metal, all pages are RWX */
+    /* The kernel direct map currently permits execution of this code cache. */
     uint64_t pages = (JIT_CACHE_SIZE + 4095) / 4096;
-    jit->code_buf = (uint8_t *)mem_alloc_pages(pages);
+    jit->code_buf = (uint8_t *)dos_host_alloc_pages(pages);
 
     if (!jit->code_buf) {
         serial_puts("[JIT] FATAL: failed to allocate code cache\n");
@@ -138,8 +135,8 @@ void jit_destroy(jit_state_t *jit)
 {
     if (!jit) return;
     if (jit->code_buf) {
-        mem_free_pages(jit->code_buf,
-                       (JIT_CACHE_SIZE + 4095u) / 4096u);
+        dos_host_free_pages(jit->code_buf,
+                             (JIT_CACHE_SIZE + 4095u) / 4096u);
         jit->code_buf = NULL;
     }
     jit->code_used = 0;

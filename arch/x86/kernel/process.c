@@ -940,6 +940,36 @@ void sched_reset_current_compat_ist1(void)
         __asm__ volatile ("sti" ::: "memory");
 }
 
+/* Native DOS exits also unwind exception frames. The same shell task may
+ * already own a private fault stack from an earlier Win32 invocation. */
+void sched_reset_current_compat_ist3(void)
+{
+    uint64_t irq_flags;
+    __asm__ volatile ("pushfq; popq %0; cli"
+                      : "=r"(irq_flags) :: "memory");
+
+    bool reset_private = false;
+    int idx = sched_current_idx;
+    if (idx >= 0 && idx < proc_capacity && current_proc == &proctab[idx] &&
+        sched_compat_ist3_phys[idx]) {
+        uint64_t top = (uint64_t)PHYS_TO_VIRT(sched_compat_ist3_phys[idx]) +
+                       COMPAT_IST3_STACK_SIZE;
+        extern uint64_t *tss_ist3_ptr;
+        sched_compat_ist3[idx] = top;
+        if (tss_ist3_ptr)
+            *tss_ist3_ptr = top;
+        reset_private = true;
+    }
+
+    if (!reset_private) {
+        extern void x86_tss_reset_ist3(void);
+        x86_tss_reset_ist3();
+    }
+
+    if (irq_flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
+
 static void proc_release_kernel_stack(process_t *p)
 {
     if (!p || !p->kernel_stack) return;

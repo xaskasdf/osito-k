@@ -6,12 +6,11 @@
  */
 
 #include "cpu8086.h"
+#include "dos_hostmem.h"
 #include "dos_io.h"
 #include "dos_mouse.h"
 #include "dos_vbe.h"
 
-extern void *mem_alloc_pages(uint64_t count);
-extern void mem_free_pages(void *address, uint64_t count);
 extern void serial_puts(const char *text);
 extern void serial_puthex(uint64_t value, int digits);
 extern void dos_int10_video(dos_vm_t *vm);
@@ -916,11 +915,11 @@ int dos_vbe_selftest(void)
     uint64_t vm_pages = (sizeof(dos_vm_t) + 4095u) / 4096u;
     uint64_t memory_pages =
         (DOS_VM_ADDRESS_SPACE_SIZE + 4095u) / 4096u;
-    dos_vm_t *vm = (dos_vm_t *)mem_alloc_pages(vm_pages);
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(memory_pages);
+    dos_vm_t *vm = (dos_vm_t *)dos_host_alloc_pages(vm_pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(memory_pages);
     if (!vm || !memory) {
-        if (vm) mem_free_pages(vm, vm_pages);
-        if (memory) mem_free_pages(memory, memory_pages);
+        if (vm) dos_host_free_pages(vm, vm_pages);
+        if (memory) dos_host_free_pages(memory, memory_pages);
         return 1;
     }
     vbe_zero((uint8_t *)vm, vm_pages * 4096u);
@@ -1096,7 +1095,7 @@ int dos_vbe_selftest(void)
 
 done:
     dos_io_shutdown(vm);
-    mem_free_pages(memory, memory_pages);
-    mem_free_pages(vm, vm_pages);
+    dos_host_free_pages(memory, memory_pages);
+    dos_host_free_pages(vm, vm_pages);
     return failures;
 }

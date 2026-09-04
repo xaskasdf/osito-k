@@ -507,6 +507,57 @@ for freeing and guest mappings; no DOS mapping fix is included here. The later
 DirectSound command could not run after the halt, so the clean-boot contract
 passes must not be read as a passing post-UT99 sequence.
 
+## 4.9 DOS backing memory and native-exit IST3 ownership (2026-09-04)
+
+The post-UT99 DOS fault from section 4.8 also reproduces on the unchanged
+`b7a1dcf3` kernel: `dos_vcpi_selftest` writes to unmapped `0x10900000` from
+allocation base `0x107BB000`, at the same RIP `0xFFFF800002417740`. Artifacts
+are under `/root/osito-dos-hostmem-20260904-r1/`.
+
+DOS host allocations now use `dos_host_alloc_pages` and `dos_host_free_pages`.
+The allocator returns the kernel direct-map pointer; only freeing and native
+guest/page-table mappings convert back to physical addresses. This covers guest
+RAM, image/EXEC buffers, EMS/VCPI state, native table pages, and JIT storage.
+Audio and VGA consume that pointer directly without applying the direct-map
+offset twice. Guest-visible addresses and the physical allocator are unchanged.
+The JIT still relies on an executable kernel direct map; this is not a W^X fix.
+
+The memory fix exposed another native-DOS exit issue: resetting IST3 to the
+global bootstrap stack discarded the shell task's private Win32 fault-stack
+ownership. The new scheduler helper resets the current owner's private stack
+when present, falling back to the global stack only when no private stack exists.
+
+Validation commands:
+```sh
+make -C arch/x86 CLANG=1 -j4
+make -C arch/x86 CLANG=1 dos-dpmi-test dos-vbe-native-test \
+    dos-audio-native-test dos-exec-test dos-vbe-test
+```
+
+`arch/x86/test/dos_hostmem.autoload` runs `dos-api-test`. Its 13 host-memory
+checks include a private CR3 without low aliases, a real high-pointer write/read
+under that CR3, zeroed native table allocation, production JIT execution, and
+IST3 reset. GCC also compiles the changed `dos_exec.c` and `process.c` separately.
+
+The final QEMU sequence under `/root/osito-dos-hostmem-20260904-r3/` renders the
+UT99 intro, exits through console `quit` with code 0, and passes input 156/156,
+window-model 95/95, DOS API, and DirectSound contracts. Native DPMI callbacks,
+EXEC COM/MZ/load-only children, native VBE, native audio DMA/IRQ, and interpreted
+VBE fixtures complete. DPMI and audio fixtures use exit 42 as their success
+value. Repeating EXEC, native audio, and DOS API leaves the observed free-page
+count unchanged at 1908492. This is a bounded cycle check, not proof of complete
+application-memory reclamation. No scheduler owner/IST3 guard warning, double
+page free, or unhandled CPU fault appears in that run.
+
+Clean-boot validation under `/root/osito-dos-hostmem-20260904-r4/` also passes
+the 13 checks with no private IST3 stack, followed by native VBE/audio and PE32
+subclass/callback-preemption probes. However, the subsequent SEH3 probe fails
+with an unhandled `#GP` at `0x004010B7` while reading `FS:0`, before installing
+its exception handler; it exits with `0xC0000005`. This is not SEH3's expected
+handled test fault. The DOS-to-PE32 segment-state transition remains open:
+restoring the FS base alone may not restore a usable compatibility-mode segment.
+No FS-selector fix or complete interleaving guarantee is included here.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of

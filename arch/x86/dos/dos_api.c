@@ -9,6 +9,7 @@
  */
 
 #include "cpu8086.h"
+#include "dos_hostmem.h"
 #include "dos_audio.h"
 #include "dos_find.h"
 #include "dos_io.h"
@@ -23,8 +24,6 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void serial_putchar(char c);
-extern void *mem_alloc_pages(uint64_t count);
-extern void mem_free_pages(void *addr, uint64_t count);
 extern int  disk_flush(void);
 
 /* Console output — bridges to OsitoK's framebuffer */
@@ -1765,7 +1764,7 @@ static int dos_exec_finish_load_only(
     uint64_t context_pages =
         (sizeof(struct dos_exec_context) + 4095u) / 4096u;
     struct dos_exec_context *context =
-        (struct dos_exec_context *)mem_alloc_pages(context_pages);
+        (struct dos_exec_context *)dos_host_alloc_pages(context_pages);
     if (!context) return DOS_ERR_NOT_ENOUGH_MEMORY;
 
     context->previous = vm->exec_context;
@@ -1782,7 +1781,7 @@ static int dos_exec_finish_load_only(
     dos_exec_save_parent(vm, &context->parent);
     int error = dos_exec_hold_parent_files(&context->parent);
     if (error) {
-        mem_free_pages(context, context_pages);
+        dos_host_free_pages(context, context_pages);
         return error;
     }
 
@@ -1841,7 +1840,7 @@ static int dos_exec_finish_load_only(
         vm->jft_external_psp = parent_jft_psp;
         vm->jft_active = parent_jft_active;
         dos_exec_release_parent_files(&context->parent);
-        mem_free_pages(context, context_pages);
+        dos_host_free_pages(context, context_pages);
     } else {
         context->child_psp = child_psp;
         context->entry_offset = entry_values[2];
@@ -1974,8 +1973,8 @@ static void dos_exec_restore_loaded_context(dos_vm_t *vm,
         serial_puts("\n");
     }
 
-    mem_free_pages(context,
-                   (sizeof(struct dos_exec_context) + 4095u) / 4096u);
+    dos_host_free_pages(context,
+                         (sizeof(struct dos_exec_context) + 4095u) / 4096u);
 }
 
 bool dos_exec_complete_termination(dos_vm_t *vm)
@@ -2043,10 +2042,10 @@ static int dos_exec_load_program(dos_vm_t *vm, uint16_t path_segment,
     if (file_size > DOS_TOTAL_MEM || file_size > 0x7FFFFFFFu)
         return DOS_ERR_NOT_ENOUGH_MEMORY;
     uint64_t image_pages = (file_size + 4095u) / 4096u;
-    uint8_t *image = (uint8_t *)mem_alloc_pages(image_pages);
+    uint8_t *image = (uint8_t *)dos_host_alloc_pages(image_pages);
     if (!image) return DOS_ERR_NOT_ENOUGH_MEMORY;
     if (osfs2_read(file, 0, image, file_size) != (int)file_size) {
-        mem_free_pages(image, image_pages);
+        dos_host_free_pages(image, image_pages);
         return DOS_ERR_ACCESS_DENIED;
     }
 
@@ -2057,7 +2056,7 @@ static int dos_exec_load_program(dos_vm_t *vm, uint16_t path_segment,
                                       vm->current_dir, canonical,
                                       sizeof(canonical), &canonical_size);
     if (error) {
-        mem_free_pages(image, image_pages);
+        dos_host_free_pages(image, image_pages);
         return error;
     }
 
@@ -2078,22 +2077,22 @@ static int dos_exec_load_program(dos_vm_t *vm, uint16_t path_segment,
         error = dos_exec_finish_load_only(vm, image, file_size, format,
                                           canonical, &spec, inherited,
                                           block_segment, block_offset);
-        mem_free_pages(image, image_pages);
+        dos_host_free_pages(image, image_pages);
         return error;
     }
 
     uint64_t state_pages = (sizeof(dos_exec_parent_state_t) + 4095u) / 4096u;
     dos_exec_parent_state_t *parent =
-        (dos_exec_parent_state_t *)mem_alloc_pages(state_pages);
+        (dos_exec_parent_state_t *)dos_host_alloc_pages(state_pages);
     if (!parent) {
-        mem_free_pages(image, image_pages);
+        dos_host_free_pages(image, image_pages);
         return DOS_ERR_NOT_ENOUGH_MEMORY;
     }
     dos_exec_save_parent(vm, parent);
     error = dos_exec_hold_parent_files(parent);
     if (error) {
-        mem_free_pages(parent, state_pages);
-        mem_free_pages(image, image_pages);
+        dos_host_free_pages(parent, state_pages);
+        dos_host_free_pages(image, image_pages);
         return error;
     }
     dos_exec_begin_child(vm, parent);
@@ -2105,7 +2104,7 @@ static int dos_exec_load_program(dos_vm_t *vm, uint16_t path_segment,
     else
         error = dos_load_com_process(vm, image, file_size, canonical,
                                      &spec, &child_psp);
-    mem_free_pages(image, image_pages);
+    dos_host_free_pages(image, image_pages);
 
     if (!error) error = dos_exec_retain_inherited_handles(vm, inherited);
     uint64_t child_instructions = 0;
@@ -2142,7 +2141,7 @@ static int dos_exec_load_program(dos_vm_t *vm, uint16_t path_segment,
         vm->last_return_code = return_code;
         vm->last_return_type = return_type;
     }
-    mem_free_pages(parent, state_pages);
+    dos_host_free_pages(parent, state_pages);
     return error;
 }
 
@@ -2176,10 +2175,10 @@ static int dos_exec_load_overlay(dos_vm_t *vm, uint16_t path_segment,
         return DOS_ERR_NOT_ENOUGH_MEMORY;
 
     uint64_t image_pages = (file_size + 4095u) / 4096u;
-    uint8_t *image = (uint8_t *)mem_alloc_pages(image_pages);
+    uint8_t *image = (uint8_t *)dos_host_alloc_pages(image_pages);
     if (!image) return DOS_ERR_NOT_ENOUGH_MEMORY;
     if (osfs2_read(file, 0, image, file_size) != (int)file_size) {
-        mem_free_pages(image, image_pages);
+        dos_host_free_pages(image, image_pages);
         return DOS_ERR_ACCESS_DENIED;
     }
 
@@ -2189,7 +2188,7 @@ static int dos_exec_load_overlay(dos_vm_t *vm, uint16_t path_segment,
         (uint16_t)(raw[2] | ((uint16_t)raw[3] << 8));
     error = dos_load_overlay(vm, image, file_size, load_segment,
                              relocation_factor);
-    mem_free_pages(image, image_pages);
+    dos_host_free_pages(image, image_pages);
     return error;
 }
 
@@ -3794,7 +3793,7 @@ static int dos_psp_creation_selftest(void)
     const uint32_t int23 = 0xA3332222u;
     const uint32_t int24 = 0xA4443333u;
     const uint64_t pages = (DOS_CONV_TOP + 4095u) / 4096u;
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(pages);
     if (!memory) return 1;
     for (uint64_t i = 0; i < pages * 4096u; i++) memory[i] = 0;
 
@@ -4002,7 +4001,7 @@ static int dos_psp_creation_selftest(void)
             break;
         }
     }
-    mem_free_pages(memory, pages);
+    dos_host_free_pages(memory, pages);
     return failures;
 }
 
@@ -4588,7 +4587,7 @@ static int dos_extended_open_contract_selftest(dos_vm_t *vm,
 static int dos_system_variables_selftest(void)
 {
     const uint64_t pages = (DOS_CONV_TOP + 4095u) / 4096u;
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(pages);
     if (!memory) return 1;
     for (uint64_t i = 0; i < pages * 4096u; i++) memory[i] = 0;
 
@@ -5199,7 +5198,7 @@ static int dos_system_variables_selftest(void)
             break;
         }
     }
-    mem_free_pages(memory, pages);
+    dos_host_free_pages(memory, pages);
     return failures;
 }
 
@@ -5303,6 +5302,7 @@ int dos_api_selftest(void)
         total_clusters != 8192)
         failures++;
 
+    dos_selftest_accumulate(&failures, "host memory", dos_hostmem_selftest());
     dos_selftest_accumulate(&failures, "memory", dos_mem_selftest());
     dos_selftest_accumulate(&failures, "system variables",
                             dos_system_variables_selftest());

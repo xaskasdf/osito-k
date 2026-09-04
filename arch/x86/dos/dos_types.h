@@ -192,7 +192,7 @@ typedef struct {
 
 typedef struct dos_vm {
     struct cpu8086_state *cpu;
-    uint8_t         *mem;               /* complete guest address space */
+    uint8_t         *mem;               /* kernel direct-map view of guest RAM */
     uint32_t         total_mem_size;    /* actual allocated size */
     uint32_t         system_mem_size;   /* RAM visible to DOS/DPMI clients */
 

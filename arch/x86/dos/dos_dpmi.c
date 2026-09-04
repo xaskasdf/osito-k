@@ -10,6 +10,7 @@
  */
 
 #include "cpu8086.h"
+#include "dos_hostmem.h"
 #include "dos_dpmi.h"
 #include "dos_io.h"
 #include "dos_mem.h"
@@ -2555,16 +2556,14 @@ void dos_int31_dpmi(dos_vm_t *vm)
 
 static int dpmi_rm_call_selftest(void)
 {
-    extern void *mem_alloc_pages(uint64_t count);
-    extern void mem_free_pages(void *addr, uint64_t count);
 
     const uint64_t memory_pages = 512;
     uint64_t vm_pages = (sizeof(dos_vm_t) + 4095u) / 4096u;
-    dos_vm_t *vm = (dos_vm_t *)mem_alloc_pages(vm_pages);
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(memory_pages);
+    dos_vm_t *vm = (dos_vm_t *)dos_host_alloc_pages(vm_pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(memory_pages);
     if (!vm || !memory) {
-        if (memory) mem_free_pages(memory, memory_pages);
-        if (vm) mem_free_pages(vm, vm_pages);
+        if (memory) dos_host_free_pages(memory, memory_pages);
+        if (vm) dos_host_free_pages(vm, vm_pages);
         return 1;
     }
 
@@ -2792,23 +2791,21 @@ static int dpmi_rm_call_selftest(void)
     }
 
 done:
-    mem_free_pages(memory, memory_pages);
-    mem_free_pages(vm, vm_pages);
+    dos_host_free_pages(memory, memory_pages);
+    dos_host_free_pages(vm, vm_pages);
     return failures;
 }
 
 static int dpmi_dos_memory_selftest(void)
 {
-    extern void *mem_alloc_pages(uint64_t count);
-    extern void mem_free_pages(void *addr, uint64_t count);
 
     const uint64_t vm_pages = (sizeof(dos_vm_t) + 4095u) / 4096u;
     const uint64_t memory_pages = (DOS_CONV_TOP + 4095u) / 4096u;
-    dos_vm_t *vm = (dos_vm_t *)mem_alloc_pages(vm_pages);
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(memory_pages);
+    dos_vm_t *vm = (dos_vm_t *)dos_host_alloc_pages(vm_pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(memory_pages);
     if (!vm || !memory) {
-        if (memory) mem_free_pages(memory, memory_pages);
-        if (vm) mem_free_pages(vm, vm_pages);
+        if (memory) dos_host_free_pages(memory, memory_pages);
+        if (vm) dos_host_free_pages(vm, vm_pages);
         return 1;
     }
 
@@ -3045,8 +3042,8 @@ static int dpmi_dos_memory_selftest(void)
     if (!(cpu.eflags & FLAG_CF) || cpu.ax != 0x0007 || cpu.bx != 0)
         failures++;
 
-    mem_free_pages(memory, memory_pages);
-    mem_free_pages(vm, vm_pages);
+    dos_host_free_pages(memory, memory_pages);
+    dos_host_free_pages(vm, vm_pages);
     return failures;
 }
 
@@ -3107,16 +3104,14 @@ static bool dpmi_descriptor_unchanged(const dpmi_descriptor_t *left,
 
 static int dpmi_entry_selftest(void)
 {
-    extern void *mem_alloc_pages(uint64_t count);
-    extern void mem_free_pages(void *addr, uint64_t count);
 
     const uint64_t vm_pages = (sizeof(dos_vm_t) + 4095u) / 4096u;
     const uint64_t memory_pages = 256;
-    dos_vm_t *vm = (dos_vm_t *)mem_alloc_pages(vm_pages);
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(memory_pages);
+    dos_vm_t *vm = (dos_vm_t *)dos_host_alloc_pages(vm_pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(memory_pages);
     if (!vm || !memory) {
-        if (memory) mem_free_pages(memory, memory_pages);
-        if (vm) mem_free_pages(vm, vm_pages);
+        if (memory) dos_host_free_pages(memory, memory_pages);
+        if (vm) dos_host_free_pages(vm, vm_pages);
         return 1;
     }
 
@@ -3363,8 +3358,8 @@ static int dpmi_entry_selftest(void)
          i < DPMI_MAX_DESCRIPTORS; i++)
         if (vm->dpmi.descriptor_state[i] != DPMI_DESC_MUTABLE) failures++;
 
-    mem_free_pages(memory, memory_pages);
-    mem_free_pages(vm, vm_pages);
+    dos_host_free_pages(memory, memory_pages);
+    dos_host_free_pages(vm, vm_pages);
     return failures;
 }
 
@@ -3452,11 +3447,9 @@ static int dpmi_page_interrupt_service_selftest(dos_vm_t *vm,
 
 int dpmi_selftest(void)
 {
-    extern void *mem_alloc_pages(uint64_t count);
-    extern void mem_free_pages(void *addr, uint64_t count);
 
     uint64_t pages = (sizeof(dos_vm_t) + 4095u) / 4096u;
-    dos_vm_t *vm = (dos_vm_t *)mem_alloc_pages(pages);
+    dos_vm_t *vm = (dos_vm_t *)dos_host_alloc_pages(pages);
     if (!vm) return 1;
 
     dpmi_zero(vm, pages * 4096u);
@@ -3918,6 +3911,6 @@ int dpmi_selftest(void)
         serial_putdec(failures - descriptor_failures_start);
         serial_puts("\n");
     }
-    mem_free_pages(vm, pages);
+    dos_host_free_pages(vm, pages);
     return failures;
 }

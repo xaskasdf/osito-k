@@ -6,6 +6,7 @@
  */
 
 #include "cpu8086.h"
+#include "dos_hostmem.h"
 #include "dos_audio.h"
 #include "dos_io.h"
 #include "dos_jit.h"
@@ -17,10 +18,6 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void fb_puts(const char *s);
-
-/* Memory */
-extern void *mem_alloc_pages(uint64_t count);
-extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* OsitoFS */
 extern bool     osfs2_is_mounted(void);
@@ -46,7 +43,7 @@ static void dos_jit_release(dos_vm_t *vm)
     if (!vm || !vm->jit) return;
     jit_state_t *jit = (jit_state_t *)vm->jit;
     jit_destroy(jit);
-    mem_free_pages(jit, (sizeof(jit_state_t) + 4095u) / 4096u);
+    dos_host_free_pages(jit, (sizeof(jit_state_t) + 4095u) / 4096u);
     vm->jit = NULL;
 }
 
@@ -171,7 +168,7 @@ int dos_run(const char *filename, int argc, const char **argv)
 
     /* Read file into buffer */
     uint64_t buf_pages = (size + 0xFFF) / 4096;
-    uint8_t *buf = (uint8_t *)mem_alloc_pages(buf_pages);
+    uint8_t *buf = (uint8_t *)dos_host_alloc_pages(buf_pages);
     if (!buf) {
         serial_puts("[DOS] Failed to allocate read buffer\n");
         return -1;
@@ -197,10 +194,10 @@ int dos_run(const char *filename, int argc, const char **argv)
      * aperture after it so framebuffer bytes never consume DPMI memory. */
     uint64_t total_mem = DOS_VM_ADDRESS_SPACE_SIZE;
     uint64_t mem_pages = (total_mem + 0xFFF) / 4096;
-    vm.mem = (uint8_t *)mem_alloc_pages(mem_pages);
+    vm.mem = (uint8_t *)dos_host_alloc_pages(mem_pages);
     if (!vm.mem) {
         serial_puts("[DOS] Failed to allocate DOS address space\n");
-        mem_free_pages(buf, buf_pages);
+        dos_host_free_pages(buf, buf_pages);
         return -1;
     }
     vm.total_mem_size = (uint32_t)total_mem;
@@ -233,7 +230,7 @@ int dos_run(const char *filename, int argc, const char **argv)
 
     if (!dos_io_init(&vm)) {
         serial_puts("[DOS] Failed to initialize virtual ISA devices\n");
-        mem_free_pages(buf, buf_pages);
+        dos_host_free_pages(buf, buf_pages);
         dos_native_cleanup(&vm);
         return -1;
     }
@@ -262,13 +259,13 @@ int dos_run(const char *filename, int argc, const char **argv)
         rc = dos_load_com(&vm, buf, size, filename, cmdline);
     } else {
         serial_puts("[DOS] Unknown binary format\n");
-        mem_free_pages(buf, buf_pages);
+        dos_host_free_pages(buf, buf_pages);
         dos_native_cleanup(&vm);
         return -1;
     }
 
     /* Free file buffer (data is copied into emulated memory) */
-    mem_free_pages(buf, buf_pages);
+    dos_host_free_pages(buf, buf_pages);
 
     if (rc != 0) {
         serial_puts("[DOS] Failed to load binary\n");
@@ -279,7 +276,7 @@ int dos_run(const char *filename, int argc, const char **argv)
     /* Initialize the optional JIT only after the image loaded successfully. */
     {
         uint64_t jit_pages = (sizeof(jit_state_t) + 4095u) / 4096u;
-        jit_state_t *jit = (jit_state_t *)mem_alloc_pages(jit_pages);
+        jit_state_t *jit = (jit_state_t *)dos_host_alloc_pages(jit_pages);
         if (jit) {
             uint8_t *p = (uint8_t *)jit;
             for (uint64_t i = 0; i < jit_pages * 4096u; i++) p[i] = 0;
@@ -288,7 +285,7 @@ int dos_run(const char *filename, int argc, const char **argv)
                 vm.jit = jit;
                 serial_puts("[DOS] JIT engine initialized\n");
             } else {
-                mem_free_pages(jit, jit_pages);
+                dos_host_free_pages(jit, jit_pages);
             }
         }
     }
@@ -537,18 +534,134 @@ static bool dos_nt_guest_gdt_read(dos_vm_t *vm, unsigned index,
 
 static void *dos_nt_alloc_table_page(void)
 {
-    void *physical = mem_alloc_pages(DOS_NT_TABLE_PAGES);
-    if (!physical) return NULL;
-    uint8_t *bytes = (uint8_t *)physical;
+    uint8_t *bytes = (uint8_t *)dos_host_alloc_pages(DOS_NT_TABLE_PAGES);
+    if (!bytes) return NULL;
     for (unsigned i = 0; i < 4096; i++) bytes[i] = 0;
-    return (void *)(dos_nt_va_to_pa(physical) + DOS_NT_KERNEL_VBASE);
+    return bytes;
 }
 
 static void dos_nt_free_table_page(void **table)
 {
     if (!table || !*table) return;
-    mem_free_pages((void *)dos_nt_va_to_pa(*table), DOS_NT_TABLE_PAGES);
+    dos_host_free_pages(*table, DOS_NT_TABLE_PAGES);
     *table = NULL;
+}
+
+static bool dos_hostmem_mapped(uint64_t cr3, const void *address, uint64_t pages)
+{
+    if ((uintptr_t)address < KERNEL_VBASE) return false;
+    uint64_t physical = VIRT_TO_PHYS(address);
+    for (uint64_t offset = 0; offset < pages * 4096u; offset += 4096u) {
+        if (paging_translate_in_cr3(cr3, (uintptr_t)address + offset) !=
+                physical + offset ||
+            paging_translate_in_cr3(cr3, physical + offset) != UINT64_MAX)
+            return false;
+    }
+    return true;
+}
+
+int dos_hostmem_selftest(void)
+{
+    const uint64_t jit_pages = (sizeof(jit_state_t) + 4095u) / 4096u;
+    uint64_t cr3 = paging_create_process_cr3();
+    uint64_t *memory = (uint64_t *)dos_host_alloc_pages(2);
+    void *table = dos_nt_alloc_table_page();
+    jit_state_t *jit = (jit_state_t *)dos_host_alloc_pages(jit_pages);
+    if (jit) jit_init(jit);
+    int checks = 0, failures = 0;
+#define HOSTMEM_CHECK(condition) do { \
+    checks++; \
+    if (!(condition)) { \
+        failures++; \
+        serial_puts("[DOS-HOSTMEM] FAIL: " #condition "\n"); \
+    } \
+} while (0)
+    HOSTMEM_CHECK(cr3 && memory && table && jit && jit->code_buf);
+    if (!cr3 || !memory || !table || !jit || !jit->code_buf) goto cleanup;
+
+    HOSTMEM_CHECK(dos_host_alloc_pages(0) == NULL);
+    bool memory_mapped = dos_hostmem_mapped(cr3, memory, 2);
+    HOSTMEM_CHECK(memory_mapped);
+    HOSTMEM_CHECK(dos_hostmem_mapped(cr3, table, DOS_NT_TABLE_PAGES));
+    HOSTMEM_CHECK(dos_hostmem_mapped(cr3, jit, jit_pages));
+    HOSTMEM_CHECK(dos_hostmem_mapped(cr3, jit->code_buf,
+                                     (JIT_CACHE_SIZE + 4095u) / 4096u));
+    bool table_zeroed = true;
+    for (unsigned i = 0; i < 4096; i++)
+        if (((uint8_t *)table)[i]) table_zeroed = false;
+    HOSTMEM_CHECK(table_zeroed);
+
+    if (memory_mapped) {
+        const uint64_t value = 0xA17E0123456789ABULL;
+        uint64_t flags, previous_cr3, observed;
+        /* The private root has no lower-half mappings, including this C
+         * stack. Touch only the validated high pointer until CR3 is restored. */
+        __asm__ volatile (
+            "pushfq; popq %[flags]; cli\n"
+            "mov %%cr3, %[previous]\n"
+            "mov %[root], %%cr3\n"
+            "mov %[value], (%[address])\n"
+            "mov (%[address]), %[observed]\n"
+            "mov %[previous], %%cr3\n"
+            : [flags] "=&r"(flags), [previous] "=&r"(previous_cr3),
+              [observed] "=&r"(observed)
+            : [root] "r"(cr3), [value] "r"(value),
+              [address] "r"(&memory[1023])
+            : "memory");
+        if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+        HOSTMEM_CHECK(observed == value && memory[1023] == value);
+    }
+
+    jit_block_t *block = jit_get_block(jit, 0, 0x100);
+    HOSTMEM_CHECK(block != NULL);
+    if (block) {
+        block->length = 3;
+        block->ir_count = 2;
+        block->ir[0] = (ir_inst_t){ .op = IR_MOV_REG_IMM,
+                                   .a = REG_AX, .b = 0x1234, .width = 2 };
+        block->ir[1] = (ir_inst_t){ .op = IR_EXIT_BLOCK };
+        int compiled = jit_compile_block(jit, block);
+        HOSTMEM_CHECK(compiled == 0 && block->compiled);
+        if (compiled == 0 && block->compiled) {
+            cpu8086_state_t cpu = {0};
+            dos_vm_t vm = { .cpu = &cpu };
+            jit_exec_block(&vm, block);
+            HOSTMEM_CHECK(cpu.ax == 0x1234 && cpu.ip == 0x103 &&
+                          block->exec_count == 1);
+        }
+    }
+
+    extern uint64_t *tss_ist3_ptr;
+    extern void sched_reset_current_compat_ist3(void);
+    HOSTMEM_CHECK(tss_ist3_ptr != NULL);
+    if (tss_ist3_ptr) {
+        uint64_t flags;
+        __asm__ volatile ("pushfq; popq %0; cli"
+                          : "=r"(flags) :: "memory");
+        uint64_t expected = *tss_ist3_ptr;
+        *tss_ist3_ptr = 0;
+        sched_reset_current_compat_ist3();
+        uint64_t restored = *tss_ist3_ptr;
+        *tss_ist3_ptr = expected;
+        if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+        HOSTMEM_CHECK(expected != 0 && restored == expected);
+    }
+
+cleanup:
+    if (jit) {
+        jit_destroy(jit);
+        dos_host_free_pages(jit, jit_pages);
+    }
+    dos_nt_free_table_page(&table);
+    dos_host_free_pages(memory, 2);
+    if (cr3) paging_free_process_cr3(cr3);
+    serial_puts("[DOS-HOSTMEM] checks=");
+    serial_putdec((uint64_t)checks);
+    serial_puts(" failures=");
+    serial_putdec((uint64_t)failures);
+    serial_puts("\n");
+#undef HOSTMEM_CHECK
+    return failures;
 }
 
 void dos_native_sync_ldt(dos_vm_t *vm)
@@ -790,7 +903,7 @@ void dos_native_cleanup(dos_vm_t *vm)
     dos_jit_release(vm);
     dos_vcpi_cleanup(vm);
     if (vm->mem && vm->mem_pages) {
-        mem_free_pages(vm->mem, vm->mem_pages);
+        dos_host_free_pages(vm->mem, vm->mem_pages);
         vm->mem = NULL;
         vm->mem_pages = 0;
         vm->total_mem_size = 0;

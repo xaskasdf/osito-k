@@ -7,12 +7,11 @@
  */
 
 #include "cpu8086.h"
+#include "dos_hostmem.h"
 #include "dos_mem.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
-extern void *mem_alloc_pages(uint64_t count);
-extern void mem_free_pages(void *addr, uint64_t count);
 
 #ifndef DOS_DIAGNOSTICS
 #define DOS_DIAGNOSTICS 0
@@ -405,7 +404,7 @@ int dos_mem_free_owner(dos_vm_t *vm, uint16_t owner)
 int dos_mem_selftest(void)
 {
     const uint64_t pages = (DOS_CONV_TOP + 4095u) / 4096u;
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(pages);
     if (!memory) return 1;
     for (uint64_t i = 0; i < pages * 4096u; i++) memory[i] = 0;
 
@@ -530,6 +529,6 @@ int dos_mem_selftest(void)
     if (dos_mcb_validate(&vm) < 0 || dos_mem_free(&vm, 0) == 0)
         failures++;
 
-    mem_free_pages(memory, pages);
+    dos_host_free_pages(memory, pages);
     return failures;
 }

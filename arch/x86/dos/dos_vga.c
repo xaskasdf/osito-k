@@ -7,7 +7,6 @@
 #include "cpu8086.h"
 #include "dos_io.h"
 #include "dos_vbe.h"
-#include "../include/paging.h"
 
 extern uint32_t *fb_get_base(void);
 extern uint32_t  fb_get_width(void);
@@ -60,7 +59,7 @@ static uint8_t dos_vga_dac[256][3];
 void dos_vga_bind_vm(dos_vm_t *vm)
 {
     dos_vga_bound_vm = vm;
-    dos_vga_bound_memory = vm ? (uint8_t *)PHYS_TO_VIRT(vm->mem) : NULL;
+    dos_vga_bound_memory = vm ? vm->mem : NULL;
     dos_vga_bound_memory_size = vm ? vm->total_mem_size : 0;
     dos_vga_bound_mode = vm ? vm->vga_mode : 0;
     dos_vga_vbe_active = vm ? vm->vbe_active : false;

@@ -7,18 +7,16 @@
  */
 
 #include "dos_audio.h"
+#include "dos_hostmem.h"
 #include "dos_types.h"
 #include "../include/audio_sched.h"
 #include "../include/pcm.h"
-#include "../include/paging.h"
 
 extern void serial_puts(const char *text);
 extern void serial_putdec(uint64_t value);
 extern void serial_puthex(uint64_t value, int digits);
 extern void *kmalloc(uint64_t size);
 extern void kfree(void *pointer);
-extern void *mem_alloc_pages(uint64_t count);
-extern void mem_free_pages(void *address, uint64_t count);
 extern uint64_t idt_get_monotonic_ns(void);
 
 #define DOS_SB_BASE              0x220U
@@ -2145,7 +2143,7 @@ bool dos_audio_init(struct dos_vm *vm)
     if (!state)
         return false;
     memset(state, 0, sizeof(*state));
-    state->guest_memory = (uint8_t *)PHYS_TO_VIRT(vm->mem);
+    state->guest_memory = vm->mem;
     state->guest_memory_size = vm->total_mem_size;
     state->present = audio_output_is_ready();
     state->sample_rate = 22050U;
@@ -2205,11 +2203,11 @@ void dos_audio_shutdown(struct dos_vm *vm)
 int dos_audio_selftest(void)
 {
     const uint64_t pages = 2;
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(pages);
     DOS_AUDIO_STATE *state = (DOS_AUDIO_STATE *)kmalloc(sizeof(*state));
     if (!memory || !state) {
         if (memory)
-            mem_free_pages(memory, pages);
+            dos_host_free_pages(memory, pages);
         if (state)
             kfree(state);
         return 1;
@@ -2221,7 +2219,7 @@ int dos_audio_selftest(void)
     vm.mem = memory;
     vm.total_mem_size = (uint32_t)(pages * 4096U);
     vm.audio = state;
-    state->guest_memory = (uint8_t *)PHYS_TO_VIRT(memory);
+    state->guest_memory = memory;
     state->guest_memory_size = vm.total_mem_size;
     state->present = true;
     state->test_mode = true;
@@ -2998,6 +2996,6 @@ int dos_audio_selftest(void)
 
     vm.audio = NULL;
     kfree(state);
-    mem_free_pages(memory, pages);
+    dos_host_free_pages(memory, pages);
     return failures;
 }

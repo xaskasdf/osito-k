@@ -6,10 +6,8 @@
  */
 
 #include "cpu8086.h"
+#include "dos_hostmem.h"
 #include "dos_dpmi.h"
-
-extern void *mem_alloc_pages(uint64_t count);
-extern void mem_free_pages(void *addr, uint64_t count);
 
 #define EMS_PAGE_FRAME_SEG       0xE000u
 #define EMS_VERSION              0x40u
@@ -79,7 +77,7 @@ static struct dos_vcpi_state *vcpi_get_state(dos_vm_t *vm, bool create)
 
     uint64_t pages = (sizeof(struct dos_vcpi_state) + 4095u) / 4096u;
     struct dos_vcpi_state *state =
-        (struct dos_vcpi_state *)mem_alloc_pages(pages);
+        (struct dos_vcpi_state *)dos_host_alloc_pages(pages);
     if (!state) return NULL;
 
     vcpi_zero(state, pages * 4096u);
@@ -178,7 +176,7 @@ static void ems_release_handle(dos_vm_t *vm,
         (void)dpmi_ext_free_pages(vm, entry->pages[page],
                                   EMS_PAGES_PER_LOGICAL);
     if (entry->pages)
-        mem_free_pages(entry->pages, entry->table_pages);
+        dos_host_free_pages(entry->pages, entry->table_pages);
     vcpi_zero(entry, sizeof(*entry));
     if (handle < state->next_handle)
         state->next_handle = (uint8_t)handle;
@@ -230,7 +228,7 @@ static void ems_allocate(dos_vm_t *vm)
 
     uint64_t table_pages =
         (logical_pages * sizeof(uint32_t) + 4095u) / 4096u;
-    uint32_t *pages = (uint32_t *)mem_alloc_pages(table_pages);
+    uint32_t *pages = (uint32_t *)dos_host_alloc_pages(table_pages);
     if (!pages) {
         cpu->ah = EMS_ERR_OUT_OF_PAGES;
         return;
@@ -248,7 +246,7 @@ static void ems_allocate(dos_vm_t *vm)
         for (uint32_t i = 0; i < allocated; i++)
             (void)dpmi_ext_free_pages(vm, pages[i],
                                       EMS_PAGES_PER_LOGICAL);
-        mem_free_pages(pages, table_pages);
+        dos_host_free_pages(pages, table_pages);
         cpu->ah = EMS_ERR_OUT_OF_PAGES;
         return;
     }
@@ -766,14 +764,14 @@ void dos_vcpi_cleanup(dos_vm_t *vm)
         }
     }
     uint64_t pages = (sizeof(*state) + 4095u) / 4096u;
-    mem_free_pages(state, pages);
+    dos_host_free_pages(state, pages);
     vm->vcpi = NULL;
 }
 
 int dos_vcpi_selftest(void)
 {
     uint64_t memory_pages = (DOS_TOTAL_MEM + 4095u) / 4096u;
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(memory_pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(memory_pages);
     if (!memory) return 1;
     vcpi_zero(memory, memory_pages * 4096u);
 
@@ -984,6 +982,6 @@ int dos_vcpi_selftest(void)
     dos_vcpi_cleanup(&vm);
     if (vm.vcpi || dpmi_ext_free_page_count(&vm) != initial_free)
         failures++;
-    mem_free_pages(memory, memory_pages);
+    dos_host_free_pages(memory, memory_pages);
     return failures;
 }

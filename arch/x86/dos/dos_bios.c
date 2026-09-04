@@ -9,6 +9,7 @@
  */
 
 #include "cpu8086.h"
+#include "dos_hostmem.h"
 #include "dos_mouse.h"
 #include "dos_time.h"
 #include "dos_vbe.h"
@@ -624,12 +625,10 @@ void dos_int1a_timer(dos_vm_t *vm)
 
 static int dos_bios_video_selftest(void)
 {
-    extern void *mem_alloc_pages(uint64_t count);
-    extern void mem_free_pages(void *addr, uint64_t count);
 
     const uint64_t pages =
         (DOS_VRAM_BASE + DOS_VRAM_SIZE + 4095U) / 4096U;
-    uint8_t *memory = (uint8_t *)mem_alloc_pages(pages);
+    uint8_t *memory = (uint8_t *)dos_host_alloc_pages(pages);
     if (!memory) {
         serial_puts("[DOS-TEST] BIOS video allocation\n");
         return 1;
@@ -769,7 +768,7 @@ static int dos_bios_video_selftest(void)
         failures++;
     }
 
-    mem_free_pages(memory, pages);
+    dos_host_free_pages(memory, pages);
     return failures;
 }
 

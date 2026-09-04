@@ -7446,7 +7446,7 @@ q4kgdone:
             extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
             extern uint64_t *dos_native_exit_jmpbuf;
             extern void x86_tss_reset_ist2(void);
-            extern void x86_tss_reset_ist3(void);
+            extern void sched_reset_current_compat_ist3(void);
             static uint64_t dosrun_jmpbuf[9];
             dos_native_exit_jmpbuf = dosrun_jmpbuf;
             int rc = kern_setjmp(dosrun_jmpbuf);
@@ -7457,7 +7457,7 @@ q4kgdone:
                 sh_puts(rc == 2 ? "crash" : "normal");
                 sh_puts(") — returned to shell\n");
                 x86_tss_reset_ist2();
-                x86_tss_reset_ist3();
+                sched_reset_current_compat_ist3();
                 sh_sti();
             }
             dos_native_exit_jmpbuf = NULL;
