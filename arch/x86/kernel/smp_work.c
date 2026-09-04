@@ -28,6 +28,7 @@ ws_cpu_t         ws_cpus[SMP_TOTAL_CPUS] __attribute__((aligned(128)));
 int              ws_cpu_count;
 int              ap_worker_count;       /* ws_cpu_count - 1 (compat) */
 static volatile int ws_ready;           /* set to 1 after init */
+static volatile uint32_t ws_online_mask;
 
 /* ── Task pool ──────────────────────────────────────────────── */
 
@@ -64,21 +65,40 @@ static void task_free(uint32_t tid)
 
 /* ── Chase-Lev deque operations ─────────────────────────────── */
 
+/* Owner operations must not interleave with an ISR or another BSP thread.
+ * Thieves remain lock-free and may run while the owner has IRQs masked. */
+static inline uint64_t ws_irq_save(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static inline void ws_irq_restore(uint64_t flags)
+{
+    __asm__ volatile ("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+}
+
 static int deque_push(ws_deque_t *dq, uint32_t task_id)
 {
+    uint64_t flags = ws_irq_save();
     int64_t b = __atomic_load_n(&dq->bottom, __ATOMIC_RELAXED);
     int64_t t = __atomic_load_n(&dq->top, __ATOMIC_ACQUIRE);
 
-    if (b - t >= DEQUE_CAPACITY)
+    if (b - t >= DEQUE_CAPACITY) {
+        ws_irq_restore(flags);
         return -1;  /* full */
+    }
 
     dq->buf[b & (DEQUE_CAPACITY - 1)] = task_id;
     __atomic_store_n(&dq->bottom, b + 1, __ATOMIC_RELEASE);
+    ws_irq_restore(flags);
     return 0;
 }
 
 static int deque_pop(ws_deque_t *dq)
 {
+    uint64_t flags = ws_irq_save();
     int64_t b = __atomic_load_n(&dq->bottom, __ATOMIC_RELAXED) - 1;
     __atomic_store_n(&dq->bottom, b, __ATOMIC_RELAXED);
 
@@ -92,6 +112,7 @@ static int deque_pop(ws_deque_t *dq)
     if (t > b) {
         /* Empty — restore bottom */
         __atomic_store_n(&dq->bottom, t, __ATOMIC_RELAXED);
+        ws_irq_restore(flags);
         return -1;
     }
 
@@ -101,11 +122,13 @@ static int deque_pop(ws_deque_t *dq)
         /* Last element — race with steal */
         if (!__sync_bool_compare_and_swap(&dq->top, t, t + 1)) {
             __atomic_store_n(&dq->bottom, t + 1, __ATOMIC_RELAXED);
+            ws_irq_restore(flags);
             return -1;  /* thief got it */
         }
         __atomic_store_n(&dq->bottom, t + 1, __ATOMIC_RELAXED);
     }
 
+    ws_irq_restore(flags);
     return (int)task_id;
 }
 
@@ -132,12 +155,14 @@ static void send_ipi(uint32_t lapic_id, uint8_t vector)
     volatile uint32_t *apic = idt_get_apic_base();
     if (!apic) return;
 
+    uint64_t flags = ws_irq_save();
     apic[APIC_ICR_HIGH / 4] = lapic_id << 24;
     apic[APIC_ICR_LOW / 4] = (uint32_t)vector;
 
     int timeout = 100000;
     while ((apic[APIC_ICR_LOW / 4] & (1 << 12)) && --timeout > 0)
         __asm__ volatile ("pause");
+    ws_irq_restore(flags);
 }
 
 /* Wake one sleeping AP (if any). Only sends ONE IPI — the woken AP
@@ -169,11 +194,13 @@ static inline uint32_t current_cpu(void)
 static void execute_task(uint32_t tid, ws_cpu_t *me)
 {
     smp_task_t *t = &task_pool[tid];
+    uint8_t auto_free = t->auto_free;
     if (t->func)
         t->func(t->arg, t->result_buf);
-    __atomic_store_n(&t->completed, 1, __ATOMIC_RELEASE);
     me->tasks_completed++;
-    if (t->auto_free)
+    /* An awaited descriptor may be recycled as soon as completed is visible. */
+    __atomic_store_n(&t->completed, 1, __ATOMIC_RELEASE);
+    if (auto_free)
         task_free(tid);
 }
 
@@ -342,21 +369,25 @@ void smp_work_init(void)
 
     ap_worker_count = ws_cpu_count - 1;
 
-    __asm__ volatile ("mfence" ::: "memory");
-    ws_ready = 1;
+    __atomic_store_n(&ws_online_mask, 1U, __ATOMIC_RELAXED);
+    __atomic_store_n(&ws_ready, 1, __ATOMIC_RELEASE);
+
+    /* AP timers are masked. Publishing readiness cannot wake a halted AP;
+     * notify every AP, including those not yet in the normal sleeping state. */
+    for (int i = 1; i < ws_cpu_count; i++)
+        send_ipi(ws_cpus[i].lapic_id, SMP_IPI_VECTOR);
 
     /* Wait for APs to reach their work-stealing loop */
     {
-        int timeout = 100000;
+        uint32_t expected = (1U << ws_cpu_count) - 1U;
+        int timeout = 1000000;
         while (timeout-- > 0) {
-            int ready = 0;
-            for (int i = 1; i < ws_cpu_count; i++)
-                if (__atomic_load_n(&ws_cpus[i].sleeping, __ATOMIC_RELAXED) ||
-                    ws_cpus[i].tasks_completed > 0)
-                    ready++;
-            if (ready >= ap_worker_count) break;
+            if (__atomic_load_n(&ws_online_mask, __ATOMIC_ACQUIRE) == expected)
+                break;
             __asm__ volatile ("pause");
         }
+        if (__atomic_load_n(&ws_online_mask, __ATOMIC_ACQUIRE) != expected)
+            serial_puts("[SMP-WS] WARNING: AP worker startup timed out\n");
     }
 
     serial_puts("[SMP-WS] Work-stealing initialized, ");
@@ -367,14 +398,20 @@ void smp_work_init(void)
     serial_putdec(DEQUE_CAPACITY);
     serial_puts("-deep deques\n");
 
-    /* Smoke test: submit a no-op to AP 0 */
+    /* Do not let smp_wait execute the probe on the BSP and call that an AP
+     * test. First wait for an AP to complete it, then reap the descriptor. */
     if (ap_worker_count > 0) {
         int tid = smp_submit(0, NULL, NULL, NULL);
         if (tid >= 0) {
+            int timeout = 1000000;
+            while (!smp_task_done(tid) && timeout-- > 0)
+                __asm__ volatile ("pause");
+            bool ran_on_ap = smp_task_done(tid);
             smp_wait(tid);
-            serial_puts("[SMP-WS] AP 0 smoke test: OK\n");
+            serial_puts(ran_on_ap ? "[SMP-WS] AP dispatch smoke test: OK\n" :
+                                   "[SMP-WS] AP dispatch timed out; BSP fallback\n");
         } else {
-            serial_puts("[SMP-WS] AP 0 smoke test: submit failed\n");
+            serial_puts("[SMP-WS] AP dispatch smoke test: submit failed\n");
         }
     }
 }
@@ -396,9 +433,15 @@ void ap_worker_loop(uint32_t cpu_idx)
         __asm__ volatile ("mov %0, %%cr4" :: "r"(cr4));
     }
 
-    /* Wait for BSP to call smp_work_init() */
-    while (!ws_ready)
+    /* Check with IRQs masked so the ready IPI cannot be consumed between
+     * observing ws_ready == 0 and HLT. STI's interrupt shadow covers HLT. */
+    for (;;) {
+        __asm__ volatile ("cli" ::: "memory");
+        if (__atomic_load_n(&ws_ready, __ATOMIC_ACQUIRE))
+            break;
         __asm__ volatile ("sti; hlt" ::: "memory");
+    }
+    __asm__ volatile ("sti" ::: "memory");
 
     /* Find our slot */
     extern uint32_t smp_get_cpu_apic_id(uint32_t index);
@@ -415,6 +458,7 @@ void ap_worker_loop(uint32_t cpu_idx)
     }
 
     ws_cpu_t *me = &ws_cpus[my_slot];
+    __atomic_fetch_or(&ws_online_mask, 1U << my_slot, __ATOMIC_RELEASE);
 
     for (;;) {
         /* Try to find and execute work */
@@ -422,6 +466,7 @@ void ap_worker_loop(uint32_t cpu_idx)
             continue;
 
         /* No work — prepare to sleep */
+        __asm__ volatile ("cli" ::: "memory");
         __atomic_store_n(&me->sleeping, 1, __ATOMIC_RELEASE);
         __asm__ volatile ("mfence" ::: "memory");
 
@@ -436,6 +481,7 @@ void ap_worker_loop(uint32_t cpu_idx)
             }
             if (found) {
                 __atomic_store_n(&me->sleeping, 0, __ATOMIC_RELEASE);
+                __asm__ volatile ("sti" ::: "memory");
                 continue;
             }
         }

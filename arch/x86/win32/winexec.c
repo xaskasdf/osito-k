@@ -3776,9 +3776,9 @@ static void win32_cleanup_main_process(PE_IMAGE_INFO *info,
     PPEB process_peb = win64_main_peb();
     TEB *process_teb = win64_main_teb();
 
-    /* A compat32 non-local exit restores RIP/RSP but not the segment state or
-     * APIC timer mask changed by compat32_enter(). Teardown can block while
-     * workers stop, so make the root task schedulable before touching them. */
+    /* A compat32 non-local exit restores RIP/RSP but not segment state.
+     * Teardown can block while workers stop, so restore native segments and
+     * enable interrupts before touching them. */
     if (compat32) {
         __asm__ volatile (
             "mov $0x30, %%ax\n"
@@ -3787,10 +3787,6 @@ static void win32_cleanup_main_process(PE_IMAGE_INFO *info,
             "mov %%ax, %%ss\n"
             ::: "ax", "memory"
         );
-        extern volatile uint32_t *idt_get_apic_base(void);
-        volatile uint32_t *apic = idt_get_apic_base();
-        if (apic)
-            apic[0x320 / 4] &= ~0x10000U;
     }
 
     uint64_t flags;

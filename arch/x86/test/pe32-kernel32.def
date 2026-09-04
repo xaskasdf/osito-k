@@ -29,6 +29,7 @@ EXPORTS
     GetCurrentProcessId@0
     GetCurrentThreadId@0
     GetLastError@0
+    GetModuleHandleA@4
     GetQueuedCompletionStatus@20
     GetProcessHeap@0
     GetPrivateProfileIntA@16

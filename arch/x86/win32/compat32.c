@@ -426,8 +426,6 @@ typedef struct {
     uint64_t saved_ist1[MAX_CALLBACK_DEPTH];
     uint32_t saved_stack_args[MAX_CALLBACK_DEPTH];
     uint32_t callback_int2e_depth[MAX_CALLBACK_DEPTH];
-    uint32_t saved_callback_timer[MAX_CALLBACK_DEPTH];
-    uint8_t callback_timer_masked[MAX_CALLBACK_DEPTH];
     uint8_t *stacks[MAX_CALLBACK_DEPTH];
     DWORD stack_process_ids[MAX_CALLBACK_DEPTH];
     uint32_t retvals[MAX_CALLBACK_DEPTH];
@@ -2296,15 +2294,6 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
      * VirtualAlloc maps via paging_map_page (kernel PTs) which is
      * visible to all processes. No CR3 switch needed. */
 
-    /* PE32 execution remains scheduler-preemptible. Interrupt handlers use
-     * the task's private compat IST stacks rather than the low user stack. */
-    {
-        extern volatile uint32_t *idt_get_apic_base(void);
-        volatile uint32_t *apic = idt_get_apic_base();
-        if (apic)
-            apic[0x320/4] &= ~0x10000;
-    }
-
     /* Set data segments to 32-bit data selector, then RETF to compat mode.
      * Hardcode 0x48 (GDT_SEL_DATA32) because GAS doesn't like C macros
      * in mov-to-segment operands with PIE. */
@@ -2397,15 +2386,10 @@ void compat32_callback(uint32_t func_addr)
     TEB32 *teb = compat32_current_teb();
     uint32_t saved_seh = teb->ExceptionList;
 
-    /* PE32 callbacks run on a low callback stack. Keep timer preemption out
-     * until that stack has returned through the callback gate. */
-    extern volatile uint32_t *idt_get_apic_base(void);
-    volatile uint32_t *callback_apic = idt_get_apic_base();
-    uint32_t saved_callback_timer = callback_apic ? callback_apic[0x320/4] : 0;
-    callback_state->saved_callback_timer[depth] = saved_callback_timer;
-    callback_state->callback_timer_masked[depth] = callback_apic != NULL;
-    if (callback_apic)
-        callback_apic[0x320/4] = saved_callback_timer | 0x10000;
+    /* Callback frames and interrupt stacks are task-owned. A callback may
+     * block or run indefinitely, so it must not mask the CPU's timer. */
+    uint64_t saved_flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(saved_flags) :: "memory");
 
     if (kern_setjmp(callback_state->jmpbufs[depth]) == 0) {
         /*
@@ -2415,13 +2399,10 @@ void compat32_callback(uint32_t func_addr)
          */
         uint8_t *stack = callback_stack_get(callback_state, depth);
         if (!stack) {
-            if (callback_apic)
-                callback_apic[0x320/4] = saved_callback_timer;
             teb->ExceptionList = saved_seh;
             callback_state->current_stack_args =
                 callback_state->saved_stack_args[depth];
             callback_state->callback_int2e_depth[depth] = 0;
-            callback_state->callback_timer_masked[depth] = 0;
             callback_state->depth--;
             return;
         }
@@ -2434,14 +2415,15 @@ void compat32_callback(uint32_t func_addr)
         uint64_t sp64 = (uint64_t)(ULONG_PTR)sp;
 
         __asm__ volatile (
+            "cli\n"
             "movw $0x48, %%ax\n"    /* GDT_SEL_DATA32 */
             "mov %%ax, %%ds\n"
             "mov %%ax, %%es\n"
             "mov %%ax, %%ss\n"
             "mov %[sp], %%rsp\n"
-            "sti\n"                 /* Re-enable interrupts (INT 0x2E gate clears IF) */
             "push %[cs]\n"
             "push %[ip]\n"
+            "sti\n"
             "lretq\n"
             :
             : [cs] "r"(cs64),
@@ -2454,20 +2436,18 @@ void compat32_callback(uint32_t func_addr)
 
     /* longjmp returned here — 32-bit function is done. */
 
-    if (callback_apic)
-        callback_apic[0x320/4] = saved_callback_timer;
-
     teb->ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_state->current_stack_args =
         callback_state->saved_stack_args[depth];
     callback_state->callback_int2e_depth[depth] = 0;
-    callback_state->callback_timer_masked[depth] = 0;
     callback_state->depth--;
     if (depth >= 16) {
         serial_puts("[CB32] depth=");
         serial_putdec(depth);
         serial_puts(" returned\n");
     }
+    /* The return gate cleared IF; preserve the caller's interrupt state. */
+    __asm__ volatile ("pushq %0; popfq" :: "r"(saved_flags) : "memory", "cc");
 #else
     /* Test harness: call directly */
     typedef void (*void_fn)(void);
@@ -2485,7 +2465,6 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
                                              const uint32_t *args,
                                              uint32_t stack_top,
                                              uint32_t frame_ebp,
-                                             bool mask_timer,
                                              uint32_t unwind_frame)
 {
 #ifndef TEST_HARNESS
@@ -2516,26 +2495,18 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
     TEB32 *teb = compat32_current_teb();
     uint32_t saved_seh = teb->ExceptionList;
 
-    extern volatile uint32_t *idt_get_apic_base(void);
-    volatile uint32_t *callback_apic = idt_get_apic_base();
-    uint32_t saved_callback_timer = callback_apic ? callback_apic[0x320/4] : 0;
-    callback_state->saved_callback_timer[depth] = saved_callback_timer;
-    callback_state->callback_timer_masked[depth] =
-        mask_timer && callback_apic != NULL;
-    if (mask_timer && callback_apic)
-        callback_apic[0x320/4] = saved_callback_timer | 0x10000;
+    /* Keep the shared timer running across nested and blocking callbacks. */
+    uint64_t saved_flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(saved_flags) :: "memory");
 
     if (kern_setjmp(callback_state->jmpbufs[depth]) == 0) {
         uint8_t *stack = stack_top ? NULL :
                          callback_stack_get(callback_state, depth);
         if (!stack_top && !stack) {
-            if (mask_timer && callback_apic)
-                callback_apic[0x320/4] = saved_callback_timer;
             teb->ExceptionList = saved_seh;
             callback_state->current_stack_args =
                 callback_state->saved_stack_args[depth];
             callback_state->callback_int2e_depth[depth] = 0;
-            callback_state->callback_timer_masked[depth] = 0;
             callback_state->depth--;
             return 0;
         }
@@ -2545,13 +2516,10 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
 
         if (unwind_frame) {
             if (!unwind_protector_stub_addr) {
-                if (mask_timer && callback_apic)
-                    callback_apic[0x320/4] = saved_callback_timer;
                 teb->ExceptionList = saved_seh;
                 callback_state->current_stack_args =
                     callback_state->saved_stack_args[depth];
                 callback_state->callback_int2e_depth[depth] = 0;
-                callback_state->callback_timer_masked[depth] = 0;
                 callback_state->depth--;
                 return 0;
             }
@@ -2596,6 +2564,7 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
         uint64_t bp64 = frame_ebp;
 
         __asm__ volatile (
+            "cli\n"
             "movw $0x48, %%ax\n"    /* GDT_SEL_DATA32 */
             "mov %%ax, %%ds\n"
             "mov %%ax, %%es\n"
@@ -2605,9 +2574,9 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
             "mov %[bp], %%rbp\n"
             "1:\n"
             "mov %[sp], %%rsp\n"
-            "sti\n"
             "push %[cs]\n"
             "push %[ip]\n"
+            "sti\n"
             "lretq\n"
             :
             : [cs] "r"(cs64),
@@ -2619,20 +2588,16 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
         __builtin_unreachable();
     }
 
-    if (mask_timer && callback_apic)
-        callback_apic[0x320/4] = saved_callback_timer;
-
     teb->ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_state->current_stack_args =
         callback_state->saved_stack_args[depth];
     callback_state->callback_int2e_depth[depth] = 0;
-    callback_state->callback_timer_masked[depth] = 0;
     callback_state->depth--;
+    __asm__ volatile ("pushq %0; popfq" :: "r"(saved_flags) : "memory", "cc");
     return callback_state->retvals[depth];
 #else
     /* Test harness: call directly */
     (void)frame_ebp;
-    (void)mask_timer;
     (void)unwind_frame;
     typedef uint32_t (*fn0)(void);
     typedef uint32_t (*fn1)(uint32_t);
@@ -2653,13 +2618,13 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
 uint32_t compat32_callback_args(uint32_t func_addr, int nargs,
                                 const uint32_t *args)
 {
-    return compat32_callback_args_impl(func_addr, nargs, args, 0, 0, true, 0);
+    return compat32_callback_args_impl(func_addr, nargs, args, 0, 0, 0);
 }
 
 static uint32_t compat32_callback_unwind_handler(
     uint32_t func_addr, const uint32_t *args, uint32_t unwind_frame)
 {
-    return compat32_callback_args_impl(func_addr, 4, args, 0, 0, true,
+    return compat32_callback_args_impl(func_addr, 4, args, 0, 0,
                                        unwind_frame);
 }
 
@@ -2668,7 +2633,7 @@ uint32_t compat32_callback_args_with_ebp(uint32_t func_addr, int nargs,
                                          uint32_t frame_ebp)
 {
     return compat32_callback_args_impl(func_addr, nargs, args, 0, frame_ebp,
-                                       true, 0);
+                                       0);
 }
 
 uint32_t compat32_callback_args_on_stack(uint32_t func_addr, int nargs,
@@ -2676,19 +2641,16 @@ uint32_t compat32_callback_args_on_stack(uint32_t func_addr, int nargs,
                                          uint32_t stack_top)
 {
     return compat32_callback_args_impl(func_addr, nargs, args,
-                                       stack_top & ~0xFULL, 0, true, 0);
+                                       stack_top & ~0xFULL, 0, 0);
 }
 
 uint32_t compat32_thread_entry_on_stack(uint32_t func_addr, int nargs,
                                          const uint32_t *args,
                                          uint32_t stack_top)
 {
-    /* A Win32 thread entry may run for the process lifetime. Its dedicated
-     * scheduler-owned stack is safe to preempt, unlike a nested callback
-     * stack. Masking the local APIC here would starve every kernel task until
-     * the PE thread exits. */
+    /* Thread entries and nested callbacks share the same preemptible gate. */
     return compat32_callback_args_impl(func_addr, nargs, args,
-                                       stack_top & ~0xFULL, 0, false, 0);
+                                       stack_top & ~0xFULL, 0, 0);
 }
 
 /*
@@ -2974,18 +2936,12 @@ static int compat32_abandon_callbacks(callback_owner_state_t *state,
         frame->saved_ist1 = first_frame->saved_ist1;
     }
 
-    extern volatile uint32_t *idt_get_apic_base(void);
-    volatile uint32_t *apic = idt_get_apic_base();
     for (int i = old_callback_depth; i > keep_callbacks; i--) {
         int depth = i - 1;
-        if (apic && state->callback_timer_masked[depth])
-            apic[0x320/4] = state->saved_callback_timer[depth];
         memset(state->jmpbufs[depth], 0, sizeof(state->jmpbufs[depth]));
         state->saved_ist1[depth] = 0;
         state->saved_stack_args[depth] = 0;
         state->callback_int2e_depth[depth] = 0;
-        state->saved_callback_timer[depth] = 0;
-        state->callback_timer_masked[depth] = 0;
         state->retvals[depth] = 0;
     }
 

@@ -5,9 +5,9 @@
  * an idle AP pre-fetches cache lines ahead of the current RIP. This brings
  * code and nearby data into the shared L3 cache before the BSP needs them.
  *
- * For userspace code: walks the process's page tables (without CR3 switch)
- * to resolve virtual→physical, then prefetches via the kernel direct map.
- * Pages that aren't present (demand-paged) are silently skipped.
+ * The BSP snapshots direct-map targets while the process is still current.
+ * Workers issue non-faulting prefetch hints without retaining an address
+ * space or walking page tables after the owning process may have exited.
  */
 
 #include "../include/types.h"
@@ -16,57 +16,29 @@
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
 
-/* Page table walk without CR3 switch (defined in paging.c) */
-extern uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt);
-
 /* ── Prefetch task ──────────────────────────────────────────── */
 
+#define PREFETCH_LINES 32U
+
 typedef struct {
-    uint64_t rip;       /* Current instruction pointer */
-    uint64_t cr3;       /* Process page tables */
-    uint32_t lines;     /* Number of cache lines to prefetch */
+    uint64_t targets[PREFETCH_LINES];
+    uint32_t count;
 } prefetch_task_t;
 
 static prefetch_task_t prefetch_arg;
+static volatile int prefetch_pending;
 static uint64_t prefetch_count;
 static uint64_t last_prefetch_tick;
 
-/* Worker — runs on AP, prefetches code ahead of RIP.
- * For kernel code (upper-half): direct prefetch.
- * For userspace code: page-table walk → direct-map prefetch. */
+/* Reclaimed target frames are harmless: PREFETCH is only a cache hint.
+ * Never dereference a saved PTE or CR3 from asynchronous work. */
 static void prefetch_worker(void *arg, void *result)
 {
     (void)result;
     prefetch_task_t *task = (prefetch_task_t *)arg;
-    uint64_t rip = task->rip;
-    uint64_t cr3 = task->cr3;
-
-    if (rip >= 0xFFFF800000000000ULL) {
-        /* Kernel code — already in direct map, prefetch directly */
-        for (uint32_t i = 0; i < task->lines; i++) {
-            uint64_t addr = rip + (uint64_t)i * 64;
-            __asm__ volatile ("prefetcht0 (%0)" :: "r"(addr));
-        }
-        return;
-    }
-
-    /* Userspace code — walk page tables to get physical address,
-     * then prefetch via the kernel direct map (PHYS_TO_VIRT).
-     * No CR3 switch needed — we read the PTs through the direct map. */
-    if (!cr3) return;
-
-    for (uint32_t i = 0; i < task->lines; i++) {
-        uint64_t va = rip + (uint64_t)i * 64;
-
-        /* Check if we crossed a page boundary — only re-walk then */
-        uint64_t *pte = paging_get_pte_in_cr3(cr3, va);
-        if (!pte || !(*pte & 1 /* PTE_PRESENT */))
-            continue;  /* Page not present (demand-paged) — skip */
-
-        uint64_t phys = (*pte & 0x000FFFFFFFFFF000ULL) | (va & 0xFFF);
-        uint64_t direct_va = (uint64_t)PHYS_TO_VIRT(phys);
-        __asm__ volatile ("prefetcht0 (%0)" :: "r"(direct_va));
-    }
+    for (uint32_t i = 0; i < task->count; i++)
+        __asm__ volatile ("prefetcht0 (%0)" :: "r"(task->targets[i]));
+    __atomic_store_n(&prefetch_pending, 0, __ATOMIC_RELEASE);
 }
 
 /* Called from sched_tick when BSP decides NOT to context switch. */
@@ -80,15 +52,40 @@ void spec_prefetch_ahead(uint64_t rip, uint64_t cr3)
     if (ap_worker_count <= 0 || (now - last_prefetch_tick) < 2)
         return;
 
-    prefetch_arg.rip   = rip;
-    prefetch_arg.cr3   = cr3;
-    prefetch_arg.lines = 32;  /* 32 × 64 = 2KB ahead */
+    if (__atomic_exchange_n(&prefetch_pending, 1, __ATOMIC_ACQ_REL))
+        return;
 
-    __asm__ volatile ("mfence" ::: "memory");
+    /* Called with BSP IRQs masked in sched_tick, before leaving the current
+     * process. Resolve at most two pages, not one walk per cache line. */
+    uint64_t va = rip & ~63ULL;
+    uint64_t last_page = UINT64_MAX, phys_page = UINT64_MAX;
+    prefetch_arg.count = 0;
+    last_prefetch_tick = now;
+    for (uint32_t i = 0; i < PREFETCH_LINES; i++) {
+        uint64_t target = UINT64_MAX;
+        if (va >= 0xFFFF800000000000ULL) {
+            target = va;
+        } else if (va < 0x0000800000000000ULL && cr3) {
+            uint64_t page = va & ~4095ULL;
+            if (page != last_page) {
+                phys_page = paging_translate_in_cr3(cr3, page);
+                last_page = page;
+            }
+            if (phys_page != UINT64_MAX)
+                target = (uint64_t)PHYS_TO_VIRT(phys_page + (va & 4095ULL));
+        }
+        if (target != UINT64_MAX)
+            prefetch_arg.targets[prefetch_arg.count++] = target;
+        if (va > UINT64_MAX - 64)
+            break;
+        va += 64;
+    }
 
-    if (smp_submit_ff(prefetch_worker, &prefetch_arg, 0) >= 0) {
-        last_prefetch_tick = now;
+    if (prefetch_arg.count &&
+        smp_submit_ff(prefetch_worker, &prefetch_arg, 0) >= 0) {
         prefetch_count++;
+    } else {
+        __atomic_store_n(&prefetch_pending, 0, __ATOMIC_RELEASE);
     }
 }
 

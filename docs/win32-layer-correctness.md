@@ -365,6 +365,48 @@ funclet, transfers to the handler using the establishing ESP/EBP, continues afte
 the guarded block, returns to its caller, and exits with code 0 without nested
 dispatch, `#GP`, or `#UD`.
 
+## 4.6 Callback preemption and SMP rendering (2026-09-04)
+
+PE32 callbacks no longer save, mask, or restore the BSP LAPIC timer. Callback
+frames already belong to individual scheduler tasks; restoring a CPU-wide mask
+after a callback blocked could restore another task's stale mask and stop timer
+preemption. The transition protects segment/stack changes, and normal callback
+return restores the caller's interrupt flags after restoring callback state.
+Process cleanup no longer compensates by forcibly unmasking the timer.
+
+The related rendering audit found three independent SMP issues:
+- APs parked before worker initialization needed an explicit startup IPI. Both
+  startup and idle waits now check readiness/work with interrupts masked before
+  parking. The smoke test distinguishes AP execution from BSP fallback.
+- Rejected compositor jobs left entire image bands undrawn. Window copies and
+  integer scaling now execute rejected bands locally and wait for accepted jobs.
+- Speculative prefetch retained mutable arguments and a process CR3. The BSP now
+  snapshots targets while the process is current, with one pending job and at
+  most two page translations. AP workers never walk a departed address space.
+
+Validation commands:
+```sh
+make -C arch/x86 CLANG=1 -j4
+bash arch/x86/scripts/test-compositor-bands.sh
+bash arch/x86/scripts/test-spec-prefetch.sh
+sh arch/x86/scripts/build-callback-preemption-test.sh
+```
+
+The host tests pass with GCC and clang: 880 compositor cases and 1101 prefetch
+checks. The compositor test also passes with ASan/UBSan. Copy the generated
+`callback_preemption_pe32.exe` and its `.autoload` fixture to a disposable guest
+disk to run the callback test. The identical PE32 binary failed with exit 4 on
+the previous timer-masking kernel and passed twice with exit 0 on the fixed one.
+SEH3, SEH4, unwind32, legacy WinMM timers, and WaveOut also exited with code 0;
+native USER32 window/input/dialog, DirectDraw, and DOS API contracts passed.
+
+In the UT99 QEMU run, fullscreen/windowed transitions preserved the complete
+image and continued receiving newly pressed Escape keys; the BSP timer stayed
+unmasked. This was a menu-level smoke test, not a gameplay/performance benchmark.
+PE32 `CallWindowProcA` subclass dispatch, Alt+F4/system-key semantics, and the
+UT99 menu-click workflow remain unverified or incomplete; they are not covered
+by the fullscreen/preemption result.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of
