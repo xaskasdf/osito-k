@@ -558,6 +558,63 @@ handled test fault. The DOS-to-PE32 segment-state transition remains open:
 restoring the FS base alone may not restore a usable compatibility-mode segment.
 No FS-selector fix or complete interleaving guarantee is included here.
 
+## 4.10 FS/GS ownership across DOS, PE32, and ELF (2026-09-04)
+
+The section 4.9 SEH3 failure is a descriptor-state issue, not just a wrong
+FS base. On the unchanged `12b12000` kernel, SEH3 passes before native DOS;
+after native VBE, QEMU reports null, unusable FS/GS descriptors. Installing
+the PE32 TEB with WRMSR alone leaves `FS:0` faulting at `0x004010B7`.
+Baseline artifacts are under `/root/osito-fs-segments-20260904-r1/` and `r2/`.
+
+PE32 TEB setup now loads the flat data selector before writing FS_BASE, with
+interrupts masked through publication of the task's TLS state. The scheduler
+saves both selectors and bases and restores descriptors before bases. Fork and
+clone capture live architectural state rather than stale cached parent bases.
+
+Native DOS saves the host FS/GS state for its session and restores it after the
+host GDT is restored. Native entry, interrupt frames, and callback transitions
+carry guest FS/GS selectors. Successful DPMI descriptor freeing clears matching
+data selectors; invalid frees preserve unrelated selectors. The assembly frame
+layout has corresponding C offset/size assertions. Native DOS still excludes
+ordinary task scheduling while it owns the descriptor tables; this does not
+implement concurrent native DOS sessions.
+
+The extended sequence exposed two more gaps in the intermediate `r3/` run:
+ELF `ARCH_SET_GS` returned ENOSYS, and synchronous ELF exit left the shell using
+the child's TLS and a reset IST1 cursor. GS get/set is now implemented, and
+synchronous exec restores parent TLS and the exact saved IST1/IST3 cursors on
+exit and loader failure, before allowing task switches. Noncanonical SET bases
+are rejected; GET validates the writable output mapping before copying. Upper
+canonical bases remain accepted for the current native ELF stack ABI. These
+changes do not complete user/kernel address-space isolation.
+
+Validation commands:
+```sh
+make -C arch/x86 CLANG=1 -j4
+make -C arch/x86 CLANG=1 dos-dpmi-test dos-vbe-native-test \
+    dos-audio-native-test dos-exec-test dos-vbe-test
+sh arch/x86/scripts/build-teb32-test.sh
+sh arch/x86/scripts/build-tls-segments-test.sh
+```
+
+The PE32 probe passes unchanged on Windows and OsitoK. It checks four live
+worker TEBs, per-thread TLS/last-error values, and window callbacks across
+scheduling. The ELF probe passes on Linux and OsitoK with four clone threads,
+128 scheduling rounds per thread, independent FS/GS values and selectors, and
+fork inheritance. This probe does not yet cover the GET error-boundary cases.
+
+Final QEMU artifacts are under `/root/osito-fs-segments-20260904-r4/` (8 GiB,
+four CPUs, KVM, HDA, disposable snapshot disk). The booted kernel's SHA-256
+matches the build: `7ba948c41751a18514fbf6d5bf147d62a3f3e2bde70bc38c8fedb0da4c604c90`.
+The log records DOS API with 15/15 host-memory checks, native DPMI callbacks
+(exit 42), PE32 TEB, ELF TLS/clone/fork, SEH3 (exit 0), and PEB/TEB64 passes.
+Native audio (exit 42), native VBE (exit 0), and COM/MZ EXEC (exit 0) also pass,
+followed by another PE32 TEB run. Passing a COM fixture to the ELF loader is
+rejected with bad magic; the subsequent PE32 TEB probe still passes. Input
+156/156, window-model 95/95, and DirectSound contracts pass as well. SEH3's
+intentional exceptions are handled; no unexpected CPU fault or scheduler
+owner/IST guard warning appears in this run. UT99 was not rerun for this change.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of

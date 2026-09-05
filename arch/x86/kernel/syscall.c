@@ -142,6 +142,7 @@ extern int32_t  vg3d_present(uint32_t pid, uint32_t ctx_id,
 /* ── MSR definitions ─────────────────────────────────────────── */
 
 #define MSR_FS_BASE 0xC0000100  /* FS segment base (for TLS) */
+#define MSR_GS_BASE 0xC0000101  /* GS segment base (for TLS) */
 
 #define MSR_STAR    0xC0000081  /* Segment selectors for SYSCALL/SYSRET */
 #define MSR_LSTAR   0xC0000082  /* RIP for SYSCALL (64-bit) */
@@ -3609,11 +3610,42 @@ void syscall_check_signals(void)
 #define ARCH_SET_GS  0x1001
 #define ARCH_GET_GS  0x1004
 
+static bool arch_tls_canonical(uint64_t addr)
+{
+    uint64_t top = addr >> 47;
+    return top == 0 || top == 0x1FFFFu;
+}
+
+static int64_t arch_tls_copy_base(uint64_t addr, uint64_t base)
+{
+    if (!addr || addr > UINT64_MAX - 7 || !arch_tls_canonical(addr) ||
+        !arch_tls_canonical(addr + 7)) return -EFAULT;
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t last = (addr + 7) & ~0xFFFULL;
+    for (uint64_t page = addr & ~0xFFFULL;; page += 4096) {
+        uint64_t flags = 0, page_size;
+        if (paging_query_mapping_in_cr3(cr3, page, &flags, &page_size) != 0) {
+            if (demand_page_fault(page, 2) != 0 ||
+                paging_query_mapping_in_cr3(cr3, page, &flags, &page_size) != 0)
+                return -EFAULT;
+        }
+        if (!(flags & 2)) return -EFAULT;
+        if (page == last) break;
+    }
+    memcpy((void *)addr, &base, sizeof(base));
+    return 0;
+}
+
 static int64_t sys_arch_prctl(uint64_t code, uint64_t addr)
 {
     switch (code) {
     case ARCH_SET_FS: {
         extern void proc_set_fs_base(uint64_t addr);
+        /* Native ELF stacks still use the upper direct map, including TLS
+         * placed there by libc. Reject the noncanonical hole without removing
+         * that existing ABI while user-stack migration remains incomplete. */
+        if (!arch_tls_canonical(addr)) return -EPERM;
         serial_puts("[TLS] arch_prctl SET_FS=0x");
         serial_puthex(addr, 16);
         serial_puts("\n");
@@ -3622,12 +3654,16 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr)
         return 0;
     }
     case ARCH_GET_FS:
-        if (!addr) return -EFAULT;
-        *(uint64_t *)addr = rdmsr(MSR_FS_BASE);
+        return arch_tls_copy_base(addr, rdmsr(MSR_FS_BASE));
+    case ARCH_SET_GS: {
+        extern void proc_set_gs_base(uint64_t addr);
+        if (!arch_tls_canonical(addr)) return -EPERM;
+        wrmsr(MSR_GS_BASE, addr);
+        proc_set_gs_base(addr);
         return 0;
-    case ARCH_SET_GS:
+    }
     case ARCH_GET_GS:
-        return -ENOSYS;  /* GS not needed for musl */
+        return arch_tls_copy_base(addr, rdmsr(MSR_GS_BASE));
     default:
         return -EINVAL;
     }

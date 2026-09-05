@@ -689,10 +689,10 @@ unhandled:
 
 /* ── Native 32-bit INT dispatch (called from dos_int_stub.S) ────── */
 /* Register frame layout matching the assembly stub's push order:
- * ES, DS, R15-R8, RBP, RDI, RSI, RDX, RCX, RBX, RAX */
+ * GS, FS, ES, DS, R15-R8, RBP, RDI, RSI, RDX, RCX, RBX, RAX */
 
 typedef struct {
-    uint64_t es, ds;
+    uint64_t gs, fs, es, ds;
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t int_num;
@@ -700,6 +700,12 @@ typedef struct {
      * Layout matches dos_int_stub.S after the GPR area. */
     uint64_t iret_rip, iret_cs, iret_rflags, iret_rsp, iret_ss;
 } dos_native_regs_t;
+
+_Static_assert(__builtin_offsetof(dos_native_regs_t, int_num) == 19 * 8,
+               "DOS INT stub vector offset");
+_Static_assert(__builtin_offsetof(dos_native_regs_t, iret_rip) == 20 * 8,
+               "DOS INT stub IRET offset");
+_Static_assert(sizeof(dos_native_regs_t) == 25 * 8, "DOS INT stub frame size");
 
 /*
  * Global DOS VM state for native 32-bit execution.
@@ -1111,9 +1117,8 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
     }
 #endif
 
-    /* Switch to kernel CR3 so handlers can access vm->mem via its PA
-     * (identity-mapped <4 GB in kernel CR3) and any other kernel-side
-     * structures that aren't mapped in the DOS CR3. Restored before return. */
+    /* The VM object may live on a host stack absent from the DOS CR3.
+     * Guest RAM itself is accessed through the kernel direct map. */
     extern uint64_t paging_get_kernel_cr3(void);
     uint64_t saved_cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
@@ -1142,6 +1147,8 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
     cpu->ebp = (uint32_t)regs->rbp;
     cpu->ds  = (uint16_t)regs->ds;
     cpu->es  = (uint16_t)regs->es;
+    cpu->fs  = (uint16_t)regs->fs;
+    cpu->gs  = (uint16_t)regs->gs;
     cpu->cs  = (uint16_t)regs->iret_cs;
     cpu->eip = (uint32_t)regs->iret_rip;
     cpu->ss  = (uint16_t)regs->iret_ss;
@@ -1277,6 +1284,8 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
     regs->rbp = cpu->ebp;
     regs->ds  = cpu->ds;
     regs->es  = cpu->es;
+    regs->fs  = cpu->fs;
+    regs->gs  = cpu->gs;
 
     if (rewrite_iret && cpu->running) {
         regs->iret_rip = cpu->eip;

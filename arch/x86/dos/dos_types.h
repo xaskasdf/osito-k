@@ -190,6 +190,12 @@ typedef struct {
 
 /* ── DOS Virtual Machine ────────────────────────────────────────── */
 
+typedef struct {
+    uint64_t fs_base, gs_base;
+    uint16_t fs, gs;
+    bool saved;
+} dos_host_tls_t;
+
 typedef struct dos_vm {
     struct cpu8086_state *cpu;
     uint8_t         *mem;               /* kernel direct-map view of guest RAM */
@@ -334,6 +340,7 @@ typedef struct dos_vm {
     uint64_t         native_cr3;
     void            *native_gdt;
     void            *native_ldt;
+    dos_host_tls_t   native_host_tls;
     uint8_t          native_saved_idt[12][16];
     uint64_t         native_resume_jmpbuf[9];
     bool             native_idt_saved;

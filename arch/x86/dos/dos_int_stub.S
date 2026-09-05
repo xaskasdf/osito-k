@@ -47,6 +47,10 @@ dos_int_common:
     push %rax
     mov %es, %ax
     push %rax
+    mov %fs, %ax
+    push %rax
+    mov %gs, %ax
+    push %rax
 
     /* Save old IST2 on stack (for reentrancy) */
     movq tss_ist2_ptr(%rip), %r11
@@ -60,38 +64,25 @@ dos_int_common:
     /*
      * Stack layout after the common saves:
      *   [RSP +   0]:  saved old IST2
-     *   [RSP +   8]:  ES
-     *   [RSP +  16]:  DS
-     *   [RSP +  24]:  R15
-     *   [RSP +  32]:  R14
+     *   [RSP +   8]:  GS (start of dos_native_regs_t)
+     *   [RSP +  16]:  FS
+     *   [RSP +  24]:  ES
+     *   [RSP +  32]:  DS
+     *   [RSP +  40]:  R15
      *   ...
-     *   [RSP + 136]:  RAX
-     *   [RSP + 144]:  RBX  (not used, RAX is at 136)
-     *   Actually let me recalculate...
-     *   [RSP +   0]:  saved IST2
-     *   [RSP +   8]:  ES
-     *   [RSP +  16]:  DS
-     *   [RSP +  24]:  R15
-     *   [RSP +  32]:  R14
-     *   [RSP +  40]:  R13
-     *   [RSP +  48]:  R12
-     *   [RSP +  56]:  R11
-     *   [RSP +  64]:  R10
-     *   [RSP +  72]:  R9
-     *   [RSP +  80]:  R8
-     *   [RSP +  88]:  RBP
-     *   [RSP +  96]:  guest RDI
-     *   [RSP + 104]:  RSI
-     *   [RSP + 112]:  RDX
-     *   [RSP + 120]:  RCX
-     *   [RSP + 128]:  RBX
-     *   [RSP + 136]:  RAX
-     *   [RSP + 144]:  interrupt number
-     *   [RSP + 152]:  IRET RIP
-     *   [RSP + 160]:  IRET CS
-     *   [RSP + 168]:  IRET RFLAGS
-     *   [RSP + 176]:  IRET RSP
-     *   [RSP + 184]:  IRET SS
+     *   [RSP + 104]:  RBP
+     *   [RSP + 112]:  RDI
+     *   [RSP + 120]:  RSI
+     *   [RSP + 128]:  RDX
+     *   [RSP + 136]:  RCX
+     *   [RSP + 144]:  RBX
+     *   [RSP + 152]:  RAX
+     *   [RSP + 160]:  interrupt number
+     *   [RSP + 168]:  IRET RIP
+     *   [RSP + 176]:  IRET CS
+     *   [RSP + 184]:  IRET RFLAGS
+     *   [RSP + 192]:  IRET RSP
+     *   [RSP + 200]:  IRET SS
      */
 
     /* Restore 64-bit data segments for kernel C code */
@@ -103,8 +94,8 @@ dos_int_common:
      *   RDI = interrupt number
      *   RSI = pointer to saved register frame on stack
      * The C function reads/writes registers via the frame pointer. */
-    movq 144(%rsp), %rdi    /* vector pushed by the entry stub */
-    leaq 8(%rsp), %rsi      /* pointer to ES on stack = start of regs frame */
+    movq 160(%rsp), %rdi    /* vector pushed by the entry stub */
+    leaq 8(%rsp), %rsi      /* pointer to GS on stack = start of regs frame */
 
     mov %rsp, %rbp
     and $~0xF, %rsp          /* Align stack to 16 bytes */
@@ -116,6 +107,10 @@ dos_int_common:
     popq (%r11)
 
     /* Restore segment registers */
+    pop %rax
+    mov %ax, %gs
+    pop %rax
+    mov %ax, %fs
     pop %rax
     mov %ax, %es
     pop %rax

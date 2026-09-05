@@ -183,6 +183,7 @@ typedef struct {
     bool     is_thread;          /* true if created via CLONE_THREAD */
     uint64_t fs_base;            /* per-thread FS_BASE (TLS) */
     uint64_t gs_base;            /* per-thread GS_BASE (Win64 TEB) */
+    uint16_t fs_selector, gs_selector; /* descriptor state is not in the MSRs */
     int      compat32_mode;      /* Win32 ABI width for the running task */
     uint64_t *clear_child_tid;   /* set_tid_address / CLONE_CHILD_CLEARTID */
 
@@ -615,6 +616,27 @@ static inline void set_current_proc(process_t *p)
         ? (uint64_t)p->kernel_stack + KERNEL_STACK_SIZE : 0;
 }
 
+/* Callers exclude task switches while transferring architectural ownership. */
+static void proc_capture_tls(process_t *p)
+{
+    if (!p) return;
+    p->fs_base = rdmsr(MSR_FS_BASE);
+    p->gs_base = rdmsr(MSR_GS_BASE);
+    __asm__ volatile ("mov %%fs, %0; mov %%gs, %1"
+                      : "=rm"(p->fs_selector), "=rm"(p->gs_selector));
+}
+
+static void proc_restore_tls(const process_t *p)
+{
+    uint16_t fs = p ? p->fs_selector : 0;
+    uint16_t gs = p ? p->gs_selector : 0;
+    /* Selector loads reset descriptor attributes and may overwrite the base. */
+    __asm__ volatile ("mov %0, %%fs; mov %1, %%gs"
+                      : : "rm"(fs), "rm"(gs) : "memory");
+    wrmsr(MSR_FS_BASE, p ? p->fs_base : 0);
+    wrmsr(MSR_GS_BASE, p ? p->gs_base : 0);
+}
+
 /* Kernel return context — saved before exec, restored on exit */
 extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
 extern void kern_longjmp(uint64_t *buf, int val);
@@ -801,6 +823,7 @@ static process_t *proc_alloc(const char *name)
             p->is_thread = false;
             p->fs_base = 0;
             p->gs_base = 0;
+            p->fs_selector = p->gs_selector = 0;
             p->clear_child_tid = NULL;
 
             /* Allocate per-process fd_table (refcounted) */
@@ -1539,6 +1562,8 @@ void proc_set_fs_base(uint64_t addr)
 {
     if (current_proc) {
         current_proc->fs_base = addr;
+        __asm__ volatile ("mov %%fs, %0"
+                          : "=rm"(current_proc->fs_selector));
         /* DIAG: which process_t actually receives the TLS base, and whether
          * current_proc agrees with sched_current_idx. If current_proc's slot
          * != sched_idx (or slot_pid != current_proc pid), the two "current"
@@ -1583,7 +1608,11 @@ uint64_t proc_get_fs_base(void)
 
 void proc_set_gs_base(uint64_t addr)
 {
-    if (current_proc) current_proc->gs_base = addr;
+    if (current_proc) {
+        current_proc->gs_base = addr;
+        __asm__ volatile ("mov %%gs, %0"
+                          : "=rm"(current_proc->gs_selector));
+    }
 }
 
 uint64_t proc_get_gs_base(void)
@@ -1895,7 +1924,12 @@ int proc_exec(const char *filename, int argc, const char **argv)
 
     /* Set as current process and pin region registration target */
     process_t *prev = current_proc;
+    proc_capture_tls(prev);
+    extern uint64_t *tss_ist1_ptr, *tss_ist3_ptr;
+    const uint64_t parent_ist1 = tss_ist1_ptr ? *tss_ist1_ptr : 0;
+    const uint64_t parent_ist3 = tss_ist3_ptr ? *tss_ist3_ptr : 0;
     set_current_proc(p);
+    proc_restore_tls(p);
     exec_target_proc = p;
     /* Pin the parent so proc_launch_prepare can BLOCK it for the child's
      * lifetime (see exec_parent_proc). Cleared on the child's exit below. */
@@ -1940,8 +1974,12 @@ int proc_exec(const char *filename, int argc, const char **argv)
          * still pointing at the now-dead child. SYSCALL disabled interrupts
          * (FMASK clears IF) and the longjmp bypassed SYSRET, so IF is still 0
          * here — keep it 0 until current_proc/sched_idx/state are consistent. */
+        __asm__ volatile ("cli" ::: "memory");
         sched_current_set_idx(prev_sched_idx);
         set_current_proc(prev);
+        proc_restore_tls(prev);
+        if (tss_ist1_ptr) *tss_ist1_ptr = parent_ist1;
+        if (tss_ist3_ptr) *tss_ist3_ptr = parent_ist3;
         if (exec_parent_proc) {
             if (exec_parent_proc->state == PROC_BLOCKED)
                 proc_transition(exec_parent_proc, PROC_RUNNING);
@@ -1949,12 +1987,12 @@ int proc_exec(const char *filename, int argc, const char **argv)
         }
         exec_target_proc = NULL;
         int code = last_exit_code;
-        __asm__ volatile ("sti");
         /* Switch back to the parent's CR3 (kernel CR3 if no parent). */
         if (prev && prev->cr3)
             paging_switch(prev->cr3);
         else
             paging_switch(paging_get_kernel_cr3());
+        __asm__ volatile ("sti");
         (void)proc_free(p);
         return code;
     }
@@ -1976,6 +2014,9 @@ int proc_exec(const char *filename, int argc, const char **argv)
     sched_current_set_idx(prev_sched_idx);
     exec_target_proc = NULL;
     set_current_proc(prev);
+    proc_restore_tls(prev);
+    if (tss_ist1_ptr) *tss_ist1_ptr = parent_ist1;
+    if (tss_ist3_ptr) *tss_ist3_ptr = parent_ist3;
     /* exec failed before elf_jump, so the parent was never blocked; clear the
      * pin (and unblock defensively in case a path did block it). */
     if (exec_parent_proc) {
@@ -2511,7 +2552,7 @@ void __hot sched_tick(void *frame_ptr)
         }
         cur->fs_base = live_fs;
     }
-    cur->gs_base = rdmsr(MSR_GS_BASE);
+    proc_capture_tls(cur);
     /* Only mark as READY if currently RUNNING.
      * ZOMBIE processes must stay ZOMBIE — proc_wait4 relies on this. */
     if (cur->state == PROC_RUNNING)
@@ -2700,8 +2741,7 @@ void __hot sched_tick(void *frame_ptr)
             x86_tss_reset_ist3();
         }
     }
-    wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
-    wrmsr(MSR_GS_BASE, next->gs_base);  /* restore Win64 TEB */
+    proc_restore_tls(next);
 
     uint64_t active_cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
@@ -3320,8 +3360,7 @@ int32_t proc_fork(uint64_t child_stack)
      * new one whose musl will arch_prctl its own base). The child enters
      * userland via the fake IRETQ frame, NOT the syscall return path, so the
      * syscall_dispatch FS-restore wrapper does not cover it — this does. */
-    child->fs_base = parent->fs_base;
-    child->gs_base = parent->gs_base;
+    proc_capture_tls(child);
 
     /* Fork: allocate a NEW fd_table (separate copy for child). */
     child->fd_table = kmalloc(sizeof(fd_table_t));
@@ -3604,8 +3643,8 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     proc_attach_thread(thread, parent, parent->pid);
 
     /* Set per-thread TLS */
+    proc_capture_tls(thread);
     thread->fs_base = tls;
-    thread->gs_base = parent->gs_base;
 
     /* CLONE_PARENT_SETTID: write child TID to parent's memory */
     if (parent_tidptr) {

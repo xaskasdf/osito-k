@@ -474,7 +474,7 @@ typedef struct {
     dos_nt_gdtr_t gdtr;
     uint16_t ldt;
     uint32_t reserved;
-    uint64_t cr3, cs, ds, es, ss, ip, sp, rflags, kernel_sp;
+    uint64_t cr3, cs, ds, es, fs, gs, ss, ip, sp, rflags, kernel_sp;
     uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
 } dos_nt_enter_state_t;
 
@@ -545,6 +545,40 @@ static void dos_nt_free_table_page(void **table)
     if (!table || !*table) return;
     dos_host_free_pages(*table, DOS_NT_TABLE_PAGES);
     *table = NULL;
+}
+
+static void dos_host_tls_save(dos_host_tls_t *state)
+{
+    uint64_t flags;
+    uint32_t low, high;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    __asm__ volatile ("mov %%fs, %0; mov %%gs, %1"
+                      : "=rm"(state->fs), "=rm"(state->gs));
+    __asm__ volatile ("rdmsr" : "=a"(low), "=d"(high) : "c"(0xC0000100u));
+    state->fs_base = ((uint64_t)high << 32) | low;
+    __asm__ volatile ("rdmsr" : "=a"(low), "=d"(high) : "c"(0xC0000101u));
+    state->gs_base = ((uint64_t)high << 32) | low;
+    state->saved = true;
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+}
+
+static void dos_host_tls_restore(dos_host_tls_t *state)
+{
+    if (!state->saved) return;
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    /* The caller has restored the host GDT. Load descriptors before bases:
+     * a selector load can overwrite even a 64-bit MSR-programmed base. */
+    __asm__ volatile ("mov %0, %%fs; mov %1, %%gs"
+                      : : "rm"(state->fs), "rm"(state->gs) : "memory");
+    __asm__ volatile ("wrmsr" : : "c"(0xC0000100u),
+                      "a"((uint32_t)state->fs_base),
+                      "d"((uint32_t)(state->fs_base >> 32)) : "memory");
+    __asm__ volatile ("wrmsr" : : "c"(0xC0000101u),
+                      "a"((uint32_t)state->gs_base),
+                      "d"((uint32_t)(state->gs_base >> 32)) : "memory");
+    state->saved = false;
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
 }
 
 static bool dos_hostmem_mapped(uint64_t cr3, const void *address, uint64_t pages)
@@ -645,6 +679,25 @@ int dos_hostmem_selftest(void)
         *tss_ist3_ptr = expected;
         if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
         HOSTMEM_CHECK(expected != 0 && restored == expected);
+    }
+
+    {
+        dos_host_tls_t before, after;
+        uint64_t flags;
+        __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+        dos_host_tls_save(&before);
+        __asm__ volatile ("mov %0, %%fs; mov %0, %%gs"
+                          : : "r"((uint16_t)0) : "memory");
+        __asm__ volatile ("wrmsr" : : "c"(0xC0000100u),
+                          "a"(0x12345000u), "d"(0) : "memory");
+        __asm__ volatile ("wrmsr" : : "c"(0xC0000101u),
+                          "a"(0x23456000u), "d"(0) : "memory");
+        dos_host_tls_restore(&before);
+        dos_host_tls_save(&after);
+        if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+        HOSTMEM_CHECK(before.fs == after.fs && before.gs == after.gs);
+        HOSTMEM_CHECK(before.fs_base == after.fs_base &&
+                      before.gs_base == after.gs_base && !before.saved);
     }
 
 cleanup:
@@ -838,7 +891,7 @@ static void dos_native_leave_backend(dos_vm_t *vm)
 
     bool had_native_state = vm->native_cr3 || vm->native_gdt ||
                             vm->native_ldt || vm->native_idt_saved ||
-                            vm->native_active;
+                            vm->native_active || vm->native_host_tls.saved;
     if (had_native_state) {
         __asm__ volatile ("cli" ::: "memory");
 
@@ -863,6 +916,7 @@ static void dos_native_leave_backend(dos_vm_t *vm)
         }
 
         __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr) : "memory");
+        dos_host_tls_restore(&vm->native_host_tls);
 
         dos_set_native_vm(NULL);
         vm->native_active = false;
@@ -1074,6 +1128,10 @@ void dos_transfer_to_native(dos_vm_t *vm)
     dos_native_sync_ldt(vm);
     dos_native_sync_gdt(vm);
 
+    /* Native guests own FS/GS until exit or a raw-mode suspension. */
+    if (!vm->native_host_tls.saved)
+        dos_host_tls_save(&vm->native_host_tls);
+
     /* Record the VM pointer so native INT handlers can find it. */
     dos_vga_set_direct_writes(vm, true);
     vm->native_active = true;
@@ -1097,6 +1155,8 @@ void dos_transfer_to_native(dos_vm_t *vm)
     enter->cs = cpu->cs;
     enter->ds = cpu->ds;
     enter->es = cpu->es;
+    enter->fs = cpu->fs;
+    enter->gs = cpu->gs;
     enter->ss = cpu->ss;
     enter->ip = cpu->eip;
     enter->sp = cpu->esp;
@@ -1143,6 +1203,8 @@ void dos_transfer_to_native(dos_vm_t *vm)
         "mov %%rax, %%cr3\n"
         "movw %c[ds](%%r11), %%ax\n  mov %%ax, %%ds\n"
         "movw %c[es](%%r11), %%ax\n  mov %%ax, %%es\n"
+        "movw %c[fs](%%r11), %%ax\n  mov %%ax, %%fs\n"
+        "movw %c[gs](%%r11), %%ax\n  mov %%ax, %%gs\n"
         "pushq %c[ss](%%r11)\n"
         "pushq %c[sp](%%r11)\n"
         "pushq %c[rflags](%%r11)\n"
@@ -1164,6 +1226,8 @@ void dos_transfer_to_native(dos_vm_t *vm)
           [cs]   "i"(__builtin_offsetof(dos_nt_enter_state_t, cs)),
           [ds]   "i"(__builtin_offsetof(dos_nt_enter_state_t, ds)),
           [es]   "i"(__builtin_offsetof(dos_nt_enter_state_t, es)),
+          [fs]   "i"(__builtin_offsetof(dos_nt_enter_state_t, fs)),
+          [gs]   "i"(__builtin_offsetof(dos_nt_enter_state_t, gs)),
           [ss]   "i"(__builtin_offsetof(dos_nt_enter_state_t, ss)),
           [ip]   "i"(__builtin_offsetof(dos_nt_enter_state_t, ip)),
           [sp]   "i"(__builtin_offsetof(dos_nt_enter_state_t, sp)),

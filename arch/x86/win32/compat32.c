@@ -2148,6 +2148,14 @@ void compat32_setup_teb(void *teb_addr)
         addr = 0;
         teb_addr = NULL;
     }
+    uint64_t irq_flags;
+    __asm__ volatile ("pushfq; popq %0; cli"
+                      : "=r"(irq_flags) :: "memory");
+    /* WRMSR changes the base, not the cached descriptor attributes. DOS
+     * CPL3 returns can leave FS null, which is unusable in compatibility mode.
+     * Loading the selector first also avoids overwriting the new TEB base. */
+    __asm__ volatile ("mov %0, %%fs"
+                      : : "r"((uint16_t)GDT_SEL_DATA32) : "memory");
     __asm__ volatile (
         "mov $0xC0000100, %%ecx\n"   /* MSR_FS_BASE */
         "mov %0, %%rax\n"
@@ -2159,6 +2167,7 @@ void compat32_setup_teb(void *teb_addr)
         : "rax", "rcx", "rdx"
     );
     proc_set_fs_base(addr);
+    if (irq_flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
 #else
     /* On Linux, use arch_prctl to set FS base for 32-bit TEB access */
     {

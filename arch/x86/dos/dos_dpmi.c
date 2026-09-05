@@ -1525,6 +1525,7 @@ void dos_int31_dpmi(dos_vm_t *vm)
         if (dpmi_selector_allocated(dpmi, sel, &idx) &&
             dpmi->descriptor_state[idx] == DPMI_DESC_MUTABLE) {
             dpmi_release_descriptor(dpmi, idx);
+            dpmi_clear_freed_data_selectors(cpu, idx, 1);
             cpu->eflags &= ~FLAG_CF;
         } else {
             cpu->ax = 0x8022;  /* invalid selector */
@@ -3542,10 +3543,23 @@ int dpmi_selftest(void)
     cpu.ax = 0x0001;
     cpu.bx = specific_sel | 3u;
     cpu.eflags = FLAG_CF;
+    cpu.ds = specific_sel;
+    cpu.es = specific_sel | 1u;
+    cpu.fs = specific_sel | 2u;
+    cpu.gs = specific_sel | 3u;
     dos_int31_dpmi(vm);
     if ((cpu.eflags & FLAG_CF) ||
-        vm->dpmi.descriptor_state[specific_idx] != DPMI_DESC_FREE)
+        vm->dpmi.descriptor_state[specific_idx] != DPMI_DESC_FREE ||
+        cpu.ds || cpu.es || cpu.fs || cpu.gs)
         failures++;
+
+    cpu.ax = 0x0001;
+    cpu.ds = cpu.es = cpu.fs = cpu.gs = 0x30;
+    dos_int31_dpmi(vm);
+    if (!(cpu.eflags & FLAG_CF) || cpu.ax != 0x8022 ||
+        cpu.ds != 0x30 || cpu.es != 0x30 || cpu.fs != 0x30 || cpu.gs != 0x30)
+        failures++;
+    cpu.ds = cpu.es = cpu.fs = cpu.gs = 0;
 
     cpu.ax = 0x0000;
     cpu.cx = 1;

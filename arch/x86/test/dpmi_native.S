@@ -1,7 +1,7 @@
 /*
  * Minimal DPMI 0.9 client used to validate the interpreted USE16 to native
- * USE32 transition. The final FS load proves that descriptors allocated by a
- * native INT 31h call are copied into the active private LDT before return.
+ * USE32 transition, segment preservation/invalidation, and raw callbacks.
+ * Descriptors allocated by native INT 31h calls must reach the private LDT.
  */
 
     .section .text
@@ -221,6 +221,9 @@ pm16_entry:
     cmpw $0x0901, %ax
     jne pm16_interrupt_fail
 
+    movw initial_data_selector, %ax
+    movw %ax, %fs
+    movw %ax, %gs
     ljmp *native_pointer
 
 real_mode_fail:
@@ -293,10 +296,24 @@ real_fail_message:
     .code32
 native32_entry:
     movw %ds, native_data_selector
+    movw %fs, %ax
+    cmpw native_data_selector, %ax
+    jne native_segment_fail
+    movw %gs, %ax
+    cmpw native_data_selector, %ax
+    jne native_segment_fail
+    cmpl $0x2468ace0, %fs:segment_marker
+    jne native_segment_fail
+    cmpl $0x2468ace0, %gs:segment_marker
+    jne native_segment_fail
 
     movl $0x0400, %eax
     int $0x31
     jc native_fail
+    cmpl $0x2468ace0, %fs:segment_marker
+    jne native_segment_fail
+    cmpl $0x2468ace0, %gs:segment_marker
+    jne native_segment_fail
 
     /* Resident hosts may implement page services as no-ops, but the calls
      * and virtual interrupt state remain mandatory DPMI 0.9 contracts. */
@@ -508,6 +525,8 @@ native32_entry:
 
     movw dos_block_selector, %ax
     movw %ax, %es
+    movw %ax, %fs
+    movw %ax, %gs
     movw %ax, %dx
     movl $0x0101, %eax
     int $0x31
@@ -515,6 +534,12 @@ native32_entry:
     movw %es, %ax
     testw %ax, %ax
     jnz native_dos_memory_fail
+    movw %fs, %ax
+    testw %ax, %ax
+    jnz native_segment_fail
+    movw %gs, %ax
+    testw %ax, %ax
+    jnz native_segment_fail
     movw native_data_selector, %ax
     movw %ax, %es
 
@@ -538,6 +563,18 @@ native32_entry:
     jc native_fail
 
     movw %ax, %fs
+
+    movw %ax, %gs
+    movw %ax, %bx
+    movl $0x0001, %eax
+    int $0x31
+    jc native_segment_fail
+    movw %fs, %ax
+    testw %ax, %ax
+    jnz native_segment_fail
+    movw %gs, %ax
+    testw %ax, %ax
+    jnz native_segment_fail
 
     /* Allocate a real-mode callback whose PM half executes natively after
      * the final raw switch. DS names the code target; ES names the register
@@ -574,6 +611,10 @@ native32_entry:
 
 native_fail:
     movl $0x4c7d, %eax
+    int $0x21
+
+native_segment_fail:
+    movl $0x4c70, %eax
     int $0x21
 
 native_exception_fail:
@@ -654,9 +695,21 @@ native_callback:
     movw %ax, %es:44(%edi)
     addw $4, %es:46(%edi)
     movl $0x1357cafe, %es:28(%edi)
+    movw %fs, %ax
+    testw %ax, %ax
+    jnz callback_segment_fail
+    movw %gs, %ax
+    testw %ax, %ax
+    jnz callback_segment_fail
+    iretl
+
+callback_segment_fail:
+    movl $0xdead0070, %es:28(%edi)
     iretl
 
     .align 2
+segment_marker:
+    .long 0x2468ace0
 raw_pm_pointer:
     .long 0
     .word 0
