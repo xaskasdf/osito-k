@@ -1107,16 +1107,24 @@ HDC WINAPI CreateCompatibleDC(HDC hdc)
     return (HDC)(ULONG_PTR)(DC_TAG | (unsigned)idx);
 }
 
+static void gdi_release_dc(GDI_DC *dc)
+{
+    brush_release(dc->current_brush);
+    GDI_PAINT_CLIP *clip = dc->paint_clip;
+    gdi_memset(dc, 0, sizeof(*dc));
+    while (clip) {
+        GDI_PAINT_CLIP *previous = clip->previous;
+        kfree(clip);
+        clip = previous;
+    }
+}
+
 BOOL WINAPI DeleteDC(HDC hdc)
 {
     GDI_DC *dc = dc_from_handle(hdc);
     if (dc && dc->pooled_window)
         return FALSE;
-    if (dc) {
-        brush_release(dc->current_brush);
-        dc->in_use = 0;
-        dc->surface = NULL;
-    }
+    if (dc) gdi_release_dc(dc);
     return TRUE;
 }
 
@@ -1179,22 +1187,25 @@ void gdi32_free_screen_dc(HDC hdc)
     /* ReleaseDC releases a pooled borrow; the DC remains associated with its
      * window so WindowFromDC stays deterministic across concurrent windows. */
     if (dc && dc->pooled_window) return;
-    if (dc) {
-        brush_release(dc->current_brush);
-        dc->in_use = 0;
-        dc->surface = NULL;
-    }
+    if (dc) gdi_release_dc(dc);
 }
 
 BOOL gdi32_push_paint_clip(HDC hdc, const GDI_RECT *rect, uint64_t *token)
 {
     static uint64_t next_token;
     GDI_DC *dc = dc_from_handle(hdc);
-    if (!dc || !rect || !token || !dc->pooled_window) return FALSE;
+    if (!dc || !rect || !token) return FALSE;
     GDI_PAINT_CLIP *clip = kmalloc(sizeof(*clip));
     if (!clip) return FALSE;
     clip->previous = dc->paint_clip;
     clip->rect = *rect;
+    if (clip->previous) {
+        const GDI_RECT *outer = &clip->previous->rect;
+        if (clip->rect.left < outer->left) clip->rect.left = outer->left;
+        if (clip->rect.top < outer->top) clip->rect.top = outer->top;
+        if (clip->rect.right > outer->right) clip->rect.right = outer->right;
+        if (clip->rect.bottom > outer->bottom) clip->rect.bottom = outer->bottom;
+    }
     clip->token = __atomic_add_fetch(&next_token, 1, __ATOMIC_RELAXED);
     dc->paint_clip = clip;
     *token = clip->token;
@@ -1219,14 +1230,7 @@ void gdi32_release_window_dc(HANDLE window)
         GDI_DC *dc = &gdi_dcs[i];
         if (!dc->in_use || !dc->pooled_window ||
             dc->owner_window != (ULONG_PTR)window) continue;
-        brush_release(dc->current_brush);
-        GDI_PAINT_CLIP *clip = dc->paint_clip;
-        gdi_memset(dc, 0, sizeof(*dc));
-        while (clip) {
-            GDI_PAINT_CLIP *previous = clip->previous;
-            kfree(clip);
-            clip = previous;
-        }
+        gdi_release_dc(dc);
     }
 }
 

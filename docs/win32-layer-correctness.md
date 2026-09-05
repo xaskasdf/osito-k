@@ -758,6 +758,70 @@ flag-combination coverage are not completed here. The tests explicitly release
 their objects and do not prove process-exit reclamation or concurrent GDI
 lifetime correctness. This change does not modify DOS or audio implementations.
 
+## 4.14 Native BUTTON/STATIC controls and window text (2026-09-04)
+
+Native BUTTON and STATIC classes now have per-window state, painting,
+WM_SETFONT/GETFONT, dialog-code classification, parent control-color callbacks,
+and owner drawing with the PE32/PE64 DRAWITEMSTRUCT layout. Button behavior
+includes push/check/radio/three-state controls, BM_* state messages, automatic
+radio groups and tab stops, mouse capture/cancellation, and space-key clicks.
+STATIC supports text, frames, rectangles, and caller-owned bitmap/icon handles.
+Control state survives reentrant destruction until the active callback returns;
+borrowed fonts and images are not deleted with their controls.
+
+Window captions use dynamic UTF-16 storage rather than the compositor's bounded
+title buffer. Set/GetWindowText and WM_SETTEXT/GETTEXT/GETTEXTLENGTH use the
+window procedure, with ANSI/Unicode conversion for SendMessageA/W and a
+per-thread encoding context retained through queued synchronous delivery.
+GetWindowTextA and IsWindowUnicode are exported. Basic ANSI subclass forwarding
+is covered without application names or fixed binary addresses.
+
+Temporary GDI clips also work with memory DCs, so BUTTON WM_PRINTCLIENT paints
+and invokes owner-draw callbacks on bitmaps. Nested clips intersect the existing
+paint bounds instead of widening a partial BeginPaint update. DC destruction
+releases outstanding clip frames as well as the selected brush reference.
+
+Validation commands:
+```sh
+make -C arch/x86 CLANG=1 -j4
+sh arch/x86/scripts/build-user32-controls-test.sh
+```
+
+The generated `user32_controls_pe32.exe` and `user32_controls_pe64.exe` each
+pass 64 checks unchanged on native Windows and OsitoK. Coverage includes long
+captions, A/W conversion and subclassing, cross-thread Unicode text, button
+state/notifications/capture, bitmap pixels/ownership/geometry, owner-draw ABI,
+partial-update and memory-DC clipping, and destruction inside draw/color
+callbacks. The `.autoload` fixture starts the PE32 probe from `probes/`.
+
+Final QEMU artifacts are under
+`/root/osito-controls-commit-20260904-S6rozQ/` (8 GiB, four CPUs, KVM, separate
+snapshot disk). The booted kernel matches the build's SHA-256:
+`0128764abfb08d009413dbb9d358e855d1df96b0e2f61f4da2a669264ae59fb8`.
+Both control probes, GDI text 77/77 and USER32 paint 85/85 on both PE ABIs,
+both GDI paint probes, GDI DIB 32/32, GDI region 40/40, window-model 95/95,
+input 156/156, dialog 10/10, DirectDraw ABI, DirectSound, and DOS API with
+15/15 host-memory checks pass. The PE32 control probe passes again after DOS.
+No unexpected CPU fault appears. The fixture lacks the optional `diag/`
+directory, producing the previously documented boot-log parent-missing errors.
+
+The UT99 run at `/root/osito-ut99-controls-commit-20260904-HcaWzi/` uses the
+same kernel and a disposable snapshot of the UT99 fixture. `wizard.png` shows
+the banner bitmap, instructions, radio labels, and Next/Cancel buttons. The
+device LISTBOX remains black, so this is not yet a usable renderer-selection
+wizard or a validated game launch. No CPU fault was recorded in this run.
+
+LISTBOX and broader dialog keyboard navigation remain incomplete. Fonts still
+use the fixed bitmap realization. Full A/W CREATESTRUCT delivery, previous-
+procedure encoding thunks, posted messages, SendMessageTimeout text conversion,
+and multibyte/surrogate boundary handling are not established by these probes.
+Some legacy caption consumers still use the bounded display title. Exact
+external-DC state parity after WM_PRINTCLIENT is not established: native
+Windows can retain a clip on the supplied DC, while this implementation pops
+its internal temporary clip. Tests explicitly release their objects; they do
+not prove full process-exit reclamation or concurrent GDI lifetime correctness.
+This change does not modify the DOS or audio implementation.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of

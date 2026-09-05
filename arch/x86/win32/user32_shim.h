@@ -640,6 +640,8 @@ BOOL    WINAPI ShowWindow(HWND hWnd, int nCmdShow);
 BOOL    WINAPI UpdateWindow(HWND hWnd);
 BOOL    WINAPI SetWindowTextA(HWND hWnd, PCSTR lpString);
 int     WINAPI GetWindowTextLengthA(HWND hWnd);
+int     WINAPI GetWindowTextA(HWND hWnd, PSTR text, int max_count);
+BOOL    WINAPI IsWindowUnicode(HWND hWnd);
 int     WINAPI GetWindowTextLengthW(HWND hWnd);
 int     WINAPI GetWindowTextW(HWND hWnd, PWSTR text, int max_count);
 BOOL    WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertAfter,

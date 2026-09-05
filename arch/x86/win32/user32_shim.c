@@ -7,6 +7,7 @@
  */
 
 #include "user32_shim.h"
+#include "user32_controls.h"
 #include "gdi32_shim.h"
 #include "kernel32_shim.h"
 #include "compat32.h"
@@ -171,6 +172,7 @@ typedef struct {
     WORD        atom;
     int         system_class;
     int         native_wndproc;
+    BOOL        unicode;
     int         used;
 } WNDCLASS_ENTRY;
 
@@ -186,6 +188,7 @@ static LRESULT WINAPI system_class_wndproc(HWND hWnd, DWORD Msg,
 static LRESULT WINAPI dialog_class_wndproc(HWND hWnd, DWORD Msg,
                                             WPARAM wParam, LPARAM lParam);
 static void default_window_paint(HWND window);
+static BOOL window_set_text(HWND window, PCVOID text, BOOL wide);
 static HBRUSH WINAPI GetSysColorBrush_u32(int index);
 
 /* USER32 registers these classes before application code can use them.  The
@@ -398,6 +401,9 @@ typedef struct {
     HWND        handle;
     char        class_name[128];
     char        title[256];
+    PWSTR       text;
+    U32_CONTROL *control;
+    BOOL        unicode;
     WNDPROC     wndproc;
     DWORD       style;
     DWORD       ex_style;
@@ -1367,6 +1373,7 @@ typedef struct {
     WPARAM wparam;
     LPARAM lparam;
     LRESULT result;
+    BOOL unicode;
     HANDLE completion_event;
 } SENT_MESSAGE;
 
@@ -1452,6 +1459,7 @@ typedef struct {
     int depth;
     int windowpos_depth;
     int create_depth;
+    BOOL unicode_message;
     PVOID scratch_page;
     USER_HOOK_FRAME frames[USER_HOOK_MAX_DEPTH];
 } USER_HOOK_CONTEXT;
@@ -1924,6 +1932,7 @@ static inline void sent_message_unlock_irqrestore(uint64_t flags)
 
 static BOOL sent_message_begin(const WINDOW *window, DWORD message,
                                WPARAM wparam, LPARAM lparam,
+                               BOOL unicode,
                                HANDLE completion_event, int *slot_out,
                                uint32_t *generation_out)
 {
@@ -1950,6 +1959,7 @@ static BOOL sent_message_begin(const WINDOW *window, DWORD message,
         sent->message = message;
         sent->wparam = wparam;
         sent->lparam = lparam;
+        sent->unicode = unicode;
         sent->result = 0;
         sent->completion_event = completion_event;
         sent->state = SENT_MESSAGE_PENDING;
@@ -4073,6 +4083,7 @@ WORD WINAPI RegisterClassW(PVOID lpwc)
     e->menu_name = (ULONG_PTR)wc.lpszMenuName;
     e->class_name_ptr = (ULONG_PTR)class_name;
     e->hIconSm = NULL;
+    e->unicode = TRUE;
     e->owner_pid = pid;
     e->used = 1;
 
@@ -4604,6 +4615,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     if (class_name) u32_strcpy(w->class_name, class_name, 128);
     if (window_name) u32_strcpy(w->title, window_name, 256);
     w->wndproc  = wndproc;
+    w->unicode  = cls->unicode;
     w->style    = dwStyle;
     w->ex_style = dwExStyle;
     w->layered_color_key = 0;
@@ -4648,6 +4660,19 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     w->shm_pixels    = NULL;
     w->surface_width = 0;
     w->surface_height = 0;
+
+    if (!window_set_text(w->handle, window_name, FALSE)) {
+        release_window(w);
+        return NULL;
+    }
+    if (cls->system_class && (cls->atom == 0x80 || cls->atom == 0x82)) {
+        w->control = user32_control_create(cls->atom);
+        if (!w->control) {
+            release_window(w);
+            SetLastError(8);
+            return NULL;
+        }
+    }
 
     if (!message_only)
         place_window_in_z_order(w, (dwStyle & WS_CHILD) ? HWND_BOTTOM : HWND_TOP);
@@ -4861,6 +4886,10 @@ static void trace_window_release(const char *reason, const WINDOW *w,
 static void release_window(WINDOW *w)
 {
     if (!w || !w->used) return;
+    user32_control_release(w->control);
+    w->control = NULL;
+    kfree(w->text);
+    w->text = NULL;
     dialog_release_window(w->handle);
     extern void comctl32_release_window(DWORD owner_pid, HWND window);
     comctl32_release_window(w->owner_pid, w->handle);
@@ -5201,23 +5230,93 @@ BOOL WINAPI UpdateWindow(HWND hWnd)
     return TRUE;
 }
 
-BOOL WINAPI SetWindowTextA(HWND hWnd, PCSTR lpString)
+static BOOL window_set_text(HWND hWnd, PCVOID input, BOOL wide)
 {
     WINDOW *w = find_window(hWnd);
     if (!w) return FALSE;
-    u32_strcpy(w->title, lpString ? lpString : "", 256);
+    SIZE_T length = 0;
+    if (input) {
+        if (wide) {
+            while (((PCWSTR)input)[length]) {
+                if (++length >= 0x7FFFFFFEU) return FALSE;
+            }
+        } else {
+            int count = MultiByteToWideChar(0, 0, input, -1, NULL, 0);
+            if (count <= 0) return FALSE;
+            length = (SIZE_T)count - 1;
+        }
+    }
+    PWSTR text = kcalloc(length + 1, sizeof(WCHAR));
+    if (!text) { SetLastError(8); return FALSE; }
+    if (input && wide) memcpy(text, input, length * sizeof(WCHAR));
+    else if (input && !MultiByteToWideChar(0, 0, input, -1, text, (int)length+1)) {
+        kfree(text);
+        return FALSE;
+    }
+    PWSTR previous = w->text;
+    w->text = text;
+    kfree(previous);
+    /* Only the compositor/debug caption has a bounded presentation buffer. */
+    int shown = length < 255 ? (int)length : 255;
+    int bytes = shown ? WideCharToMultiByte(0, 0, text, shown,
+        w->title, sizeof(w->title)-1, NULL, NULL) : 0;
+    w->title[bytes > 0 ? bytes : 0] = 0;
     if (w->compositor_id && compositor_set_title)
         compositor_set_title(w->compositor_id, w->title);
+    invalidate_window(w, NULL, TRUE);
     return TRUE;
+}
+
+PWSTR user32_copy_window_text(HWND hWnd)
+{
+    WINDOW *w = find_window(hWnd);
+    if (!w) return NULL;
+    SIZE_T count = 0;
+    if (w->text) while (w->text[count]) count++;
+    PWSTR copy = kcalloc(count+1, sizeof(WCHAR));
+    if (copy && count) memcpy(copy, w->text, count*sizeof(WCHAR));
+    return copy;
+}
+
+static LRESULT window_text_message(HWND hWnd, DWORD message,
+                                    WPARAM capacity, LPARAM buffer, BOOL wide)
+{
+    if (message == 0x000C) return window_set_text(hWnd, (PCVOID)buffer, wide);
+    WINDOW *w = find_window(hWnd);
+    if (!w) return 0;
+    static const WCHAR empty[] = {0};
+    PCWSTR text = w->text ? w->text : empty;
+    int length = 0;
+    while (text[length]) length++;
+    if (message == 0x000E) return wide ? length :
+        (length ? WideCharToMultiByte(0, 0, text, length, NULL, 0, NULL, NULL) : 0);
+    if (!buffer || !capacity || capacity > 0x7FFFFFFFU) return 0;
+    if (wide) {
+        if ((UINT)length >= capacity) length = (int)capacity-1;
+        memcpy((PVOID)buffer, text, length*sizeof(WCHAR));
+        ((PWSTR)buffer)[length] = 0;
+        return length;
+    }
+    int out = 0;
+    for (int i = 0; i < length; i++) {
+        char bytes[8];
+        int count = WideCharToMultiByte(0, 0, text+i, 1, bytes, sizeof(bytes), NULL, NULL);
+        if (count <= 0 || (UINT)(out+count) >= capacity) break;
+        memcpy((PSTR)buffer+out, bytes, count);
+        out += count;
+    }
+    ((PSTR)buffer)[out] = 0;
+    return out;
+}
+
+BOOL WINAPI SetWindowTextA(HWND hWnd, PCSTR lpString)
+{
+    return (BOOL)SendMessageA(hWnd, 0x000C, 0, (LPARAM)lpString);
 }
 
 static BOOL WINAPI SetWindowTextW_k32(HWND hWnd, PCWSTR lpString)
 {
-    char text[256] = {0};
-    if (lpString)
-        for (int i = 0; i < 255 && lpString[i]; i++)
-            text[i] = (char)(lpString[i] & 0xFF);
-    return SetWindowTextA(hWnd, text);
+    return (BOOL)SendMessageW(hWnd, 0x000C, 0, (LPARAM)lpString);
 }
 
 int WINAPI GetWindowTextLengthA(HWND hWnd)
@@ -5225,32 +5324,46 @@ int WINAPI GetWindowTextLengthA(HWND hWnd)
     WINDOW *w = find_window(hWnd);
     if (!w) return 0;
 
-    int length = 0;
-    while (w->title[length]) length++;
-    return length;
+    return (int)(w->owner_pid == GetCurrentProcessId()
+        ? SendMessageA(hWnd, 0x000E, 0, 0)
+        : window_text_message(hWnd, 0x000E, 0, 0, FALSE));
 }
 
 int WINAPI GetWindowTextLengthW(HWND hWnd)
 {
-    return GetWindowTextLengthA(hWnd);
+    WINDOW *w = find_window(hWnd);
+    if (!w) return 0;
+    return (int)(w->owner_pid == GetCurrentProcessId()
+        ? SendMessageW(hWnd, 0x000E, 0, 0)
+        : window_text_message(hWnd, 0x000E, 0, 0, TRUE));
+}
+
+BOOL WINAPI IsWindowUnicode(HWND hWnd)
+{
+    WINDOW *window = find_window(hWnd);
+    return window ? window->unicode : FALSE;
+}
+
+int WINAPI GetWindowTextA(HWND hWnd, PSTR text, int max_count)
+{
+    WINDOW *w = find_window(hWnd);
+    if (!text || max_count <= 0) return 0;
+    text[0] = 0;
+    if (!w) return 0;
+    return (int)(w->owner_pid == GetCurrentProcessId()
+        ? SendMessageA(hWnd, 0x000D, max_count, (LPARAM)text)
+        : window_text_message(hWnd, 0x000D, max_count, (LPARAM)text, FALSE));
 }
 
 int WINAPI GetWindowTextW(HWND hWnd, PWSTR text, int max_count)
 {
     WINDOW *w = find_window(hWnd);
     if (!text || max_count <= 0) return 0;
-    if (!w) {
-        text[0] = 0;
-        return 0;
-    }
-
-    int length = 0;
-    while (length + 1 < max_count && w->title[length]) {
-        text[length] = (WCHAR)(BYTE)w->title[length];
-        length++;
-    }
-    text[length] = 0;
-    return length;
+    text[0] = 0;
+    if (!w) return 0;
+    return (int)(w->owner_pid == GetCurrentProcessId()
+        ? SendMessageW(hWnd, 0x000D, max_count, (LPARAM)text)
+        : window_text_message(hWnd, 0x000D, max_count, (LPARAM)text, TRUE));
 }
 
 BOOL WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertAfter,
@@ -5729,6 +5842,18 @@ static LRESULT dispatch_wndproc(WNDPROC wndproc, HWND hWnd, DWORD Msg,
     return ret;
 }
 
+static LRESULT dispatch_wndproc_encoded(WNDPROC proc, HWND window, DWORD msg,
+                                         WPARAM wp, LPARAM lp, BOOL unicode)
+{
+    USER_HOOK_CONTEXT *context = user_hook_context_get(TRUE);
+    if (!context) { SetLastError(8); return 0; }
+    BOOL previous = context->unicode_message;
+    context->unicode_message = unicode;
+    LRESULT result = dispatch_wndproc(proc, window, msg, wp, lp);
+    context->unicode_message = previous;
+    return result;
+}
+
 static int sent_message_dispatch_current(void)
 {
     DWORD pid = GetCurrentProcessId();
@@ -5762,9 +5887,9 @@ static int sent_message_dispatch_current(void)
         WINDOW *window = find_window(request.window);
         if (window && window->owner_pid == pid && window->owner_tid == tid) {
             if (window->wndproc)
-                result = dispatch_wndproc(window->wndproc, request.window,
+                result = dispatch_wndproc_encoded(window->wndproc, request.window,
                                           request.message, request.wparam,
-                                          request.lparam);
+                                          request.lparam, request.unicode);
             else
                 result = DefWindowProcA(request.window, request.message,
                                         request.wparam, request.lparam);
@@ -6009,7 +6134,7 @@ BOOL WINAPI PostMessageA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 
 static BOOL send_message_wait(HWND hWnd, DWORD Msg, WPARAM wParam,
                               LPARAM lParam, DWORD timeout_ms,
-                              BOOL block_reentrancy, LRESULT *result)
+                              BOOL block_reentrancy, BOOL unicode, LRESULT *result)
 {
     WINDOW *window = find_window(hWnd);
     if (!window) {
@@ -6022,7 +6147,7 @@ static BOOL send_message_wait(HWND hWnd, DWORD Msg, WPARAM wParam,
     DWORD tid = GetCurrentThreadId();
     if (window->owner_pid == pid && window->owner_tid == tid) {
         *result = window->wndproc
-                ? dispatch_wndproc(window->wndproc, hWnd, Msg, wParam, lParam)
+                ? dispatch_wndproc_encoded(window->wndproc, hWnd, Msg, wParam, lParam, unicode)
                 : DefWindowProcA(hWnd, Msg, wParam, lParam);
         return TRUE;
     }
@@ -6038,7 +6163,7 @@ static BOOL send_message_wait(HWND hWnd, DWORD Msg, WPARAM wParam,
     uint32_t generation;
     DWORD target_pid = window->owner_pid;
     DWORD target_tid = window->owner_tid;
-    if (!sent_message_begin(window, Msg, wParam, lParam, event,
+    if (!sent_message_begin(window, Msg, wParam, lParam, unicode, event,
                             &slot, &generation)) {
         CloseHandle(event);
         SetLastError(1816); /* ERROR_NOT_ENOUGH_QUOTA */
@@ -6105,12 +6230,74 @@ static BOOL send_message_wait(HWND hWnd, DWORD Msg, WPARAM wParam,
     return TRUE;
 }
 
+static PVOID message_convert_text(PCVOID text, BOOL input_wide, int *length)
+{
+    int count = input_wide
+        ? WideCharToMultiByte(0, 0, text, -1, NULL, 0, NULL, NULL)
+        : MultiByteToWideChar(0, 0, text, -1, NULL, 0);
+    if (count <= 0) return NULL;
+    PVOID copy = HeapAlloc(GetProcessHeap(), 0,
+        (SIZE_T)count * (input_wide ? 1 : sizeof(WCHAR)));
+    if (!copy) return NULL;
+    int converted = input_wide
+        ? WideCharToMultiByte(0, 0, text, -1, copy, count, NULL, NULL)
+        : MultiByteToWideChar(0, 0, text, -1, copy, count);
+    if (!converted) { HeapFree(GetProcessHeap(), 0, copy); return NULL; }
+    *length = converted-1;
+    return copy;
+}
+
+static LRESULT send_message_text(HWND window, DWORD message, WPARAM wp,
+                                  LPARAM lp, BOOL wide)
+{
+    WINDOW *w = find_window(window);
+    LRESULT result = 0;
+    BOOL target_wide = w ? w->unicode : wide;
+    if (target_wide == wide || message < 0xC || message > 0xE ||
+        (message == 0xC && !lp)) {
+        send_message_wait(window, message, wp, lp, 0xFFFFFFFFu, FALSE, wide, &result);
+        return result;
+    }
+    HANDLE heap = GetProcessHeap();
+    if (message == 0xC) {
+        int length;
+        PVOID text = message_convert_text((PCVOID)lp, wide, &length);
+        if (!text) return 0;
+        send_message_wait(window, message, wp, (LPARAM)text, 0xFFFFFFFFu,
+            FALSE, target_wide, &result);
+        HeapFree(heap, 0, text);
+        return result;
+    }
+    WPARAM capacity = wp;
+    if (message == 0xE) {
+        if (!send_message_wait(window, message, 0, 0, 0xFFFFFFFFu,
+                FALSE, target_wide, &result) || result <= 0 || result >= 0x7FFFFFFE)
+            return result;
+        capacity = (WPARAM)result+1;
+    } else if (!lp || !capacity || capacity > 0x7FFFFFFFu) return 0;
+    PVOID text = HeapAlloc(heap, 8, capacity * (target_wide ? sizeof(WCHAR) : 1));
+    if (!text) return 0;
+    BOOL completed = send_message_wait(window, 0xD, capacity, (LPARAM)text,
+        0xFFFFFFFFu, FALSE, target_wide, &result);
+    if (target_wide) ((PWSTR)text)[capacity-1] = 0;
+    else ((PSTR)text)[capacity-1] = 0;
+    int length = 0;
+    PVOID converted = completed ? message_convert_text(text, target_wide, &length) : NULL;
+    HeapFree(heap, 0, text);
+    if (!converted) return 0;
+    if (message == 0xD) {
+        if ((WPARAM)length >= wp) length = (int)wp-1;
+        memcpy((PVOID)lp, converted, (SIZE_T)length * (wide ? sizeof(WCHAR) : 1));
+        if (wide) ((PWSTR)lp)[length] = 0;
+        else ((PSTR)lp)[length] = 0;
+    }
+    HeapFree(heap, 0, converted);
+    return length;
+}
+
 LRESULT WINAPI SendMessageA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
-    LRESULT result = 0;
-    send_message_wait(hWnd, Msg, wParam, lParam, 0xFFFFFFFFU,
-                      FALSE, &result);
-    return result;
+    return send_message_text(hWnd, Msg, wParam, lParam, FALSE);
 }
 
 LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
@@ -6119,6 +6306,10 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
 
     switch (Msg) {
     case WM_NCCREATE:   return 1;       /* allow creation */
+    case 0x000C: /* WM_SETTEXT */
+    case 0x000D: /* WM_GETTEXT */
+    case 0x000E: /* WM_GETTEXTLENGTH */
+        return window_text_message(hWnd, Msg, wParam, lParam, FALSE);
     case WM_CREATE:     return 0;       /* success */
     case WM_CLOSE:      DestroyWindow(hWnd); return 0;
     case WM_DESTROY:    return 0;
@@ -6132,10 +6323,17 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
         if (!GetClientRect(hWnd, &rect)) return 0;
         return FillRect((HDC)(ULONG_PTR)wParam, &rect, entry->hbrBackground);
     }
+    case 0x0132: /* WM_CTLCOLORMSGBOX */
+    case 0x0133: /* WM_CTLCOLOREDIT */
+    case 0x0134: /* WM_CTLCOLORLISTBOX */
+    case 0x0135: /* WM_CTLCOLORBTN */
     case 0x0136: /* WM_CTLCOLORDLG */
+    case 0x0138: { /* WM_CTLCOLORSTATIC */
+        int background = Msg == 0x0133 || Msg == 0x0134 ? 5 : 15;
         SetTextColor((HDC)(ULONG_PTR)wParam, GetSysColor(8));
-        SetBkColor((HDC)(ULONG_PTR)wParam, GetSysColor(15));
-        return (LRESULT)(ULONG_PTR)GetSysColorBrush_u32(15);
+        SetBkColor((HDC)(ULONG_PTR)wParam, GetSysColor(background));
+        return (LRESULT)(ULONG_PTR)GetSysColorBrush_u32(background);
+    }
     case WM_NCHITTEST:  return HTCLIENT;
     case WM_NCLBUTTONDOWN:
         if (wParam == HTCAPTION) {
@@ -6354,24 +6552,12 @@ static LRESULT WINAPI system_class_wndproc(HWND hWnd, DWORD Msg,
                                             WPARAM wParam, LPARAM lParam)
 {
     WINDOW *window = find_window(hWnd);
-    if (window && u32_stricmp(window->class_name, "BUTTON") == 0 &&
-        !(window->style & WS_DISABLED)) {
-        if (Msg == WM_LBUTTONDOWN) {
-            SetFocus(hWnd);
-            return 0;
-        }
-        if (Msg == WM_LBUTTONUP || Msg == BM_CLICK ||
-            (Msg == WM_KEYUP && wParam == VK_SPACE)) {
-            if (window->parent) {
-                WPARAM command = (WPARAM)(
-                    (UINT)(ULONG_PTR)window->menu & 0xFFFFU);
-                command |= (WPARAM)BN_CLICKED << 16;
-                SendMessageA(window->parent, WM_COMMAND, command,
-                             (LPARAM)(ULONG_PTR)hWnd);
-            }
-            return 0;
-        }
-    }
+    LRESULT result;
+    if (window && window->control && user32_control_message(
+            window->control, hWnd, Msg, wParam, lParam, &result)) return result;
+    USER_HOOK_CONTEXT *context = user_hook_context_get(FALSE);
+    if (context && context->unicode_message)
+        return DefWindowProcW(hWnd, Msg, wParam, lParam);
     return DefWindowProcA(hWnd, Msg, wParam, lParam);
 }
 
@@ -8194,7 +8380,10 @@ LONG_PTR WINAPI SetWindowLongPtrA(HWND hWnd, int nIndex,
         place_window_in_z_order(w, HWND_TOP);
         break;
     case GWL_USERDATA: w->user_data = (PVOID)(ULONG_PTR)dwNewLong; break;
-    case GWL_WNDPROC:  w->wndproc = (WNDPROC)(ULONG_PTR)dwNewLong; break;
+    case GWL_WNDPROC:
+        w->wndproc = (WNDPROC)(ULONG_PTR)dwNewLong;
+        w->unicode = FALSE;
+        break;
     case GWL_ID:       w->menu = (HMENU)(ULONG_PTR)dwNewLong; break;
     case GWL_HWNDPARENT: {
         HWND relation = (HWND)(ULONG_PTR)dwNewLong;
@@ -11647,10 +11836,7 @@ LRESULT WINAPI DispatchMessageW(const MSG *lpMsg)
 
 LRESULT WINAPI SendMessageW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
-    LRESULT result = 0;
-    send_message_wait(hWnd, Msg, wParam, lParam, 0xFFFFFFFFU,
-                      FALSE, &result);
-    return result;
+    return send_message_text(hWnd, Msg, wParam, lParam, TRUE);
 }
 
 LRESULT WINAPI SendMessageTimeoutW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam,
@@ -11658,7 +11844,7 @@ LRESULT WINAPI SendMessageTimeoutW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM l
 {
     LRESULT result = 0;
     BOOL completed = send_message_wait(hWnd, Msg, wParam, lParam, uTimeout,
-                                       (fuFlags & 0x0001U) != 0, &result);
+                                       (fuFlags & 0x0001U) != 0, TRUE, &result);
     if (lpdwResult) {
         if (g_compat32_mode)
             *(uint32_t *)(void *)lpdwResult = (uint32_t)result;
@@ -12694,21 +12880,37 @@ LRESULT WINAPI CallWindowProcA(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
     }
     /* A subclass calls an earlier procedure, not a second message delivery.
      * Native class procedures already have callable PE32 thunks. */
+    USER_HOOK_CONTEXT *context = user_hook_context_get(TRUE);
+    if (!context) { SetLastError(8); return 0; }
+    BOOL previous = context->unicode_message;
+    context->unicode_message = FALSE;
     dispatch_depth++;
     LRESULT result = invoke_wndproc((WNDPROC)lpPrevWndFunc, hWnd, Msg,
                                     wParam, lParam);
     dispatch_depth--;
+    context->unicode_message = previous;
     return result;
 }
 
 LRESULT WINAPI CallWindowProcW(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
                                 WPARAM wParam, LPARAM lParam)
 {
-    return CallWindowProcA(lpPrevWndFunc, hWnd, Msg, wParam, lParam);
+    if (!lpPrevWndFunc) return DefWindowProcW(hWnd, Msg, wParam, lParam);
+    USER_HOOK_CONTEXT *context = user_hook_context_get(TRUE);
+    if (!context) { SetLastError(8); return 0; }
+    BOOL previous = context->unicode_message;
+    context->unicode_message = TRUE;
+    dispatch_depth++;
+    LRESULT result = invoke_wndproc((WNDPROC)lpPrevWndFunc, hWnd, Msg, wParam, lParam);
+    dispatch_depth--;
+    context->unicode_message = previous;
+    return result;
 }
 
 LRESULT WINAPI DefWindowProcW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
+    if (Msg == 0x000C || Msg == 0x000D || Msg == 0x000E)
+        return window_text_message(hWnd, Msg, wParam, lParam, TRUE);
     return DefWindowProcA(hWnd, Msg, wParam, lParam);
 }
 
@@ -12753,9 +12955,19 @@ HWND WINAPI CreateWindowExW(DWORD dwExStyle, PCWSTR lpClassName,
             name_arg = nameA;
         }
     }
-    return CreateWindowExA(dwExStyle, class_arg, name_arg, dwStyle,
-                           X, Y, nWidth, nHeight,
-                           hWndParent, hMenu, hInstance, lpParam);
+    HWND window = CreateWindowExA(dwExStyle, class_arg, name_arg, dwStyle,
+        X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+    WINDOW *entry = find_window(window);
+    if (entry) {
+        WNDCLASS_ENTRY *cls = lookup_class_for_pid(entry->class_name, entry->owner_pid);
+        if (cls && cls->system_class) entry->unicode = TRUE;
+    }
+    if (window && lpWindowName && (ULONG_PTR)lpWindowName > 0xFFFF &&
+        !window_set_text(window, lpWindowName, TRUE)) {
+        DestroyWindow(window);
+        return NULL;
+    }
+    return window;
 }
 
 WORD WINAPI RegisterClassExW(PVOID lpwcx)
@@ -12809,6 +13021,7 @@ WORD WINAPI RegisterClassExW(PVOID lpwcx)
     e->class_name_ptr = (ULONG_PTR)class_name;
     e->hIconSm = wcx.hIconSm;
     e->owner_pid = pid;
+    e->unicode = TRUE;
     e->used = 1;
     return e->atom;
 }
@@ -13101,7 +13314,7 @@ LONG WINAPI GetWindowLongW(HWND hWnd, int nIndex)
 
 LONG WINAPI SetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
 {
-    return SetWindowLongA(hWnd, nIndex, dwNewLong);
+    return (LONG)SetWindowLongPtrW(hWnd, nIndex, dwNewLong);
 }
 
 LONG_PTR WINAPI GetWindowLongPtrW(HWND hWnd, int nIndex)
@@ -13110,9 +13323,12 @@ LONG_PTR WINAPI GetWindowLongPtrW(HWND hWnd, int nIndex)
 }
 
 LONG_PTR WINAPI SetWindowLongPtrW(HWND hWnd, int nIndex,
-                                  LONG_PTR dwNewLong)
+                                   LONG_PTR dwNewLong)
 {
-    return SetWindowLongPtrA(hWnd, nIndex, dwNewLong);
+    LONG_PTR result = SetWindowLongPtrA(hWnd, nIndex, dwNewLong);
+    WINDOW *window = find_window(hWnd);
+    if (window && nIndex == GWL_WNDPROC) window->unicode = TRUE;
+    return result;
 }
 
 BOOL WINAPI IsWindow(HWND hWnd)
@@ -17078,6 +17294,8 @@ static const SHIM_EXPORT user32_exports[] = {
     { "GetWindowTextLengthA", (PVOID)GetWindowTextLengthA, 1, CC_STDCALL },
     { "GetWindowTextLengthW", (PVOID)GetWindowTextLengthW, 1, CC_STDCALL },
     { "GetWindowTextW",     (PVOID)GetWindowTextW, 3, CC_STDCALL },
+    { "GetWindowTextA",     (PVOID)GetWindowTextA, 3, CC_STDCALL },
+    { "IsWindowUnicode",    (PVOID)IsWindowUnicode, 1, CC_STDCALL },
     { "SetWindowPos",       (PVOID)SetWindowPos, 7, CC_STDCALL },
     { "MoveWindow",         (PVOID)MoveWindow, 6, CC_STDCALL },
     { "BeginDeferWindowPos",(PVOID)BeginDeferWindowPos, 1, CC_STDCALL },

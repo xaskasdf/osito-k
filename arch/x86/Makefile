@@ -242,7 +242,7 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
              win32/wintime.c win32/kernel32_shim.c win32/profile.c \
              win32/ntdll_shim.c \
             win32/msvcrt_shim.c \
-             win32/user32_shim.c win32/user32_text.c win32/gdi32_shim.c win32/opengl32_shim.c \
+             win32/user32_shim.c win32/user32_text.c win32/user32_controls.c win32/gdi32_shim.c win32/opengl32_shim.c \
              win32/libusb_shim.c \
              win32/dxgi_shim.c win32/version_shim.c \
             win32/advapi32_shim.c win32/scm.c \
