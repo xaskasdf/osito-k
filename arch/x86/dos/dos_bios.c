@@ -10,6 +10,7 @@
 
 #include "cpu8086.h"
 #include "dos_hostmem.h"
+#include "dos_keyboard.h"
 #include "dos_mouse.h"
 #include "dos_time.h"
 #include "dos_vbe.h"
@@ -19,6 +20,8 @@ extern void serial_puthex(uint64_t val, int digits);
 
 extern int  kb_has_input(void);
 extern char kb_getchar(void);
+extern void kbd_flush(void);
+extern int serial_getc(void);
 extern uint8_t kb_get_bios_shift_flags(void);
 
 /* Kernel ticks (100 Hz) */
@@ -111,11 +114,15 @@ static void dos_key_enqueue(dos_vm_t *vm, uint8_t ascii)
     vm->kb_head = next;
 }
 
-static bool dos_key_pump(dos_vm_t *vm)
+bool dos_keyboard_ready(dos_vm_t *vm)
 {
     if (dos_key_pending(vm)) return true;
-    if (!kb_has_input()) return false;
-    dos_key_enqueue(vm, (uint8_t)kb_getchar());
+    if (kb_has_input()) {
+        dos_key_enqueue(vm, (uint8_t)kb_getchar());
+    } else {
+        int ch = serial_getc();
+        if (ch >= 0) dos_key_enqueue(vm, (uint8_t)ch);
+    }
     return dos_key_pending(vm);
 }
 
@@ -124,6 +131,23 @@ static uint16_t dos_key_pop(dos_vm_t *vm)
     uint16_t key = vm->kb_buffer[vm->kb_tail];
     vm->kb_tail = (uint8_t)((vm->kb_tail + 1U) & DOS_KEY_BUFFER_MASK);
     return key;
+}
+
+uint16_t dos_keyboard_read(dos_vm_t *vm)
+{
+    if (!dos_key_pending(vm))
+        dos_key_enqueue(vm, (uint8_t)kb_getchar());
+    return dos_key_pop(vm);
+}
+
+void dos_keyboard_flush(dos_vm_t *vm)
+{
+    vm->kb_tail = vm->kb_head;
+    vm->console_scan_pending = 0;
+    vm->console_line_count = 0;
+    vm->console_line_position = 0;
+    kbd_flush();
+    while (serial_getc() >= 0) { }
 }
 
 static uint32_t dos_text_addr(uint8_t page, uint8_t row, uint8_t col)
@@ -482,16 +506,14 @@ void dos_int16_keyboard(dos_vm_t *vm)
     /* AH=00h/10h: Read key (blocking) */
     case 0x00:
     case 0x10: {
-        if (!dos_key_pending(vm))
-            dos_key_enqueue(vm, (uint8_t)kb_getchar());
-        cpu->ax = dos_key_pop(vm);
+        cpu->ax = dos_keyboard_read(vm);
         break;
     }
 
     /* AH=01h/11h: Check key (non-blocking) */
     case 0x01:
     case 0x11:
-        if (dos_key_pump(vm)) {
+        if (dos_keyboard_ready(vm)) {
             cpu->flags &= ~FLAG_ZF;
             cpu->ax = vm->kb_buffer[vm->kb_tail];
         } else {

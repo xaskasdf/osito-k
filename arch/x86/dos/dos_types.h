@@ -54,6 +54,7 @@ enum {
     DOS_ERR_INVALID_DATA = 13,
     DOS_ERR_INVALID_DRIVE = 15,
     DOS_ERR_NO_MORE_FILES = 18,
+    DOS_ERR_NOT_READY = 21,
     DOS_ERR_SHARING_VIOLATION = 32,
     DOS_ERR_FILE_EXISTS = 80,
     DOS_ERR_CANNOT_MAKE = 82
@@ -144,6 +145,7 @@ typedef struct {
     uint32_t position;      /* current seek position */
     uint32_t file_size;     /* cached file size */
     uint16_t open_mode;     /* DOS access/share/inheritance/open flags */
+    uint16_t io_flags;      /* shared SFT IOCTL flags, not driver attributes */
     uint16_t owner_psp;     /* PSP that created this SFT entry */
     bool     is_device;     /* true for DOS character devices */
     uint8_t  device_kind;
@@ -280,6 +282,10 @@ typedef struct dos_vm {
     uint16_t         kb_buffer[16];     /* circular buffer (scancode<<8 | ascii) */
     uint8_t          kb_head;
     uint8_t          kb_tail;
+    uint8_t          console_scan_pending;
+    uint8_t          console_line[129]; /* 127 edited bytes, CR, LF */
+    uint16_t         console_line_count;
+    uint16_t         console_line_position;
 
     /* Timer */
     uint32_t         bios_ticks;        /* INT 1Ah tick count */

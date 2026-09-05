@@ -13,6 +13,7 @@
 #include "dos_audio.h"
 #include "dos_find.h"
 #include "dos_io.h"
+#include "dos_keyboard.h"
 #include "dos_loader.h"
 #include "dos_mouse.h"
 #include "dos_time.h"
@@ -28,8 +29,6 @@ extern int  disk_flush(void);
 
 /* Console output — bridges to OsitoK's framebuffer */
 extern void fb_putchar(char c);
-extern int  kb_has_input(void);
-extern char kb_getchar(void);
 
 /* OsitoFS. The v2 entry points delegate to v3 when it is mounted. */
 extern bool     osfs2_is_mounted(void);
@@ -66,6 +65,7 @@ extern int      dos_mem_selftest(void);
 enum {
     DOS_ERROR_CLASS_OUT_RESOURCE = 1,
     DOS_ERROR_CLASS_AUTHORIZATION = 3,
+    DOS_ERROR_CLASS_HARDWARE = 5,
     DOS_ERROR_CLASS_APPLICATION = 7,
     DOS_ERROR_CLASS_NOT_FOUND = 8,
     DOS_ERROR_CLASS_BAD_FORMAT = 9,
@@ -83,6 +83,7 @@ enum {
 enum {
     DOS_ERROR_LOCUS_UNKNOWN = 1,
     DOS_ERROR_LOCUS_DISK = 2,
+    DOS_ERROR_LOCUS_SERIAL_DEVICE = 4,
     DOS_ERROR_LOCUS_MEMORY = 5
 };
 
@@ -127,6 +128,15 @@ enum {
     DOS_SYSVARS_OFF = 0x0080,
     DOS_SYSVARS_SIZE = 0x006A,
     DOS_INDOS_OFF = 0x00F0
+};
+
+enum {
+    DOS_IO_CON_IN = 0x01,
+    DOS_IO_CON_OUT = 0x02,
+    DOS_IO_NUL = 0x04,
+    DOS_IO_RAW = 0x20,
+    DOS_IO_NOT_EOF = 0x40,
+    DOS_IO_DEVICE = 0x80
 };
 
 static bool dos_allocation_strategy_valid(uint8_t strategy)
@@ -200,6 +210,8 @@ static int dos_clone_handle(dos_vm_t *vm, int source, int target,
 static uint8_t dos_extended_error_locus(uint8_t function, uint16_t error)
 {
     switch (error) {
+    case DOS_ERR_NOT_READY:
+        return DOS_ERROR_LOCUS_SERIAL_DEVICE;
     case DOS_ERR_FILE_NOT_FOUND:
     case DOS_ERR_PATH_NOT_FOUND:
     case DOS_ERR_INVALID_DRIVE:
@@ -249,6 +261,10 @@ static void dos_record_extended_error(dos_vm_t *vm, uint8_t function,
     uint8_t action = DOS_ERROR_ACTION_ABORT;
 
     switch (error) {
+    case DOS_ERR_NOT_READY:
+        error_class = DOS_ERROR_CLASS_HARDWARE;
+        action = DOS_ERROR_ACTION_USER;
+        break;
     case DOS_ERR_INVALID_FUNCTION:
     case DOS_ERR_INVALID_HANDLE:
     case DOS_ERR_INVALID_ACCESS:
@@ -361,6 +377,9 @@ void dos_api_init(dos_vm_t *vm)
     vm->jft_external_segment = 0;
     vm->jft_external_psp = 0;
     vm->jft_active = false;
+    vm->console_scan_pending = 0;
+    vm->console_line_count = 0;
+    vm->console_line_position = 0;
     dos_find_init(vm);
     for (unsigned i = 0; i < DOS_PSP_JFT_ENTRIES; i++)
         vm->bootstrap_jft[i].sft_index = DOS_SFT_INVALID;
@@ -502,10 +521,17 @@ static uint8_t dos_device_from_path(const char *path)
         length++;
     if (name[length] == ':' && name[length + 1] != 0)
         return DOS_DEVICE_NONE;
-    if (length == 3u && dos_ascii_upper((uint8_t)name[0]) == 'N' &&
-        dos_ascii_upper((uint8_t)name[1]) == 'U' &&
-        dos_ascii_upper((uint8_t)name[2]) == 'L')
-        return DOS_DEVICE_NUL;
+    static const struct { const char *name; uint8_t kind; } devices[] = {
+        {"NUL", DOS_DEVICE_NUL}, {"CON", DOS_DEVICE_CON},
+        {"AUX", DOS_DEVICE_AUX}, {"PRN", DOS_DEVICE_PRN},
+        {"COM1", DOS_DEVICE_AUX}, {"LPT1", DOS_DEVICE_PRN}
+    };
+    for (unsigned d = 0; d < sizeof(devices) / sizeof(devices[0]); d++) {
+        unsigned i = 0;
+        while (i < length && devices[d].name[i] &&
+               dos_ascii_upper((uint8_t)name[i]) == devices[d].name[i]) i++;
+        if (i == length && !devices[d].name[i]) return devices[d].kind;
+    }
     return DOS_DEVICE_NONE;
 }
 
@@ -1146,6 +1172,7 @@ static int dos_bind_file_handle(dos_vm_t *vm, int handle, void *file,
     entry->position = 0;
     entry->file_size = dos_file_size32(file);
     entry->open_mode = open_mode;
+    entry->io_flags = DOS_IO_NOT_EOF | vm->current_drive;
     entry->owner_psp = vm->current_psp;
     entry->is_device = false;
     entry->device_kind = DOS_DEVICE_NONE;
@@ -1180,6 +1207,11 @@ static int dos_bind_device_handle(dos_vm_t *vm, int handle,
     entry->owner_psp = vm->current_psp;
     entry->is_device = true;
     entry->device_kind = device_kind;
+    entry->io_flags = DOS_IO_DEVICE | DOS_IO_NOT_EOF;
+    if (device_kind == DOS_DEVICE_CON)
+        entry->io_flags |= 0x10u | DOS_IO_CON_IN | DOS_IO_CON_OUT;
+    else if (device_kind == DOS_DEVICE_NUL)
+        entry->io_flags |= DOS_IO_NUL;
     if (!dos_jft_write(vm, (uint16_t)handle, (uint8_t)index)) {
         *entry = (dos_sft_entry_t){0};
         return DOS_ERR_ACCESS_DENIED;
@@ -1189,17 +1221,8 @@ static int dos_bind_device_handle(dos_vm_t *vm, int handle,
 
 static uint16_t dos_handle_device_info(const dos_sft_entry_t *entry)
 {
-    if (!entry || !entry->is_device) return 0;
-    switch (entry->device_kind) {
-    case DOS_DEVICE_CON:
-        return 0x80D3u;
-    case DOS_DEVICE_NUL:
-        return 0x80C4u;
-    case DOS_DEVICE_AUX:
-    case DOS_DEVICE_PRN:
-    default:
-        return 0x80C0u;
-    }
+    if (!entry) return 0;
+    return (entry->io_flags & 0xFFu) | (entry->is_device ? 0x8000u : 0u);
 }
 
 static void dos_release_file_handle(dos_vm_t *vm, int handle)
@@ -1673,8 +1696,10 @@ static void dos_exec_restore_sft(dos_vm_t *vm,
                 : current->osfs_file == saved->osfs_file);
         uint32_t position = saved->position;
         uint32_t file_size = saved->file_size;
+        uint16_t io_flags = saved->io_flags;
         if (same_object) {
             position = current->position;
+            io_flags = current->io_flags;
             file_size = current->is_device
                       ? 0 : dos_file_size32(current->osfs_file);
         } else if (current->used && !current->is_device &&
@@ -1684,6 +1709,7 @@ static void dos_exec_restore_sft(dos_vm_t *vm,
         *current = *saved;
         current->position = position;
         current->file_size = file_size;
+        current->io_flags = io_flags;
 
         /* The live entry already owns a retain when it survived the child.
          * Otherwise the snapshot retain becomes the restored entry's retain. */
@@ -2420,6 +2446,141 @@ static void dos_putchar(dos_vm_t *vm, char ch)
     serial_putchar(ch);  /* echo to serial for debugging */
 }
 
+static bool dos_console_input_ready(dos_vm_t *vm)
+{
+    return vm->console_scan_pending != 0 || dos_keyboard_ready(vm);
+}
+
+static uint8_t dos_console_getchar(dos_vm_t *vm)
+{
+    if (vm->console_scan_pending) {
+        uint8_t scan = vm->console_scan_pending;
+        vm->console_scan_pending = 0;
+        return scan;
+    }
+    uint16_t key = dos_keyboard_read(vm);
+    if (!(key & 0xFFu)) vm->console_scan_pending = (uint8_t)(key >> 8);
+    return (uint8_t)key;
+}
+
+/* Capacity includes the terminating CR, as in INT 21h/AH=0Ah. */
+static uint16_t dos_console_read_line(dos_vm_t *vm, uint8_t *buffer,
+                                      uint16_t capacity)
+{
+    uint16_t count = 0;
+    if (!capacity) return 0;
+    for (;;) {
+        uint8_t ch = dos_console_getchar(vm);
+        if (ch == '\r' || ch == '\n') {
+            buffer[count] = '\r';
+            dos_putchar(vm, '\r');
+            return count;
+        }
+        if (ch == '\b') {
+            if (count) {
+                count--;
+                dos_putchar(vm, '\b');
+                dos_putchar(vm, ' ');
+                dos_putchar(vm, '\b');
+            }
+            continue;
+        }
+        if (count + 1u < capacity) {
+            buffer[count++] = ch;
+            dos_putchar(vm, (char)ch);
+        } else {
+            dos_putchar(vm, '\a');
+        }
+    }
+}
+
+static uint16_t dos_console_read_handle(dos_vm_t *vm, dos_sft_entry_t *entry,
+                                        uint32_t address, uint16_t count)
+{
+    if (!count || !(entry->io_flags & DOS_IO_NOT_EOF)) return 0;
+    if ((entry->io_flags & DOS_IO_RAW) ||
+        !(entry->io_flags & DOS_IO_CON_IN)) {
+        uint16_t total = 0;
+        while (total < count) {
+            uint8_t ch = dos_console_getchar(vm);
+            dos_mem_write8(vm, address + total++, ch);
+            if (!(entry->io_flags & DOS_IO_RAW)) {
+                if (ch == 0x1Au) entry->io_flags &= ~DOS_IO_NOT_EOF;
+                if (ch == '\r' || ch == 0x1Au) break;
+            }
+        }
+        return total;
+    }
+
+    /* DOS retains the edited CON line across short reads and appends LF.
+     * The line is device-wide; raw mode bypasses it without losing it. */
+    if (vm->console_line_position == vm->console_line_count) {
+        uint16_t length = dos_console_read_line(vm, vm->console_line, 128u);
+        vm->console_line_position = 0;
+        vm->console_line_count = 0;
+        if (vm->console_line[0] == 0x1Au) {
+            entry->io_flags &= ~DOS_IO_NOT_EOF;
+            dos_putchar(vm, '\n');
+            return 0;
+        }
+        vm->console_line[length + 1u] = '\n';
+        vm->console_line_count = length + 2u;
+    }
+    uint16_t available = vm->console_line_count - vm->console_line_position;
+    uint16_t total = count < available ? count : available;
+    for (uint16_t i = 0; i < total; i++) {
+        uint8_t ch = vm->console_line[vm->console_line_position++];
+        dos_mem_write8(vm, address + i, ch);
+        if (ch == '\n') dos_putchar(vm, '\n');
+    }
+    return total;
+}
+
+static int dos_ioctl_handle(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    uint8_t function = cpu->al;
+    switch (function) {
+    case 0: case 1: case 2: case 3: case 6: case 7: case 0x0A: case 0x0C:
+        break;
+    default:
+        return DOS_ERR_INVALID_FUNCTION;
+    }
+    dos_sft_entry_t *entry = dos_handle_sft(vm, cpu->bx);
+    if (!entry) return DOS_ERR_INVALID_HANDLE;
+    if (function == 0) {
+        cpu->ax = cpu->dx = dos_handle_device_info(entry);
+        return 0;
+    }
+    if (function == 1) {
+        /* DOS 4+ permits DH bit 0 (return disk-full errors to the caller).
+         * Driver attributes are not writable, and character identity stays set. */
+        if (cpu->dh & ~1u) return DOS_ERR_INVALID_DATA;
+        if (entry->is_device)
+            entry->io_flags = (entry->io_flags & 0xFF00u) |
+                              cpu->dl | DOS_IO_DEVICE;
+        entry->io_flags |= cpu->dx & 0x100u;
+        return 0;
+    }
+    if (function == 0x0A) {
+        cpu->dx = entry->io_flags; /* No network SFTs are advertised. */
+        return 0;
+    }
+    if (function != 6 && function != 7) return DOS_ERR_INVALID_FUNCTION;
+
+    bool ready = false;
+    if (!entry->is_device) {
+        if (!entry->osfs_file) return DOS_ERR_INVALID_HANDLE;
+        entry->file_size = dos_file_size32(entry->osfs_file);
+        ready = function == 7 || entry->position < entry->file_size;
+    } else if (entry->device_kind == DOS_DEVICE_NUL) {
+        ready = true; /* Reading EOF from NUL also completes immediately. */
+    } else if (entry->device_kind == DOS_DEVICE_CON) {
+        ready = function == 7 || dos_console_input_ready(vm);
+    }
+    cpu->al = ready ? 0xFFu : 0u;
+    return 0;
+}
+
 /* ── INT 21h function dispatch ──────────────────────────────────── */
 
 void dos_int21_dispatch(dos_vm_t *vm)
@@ -2448,7 +2609,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
 
     /* ── AH=01h: Read char with echo ────────────────────────────── */
     case 0x01: {
-        char ch = kb_getchar();
+        char ch = (char)dos_console_getchar(vm);
         dos_putchar(vm, ch);
         cpu->al = (uint8_t)ch;
         break;
@@ -2463,8 +2624,8 @@ void dos_int21_dispatch(dos_vm_t *vm)
     case 0x06:
         if (cpu->dl == 0xFF) {
             /* Input */
-            if (kb_has_input()) {
-                cpu->al = (uint8_t)kb_getchar();
+            if (dos_console_input_ready(vm)) {
+                cpu->al = dos_console_getchar(vm);
                 cpu->flags &= ~FLAG_ZF;
             } else {
                 cpu->al = 0;
@@ -2479,7 +2640,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
     /* ── AH=07h/08h: Read char without echo ─────────────────────── */
     case 0x07:
     case 0x08: {
-        cpu->al = (uint8_t)kb_getchar();
+        cpu->al = dos_console_getchar(vm);
         break;
     }
 
@@ -2502,41 +2663,24 @@ void dos_int21_dispatch(dos_vm_t *vm)
     case 0x0A: {
         uint32_t buf_addr = dos_addr(vm, cpu->ds, cpu->dx);
         uint8_t max_len = dos_mem_read8(vm, buf_addr);
-        uint8_t count = 0;
-        for (;;) {
-            char ch = kb_getchar();
-            if (ch == '\r' || ch == '\n') {
-                dos_putchar(vm, '\r');
-                dos_putchar(vm, '\n');
-                break;
-            }
-            if (ch == 8 && count > 0) {  /* backspace */
-                count--;
-                dos_putchar(vm, '\b');
-                dos_putchar(vm, ' ');
-                dos_putchar(vm, '\b');
-                continue;
-            }
-            if (count < max_len - 1) {
-                dos_mem_write8(vm, buf_addr + 2 + count, (uint8_t)ch);
-                dos_putchar(vm, ch);
-                count++;
-            }
-        }
-        dos_mem_write8(vm, buf_addr + 2 + count, 0x0D);
-        dos_mem_write8(vm, buf_addr + 1, count);
+        if (!max_len || dos_guest_buffer(vm, cpu->ds, cpu->dx,
+                                         (uint32_t)max_len + 2u,
+                                         &buf_addr) < 0) break;
+        uint16_t count = dos_console_read_line(vm, vm->mem + buf_addr + 2u,
+                                               max_len);
+        dos_mem_write8(vm, buf_addr + 1u, (uint8_t)count);
         break;
     }
 
     /* ── AH=0Bh: Check stdin status ─────────────────────────────── */
     case 0x0B:
-        cpu->al = kb_has_input() ? 0xFF : 0x00;
+        cpu->al = dos_console_input_ready(vm) ? 0xFF : 0x00;
         break;
 
     /* ── AH=0Ch: Flush input + call function ────────────────────── */
     case 0x0C:
         /* Flush keyboard buffer */
-        while (kb_has_input()) kb_getchar();
+        dos_keyboard_flush(vm);
         /* Re-dispatch with AL as function */
         if (cpu->al == 0x01 || cpu->al == 0x06 || cpu->al == 0x07 ||
             cpu->al == 0x08 || cpu->al == 0x0A) {
@@ -2842,21 +2986,14 @@ void dos_int21_dispatch(dos_vm_t *vm)
                     cpu->ax = DOS_ERR_ACCESS_DENIED;
                     break;
                 }
-                uint16_t total = 0;
-                while (total < count) {
-                    char ch = kb_getchar();
-                    dos_mem_write8(vm, buf + total, (uint8_t)ch);
-                    total++;
-                    if (ch == '\r' || ch == '\n') break;
-                }
-                cpu->ax = total;
+                cpu->ax = dos_console_read_handle(vm, fh, buf, count);
                 cpu->flags &= ~FLAG_CF;
             } else if (fh->device_kind == DOS_DEVICE_NUL) {
                 cpu->ax = 0;
                 cpu->flags &= ~FLAG_CF;
             } else {
                 cpu->flags |= FLAG_CF;
-                cpu->ax = DOS_ERR_ACCESS_DENIED;
+                cpu->ax = DOS_ERR_NOT_READY;
             }
             break;
         }
@@ -2938,6 +3075,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
             break;
         }
         if (fh->is_device) {
+            fh->io_flags |= DOS_IO_NOT_EOF;
             if (fh->device_kind == DOS_DEVICE_CON) {
                 uint32_t buf = 0;
                 if (count && dos_guest_buffer(vm, cpu->ds, cpu->dx, count,
@@ -2946,16 +3084,21 @@ void dos_int21_dispatch(dos_vm_t *vm)
                     cpu->ax = DOS_ERR_ACCESS_DENIED;
                     break;
                 }
-                for (uint16_t i = 0; i < count; i++)
-                    dos_putchar(vm, (char)dos_mem_read8(vm, buf + i));
-                cpu->ax = count;
+                uint16_t written = 0;
+                while (written < count) {
+                    uint8_t ch = dos_mem_read8(vm, buf + written);
+                    if (ch == 0x1Au && !(fh->io_flags & DOS_IO_RAW)) break;
+                    dos_putchar(vm, (char)ch);
+                    written++;
+                }
+                cpu->ax = written;
                 cpu->flags &= ~FLAG_CF;
             } else if (fh->device_kind == DOS_DEVICE_NUL) {
                 cpu->ax = count;
                 cpu->flags &= ~FLAG_CF;
             } else {
                 cpu->flags |= FLAG_CF;
-                cpu->ax = DOS_ERR_ACCESS_DENIED;
+                cpu->ax = DOS_ERR_NOT_READY;
             }
             break;
         }
@@ -2971,6 +3114,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
                 break;
             }
             fh->file_size = fh->position;
+            fh->io_flags &= ~DOS_IO_NOT_EOF; /* Disk bit 6 means unwritten. */
             cpu->ax = 0;
             cpu->flags &= ~FLAG_CF;
             break;
@@ -2990,6 +3134,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
             break;
         }
         fh->position += count;
+        fh->io_flags &= ~DOS_IO_NOT_EOF;
         if (fh->position > fh->file_size) fh->file_size = fh->position;
         cpu->ax = count;
         cpu->flags &= ~FLAG_CF;
@@ -3126,21 +3271,12 @@ void dos_int21_dispatch(dos_vm_t *vm)
 
     /* ── AH=44h: IOCTL ──────────────────────────────────────────── */
     case 0x44: {
-        uint16_t h = cpu->bx;
-        if (cpu->al == 0x00) {
-            dos_sft_entry_t *entry = dos_handle_sft(vm, h);
-            if (!entry) {
-                cpu->flags |= FLAG_CF;
-                cpu->ax = DOS_ERR_INVALID_HANDLE;
-                break;
-            }
-            uint16_t info = dos_handle_device_info(entry);
-            cpu->ax = info;
-            cpu->dx = info;
-            cpu->flags &= ~FLAG_CF;
-        } else {
+        int error = dos_ioctl_handle(vm, cpu);
+        if (error) {
             cpu->flags |= FLAG_CF;
-            cpu->ax = DOS_ERR_INVALID_FUNCTION;
+            cpu->ax = (uint16_t)error;
+        } else {
+            cpu->flags &= ~FLAG_CF;
         }
         break;
     }

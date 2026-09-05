@@ -400,6 +400,18 @@ $(BUILD)/test/doscon.com: $(BUILD)/test/dos_console_input.o \
 $(BUILD)/test/dos_console_input.o: test/dos_console_input.S | $(BUILD)/test
 	as --32 -o $@ $<
 
+$(BUILD)/test/dosioctl.com: $(BUILD)/test/dos_ioctl.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_ioctl.o: test/dos_ioctl.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/iochild.com: $(BUILD)/test/dos_ioctl_child.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_ioctl_child.o: test/dos_ioctl_child.S | $(BUILD)/test
+	as --32 -o $@ $<
+
 $(BUILD)/test/doserr.com: $(BUILD)/test/dos_extended_error.o \
 		test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
