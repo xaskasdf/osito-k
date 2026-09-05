@@ -185,6 +185,8 @@ static LRESULT WINAPI system_class_wndproc(HWND hWnd, DWORD Msg,
                                             WPARAM wParam, LPARAM lParam);
 static LRESULT WINAPI dialog_class_wndproc(HWND hWnd, DWORD Msg,
                                             WPARAM wParam, LPARAM lParam);
+static void default_window_paint(HWND window);
+static HBRUSH WINAPI GetSysColorBrush_u32(int index);
 
 /* USER32 registers these classes before application code can use them.  The
  * metadata matches 32-bit and 64-bit NT; cbWndExtra is ABI-stable for these
@@ -4868,6 +4870,7 @@ static void release_window(WINDOW *w)
         (w->style & WS_CHILD) ? NULL : w->menu, w->system_menu);
     if (w->compositor_id && compositor_destroy_window)
         compositor_destroy_window(w->compositor_id);
+    gdi32_release_window_dc(w->handle);
     if (w->shm_handle && shm_unmap)
         shm_unmap(w->shm_handle);
     if (w->shm_handle && shm_destroy)
@@ -6120,7 +6123,19 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
     case WM_CLOSE:      DestroyWindow(hWnd); return 0;
     case WM_DESTROY:    return 0;
     case WM_NCDESTROY:  return 0;
-    case WM_ERASEBKGND: return 1;       /* "erased" */
+    case WM_ERASEBKGND: {
+        WINDOW *window = find_window(hWnd);
+        WNDCLASS_ENTRY *entry = window
+            ? lookup_class_for_pid(window->class_name, window->owner_pid) : NULL;
+        if (!entry || !entry->hbrBackground) return 0;
+        RECT rect;
+        if (!GetClientRect(hWnd, &rect)) return 0;
+        return FillRect((HDC)(ULONG_PTR)wParam, &rect, entry->hbrBackground);
+    }
+    case 0x0136: /* WM_CTLCOLORDLG */
+        SetTextColor((HDC)(ULONG_PTR)wParam, GetSysColor(8));
+        SetBkColor((HDC)(ULONG_PTR)wParam, GetSysColor(15));
+        return (LRESULT)(ULONG_PTR)GetSysColorBrush_u32(15);
     case WM_NCHITTEST:  return HTCLIENT;
     case WM_NCLBUTTONDOWN:
         if (wParam == HTCAPTION) {
@@ -6203,8 +6218,7 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
         }
         break;
     case WM_PAINT:
-        /* Default window procedures consume the pending update region. */
-        ValidateRect(hWnd, NULL);
+        default_window_paint(hWnd);
         return 0;
     }
 
@@ -6270,6 +6284,17 @@ static LRESULT dialog_default_proc(HWND hWnd, DWORD Msg,
 {
     U32_DIALOG_STATE *state = dialog_state_find(hWnd);
     switch (Msg) {
+    case WM_ERASEBKGND: {
+        BOOL compat32 = g_compat32_mode;
+        LRESULT result = SendMessageA(
+            hWnd, 0x0136, wParam, (LPARAM)(ULONG_PTR)hWnd); /* WM_CTLCOLORDLG */
+        /* LRESULT is signed; a PE32 brush handle is an unsigned 32-bit value. */
+        HBRUSH brush = (HBRUSH)(compat32
+            ? (ULONG_PTR)(uint32_t)result : (ULONG_PTR)result);
+        RECT rect;
+        if (!brush || !GetClientRect(hWnd, &rect)) return 0;
+        return FillRect((HDC)(ULONG_PTR)wParam, &rect, brush);
+    }
     case WM_INITDIALOG:
         return TRUE;
     case WM_CLOSE:
@@ -12563,47 +12588,50 @@ _Static_assert(sizeof(PAINTSTRUCT64_K32) == 72,
 HDC WINAPI BeginPaint(HWND hWnd, PVOID lpPaint)
 {
     WINDOW *w = find_window(hWnd);
+    if (!w || !lpPaint) {
+        SetLastError(!w ? 1400 : 87);
+        return NULL;
+    }
+    BOOL compat32 = g_compat32_mode;
     HDC hdc = gdi32_alloc_window_dc(hWnd);
     RECT paint = { 0, 0, 0, 0 };
     BOOL erase = FALSE;
-
-    serial_puts("[USER32] BeginPaint hwnd=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
-    serial_puts(" -> hdc=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)hdc, 8);
-    serial_puts(" mode=");
-    serial_puts(g_compat32_mode ? "32\n" : "64\n");
-
     if (!hdc) {
         SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;
     }
-
-    if (w && w->paint_pending) {
+    if (w->paint_pending) {
         paint = w->update_rect;
         erase = w->erase_pending ? TRUE : FALSE;
-        w->paint_pending = 0;
-        w->erase_pending = 0;
-        w->update_rect.left = w->update_rect.top = 0;
-        w->update_rect.right = w->update_rect.bottom = 0;
+    }
+    uint64_t token;
+    if (!gdi32_push_paint_clip(hdc, (const GDI_RECT *)&paint, &token)) {
+        gdi32_free_screen_dc(hdc);
+        SetLastError(8);
+        return NULL;
     }
 
-    if (lpPaint) {
-        if (g_compat32_mode) {
-            PAINTSTRUCT32_K32 *ps = (PAINTSTRUCT32_K32 *)lpPaint;
-            BYTE *p = (BYTE *)ps;
-            for (SIZE_T i = 0; i < sizeof(*ps); i++) p[i] = 0;
-            ps->hdc = (uint32_t)(ULONG_PTR)hdc;
-            ps->fErase = erase;
-            ps->rcPaint = paint;
-        } else {
-            PAINTSTRUCT64_K32 *ps = (PAINTSTRUCT64_K32 *)lpPaint;
-            BYTE *p = (BYTE *)ps;
-            for (SIZE_T i = 0; i < sizeof(*ps); i++) p[i] = 0;
-            ps->hdc = hdc;
-            ps->fErase = erase;
-            ps->rcPaint = paint;
-        }
+    /* Consume this update before calling application code. A callback may
+     * invalidate again, recurse into painting, or destroy its own window. */
+    w->paint_pending = w->erase_pending = 0;
+    memset(&w->update_rect, 0, sizeof(w->update_rect));
+    if (erase && SendMessageA(hWnd, WM_ERASEBKGND, (WPARAM)hdc, 0))
+        erase = FALSE;
+
+    if (compat32) {
+        PAINTSTRUCT32_K32 *ps = (PAINTSTRUCT32_K32 *)lpPaint;
+        memset(ps, 0, sizeof(*ps));
+        ps->hdc = (uint32_t)(ULONG_PTR)hdc;
+        ps->fErase = erase;
+        ps->rcPaint = paint;
+        memcpy(ps->rgbReserved, &token, sizeof(token));
+    } else {
+        PAINTSTRUCT64_K32 *ps = (PAINTSTRUCT64_K32 *)lpPaint;
+        memset(ps, 0, sizeof(*ps));
+        ps->hdc = hdc;
+        ps->fErase = erase;
+        ps->rcPaint = paint;
+        memcpy(ps->rgbReserved, &token, sizeof(token));
     }
     SetLastError(0);
     return hdc;
@@ -12613,17 +12641,37 @@ BOOL WINAPI EndPaint(HWND hWnd, PVOID lpPaint)
 {
     HDC hdc = NULL;
     WINDOW *w = find_window(hWnd);
+    uint64_t token = 0;
 
     if (lpPaint) {
-        if (g_compat32_mode)
-            hdc = (HDC)(ULONG_PTR)((PAINTSTRUCT32_K32 *)lpPaint)->hdc;
-        else
-            hdc = ((PAINTSTRUCT64_K32 *)lpPaint)->hdc;
+        if (g_compat32_mode) {
+            const PAINTSTRUCT32_K32 *ps = lpPaint;
+            hdc = (HDC)(ULONG_PTR)ps->hdc;
+            memcpy(&token, ps->rgbReserved, sizeof(token));
+        } else {
+            const PAINTSTRUCT64_K32 *ps = lpPaint;
+            hdc = ps->hdc;
+            memcpy(&token, ps->rgbReserved, sizeof(token));
+        }
     }
-    if (hdc) gdi32_free_screen_dc(hdc);
+    if (hdc && gdi32_window_from_dc(hdc) == hWnd) {
+        /* An owned DC is shared across nested BeginPaint calls. EndPaint
+         * releases its paint clip, not a saved application clip/state. */
+        gdi32_pop_paint_clip(hdc, token, FALSE);
+        gdi32_free_screen_dc(hdc);
+    }
     if (w && w->compositor_id && compositor_signal_dirty)
         compositor_signal_dirty(w->compositor_id);
     return TRUE;
+}
+
+static void default_window_paint(HWND window)
+{
+    union {
+        PAINTSTRUCT32_K32 narrow;
+        PAINTSTRUCT64_K32 wide;
+    } paint;
+    if (BeginPaint(window, &paint)) EndPaint(window, &paint);
 }
 
 LRESULT WINAPI CallWindowProcA(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
@@ -13207,9 +13255,25 @@ BOOL WINAPI ScreenToClient(HWND hWnd, PVOID lpPoint)
 BOOL WINAPI GetUpdateRect(HWND hWnd, PVOID lpRect, BOOL bErase)
 {
     WINDOW *w = find_window(hWnd);
-    if (!w || !w->paint_pending) return FALSE;
+    if (!w) return FALSE;
+    if (!w->paint_pending) {
+        if (lpRect) memset(lpRect, 0, sizeof(RECT));
+        return FALSE;
+    }
     if (lpRect) *(RECT *)lpRect = w->update_rect;
-    if (bErase) w->erase_pending = 1;
+    if (bErase && w->erase_pending) {
+        HDC dc = gdi32_alloc_window_dc(hWnd);
+        uint64_t token;
+        if (dc && gdi32_push_paint_clip(
+                dc, (const GDI_RECT *)&w->update_rect, &token)) {
+            w->erase_pending = 0;
+            LRESULT erased = SendMessageA(hWnd, WM_ERASEBKGND, (WPARAM)dc, 0);
+            w = find_window(hWnd);
+            if (w && !erased && w->paint_pending) w->erase_pending = 1;
+            gdi32_pop_paint_clip(dc, token, TRUE);
+        }
+        if (dc) gdi32_free_screen_dc(dc);
+    }
     return TRUE;
 }
 

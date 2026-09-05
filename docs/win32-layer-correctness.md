@@ -656,6 +656,53 @@ paths remain outside this change. UT99's initial wizard was not rerun during
 this validation. The probe explicitly releases its objects; it does not prove
 complete process-exit reclamation or concurrent GDI lifetime correctness.
 
+## 4.12 USER32 paint lifecycle and dialog backgrounds (2026-09-04)
+
+`BeginPaint` now consumes the pending update before calling `WM_ERASEBKGND`,
+clips drawing to that update, and reports whether erasing remains necessary in
+the caller's PE32/PE64 PAINTSTRUCT. Callback reinvalidation survives the paint
+cycle. The transient paint clip is independent of `SelectClipRgn`; clearing an
+application clip cannot bypass it. Nested `EndPaint` on an owned DC removes the
+paint clip, matching the native Windows probe. Window destruction releases its
+retained GDI DC, selected brush reference, and outstanding paint-clip frames.
+
+Default `WM_PAINT` uses BeginPaint/EndPaint rather than merely validating.
+Default background erasing uses the registered class brush, and dialogs obtain
+their brush through `WM_CTLCOLORDLG`. PE32 brush results are zero-extended from
+32 bits, rather than treating signed LRESULT as a native-width handle.
+`GetUpdateRect(TRUE)` performs requested erasing without validating the region;
+an empty update query clears its output RECT.
+
+Validation commands:
+```sh
+make -C arch/x86 CLANG=1 -j4
+sh arch/x86/scripts/build-user32-paint-test.sh
+```
+
+The generated `user32_paint_pe32.exe` and `user32_paint_pe64.exe` each pass 85
+checks unchanged on Windows and OsitoK. Coverage includes callback ordering,
+class and dialog brushes, fErase, empty updates, FillRect/BitBlt clipping,
+application-clip intersection, nested painting, callback reinvalidation, and
+destruction during erasing. The `.autoload` fixture runs the PE32 executable
+from `probes/`; the PE64 executable runs with
+`winexec "probes/user32_paint_pe64.exe"`.
+
+Final QEMU artifacts are under `/root/osito-user32-paint-20260904-r6/` (8 GiB,
+four CPUs, KVM, separate snapshot disk). The booted kernel matches the build's
+SHA-256: `7fb6bfe86cc38448c475b64f59fde3f5d72bb0c6d35759357f683735d8637ef5`.
+Both GDI paint probes, GDI DIB 32/32, window-model 95/95, input 156/156, dialog
+10/10, DirectDraw ABI, DirectSound, and DOS API with 15/15 host-memory checks
+pass. The PE32 paint probe also passes again after DOS API. No unexpected CPU
+fault appears in this run. The fixture still lacks the optional `diag/`
+directory, producing the documented parent-missing boot-log errors.
+
+The update region still uses a bounding rectangle, not a complex region.
+Common-DC caching, child/occlusion clipping, caret handling, DrawText, and
+default control painting remain incomplete. These checks do not prove complete
+process-exit reclamation or concurrent GDI lifetime correctness. UT99's setup
+wizard was not visually validated on this final kernel, so this change does
+not establish that its controls or text render correctly.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of

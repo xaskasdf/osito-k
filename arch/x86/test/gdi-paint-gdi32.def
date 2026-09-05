@@ -13,6 +13,7 @@ EXPORTS
     GetObjectA@12
     GetObjectType@4
     PatBlt@24
+    BitBlt@36
     CreateRectRgn@16
     SelectClipRgn@8
     SetViewportOrgEx@16

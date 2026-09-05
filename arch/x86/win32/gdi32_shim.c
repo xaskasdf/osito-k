@@ -470,6 +470,12 @@ void gdi32_release_process(DWORD process_id)
 #define MAX_GDI_REGIONS 512
 #define MAX_REGION_RECTS 64
 
+typedef struct GDI_PAINT_CLIP {
+    struct GDI_PAINT_CLIP *previous;
+    GDI_RECT rect;
+    uint64_t token;
+} GDI_PAINT_CLIP;
+
 typedef struct {
     int      in_use;
     void    *surface;       /* pixel buffer (NULL = no bitmap selected yet) */
@@ -493,6 +499,7 @@ typedef struct {
     UINT     clip_count;
     BOOL     clip_active;
     GDI_RECT clip_rects[MAX_REGION_RECTS];
+    GDI_PAINT_CLIP *paint_clip;
     int      is_screen;     /* DC targets the GOP framebuffer (window/screen DC) */
     int      pooled_window; /* GetDC/BeginPaint DC, retained across ReleaseDC */
     ULONG_PTR owner_window; /* HWND associated with a pooled window DC */
@@ -1175,6 +1182,50 @@ void gdi32_free_screen_dc(HDC hdc)
         brush_release(dc->current_brush);
         dc->in_use = 0;
         dc->surface = NULL;
+    }
+}
+
+BOOL gdi32_push_paint_clip(HDC hdc, const GDI_RECT *rect, uint64_t *token)
+{
+    static uint64_t next_token;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (!dc || !rect || !token || !dc->pooled_window) return FALSE;
+    GDI_PAINT_CLIP *clip = kmalloc(sizeof(*clip));
+    if (!clip) return FALSE;
+    clip->previous = dc->paint_clip;
+    clip->rect = *rect;
+    clip->token = __atomic_add_fetch(&next_token, 1, __ATOMIC_RELAXED);
+    dc->paint_clip = clip;
+    *token = clip->token;
+    return TRUE;
+}
+
+void gdi32_pop_paint_clip(HDC hdc, uint64_t token, BOOL restore_previous)
+{
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (!dc || !dc->paint_clip || dc->paint_clip->token != token) return;
+    do {
+        GDI_PAINT_CLIP *clip = dc->paint_clip;
+        dc->paint_clip = clip->previous;
+        kfree(clip);
+    } while (!restore_previous && dc->paint_clip);
+}
+
+void gdi32_release_window_dc(HANDLE window)
+{
+    if (!window) return;
+    for (int i = 0; i < MAX_GDI_DCS; i++) {
+        GDI_DC *dc = &gdi_dcs[i];
+        if (!dc->in_use || !dc->pooled_window ||
+            dc->owner_window != (ULONG_PTR)window) continue;
+        brush_release(dc->current_brush);
+        GDI_PAINT_CLIP *clip = dc->paint_clip;
+        gdi_memset(dc, 0, sizeof(*dc));
+        while (clip) {
+            GDI_PAINT_CLIP *previous = clip->previous;
+            kfree(clip);
+            clip = previous;
+        }
     }
 }
 
@@ -2454,6 +2505,11 @@ static uint32_t gdi_colorref_to_argb(DWORD color);
 
 static BOOL gdi_dc_point_visible(const GDI_DC *dc, int x, int y)
 {
+    if (dc->paint_clip) {
+        const GDI_RECT *rect = &dc->paint_clip->rect;
+        if (x < rect->left || x >= rect->right ||
+            y < rect->top || y >= rect->bottom) return FALSE;
+    }
     if (!dc->clip_active) return TRUE;
     for (UINT i = 0; i < dc->clip_count; i++) {
         const GDI_RECT *rect = &dc->clip_rects[i];
@@ -2621,7 +2677,7 @@ BOOL WINAPI BitBlt(HDC hdcDest, int x, int y, int cx, int cy,
 
         int src_bytes = src->bpp / 8;
         int dst_bytes = dst->bpp / 8;
-        BOOL identical_format = !dst->clip_active &&
+        BOOL identical_format = !dst->clip_active && !dst->paint_clip &&
                                 src->bpp == dst->bpp && src_bytes > 0 &&
                                 src_bytes <= 4;
 
@@ -3644,6 +3700,7 @@ static BOOL WINAPI GradientFill_k32(HDC hdc, const GDI_TRIVERTEX *vertices,
             uint32_t *row = gdi_dc_row32(dc, y);
             if (!row) continue;
             for (int x = clip_x0; x < clip_x1; x++) {
+                if (!gdi_dc_point_visible(dc, x, y)) continue;
                 int position = mode == GRADIENT_FILL_RECT_H ? x - x0 : y - y0;
                 USHORT red = gradient_channel(first->red, second->red,
                                               position, span);
@@ -3693,7 +3750,8 @@ static BOOL WINAPI TransparentBlt_k32(HDC destination, int x, int y,
                 src_x < 0 || src_x >= src->width)
                 continue;
             uint32_t pixel = src_row[src_x];
-            if ((pixel & 0x00FFFFFFu) != (transparent & 0x00FFFFFFu))
+            if (gdi_dc_point_visible(dst, dst_x, dst_y) &&
+                (pixel & 0x00FFFFFFu) != (transparent & 0x00FFFFFFu))
                 dst_row[dst_x] = pixel;
         }
     }
@@ -3732,6 +3790,7 @@ static BOOL WINAPI AlphaBlend_k32(HDC destination, int x, int y,
                 src_x < 0 || src_x >= src->width)
                 continue;
 
+            if (!gdi_dc_point_visible(dst, dst_x, dst_y)) continue;
             uint32_t source_pixel = src_row[src_x];
             uint32_t destination_pixel = dst_row[dst_x];
             UINT alpha = constant_alpha;

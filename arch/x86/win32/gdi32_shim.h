@@ -135,6 +135,9 @@ HDC   gdi32_alloc_screen_dc(void);
 HDC   gdi32_alloc_window_dc(HANDLE window);
 HANDLE gdi32_window_from_dc(HDC hdc);
 void  gdi32_free_screen_dc(HDC hdc);
+BOOL  gdi32_push_paint_clip(HDC hdc, const GDI_RECT *rect, uint64_t *token);
+void  gdi32_pop_paint_clip(HDC hdc, uint64_t token, BOOL restore_previous);
+void  gdi32_release_window_dc(HANDLE window);
 BOOL  gdi32_fill_rect(HDC hdc, const GDI_RECT *rect, HGDIOBJ brush);
 BOOL  gdi32_draw_focus_rect(HDC hdc, const GDI_RECT *rect);
 
