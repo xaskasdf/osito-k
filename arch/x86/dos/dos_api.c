@@ -26,6 +26,8 @@ extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void serial_putchar(char c);
 extern int  disk_flush(void);
+extern bool sched_is_enabled(void);
+extern int sched_sleep_ticks(uint64_t ticks);
 
 /* Console output — bridges to OsitoK's framebuffer */
 extern void fb_putchar(char c);
@@ -378,6 +380,7 @@ void dos_api_init(dos_vm_t *vm)
     vm->jft_external_psp = 0;
     vm->jft_active = false;
     vm->console_scan_pending = 0;
+    vm->console_column = 0;
     vm->console_line_count = 0;
     vm->console_line_position = 0;
     dos_find_init(vm);
@@ -2463,39 +2466,179 @@ static uint8_t dos_console_getchar(dos_vm_t *vm)
     return (uint8_t)key;
 }
 
-/* Capacity includes the terminating CR, as in INT 21h/AH=0Ah. */
-static uint16_t dos_console_read_line(dos_vm_t *vm, uint8_t *buffer,
-                                      uint16_t capacity)
+static int dos_file_read(dos_sft_entry_t *entry, void *buffer, uint16_t count)
+{
+    if (!entry) return -DOS_ERR_INVALID_HANDLE;
+    if (!entry->osfs_file ||
+        dos_open_access(entry->open_mode) == DOS_ACCESS_WRITE)
+        return -DOS_ERR_ACCESS_DENIED;
+    entry->file_size = dos_file_size32(entry->osfs_file);
+    if (entry->position >= entry->file_size) return 0;
+    uint32_t available = entry->file_size - entry->position;
+    if (count > available) count = (uint16_t)available;
+    int result = count
+        ? osfs2_read(entry->osfs_file, entry->position, buffer, count) : 0;
+    if (result < 0) return -DOS_ERR_ACCESS_DENIED;
+    entry->position += (uint32_t)result;
+    return result;
+}
+
+static int dos_file_write(dos_sft_entry_t *entry, const void *buffer,
+                           uint16_t count)
+{
+    if (!entry) return -DOS_ERR_INVALID_HANDLE;
+    if (!entry->osfs_file ||
+        dos_open_access(entry->open_mode) == DOS_ACCESS_READ ||
+        entry->position > UINT32_MAX - count)
+        return -DOS_ERR_ACCESS_DENIED;
+    int result = count
+        ? osfs2_write(entry->osfs_file, entry->position, buffer, count)
+        : osfs2_truncate(entry->osfs_file, entry->position);
+    if (result < 0) return -DOS_ERR_ACCESS_DENIED;
+    entry->position += count;
+    entry->file_size = dos_file_size32(entry->osfs_file);
+    entry->io_flags &= ~DOS_IO_NOT_EOF;
+    return count;
+}
+
+/* CP/M-style calls address an SFT but talk directly to character drivers;
+ * they do not inherit AH=3Fh/40h cooked-line or Ctrl-Z processing. */
+static int dos_raw_character_output(dos_vm_t *vm, dos_sft_entry_t *entry,
+                                     uint8_t ch)
+{
+    if (!entry) return -DOS_ERR_INVALID_HANDLE;
+    if (!entry->is_device) {
+        int result = dos_file_write(entry, &ch, 1);
+        return result < 0 ? result : 0;
+    }
+    if (entry->device_kind == DOS_DEVICE_CON) {
+        dos_putchar(vm, (char)ch);
+        return 0;
+    }
+    return entry->device_kind == DOS_DEVICE_NUL ? 0 : -DOS_ERR_NOT_READY;
+}
+
+static int dos_cooked_character_output(dos_vm_t *vm, dos_sft_entry_t *entry,
+                                        uint8_t ch)
+{
+    if (ch == '\t') {
+        unsigned spaces = 8u - (vm->console_column & 7u);
+        while (spaces--) {
+            int error = dos_cooked_character_output(vm, entry, ' ');
+            if (error) return error;
+        }
+        return 0;
+    }
+    int error = dos_raw_character_output(vm, entry, ch);
+    if (error) return error;
+    if (ch == '\r') vm->console_column = 0;
+    else if (ch == '\b') vm->console_column--;
+    else if (ch >= ' ' && ch != 0x7Fu) vm->console_column++;
+    return 0;
+}
+
+static int dos_character_input_status(dos_vm_t *vm, dos_sft_entry_t *entry,
+                                       bool *ready)
+{
+    *ready = false;
+    if (!entry) return -DOS_ERR_INVALID_HANDLE;
+    if (entry->is_device) {
+        if (entry->device_kind == DOS_DEVICE_CON)
+            *ready = dos_console_input_ready(vm);
+        else if (entry->device_kind == DOS_DEVICE_NUL)
+            *ready = true;
+        return 0;
+    }
+    uint32_t position = entry->position;
+    uint8_t ch;
+    int result = dos_file_read(entry, &ch, 1);
+    entry->position = position;
+    if (result < 0) return result;
+    *ready = result != 0;
+    return 0;
+}
+
+static int dos_raw_character_input(dos_vm_t *vm, dos_sft_entry_t *entry,
+                                    uint8_t *ch, bool blocking)
+{
+    if (!entry) return -DOS_ERR_INVALID_HANDLE;
+    if (entry->is_device) {
+        if (entry->device_kind == DOS_DEVICE_NUL) {
+            /* Its driver reports ready but supplies no character. Legacy AL
+             * is unspecified here; use zero, not a synthesized Ctrl-Z. */
+            *ch = 0;
+            return 1;
+        }
+        if (entry->device_kind != DOS_DEVICE_CON) return -DOS_ERR_NOT_READY;
+        if (!blocking && !dos_console_input_ready(vm)) return 0;
+        *ch = dos_console_getchar(vm);
+        return 1;
+    }
+    for (;;) {
+        int result = dos_file_read(entry, ch, 1);
+        if (result || !blocking || !vm->cpu->running) return result;
+        /* Legacy blocking calls have no EOF result. Yield while waiting for
+         * more input instead of polling the filesystem at full CPU speed. */
+        uint64_t flags;
+        __asm__ volatile ("pushfq; popq %0" : "=r"(flags));
+        bool enable_irqs = !(flags & (1ULL << 9)) && sched_is_enabled();
+        if (enable_irqs) __asm__ volatile ("sti" ::: "memory");
+        if (sched_sleep_ticks(1) < 0) __asm__ volatile ("pause");
+        if (enable_irqs) __asm__ volatile ("cli" ::: "memory");
+    }
+}
+
+/* Capacity includes CR. Explicit CON handle reads pass the same SFT for
+ * input and echo; AH=0Ah resolves stdin and stdout independently. */
+static int dos_console_read_line(dos_vm_t *vm, dos_sft_entry_t *input,
+                                  dos_sft_entry_t *output, uint8_t *buffer,
+                                  uint16_t capacity)
 {
     uint16_t count = 0;
     if (!capacity) return 0;
+    bool first = true;
     for (;;) {
-        uint8_t ch = dos_console_getchar(vm);
-        if (ch == '\r' || ch == '\n') {
+        uint8_t ch;
+        int result = dos_raw_character_input(vm, input, &ch, true);
+        if (result <= 0) return result < 0 ? result : -DOS_ERR_NOT_READY;
+        if (first) {
+            first = false;
+            if (ch == '\n') continue; /* CR/LF redirected from a prior line. */
+        }
+        if (ch == '\r') {
             buffer[count] = '\r';
-            dos_putchar(vm, '\r');
+            result = dos_cooked_character_output(vm, output, '\r');
+            if (result) return result;
             return count;
         }
-        if (ch == '\b') {
+        if (ch == '\n') {
+            result = dos_cooked_character_output(vm, output, '\r');
+            if (!result) result = dos_cooked_character_output(vm, output, '\n');
+            if (result) return result;
+            continue;
+        }
+        if (ch == '\b' || ch == 0x7Fu) {
             if (count) {
                 count--;
-                dos_putchar(vm, '\b');
-                dos_putchar(vm, ' ');
-                dos_putchar(vm, '\b');
+                result = dos_cooked_character_output(vm, output, '\b');
+                if (!result) result = dos_cooked_character_output(vm, output, ' ');
+                if (!result) result = dos_cooked_character_output(vm, output, '\b');
+                if (result) return result;
             }
             continue;
         }
         if (count + 1u < capacity) {
             buffer[count++] = ch;
-            dos_putchar(vm, (char)ch);
+            result = dos_cooked_character_output(vm, output, ch);
         } else {
-            dos_putchar(vm, '\a');
+            result = dos_cooked_character_output(vm, output, '\a');
         }
+        if (result) return result;
     }
 }
 
-static uint16_t dos_console_read_handle(dos_vm_t *vm, dos_sft_entry_t *entry,
-                                        uint32_t address, uint16_t count)
+static int dos_console_read_handle(dos_vm_t *vm, dos_sft_entry_t *entry,
+                                    uint32_t address, uint16_t count)
 {
     if (!count || !(entry->io_flags & DOS_IO_NOT_EOF)) return 0;
     if ((entry->io_flags & DOS_IO_RAW) ||
@@ -2515,12 +2658,14 @@ static uint16_t dos_console_read_handle(dos_vm_t *vm, dos_sft_entry_t *entry,
     /* DOS retains the edited CON line across short reads and appends LF.
      * The line is device-wide; raw mode bypasses it without losing it. */
     if (vm->console_line_position == vm->console_line_count) {
-        uint16_t length = dos_console_read_line(vm, vm->console_line, 128u);
+        int length = dos_console_read_line(vm, entry, entry,
+                                           vm->console_line, 128u);
+        if (length < 0) return length;
         vm->console_line_position = 0;
         vm->console_line_count = 0;
         if (vm->console_line[0] == 0x1Au) {
             entry->io_flags &= ~DOS_IO_NOT_EOF;
-            dos_putchar(vm, '\n');
+            (void)dos_cooked_character_output(vm, entry, '\n');
             return 0;
         }
         vm->console_line[length + 1u] = '\n';
@@ -2531,7 +2676,7 @@ static uint16_t dos_console_read_handle(dos_vm_t *vm, dos_sft_entry_t *entry,
     for (uint16_t i = 0; i < total; i++) {
         uint8_t ch = vm->console_line[vm->console_line_position++];
         dos_mem_write8(vm, address + i, ch);
-        if (ch == '\n') dos_putchar(vm, '\n');
+        if (ch == '\n') (void)dos_cooked_character_output(vm, entry, '\n');
     }
     return total;
 }
@@ -2568,14 +2713,12 @@ static int dos_ioctl_handle(dos_vm_t *vm, cpu8086_state_t *cpu)
     if (function != 6 && function != 7) return DOS_ERR_INVALID_FUNCTION;
 
     bool ready = false;
-    if (!entry->is_device) {
-        if (!entry->osfs_file) return DOS_ERR_INVALID_HANDLE;
-        entry->file_size = dos_file_size32(entry->osfs_file);
-        ready = function == 7 || entry->position < entry->file_size;
-    } else if (entry->device_kind == DOS_DEVICE_NUL) {
-        ready = true; /* Reading EOF from NUL also completes immediately. */
-    } else if (entry->device_kind == DOS_DEVICE_CON) {
-        ready = function == 7 || dos_console_input_ready(vm);
+    if (function == 6) {
+        int error = dos_character_input_status(vm, entry, &ready);
+        if (error) return -error;
+    } else {
+        ready = !entry->is_device || entry->device_kind == DOS_DEVICE_NUL ||
+                entry->device_kind == DOS_DEVICE_CON;
     }
     cpu->al = ready ? 0xFFu : 0u;
     return 0;
@@ -2593,6 +2736,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
                                   (uint16_t)cpu_stack_offset(cpu);
     }
     uint8_t ah = cpu->ah;
+    int console_error = 0;
     uint8_t previous_indos = vm->indos_count;
     if (vm->indos_count != 0xFFu) vm->indos_count++;
     dos_publish_indos(vm);
@@ -2609,38 +2753,65 @@ void dos_int21_dispatch(dos_vm_t *vm)
 
     /* ── AH=01h: Read char with echo ────────────────────────────── */
     case 0x01: {
-        char ch = (char)dos_console_getchar(vm);
-        dos_putchar(vm, ch);
-        cpu->al = (uint8_t)ch;
+        uint8_t ch = 0;
+        console_error = dos_raw_character_input(vm, dos_handle_sft(vm, 0),
+                                                &ch, true);
+        if (console_error > 0)
+            console_error = dos_cooked_character_output(vm,
+                              dos_handle_sft(vm, 1), ch);
+        cpu->al = ch;
         break;
     }
 
     /* ── AH=02h: Write character ────────────────────────────────── */
     case 0x02:
-        dos_putchar(vm, (char)cpu->dl);
+        console_error = dos_cooked_character_output(vm, dos_handle_sft(vm, 1),
+                                                     cpu->dl);
+        cpu->al = cpu->dl == '\t' ? ' ' : cpu->dl;
+        break;
+
+    /* AUX/PRN follow handles 3 and 4, including redirection through dup. */
+    case 0x03: {
+        uint8_t ch = 0;
+        console_error = dos_raw_character_input(vm, dos_handle_sft(vm, 3),
+                                                &ch, true);
+        cpu->al = ch;
+        break;
+    }
+    case 0x04:
+    case 0x05:
+        console_error = dos_raw_character_output(vm,
+                          dos_handle_sft(vm, ah == 0x04 ? 3 : 4), cpu->dl);
+        cpu->al = cpu->dl;
         break;
 
     /* ── AH=06h: Direct console I/O ─────────────────────────────── */
     case 0x06:
         if (cpu->dl == 0xFF) {
-            /* Input */
-            if (dos_console_input_ready(vm)) {
-                cpu->al = dos_console_getchar(vm);
+            uint8_t ch = 0;
+            console_error = dos_raw_character_input(vm, dos_handle_sft(vm, 0),
+                                                    &ch, false);
+            if (console_error > 0) {
+                cpu->al = ch;
                 cpu->flags &= ~FLAG_ZF;
             } else {
                 cpu->al = 0;
                 cpu->flags |= FLAG_ZF;
             }
         } else {
-            /* Output */
-            dos_putchar(vm, (char)cpu->dl);
+            console_error = dos_raw_character_output(vm, dos_handle_sft(vm, 1),
+                                                      cpu->dl);
+            cpu->al = cpu->dl;
         }
         break;
 
     /* ── AH=07h/08h: Read char without echo ─────────────────────── */
     case 0x07:
     case 0x08: {
-        cpu->al = dos_console_getchar(vm);
+        uint8_t ch = 0;
+        console_error = dos_raw_character_input(vm, dos_handle_sft(vm, 0),
+                                                &ch, true);
+        cpu->al = ch;
         break;
     }
 
@@ -2652,7 +2823,9 @@ void dos_int21_dispatch(dos_vm_t *vm)
             if (address >= vm->total_mem_size) break;
             uint8_t ch = dos_mem_read8(vm, address);
             if (ch == '$') break;
-            dos_putchar(vm, (char)ch);
+            console_error = dos_cooked_character_output(vm,
+                              dos_handle_sft(vm, 1), ch);
+            if (console_error) break;
             off++;
         }
         cpu->al = '$';
@@ -2666,28 +2839,36 @@ void dos_int21_dispatch(dos_vm_t *vm)
         if (!max_len || dos_guest_buffer(vm, cpu->ds, cpu->dx,
                                          (uint32_t)max_len + 2u,
                                          &buf_addr) < 0) break;
-        uint16_t count = dos_console_read_line(vm, vm->mem + buf_addr + 2u,
-                                               max_len);
-        dos_mem_write8(vm, buf_addr + 1u, (uint8_t)count);
+        int count = dos_console_read_line(vm, dos_handle_sft(vm, 0),
+                                          dos_handle_sft(vm, 1),
+                                          vm->mem + buf_addr + 2u, max_len);
+        if (count < 0) console_error = count;
+        else dos_mem_write8(vm, buf_addr + 1u, (uint8_t)count);
         break;
     }
 
     /* ── AH=0Bh: Check stdin status ─────────────────────────────── */
-    case 0x0B:
-        cpu->al = dos_console_input_ready(vm) ? 0xFF : 0x00;
+    case 0x0B: {
+        bool ready;
+        console_error = dos_character_input_status(vm, dos_handle_sft(vm, 0),
+                                                    &ready);
+        cpu->al = ready ? 0xFF : 0x00;
         break;
+    }
 
     /* ── AH=0Ch: Flush input + call function ────────────────────── */
-    case 0x0C:
-        /* Flush keyboard buffer */
-        dos_keyboard_flush(vm);
+    case 0x0C: {
+        dos_sft_entry_t *input = dos_handle_sft(vm, 0);
+        if (input && input->is_device && input->device_kind == DOS_DEVICE_CON)
+            dos_keyboard_flush(vm);
         /* Re-dispatch with AL as function */
         if (cpu->al == 0x01 || cpu->al == 0x06 || cpu->al == 0x07 ||
             cpu->al == 0x08 || cpu->al == 0x0A) {
             cpu->ah = cpu->al;
             dos_int21_dispatch(vm);
-        }
+        } else cpu->al = 0;
         break;
+    }
 
     /* ── AH=0Dh: Disk Reset ─────────────────────────────────────── */
     /* MS-DOS flushes disk buffers. Our VM has no write-back cache,
@@ -2986,8 +3167,14 @@ void dos_int21_dispatch(dos_vm_t *vm)
                     cpu->ax = DOS_ERR_ACCESS_DENIED;
                     break;
                 }
-                cpu->ax = dos_console_read_handle(vm, fh, buf, count);
-                cpu->flags &= ~FLAG_CF;
+                int result = dos_console_read_handle(vm, fh, buf, count);
+                if (result < 0) {
+                    cpu->ax = (uint16_t)-result;
+                    cpu->flags |= FLAG_CF;
+                } else {
+                    cpu->ax = (uint16_t)result;
+                    cpu->flags &= ~FLAG_CF;
+                }
             } else if (fh->device_kind == DOS_DEVICE_NUL) {
                 cpu->ax = 0;
                 cpu->flags &= ~FLAG_CF;
@@ -3018,15 +3205,12 @@ void dos_int21_dispatch(dos_vm_t *vm)
             break;
         }
         uint32_t pos_before = fh->position;
-        int total = to_read
-            ? osfs2_read(fh->osfs_file, fh->position, vm->mem + buf, to_read)
-            : 0;
+        int total = dos_file_read(fh, vm->mem + buf, (uint16_t)to_read);
         if (total < 0) {
             cpu->flags |= FLAG_CF;
-            cpu->ax = DOS_ERR_ACCESS_DENIED;
+            cpu->ax = (uint16_t)-total;
             break;
         }
-        fh->position += (uint32_t)total;
 
 #if DOS_DIAGNOSTICS
         /* Sampled trace: first 16 reads verbose, then every 64k. Shows
@@ -3088,7 +3272,11 @@ void dos_int21_dispatch(dos_vm_t *vm)
                 while (written < count) {
                     uint8_t ch = dos_mem_read8(vm, buf + written);
                     if (ch == 0x1Au && !(fh->io_flags & DOS_IO_RAW)) break;
-                    dos_putchar(vm, (char)ch);
+                    if (!(fh->io_flags & DOS_IO_RAW) &&
+                        (fh->io_flags & DOS_IO_CON_OUT))
+                        (void)dos_cooked_character_output(vm, fh, ch);
+                    else
+                        dos_putchar(vm, (char)ch);
                     written++;
                 }
                 cpu->ax = written;
@@ -3107,37 +3295,20 @@ void dos_int21_dispatch(dos_vm_t *vm)
             cpu->ax = DOS_ERR_ACCESS_DENIED;
             break;
         }
-        if (count == 0) {
-            if (osfs2_truncate(fh->osfs_file, fh->position) < 0) {
-                cpu->flags |= FLAG_CF;
-                cpu->ax = DOS_ERR_ACCESS_DENIED;
-                break;
-            }
-            fh->file_size = fh->position;
-            fh->io_flags &= ~DOS_IO_NOT_EOF; /* Disk bit 6 means unwritten. */
-            cpu->ax = 0;
-            cpu->flags &= ~FLAG_CF;
-            break;
-        }
-
-        if (fh->position > UINT32_MAX - count) {
-            cpu->flags |= FLAG_CF;
-            cpu->ax = DOS_ERR_ACCESS_DENIED;
-            break;
-        }
         uint32_t buf = 0;
-        if (dos_guest_buffer(vm, cpu->ds, cpu->dx, count, &buf) < 0 ||
-            osfs2_write(fh->osfs_file, fh->position, vm->mem + buf,
-                        count) < 0) {
+        if (count && dos_guest_buffer(vm, cpu->ds, cpu->dx, count, &buf) < 0) {
             cpu->flags |= FLAG_CF;
             cpu->ax = DOS_ERR_ACCESS_DENIED;
             break;
         }
-        fh->position += count;
-        fh->io_flags &= ~DOS_IO_NOT_EOF;
-        if (fh->position > fh->file_size) fh->file_size = fh->position;
-        cpu->ax = count;
-        cpu->flags &= ~FLAG_CF;
+        int result = dos_file_write(fh, vm->mem + buf, count);
+        if (result < 0) {
+            cpu->ax = (uint16_t)-result;
+            cpu->flags |= FLAG_CF;
+        } else {
+            cpu->ax = (uint16_t)result;
+            cpu->flags &= ~FLAG_CF;
+        }
         break;
     }
 
@@ -3836,6 +4007,11 @@ void dos_int21_dispatch(dos_vm_t *vm)
         break;
     }
 
+    if (console_error < 0) {
+        cpu->ax = (uint16_t)-console_error;
+        cpu->flags |= FLAG_CF;
+        dos_record_extended_error(vm, ah, cpu->ax);
+    }
     if ((cpu->flags & FLAG_CF) && dos_int21_reports_carry_error(ah))
         dos_record_extended_error(vm, ah, cpu->ax);
 

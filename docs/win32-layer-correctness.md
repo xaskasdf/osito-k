@@ -1455,6 +1455,72 @@ output-format configuration, and FILE lifetime/locking remain separate work.
 Wide FILE formatting still measures and allocates its whole converted output.
 UT99 gameplay and audio were not rerun for this formatter change.
 
+## 4.25 DOS standard handles and legacy console routing (2026-09-05)
+
+Commit `0a5efac7` added shared SFT IOCTL modes, CON line buffering, raw
+handle I/O, and a common BIOS/DOS keyboard queue. The older `AH=01h..0Ch`
+services still bypassed the JFT and accessed the framebuffer/keyboard
+directly. AUX and PRN's legacy entry points were missing entirely.
+
+These calls now resolve the current process's standard handles, including
+duplicates and inherited file positions. File reads/writes share the same
+helpers as `AH=3Fh/40h`; status probes restore the position after reading.
+The character-driver path deliberately differs from handle-based cooked
+I/O: embedded NUL and Ctrl-Z bytes are not string terminators for these
+legacy calls. Cooked output expands tabs using a VM-local column, while
+`AH=06h` and AUX/PRN output remain raw. These contracts were reviewed against
+[MS-DOS CPMIO](https://github.com/microsoft/MS-DOS/blob/2d04cacc5322951f187bb17e017c12920ac8ebe2/v4.0/src/DOS/CPMIO.ASM)
+and [CPMIO2](https://github.com/microsoft/MS-DOS/blob/2d04cacc5322951f187bb17e017c12920ac8ebe2/v4.0/src/DOS/CPMIO2.ASM).
+
+`AH=0Ah` reads stdin and echoes to stdout. It handles a leading LF from a
+previous redirected CR/LF line, keeps reading after an internal LF, and
+preserves the capacity/terminating-CR contract. An explicit cooked CON
+handle read uses that device for both input and echo, even with redirected
+standard handles. `AH=0Ch` only flushes the keyboard when stdin names CON.
+See the [line-input implementation](https://github.com/microsoft/MS-DOS/blob/2d04cacc5322951f187bb17e017c12920ac8ebe2/v4.0/src/DOS/STRIN.ASM)
+and [CON handle swapping](https://github.com/microsoft/MS-DOS/blob/2d04cacc5322951f187bb17e017c12920ac8ebe2/v4.0/src/DOS/DISK.ASM).
+
+Build with:
+
+```sh
+make -C arch/x86 CLANG=1 -j4 all \
+    build/test/dstdio.com build/test/dscchild.com
+```
+
+Copy both COM files to the guest root and run
+`dosrun dstdio.com`, or use `dos_stdio.autoload`. Feed `K`, `J`, `R`, and
+`G` followed by CR after the KEYBOARD, FLUSH, ECHO, and CON READY markers,
+respectively. This is a source-derived contract probe, not a differential
+run against a native MS-DOS installation. It compares 36 captured bytes,
+checks returns and positions, preserves BIOS lookahead across a file flush,
+and restores handles before deleting only its CREATE_NEW-owned fixtures.
+Cleanup failures make the test fail; capture differences print hexadecimal.
+
+The initial probe fails with exit code 2 on the previous kernel in
+`/root/osito-dos-stdio-before-20260905-UulfD5/`. The extended probe passes
+twice in `/root/osito-dos-stdio-verified-20260905-oBmOVl/`, including after
+DOS/Win32 transitions. NUL status/output, closed handles, read-only output,
+and unavailable AUX/PRN are covered. The error cases check OsitoK's CF/AX
+and extended-error reporting, not the still-missing INT 24h protocol.
+NUL legacy input's unspecified character is zeroed rather than synthesizing
+Ctrl-Z; the probe does not assert a native character value for that case.
+
+On that same KVM 8 GiB/four-CPU snapshot, `dos-api-test` passes with 15/15
+host-memory checks, `dosioctl.com`, `doscon.com`, and `dosexec.com` pass,
+and `dpmi_native.com` exits with its expected code 42. Module-image/ABI
+passes 45/45, and CRT format passes 194/194 for PE32 MSVCRT and PE64 UCRT.
+No CPU fault or contract failure appears in the final log. QEMU was stopped
+and reaped. The built and booted kernel SHA-256 is
+`17c8f76ec6a53e16e2b7404f637f642da6644866be8c42bf2c440a8cb2683c0f`.
+
+This does not complete DOS console compatibility. INT 23h control-break
+callbacks, INT 24h critical-error actions, Ctrl-S/Ctrl-P processing, template
+editing and caret/tab-aware erasure still need implementation. Legacy
+blocking reads at disk EOF have no EOF return and yield while waiting;
+cancellation and growth during that wait are not covered here. UART/printer
+backends remain unavailable. No UT99 gameplay, audio-device integration, or
+legacy Linux/Unix binary run was performed for this change.
+
 ## 5. Open questions / notes
 - `WINAPI` selects the Microsoft x64 ABI for native shims, not the kernel's
   SysV ABI. Export arg-count metadata also drives the **32-bit thunk's `RET n*4`**.

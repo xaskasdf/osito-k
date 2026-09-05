@@ -283,6 +283,7 @@ typedef struct dos_vm {
     uint8_t          kb_head;
     uint8_t          kb_tail;
     uint8_t          console_scan_pending;
+    uint8_t          console_column;   /* DOS cooked-output column, modulo 256 */
     uint8_t          console_line[129]; /* 127 edited bytes, CR, LF */
     uint16_t         console_line_count;
     uint16_t         console_line_position;

@@ -412,6 +412,18 @@ $(BUILD)/test/iochild.com: $(BUILD)/test/dos_ioctl_child.o test/dpmi_native.ld
 $(BUILD)/test/dos_ioctl_child.o: test/dos_ioctl_child.S | $(BUILD)/test
 	as --32 -o $@ $<
 
+$(BUILD)/test/dstdio.com: $(BUILD)/test/dos_stdio.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_stdio.o: test/dos_stdio.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dscchild.com: $(BUILD)/test/dos_stdio_child.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_stdio_child.o: test/dos_stdio_child.S | $(BUILD)/test
+	as --32 -o $@ $<
+
 $(BUILD)/test/doserr.com: $(BUILD)/test/dos_extended_error.o \
 		test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
