@@ -896,11 +896,71 @@ Escape (`escape.png`). No compositor fault recurs during this sequence.
 This is not full UT99 validation. The detail page still has an unimplemented
 EDIT control. Five renderer rows share the Software Rendering label even
 though read-only extraction of D3DDrv.int, SoftDrv.int and OpenGlDrv.int shows
-distinct ClassCaption values. A pointer-driven practice-menu attempt did not
+distinct ClassCaption values (the fixture cause is isolated in section 4.17).
+A pointer-driven practice-menu attempt did not
 open its dialog, so gameplay, in-game pointer behavior and audible output are
 not established. General native/Win32 ID mapping, per-thread input attachment,
 queue teardown races, and complete process-exit reclamation remain separate
 work. The DOS and audio implementations are unchanged by this patch.
+
+## 4.17 UT99 fixture paths and renderer enumeration (2026-09-05)
+
+The repeated renderer labels were not a LISTBOX string-storage or private-
+profile bug. With kernel SHA-256
+`473a8bd0f296f0f749c8f689b0b6da9959dcf272ef09b5baa2f962558d773c1a`,
+GDB observations in `/root/osito-ut99-labels-20260905-kPMJfu/` showed:
+
+- `labels-gdb.log`: LB_ADDSTRING already receives repeated UTF-16 Software
+  Rendering strings; GetPrivateProfileStringA/W are not called on that path.
+- `localize-gdb.log`: Show all devices obtains the distinct ClassCaption
+  values for D3DDrv, GlideDrv, MeTaLDrv, OpenGLDrv and SoftDrv.
+- `iterator-gdb.log`: the application's registry-object array contains 25
+  entries, five repetitions of those five classes. Its compatibility filter
+  selects the software entry from each repetition.
+
+Both INIs in the flat image `/root/osito-dialog-ut99/nvme_ut99.img` contain
+`Paths=*.u`, `*.unr`, `*.utx`, `*.uax` and `*.umx`. The engine searches
+each corresponding directory for localization metadata; all five resolve to
+`C:\\*.int`. Serial logs confirm five identical directory searches.
+Deduplicating strings in USER32 would hide an image-layout error and violate
+normal list insertion behavior.
+
+A separate OSFS2 copy, `/root/osito-ut99-layout-20260905-f3O3tU/disk.img`,
+keeps executables, DLLs, .int and .u files at the root, and relocates 265
+resource files with the existing journaled ositofs-rename tool: 96 maps,
+110 texture packages, 29 sound packages and 30 music packages. Both INIs use:
+
+```ini
+Paths=*.u
+Paths=Maps/*.unr
+Paths=Textures/*.utx
+Paths=Sounds/*.uax
+Paths=Music/*.umx
+```
+
+Preflight also found an existing overlap in the source image: the empty
+UnrealTournament.log entry and Entry.unr both claimed block 857. The map's
+bytes were still intact. Only the copy's empty log was rewritten with zero
+allocated blocks; this was not a blanket fsck repair. The map retains SHA-256
+`4bd31b4af4195d257d4b100026c12c7ad511b000f3bc8653e4a34a30fbbf689c`
+after relocation. ositofs-fsck reports a clean journal, matching superblocks,
+731 files, correct block accounting and no overlaps. The original image's
+SHA-256 remains unchanged; it still contains the preexisting overlap.
+
+With the same kernel, KVM, 8 GiB, four CPUs and -snapshot, the corrected copy
+shows one compatible Software entry (`certified.png`) and five distinct
+entries under Show all devices (`all-devices.png`). `registry-gdb.log`
+independently confirms the application array has five entries, not 25.
+Next/Run reaches the rendered menu. Escape, Down, Down, Enter opens Start
+Practice Session with the DM-Agony preview (`practice.png`), exercising the
+relocated map and texture paths.
+
+This does not establish full gameplay or audible output. Native EDIT is still
+unimplemented, and an absolute pointer move to guest-screen (939,600) places
+the visible in-game pointer near (294,140), not the Start button
+(`practice-pointer.png`). The exclusive-mode pointer coordinate path needs
+separate investigation. No Win32/DOS runtime code or application binary was
+changed for this fixture correction.
 
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
