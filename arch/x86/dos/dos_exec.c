@@ -70,6 +70,12 @@ static void dos_init_ivt(dos_vm_t *vm)
      * INT instructions are host-dispatched, while NOP;IRET remains a valid
      * fallback if guest code reaches the ROM vector directly. */
     vm->mem[DOS_ROM_BASE + 0x33U] = 0x90;
+
+    /* The shell's default Ctrl-C action is an abort, including when a
+     * program chains to the saved real-mode vector. */
+    vm->mem[DOS_ROM_BASE + DOS_DEFAULT_BREAK_OFF] = 0xF9; /* STC */
+    vm->mem[DOS_ROM_BASE + DOS_DEFAULT_BREAK_OFF + 1u] = 0xCB; /* RETF */
+    dos_mem_write16(vm, 0x23u * 4u, DOS_DEFAULT_BREAK_OFF);
 }
 
 /* ── Initialize BDA (BIOS Data Area) ───────────────────────────── */

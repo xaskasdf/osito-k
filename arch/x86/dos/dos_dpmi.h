@@ -71,6 +71,8 @@ enum {
 #define DPMI_RM_RETURN_OFF            0x0128
 #define DPMI_RM_INT_STUB_OFF          0x0130
 #define DPMI_CALLBACK_RETURN_OFF      0x0140
+#define DPMI_CONTROL_RETURN_OFF       0x0150
+#define DOS_DEFAULT_BREAK_OFF         0x0158
 #define DPMI_CALLBACK_BASE_OFF        0x0200
 #define DPMI_CALLBACK_STUB_SIZE       4
 #define DPMI_PM_REFLECT_BASE_OFF      0x1000
@@ -222,6 +224,8 @@ bool dpmi_callback_return(dos_vm_t *vm, bool discard_private_int_frame);
 bool dpmi_dispatch_default_interrupt(dos_vm_t *vm, uint8_t int_num,
                                      uint8_t private_frame_bytes);
 uint16_t dpmi_get_host_code_selector(dos_vm_t *vm);
+uint16_t dpmi_segment_selector(dos_vm_t *vm, uint16_t segment);
+bool dpmi_control_break(dos_vm_t *vm);
 
 uint32_t dpmi_translate(dos_vm_t *vm, uint16_t selector, uint32_t offset);
 bool dpmi_guest_descriptor(dos_vm_t *vm, uint16_t selector,

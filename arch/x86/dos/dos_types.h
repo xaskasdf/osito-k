@@ -359,7 +359,9 @@ typedef struct dos_vm {
     /* A DPMI real-mode service can temporarily re-enter the interpreter.
      * The nested run stops before fetching the host-owned return address. */
     uint16_t         interpreter_stop_cs;
-    uint16_t         interpreter_stop_ip;
+    uint32_t         interpreter_stop_ip;
+    uint16_t         interpreter_stop_psp;
+    bool             interpreter_stop_protected;
     bool             interpreter_stop_active;
     bool             interpreter_stop_reached;
 } dos_vm_t;

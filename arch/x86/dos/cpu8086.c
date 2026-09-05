@@ -1351,6 +1351,11 @@ int cpu8086_run(dos_vm_t *vm)
 
     for (;;) {
         if (!cpu->running) {
+            /* Let the suspended DOS service unwind before its process is
+             * reaped. Children started inside the callback still run normally. */
+            if (vm->interpreter_stop_active &&
+                vm->current_psp == vm->interpreter_stop_psp)
+                break;
             if (!dos_exec_complete_termination(vm)) break;
             cpu = vm->cpu;
             jit = (jit_state_t *)vm->jit;
@@ -1363,9 +1368,10 @@ int cpu8086_run(dos_vm_t *vm)
             prev_cs = cpu->cs;
         }
 
-        if (vm->interpreter_stop_active && !cpu->protected_mode &&
+        if (vm->interpreter_stop_active &&
+            cpu->protected_mode == vm->interpreter_stop_protected &&
             cpu->cs == vm->interpreter_stop_cs &&
-            cpu->ip == vm->interpreter_stop_ip) {
+            cpu->eip == vm->interpreter_stop_ip) {
             vm->interpreter_stop_reached = true;
             break;
         }
@@ -4338,8 +4344,8 @@ int cpu8086_run(dos_vm_t *vm)
     return exit_code;
 }
 
-bool cpu8086_run_until_real(dos_vm_t *vm, uint16_t stop_cs,
-                            uint16_t stop_ip)
+bool cpu8086_run_until(dos_vm_t *vm, bool protected_mode,
+                       uint16_t stop_cs, uint32_t stop_ip)
 {
     if (!vm || !vm->cpu)
         return false;
@@ -4352,11 +4358,15 @@ bool cpu8086_run_until_real(dos_vm_t *vm, uint16_t stop_cs,
     bool saved_stop_active = vm->interpreter_stop_active;
     bool saved_stop_reached = vm->interpreter_stop_reached;
     uint16_t saved_stop_cs = vm->interpreter_stop_cs;
-    uint16_t saved_stop_ip = vm->interpreter_stop_ip;
+    uint32_t saved_stop_ip = vm->interpreter_stop_ip;
+    uint16_t saved_stop_psp = vm->interpreter_stop_psp;
+    bool saved_stop_protected = vm->interpreter_stop_protected;
     bool saved_running = vm->cpu->running;
 
     vm->interpreter_stop_cs = stop_cs;
     vm->interpreter_stop_ip = stop_ip;
+    vm->interpreter_stop_psp = vm->current_psp;
+    vm->interpreter_stop_protected = protected_mode;
     vm->interpreter_stop_reached = false;
     vm->interpreter_stop_active = true;
     vm->cpu->running = true;
@@ -4368,6 +4378,8 @@ bool cpu8086_run_until_real(dos_vm_t *vm, uint16_t stop_cs,
     vm->interpreter_stop_reached = saved_stop_reached;
     vm->interpreter_stop_cs = saved_stop_cs;
     vm->interpreter_stop_ip = saved_stop_ip;
+    vm->interpreter_stop_psp = saved_stop_psp;
+    vm->interpreter_stop_protected = saved_stop_protected;
     vm->native_resume_armed = saved_resume_armed;
     for (unsigned i = 0; i < 9; i++)
         vm->native_resume_jmpbuf[i] = saved_resume_jmpbuf[i];
@@ -4375,4 +4387,10 @@ bool cpu8086_run_until_real(dos_vm_t *vm, uint16_t stop_cs,
     if (reached)
         vm->cpu->running = saved_running;
     return reached;
+}
+
+bool cpu8086_run_until_real(dos_vm_t *vm, uint16_t stop_cs,
+                            uint16_t stop_ip)
+{
+    return cpu8086_run_until(vm, false, stop_cs, stop_ip);
 }

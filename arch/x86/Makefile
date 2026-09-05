@@ -421,6 +421,30 @@ $(BUILD)/test/dos_stdio.o: test/dos_stdio.S | $(BUILD)/test
 $(BUILD)/test/dscchild.com: $(BUILD)/test/dos_stdio_child.o test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
+$(BUILD)/test/dosbreak.com: $(BUILD)/test/dos_break.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_break.o: test/dos_break.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dbchild.com: $(BUILD)/test/dos_break_child.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_break_child.o: test/dos_break_child.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpbreak16.com: $(BUILD)/test/dpmi_break16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_break16.o: test/dpmi_break.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpbreak32.com: $(BUILD)/test/dpmi_break32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_break32.o: test/dpmi_break.S | $(BUILD)/test
+	as --32 --defsym CLIENT32=1 -o $@ $<
+
 $(BUILD)/test/dos_stdio_child.o: test/dos_stdio_child.S | $(BUILD)/test
 	as --32 -o $@ $<
 

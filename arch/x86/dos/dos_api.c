@@ -2558,33 +2558,128 @@ static int dos_character_input_status(dos_vm_t *vm, dos_sft_entry_t *entry,
     return 0;
 }
 
+/* Internal unwind result, never exposed as a DOS error number. */
+#define DOS_CONSOLE_BREAK (-65536)
+
+static int dos_console_check_break(dos_vm_t *vm, dos_sft_entry_t *input)
+{
+    if (vm->indos_count == 1 && !vm->console_scan_pending &&
+        dos_keyboard_ready(vm) &&
+        (uint8_t)vm->kb_buffer[vm->kb_tail] == 3u) {
+        (void)dos_keyboard_read(vm);
+        return DOS_CONSOLE_BREAK;
+    }
+    if (input && !input->is_device) {
+        uint32_t position = input->position;
+        uint8_t ch;
+        int result = dos_file_read(input, &ch, 1);
+        if (result == 1 && ch == 3u) return DOS_CONSOLE_BREAK;
+        input->position = position;
+    }
+    return 0;
+}
+
+static bool dos_console_break(dos_vm_t *vm)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+    const char message[] = "^C\r\n";
+    for (unsigned i = 0; i < sizeof(message) - 1u; i++)
+        (void)dos_cooked_character_output(vm, dos_handle_sft(vm, 1), message[i]);
+
+    if (vm->dpmi.active) {
+        if (dpmi_control_break(vm)) return cpu->running;
+        if (cpu->running) {
+            serial_puts("[DOS] Invalid protected INT 23h return\n");
+            cpu->running = false;
+            cpu->exit_code = -1;
+        }
+        return false;
+    }
+
+    cpu8086_state_t saved = *cpu;
+    uint32_t flags = vm->software_int_frame_bytes
+                   ? vm->software_int_return_flags : cpu->eflags;
+    uint16_t segment = dos_mem_read16(vm, 0x23u * 4u + 2u);
+    uint16_t offset = dos_mem_read16(vm, 0x23u * 4u);
+    uint32_t stack = cpu_stack_offset(cpu);
+    if ((!segment && !offset) ||
+        !dos_exec_guest_buffer(vm, cpu->ss, (uint16_t)(stack - 6u), 6u, NULL))
+        goto abort;
+
+    cpu->eflags = (flags & ~FLAG_CF) | FLAGS_FIXED;
+    cpu_push16(cpu, cpu->flags);
+    cpu_push16(cpu, DPMI_ENTRY_SEG);
+    cpu_push16(cpu, DPMI_CONTROL_RETURN_OFF);
+    cpu->cs = segment;
+    cpu->eip = offset;
+    cpu->flags &= ~(FLAG_IF | FLAG_TF);
+    bool returned = cpu8086_run_until_real(vm, DPMI_ENTRY_SEG,
+                                           DPMI_CONTROL_RETURN_OFF);
+    uint32_t returned_stack = cpu_stack_offset(cpu);
+    bool same_stack = cpu->ss == saved.ss;
+    bool iret = same_stack && returned_stack == stack;
+    bool retf = same_stack && returned_stack == (uint16_t)(stack - 2u);
+    bool resume = returned && (iret || (retf && !(cpu->flags & FLAG_CF)));
+    /* A continuing real-mode handler may modify the service registers.
+     * The suspended DOS call owns its original return address and frame. */
+    cpu->cs = saved.cs;
+    cpu->eip = saved.eip;
+    cpu->ss = saved.ss;
+    cpu->esp = saved.esp;
+    cpu->eflags = saved.eflags;
+    cpu8086_sync_cs(cpu);
+    if (!cpu->running) return false; /* A handler can use AH=4Ch itself. */
+    if (resume) return true;
+abort:
+    vm->termination_type = 1;
+    vm->process_terminated = true;
+    cpu->running = false;
+    cpu->exit_code = 0;
+    return false;
+}
+
+static void dos_console_wait(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(flags));
+    bool enable_irqs = !(flags & (1ULL << 9)) && sched_is_enabled();
+    if (enable_irqs) __asm__ volatile ("sti" ::: "memory");
+    if (sched_sleep_ticks(1) < 0) __asm__ volatile ("pause");
+    if (enable_irqs) __asm__ volatile ("cli" ::: "memory");
+}
+
 static int dos_raw_character_input(dos_vm_t *vm, dos_sft_entry_t *entry,
-                                    uint8_t *ch, bool blocking)
+                                    uint8_t *ch, bool blocking,
+                                    dos_sft_entry_t *check_input)
 {
     if (!entry) return -DOS_ERR_INVALID_HANDLE;
-    if (entry->is_device) {
-        if (entry->device_kind == DOS_DEVICE_NUL) {
-            /* Its driver reports ready but supplies no character. Legacy AL
-             * is unspecified here; use zero, not a synthesized Ctrl-Z. */
-            *ch = 0;
-            return 1;
-        }
-        if (entry->device_kind != DOS_DEVICE_CON) return -DOS_ERR_NOT_READY;
-        if (!blocking && !dos_console_input_ready(vm)) return 0;
-        *ch = dos_console_getchar(vm);
-        return 1;
-    }
     for (;;) {
-        int result = dos_file_read(entry, ch, 1);
-        if (result || !blocking || !vm->cpu->running) return result;
-        /* Legacy blocking calls have no EOF result. Yield while waiting for
-         * more input instead of polling the filesystem at full CPU speed. */
-        uint64_t flags;
-        __asm__ volatile ("pushfq; popq %0" : "=r"(flags));
-        bool enable_irqs = !(flags & (1ULL << 9)) && sched_is_enabled();
-        if (enable_irqs) __asm__ volatile ("sti" ::: "memory");
-        if (sched_sleep_ticks(1) < 0) __asm__ volatile ("pause");
-        if (enable_irqs) __asm__ volatile ("cli" ::: "memory");
+        if (check_input) {
+            int error = dos_console_check_break(vm, check_input);
+            if (error) return error;
+        }
+        if (entry->is_device) {
+            if (entry->device_kind == DOS_DEVICE_NUL) {
+                /* Its driver reports ready but supplies no character. Legacy
+                 * AL is unspecified; do not synthesize Ctrl-Z. */
+                *ch = 0;
+                return 1;
+            }
+            if (entry->device_kind != DOS_DEVICE_CON) return -DOS_ERR_NOT_READY;
+            if (dos_console_input_ready(vm)) {
+                bool scan = vm->console_scan_pending != 0;
+                *ch = dos_console_getchar(vm);
+                if (check_input && !scan && *ch == 3u)
+                    return DOS_CONSOLE_BREAK;
+                return 1;
+            }
+            if (!blocking || !vm->cpu->running) return 0;
+        } else {
+            int result = dos_file_read(entry, ch, 1);
+            if (result || !blocking || !vm->cpu->running) return result;
+        }
+        /* Poll checked input after waking, including at redirected EOF. */
+        dos_console_wait();
     }
 }
 
@@ -2599,7 +2694,7 @@ static int dos_console_read_line(dos_vm_t *vm, dos_sft_entry_t *input,
     bool first = true;
     for (;;) {
         uint8_t ch;
-        int result = dos_raw_character_input(vm, input, &ch, true);
+        int result = dos_raw_character_input(vm, input, &ch, true, input);
         if (result <= 0) return result < 0 ? result : -DOS_ERR_NOT_READY;
         if (first) {
             first = false;
@@ -2730,6 +2825,8 @@ void dos_int21_dispatch(dos_vm_t *vm)
 {
     if (!vm || !vm->cpu) return;
     cpu8086_state_t *cpu = vm->cpu;
+dispatch_again:;
+    cpu8086_state_t request = *cpu;
     dos_psp_t *current_psp = NULL;
     if (dos_psp_location(vm, vm->current_psp, &current_psp, NULL)) {
         current_psp->last_ss_sp = ((uint32_t)cpu->ss << 16) |
@@ -2740,6 +2837,17 @@ void dos_int21_dispatch(dos_vm_t *vm)
     uint8_t previous_indos = vm->indos_count;
     if (vm->indos_count != 0xFFu) vm->indos_count++;
     dos_publish_indos(vm);
+
+    bool console_check = (ah >= 1u && ah <= 5u) || ah == 8u ||
+                          ah == 9u || ah == 0x0Bu;
+    bool extended_check = vm->ctrl_break_enabled && ah > 0x0Cu &&
+                          ah != 0x33u && ah != 0x50u && ah != 0x51u &&
+                          ah != 0x62u;
+    if (console_check || extended_check) {
+        console_error = dos_console_check_break(vm,
+                          console_check ? dos_handle_sft(vm, 0) : NULL);
+        if (console_error) goto console_result;
+    }
 
     switch (ah) {
 
@@ -2755,7 +2863,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
     case 0x01: {
         uint8_t ch = 0;
         console_error = dos_raw_character_input(vm, dos_handle_sft(vm, 0),
-                                                &ch, true);
+                                                &ch, true, dos_handle_sft(vm, 0));
         if (console_error > 0)
             console_error = dos_cooked_character_output(vm,
                               dos_handle_sft(vm, 1), ch);
@@ -2774,7 +2882,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
     case 0x03: {
         uint8_t ch = 0;
         console_error = dos_raw_character_input(vm, dos_handle_sft(vm, 3),
-                                                &ch, true);
+                                                &ch, true, dos_handle_sft(vm, 0));
         cpu->al = ch;
         break;
     }
@@ -2790,7 +2898,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
         if (cpu->dl == 0xFF) {
             uint8_t ch = 0;
             console_error = dos_raw_character_input(vm, dos_handle_sft(vm, 0),
-                                                    &ch, false);
+                                                    &ch, false, NULL);
             if (console_error > 0) {
                 cpu->al = ch;
                 cpu->flags &= ~FLAG_ZF;
@@ -2810,7 +2918,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
     case 0x08: {
         uint8_t ch = 0;
         console_error = dos_raw_character_input(vm, dos_handle_sft(vm, 0),
-                                                &ch, true);
+                             &ch, true, ah == 0x08 ? dos_handle_sft(vm, 0) : NULL);
         cpu->al = ch;
         break;
     }
@@ -2823,6 +2931,8 @@ void dos_int21_dispatch(dos_vm_t *vm)
             if (address >= vm->total_mem_size) break;
             uint8_t ch = dos_mem_read8(vm, address);
             if (ch == '$') break;
+            console_error = dos_console_check_break(vm, dos_handle_sft(vm, 0));
+            if (console_error) break;
             console_error = dos_cooked_character_output(vm,
                               dos_handle_sft(vm, 1), ch);
             if (console_error) break;
@@ -3168,6 +3278,10 @@ void dos_int21_dispatch(dos_vm_t *vm)
                     break;
                 }
                 int result = dos_console_read_handle(vm, fh, buf, count);
+                if (result == DOS_CONSOLE_BREAK) {
+                    console_error = result;
+                    break;
+                }
                 if (result < 0) {
                     cpu->ax = (uint16_t)-result;
                     cpu->flags |= FLAG_CF;
@@ -3272,6 +3386,10 @@ void dos_int21_dispatch(dos_vm_t *vm)
                 while (written < count) {
                     uint8_t ch = dos_mem_read8(vm, buf + written);
                     if (ch == 0x1Au && !(fh->io_flags & DOS_IO_RAW)) break;
+                    if (!(fh->io_flags & DOS_IO_RAW)) {
+                        console_error = dos_console_check_break(vm, fh);
+                        if (console_error) break;
+                    }
                     if (!(fh->io_flags & DOS_IO_RAW) &&
                         (fh->io_flags & DOS_IO_CON_OUT))
                         (void)dos_cooked_character_output(vm, fh, ch);
@@ -3749,8 +3867,10 @@ void dos_int21_dispatch(dos_vm_t *vm)
 
     /* ── AH=34h: Get InDOS flag pointer ───────────────────────────── */
     case 0x34:
-        cpu->es = DOS_SYSVARS_SEG;
+        cpu->es = cpu->protected_mode && vm->dpmi.active
+                ? dpmi_segment_selector(vm, DOS_SYSVARS_SEG) : DOS_SYSVARS_SEG;
         cpu->bx = DOS_INDOS_OFF;
+        if (!cpu->es) console_error = -DOS_ERR_NOT_ENOUGH_MEMORY;
         break;
 
     /* ── AH=50h: Set PSP ──────────────────────────────────────────── */
@@ -4007,6 +4127,19 @@ void dos_int21_dispatch(dos_vm_t *vm)
         break;
     }
 
+console_result:
+    if (console_error == DOS_CONSOLE_BREAK) {
+        uint64_t instructions = cpu->insn_count;
+        *cpu = request;
+        cpu->insn_count = instructions;
+        vm->indos_count = 0;
+        dos_publish_indos(vm);
+        bool resume = dos_console_break(vm);
+        vm->indos_count = previous_indos;
+        dos_publish_indos(vm);
+        if (resume) goto dispatch_again;
+        return;
+    }
     if (console_error < 0) {
         cpu->ax = (uint16_t)-console_error;
         cpu->flags |= FLAG_CF;

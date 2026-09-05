@@ -301,6 +301,8 @@ static inline bool parity8(uint8_t v)
 
 void cpu8086_init(cpu8086_state_t *cpu, dos_vm_t *vm);
 int cpu8086_run(dos_vm_t *vm);
+bool cpu8086_run_until(dos_vm_t *vm, bool protected_mode,
+                       uint16_t stop_cs, uint32_t stop_ip);
 bool cpu8086_run_until_real(dos_vm_t *vm, uint16_t stop_cs,
                             uint16_t stop_ip);
 void cpu8086_sync_cs(cpu8086_state_t *cpu);

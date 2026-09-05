@@ -698,6 +698,24 @@ static void dpmi_clear_freed_data_selectors(cpu8086_state_t *cpu,
     if (dpmi_selector_in_run(cpu->gs, start, count)) cpu->gs = 0;
 }
 
+uint16_t dpmi_segment_selector(dos_vm_t *vm, uint16_t segment)
+{
+    dpmi_state_t *dpmi = &vm->dpmi;
+    for (uint16_t i = 0; i < DPMI_MAX_DESCRIPTORS; i++) {
+        if (dpmi->descriptor_state[i] == DPMI_DESC_RM_ALIAS &&
+            dpmi_desc_get_base(&dpmi->ldt[i]) == ((uint32_t)segment << 4))
+            return dpmi_index_to_sel(i);
+    }
+    uint16_t selector = dpmi_alloc_descriptor(dpmi);
+    if (!selector) return 0;
+    uint16_t index = dpmi_sel_to_index(selector);
+    dpmi_build_desc(&dpmi->ldt[index], (uint32_t)segment << 4, 0xFFFF,
+                    DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT | DESC_WRITABLE, 0);
+    dpmi->descriptor_state[index] = DPMI_DESC_RM_ALIAS;
+    dos_native_sync_ldt(vm);
+    return selector;
+}
+
 static uint16_t dpmi_host_code_selector(dpmi_state_t *dpmi)
 {
     uint16_t idx;
@@ -1074,6 +1092,66 @@ static uint16_t dpmi_callback_stack_selector(dos_vm_t *vm)
     return selector;
 }
 
+bool dpmi_control_break(dos_vm_t *vm)
+{
+    dpmi_state_t *dpmi = &vm->dpmi;
+    cpu8086_state_t *cpu = vm->cpu;
+    uint16_t selector = dpmi->pm_vectors[0x23].sel;
+    uint32_t offset = dpmi->pm_vectors[0x23].off;
+    if (!selector || (selector == dpmi->sel_host_code &&
+        offset == DPMI_PM_REFLECT_BASE_OFF + 0x23u * DPMI_PM_REFLECT_STUB_SIZE))
+        return true;
+
+    uint16_t host_cs = dpmi_get_host_code_selector(vm);
+    uint16_t host_ss = dpmi_callback_stack_selector(vm);
+    if (!host_cs || !host_ss || !dpmi_code_target(vm, selector, offset) ||
+        dpmi->callback_depth >= DPMI_MAX_CALLBACKS)
+        return false;
+
+    cpu8086_state_t saved = *cpu;
+    bool saved_virtual_if = dpmi->virtual_interrupts_enabled;
+    uint32_t top = (++dpmi->callback_depth) * DPMI_CALLBACK_STACK_SIZE - 16u;
+    /* Use the same resident stack pool as real-mode callbacks. This also
+     * covers INT 23h reflected from a simulated real-mode DOS service. */
+    cpu->protected_mode = true;
+    cpu->cr0 |= 1u;
+    cpu->ss = host_ss;
+    cpu->esp = top;
+    if (!saved.protected_mode)
+        cpu->ds = cpu->es = cpu->fs = cpu->gs = 0;
+    cpu->eflags = (saved.eflags & ~(FLAG_CF | FLAG_TF)) | FLAGS_FIXED | FLAG_IF;
+    if (dpmi->is_32bit) {
+        cpu_push32(cpu, cpu->eflags);
+        cpu_push32(cpu, host_cs);
+        cpu_push32(cpu, DPMI_CONTROL_RETURN_OFF);
+    } else {
+        cpu_push16(cpu, cpu->flags);
+        cpu_push16(cpu, host_cs);
+        cpu_push16(cpu, DPMI_CONTROL_RETURN_OFF);
+    }
+    cpu->cs = selector;
+    cpu->eip = offset;
+    cpu->halted = false;
+    cpu8086_sync_cs(cpu);
+    vm->native_dispatch_depth++;
+    bool returned = cpu8086_run_until(vm, true, host_cs,
+                                      DPMI_CONTROL_RETURN_OFF);
+    vm->native_dispatch_depth--;
+    bool valid = returned && cpu->ss == host_ss && cpu_stack_offset(cpu) == top;
+    bool running = cpu->running;
+    int32_t exit_code = cpu->exit_code;
+    uint64_t instructions = cpu->insn_count;
+    *cpu = saved;
+    cpu->insn_count = instructions;
+    if (!running) {
+        cpu->running = false;
+        cpu->exit_code = exit_code;
+    }
+    dpmi->callback_depth--;
+    dpmi->virtual_interrupts_enabled = saved_virtual_if;
+    return valid;
+}
+
 static void dpmi_read_rm_regs(dos_vm_t *vm, uint32_t address,
                               dpmi_rm_regs_t *regs)
 {
@@ -1439,7 +1517,11 @@ bool dpmi_dispatch_default_interrupt(dos_vm_t *vm, uint8_t int_num,
         return false;
 
     uint32_t reflected_flags;
-    if (dos_int_has_pm_translator(int_num)) {
+    if (int_num == 0x23u) {
+        /* The default protected Ctrl-C handler ignores the notification;
+         * chaining here must not fall back to the real-mode abort handler. */
+        reflected_flags = cpu->eflags;
+    } else if (dos_int_has_pm_translator(int_num)) {
         dos_int_dispatch(vm, int_num);
         reflected_flags = cpu->eflags;
     } else {
@@ -1537,34 +1619,13 @@ void dos_int31_dpmi(dos_vm_t *vm)
     /* ── AX=0003h: Get Selector Increment ──────────────────────── */
     /* AX=0002h: Segment to Descriptor */
     case 0x0002: {
-        uint16_t existing = 0;
-        for (uint16_t i = 0; i < DPMI_MAX_DESCRIPTORS; i++) {
-            if (dpmi->descriptor_state[i] == DPMI_DESC_RM_ALIAS &&
-                dpmi_desc_get_base(&dpmi->ldt[i]) == ((uint32_t)cpu->bx << 4)) {
-                existing = dpmi_index_to_sel(i);
-                break;
-            }
-        }
-        if (existing) {
-            cpu->ax = existing;
-            cpu->eflags &= ~FLAG_CF;
-            break;
-        }
-
-        uint16_t sel = dpmi_alloc_descriptor(dpmi);
+        uint16_t sel = dpmi_segment_selector(vm, cpu->bx);
         if (!sel) {
             cpu->ax = 0x8011;  /* descriptor unavailable */
             cpu->eflags |= FLAG_CF;
             break;
         }
 
-        uint16_t idx = dpmi_sel_to_index(sel);
-        dpmi_build_desc(&dpmi->ldt[idx], (uint32_t)cpu->bx << 4,
-                        0xFFFF,
-                        DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
-                        DESC_WRITABLE,
-                        0);
-        dpmi->descriptor_state[idx] = DPMI_DESC_RM_ALIAS;
         cpu->ax = sel;
         cpu->eflags &= ~FLAG_CF;
         break;

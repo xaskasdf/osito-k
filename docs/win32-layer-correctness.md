@@ -1521,6 +1521,74 @@ cancellation and growth during that wait are not covered here. UART/printer
 backends remain unavailable. No UT99 gameplay, audio-device integration, or
 legacy Linux/Unix binary run was performed for this change.
 
+## 4.26 DOS Ctrl-C callbacks and protected InDOS pointers (2026-09-05)
+
+The standard-handle work in `27bcbad5` exposed another missing contract:
+checked character input returned Ctrl-C as an ordinary byte and `AH=33h`
+only stored a flag. Checked console calls now consume Ctrl-C, unwind the
+active service, publish InDOS=0, and invoke the application's INT 23h.
+Physical-console checks work with redirected stdin, including while waiting
+at disk EOF. `AH=06h/07h` remain raw; BREAK ON also checks ordinary disk
+services without changing the early `AH=33h/50h/51h/62h` dispatch contract.
+
+Real-mode handlers can return with IRET or clear-carry RETF to redispatch
+the service, including a changed AH. Set-carry RETF produces termination
+type 1 and code 0; an explicit AH=4Ch in a handler retains its normal exit
+code. A ROM default handler also supports chaining through the saved vector.
+This follows the published
+[MS-DOS Ctrl-C implementation](https://github.com/microsoft/MS-DOS/blob/2d04cacc5322951f187bb17e017c12920ac8ebe2/v4.0/src/DOS/CTRLC.ASM).
+The nested interpreter stops at the host return address in the matching
+CPU mode. It must unwind before reaping its current process, so termination
+inside an INT 23h handler also works for an EXEC 4B01 load-only child.
+
+DPMI uses its separate contract: an unhooked protected INT 23h is ignored,
+and a hooked handler returns through a resident host stack without using
+carry as an abort request. The existing callback-stack pool is shared by
+depth, and the native outer interrupt context stays intact while nested
+callbacks are interpreted. A handler can chain to the default reflector.
+This covers direct protected calls and notifications raised during an
+INT 31h/0300h simulated real-mode service. See Microsoft's
+[MS-DOS API Extensions for DPMI Hosts, section 12](https://docs.pcjs.org/specs/dpmi/1991_03_11-MSDOS_DPMI_EXTENSIONS.pdf).
+
+The new probes also found that AH=34h returned a real segment to DPMI
+callers. It now returns a reusable segment-alias selector and synchronizes
+new descriptors with the native LDT. INT 31h/0002h uses the same allocator.
+Both direct native access and access inside callbacks verify that the
+returned InDOS byte is zero after the query returns.
+
+```sh
+make -C arch/x86 CLANG=1 -j4 all build/test/dosbreak.com \
+    build/test/dbchild.com build/test/dpbreak16.com build/test/dpbreak32.com
+```
+
+Copy these four COM files to the guest root. `dosrun dosbreak.com` (or
+`dos_break.autoload`) expects one Ctrl-C after each RAW READY, EXTENDED READY,
+and EOF READY marker. It checks raw bypass, IRET/RETF continuation, registers
+and stack, edited-line restart, status consumption, ordinary and load-only
+EXEC exits, BREAK ON/OFF, and cancellation at redirected EOF. `dpbreak16.com`
+and `dpbreak32.com` need no keyboard input. They check the unhooked default,
+installed handler, carry-independent return, chaining, InDOS, and real-mode
+reflection. The tests use CREATE_NEW and remove only their owned fixtures.
+These are source-derived probes, not differential runs against MS-DOS.
+
+The initial real-mode probe fails at stage 3 on the previous kernel in
+`/root/osito-dos-break-before-20260905-QGCWrg/`. The final run is
+`/root/osito-dos-break-verified-20260905-DgBK2g/`, KVM with 8 GiB/four CPUs.
+All three break probes pass, with both DPMI variants repeated after Win32.
+DOS API/HOSTMEM (15 checks), stdio, IOCTL, console input, and EXEC pass;
+the native DPMI probe exits with its expected code 42. Win32 module/ABI
+passes 45/45 and CRT format passes 194/194 for PE32 MSVCRT and PE64 UCRT.
+No CPU fault or contract-failure marker appears in that final log. The VM
+was stopped and reaped. Built and booted kernel SHA-256:
+`61c9d6d30b59ea213faa8c54129799cc12064190eea271a703d75188b29dc3b9`.
+
+Remaining work includes INT 24h critical-error actions, physical Ctrl-Break
+(INT 1Bh), Ctrl-S/Ctrl-P, full line editing, and standalone software INT 23h
+delivery outside a checked DOS call. Callback-pool exhaustion, malformed
+returns, and deeply nested handlers need dedicated negative coverage.
+No UT99 gameplay, physical audio integration, or legacy Unix/Linux binary
+was exercised in this slice. This does not complete the Win32/DOS layer goal.
+
 ## 5. Open questions / notes
 - `WINAPI` selects the Microsoft x64 ABI for native shims, not the kernel's
   SysV ABI. Export arg-count metadata also drives the **32-bit thunk's `RET n*4`**.
