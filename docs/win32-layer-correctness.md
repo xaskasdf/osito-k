@@ -962,9 +962,70 @@ the visible in-game pointer near (294,140), not the Start button
 separate investigation. No Win32/DOS runtime code or application binary was
 changed for this fixture correction.
 
+## 4.18 Thread-owned CRT floating-point control (2026-09-05)
+
+`_controlfp` previously updated a global shadow without changing hardware;
+`_controlfp_s` always returned success and a zero control value. The early
+PE32/PE64 probes failed 11/21 and 7/16 checks with the old kernel in
+`/root/osito-crt-fp-baseline-20260905-0jOWbz/`.
+
+The shared CRT shim now reads and updates the current thread's x87 control
+word and MXCSR. `_control87` maps CRT exception masks, rounding, precision,
+and denormal modes to hardware; `_controlfp` preserves the denormal exception
+mask. PE32 reports ambiguous x87/SSE state, while PE64 controls SSE without
+changing x87. DAZ changes honor the processor's MXCSR mask. Queries preserve
+sticky SSE status; an effective control change clears it, as observed on
+native Windows. The existing scheduler FPU context provides thread isolation.
+
+`_controlfp_s` reports the actual resulting control and rejects selected
+unknown bits through the invalid-parameter handler and EINVAL. Process-level
+handler storage uses the existing process-owned CRT state; a thread-local
+handler takes precedence. Callbacks run outside the state lock through the
+appropriate PE ABI. This follows the
+[CRT control API](https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/control87-controlfp-control87-2?view=msvc-170).
+The installed release UCRT treats PE64 x87-only precision requests as a
+successful no-op, which the probe records explicitly rather than assuming
+the invalid-parameter behavior described for that case in the documentation.
+
+Build with `sh arch/x86/scripts/build-crt-fp-test.sh`. Copy the two executables
+from `arch/x86/build/test-crt-fp/pe{32,64}/` to an image's `probes/` directory.
+Run `winexec probes/crt_fp_pe32.exe` and the PE64 equivalent, both with and
+without a trailing `ucrt` argument. `crt_fp.autoload` starts the PE32 MSVCRT
+case. The same binaries run directly on Windows. Coverage includes actual
+rounding and precision arithmetic, all exception masks, denormal modes,
+hardware readback, thread isolation, and invalid-parameter handler precedence.
+Mask tests clear pending x87 flags left by earlier arithmetic before
+unmasking exceptions, keeping the cases independent.
+
+| Runtime | PE32 MSVCRT | PE32 UCRT | PE64 MSVCRT | PE64 UCRT |
+| --- | --- | --- | --- | --- |
+| Native Windows | 44/44 | 50/50 | 31/31 | 38/38 |
+| OsitoK | 48/48 | 50/50 | 36/36 | 38/38 |
+
+Counts differ because the host MSVCRT lacks the process invalid-parameter
+handler export; those conditional checks run in OsitoK and UCRT. Final QEMU
+artifacts are in `/root/osito-crt-fp-commit-20260905-MjpSGF/`, using an isolated
+OSFS3 snapshot, 8 GiB, four CPUs, KVM, VNC :12 and UDP 7790. The CLANG=1 build
+and booted kernel share SHA-256
+`2c93557771ab849704a472fcdfdf7870251d633e5efcd4cb4552897c2bae485f`.
+Input 166/166, window-model 95/95, dialog 10/10, GDI DIB 32/32, regions 40/40,
+DirectDraw ABI, DirectSound, and DOS API with 15/15 host-memory checks pass.
+Both UCRT probes pass again after DOS. No unexpected CPU fault appears in
+this regression run.
+
+This does not establish full CRT floating-point coverage: startup FPU defaults,
+`__control87_2`, `_statusfp`, `_clearfp`, `_fpreset`, and the no-handler fatal
+path remain outside these probes. No DOS or audio implementation changed.
+The UT99 render defect still needs an integration rerun: with the old kernel,
+`/root/osito-ut99-relative-20260905-dDAv7S/` reached DM-Agony using a relative
+USB mouse, but a raw submitted RGB565 buffer (`frame8.png`) already contained
+the stale scene and accumulated HUD. That isolates the observed corruption
+upstream of the compositor; it does not prove this CRT fix resolves it.
+
 ## 5. Open questions / notes
-- `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
-  drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of
+- `WINAPI` selects the Microsoft x64 ABI for native shims, not the kernel's
+  SysV ABI. Export arg-count metadata also drives the **32-bit thunk's `RET n*4`**.
+  So GT-argc must be the count of
   **32-bit stack DWORDs the 32-bit caller pushed**, not the 64-bit ABI.
 - Variadic CRT fns (printf family) are cdecl → caller cleans, so a too-large
   argc (12) is harmless for cleanup; it only affects how many stack DWORDs the

@@ -3194,6 +3194,7 @@ typedef struct {
     ULONG_PTR initenv_entries[1];
     ULONG_PTR signal_handlers[7];
     char command_line[4096];
+    PVOID invalid_parameter_handler;
 } UCRT_PROCESS_MODE_VALUES;
 
 typedef struct {
@@ -3639,6 +3640,58 @@ PVOID WINAPI crt_set_thread_local_invalid_parameter_handler(PVOID handler)
     }
     ucrt_state_lock_release();
     return previous;
+}
+
+PVOID WINAPI crt_get_thread_local_invalid_parameter_handler(void)
+{
+    DWORD pid = GetCurrentProcessId();
+    DWORD tid = GetCurrentThreadId();
+    PVOID handler = NULL;
+    ucrt_state_lock_acquire();
+    for (uint32_t i = 0; i < UCRT_INVALID_HANDLER_SLOTS; i++) {
+        UCRT_INVALID_HANDLER_SLOT *slot = &ucrt_invalid_handlers[i];
+        if (slot->used && slot->owner_pid == pid && slot->owner_tid == tid) {
+            handler = slot->handler;
+            break;
+        }
+    }
+    ucrt_state_lock_release();
+    return handler;
+}
+
+PVOID WINAPI crt_set_invalid_parameter_handler(PVOID handler)
+{
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) return NULL;
+    return __atomic_exchange_n(&values->invalid_parameter_handler, handler,
+                               __ATOMIC_ACQ_REL);
+}
+
+PVOID WINAPI crt_get_invalid_parameter_handler(void)
+{
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(FALSE);
+    return values ? __atomic_load_n(&values->invalid_parameter_handler,
+                                     __ATOMIC_ACQUIRE) : NULL;
+}
+
+static void crt_report_invalid_parameter(void)
+{
+    PVOID handler = crt_get_thread_local_invalid_parameter_handler();
+    if (!handler) handler = crt_get_invalid_parameter_handler();
+    if (!handler) {
+        serial_puts("[MSVCRT] invalid parameter without a handler\n");
+        ExitProcess(0xC0000417U); /* STATUS_INVALID_CRUNTIME_PARAMETER */
+        return;
+    }
+    if (g_compat32_mode) {
+        uint32_t args[5] = { 0, 0, 0, 0, 0 };
+        (void)compat32_callback_args((uint32_t)(ULONG_PTR)handler, 5, args);
+    } else {
+        typedef void (WINAPI *INVALID_HANDLER)(const WCHAR *, const WCHAR *,
+                                                const WCHAR *, unsigned,
+                                                ULONG_PTR);
+        ((INVALID_HANDLER)handler)(NULL, NULL, NULL, 0, 0);
+    }
 }
 
 /* Locale. The CRT starts in C and OsitoK currently has no configurable
@@ -4819,8 +4872,6 @@ void WINAPI crt_compat32_longjmp_marker(PVOID environment, int value)
 
 /* ── Misc CRT internal ────────────────────────────────────── */
 
-int  WINAPI crt_controlfp_s(unsigned int *old, unsigned int newval, unsigned int mask)
-    { if (old) *old = 0; (void)newval; (void)mask; return 0; }
 int  WINAPI crt_configthreadlocale(int type) { (void)type; return 0; }
 void WINAPI crt_lock(int locknum) { (void)locknum; }
 void WINAPI crt_unlock(int locknum) { (void)locknum; }
@@ -5428,16 +5479,126 @@ int* WINAPI crt_adjust_fdiv(void)
     return values ? &values->adjust_fdiv : NULL;
 }
 
-/* _controlfp — control floating point
- * Default x87 control word: 0x027F (round nearest, double precision, all exceptions masked)
- * We store and return a state but don't actually modify FPU — safe for single-threaded compat */
-static unsigned int crt_fpcontrol = 0x0009001F; /* MCW_EM=0x1F | MCW_RC=0 | MCW_PC=0x20000 */
+/* CRT flags are not hardware bit positions. The current thread's saved FPU
+ * context, not a CRT-global shadow, owns the x87 and SSE control state. */
+#define CRT_MCW_EM 0x0008001FU
+#define CRT_EM_DENORMAL 0x00080000U
+#define CRT_MCW_RC 0x00000300U
+#define CRT_MCW_PC 0x00030000U
+#define CRT_PC_24 0x00020000U
+#define CRT_PC_53 0x00010000U
+#define CRT_MCW_IC 0x00040000U
+#define CRT_MCW_DN 0x03000000U
+#define CRT_EM_AMBIGUOUS 0x80000000U
+#define CRT_MCW_ALL (CRT_MCW_EM | CRT_MCW_RC | CRT_MCW_PC | CRT_MCW_IC | CRT_MCW_DN)
+
+static unsigned crt_fp_exceptions_from_hw(unsigned bits)
+{
+    return ((bits & 1) ? 0x10U : 0) |
+           ((bits & 2) ? CRT_EM_DENORMAL : 0) |
+           ((bits & 4) ? 8U : 0) | ((bits & 8) ? 4U : 0) |
+           ((bits & 16) ? 2U : 0) | ((bits & 32) ? 1U : 0);
+}
+
+static unsigned crt_fp_exceptions_to_hw(unsigned bits)
+{
+    return ((bits & 0x10) ? 1U : 0) |
+           ((bits & CRT_EM_DENORMAL) ? 2U : 0) |
+           ((bits & 8) ? 4U : 0) | ((bits & 4) ? 8U : 0) |
+           ((bits & 2) ? 16U : 0) | ((bits & 1) ? 32U : 0);
+}
+
+static unsigned crt_fp_x87_control(unsigned short word)
+{
+    unsigned value = crt_fp_exceptions_from_hw(word & 0x3F) |
+                     ((word >> 2) & CRT_MCW_RC);
+    if ((word & 0x300) == 0) value |= CRT_PC_24;
+    else if ((word & 0x300) == 0x200) value |= CRT_PC_53;
+    if (word & 0x1000) value |= CRT_MCW_IC;
+    return value;
+}
+
+static unsigned crt_fp_sse_control(unsigned csr)
+{
+    unsigned value = crt_fp_exceptions_from_hw((csr >> 7) & 0x3F) |
+                     ((csr >> 5) & CRT_MCW_RC);
+    switch (csr & 0x8040) {
+    case 0x8040: value |= 0x01000000U; break; /* flush operands and results */
+    case 0x0040: value |= 0x02000000U; break; /* flush operands */
+    case 0x8000: value |= 0x03000000U; break; /* flush results */
+    }
+    return value;
+}
+
+unsigned int WINAPI crt_control87(unsigned int newval, unsigned int mask)
+{
+    unsigned short cw;
+    unsigned csr;
+    __asm__ volatile ("fnstcw %0; stmxcsr %1" : "=m"(cw), "=m"(csr));
+    unsigned x87 = crt_fp_x87_control(cw);
+    unsigned sse = crt_fp_sse_control(csr);
+    mask &= CRT_MCW_ALL;
+
+    if (g_compat32_mode) {
+        unsigned x87_mask = mask & ~CRT_MCW_DN;
+        unsigned value = (x87 & ~x87_mask) | (newval & x87_mask);
+        unsigned short next = (cw & ~0x1F3FU) |
+            crt_fp_exceptions_to_hw(value) | ((value & CRT_MCW_RC) << 2);
+        switch (value & CRT_MCW_PC) {
+        case CRT_PC_24: break;
+        case CRT_PC_53: next |= 0x200; break;
+        default: next |= 0x300; break;
+        }
+        if (value & CRT_MCW_IC) next |= 0x1000;
+        if (next != cw) __asm__ volatile ("fldcw %0" : : "m"(next) : "memory");
+        x87 = crt_fp_x87_control(next);
+    }
+
+    unsigned sse_mask = mask & ~(CRT_MCW_PC | CRT_MCW_IC);
+    unsigned value = (sse & ~sse_mask) | (newval & sse_mask);
+    unsigned next = (csr & ~0xFFC0U) |
+        (crt_fp_exceptions_to_hw(value) << 7) | ((value & CRT_MCW_RC) << 5);
+    switch (value & CRT_MCW_DN) {
+    case 0x01000000U: next |= 0x8040; break;
+    case 0x02000000U: next |= 0x0040; break;
+    case 0x03000000U: next |= 0x8000; break;
+    }
+    if ((next ^ csr) & 0x0040) {
+        /* DAZ is optional even with SSE2; never load a reserved MXCSR bit. */
+        __attribute__((aligned(16))) unsigned char state[512];
+        __asm__ volatile ("fxsave64 %0" : "=m"(state));
+        unsigned supported = *(const unsigned *)(state + 28);
+        if (!supported) supported = 0xFFBF;
+        next &= supported;
+    }
+    if (next != csr) {
+        next &= ~0x3FU;
+        __asm__ volatile ("ldmxcsr %0" : : "m"(next) : "memory");
+    }
+    sse = crt_fp_sse_control(next);
+    if (!g_compat32_mode) return sse;
+    unsigned result = x87 | sse;
+    if ((x87 ^ sse) & (CRT_MCW_EM | CRT_MCW_RC)) result |= CRT_EM_AMBIGUOUS;
+    return result;
+}
+
 unsigned int WINAPI crt_controlfp(unsigned int newval, unsigned int mask)
 {
-    if (mask) {
-        crt_fpcontrol = (crt_fpcontrol & ~mask) | (newval & mask);
+    return crt_control87(newval, mask & ~CRT_EM_DENORMAL);
+}
+
+int WINAPI crt_controlfp_s(unsigned int *current, unsigned int newval,
+                            unsigned int mask)
+{
+    if (newval & mask & ~CRT_MCW_ALL) {
+        if (current) *current = crt_controlfp(0, 0);
+        crt_report_invalid_parameter();
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
     }
-    return crt_fpcontrol;
+    unsigned value = crt_controlfp(newval, mask);
+    if (current) *current = value;
+    return 0;
 }
 
 /* _ftol — float to long conversion */
@@ -9256,6 +9417,13 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_set_thread_local_invalid_parameter_handler",
                             (PVOID)crt_set_thread_local_invalid_parameter_handler,
                             1, CC_CDECL },
+    { "_get_thread_local_invalid_parameter_handler",
+                            (PVOID)crt_get_thread_local_invalid_parameter_handler,
+                            0, CC_CDECL },
+    { "_set_invalid_parameter_handler",
+                            (PVOID)crt_set_invalid_parameter_handler, 1, CC_CDECL },
+    { "_get_invalid_parameter_handler",
+                            (PVOID)crt_get_invalid_parameter_handler, 0, CC_CDECL },
 
     /* Locale */
     { "setlocale",           (PVOID)crt_setlocale,    2, CC_CDECL },
@@ -9372,6 +9540,7 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     WX_DATA_DYNAMIC("_acmdln"),
     WX_DATA_DYNAMIC("_adjust_fdiv"),
     { "_controlfp",          (PVOID)crt_controlfp,    2, CC_CDECL },
+    { "_control87",          (PVOID)crt_control87,    2, CC_CDECL },
     { "_ftol",               (PVOID)crt_ftol,         2, CC_CDECL },  /* double = 2 DWORDs */
     { "_onexit",             (PVOID)crt_onexit,       1, CC_CDECL },
     { "_purecall",           (PVOID)crt_purecall,     0, CC_CDECL },
