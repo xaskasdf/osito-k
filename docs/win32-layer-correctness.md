@@ -822,6 +822,86 @@ its internal temporary clip. Tests explicitly release their objects; they do
 not prove full process-exit reclamation or concurrent GDI lifetime correctness.
 This change does not modify the DOS or audio implementation.
 
+## 4.15 Native LISTBOX control contracts (2026-09-05)
+
+Commit `17cb1705` adds per-window LISTBOX state with dynamically grown UTF-16
+item storage, ANSI/Unicode message conversion, item data, sorting/search,
+single/multiple selection, caret/anchor/top-index geometry, mouse capture,
+keyboard selection, and parent notifications. Fixed/variable owner drawing
+uses the PE32/PE64 MEASUREITEM, COMPAREITEM, DRAWITEM and DELETEITEM layouts.
+Control state stays alive until reentrant callbacks return; destroying a list
+does not release its borrowed font.
+
+Build the probes with `sh arch/x86/scripts/build-user32-listbox-test.sh`.
+`user32_listbox_pe32.exe` and `user32_listbox_pe64.exe` each pass 65 checks on
+native Windows and 86 checks in OsitoK. The counts differ because OsitoK paints
+more often and the probe checks each owner-draw callback. The optional
+`--reentrant` mode passes 91 checks per ABI in OsitoK; destruction from inside
+owner drawing is a robustness test, not established native Windows parity.
+Artifacts for that initial QEMU run are in
+`/root/osito-listbox-20260904-5z7Idk/`.
+
+The UT99 wizard now paints its renderer list. The initial integration run
+`/root/osito-ut99-listbox-20260904-NCGf1d/` nevertheless crashed the compositor
+on a physical click, unlike the message-driven probes. This is addressed and
+independently reproduced in section 4.16.
+
+Full locale collation, native nonclient scrollbars, integral-height resizing,
+and directory population remain incomplete. LB_DIR/LB_ADDFILE report failure
+rather than inventing entries. Concurrent mutation between cross-encoding
+LB_GETTEXTLEN/LB_GETTEXT requests is not validated. Existing bitmap-font and
+broader ANSI/Unicode thunk limitations from section 4.14 still apply.
+
+## 4.16 Window callback scheduler ownership (2026-09-05)
+
+The root PE runtime and native tasks without a Win32 context both expose the
+fallback Win32 PID/TID `1:1`. Comparing only those IDs let compositor task 3
+call a PE32 window procedure belonging to task 1, using the wrong address
+space, TEB and callback mode. The saved fault was a compositor instruction
+fetch at RIP zero while dispatching WM_KILLFOCUS from SetFocus.
+
+WINDOW now records its creating scheduler task. Immediate window-message,
+window-position, native drag, capture and destruction paths check that task
+as well as the Win32 IDs. Queued synchronous requests also retain their target
+task, preventing a sender with colliding fallback IDs from consuming its own
+request. UpdateWindow uses the synchronous message path for owner-thread
+painting. This follows the ownership model described in
+[Creating Windows in Threads](https://learn.microsoft.com/en-us/windows/win32/procthread/creating-windows-in-threads);
+it does not change application-visible process IDs or add game-specific rules.
+
+The extended `win32-input-test` spawns a real native input producer. It checks
+deferred focus delivery, owner-thread focus/mouse/key callbacks, synchronous
+results, owner-thread repainting, and rejection of foreign capture/destruction.
+Before the fix the first version failed 2 of 162 checks, specifically premature
+callbacks and wrong-task execution, in
+`/root/osito-input-owner-before-20260905-bb156d/`. After the fix those 162 pass;
+the expanded final version passes 166/166.
+
+Final regression artifacts: `/root/osito-input-owner-final-20260905-b9HdRx/`.
+The CLANG=1 build and booted kernel share SHA-256
+`473a8bd0f296f0f749c8f689b0b6da9959dcf272ef09b5baa2f962558d773c1a`.
+Window-model 95/95, dialog 10/10, GDI DIB 32/32, regions 40/40, DirectDraw,
+DirectSound, and DOS API with 15/15 host-memory checks pass. After DOS, LISTBOX
+86/86 and reentrant 91/91, BUTTON/STATIC 64/64, and paint 85/85 all pass on both
+PE ABIs. No unexpected CPU fault appears in this regression run.
+
+The same kernel in `/root/osito-ut99-input-owner-20260905-OrxMo4/` boots the
+UT99 image with `-snapshot`, 8 GiB, four CPUs and KVM. QMP absolute-pointer
+input selects the second list item (`selected.png`), and Down selects the
+third (`keyboard.png`). Focus logs show `tasks=1:3`. Next advances through
+the detail and ready pages (`next.png`, `ready.png`); Run loads SoftDrv,
+configures DirectDraw to 640x480, and reaches the rendered game menu after
+Escape (`escape.png`). No compositor fault recurs during this sequence.
+
+This is not full UT99 validation. The detail page still has an unimplemented
+EDIT control. Five renderer rows share the Software Rendering label even
+though read-only extraction of D3DDrv.int, SoftDrv.int and OpenGlDrv.int shows
+distinct ClassCaption values. A pointer-driven practice-menu attempt did not
+open its dialog, so gameplay, in-game pointer behavior and audible output are
+not established. General native/Win32 ID mapping, per-thread input attachment,
+queue teardown races, and complete process-exit reclamation remain separate
+work. The DOS and audio implementations are unchanged by this patch.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of

@@ -420,6 +420,7 @@ typedef struct {
     PVOID       user_data;
     DWORD       owner_pid;
     DWORD       owner_tid;
+    int32_t     owner_task;
     int         visible;
     int         message_only;
     int         destroying;
@@ -451,6 +452,25 @@ static int window_count = 0;
 static ULONG_PTR next_hwnd = 0xA0000001;
 static int defer_sync_depth;
 static unsigned show_trace_count;
+
+static int32_t user32_current_task(void)
+{
+#ifndef TEST_HARNESS
+    extern int32_t proc_current_pid(void);
+    return proc_current_pid();
+#else
+    return 0;
+#endif
+}
+
+static BOOL window_on_current_thread(const WINDOW *window)
+{
+    /* Native tasks can share the root runtime's fallback Win32 IDs without
+     * owning its address space, TEB or callback ABI. */
+    return window && window->owner_task == user32_current_task() &&
+           window->owner_pid == GetCurrentProcessId() &&
+           window->owner_tid == GetCurrentThreadId();
+}
 
 typedef struct {
     BOOL used;
@@ -1370,6 +1390,7 @@ typedef struct {
     DWORD sender_tid;
     DWORD target_pid;
     DWORD target_tid;
+    int32_t target_task;
     HWND window;
     DWORD message;
     WPARAM wparam;
@@ -1957,6 +1978,7 @@ static BOOL sent_message_begin(const WINDOW *window, DWORD message,
         sent->sender_tid = GetCurrentThreadId();
         sent->target_pid = window->owner_pid;
         sent->target_tid = window->owner_tid;
+        sent->target_task = window->owner_task;
         sent->window = window->handle;
         sent->message = message;
         sent->wparam = wparam;
@@ -1975,10 +1997,12 @@ static BOOL sent_message_begin(const WINDOW *window, DWORD message,
 static BOOL sent_message_pending(DWORD pid, DWORD tid)
 {
     BOOL pending = FALSE;
+    int32_t task = user32_current_task();
     uint64_t flags = sent_message_lock_irqsave();
     for (int i = 0; i < SENT_MESSAGE_SLOTS; i++) {
         SENT_MESSAGE *sent = &sent_messages[i];
         if (sent->state == SENT_MESSAGE_PENDING &&
+            sent->target_task == task &&
             sent->target_pid == pid && sent->target_tid == tid) {
             pending = TRUE;
             break;
@@ -4266,8 +4290,7 @@ static void dispatch_window_message(WINDOW *w, DWORD message,
     if (!w || !w->wndproc)
         return;
 
-    if (w->owner_pid == GetCurrentProcessId() &&
-        w->owner_tid == GetCurrentThreadId()) {
+    if (window_on_current_thread(w)) {
         dispatch_wndproc(w->wndproc, w->handle, message, wParam, lParam);
         return;
     }
@@ -4289,6 +4312,10 @@ static void dispatch_window_message(WINDOW *w, DWORD message,
             serial_putdec(GetCurrentProcessId());
             serial_puts(":");
             serial_putdec(GetCurrentThreadId());
+            serial_puts(" tasks=");
+            serial_putdec((uint32_t)w->owner_task);
+            serial_puts(":");
+            serial_putdec((uint32_t)user32_current_task());
             serial_puts("\n");
         }
     }
@@ -4330,9 +4357,7 @@ _Static_assert(sizeof(WINDOWPOS32) == 28, "Win32 WINDOWPOS ABI");
 static BOOL dispatch_windowpos_message(WINDOW *w, DWORD message,
                                        WINDOWPOS *position, BOOL copy_back)
 {
-    if (!w || !w->wndproc || !position ||
-        w->owner_pid != GetCurrentProcessId() ||
-        w->owner_tid != GetCurrentThreadId())
+    if (!w || !w->wndproc || !position || !window_on_current_thread(w))
         return FALSE;
 
     if (!g_compat32_mode) {
@@ -4635,6 +4660,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     w->user_data = NULL;
     w->owner_pid = pid;
     w->owner_tid = GetCurrentThreadId();
+    w->owner_task = user32_current_task();
     w->visible  = !message_only && (dwStyle & WS_VISIBLE) ? 1 : 0;
     w->message_only = message_only;
     w->destroying = 0;
@@ -5000,7 +5026,7 @@ BOOL WINAPI DestroyWindow(HWND hWnd)
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return FALSE;
     }
-    if (w->owner_tid != GetCurrentThreadId()) {
+    if (!window_on_current_thread(w)) {
         SetLastError(5); /* ERROR_ACCESS_DENIED */
         return FALSE;
     }
@@ -5237,7 +5263,7 @@ BOOL WINAPI UpdateWindow(HWND hWnd)
     if (!w) return FALSE;
 
     if (w->wndproc && w->visible && w->paint_pending)
-        dispatch_wndproc(w->wndproc, hWnd, WM_PAINT, 0, 0);
+        SendMessageA(hWnd, WM_PAINT, 0, 0);
 
     return TRUE;
 }
@@ -5870,6 +5896,7 @@ static int sent_message_dispatch_current(void)
 {
     DWORD pid = GetCurrentProcessId();
     DWORD tid = GetCurrentThreadId();
+    int32_t task = user32_current_task();
     int dispatched = 0;
 
     for (;;) {
@@ -5880,6 +5907,7 @@ static int sent_message_dispatch_current(void)
         for (int i = 0; i < SENT_MESSAGE_SLOTS; i++) {
             SENT_MESSAGE *candidate = &sent_messages[i];
             if (candidate->state == SENT_MESSAGE_PENDING &&
+                candidate->target_task == task &&
                 candidate->target_pid == pid &&
                 candidate->target_tid == tid &&
                 candidate->sequence < oldest) {
@@ -5897,7 +5925,7 @@ static int sent_message_dispatch_current(void)
 
         LRESULT result = 0;
         WINDOW *window = find_window(request.window);
-        if (window && window->owner_pid == pid && window->owner_tid == tid) {
+        if (window_on_current_thread(window)) {
             if (window->wndproc)
                 result = dispatch_wndproc_encoded(window->wndproc, request.window,
                                           request.message, request.wparam,
@@ -5941,8 +5969,7 @@ static void native_move_finish(POINT point, BOOL send_button_up)
     WINDOW *window = find_window(handle);
     native_move.window = NULL;
 
-    if (window && window->owner_pid == GetCurrentProcessId() &&
-        window->owner_tid == GetCurrentThreadId() && window->wndproc) {
+    if (window_on_current_thread(window) && window->wndproc) {
         if (send_button_up)
             dispatch_wndproc(window->wndproc, handle, WM_NCLBUTTONUP,
                              HTCAPTION, screen_point_lparam(point));
@@ -5959,8 +5986,7 @@ static BOOL native_move_begin(HWND handle, POINT point)
     if (!window)
         return FALSE;
     window = window_root(window, NULL);
-    if (!window || window->owner_pid != GetCurrentProcessId() ||
-        window->owner_tid != GetCurrentThreadId())
+    if (!window_on_current_thread(window))
         return FALSE;
 
     if (native_move.window && native_move.window != window->handle)
@@ -5994,8 +6020,7 @@ static void native_move_update(POINT point)
         native_move.window = NULL;
         return;
     }
-    if (window->owner_pid != GetCurrentProcessId() ||
-        window->owner_tid != GetCurrentThreadId())
+    if (!window_on_current_thread(window))
         return;
 
     int x = point.x - native_move.pointer_offset_x;
@@ -6013,9 +6038,7 @@ static BOOL dispatch_nonclient_press(const MSG *message, LRESULT *result)
         if (parent && parent->wndproc)
             host = parent;
     }
-    if (!host || !host->wndproc ||
-        host->owner_pid != GetCurrentProcessId() ||
-        host->owner_tid != GetCurrentThreadId())
+    if (!host || !host->wndproc || !window_on_current_thread(host))
         return FALSE;
 
     LPARAM screen_position = screen_point_lparam(message->pt);
@@ -6155,9 +6178,7 @@ static BOOL send_message_wait(HWND hWnd, DWORD Msg, WPARAM wParam,
         return FALSE;
     }
 
-    DWORD pid = GetCurrentProcessId();
-    DWORD tid = GetCurrentThreadId();
-    if (window->owner_pid == pid && window->owner_tid == tid) {
+    if (window_on_current_thread(window)) {
         *result = window->wndproc
                 ? dispatch_wndproc_encoded(window->wndproc, hWnd, Msg, wParam, lParam, unicode)
                 : DefWindowProcA(hWnd, Msg, wParam, lParam);
@@ -9703,7 +9724,7 @@ HWND WINAPI SetCapture(HWND hWnd)
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return NULL;
     }
-    if (window->owner_tid != GetCurrentThreadId()) {
+    if (!window_on_current_thread(window)) {
         SetLastError(5); /* ERROR_ACCESS_DENIED */
         return NULL;
     }
@@ -15445,6 +15466,18 @@ static UINT wm_test_timer_message;
 static ULONG_PTR wm_test_timer_id;
 static DWORD wm_test_timer_time;
 
+#ifndef TEST_HARNESS
+extern int32_t proc_current_pid(void);
+static struct {
+    int32_t owner, producer, reply_task, paint_task;
+    int x, y;
+    HWND target;
+    BOOL active, input_done, done, replied, capture_denied, destroy_denied;
+    LRESULT reply;
+    unsigned callbacks, wrong_thread, paints;
+} input_owner_test;
+#endif
+
 static void WINAPI wm_test_timer_proc(HWND window, UINT message,
                                       ULONG_PTR event_id, DWORD time)
 {
@@ -15458,6 +15491,28 @@ static void WINAPI wm_test_timer_proc(HWND window, UINT message,
 static LRESULT WINAPI wm_test_wndproc(HWND window, DWORD message,
                                        WPARAM wparam, LPARAM lparam)
 {
+#ifndef TEST_HARNESS
+    if (input_owner_test.active && window == input_owner_test.target) {
+        if (message == WM_USER + 81) {
+            input_owner_test.reply_task = proc_current_pid();
+            return wparam == 0x1357 && lparam == 0x2468 ? 0x51A7 : 0;
+        }
+        if (message == WM_PAINT) {
+            input_owner_test.paint_task = proc_current_pid();
+            input_owner_test.paints++;
+            if (input_owner_test.paint_task != input_owner_test.owner)
+                input_owner_test.wrong_thread++;
+        }
+    }
+    if (input_owner_test.active &&
+        (message == WM_SETFOCUS || message == WM_KILLFOCUS ||
+         message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
+         message == WM_KEYDOWN || message == WM_KEYUP)) {
+        input_owner_test.callbacks++;
+        if (proc_current_pid() != input_owner_test.owner)
+            input_owner_test.wrong_thread++;
+    }
+#endif
     if (message == WM_NCHITTEST && wm_test_caption_hit)
         return HTCAPTION;
     if (message == WM_DESTROY)
@@ -16275,6 +16330,104 @@ static BOOL input_test_take(HWND window, DWORD minimum, DWORD maximum,
     return PeekMessageA(message, window, minimum, maximum, PM_REMOVE);
 }
 
+#ifndef TEST_HARNESS
+static void input_test_producer(void)
+{
+    input_owner_test.producer = proc_current_pid();
+    win32_post_mouse_screen(input_owner_test.x, input_owner_test.y, 0, 0, 1, 0);
+    win32_post_mouse_screen(input_owner_test.x, input_owner_test.y, 0, 0, 0, 0);
+    win32_post_keyboard_event(0x1E, FALSE);
+    win32_post_keyboard_event(0x1E, TRUE);
+    __atomic_store_n(&input_owner_test.input_done, TRUE, __ATOMIC_RELEASE);
+    input_owner_test.replied = send_message_wait(input_owner_test.target,
+        WM_USER + 81, 0x1357, 0x2468, 1000, FALSE, FALSE, &input_owner_test.reply);
+    InvalidateRect(input_owner_test.target, NULL, FALSE);
+    UpdateWindow(input_owner_test.target);
+    SetLastError(0);
+    SetCapture(input_owner_test.target);
+    input_owner_test.capture_denied = GetCapture() != input_owner_test.target &&
+                                     GetLastError() == 5;
+    SetLastError(0);
+    input_owner_test.destroy_denied = !DestroyWindow(input_owner_test.target) &&
+                                     GetLastError() == 5;
+    __atomic_store_n(&input_owner_test.done, TRUE, __ATOMIC_RELEASE);
+}
+
+static void input_test_owner_thread(HWND parent, const char *class_name,
+                                      int *checks, int *failures)
+{
+    extern int sched_spawn(const char *name, void (*entry)(void));
+    extern void sched_yield(void);
+    extern int proc_waitpid(uint32_t pid, int32_t *status);
+    POINT saved_cursor = cursor_pos;
+    HWND child = CreateWindowExA(0, class_name, "input-owner", WS_CHILD | WS_VISIBLE,
+                                  24, 24, 32, 32, parent, NULL, NULL, NULL);
+    input_test_expect(child != NULL, "create native input ownership target", checks, failures);
+    if (!child) return;
+    SetFocus(parent);
+    ValidateRect(child, NULL);
+    msg_purge_process(GetCurrentProcessId());
+    RECT rect;
+    GetWindowRect(child, &rect);
+    input_owner_test.owner = proc_current_pid();
+    input_owner_test.producer = 0;
+    input_owner_test.target = child;
+    input_owner_test.x = rect.left + 4;
+    input_owner_test.y = rect.top + 4;
+    input_owner_test.callbacks = input_owner_test.wrong_thread = 0;
+    input_owner_test.reply_task = input_owner_test.paint_task = 0;
+    input_owner_test.paints = 0;
+    input_owner_test.reply = 0;
+    input_owner_test.active = TRUE;
+    __atomic_store_n(&input_owner_test.input_done, FALSE, __ATOMIC_RELEASE);
+    __atomic_store_n(&input_owner_test.done, FALSE, __ATOMIC_RELEASE);
+    int producer = sched_spawn("user32-input-test", input_test_producer);
+    input_test_expect(producer > 0, "spawn separate native input producer", checks, failures);
+    if (producer > 0) {
+        DWORD start = shim_timeGetTime();
+        while (!__atomic_load_n(&input_owner_test.input_done, __ATOMIC_ACQUIRE) &&
+               (DWORD)(shim_timeGetTime() - start) < 3000)
+            sched_yield();
+        BOOL ready = __atomic_load_n(&input_owner_test.input_done, __ATOMIC_ACQUIRE);
+        input_test_expect(ready && input_owner_test.producer != input_owner_test.owner,
+                          "native producer injects input on a different scheduler task", checks, failures);
+        input_test_expect(input_owner_test.callbacks == 0,
+                          "native input producer queues focus without calling the window procedure",
+                          checks, failures);
+        start = shim_timeGetTime();
+        do {
+            MSG message;
+            for (int i = 0; i < 32 && input_test_take(NULL, 0, 0, &message); i++)
+                DispatchMessageA(&message);
+            sched_yield();
+        } while (!__atomic_load_n(&input_owner_test.done, __ATOMIC_ACQUIRE) &&
+                 (DWORD)(shim_timeGetTime() - start) < 3000);
+        BOOL done = __atomic_load_n(&input_owner_test.done, __ATOMIC_ACQUIRE);
+        input_test_expect(done, "native producer completes after synchronous delivery", checks, failures);
+        input_test_expect(input_owner_test.callbacks == 6 && !input_owner_test.wrong_thread,
+                          "focus, click and key callbacks run on the owning scheduler task",
+                          checks, failures);
+        input_test_expect(GetFocus() == child, "native click transfers keyboard focus to child",
+                          checks, failures);
+        input_test_expect(done && input_owner_test.replied && input_owner_test.reply == 0x51A7 &&
+                          input_owner_test.reply_task == input_owner_test.owner,
+                          "synchronous sender cannot consume the owner's request", checks, failures);
+        input_test_expect(done && input_owner_test.paints &&
+                          input_owner_test.paint_task == input_owner_test.owner,
+                          "cross-task UpdateWindow paints on the owner", checks, failures);
+        input_test_expect(done && input_owner_test.capture_denied && input_owner_test.destroy_denied &&
+                          IsWindow(child), "native producer cannot capture or destroy a foreign window",
+                          checks, failures);
+        (void)proc_waitpid((uint32_t)producer, NULL);
+    }
+    input_owner_test.active = FALSE;
+    DestroyWindow(child);
+    SetFocus(parent);
+    cursor_pos = saved_cursor;
+    msg_purge_process(GetCurrentProcessId());
+}
+#endif
+
 static void input_test_write_u16(BYTE *output, WORD value)
 {
     output[0] = (BYTE)value;
@@ -16491,6 +16644,10 @@ int user32_input_selftest(void)
     mouse_buttons = 0;
     ValidateRect(window, NULL);
     msg_purge_process(GetCurrentProcessId());
+
+#ifndef TEST_HARNESS
+    input_test_owner_thread(window, class_name, &checks, &failures);
+#endif
 
     wm_test_capturechanged_count = 0;
     wm_test_capturechanged_window = NULL;
