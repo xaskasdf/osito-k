@@ -1302,6 +1302,92 @@ overflow behavior, and OSFS2's reduced access-time granularity remain
 outside this probe's coverage. No application-specific timestamp or
 timezone correction is introduced.
 
+## 4.23 Printf destinations, argument widths, and count policies (2026-09-05)
+
+The narrow formatter treated a null buffer as console output. Consequently,
+measurement calls printed their text, `fprintf`/`vfprintf` ignored the supplied
+FILE, and `printf` bypassed CRT descriptor redirection. Explicit `va_list`
+exports always used packed PE32 arguments, including for PE64 callers. The
+UCRT common narrow/wide entry points had the opposite problem: native-only
+argument parsing and six DWORDs of thunk metadata for a seven-DWORD PE32
+signature whose first parameter is a 64-bit options field.
+
+The formatter context now distinguishes bounded storage, measurement, and
+FILE output. Stream output uses a 256-byte staging buffer and the existing
+CRT file resolver/write path, including PE32 FILE proxies. It propagates
+write errors and preserves embedded NULs; stdout comes from the CRT's current
+descriptor, so `_dup2` redirection applies. `crt_fwrite` now sets errno and
+the stream error flag for invalid, failed, and short writes. Its existing
+large-transfer, text-mode, and synchronization policies are not replaced.
+
+Legacy `_snprintf` and `_vsnprintf` can fill all `count` bytes without NUL;
+exact fit returns the length and truncation returns -1. A nonnull buffer with
+zero count fails without writing; null/zero measurement is silent. Contexts
+that require terminated output keep that policy. The common UCRT APIs select
+legacy or standard count behavior from options, use the caller's argument
+layout, and register fixed-signature PE32 bridges that reassemble the options
+DWORDs. The native and PE32 narrow integer parsers also distinguish Windows
+32-bit `long`, 64-bit integers, pointer-sized integers, and short/char
+narrowing. Alternate radix output, negative dynamic width, and default `%p`
+formatting now have native-reference cases rather than host-ABI assumptions.
+
+Build `sh arch/x86/scripts/build-crt-format-test.sh`, copy its executables
+from `arch/x86/build/test-crt-format/pe32/` and `pe64/` to `probes/`, then run
+`winexec probes/crt_format_pe32.exe` and the PE64 equivalent. A trailing
+`ucrt` selects that provider; `crt_format.autoload` starts PE32 MSVCRT.
+The probe covers mixed argument widths, pointer strings, storage canaries,
+count 0 through 11, exact fit, truncation, measurement, common narrow/wide
+options, FILE routing, stdout redirection, chunk boundaries, embedded NUL,
+and read-only stream errors. It creates its fixture with `CREATE_NEW` and
+deletes only that owned file; a duplicated Win32 handle preserves diagnostics
+while stdout is redirected.
+
+| Reference/provider | PE32 | PE64 |
+| --- | --- | --- |
+| Native Windows MSVCRT | 94/94 | 94/94 |
+| Native Windows UCRT | 133/133 | 133/133 |
+| OsitoK MSVCRT | 194/194 | 194/194 |
+| OsitoK UCRT | 194/194 | 194/194 |
+
+The native DLLs expose different export sets, so the native rows are not
+identical coverage: common UCRT entry points are absent from native MSVCRT,
+and legacy formatting exports are absent from native UCRT. Modern `hh`
+integer cases use UCRT as their reference, not legacy Windows MSVCRT.
+OsitoK exposes both groups through each alias and runs the combined probe.
+
+The initial `basic` baseline in
+`/root/osito-crt-format-before-20260905-lD1OLp/` fails 38 of 77 PE32 checks
+and 62 of 175 PE64 checks. It excludes pointer cases and the broken PE32
+common thunk; additional integer cases were added later, so these are not
+194-check baselines. The final run in
+`/root/osito-crt-format-final-20260905-GXf8O5/` passes all four combined
+variants. Console PE32 exits with code zero; DOS API passes with 15/15
+host-memory checks; module-image/ABI passes 45/45. After DOS, formatting
+passes 194/194 for PE32 MSVCRT and PE64 UCRT, wide formatting 60/60 and
+far-date stat 104/104 for those same variants, x87 68/68, and rounding
+1305/1305 PE32 MSVCRT and 873/873 PE64 UCRT. No CPU fault is logged.
+
+UT99 integration in `/root/osito-ut99-format-20260905-zBN1eJ/` uses KVM,
+8 GiB, four CPUs, a relative USB mouse and an isolated snapshot. DM-Agony
+starts from the practice-session UI with no FOV override. `loaded.png`,
+`playing.png`, and `moving.png` show world geometry, textures, the weapon,
+HUD, and movement; the match advances. Console `quit` exits with code zero
+and releases 24 root-process modules. No CPU fault is logged, QEMU was
+stopped and reaped, and the base image retains SHA-256
+`cdec52eccec06dac6a24e83752f23fcbf59fba4eebd014f8f8fc79d2b307d350`.
+This is an integration smoke test, not full renderer or audio certification.
+
+`make -C arch/x86 CLANG=1 -j4`, the probe builder, and `git diff --check`
+pass. The built kernel and both final booted copies share SHA-256
+`0446ed0266541040eb91c987eaa2710d63252fa16c63c0273ecbf3fe6b559d65`.
+No DOS runtime, audio driver, filesystem implementation, application binary,
+or persistent game settings changed. Remaining CRT work includes complete
+floating conversions and their scratch-storage bounds, large width/precision
+parsing, locale/encoding behavior, `%n` opt-in policy, invalid-parameter
+callbacks, more UCRT option combinations, and FILE lifetime/locking/text
+translation. This probe validates binary streams, not those remaining
+contracts.
+
 ## 5. Open questions / notes
 - `WINAPI` selects the Microsoft x64 ABI for native shims, not the kernel's
   SysV ABI. Export arg-count metadata also drives the **32-bit thunk's `RET n*4`**.

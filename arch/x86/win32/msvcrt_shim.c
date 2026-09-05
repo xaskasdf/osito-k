@@ -31,6 +31,19 @@ typedef __builtin_ms_va_list ms_va_list;
 #define ms_va_end(ap)          __builtin_ms_va_end(ap)
 #define ms_va_copy(dst, src)   __builtin_ms_va_copy(dst, src)
 
+#define CRT_EBADF       9
+#define CRT_EIO         5
+#define CRT_ENOMEM     12
+#define CRT_EACCES     13
+#define CRT_EINVAL     22
+#define CRT_EMFILE     24
+#define CRT_ENOENT      2
+#define CRT_ENAMETOOLONG 38
+#define CRT_EILSEQ      42
+#define CRT_EOVERFLOW 132
+#define CRT_ERANGE     34
+#define CRT_STRUNCATE  80
+
 /* ── Internal helpers ──────────────────────────────────────── */
 
 extern void serial_puts(const char *s);
@@ -490,30 +503,86 @@ typedef struct {
     char *buf;
     SIZE_T size;
     SIZE_T pos;
+    BOOL legacy_count;
+    CRT_FILE *stream;
+    SIZE_T pending_count;
+    BOOL failed;
+    char pending[256];
 } FMT_CTX;
+
+static BOOL crt_format_stream_valid(CRT_FILE *stream);
+static int crt_errno_from_last_error(void);
+
+static void fmt_flush(FMT_CTX *ctx)
+{
+    if (!ctx->stream || !ctx->pending_count || ctx->failed) return;
+    if (crt_fwrite(ctx->pending, 1, ctx->pending_count, ctx->stream) !=
+        ctx->pending_count)
+        ctx->failed = TRUE;
+    ctx->pending_count = 0;
+}
 
 static void fmt_putc(FMT_CTX *ctx, char c)
 {
-    if (ctx->buf) {
-        if (ctx->pos < ctx->size - 1)
+    if (ctx->failed) return;
+    if (ctx->pos == 0x7FFFFFFFU) {
+        *crt_errno() = CRT_EOVERFLOW;
+        ctx->failed = TRUE;
+        return;
+    }
+    if (ctx->stream) {
+        ctx->pending[ctx->pending_count++] = c;
+        if (ctx->pending_count == sizeof(ctx->pending)) fmt_flush(ctx);
+    } else if (ctx->buf) {
+        SIZE_T limit = ctx->size;
+        if (limit && !ctx->legacy_count) limit--;
+        if (ctx->pos < limit)
             ctx->buf[ctx->pos] = c;
-    } else {
-        /* Direct to console stdout */
-        DWORD written;
-        WriteFile((HANDLE)(ULONG_PTR)8, &c, 1, &written, NULL);
     }
     ctx->pos++;
 }
 
+static int fmt_finish(FMT_CTX *ctx)
+{
+    fmt_flush(ctx);
+    if (ctx->buf && ctx->size) {
+        if (ctx->pos < ctx->size)
+            ctx->buf[ctx->pos] = 0;
+        else if (!ctx->legacy_count)
+            ctx->buf[ctx->size - 1] = 0;
+    }
+    return ctx->failed ? -1 : (int)ctx->pos;
+}
+
+static BOOL fmt_buffer_valid(char *buffer, SIZE_T count, const char *format,
+                              BOOL legacy_count)
+{
+    if (!format || (!buffer && count)) {
+        if (buffer && count) buffer[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return FALSE;
+    }
+    if (legacy_count && buffer && !count) {
+        *crt_errno() = CRT_ERANGE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static int fmt_legacy_result(int required, const void *buffer, SIZE_T count)
+{
+    return required < 0 || (buffer && (SIZE_T)required > count) ? -1 : required;
+}
+
 static void fmt_puts(FMT_CTX *ctx, const char *s, SIZE_T len)
 {
-    for (SIZE_T i = 0; i < len; i++)
+    for (SIZE_T i = 0; i < len && !ctx->failed; i++)
         fmt_putc(ctx, s[i]);
 }
 
 static void fmt_pad(FMT_CTX *ctx, int count, char pad_char)
 {
-    while (count-- > 0) fmt_putc(ctx, pad_char);
+    while (count-- > 0 && !ctx->failed) fmt_putc(ctx, pad_char);
 }
 
 static SIZE_T uint_to_str(char *buf, unsigned long long val, int base, int upper)
@@ -534,24 +603,36 @@ static SIZE_T uint_to_str(char *buf, unsigned long long val, int base, int upper
 
 static void fmt_integer(FMT_CTX *ctx, const char *digits, SIZE_T digit_count,
                         int width, int precision, int left_align,
-                        int zero_pad, char sign)
+                        int zero_pad, char sign, char conversion, int alternate)
 {
+    int explicit_precision = precision >= 0;
     if (precision == 0 && digit_count == 1 && digits[0] == '0')
         digit_count = 0;
+
+    const char *radix = NULL;
+    if (alternate && (conversion == 'x' || conversion == 'X') &&
+        digit_count && !(digit_count == 1 && digits[0] == '0'))
+        radix = conversion == 'X' ? "0X" : "0x";
+    if (alternate && conversion == 'o' &&
+        (!digit_count || digits[0] != '0') && precision <= (int)digit_count)
+        precision = (int)digit_count + 1;
 
     int precision_zeroes = 0;
     if (precision > (int)digit_count)
         precision_zeroes = precision - (int)digit_count;
 
-    int content = (sign ? 1 : 0) + precision_zeroes + (int)digit_count;
+    int content = (sign ? 1 : 0) + (radix ? 2 : 0) +
+                  precision_zeroes + (int)digit_count;
     int width_pad = width > content ? width - content : 0;
 
     /* An explicit integer precision disables the zero flag. */
-    if (!left_align && (!zero_pad || precision >= 0))
+    if (!left_align && (!zero_pad || explicit_precision))
         fmt_pad(ctx, width_pad, ' ');
     if (sign)
         fmt_putc(ctx, sign);
-    if (!left_align && zero_pad && precision < 0)
+    if (radix)
+        fmt_puts(ctx, radix, 2);
+    if (!left_align && zero_pad && !explicit_precision)
         fmt_pad(ctx, width_pad, '0');
     fmt_pad(ctx, precision_zeroes, '0');
     fmt_puts(ctx, digits, digit_count);
@@ -561,7 +642,12 @@ static void fmt_integer(FMT_CTX *ctx, const char *digits, SIZE_T digit_count,
 
 static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
 {
-    while (*fmt) {
+    if (!fmt) {
+        *crt_errno() = CRT_EINVAL;
+        ctx->failed = TRUE;
+        return fmt_finish(ctx);
+    }
+    while (*fmt && !ctx->failed) {
         if (*fmt != '%') {
             fmt_putc(ctx, *fmt++);
             continue;
@@ -569,12 +655,13 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
         fmt++; /* skip '%' */
 
         /* Flags */
-        int left_align = 0, zero_pad = 0, plus_sign = 0, space_sign = 0;
+        int left_align = 0, zero_pad = 0, plus_sign = 0, space_sign = 0, alternate = 0;
         for (;;) {
             if (*fmt == '-') { left_align = 1; fmt++; }
             else if (*fmt == '0') { zero_pad = 1; fmt++; }
             else if (*fmt == '+') { plus_sign = 1; fmt++; }
             else if (*fmt == ' ') { space_sign = 1; fmt++; }
+            else if (*fmt == '#') { alternate = 1; fmt++; }
             else break;
         }
 
@@ -582,6 +669,15 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
         int width = 0;
         if (*fmt == '*') { width = ms_va_arg(ap, int); fmt++; }
         else { while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; } }
+        if (width < 0) {
+            if (width == (-2147483647 - 1)) {
+                *crt_errno() = CRT_EOVERFLOW;
+                ctx->failed = TRUE;
+                break;
+            }
+            left_align = 1;
+            width = -width;
+        }
 
         /* Precision */
         int precision = -1;
@@ -593,21 +689,23 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
         }
 
         /* Length modifier */
-        int len_mod = 0; /* 0=int, 1=long, 2=long long, 3=size_t */
+        int len_mod = 0; /* 0=int, 1=long32, 2=int64, 3=intptr, 4=short, 5=char */
         if (*fmt == 'l') {
             fmt++; len_mod = 1;
             if (*fmt == 'l') { fmt++; len_mod = 2; }
-        } else if (*fmt == 'z') {
+        } else if (*fmt == 'z' || *fmt == 't') {
             fmt++; len_mod = 3;
+        } else if (*fmt == 'j') {
+            fmt++; len_mod = 2;
         } else if (*fmt == 'h') {
-            fmt++;
-            if (*fmt == 'h') fmt++;
-            /* treat as int */
+            fmt++; len_mod = 4;
+            if (*fmt == 'h') { fmt++; len_mod = 5; }
         } else if (*fmt == 'I') {
-            /* MSVC I64 prefix */
             if (fmt[1] == '6' && fmt[2] == '4') {
                 fmt += 3; len_mod = 2;
-            }
+            } else if (fmt[1] == '3' && fmt[2] == '2') {
+                fmt += 3;
+            } else { fmt++; len_mod = 3; }
         }
 
         /* Conversion */
@@ -620,9 +718,10 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
         switch (*fmt) {
         case 'd': case 'i': {
             long long val;
-            if (len_mod == 2) val = ms_va_arg(ap, long long);
-            else if (len_mod == 1 || len_mod == 3) val = ms_va_arg(ap, long);
+            if (len_mod == 2 || len_mod == 3) val = ms_va_arg(ap, long long);
             else val = ms_va_arg(ap, int);
+            if (len_mod == 4) val = (short)val;
+            else if (len_mod == 5) val = (signed char)val;
 
             unsigned long long magnitude;
             if (val < 0) {
@@ -635,48 +734,50 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
             char sign = negative ? '-' : (plus_sign ? '+' :
                                            (space_sign ? ' ' : 0));
             fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
-                        zero_pad, sign);
+                        zero_pad, sign, *fmt, alternate);
             break;
         }
         case 'u': {
             unsigned long long val;
-            if (len_mod == 2) val = ms_va_arg(ap, unsigned long long);
-            else if (len_mod == 1 || len_mod == 3) val = ms_va_arg(ap, unsigned long);
+            if (len_mod == 2 || len_mod == 3) val = ms_va_arg(ap, unsigned long long);
             else val = ms_va_arg(ap, unsigned int);
+            if (len_mod == 4) val = (unsigned short)val;
+            else if (len_mod == 5) val = (unsigned char)val;
 
             num_len = uint_to_str(num_buf, val, 10, 0);
             fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
-                        zero_pad, 0);
+                        zero_pad, 0, *fmt, alternate);
             break;
         }
         case 'x': case 'X': {
             unsigned long long val;
-            if (len_mod == 2) val = ms_va_arg(ap, unsigned long long);
-            else if (len_mod == 1 || len_mod == 3) val = ms_va_arg(ap, unsigned long);
+            if (len_mod == 2 || len_mod == 3) val = ms_va_arg(ap, unsigned long long);
             else val = ms_va_arg(ap, unsigned int);
+            if (len_mod == 4) val = (unsigned short)val;
+            else if (len_mod == 5) val = (unsigned char)val;
 
             num_len = uint_to_str(num_buf, val, 16, (*fmt == 'X'));
             fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
-                        zero_pad, 0);
+                        zero_pad, 0, *fmt, alternate);
             break;
         }
         case 'o': {
             unsigned long long val;
-            if (len_mod >= 1) val = ms_va_arg(ap, unsigned long long);
+            if (len_mod == 2 || len_mod == 3) val = ms_va_arg(ap, unsigned long long);
             else val = ms_va_arg(ap, unsigned int);
+            if (len_mod == 4) val = (unsigned short)val;
+            else if (len_mod == 5) val = (unsigned char)val;
 
             num_len = uint_to_str(num_buf, val, 8, 0);
             fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
-                        zero_pad, 0);
+                        zero_pad, 0, *fmt, alternate);
             break;
         }
         case 'p': {
             unsigned long long val = (unsigned long long)(ULONG_PTR)ms_va_arg(ap, PVOID);
-            num_len = uint_to_str(num_buf, val, 16, 0);
-            /* Pad to pointer width */
-            int total = (int)num_len + 2; /* "0x" prefix */
+            num_len = uint_to_str(num_buf, val, 16, 1);
+            int total = 16;
             if (!left_align) fmt_pad(ctx, width - total, ' ');
-            fmt_putc(ctx, '0'); fmt_putc(ctx, 'x');
             fmt_pad(ctx, 16 - (int)num_len, '0');
             fmt_puts(ctx, num_buf, num_len);
             if (left_align) fmt_pad(ctx, width - total, ' ');
@@ -778,8 +879,10 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
 
         case 'n':
             /* Store chars written */
-            if (len_mod == 2) *ms_va_arg(ap, long long *) = (long long)ctx->pos;
-            else if (len_mod == 1) *ms_va_arg(ap, long *) = (long)ctx->pos;
+            if (len_mod == 2 || len_mod == 3)
+                *ms_va_arg(ap, long long *) = (long long)ctx->pos;
+            else if (len_mod == 4) *ms_va_arg(ap, short *) = (short)ctx->pos;
+            else if (len_mod == 5) *ms_va_arg(ap, signed char *) = (signed char)ctx->pos;
             else *ms_va_arg(ap, int *) = (int)ctx->pos;
             break;
 
@@ -795,11 +898,7 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
         fmt++;
     }
 done:
-    if (ctx->buf && ctx->size > 0) {
-        SIZE_T end = ctx->pos < ctx->size - 1 ? ctx->pos : ctx->size - 1;
-        ctx->buf[end] = 0;
-    }
-    return (int)ctx->pos;
+    return fmt_finish(ctx);
 }
 
 /*
@@ -812,7 +911,12 @@ done:
  */
 static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
 {
-    while (*fmt) {
+    if (!fmt) {
+        *crt_errno() = CRT_EINVAL;
+        ctx->failed = TRUE;
+        return fmt_finish(ctx);
+    }
+    while (*fmt && !ctx->failed) {
         if (*fmt != '%') {
             fmt_putc(ctx, *fmt++);
             continue;
@@ -820,12 +924,13 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
         fmt++; /* skip '%' */
 
         /* Flags */
-        int left_align = 0, zero_pad = 0, plus_sign = 0, space_sign = 0;
+        int left_align = 0, zero_pad = 0, plus_sign = 0, space_sign = 0, alternate = 0;
         for (;;) {
             if (*fmt == '-') { left_align = 1; fmt++; }
             else if (*fmt == '0') { zero_pad = 1; fmt++; }
             else if (*fmt == '+') { plus_sign = 1; fmt++; }
             else if (*fmt == ' ') { space_sign = 1; fmt++; }
+            else if (*fmt == '#') { alternate = 1; fmt++; }
             else break;
         }
 
@@ -833,6 +938,15 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
         int width = 0;
         if (*fmt == '*') { width = (int)(*vp++); fmt++; }
         else { while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; } }
+        if (width < 0) {
+            if (width == (-2147483647 - 1)) {
+                *crt_errno() = CRT_EOVERFLOW;
+                ctx->failed = TRUE;
+                break;
+            }
+            left_align = 1;
+            width = -width;
+        }
 
         /* Precision */
         int precision = -1;
@@ -844,21 +958,23 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
         }
 
         /* Length modifier */
-        int len_mod = 0; /* 0=int, 1=long, 2=long long, 3=size_t */
+        int len_mod = 0; /* 0=int, 1=long32, 2=int64, 3=intptr, 4=short, 5=char */
         if (*fmt == 'l') {
             fmt++; len_mod = 1;
             if (*fmt == 'l') { fmt++; len_mod = 2; }
-        } else if (*fmt == 'z') {
+        } else if (*fmt == 'z' || *fmt == 't') {
             fmt++; len_mod = 3;
+        } else if (*fmt == 'j') {
+            fmt++; len_mod = 2;
         } else if (*fmt == 'h') {
-            fmt++;
-            if (*fmt == 'h') fmt++;
-            /* treat as int */
+            fmt++; len_mod = 4;
+            if (*fmt == 'h') { fmt++; len_mod = 5; }
         } else if (*fmt == 'I') {
-            /* MSVC I64 prefix */
             if (fmt[1] == '6' && fmt[2] == '4') {
                 fmt += 3; len_mod = 2;
-            }
+            } else if (fmt[1] == '3' && fmt[2] == '2') {
+                fmt += 3;
+            } else { fmt++; len_mod = 3; }
         }
 
         /* Conversion */
@@ -878,6 +994,8 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             } else {
                 val = (long long)(int32_t)(*vp++);
             }
+            if (len_mod == 4) val = (short)val;
+            else if (len_mod == 5) val = (signed char)val;
 
             unsigned long long magnitude;
             if (val < 0) {
@@ -890,7 +1008,7 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             char sign = negative ? '-' : (plus_sign ? '+' :
                                            (space_sign ? ' ' : 0));
             fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
-                        zero_pad, sign);
+                        zero_pad, sign, *fmt, alternate);
             break;
         }
         case 'u': {
@@ -901,10 +1019,12 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             } else {
                 val = (unsigned long long)(*vp++);
             }
+            if (len_mod == 4) val = (unsigned short)val;
+            else if (len_mod == 5) val = (unsigned char)val;
 
             num_len = uint_to_str(num_buf, val, 10, 0);
             fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
-                        zero_pad, 0);
+                        zero_pad, 0, *fmt, alternate);
             break;
         }
         case 'x': case 'X': {
@@ -915,33 +1035,36 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             } else {
                 val = (unsigned long long)(*vp++);
             }
+            if (len_mod == 4) val = (unsigned short)val;
+            else if (len_mod == 5) val = (unsigned char)val;
 
             num_len = uint_to_str(num_buf, val, 16, (*fmt == 'X'));
             fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
-                        zero_pad, 0);
+                        zero_pad, 0, *fmt, alternate);
             break;
         }
         case 'o': {
             unsigned long long val;
-            if (len_mod >= 1) {
+            if (len_mod == 2) {
                 uint32_t lo = *vp++, hi = *vp++;
                 val = ((uint64_t)hi << 32) | lo;
             } else {
                 val = (unsigned long long)(*vp++);
             }
+            if (len_mod == 4) val = (unsigned short)val;
+            else if (len_mod == 5) val = (unsigned char)val;
 
             num_len = uint_to_str(num_buf, val, 8, 0);
             fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
-                        zero_pad, 0);
+                        zero_pad, 0, *fmt, alternate);
             break;
         }
         case 'p': {
             /* 32-bit pointer */
             uint32_t val32 = *vp++;
-            num_len = uint_to_str(num_buf, (unsigned long long)val32, 16, 0);
-            int total = (int)num_len + 2; /* "0x" prefix */
+            num_len = uint_to_str(num_buf, (unsigned long long)val32, 16, 1);
+            int total = 8;
             if (!left_align) fmt_pad(ctx, width - total, ' ');
-            fmt_putc(ctx, '0'); fmt_putc(ctx, 'x');
             fmt_pad(ctx, 8 - (int)num_len, '0');
             fmt_puts(ctx, num_buf, num_len);
             if (left_align) fmt_pad(ctx, width - total, ' ');
@@ -1041,8 +1164,10 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
                 *p = (long long)ctx->pos;
             } else {
                 uint32_t addr32 = *vp++;
-                int *p = (int *)(uintptr_t)addr32;
-                *p = (int)ctx->pos;
+                PVOID p = (PVOID)(uintptr_t)addr32;
+                if (len_mod == 4) *(short *)p = (short)ctx->pos;
+                else if (len_mod == 5) *(signed char *)p = (signed char)ctx->pos;
+                else *(int *)p = (int)ctx->pos;
             }
             break;
 
@@ -1057,46 +1182,53 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
         fmt++;
     }
 done32:
-    if (ctx->buf && ctx->size > 0) {
-        SIZE_T end = ctx->pos < ctx->size - 1 ? ctx->pos : ctx->size - 1;
-        ctx->buf[end] = 0;
-    }
-    return (int)ctx->pos;
+    return fmt_finish(ctx);
+}
+
+static int fmt_caller_args(FMT_CTX *ctx, const char *format, ms_va_list args)
+{
+    return g_compat32_mode
+        ? do_vformat32(ctx, format, (uint32_t *)(void *)args)
+        : do_vformat(ctx, format, args);
 }
 
 static int WINAPI crt_printf_compat32(const char *fmt, uint32_t *args)
 {
-    FMT_CTX ctx = { NULL, 0, 0 };
+    FMT_CTX ctx = { .stream = crt_acrt_iob_func(1) };
+    if (!crt_format_stream_valid(ctx.stream)) return -1;
     return do_vformat32(&ctx, fmt, args);
 }
 
 static int WINAPI crt_sprintf_compat32(char *buf, const char *fmt,
                                        uint32_t *args)
 {
-    FMT_CTX ctx = { buf, (SIZE_T)-1, 0 };
+    if (!fmt_buffer_valid(buf, (SIZE_T)-1, fmt, FALSE)) return -1;
+    FMT_CTX ctx = { .buf = buf, .size = (SIZE_T)-1 };
     return do_vformat32(&ctx, fmt, args);
 }
 
 static int WINAPI crt_snprintf_compat32(char *buf, SIZE_T size,
                                         const char *fmt, uint32_t *args)
 {
-    FMT_CTX ctx = { buf, size, 0 };
-    return do_vformat32(&ctx, fmt, args);
+    if (!fmt_buffer_valid(buf, size, fmt, TRUE)) return -1;
+    FMT_CTX ctx = { .buf = buf, .size = size, .legacy_count = TRUE };
+    return fmt_legacy_result(do_vformat32(&ctx, fmt, args), buf, size);
 }
 
 static int WINAPI crt_fprintf_compat32(PVOID stream, const char *fmt,
                                        uint32_t *args)
 {
-    (void)stream;
-    FMT_CTX ctx = { NULL, 0, 0 };
+    FMT_CTX ctx = { .stream = (CRT_FILE *)stream };
+    if (!crt_format_stream_valid(ctx.stream)) return -1;
     return do_vformat32(&ctx, fmt, args);
 }
 
 int WINAPI crt_printf(const char *fmt, ...)
 {
+    FMT_CTX ctx = { .stream = crt_acrt_iob_func(1) };
+    if (!crt_format_stream_valid(ctx.stream)) return -1;
     ms_va_list ap;
     ms_va_start(ap, fmt);
-    FMT_CTX ctx = { NULL, 0, 0 };
     int ret = do_vformat(&ctx, fmt, ap);
     ms_va_end(ap);
     return ret;
@@ -1104,9 +1236,10 @@ int WINAPI crt_printf(const char *fmt, ...)
 
 int WINAPI crt_sprintf(char *buf, const char *fmt, ...)
 {
+    if (!fmt_buffer_valid(buf, (SIZE_T)-1, fmt, FALSE)) return -1;
     ms_va_list ap;
     ms_va_start(ap, fmt);
-    FMT_CTX ctx = { buf, (SIZE_T)-1, 0 };
+    FMT_CTX ctx = { .buf = buf, .size = (SIZE_T)-1 };
     int ret = do_vformat(&ctx, fmt, ap);
     ms_va_end(ap);
     return ret;
@@ -1114,20 +1247,21 @@ int WINAPI crt_sprintf(char *buf, const char *fmt, ...)
 
 int WINAPI crt_snprintf(char *buf, SIZE_T size, const char *fmt, ...)
 {
+    if (!fmt_buffer_valid(buf, size, fmt, TRUE)) return -1;
     ms_va_list ap;
     ms_va_start(ap, fmt);
-    FMT_CTX ctx = { buf, size, 0 };
+    FMT_CTX ctx = { .buf = buf, .size = size, .legacy_count = TRUE };
     int ret = do_vformat(&ctx, fmt, ap);
     ms_va_end(ap);
-    return ret;
+    return fmt_legacy_result(ret, buf, size);
 }
 
 int WINAPI crt_fprintf(PVOID stream, const char *fmt, ...)
 {
-    /* Route to printf for now — stream is ignored, goes to stdout */
+    FMT_CTX ctx = { .stream = (CRT_FILE *)stream };
+    if (!crt_format_stream_valid(ctx.stream)) return -1;
     ms_va_list ap;
     ms_va_start(ap, fmt);
-    FMT_CTX ctx = { NULL, 0, 0 };
     int ret = do_vformat(&ctx, fmt, ap);
     ms_va_end(ap);
     return ret;
@@ -1520,18 +1654,6 @@ typedef struct {
     CRT_FILE32 *files;
 } CRT_FILE_PROXY_SLOT;
 
-#define CRT_EBADF       9
-#define CRT_ENOMEM     12
-#define CRT_EACCES     13
-#define CRT_EINVAL     22
-#define CRT_EMFILE     24
-#define CRT_ENOENT      2
-#define CRT_ENAMETOOLONG 38
-#define CRT_EILSEQ      42
-#define CRT_EOVERFLOW 132
-#define CRT_ERANGE     34
-#define CRT_STRUNCATE  80
-
 #define CRT_O_WRONLY   0x0001
 #define CRT_O_RDWR     0x0002
 #define CRT_O_APPEND   0x0008
@@ -1735,6 +1857,23 @@ static CRT_FILE *crt_file_resolve(CRT_FILE *file, int *fd_out)
     int fd = crt_file_index(file);
     if (fd_out) *fd_out = fd;
     return fd >= 0 ? &crt_files[fd] : NULL;
+}
+
+static BOOL crt_format_stream_valid(CRT_FILE *stream)
+{
+    int fd;
+    CRT_FILE *file = crt_file_resolve(stream, &fd);
+    if (!file) {
+        *crt_errno() = stream ? CRT_EBADF : CRT_EINVAL;
+        return FALSE;
+    }
+    if (!(file->flags & 2)) {
+        file->flags |= 8;
+        crt_file_proxy_sync(fd);
+        *crt_errno() = CRT_EBADF;
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static CRT_FILE *crt_file_from_fd(int fd)
@@ -1948,6 +2087,7 @@ SIZE_T WINAPI crt_fwrite(PCVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f)
     CRT_FILE *file = crt_file_resolve(f, &fd);
     if (!size || !count) return 0;
     if (!buf || !file || !(file->flags & 2)) {
+        *crt_errno() = !buf || !f ? CRT_EINVAL : CRT_EBADF;
         if (file) {
             file->flags |= 8;
             crt_file_proxy_sync(fd);
@@ -1956,9 +2096,11 @@ SIZE_T WINAPI crt_fwrite(PCVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f)
     }
     DWORD total = (DWORD)(size * count);
     DWORD bytes_written = 0;
-    if (!WriteFile(file->nt_handle, buf, total, &bytes_written, NULL)) {
+    BOOL ok = WriteFile(file->nt_handle, buf, total, &bytes_written, NULL);
+    if (!ok || bytes_written != total) {
         file->flags |= 8;
         crt_file_proxy_sync(fd);
+        *crt_errno() = ok ? CRT_EIO : crt_errno_from_last_error();
     }
 
     /* Echo text writes to serial (captures engine log output) */
@@ -5624,27 +5766,26 @@ void WINAPI crt_purecall(void)
 
 /* ── vprintf family (ms_abi va_list wrappers) ─────────────── */
 
-/*
- * v*printf family — the va_list parameter is a 32-bit pointer to the
- * 32-bit caller's stack (4-byte arg slots). Cast to uint32_t* and use
- * do_vformat32 which walks 4-byte slots correctly.
- */
+/* Explicit va_list entry points select the caller's packed or native ABI. */
 static int WINAPI crt_vprintf(const char *fmt, ms_va_list ap)
 {
-    FMT_CTX ctx = { NULL, 0, 0 };
-    return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
+    FMT_CTX ctx = { .stream = crt_acrt_iob_func(1) };
+    if (!crt_format_stream_valid(ctx.stream)) return -1;
+    return fmt_caller_args(&ctx, fmt, ap);
 }
 
 static int WINAPI crt_vsprintf(char *buf, const char *fmt, ms_va_list ap)
 {
-    FMT_CTX ctx = { buf, (SIZE_T)-1, 0 };
-    return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
+    if (!fmt_buffer_valid(buf, (SIZE_T)-1, fmt, FALSE)) return -1;
+    FMT_CTX ctx = { .buf = buf, .size = (SIZE_T)-1 };
+    return fmt_caller_args(&ctx, fmt, ap);
 }
 
 static int WINAPI crt_vsnprintf(char *buf, SIZE_T size, const char *fmt, ms_va_list ap)
 {
-    FMT_CTX ctx = { buf, size, 0 };
-    return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
+    if (!fmt_buffer_valid(buf, size, fmt, TRUE)) return -1;
+    FMT_CTX ctx = { .buf = buf, .size = size, .legacy_count = TRUE };
+    return fmt_legacy_result(fmt_caller_args(&ctx, fmt, ap), buf, size);
 }
 
 static BOOL crt_secure_truncate_count(SIZE_T count)
@@ -5691,7 +5832,7 @@ static int WINAPI crt_snprintf_s_compat32(char *buf, SIZE_T size,
         return -1;
     }
 
-    FMT_CTX ctx = { buf, crt_snprintf_s_capacity(size, count), 0 };
+    FMT_CTX ctx = { .buf = buf, .size = crt_snprintf_s_capacity(size, count) };
     int required = do_vformat32(&ctx, fmt, args);
     return crt_snprintf_s_result(buf, size, count, required);
 }
@@ -5707,7 +5848,7 @@ int WINAPI crt_snprintf_s(char *buf, SIZE_T size, SIZE_T count,
 
     ms_va_list ap;
     ms_va_start(ap, fmt);
-    FMT_CTX ctx = { buf, crt_snprintf_s_capacity(size, count), 0 };
+    FMT_CTX ctx = { .buf = buf, .size = crt_snprintf_s_capacity(size, count) };
     int required = do_vformat(&ctx, fmt, ap);
     ms_va_end(ap);
     return crt_snprintf_s_result(buf, size, count, required);
@@ -5715,12 +5856,23 @@ int WINAPI crt_snprintf_s(char *buf, SIZE_T size, SIZE_T count,
 
 static int WINAPI crt_vfprintf(PVOID stream, const char *fmt, ms_va_list ap)
 {
-    (void)stream;
-    FMT_CTX ctx = { NULL, 0, 0 };
-    return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
+    FMT_CTX ctx = { .stream = (CRT_FILE *)stream };
+    if (!crt_format_stream_valid(ctx.stream)) return -1;
+    return fmt_caller_args(&ctx, fmt, ap);
 }
 
+#define CRT_PRINTF_LEGACY_COUNT      (1ULL << 0)
 #define CRT_PRINTF_STANDARD_SNPRINTF (1ULL << 1)
+
+static int fmt_common_result(uint64_t options, int required,
+                              const void *buffer, SIZE_T count)
+{
+    if (required < 0) return -1;
+    if (!buffer || (options & CRT_PRINTF_STANDARD_SNPRINTF)) return required;
+    if (options & CRT_PRINTF_LEGACY_COUNT)
+        return fmt_legacy_result(required, buffer, count);
+    return (SIZE_T)required >= count ? -1 : required;
+}
 
 int WINAPI crt_stdio_common_vsprintf(uint64_t options, char *buffer,
                                      SIZE_T buffer_count,
@@ -5734,9 +5886,9 @@ int WINAPI crt_stdio_common_vsprintf(uint64_t options, char *buffer,
         return -1;
     }
 
-    FMT_CTX ctx = { buffer, buffer_count, 0 };
-    int required = do_vformat(&ctx, format, (ms_va_list)arg_list);
-    int truncated = buffer_count == 0 || (SIZE_T)required >= buffer_count;
+    FMT_CTX ctx = { .buf = buffer, .size = buffer_count,
+                   .legacy_count = (options & CRT_PRINTF_LEGACY_COUNT) != 0 };
+    int required = fmt_caller_args(&ctx, format, (ms_va_list)arg_list);
 
     static int trace_count;
     if (trace_count < 8) {
@@ -5753,9 +5905,15 @@ int WINAPI crt_stdio_common_vsprintf(uint64_t options, char *buffer,
         serial_puts("\"\n");
     }
 
-    if (truncated && !(options & CRT_PRINTF_STANDARD_SNPRINTF))
-        return -1;
-    return required;
+    return fmt_common_result(options, required, buffer, buffer_count);
+}
+
+static int WINAPI crt_stdio_common_vsprintf_compat32(
+    uint32_t options_low, uint32_t options_high, char *buffer,
+    uint32_t count, const char *format, PVOID locale, PVOID args)
+{
+    uint64_t options = ((uint64_t)options_high << 32) | options_low;
+    return crt_stdio_common_vsprintf(options, buffer, count, format, locale, args);
 }
 
 /* Universal CRT wide formatting for native PE32+ callers. A Microsoft x64
@@ -6512,9 +6670,21 @@ int WINAPI crt_stdio_common_vswprintf(uint64_t options, WCHAR *buffer,
         return -1;
     }
 
-    WFMT_CTX ctx = { buffer, buffer_count, 0, FALSE };
-    int required = do_vformat_wide64(&ctx, format, (ms_va_list)arg_list);
-    int truncated = buffer_count == 0 || (SIZE_T)required >= buffer_count;
+    WFMT_CTX ctx = { buffer, buffer_count, 0,
+                    (options & CRT_PRINTF_LEGACY_COUNT) != 0 };
+    SIZE_T required;
+    if (g_compat32_mode) {
+        required = do_vformat_wide32(&ctx, format, (uint32_t *)arg_list);
+    } else {
+        int native_required = do_vformat_wide64(&ctx, format,
+                                                 (ms_va_list)arg_list);
+        if (native_required < 0) return -1;
+        required = (SIZE_T)native_required;
+    }
+    if (required > 0x7FFFFFFFU) {
+        *crt_errno() = CRT_EOVERFLOW;
+        return -1;
+    }
 
     static int trace_count;
     if (trace_count < 8) {
@@ -6531,9 +6701,15 @@ int WINAPI crt_stdio_common_vswprintf(uint64_t options, WCHAR *buffer,
         serial_puts("\"\n");
     }
 
-    if (truncated && !(options & CRT_PRINTF_STANDARD_SNPRINTF))
-        return -1;
-    return required;
+    return fmt_common_result(options, (int)required, buffer, buffer_count);
+}
+
+static int WINAPI crt_stdio_common_vswprintf_compat32(
+    uint32_t options_low, uint32_t options_high, WCHAR *buffer,
+    uint32_t count, const WCHAR *format, PVOID locale, PVOID args)
+{
+    uint64_t options = ((uint64_t)options_high << 32) | options_low;
+    return crt_stdio_common_vswprintf(options, buffer, count, format, locale, args);
 }
 
 /* ── MSVC C++ runtime and compiler-intrinsic exports ───────── */
@@ -9234,9 +9410,9 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "vsprintf",            (PVOID)crt_vsprintf,     3, CC_CDECL },
     { "vfprintf",            (PVOID)crt_vfprintf,     3, CC_CDECL },
     { "__stdio_common_vsprintf",
-                            (PVOID)crt_stdio_common_vsprintf, 6, CC_CDECL },
+                            (PVOID)crt_stdio_common_vsprintf, 7, CC_CDECL },
     { "__stdio_common_vswprintf",
-                            (PVOID)crt_stdio_common_vswprintf, 6, CC_CDECL },
+                            (PVOID)crt_stdio_common_vswprintf, 7, CC_CDECL },
     { "sscanf",              (PVOID)crt_sscanf,       2, CC_CDECL | CC_VARIADIC },
     { "sscanf_s",            (PVOID)crt_sscanf,       2, CC_CDECL | CC_VARIADIC },
     { "puts",                (PVOID)crt_puts,         1, CC_CDECL },
@@ -9666,5 +9842,9 @@ PVOID msvcrt_shim_init(void)
                                         (PVOID)crt_finite_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_isnan,
                                         (PVOID)crt_isnan_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_stdio_common_vsprintf,
+                                      (PVOID)crt_stdio_common_vsprintf_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_stdio_common_vswprintf,
+                                      (PVOID)crt_stdio_common_vswprintf_compat32);
     return (PVOID)msvcrt_exports;
 }
