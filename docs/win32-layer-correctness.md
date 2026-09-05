@@ -1388,6 +1388,73 @@ callbacks, more UCRT option combinations, and FILE lifetime/locking/text
 translation. This probe validates binary streams, not those remaining
 contracts.
 
+## 4.24 Binary64 formatting and native CRT policies (2026-09-05)
+
+Narrow PE32/PE64 and wide formatting now share `win32/crt_float.c` for
+`f/F`, `e/E`, `g/G`, and `a/A`. The converter consumes IEEE binary64 bits
+and uses integer decimal blocks rather than casting the integer part to
+64 bits or building a precision-sized stack string. Decimal expansion and
+emission are adapted from musl's MIT-licensed `vfprintf`; the source retains
+its license and attribution. Callbacks write into the existing bounded,
+measuring, or FILE contexts, including wide output and error propagation.
+Padding for bounded and measuring contexts counts skipped output in bulk.
+
+The legacy export profile and common UCRT options are separate. They cover
+legacy non-finite spellings, two/three-digit decimal exponents, hexadecimal
+precision and padding, and the standard-rounding option. Native MSVCRT's
+17-significant-digit decimal seed and 512-digit precision limit are legacy
+policies, not limits on UCRT output. Standard rounding observes the caller's
+x87 or SSE rounding control without modifying it. Signed zero, subnormals,
+largest finite values, infinities, and quiet/signaling NaNs have reference
+cases. No application-name or game-specific formatting path is introduced.
+
+Build with `sh arch/x86/scripts/build-crt-float-test.sh`. From an empty
+reference working directory on Windows, run each PE32/PE64 executable with
+`record`, then with `record ucrt`. Recording uses `CREATE_NEW`; it will not
+replace an existing reference. Run without `record` to compare against
+those files, adding `ucrt` for the common APIs. The reference DLL versions
+are MSVCRT `7.0.26100.8875` and UCRT `10.0.26100.8875` for both architectures.
+
+Copy the executables and their four `crt-float-*.ref` files into guest
+`probes/`, since `winexec` sets the application's working directory there.
+Run `winexec probes/crt_float_pe32.exe`, its PE64 equivalent, and both with
+`ucrt`. `crt_float.autoload` starts the PE32 legacy variant. The optional
+PE64 `local` mode compares the linked converter directly with Windows;
+guest verification must use the normal comparison mode, not `local` or
+`record`. `basic` selects a reduced reference set and is not the full suite.
+
+| Reference comparison | PE32 | PE64 |
+| --- | --- | --- |
+| Native Windows MSVCRT | 9026/9026 | 9026/9026 |
+| Native Windows UCRT | 72194/72194 | 72194/72194 |
+| OsitoK MSVCRT | 9026/9026 | 9026/9026 |
+| OsitoK UCRT | 72194/72194 | 72194/72194 |
+
+Each legacy run has 1128 conversion cases; UCRT runs eight option profiles
+for 9024 cases. Checks compare narrow/wide text and counts, storage guards,
+terminators, rounding-control preservation, and exact reference consumption.
+The cases include precision up to 1200 and deterministic binary64 samples.
+Direct local converter comparisons additionally pass 9024 legacy and 72192
+UCRT checks on native Windows.
+
+The isolated KVM snapshot in
+`/root/osito-crt-float-commit-20260905-h0QHCP/` uses 8 GiB and four CPUs.
+Formatting passes 194/194 and wide formatting 60/60 through both provider
+aliases on both architectures. DOS API passes, including 15/15 host-memory
+checks; module-image/ABI passes 45/45; the console PE32 probe exits zero.
+After DOS, x87 passes 68/68, rounding passes 1305/1305 PE32 MSVCRT and
+873/873 PE64 UCRT, and the remaining format/wide alias variants also pass.
+No CPU fault is logged. QEMU was stopped and reaped; the probe builder,
+`make -C arch/x86 CLANG=1 -j4`, and `git diff --check` pass.
+The booted kernel SHA-256 is
+`3fcf4354d61aca642df501563b5945da4788233612804660044eda99c4b60f67`.
+
+This change does not complete the CRT: large literal width/precision parsing,
+locale/encoding contracts, `%n` policy, invalid-parameter callbacks, legacy
+output-format configuration, and FILE lifetime/locking remain separate work.
+Wide FILE formatting still measures and allocates its whole converted output.
+UT99 gameplay and audio were not rerun for this formatter change.
+
 ## 5. Open questions / notes
 - `WINAPI` selects the Microsoft x64 ABI for native shims, not the kernel's
   SysV ABI. Export arg-count metadata also drives the **32-bit thunk's `RET n*4`**.

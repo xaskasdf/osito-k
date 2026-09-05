@@ -12,6 +12,7 @@
 #include "unwind64.h"
 #include "win32_abi.h"
 #include "wintime.h"
+#include "crt_float.h"
 #include "../fs/vfs.h"
 #include "../fs/ositofs_metadata.h"
 #include "../include/paging.h"
@@ -508,6 +509,8 @@ typedef struct {
     SIZE_T pending_count;
     BOOL failed;
     char pending[256];
+    BOOL ucrt;
+    uint64_t float_options;
 } FMT_CTX;
 
 static BOOL crt_format_stream_valid(CRT_FILE *stream);
@@ -582,7 +585,71 @@ static void fmt_puts(FMT_CTX *ctx, const char *s, SIZE_T len)
 
 static void fmt_pad(FMT_CTX *ctx, int count, char pad_char)
 {
+    if (count <= 0 || ctx->failed) return;
+    if ((SIZE_T)count > 0x7FFFFFFFU - ctx->pos) {
+        *crt_errno() = CRT_EOVERFLOW;
+        ctx->failed = TRUE;
+        return;
+    }
+    if (!ctx->stream) {
+        SIZE_T limit = ctx->size;
+        if (limit && !ctx->legacy_count) limit--;
+        if (ctx->buf && ctx->pos < limit) {
+            SIZE_T room = limit - ctx->pos;
+            SIZE_T written = (SIZE_T)count < room ? (SIZE_T)count : room;
+            crt_memset(ctx->buf + ctx->pos, pad_char, written);
+        }
+        ctx->pos += (SIZE_T)count;
+        return;
+    }
     while (count-- > 0 && !ctx->failed) fmt_putc(ctx, pad_char);
+}
+
+static unsigned fmt_float_rounding(void)
+{
+    if (g_compat32_mode) {
+        unsigned short control;
+        __asm__ volatile ("fnstcw %0" : "=m"(control));
+        return (control >> 10) & 3;
+    }
+    unsigned control;
+    __asm__ volatile ("stmxcsr %0" : "=m"(control));
+    return (control >> 13) & 3;
+}
+
+static unsigned fmt_float_flags(int left, int zero, int plus, int space, int alternate)
+{
+    return (left ? CRT_FLOAT_LEFT : 0) | (zero ? CRT_FLOAT_ZERO : 0) |
+           (plus ? CRT_FLOAT_PLUS : 0) | (space ? CRT_FLOAT_SPACE : 0) |
+           (alternate ? CRT_FLOAT_ALT : 0);
+}
+
+static int fmt_float_write(void *opaque, const char *data, size_t length)
+{
+    FMT_CTX *ctx = opaque;
+    fmt_puts(ctx, data, length);
+    return !ctx->failed;
+}
+
+static int fmt_float_repeat(void *opaque, char c, int count)
+{
+    FMT_CTX *ctx = opaque;
+    fmt_pad(ctx, count, c);
+    return !ctx->failed;
+}
+
+static void fmt_float(FMT_CTX *ctx, double value, int width, int precision,
+                       unsigned flags, char conversion)
+{
+    union { double value; uint64_t bits; } input = {value};
+    CRT_FLOAT_SINK sink = {ctx, fmt_float_write, fmt_float_repeat, 0};
+    int result = crt_float_format(&sink, input.bits, width, precision, flags,
+        conversion, ctx->ucrt ? ctx->float_options : CRT_FLOAT_LEGACY,
+        fmt_float_rounding());
+    if (result < 0 && !ctx->failed) {
+        *crt_errno() = CRT_EOVERFLOW;
+        ctx->failed = TRUE;
+    }
 }
 
 static SIZE_T uint_to_str(char *buf, unsigned long long val, int base, int upper)
@@ -801,78 +868,11 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
             if (left_align) fmt_pad(ctx, width - 1, ' ');
             break;
         }
-        case 'f': case 'e': case 'g': {
-            double val = ms_va_arg(ap, double);
-            int prec = (precision >= 0) ? precision : 6;
-
-            /* Handle negative / sign */
-            int f_neg = 0;
-            if (val < 0) { f_neg = 1; val = -val; }
-
-            /* Decompose into integer and fractional parts.
-             * We work with unsigned 64-bit for the integer portion
-             * and compute fractional digits via repeated multiply. */
-            unsigned long long int_part = (unsigned long long)val;
-            double frac_part = val - (double)int_part;
-
-            /* Build integer-part string */
-            char f_buf[80];
-            int f_pos = 0;
-            SIZE_T ip_len = uint_to_str(f_buf, int_part, 10, 0);
-            f_pos = (int)ip_len;
-
-            /* Decimal point + fractional digits */
-            if (prec > 0) {
-                f_buf[f_pos++] = '.';
-                for (int fi = 0; fi < prec; fi++) {
-                    frac_part *= 10.0;
-                    int fdigit = (int)frac_part;
-                    if (fdigit > 9) fdigit = 9;
-                    f_buf[f_pos++] = '0' + fdigit;
-                    frac_part -= fdigit;
-                }
-                /* Round: check if remaining frac >= 0.5 */
-                if (frac_part >= 0.5) {
-                    /* Propagate carry backwards through frac digits */
-                    int ci = f_pos - 1;
-                    while (ci >= 0) {
-                        if (f_buf[ci] == '.') { ci--; continue; }
-                        if (f_buf[ci] < '9') { f_buf[ci]++; break; }
-                        f_buf[ci] = '0';
-                        ci--;
-                    }
-                    if (ci < 0) {
-                        /* Carry overflowed past all digits — shift right and insert '1' */
-                        for (int si = f_pos; si > 0; si--)
-                            f_buf[si] = f_buf[si - 1];
-                        f_buf[0] = '1';
-                        f_pos++;
-                    }
-                }
-            } else if (precision == 0) {
-                /* No decimal point when precision is explicitly 0 */
-                /* Round the integer part */
-                if (frac_part >= 0.5) {
-                    int_part++;
-                    f_pos = (int)uint_to_str(f_buf, int_part, 10, 0);
-                }
-            }
-            f_buf[f_pos] = 0;
-
-            int f_total = f_pos + f_neg;
-            if (!f_neg && plus_sign) f_total++;
-            else if (!f_neg && space_sign) f_total++;
-            char f_pad = (zero_pad && !left_align) ? '0' : ' ';
-
-            if (!left_align && f_pad == ' ') fmt_pad(ctx, width - f_total, ' ');
-            if (f_neg) fmt_putc(ctx, '-');
-            else if (plus_sign) fmt_putc(ctx, '+');
-            else if (space_sign) fmt_putc(ctx, ' ');
-            if (!left_align && f_pad == '0') fmt_pad(ctx, width - f_total, '0');
-            fmt_puts(ctx, f_buf, f_pos);
-            if (left_align) fmt_pad(ctx, width - f_total, ' ');
+        case 'f': case 'F': case 'e': case 'E':
+        case 'g': case 'G': case 'a': case 'A':
+            fmt_float(ctx, ms_va_arg(ap, double), width, precision,
+                fmt_float_flags(left_align, zero_pad, plus_sign, space_sign, alternate), *fmt);
             break;
-        }
         case '%':
             fmt_putc(ctx, '%');
             break;
@@ -1088,69 +1088,14 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             if (left_align) fmt_pad(ctx, width - 1, ' ');
             break;
         }
-        case 'f': case 'e': case 'g': {
-            /* Double on 32-bit stack: 8 bytes = two consecutive uint32_t */
-            uint32_t lo = *vp++, hi = *vp++;
-            uint64_t bits = ((uint64_t)hi << 32) | lo;
-            double val;
-            __builtin_memcpy(&val, &bits, 8);
-            int prec = (precision >= 0) ? precision : 6;
-
-            int f_neg = 0;
-            if (val < 0) { f_neg = 1; val = -val; }
-
-            unsigned long long int_part = (unsigned long long)val;
-            double frac_part = val - (double)int_part;
-
-            char f_buf[80];
-            int f_pos = 0;
-            SIZE_T ip_len = uint_to_str(f_buf, int_part, 10, 0);
-            f_pos = (int)ip_len;
-
-            if (prec > 0) {
-                f_buf[f_pos++] = '.';
-                for (int fi = 0; fi < prec; fi++) {
-                    frac_part *= 10.0;
-                    int fdigit = (int)frac_part;
-                    if (fdigit > 9) fdigit = 9;
-                    f_buf[f_pos++] = '0' + fdigit;
-                    frac_part -= fdigit;
-                }
-                if (frac_part >= 0.5) {
-                    int ci = f_pos - 1;
-                    while (ci >= 0) {
-                        if (f_buf[ci] == '.') { ci--; continue; }
-                        if (f_buf[ci] < '9') { f_buf[ci]++; break; }
-                        f_buf[ci] = '0';
-                        ci--;
-                    }
-                    if (ci < 0) {
-                        for (int si = f_pos; si > 0; si--)
-                            f_buf[si] = f_buf[si - 1];
-                        f_buf[0] = '1';
-                        f_pos++;
-                    }
-                }
-            } else if (precision == 0) {
-                if (frac_part >= 0.5) {
-                    int_part++;
-                    f_pos = (int)uint_to_str(f_buf, int_part, 10, 0);
-                }
-            }
-            f_buf[f_pos] = 0;
-
-            int f_total = f_pos + f_neg;
-            if (!f_neg && plus_sign) f_total++;
-            else if (!f_neg && space_sign) f_total++;
-            char f_pad = (zero_pad && !left_align) ? '0' : ' ';
-
-            if (!left_align && f_pad == ' ') fmt_pad(ctx, width - f_total, ' ');
-            if (f_neg) fmt_putc(ctx, '-');
-            else if (plus_sign) fmt_putc(ctx, '+');
-            else if (space_sign) fmt_putc(ctx, ' ');
-            if (!left_align && f_pad == '0') fmt_pad(ctx, width - f_total, '0');
-            fmt_puts(ctx, f_buf, f_pos);
-            if (left_align) fmt_pad(ctx, width - f_total, ' ');
+        case 'f': case 'F': case 'e': case 'E':
+        case 'g': case 'G': case 'a': case 'A': {
+            union { uint64_t bits; double value; } input = {
+                (uint64_t)vp[0] | ((uint64_t)vp[1] << 32)
+            };
+            vp += 2;
+            fmt_float(ctx, input.value, width, precision,
+                fmt_float_flags(left_align, zero_pad, plus_sign, space_sign, alternate), *fmt);
             break;
         }
         case '%':
@@ -5887,6 +5832,7 @@ int WINAPI crt_stdio_common_vsprintf(uint64_t options, char *buffer,
     }
 
     FMT_CTX ctx = { .buf = buffer, .size = buffer_count,
+                   .ucrt = TRUE, .float_options = options,
                    .legacy_count = (options & CRT_PRINTF_LEGACY_COUNT) != 0 };
     int required = fmt_caller_args(&ctx, format, (ms_va_list)arg_list);
 
@@ -5924,10 +5870,19 @@ typedef struct {
     SIZE_T size;
     SIZE_T pos;
     BOOL legacy_count;
+    BOOL failed;
+    BOOL ucrt;
+    uint64_t float_options;
 } WFMT_CTX;
 
 static void wfmt_putc(WFMT_CTX *ctx, WCHAR c)
 {
+    if (ctx->failed) return;
+    if (ctx->pos == 0x7FFFFFFFU) {
+        *crt_errno() = CRT_EOVERFLOW;
+        ctx->failed = TRUE;
+        return;
+    }
     SIZE_T limit = ctx->size;
     if (limit && !ctx->legacy_count) limit--;
     if (ctx->buf && ctx->pos < limit)
@@ -5946,20 +5901,32 @@ static void wfmt_terminate(WFMT_CTX *ctx)
 
 static void wfmt_put_ascii(WFMT_CTX *ctx, const char *s, SIZE_T len)
 {
-    for (SIZE_T i = 0; i < len; i++)
+    for (SIZE_T i = 0; i < len && !ctx->failed; i++)
         wfmt_putc(ctx, (WCHAR)(unsigned char)s[i]);
 }
 
 static void wfmt_put_wide(WFMT_CTX *ctx, const WCHAR *s, SIZE_T len)
 {
-    for (SIZE_T i = 0; i < len; i++)
+    for (SIZE_T i = 0; i < len && !ctx->failed; i++)
         wfmt_putc(ctx, s[i]);
 }
 
 static void wfmt_pad(WFMT_CTX *ctx, int count, WCHAR c)
 {
-    while (count-- > 0)
-        wfmt_putc(ctx, c);
+    if (count <= 0 || ctx->failed) return;
+    if ((SIZE_T)count > 0x7FFFFFFFU - ctx->pos) {
+        *crt_errno() = CRT_EOVERFLOW;
+        ctx->failed = TRUE;
+        return;
+    }
+    SIZE_T limit = ctx->size;
+    if (limit && !ctx->legacy_count) limit--;
+    if (ctx->buf && ctx->pos < limit) {
+        SIZE_T room = limit - ctx->pos;
+        SIZE_T written = (SIZE_T)count < room ? (SIZE_T)count : room;
+        for (SIZE_T i = 0; i < written; i++) ctx->buf[ctx->pos + i] = c;
+    }
+    ctx->pos += (SIZE_T)count;
 }
 
 static SIZE_T wfmt_wcsnlen(const WCHAR *s, int precision)
@@ -6022,55 +5989,32 @@ static void wfmt_integer(WFMT_CTX *ctx, unsigned long long value, int negative,
     if (left) wfmt_pad(ctx, width_pad, ' ');
 }
 
-static void wfmt_float(WFMT_CTX *ctx, double value, int width, int precision,
-                       int left, int zero, int plus, int space)
+static int wfmt_float_write(void *opaque, const char *data, size_t length)
 {
-    char out[96];
-    int pos = 0;
-    int negative = value < 0.0;
-    if (negative) value = -value;
-    if (precision < 0) precision = 6;
-    if (precision > 48) precision = 48;
+    WFMT_CTX *ctx = opaque;
+    wfmt_put_ascii(ctx, data, length);
+    return !ctx->failed;
+}
 
-    unsigned long long integer = (unsigned long long)value;
-    double fraction = value - (double)integer;
-    pos = (int)uint_to_str(out, integer, 10, 0);
-    if (precision > 0) {
-        out[pos++] = '.';
-        for (int i = 0; i < precision; i++) {
-            fraction *= 10.0;
-            int digit = (int)fraction;
-            if (digit < 0) digit = 0;
-            if (digit > 9) digit = 9;
-            out[pos++] = (char)('0' + digit);
-            fraction -= digit;
-        }
-        if (fraction >= 0.5) {
-            int i = pos - 1;
-            while (i >= 0) {
-                if (out[i] == '.') { i--; continue; }
-                if (out[i] != '9') { out[i]++; break; }
-                out[i--] = '0';
-            }
-            if (i < 0 && pos < (int)sizeof(out) - 1) {
-                for (int j = pos; j > 0; j--) out[j] = out[j - 1];
-                out[0] = '1';
-                pos++;
-            }
-        }
-    } else if (fraction >= 0.5) {
-        integer++;
-        pos = (int)uint_to_str(out, integer, 10, 0);
+static int wfmt_float_repeat(void *opaque, char c, int count)
+{
+    WFMT_CTX *ctx = opaque;
+    wfmt_pad(ctx, count, (WCHAR)(unsigned char)c);
+    return !ctx->failed;
+}
+
+static void wfmt_float(WFMT_CTX *ctx, double value, int width, int precision,
+                       unsigned flags, char conversion)
+{
+    union { double value; uint64_t bits; } input = {value};
+    CRT_FLOAT_SINK sink = {ctx, wfmt_float_write, wfmt_float_repeat, 0};
+    int result = crt_float_format(&sink, input.bits, width, precision, flags,
+        conversion, ctx->ucrt ? ctx->float_options : CRT_FLOAT_LEGACY,
+        fmt_float_rounding());
+    if (result < 0 && !ctx->failed) {
+        *crt_errno() = CRT_EOVERFLOW;
+        ctx->failed = TRUE;
     }
-
-    char sign = negative ? '-' : plus ? '+' : space ? ' ' : 0;
-    int content = pos + (sign != 0);
-    int pad = width > content ? width - content : 0;
-    if (!left && !zero) wfmt_pad(ctx, pad, ' ');
-    if (sign) wfmt_putc(ctx, (WCHAR)sign);
-    if (!left && zero) wfmt_pad(ctx, pad, '0');
-    wfmt_put_ascii(ctx, out, (SIZE_T)pos);
-    if (left) wfmt_pad(ctx, pad, ' ');
 }
 
 static int do_vformat_wide64(WFMT_CTX *ctx, const WCHAR *fmt, ms_va_list ap)
@@ -6078,7 +6022,7 @@ static int do_vformat_wide64(WFMT_CTX *ctx, const WCHAR *fmt, ms_va_list ap)
     static const WCHAR null_wide[] = {'(','n','u','l','l',')',0};
     static const char null_narrow[] = "(null)";
 
-    while (*fmt) {
+    while (*fmt && !ctx->failed) {
         if (*fmt != '%') {
             wfmt_putc(ctx, *fmt++);
             continue;
@@ -6220,9 +6164,10 @@ static int do_vformat_wide64(WFMT_CTX *ctx, const WCHAR *fmt, ms_va_list ap)
             if (left) wfmt_pad(ctx, width - 1, ' ');
             break;
         }
-        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G':
+        case 'f': case 'F': case 'e': case 'E':
+        case 'g': case 'G': case 'a': case 'A':
             wfmt_float(ctx, ms_va_arg(ap, double), width, precision,
-                       left, zero, plus, space);
+                fmt_float_flags(left, zero, plus, space, alternate), (char)conversion);
             break;
         case 'n': {
             PVOID out = ms_va_arg(ap, PVOID);
@@ -6246,7 +6191,7 @@ static int do_vformat_wide64(WFMT_CTX *ctx, const WCHAR *fmt, ms_va_list ap)
     }
 
     wfmt_terminate(ctx);
-    return (int)ctx->pos;
+    return ctx->failed ? -1 : (int)ctx->pos;
 }
 
 static uint32_t wfmt_arg32_u32(uint32_t **args)
@@ -6281,7 +6226,7 @@ static SIZE_T do_vformat_wide32(WFMT_CTX *ctx, const WCHAR *fmt,
     static const WCHAR null_wide[] = {'(','n','u','l','l',')',0};
     static const char null_narrow[] = "(null)";
 
-    while (*fmt) {
+    while (*fmt && !ctx->failed) {
         if (*fmt != '%') {
             wfmt_putc(ctx, *fmt++);
             continue;
@@ -6450,9 +6395,10 @@ static SIZE_T do_vformat_wide32(WFMT_CTX *ctx, const WCHAR *fmt,
             if (left) wfmt_pad(ctx, width - 1, ' ');
             break;
         }
-        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G':
+        case 'f': case 'F': case 'e': case 'E':
+        case 'g': case 'G': case 'a': case 'A':
             wfmt_float(ctx, wfmt_arg32_double(&args), width, precision,
-                       left, zero, plus, space);
+                fmt_float_flags(left, zero, plus, space, alternate), (char)conversion);
             break;
         case 'n': {
             PVOID out = (PVOID)(uintptr_t)wfmt_arg32_u32(&args);
@@ -6477,7 +6423,7 @@ static SIZE_T do_vformat_wide32(WFMT_CTX *ctx, const WCHAR *fmt,
     }
 
     wfmt_terminate(ctx);
-    return ctx->pos;
+    return ctx->failed ? (SIZE_T)-1 : ctx->pos;
 }
 
 int WINAPI crt_vswprintf_c_l(WCHAR *buffer, SIZE_T buffer_count,
@@ -6494,7 +6440,7 @@ int WINAPI crt_vswprintf_c_l(WCHAR *buffer, SIZE_T buffer_count,
     if (buffer && buffer_count == 0)
         return -1;
 
-    WFMT_CTX ctx = { buffer, buffer_count, 0, FALSE };
+    WFMT_CTX ctx = { .buf = buffer, .size = buffer_count };
     SIZE_T required;
     if (g_compat32_mode) {
         required = do_vformat_wide32(
@@ -6537,7 +6483,7 @@ static int WINAPI crt_snwprintf_compat32(WCHAR *buffer, SIZE_T buffer_count,
         return -1;
     }
 
-    WFMT_CTX ctx = { buffer, buffer_count, 0, FALSE };
+    WFMT_CTX ctx = { .buf = buffer, .size = buffer_count };
     SIZE_T required = do_vformat_wide32(&ctx, format, args);
     return crt_wformat_bounded_result(required, buffer_count);
 }
@@ -6554,7 +6500,7 @@ int WINAPI crt_snwprintf(WCHAR *buffer, SIZE_T buffer_count,
 
     ms_va_list ap;
     ms_va_start(ap, format);
-    WFMT_CTX ctx = { buffer, buffer_count, 0, FALSE };
+    WFMT_CTX ctx = { .buf = buffer, .size = buffer_count };
     int required = do_vformat_wide64(&ctx, format, ap);
     ms_va_end(ap);
     if (required < 0)
@@ -6607,13 +6553,13 @@ static int WINAPI crt_fwprintf_compat32(PVOID stream, const WCHAR *format,
         return -1;
     }
 
-    WFMT_CTX measure = { NULL, 0, 0, FALSE };
+    WFMT_CTX measure = {0};
     SIZE_T required = do_vformat_wide32(&measure, format, args);
     WCHAR *buffer = crt_fwprintf_allocate(required);
     if (!buffer)
         return -1;
 
-    WFMT_CTX output = { buffer, required + 1, 0, FALSE };
+    WFMT_CTX output = { .buf = buffer, .size = required + 1 };
     do_vformat_wide32(&output, format, args);
     int result = crt_fwprintf_write(stream, buffer, required);
     crt_free(buffer);
@@ -6631,7 +6577,7 @@ int WINAPI crt_fwprintf(PVOID stream, const WCHAR *format, ...)
     ms_va_start(ap, format);
     ms_va_list measure_args;
     ms_va_copy(measure_args, ap);
-    WFMT_CTX measure = { NULL, 0, 0, FALSE };
+    WFMT_CTX measure = {0};
     int native_required = do_vformat_wide64(&measure, format, measure_args);
     ms_va_end(measure_args);
     if (native_required < 0) {
@@ -6648,7 +6594,7 @@ int WINAPI crt_fwprintf(PVOID stream, const WCHAR *format, ...)
 
     ms_va_list output_args;
     ms_va_copy(output_args, ap);
-    WFMT_CTX output = { buffer, required + 1, 0, FALSE };
+    WFMT_CTX output = { .buf = buffer, .size = required + 1 };
     do_vformat_wide64(&output, format, output_args);
     ms_va_end(output_args);
     ms_va_end(ap);
@@ -6670,8 +6616,9 @@ int WINAPI crt_stdio_common_vswprintf(uint64_t options, WCHAR *buffer,
         return -1;
     }
 
-    WFMT_CTX ctx = { buffer, buffer_count, 0,
-                    (options & CRT_PRINTF_LEGACY_COUNT) != 0 };
+    WFMT_CTX ctx = { .buf = buffer, .size = buffer_count,
+                    .legacy_count = (options & CRT_PRINTF_LEGACY_COUNT) != 0,
+                    .ucrt = TRUE, .float_options = options };
     SIZE_T required;
     if (g_compat32_mode) {
         required = do_vformat_wide32(&ctx, format, (uint32_t *)arg_list);
@@ -7639,7 +7586,7 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
         return -1;
     }
 
-    WFMT_CTX ctx = { buf, count, 0, TRUE };
+    WFMT_CTX ctx = { .buf = buf, .size = count, .legacy_count = TRUE };
     SIZE_T required;
     if (g_compat32_mode) {
         required = do_vformat_wide32(&ctx, fmt, (uint32_t *)(void *)ap);
