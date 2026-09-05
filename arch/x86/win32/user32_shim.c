@@ -8,6 +8,7 @@
 
 #include "user32_shim.h"
 #include "user32_controls.h"
+#include "user32_listbox.h"
 #include "gdi32_shim.h"
 #include "kernel32_shim.h"
 #include "compat32.h"
@@ -403,6 +404,7 @@ typedef struct {
     char        title[256];
     PWSTR       text;
     U32_CONTROL *control;
+    U32_LISTBOX *listbox;
     BOOL        unicode;
     WNDPROC     wndproc;
     DWORD       style;
@@ -4673,6 +4675,14 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
             return NULL;
         }
     }
+    if (cls->system_class && cls->atom == 0x83) {
+        w->listbox = user32_listbox_create(dwStyle);
+        if (!w->listbox) {
+            release_window(w);
+            SetLastError(8);
+            return NULL;
+        }
+    }
 
     if (!message_only)
         place_window_in_z_order(w, (dwStyle & WS_CHILD) ? HWND_BOTTOM : HWND_TOP);
@@ -4888,6 +4898,8 @@ static void release_window(WINDOW *w)
     if (!w || !w->used) return;
     user32_control_release(w->control);
     w->control = NULL;
+    user32_listbox_release(w->listbox);
+    w->listbox = NULL;
     kfree(w->text);
     w->text = NULL;
     dialog_release_window(w->handle);
@@ -6247,12 +6259,51 @@ static PVOID message_convert_text(PCVOID text, BOOL input_wide, int *length)
     return copy;
 }
 
+static LRESULT send_listbox_text(HWND window, DWORD message, WPARAM wp,
+                                  LPARAM lp, BOOL wide, BOOL target_wide)
+{
+    HANDLE heap = GetProcessHeap();
+    LRESULT result = -1;
+    if (message != 0x0189 && message != 0x018A) { /* LB_GETTEXT / LB_GETTEXTLEN */
+        int length;
+        PVOID text = lp ? message_convert_text((PCVOID)lp, wide, &length) : NULL;
+        if (lp && !text) return -2;
+        send_message_wait(window, message, wp, (LPARAM)text, 0xFFFFFFFFu,
+            FALSE, target_wide, &result);
+        if (text) HeapFree(heap, 0, text);
+        return result;
+    }
+    if (!send_message_wait(window, 0x018A, wp, 0, 0xFFFFFFFFu,
+            FALSE, target_wide, &result) || result < 0 || result >= 0x7FFFFFFE)
+        return result;
+    SIZE_T capacity = (SIZE_T)result+1;
+    PVOID text = HeapAlloc(heap, 8, capacity * (target_wide ? sizeof(WCHAR) : 1));
+    if (!text) return -2;
+    BOOL completed = send_message_wait(window, 0x0189, wp, (LPARAM)text,
+        0xFFFFFFFFu, FALSE, target_wide, &result);
+    if (target_wide) ((PWSTR)text)[capacity-1] = 0;
+    else ((PSTR)text)[capacity-1] = 0;
+    int length = 0;
+    PVOID converted = completed && result >= 0 ?
+        message_convert_text(text, target_wide, &length) : NULL;
+    HeapFree(heap, 0, text);
+    if (!converted) return -1;
+    if (message == 0x0189 && lp)
+        memcpy((PVOID)lp, converted, ((SIZE_T)length+1)*(wide ? sizeof(WCHAR) : 1));
+    HeapFree(heap, 0, converted);
+    return length;
+}
+
 static LRESULT send_message_text(HWND window, DWORD message, WPARAM wp,
                                   LPARAM lp, BOOL wide)
 {
     WINDOW *w = find_window(window);
     LRESULT result = 0;
     BOOL target_wide = w ? w->unicode : wide;
+    if (target_wide != wide && w && user32_listbox_has_strings(w->listbox) &&
+        (message == 0x0180 || message == 0x0181 || message == 0x0189 ||
+         message == 0x018A || message == 0x018C || message == 0x018F || message == 0x01A2))
+        return send_listbox_text(window, message, wp, lp, wide, target_wide);
     if (target_wide == wide || message < 0xC || message > 0xE ||
         (message == 0xC && !lp)) {
         send_message_wait(window, message, wp, lp, 0xFFFFFFFFu, FALSE, wide, &result);
@@ -6553,9 +6604,11 @@ static LRESULT WINAPI system_class_wndproc(HWND hWnd, DWORD Msg,
 {
     WINDOW *window = find_window(hWnd);
     LRESULT result;
+    USER_HOOK_CONTEXT *context = user_hook_context_get(FALSE);
+    if (window && window->listbox && user32_listbox_message(window->listbox,
+            hWnd, Msg, wParam, lParam, context && context->unicode_message, &result)) return result;
     if (window && window->control && user32_control_message(
             window->control, hWnd, Msg, wParam, lParam, &result)) return result;
-    USER_HOOK_CONTEXT *context = user_hook_context_get(FALSE);
     if (context && context->unicode_message)
         return DefWindowProcW(hWnd, Msg, wParam, lParam);
     return DefWindowProcA(hWnd, Msg, wParam, lParam);
