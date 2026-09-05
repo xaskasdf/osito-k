@@ -6673,7 +6673,15 @@ void compat32_init_fast_math(uint8_t *page, uint32_t user_base)
     /* _CIfmod: ST(1)=x, ST(0)=y → result in ST(0) = x mod y */
     g_fast_CIfmod_addr = user_base + (uint32_t)p;
     /* fxch st(1) */          page[p++] = 0xD9; page[p++] = 0xC9;
+    /* FPREM can produce a partial reduction; repeat while C2 is set.
+     * Preserve EAX because the intrinsic ABI need not spill it. */
+    /* push eax */           page[p++] = 0x50;
     /* fprem */               page[p++] = 0xD9; page[p++] = 0xF8;
+    /* fnstsw ax */          page[p++] = 0xDF; page[p++] = 0xE0;
+    /* test ah,4 */          page[p++] = 0xF6; page[p++] = 0xC4;
+                              page[p++] = 0x04;
+    /* jnz fprem */          page[p++] = 0x75; page[p++] = 0xF7;
+    /* pop eax */            page[p++] = 0x58;
     /* fstp st(1) */          page[p++] = 0xDD; page[p++] = 0xD9;
     /* ret */                 page[p++] = 0xC3;
 
@@ -6685,7 +6693,7 @@ void compat32_init_fast_math(uint8_t *page, uint32_t user_base)
     /* fld st(0) — dup x */   page[p++] = 0xD9; page[p++] = 0xC0;
     /* fmul st(0), st(0) */   page[p++] = 0xD8; page[p++] = 0xC8;
     /* fld1 */                page[p++] = 0xD9; page[p++] = 0xE8;
-    /* fsubrp st(1) */        page[p++] = 0xDE; page[p++] = 0xE9;
+    /* fsubrp st(1): 1-x*x */ page[p++] = 0xDE; page[p++] = 0xE1;
     /* fsqrt */               page[p++] = 0xD9; page[p++] = 0xFA;
     /* fxch st(1) */          page[p++] = 0xD9; page[p++] = 0xC9;
     /* fpatan — atan2(ST(1), ST(0)) */

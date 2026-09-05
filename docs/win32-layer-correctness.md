@@ -1022,6 +1022,68 @@ USB mouse, but a raw submitted RGB565 buffer (`frame8.png`) already contained
 the stale scene and accumulated HUD. That isolates the observed corruption
 upstream of the compositor; it does not prove this CRT fix resolves it.
 
+## 4.19 PE32 x87 acos and remainder contracts (2026-09-05)
+
+The native PE32 `_CIacos` sequence encoded `x*x-1` where its square root
+requires `1-x*x`. `_CIfmod` executed FPREM only once, returning an intermediate
+remainder when the operands' exponents were far apart. The emitted sequences
+now use the correct reverse subtraction and repeat reduction while C2 is set,
+preserving the scratch EAX register. The partial-reduction rule is defined in
+the [Intel instruction reference](https://cdrdv2-public.intel.com/825760/325383-sdm-vol-2abcd.pdf).
+The existing provider registrations and x87 argument/result ABI are unchanged;
+these fixes apply to the shared PE32 CRT aliases, not the PE64 fallbacks or DOS.
+
+Build `crt_x87_pe32.exe` with `sh arch/x86/scripts/build-crt-x87-test.sh` and
+run `winexec probes/crt_x87_pe32.exe`, optionally followed by `ucrt`.
+`crt_x87.autoload` starts the MSVCRT case. The probe calls the real intrinsics
+with live values below their x87 operands and checks stack depth, preserved
+values/control, acos endpoints/interior values, large exponent differences,
+remainder signs, subnormals, signed zero, infinities and NaNs. A final case
+sets C2 through a partial reduction before requesting an invalid remainder.
+
+The initial 43-check version passed on native Windows MSVCRT and UCRT but
+failed seven checks in OsitoK, through both aliases, in
+`/root/osito-crt-x87-before-20260905-jrqh3M/`. The final 68-check version passes
+on native UCRT and on both OsitoK aliases. Native MSVCRT differs on two edge
+values: remainder with an infinite divisor and negative-zero preservation.
+Those checks deliberately remain visible failures for that legacy reference;
+the shared shim follows the UCRT values instead of introducing app-specific
+or host-detection exceptions into the probe.
+
+Regression artifacts: `/root/osito-crt-x87-edge-20260905-WA3hmj/`, with
+8 GiB, four CPUs, KVM and an isolated OSFS3 snapshot. The built and booted
+kernel share SHA-256
+`a00b3766affd23956e11543b7bb138478e25dd09c0c8910d36a3c8f3cebab7d6`.
+All four CRT-FP variants pass (48/50 PE32, 36/38 PE64 for MSVCRT/UCRT).
+Input 166/166, DirectDraw ABI, DirectSound, and DOS API with 15/15 host-memory
+checks pass. The UCRT x87 probe passes 68/68 again after DOS. No unexpected
+CPU fault appears. errno/_matherr compatibility, unmasked exceptions, all
+precision/rounding combinations and the other `_CI` intrinsics are not
+established by this change.
+
+The final probe explicitly declares volatile SSE registers at its inline
+assembly calls. `/root/osito-crt-x87-final-20260905-Eh6DE5/` repeats 68/68 on
+both aliases before and after DOS with the same kernel. Its executable has
+SHA-256 `a768cde7d476f2b0c7434fcd7c2b2c338259d87cf7217cc1dd8a3dbb58c8a5c2`.
+
+Two UT99 integration runs retain the corrected fixture from section 4.17.
+`/root/osito-ut99-fp-20260905-HhrROT/` uses the control-word fix alone;
+`fp-frame-v2-gdb.log` observes the application's precision requests changing
+the hardware x87 word, but the raw submitted `frame8.png` is already stale.
+`/root/osito-ut99-x87-20260905-Dp3xiN/` adds these intrinsic corrections.
+Both reach DM-Agony and start the match through actual relative mouse and
+keyboard input. `playing.png`, `moving.png` and `settled.png` in the latter
+still show a static scene, missing first-person weapon and accumulating HUD.
+The startup sample observes `_CIfmod` calls but no `_CIacos` calls; it does
+not establish coverage throughout gameplay. The render problem therefore
+remains open, rather than being attributed to either fixed math defect.
+
+Both game runs exit through their console with code zero, and the layer
+reports releasing 24 root-process modules. No unexpected CPU fault is logged.
+The QEMU and GDB sessions were stopped. The base fixture remains unchanged at
+SHA-256 `cdec52eccec06dac6a24e83752f23fcbf59fba4eebd014f8f8fc79d2b307d350`;
+no application binary or persistent game configuration was patched.
+
 ## 5. Open questions / notes
 - `WINAPI` selects the Microsoft x64 ABI for native shims, not the kernel's
   SysV ABI. Export arg-count metadata also drives the **32-bit thunk's `RET n*4`**.
