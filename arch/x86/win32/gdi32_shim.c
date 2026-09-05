@@ -102,6 +102,7 @@ static BOOL gdi_font_validate_memory(const void *data, DWORD size,
 static LONG dwrite_utf16_path_to_utf8(PCWSTR input, char *output,
                                       UINT capacity);
 static void dwrite_release_system_collection_cache(DWORD process_id);
+static void gdi_brush_release_process(DWORD process_id);
 
 static void gdi_font_resources_lock(void)
 {
@@ -429,6 +430,7 @@ static BOOL gdi_font_resource_snapshot_paths(DWORD process_id,
 
 void gdi32_release_process(DWORD process_id)
 {
+    gdi_brush_release_process(process_id);
     if (!process_id) return;
     GDI_FONT_RESOURCE *retired = NULL;
     BOOL catalog_changed = FALSE;
@@ -487,6 +489,10 @@ typedef struct {
     float    world_transform[6];
     HGDIOBJ  prev_bitmap;   /* currently selected bitmap handle */
     HGDIOBJ  current_font;  /* currently selected font handle */
+    HGDIOBJ  current_brush;
+    UINT     clip_count;
+    BOOL     clip_active;
+    GDI_RECT clip_rects[MAX_REGION_RECTS];
     int      is_screen;     /* DC targets the GOP framebuffer (window/screen DC) */
     int      pooled_window; /* GetDC/BeginPaint DC, retained across ReleaseDC */
     ULONG_PTR owner_window; /* HWND associated with a pooled window DC */
@@ -582,6 +588,118 @@ static UINT       gdi_blit_trace_count;
 #define STOCK_SYSTEM_FONT ((HGDIOBJ)(ULONG_PTR)0xAA00000Du)
 #define OBJ_BITMAP 7
 #define OBJ_FONT   6
+#define OBJ_BRUSH  2
+#define BRUSH_TAG  0xBE000000u
+#define SYSTEM_BRUSH_TAG 0xBC000000u
+#define STOCK_WHITE_BRUSH ((HGDIOBJ)(ULONG_PTR)0xAA000000u)
+
+typedef struct GDI_BRUSH {
+    struct GDI_BRUSH *next;
+    HGDIOBJ handle;
+    DWORD owner_pid, color;
+    UINT style, references;
+    GDI_BITMAP pattern;
+} GDI_BRUSH;
+
+#define BRUSH_BUCKETS 128u
+static GDI_BRUSH *gdi_brushes[BRUSH_BUCKETS];
+static ULONG next_brush_id = 1;
+static volatile ULONG gdi_brush_lock;
+extern DWORD WINAPI GetSysColor(int index);
+
+static uint64_t brushes_lock(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    while (__atomic_exchange_n(&gdi_brush_lock, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+    return flags;
+}
+
+static void brushes_unlock(uint64_t flags)
+{
+    __atomic_store_n(&gdi_brush_lock, 0, __ATOMIC_RELEASE);
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+}
+
+static GDI_BRUSH *brush_find_locked(HGDIOBJ handle)
+{
+    for (GDI_BRUSH *brush = gdi_brushes[(ULONG_PTR)handle % BRUSH_BUCKETS];
+         brush; brush = brush->next)
+        if (brush->handle == handle) return brush;
+    return NULL;
+}
+
+/* Borrowed brush snapshots pin pattern pixels across a preemptible draw. */
+static BOOL brush_acquire(HGDIOBJ handle, const GDI_DC *dc, GDI_BRUSH *out)
+{
+    ULONG_PTR value = (ULONG_PTR)handle;
+    gdi_memset(out, 0, sizeof(*out));
+    if ((value & TAG_MASK) == 0xAA000000u) {
+        UINT stock = (UINT)(value & ~TAG_MASK);
+        static const DWORD colors[] = {
+            0x00FFFFFFu, 0x00C0C0C0u, 0x00808080u, 0x00404040u, 0,
+        };
+        if (stock < 5) out->color = colors[stock];
+        else if (stock == 5) out->style = 1; /* NULL_BRUSH */
+        else if (stock == 18) out->color = dc ? dc->brush_color : 0xFFFFFFu;
+        else return FALSE;
+        return TRUE;
+    }
+    if ((value & TAG_MASK) == SYSTEM_BRUSH_TAG &&
+        (value & ~TAG_MASK) < 31) {
+        out->color = GetSysColor((int)(value & ~TAG_MASK));
+        return TRUE;
+    }
+    if ((value & TAG_MASK) != BRUSH_TAG) return FALSE;
+    uint64_t flags = brushes_lock();
+    GDI_BRUSH *brush = brush_find_locked(handle);
+    if (brush && brush->owner_pid != GetCurrentProcessId()) brush = NULL;
+    if (brush) {
+        brush->references++;
+        *out = *brush;
+    }
+    brushes_unlock(flags);
+    return brush != NULL;
+}
+
+static void brush_release(HGDIOBJ handle)
+{
+    uint64_t flags = brushes_lock();
+    GDI_BRUSH *brush = brush_find_locked(handle);
+    if (brush && brush->references) brush->references--;
+    brushes_unlock(flags);
+}
+
+static void gdi_brush_release_process(DWORD process_id)
+{
+    if (!process_id) return;
+    GDI_BRUSH *retired = NULL;
+    uint64_t flags = brushes_lock();
+    for (UINT bucket = 0; bucket < BRUSH_BUCKETS; bucket++) {
+        GDI_BRUSH **link = &gdi_brushes[bucket];
+        while (*link) {
+            GDI_BRUSH *brush = *link;
+            if (brush->owner_pid != process_id) {
+                link = &brush->next;
+                continue;
+            }
+            for (int i = 0; i < MAX_GDI_DCS; i++)
+                if (gdi_dcs[i].current_brush == brush->handle)
+                    gdi_dcs[i].current_brush = STOCK_WHITE_BRUSH;
+            *link = brush->next;
+            brush->next = retired;
+            retired = brush;
+        }
+    }
+    brushes_unlock(flags);
+    while (retired) {
+        GDI_BRUSH *next = retired->next;
+        kfree(retired->pattern.pixels);
+        kfree(retired);
+        retired = next;
+    }
+}
 
 #define GDI_BI_RGB            0u
 #define GDI_BI_BITFIELDS      3u
@@ -745,6 +863,8 @@ static int alloc_dc(void)
             gdi_dcs[i].world_transform[0] = 1.0f;
             gdi_dcs[i].world_transform[3] = 1.0f;
             gdi_dcs[i].current_font = STOCK_SYSTEM_FONT;
+            gdi_dcs[i].current_brush = STOCK_WHITE_BRUSH;
+            gdi_dcs[i].brush_color = 0x00FFFFFFu;
             return i;
         }
     }
@@ -985,6 +1105,7 @@ BOOL WINAPI DeleteDC(HDC hdc)
     if (dc && dc->pooled_window)
         return FALSE;
     if (dc) {
+        brush_release(dc->current_brush);
         dc->in_use = 0;
         dc->surface = NULL;
     }
@@ -1051,6 +1172,7 @@ void gdi32_free_screen_dc(HDC hdc)
      * window so WindowFromDC stays deterministic across concurrent windows. */
     if (dc && dc->pooled_window) return;
     if (dc) {
+        brush_release(dc->current_brush);
         dc->in_use = 0;
         dc->surface = NULL;
     }
@@ -1287,17 +1409,24 @@ int WINAPI GetDIBits(HDC hdc, HBITMAP bitmap, UINT start_scan,
 HBITMAP WINAPI CreateBitmap(int nWidth, int nHeight, UINT nPlanes,
                              UINT nBitCount, PVOID lpBits)
 {
-    (void)nPlanes;
-    serial_puts("[GDI32] CreateBitmap\n");
-
-    if (nWidth <= 0 || nHeight <= 0) return NULL;
+    if (nWidth <= 0 || nHeight <= 0 || nPlanes != 1 ||
+        (nBitCount != 1 && nBitCount != 8 && nBitCount != 16 &&
+         nBitCount != 24 && nBitCount != 32)) {
+        SetLastError(87);
+        return NULL;
+    }
+    /* CreateBitmap input rows are WORD-aligned, unlike DIB DWORD rows. */
+    uint64_t row_bytes = (((uint64_t)(UINT)nWidth * nBitCount + 15) / 16) * 2;
+    if (row_bytes > 0x7FFFFFFFu || row_bytes * (UINT)nHeight > (SIZE_T)-1) {
+        SetLastError(8);
+        return NULL;
+    }
 
     int idx = alloc_bmp();
     if (idx < 0) return NULL;
 
     int bpp = (int)nBitCount;
-    if (bpp < 8) bpp = 32; /* default to 32bpp for monochrome requests */
-    int pitch = nWidth * (bpp / 8);
+    int pitch = (int)row_bytes;
     void *pixels = kmalloc((uint64_t)pitch * nHeight);
     if (!pixels) {
         gdi_bmps[idx].in_use = 0;
@@ -1506,6 +1635,15 @@ HGDIOBJ WINAPI SelectObject(HDC hdc, HGDIOBJ h)
         return prev ? prev : STOCK_SYSTEM_FONT;
     }
 
+    GDI_BRUSH brush;
+    if (brush_acquire(h, dc, &brush)) {
+        HGDIOBJ previous = dc->current_brush;
+        dc->current_brush = h;
+        brush_release(previous);
+        return previous;
+    }
+    if (((ULONG_PTR)h & TAG_MASK) == BRUSH_TAG) return NULL;
+
     /* For brushes and pens, keep the existing passthrough behavior. */
     return h;
 }
@@ -1518,6 +1656,7 @@ HGDIOBJ WINAPI GetCurrentObject(HDC hdc, UINT type)
         return dc->prev_bitmap ? dc->prev_bitmap : STOCK_BITMAP;
     if (type == OBJ_FONT)
         return dc->current_font ? dc->current_font : STOCK_SYSTEM_FONT;
+    if (type == OBJ_BRUSH) return dc->current_brush;
     return NULL;
 }
 
@@ -1919,11 +2058,22 @@ int WINAPI OffsetRgn(HGDIOBJ rgn, int x, int y)
 
 int WINAPI SelectClipRgn(HDC hdc, HGDIOBJ rgn)
 {
-    if (!dc_from_handle(hdc)) return GDI_RGN_ERROR;
-    if (!rgn) return GDI_NULLREGION;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (!dc) return GDI_RGN_ERROR;
+    if (!rgn) {
+        dc->clip_active = FALSE;
+        dc->clip_count = 0;
+        return GDI_SIMPLEREGION;
+    }
     regions_lock();
     GDI_REGION *region = region_from_handle(rgn);
     int type = region ? region_type(region) : GDI_RGN_ERROR;
+    if (region) {
+        dc->clip_count = region->count;
+        gdi_memcpy(dc->clip_rects, region->rects,
+                   region->count * sizeof(GDI_RECT));
+        dc->clip_active = TRUE;
+    }
     regions_unlock();
     return type;
 }
@@ -2021,6 +2171,22 @@ UINT WINAPI SetTextAlign(HDC hdc, UINT align)
 
 BOOL WINAPI DeleteObject(HGDIOBJ ho)
 {
+    if (((ULONG_PTR)ho & TAG_MASK) == BRUSH_TAG) {
+        uint64_t flags = brushes_lock();
+        GDI_BRUSH **link = &gdi_brushes[(ULONG_PTR)ho % BRUSH_BUCKETS];
+        while (*link && (*link)->handle != ho) link = &(*link)->next;
+        GDI_BRUSH *brush = *link;
+        if (!brush || brush->references ||
+            brush->owner_pid != GetCurrentProcessId()) {
+            brushes_unlock(flags);
+            return FALSE;
+        }
+        *link = brush->next;
+        brushes_unlock(flags);
+        kfree(brush->pattern.pixels);
+        kfree(brush);
+        return TRUE;
+    }
     if (IS_REGION_HANDLE(ho)) {
         regions_lock();
         GDI_REGION *region = region_from_handle(ho);
@@ -2088,6 +2254,17 @@ _Static_assert(sizeof(GDI_BITMAP_INFO64) == 32,
 
 static int gdi_get_object(HGDIOBJ h, int c, PVOID pv, BOOL wide)
 {
+    GDI_BRUSH brush;
+    if (brush_acquire(h, NULL, &brush)) {
+        int required = g_compat32_mode ? 12 : 16; /* LOGBRUSH */
+        if (pv && c >= required) {
+            gdi_memset(pv, 0, required);
+            ((DWORD *)pv)[0] = brush.style;
+            ((DWORD *)pv)[1] = brush.color;
+        }
+        brush_release(h);
+        return !pv || c >= required ? required : 0;
+    }
     GDI_FONT *font = font_from_handle(h);
     GDI_LOGFONTW stock_font;
     const GDI_LOGFONTW *logfont = font ? &font->logfont : NULL;
@@ -2189,10 +2366,14 @@ static int WINAPI GetObjectW_k32(HGDIOBJ h, int c, PVOID pv)
 
 static DWORD WINAPI GetObjectType_k32(HGDIOBJ h)
 {
+    GDI_BRUSH brush;
+    if (brush_acquire(h, NULL, &brush)) {
+        brush_release(h);
+        return OBJ_BRUSH;
+    }
     if (bmp_from_handle((HBITMAP)h) || h == STOCK_BITMAP) return OBJ_BITMAP;
     if (font_from_handle(h)) return 6; /* OBJ_FONT */
     if (dc_from_handle((HDC)h)) return 3; /* OBJ_DC */
-    if (((ULONG_PTR)h & TAG_MASK) == 0xBE000000u) return 2; /* OBJ_BRUSH */
     if (((ULONG_PTR)h & TAG_MASK) == 0xEE000000u) return 1; /* OBJ_PEN */
     if (((ULONG_PTR)h & TAG_MASK) == 0xAA000000u) return 6; /* OBJ_FONT */
     if (IS_REGION_HANDLE(h)) {
@@ -2206,16 +2387,48 @@ static DWORD WINAPI GetObjectType_k32(HGDIOBJ h)
 
 /* ── GDI object creation (brushes, pens, stock objects) ──────── */
 
+static HBRUSH_GDI gdi_create_brush(UINT style, DWORD color,
+                                    const GDI_BITMAP *pattern)
+{
+    GDI_BRUSH *brush = kmalloc(sizeof(*brush));
+    if (!brush) return NULL;
+    gdi_memset(brush, 0, sizeof(*brush));
+    brush->style = style;
+    brush->color = color & 0xFFFFFFu;
+    brush->owner_pid = GetCurrentProcessId();
+    if (pattern) {
+        SIZE_T bytes = (SIZE_T)pattern->pitch * pattern->height;
+        brush->pattern = *pattern;
+        brush->pattern.pixels = kmalloc(bytes);
+        if (!brush->pattern.pixels) {
+            kfree(brush);
+            return NULL;
+        }
+        gdi_memcpy(brush->pattern.pixels, pattern->pixels, bytes);
+    }
+    uint64_t flags = brushes_lock();
+    do {
+        ULONG id = next_brush_id++ & 0x00FFFFFFu;
+        brush->handle = (HGDIOBJ)(ULONG_PTR)(BRUSH_TAG | id);
+    } while (brush_find_locked(brush->handle));
+    UINT bucket = (ULONG_PTR)brush->handle % BRUSH_BUCKETS;
+    brush->next = gdi_brushes[bucket];
+    gdi_brushes[bucket] = brush;
+    brushes_unlock(flags);
+    return (HBRUSH_GDI)brush->handle;
+}
+
 HBRUSH_GDI WINAPI CreateSolidBrush(DWORD color)
 {
-    (void)color;
-    return (HBRUSH_GDI)(ULONG_PTR)0xBE000001;
+    return gdi_create_brush(0, color, NULL);
 }
 
 HBRUSH_GDI WINAPI CreatePatternBrush(HBITMAP hBitmap)
 {
-    (void)hBitmap;
-    return (HBRUSH_GDI)(ULONG_PTR)0xBE000002;
+    GDI_BITMAP *bitmap = bmp_from_handle(hBitmap);
+    if (!bitmap || !bitmap->pixels || bitmap->pitch <= 0 ||
+        bitmap->height <= 0 || bitmap->width <= 0) return NULL;
+    return gdi_create_brush(3, 0, bitmap); /* BS_PATTERN */
 }
 
 HPEN WINAPI CreatePen(int iStyle, int cWidth, DWORD color)
@@ -2236,6 +2449,93 @@ HGDIOBJ WINAPI GetStockObject(int i)
 #define ROP_BLACKNESS  0x00000042
 #define ROP_WHITENESS  0x00FF0062
 #define ROP_PATCOPY    0x00F00021
+
+static uint32_t gdi_colorref_to_argb(DWORD color);
+
+static BOOL gdi_dc_point_visible(const GDI_DC *dc, int x, int y)
+{
+    if (!dc->clip_active) return TRUE;
+    for (UINT i = 0; i < dc->clip_count; i++) {
+        const GDI_RECT *rect = &dc->clip_rects[i];
+        if (x >= rect->left && x < rect->right &&
+            y >= rect->top && y < rect->bottom) return TRUE;
+    }
+    return FALSE;
+}
+
+static int gdi_pattern_coordinate(int coordinate, int origin, int size)
+{
+    int result = (int)(((int64_t)coordinate - origin) % size);
+    return result < 0 ? result + size : result;
+}
+
+BOOL gdi32_fill_rect(HDC hdc, const GDI_RECT *rect, HGDIOBJ handle)
+{
+    GDI_DC *dc = dc_from_handle(hdc);
+    GDI_BRUSH brush;
+    if (!dc || !dc->surface || !rect || !brush_acquire(handle, dc, &brush))
+        return FALSE;
+
+    int64_t left = (int64_t)rect->left + dc->viewport_x;
+    int64_t top = (int64_t)rect->top + dc->viewport_y;
+    int64_t right = (int64_t)rect->right + dc->viewport_x;
+    int64_t bottom = (int64_t)rect->bottom + dc->viewport_y;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > dc->width) right = dc->width;
+    if (bottom > dc->height) bottom = dc->height;
+    uint32_t solid = gdi_colorref_to_argb(brush.color);
+    BOOL wrote = FALSE;
+    if (brush.style != 1) {
+        for (int64_t y = top; y < bottom; y++) {
+            for (int64_t x = left; x < right; x++) {
+                if (!gdi_dc_point_visible(dc, (int)x, (int)y)) continue;
+                uint32_t color = solid;
+                if (brush.style == 3) {
+                    int px = gdi_pattern_coordinate((int)x, dc->brush_x,
+                                                    brush.pattern.width);
+                    int py = gdi_pattern_coordinate((int)y, dc->brush_y,
+                                                    brush.pattern.height);
+                    if (!gdi_read_bitmap_pixel(&brush.pattern, px, py, &color))
+                        continue;
+                    if (brush.pattern.bpp == 1)
+                        color = gdi_colorref_to_argb((color & 0xFFFFFFu)
+                            ? dc->bk_color : dc->text_color);
+                }
+                wrote |= gdi_write_dc_pixel(dc, (int)x, (int)y, color);
+            }
+        }
+    }
+    brush_release(handle);
+    if (wrote) mark_dc_dirty(dc);
+    return TRUE;
+}
+
+BOOL gdi32_draw_focus_rect(HDC hdc, const GDI_RECT *rect)
+{
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (!dc || !dc->surface || !rect || dc->map_mode != 1) return FALSE;
+    int64_t left = (int64_t)rect->left + dc->viewport_x;
+    int64_t top = (int64_t)rect->top + dc->viewport_y;
+    int64_t right = (int64_t)rect->right + dc->viewport_x;
+    int64_t bottom = (int64_t)rect->bottom + dc->viewport_y;
+    int64_t x0 = left < 0 ? 0 : left, x1 = right > dc->width ? dc->width : right;
+    int64_t y0 = top < 0 ? 0 : top, y1 = bottom > dc->height ? dc->height : bottom;
+    BOOL wrote = FALSE;
+    for (int64_t y = y0; y < y1; y++) {
+        for (int64_t x = x0; x < x1; x++) {
+            if ((x != left && x != right - 1 && y != top && y != bottom - 1) ||
+                ((x + y) & 1) || !gdi_dc_point_visible(dc, (int)x, (int)y))
+                continue;
+            uint32_t color;
+            if (gdi_read_dc_pixel(dc, (int)x, (int)y, &color))
+                wrote |= gdi_write_dc_pixel(dc, (int)x, (int)y,
+                                             color ^ 0x00FFFFFFu);
+        }
+    }
+    if (wrote) mark_dc_dirty(dc);
+    return TRUE;
+}
 
 BOOL WINAPI BitBlt(HDC hdcDest, int x, int y, int cx, int cy,
                    HDC hdcSrc, int x1, int y1, DWORD rop)
@@ -2259,32 +2559,15 @@ BOOL WINAPI BitBlt(HDC hdcDest, int x, int y, int cx, int cy,
     }
     if (!dst || !dst->surface) return FALSE;
 
-    /* Handle fill-only raster ops (no source needed) */
     if (rop == ROP_BLACKNESS || rop == ROP_WHITENESS || rop == ROP_PATCOPY) {
-        uint32_t fill;
-        if (rop == ROP_BLACKNESS)     fill = 0x00000000;
-        else if (rop == ROP_WHITENESS) fill = 0xFFFFFFFF;
-        else                           fill = 0x00000000; /* PATCOPY: black brush */
-
-        /* Clip destination rectangle */
-        int dx = x, dy = y;
-        int dw = cx, dh = cy;
-        if (dx < 0) { dw += dx; dx = 0; }
-        if (dy < 0) { dh += dy; dy = 0; }
-        if (dx + dw > dst->width)  dw = dst->width - dx;
-        if (dy + dh > dst->height) dh = dst->height - dy;
-        if (dw <= 0 || dh <= 0) return TRUE;
-
-        BYTE *dst_base = (BYTE *)dst->surface;
-        int dst_pitch = dst->pitch;
-
-        for (int row = 0; row < dh; row++) {
-            uint32_t *dp = (uint32_t *)(dst_base + (dy + row) * dst_pitch) + dx;
-            for (int col = 0; col < dw; col++)
-                dp[col] = fill;
-        }
-        mark_dc_dirty(dst);
-        return TRUE;
+        int64_t right = (int64_t)x + cx, bottom = (int64_t)y + cy;
+        if (right < (-2147483647LL - 1) || right > 2147483647LL ||
+            bottom < (-2147483647LL - 1) || bottom > 2147483647LL)
+            return FALSE;
+        GDI_RECT rect = { x, y, (LONG)right, (LONG)bottom };
+        HGDIOBJ brush = rop == ROP_PATCOPY ? dst->current_brush :
+            GetStockObject(rop == ROP_BLACKNESS ? 4 : 0);
+        return gdi32_fill_rect(hdcDest, &rect, brush);
     }
 
     /* SRCCOPY: requires valid source */
@@ -2338,7 +2621,8 @@ BOOL WINAPI BitBlt(HDC hdcDest, int x, int y, int cx, int cy,
 
         int src_bytes = src->bpp / 8;
         int dst_bytes = dst->bpp / 8;
-        BOOL identical_format = src->bpp == dst->bpp && src_bytes > 0 &&
+        BOOL identical_format = !dst->clip_active &&
+                                src->bpp == dst->bpp && src_bytes > 0 &&
                                 src_bytes <= 4;
 
         if (identical_format) {
@@ -2980,6 +3264,7 @@ static BOOL gdi_write_dc_pixel(GDI_DC *dc, int x, int y, uint32_t color)
     if (!dc || !dc->surface || x < 0 || y < 0 ||
         x >= dc->width || y >= dc->height)
         return FALSE;
+    if (!gdi_dc_point_visible(dc, x, y)) return TRUE;
     int stored_y = dc->bottomup ? dc->height - 1 - y : y;
     BYTE *pixel = (BYTE *)dc->surface + (SIZE_T)stored_y * dc->pitch;
     if (dc->bpp == 32) {

@@ -7,6 +7,7 @@
  */
 
 #include "user32_shim.h"
+#include "gdi32_shim.h"
 #include "kernel32_shim.h"
 #include "compat32.h"
 #include "win32_abi.h"
@@ -13214,14 +13215,15 @@ BOOL WINAPI GetUpdateRect(HWND hWnd, PVOID lpRect, BOOL bErase)
 
 int WINAPI FillRect(HDC hDC, PVOID lprc, HBRUSH hbr)
 {
-    (void)hDC; (void)lprc; (void)hbr;
-    return 1;
+    ULONG_PTR value = (ULONG_PTR)hbr;
+    if (value >= 1 && value <= 31)
+        hbr = (HBRUSH)(ULONG_PTR)(0xBC000000u | (value - 1));
+    return gdi32_fill_rect(hDC, (const GDI_RECT *)lprc, (HGDIOBJ)hbr);
 }
 
 BOOL WINAPI DrawFocusRect(HDC hDC, PVOID lprc)
 {
-    (void)hDC; (void)lprc;
-    return TRUE;
+    return gdi32_draw_focus_rect(hDC, (const GDI_RECT *)lprc);
 }
 
 int WINAPI DrawTextA(HDC hdc, PCSTR lpchText, int cchText, PVOID lprc, UINT format)
@@ -13248,8 +13250,25 @@ int WINAPI DrawTextExW(HDC hdc, PWSTR lpchText, int cchText, PVOID lprc,
 
 DWORD WINAPI GetSysColor(int nIndex)
 {
-    (void)nIndex;
-    return 0;
+    /* Default unthemed system palette, in COLORREF order (00BBGGRR). */
+    static const DWORD colors[] = {
+        0x00C8C8C8, 0x00000000, 0x00D1B499, 0x00DBCDBF,
+        0x00F0F0F0, 0x00FFFFFF, 0x00646464, 0x00000000,
+        0x00000000, 0x00000000, 0x00B4B4B4, 0x00FCF7F4,
+        0x00ABABAB, 0x00D77800, 0x00FFFFFF, 0x00F0F0F0,
+        0x00A0A0A0, 0x006D6D6D, 0x00000000, 0x00544E43,
+        0x00FFFFFF, 0x00696969, 0x00E3E3E3, 0x00000000,
+        0x00E1FFFF, 0x00000000, 0x00CC6600, 0x00EAD1B9,
+        0x00F2E4D7, 0x00D77800, 0x00F0F0F0,
+    };
+    return (UINT)nIndex < sizeof(colors) / sizeof(colors[0])
+        ? colors[nIndex] : 0;
+}
+
+static HBRUSH WINAPI GetSysColorBrush_u32(int index)
+{
+    return (UINT)index < 31
+        ? (HBRUSH)(ULONG_PTR)(0xBC000000u | (UINT)index) : NULL;
 }
 
 /* ── Dialog box stubs ──────────────────────────────────────── */
@@ -17307,6 +17326,7 @@ static const SHIM_EXPORT user32_exports[] = {
     { "DrawTextExA",        (PVOID)DrawTextExA, 6, CC_STDCALL },
     { "DrawTextExW",        (PVOID)DrawTextExW, 6, CC_STDCALL },
     { "GetSysColor",        (PVOID)GetSysColor, 1, CC_STDCALL },
+    { "GetSysColorBrush",   (PVOID)GetSysColorBrush_u32, 1, CC_STDCALL },
     /* Dialog box */
     { "DialogBoxParamA",    (PVOID)DialogBoxParamA, 5, CC_STDCALL },
     { "DialogBoxParamW",    (PVOID)DialogBoxParamW, 5, CC_STDCALL },

@@ -615,6 +615,47 @@ rejected with bad magic; the subsequent PE32 TEB probe still passes. Input
 intentional exceptions are handled; no unexpected CPU fault or scheduler
 owner/IST guard warning appears in this run. UT99 was not rerun for this change.
 
+## 4.11 GDI brush identity and rectangle painting (2026-09-04)
+
+Solid and pattern brushes now have independent handles, process ownership,
+selection references, and copied pattern pixels. Deleting a source bitmap does
+not invalidate its pattern brush. Stock and system brushes are recognized by
+`GetObjectType`, and `GetObject` reports the caller's PE32/PE64 LOGBRUSH layout.
+`GetSysColorBrush` provides cached system brush handles instead of allocating
+objects on each call.
+
+`FillRect` and fill-only BitBlt/PatBlt operations use the brush color or repeating
+pattern, viewport origin, destination pixel format, and selected clip region.
+`SelectClipRgn` copies region rectangles, including the distinction between an
+empty clip and no clip. `CreateBitmap` preserves monochrome input and WORD row
+alignment. `DrawFocusRect` draws an XOR border instead of returning success
+without painting.
+
+Validation commands:
+```sh
+make -C arch/x86 CLANG=1 -j4
+sh arch/x86/scripts/build-gdi-paint-test.sh
+```
+
+The generated `gdi_paint_pe32.exe` and `gdi_paint_pe64.exe` both pass unchanged
+on Windows and OsitoK. They check brush identity, LOGBRUSH ABI, selected-object
+preservation, PATCOPY, viewport translation, copied and empty clips, monochrome
+pattern ownership/colors/origin, system brushes, XOR restoration, and 24-bit
+bottom-up row bounds. The `.autoload` fixture starts the PE32 executable from
+`probes/`; the PE64 executable is run with `winexec probes/gdi_paint_pe64.exe`.
+
+QEMU artifacts are under `/root/osito-gdi-commit-20260904-r1/` (8 GiB, four CPUs,
+KVM, separate snapshot disk). GDI DIB 32/32, window-model 95/95, input 156/156,
+dialog 10/10, DirectDraw ABI, and DOS API contracts also pass without unexpected
+CPU faults in this run. The fixture disk lacks the optional `diag/` directory,
+so boot-log file creation reports parent-missing errors on that disk.
+
+This is not complete GDI or control painting support. DrawText, default control
+painting, broader mapping-mode behavior, and clipping in other presentation
+paths remain outside this change. UT99's initial wizard was not rerun during
+this validation. The probe explicitly releases its objects; it does not prove
+complete process-exit reclamation or concurrent GDI lifetime correctness.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of

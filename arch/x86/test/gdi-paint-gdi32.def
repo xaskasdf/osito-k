@@ -1,0 +1,22 @@
+LIBRARY GDI32.dll
+EXPORTS
+    CreateCompatibleDC@4
+    CreateDIBSection@24
+    CreateBitmap@20
+    SelectObject@8
+    GetCurrentObject@8
+    GetStockObject@4
+    CreateSolidBrush@4
+    CreatePatternBrush@4
+    DeleteObject@4
+    DeleteDC@4
+    GetObjectA@12
+    GetObjectType@4
+    PatBlt@24
+    CreateRectRgn@16
+    SelectClipRgn@8
+    SetViewportOrgEx@16
+    SetBrushOrgEx@16
+    SetTextColor@8
+    SetBkColor@8
+    GdiFlush@0

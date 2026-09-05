@@ -1,0 +1,1 @@
+winexec "probes/gdi_paint_pe32.exe"
