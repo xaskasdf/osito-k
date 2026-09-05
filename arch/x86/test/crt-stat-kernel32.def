@@ -1,0 +1,13 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+    LoadLibraryA@4
+    GetProcAddress@8
+    GetCommandLineA@0
+    GetStdHandle@4
+    WriteFile@20
+    CreateFileA@28
+    CloseHandle@4
+    DeleteFileA@4
+    GetLastError@0
+    SetFileTime@16
+    ExitProcess@4

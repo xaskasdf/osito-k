@@ -1167,6 +1167,141 @@ The QEMU session was stopped and the fixture retains SHA-256
 `cdec52eccec06dac6a24e83752f23fcbf59fba4eebd014f8f8fc79d2b307d350`.
 No DOS, audio, application binary, or persistent game configuration changed.
 
+## 4.21 Legacy wide formatting and UT99 FOV reload (2026-09-05)
+
+The stale UT99 world and accumulating HUD have a configuration cause. In
+`/root/osito-ut99-render-trace-20260905-j59T0S/`, `DrawWorld` was reached but
+SoftDrv received no world surfaces. The actor's FOV was zero; the original
+Core.dll `appTan` correctly returned zero, after which Engine.dll divided
+the viewport half-width by that value. The projection became infinite and
+the clipping planes contained NaNs. A diagnostic `fov 90` command restored
+world rendering and the weapon, but was not used as a persistent solution.
+
+A clean snapshot in `/root/osito-ut99-config-trace-20260905-E1oCnb/` locates
+the loss of the default. `config-gdb.log` shows PlayerPawn and derived class
+defaults entering `UObject::LoadConfig` with FOV 90. Missing DesiredFOV and
+DefaultFOV INI keys are skipped, and ordinary `1.0`/`0.8` imports work.
+Starting the practice match subsequently reloads the literal string `%f`
+into both FOV properties. A data watchpoint catches DefaultFOV changing
+from 90 to zero in `UFloatProperty::ImportText`; a later live call confirms
+that the native `crt_vsnwprintf` returns the literal `%f` for a double.
+The original binary and packaged class defaults were not patched.
+
+`_vsnwprintf` had its own incomplete parser, with no floating conversion
+and unconditional PE32 argument slots even for PE64 callers. It now uses
+the existing wide PE32/PE64 parsers, selecting the caller ABI as the other
+explicit-va_list entry point does. A context-local legacy count policy lets
+this API fill all `count` WCHARs and omit NUL when no room remains. Exact
+fit returns the character count; truncation returns -1. Existing terminated
+wide formatter consumers retain their previous policy. This matches the
+[documented legacy count contract](https://learn.microsoft.com/en-us/previous-versions/1kt27hek%28v%3Dvs.140%29)
+and is not an application-specific fallback.
+
+Build the standalone probe with
+`sh arch/x86/scripts/build-crt-wformat-test.sh`. Copy its PE32/PE64 outputs
+from `arch/x86/build/test-crt-wformat/pe32/` and `pe64/` into `probes/`, then
+run `winexec probes/crt_wformat_pe32.exe` and the PE64 equivalent. A trailing
+`ucrt` tests OsitoK's provider alias. Native Windows UCRT does not export
+these legacy entry points directly; the native reference here is MSVCRT,
+not a claimed UCRT pass. `crt_wformat.autoload` starts the PE32 case.
+
+The probe covers mixed doubles/integers/pointers, 64-bit integers, width and
+precision arguments, wide/narrow strings, exact fit, zero count, truncation,
+measurement without a destination, storage canaries, and the existing
+terminated/direct-varargs paths. Both native Windows builds pass 60/60.
+In `/root/osito-crt-wformat-before-20260905-VDrHpx/`, the old kernel fails
+46/60 PE32 checks and 42/54 PE64 checks through each alias. The PE64 `basic`
+baseline excludes the two pointer-string cases because the old parser
+truncates 64-bit pointers; the fixed kernel runs the full probe.
+
+`/root/osito-crt-wformat-fixed-20260905-q5l2KO/` passes 60/60 for both
+architectures and both OsitoK aliases. Additional regressions pass:
+rounding/strtod 1305/1305 PE32 MSVCRT and 873/873 PE64 UCRT; CRT-FP 48/48
+PE32 MSVCRT and 38/38 PE64 UCRT; DOS API with 15/15 host-memory checks;
+module-image/ABI 45/45; x87 68/68 after DOS. The PE32 MSVCRT and PE64 UCRT
+wide probes pass again after DOS. No unexpected CPU fault is logged.
+
+The fixed integration run is
+`/root/osito-ut99-wformat-fixed-20260905-6PdkE4/`, with 8 GiB, four CPUs,
+KVM, a relative USB mouse and an isolated snapshot of the same fixture.
+DM-Agony starts through the practice-session UI without a `fov` command or
+configuration override. A bounded, read-only hardware-breakpoint trace in
+`projection-gdb.log` observes actor and class-default FOV values of 90,
+finite projection `(-319.5, -239.5, 320)`, and 18 SoftDrv world-surface calls
+before the third projection sample. The debugger then detaches.
+
+`playing.png`, `moving.png` and `respawn.png` show the world, weapon, match
+progression and respawn, without the old accumulating HUD. This establishes
+the FOV fix, not complete rendering correctness: the scene remains very
+dark and some surfaces appear black, so lighting/texture correctness still
+needs investigation. Console `quit` exits with code zero and releases 24
+root-process modules. No unexpected CPU fault is logged. QEMU was stopped
+and reaped, and the base fixture retains SHA-256
+`cdec52eccec06dac6a24e83752f23fcbf59fba4eebd014f8f8fc79d2b307d350`.
+No persistent game settings or binaries were modified.
+
+`make -C arch/x86 CLANG=1 -j4` and `git diff --check` pass. The fixed kernel
+has SHA-256 `70492ef780b075b6999bc45c98b8894df6c3ab33b2812bd76be91b3ea9a4bbb7`.
+The shared formatter still needs complete scientific/general formatting,
+large and non-finite values, signed-zero/rounding parity, locale conversion,
+and invalid-parameter callback coverage. This formatter change does not
+establish those contracts. The separate console-probe filesystem failure
+from section 4.20 is addressed below. No DOS, audio, or application code
+is changed.
+
+## 4.22 CRT path-stat timestamp parity (2026-09-05)
+
+The console PE32 probe's exit code 134 (`_fail_crt_fstat_time`) was a real
+path-versus-descriptor metadata mismatch. `crt_stat_query` used the legacy
+32-bit `osfs2_file_ctime`/`osfs2_file_mtime` accessors and synthesized access
+time from modification time. On OSFS3, the former exposes inode metadata
+change time, not file creation; the latter truncates timestamps beyond
+2106. `_fstat64` already obtained distinct, 64-bit creation/access/write
+times through `NtQueryInformationFile(FileBasicInformation)`.
+
+Path queries now use the existing `osfs2_file_get_times` dispatcher, as
+the NT descriptor path does. CRT `st_ctime` receives creation time, not
+POSIX inode change time; `st_atime` and `st_mtime` remain independent.
+Values outside signed 64-bit storage return `EOVERFLOW`. This affects the
+ten `_stat*`/`_wstat*` export entries through their four shared layouts,
+without changing their ABI structures or either filesystem implementation.
+
+Build `sh arch/x86/scripts/build-crt-stat-test.sh` and copy the PE32/PE64
+executables from `arch/x86/build/test-crt-stat/pe32/` and `pe64/` into
+`probes/`. Run `winexec probes/crt_stat_pe32.exe ucrt far` and the PE64
+equivalent. Omit `ucrt` for OsitoK's MSVCRT provider alias; omit `far` for
+the two ordinary-date phases. `crt_stat.autoload` starts PE32 UCRT without
+the optional far-date phase.
+
+The probe compares all four narrow and wide path layouts with `_fstat64`,
+checks size and output canaries, assigns distinct creation/access/write
+times twice, and changes file mode without losing creation time. The
+optional third phase exercises time64 layouts after unsigned 32-bit
+seconds overflow. It uses `CREATE_NEW` and deletes only its owned file.
+Native Windows UCRT passes 104/104 for both architectures. This reference
+does not establish legacy Windows MSVCRT timezone-conversion parity.
+
+The baseline `/root/osito-crt-stat-before-20260905-o2LZHo/` records 16/82
+failures for PE32 UCRT and 20/104 for PE64 UCRT with `far`, followed by
+console exit 134. In `/root/osito-crt-stat-commit-20260905-0b5azQ/`, an
+isolated OSFS3 snapshot with KVM, 8 GiB and four CPUs passes 104/104 for
+both architectures through both provider aliases. The same console probe
+now exits with code zero.
+
+DOS API passes, including 15/15 host-memory checks; module-image/ABI passes
+45/45. After DOS, wide formatting passes 60/60 for all four architecture/
+provider combinations, x87 passes 68/68, and rounding passes 1305/1305
+PE32 MSVCRT and 873/873 PE64 UCRT. No CPU fault is logged. QEMU was stopped
+and reaped. The kernel SHA-256 is
+`65bc121573ce8043671820bbf528d13a490980ffde476b3dcdc82682f49ddc2b`;
+`make -C arch/x86 CLANG=1 -j4`, both new probe builders, and
+`git diff --check` pass.
+
+This validation covers OSFS3 regular files. Directory timestamps, time32
+overflow behavior, and OSFS2's reduced access-time granularity remain
+outside this probe's coverage. No application-specific timestamp or
+timezone correction is introduced.
+
 ## 5. Open questions / notes
 - `WINAPI` selects the Microsoft x64 ABI for native shims, not the kernel's
   SysV ABI. Export arg-count metadata also drives the **32-bit thunk's `RET n*4`**.

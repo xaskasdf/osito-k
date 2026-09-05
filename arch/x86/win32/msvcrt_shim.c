@@ -13,6 +13,7 @@
 #include "win32_abi.h"
 #include "wintime.h"
 #include "../fs/vfs.h"
+#include "../fs/ositofs_metadata.h"
 #include "../include/paging.h"
 
 #ifdef TEST_HARNESS
@@ -5764,13 +5765,25 @@ typedef struct {
     WCHAR *buf;
     SIZE_T size;
     SIZE_T pos;
+    BOOL legacy_count;
 } WFMT_CTX;
 
 static void wfmt_putc(WFMT_CTX *ctx, WCHAR c)
 {
-    if (ctx->buf && ctx->size > 0 && ctx->pos < ctx->size - 1)
+    SIZE_T limit = ctx->size;
+    if (limit && !ctx->legacy_count) limit--;
+    if (ctx->buf && ctx->pos < limit)
         ctx->buf[ctx->pos] = c;
     ctx->pos++;
+}
+
+static void wfmt_terminate(WFMT_CTX *ctx)
+{
+    if (!ctx->buf || !ctx->size) return;
+    if (ctx->pos < ctx->size)
+        ctx->buf[ctx->pos] = 0;
+    else if (!ctx->legacy_count)
+        ctx->buf[ctx->size - 1] = 0;
 }
 
 static void wfmt_put_ascii(WFMT_CTX *ctx, const char *s, SIZE_T len)
@@ -6074,10 +6087,7 @@ static int do_vformat_wide64(WFMT_CTX *ctx, const WCHAR *fmt, ms_va_list ap)
         }
     }
 
-    if (ctx->buf && ctx->size > 0) {
-        SIZE_T end = ctx->pos < ctx->size - 1 ? ctx->pos : ctx->size - 1;
-        ctx->buf[end] = 0;
-    }
+    wfmt_terminate(ctx);
     return (int)ctx->pos;
 }
 
@@ -6308,10 +6318,7 @@ static SIZE_T do_vformat_wide32(WFMT_CTX *ctx, const WCHAR *fmt,
         }
     }
 
-    if (ctx->buf && ctx->size > 0) {
-        SIZE_T end = ctx->pos < ctx->size - 1 ? ctx->pos : ctx->size - 1;
-        ctx->buf[end] = 0;
-    }
+    wfmt_terminate(ctx);
     return ctx->pos;
 }
 
@@ -6329,7 +6336,7 @@ int WINAPI crt_vswprintf_c_l(WCHAR *buffer, SIZE_T buffer_count,
     if (buffer && buffer_count == 0)
         return -1;
 
-    WFMT_CTX ctx = { buffer, buffer_count, 0 };
+    WFMT_CTX ctx = { buffer, buffer_count, 0, FALSE };
     SIZE_T required;
     if (g_compat32_mode) {
         required = do_vformat_wide32(
@@ -6372,7 +6379,7 @@ static int WINAPI crt_snwprintf_compat32(WCHAR *buffer, SIZE_T buffer_count,
         return -1;
     }
 
-    WFMT_CTX ctx = { buffer, buffer_count, 0 };
+    WFMT_CTX ctx = { buffer, buffer_count, 0, FALSE };
     SIZE_T required = do_vformat_wide32(&ctx, format, args);
     return crt_wformat_bounded_result(required, buffer_count);
 }
@@ -6389,7 +6396,7 @@ int WINAPI crt_snwprintf(WCHAR *buffer, SIZE_T buffer_count,
 
     ms_va_list ap;
     ms_va_start(ap, format);
-    WFMT_CTX ctx = { buffer, buffer_count, 0 };
+    WFMT_CTX ctx = { buffer, buffer_count, 0, FALSE };
     int required = do_vformat_wide64(&ctx, format, ap);
     ms_va_end(ap);
     if (required < 0)
@@ -6442,13 +6449,13 @@ static int WINAPI crt_fwprintf_compat32(PVOID stream, const WCHAR *format,
         return -1;
     }
 
-    WFMT_CTX measure = { NULL, 0, 0 };
+    WFMT_CTX measure = { NULL, 0, 0, FALSE };
     SIZE_T required = do_vformat_wide32(&measure, format, args);
     WCHAR *buffer = crt_fwprintf_allocate(required);
     if (!buffer)
         return -1;
 
-    WFMT_CTX output = { buffer, required + 1, 0 };
+    WFMT_CTX output = { buffer, required + 1, 0, FALSE };
     do_vformat_wide32(&output, format, args);
     int result = crt_fwprintf_write(stream, buffer, required);
     crt_free(buffer);
@@ -6466,7 +6473,7 @@ int WINAPI crt_fwprintf(PVOID stream, const WCHAR *format, ...)
     ms_va_start(ap, format);
     ms_va_list measure_args;
     ms_va_copy(measure_args, ap);
-    WFMT_CTX measure = { NULL, 0, 0 };
+    WFMT_CTX measure = { NULL, 0, 0, FALSE };
     int native_required = do_vformat_wide64(&measure, format, measure_args);
     ms_va_end(measure_args);
     if (native_required < 0) {
@@ -6483,7 +6490,7 @@ int WINAPI crt_fwprintf(PVOID stream, const WCHAR *format, ...)
 
     ms_va_list output_args;
     ms_va_copy(output_args, ap);
-    WFMT_CTX output = { buffer, required + 1, 0 };
+    WFMT_CTX output = { buffer, required + 1, 0, FALSE };
     do_vformat_wide64(&output, format, output_args);
     ms_va_end(output_args);
     ms_va_end(ap);
@@ -6505,7 +6512,7 @@ int WINAPI crt_stdio_common_vswprintf(uint64_t options, WCHAR *buffer,
         return -1;
     }
 
-    WFMT_CTX ctx = { buffer, buffer_count, 0 };
+    WFMT_CTX ctx = { buffer, buffer_count, 0, FALSE };
     int required = do_vformat_wide64(&ctx, format, (ms_va_list)arg_list);
     int truncated = buffer_count == 0 || (SIZE_T)required >= buffer_count;
 
@@ -7013,8 +7020,6 @@ typedef struct {
 extern void *osfs2_find_exact_ci(const char *name);
 extern void *osfs2_find(const char *name);
 extern uint64_t osfs2_file_size(void *file);
-extern uint32_t osfs2_file_ctime(void *file);
-extern uint32_t osfs2_file_mtime(void *file);
 
 int WINAPI crt_chmod(const char *path, int mode)
 {
@@ -7107,6 +7112,17 @@ static int crt_stat_query(const char *path, CRT_STAT_META *meta)
 
     void *file = osfs2_find_exact_ci(normalized);
     if (file) {
+        osfs_file_times_t times;
+        if (osfs2_file_get_times(file, &times) < 0) {
+            *crt_errno() = CRT_ENOENT;
+            return -1;
+        }
+        if (times.creation > 0x7FFFFFFFFFFFFFFFULL ||
+            times.access > 0x7FFFFFFFFFFFFFFFULL ||
+            times.modified > 0x7FFFFFFFFFFFFFFFULL) {
+            *crt_errno() = CRT_EOVERFLOW;
+            return -1;
+        }
         meta->mode = CRT_S_IFREG | CRT_S_IREAD | CRT_S_IWRITE;
         vfs_node_t node;
         uint16_t stored_mode;
@@ -7120,9 +7136,10 @@ static int crt_stat_query(const char *path, CRT_STAT_META *meta)
             meta->mode |= CRT_S_IEXEC;
         }
         meta->size = osfs2_file_size(file);
-        meta->ctime = (int64_t)osfs2_file_ctime(file);
-        meta->mtime = (int64_t)osfs2_file_mtime(file);
-        meta->atime = meta->mtime;
+        /* CRT ctime is creation, not the POSIX metadata-change timestamp. */
+        meta->ctime = (int64_t)times.creation;
+        meta->mtime = (int64_t)times.modified;
+        meta->atime = (int64_t)times.access;
         *crt_errno() = 0;
         return 0;
     }
@@ -7433,178 +7450,36 @@ WCHAR* WINAPI crt_wstrtime(WCHAR *buf)
     return buf;
 }
 
-/* _vsnwprintf — wide vsnprintf with format processing
- *
- * CRITICAL: This is called from 32-bit compat mode via INT 0x2E thunk.
- * The va_list (ap) points to the 32-bit caller's stack where each vararg
- * occupies 4 bytes. ms_va_arg() reads 8-byte slots (64-bit mode) which
- * is WRONG — it combines two 4-byte args into one garbage value.
- * We must manually walk 4-byte slots using a uint32_t pointer.
- */
+/* The legacy count may be filled entirely; NUL is written only if it fits. */
 int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list ap)
 {
-    if (!buf || count == 0) return 0;
-    if (!fmt) { buf[0] = 0; return 0; }
-
-    /* Walk the 32-bit va_list manually — 4 bytes per arg */
-    uint32_t *vp = (uint32_t *)(void *)ap;
-
-
-    SIZE_T pos = 0;
-    SIZE_T max = count - 1;
-
-    while (*fmt && pos < max) {
-        if (*fmt != '%') {
-            buf[pos++] = *fmt++;
-            continue;
-        }
-        fmt++; /* skip '%' */
-
-        /* Parse flags */
-        int left_align = 0, zero_pad = 0;
-        while (*fmt == '-' || *fmt == '0') {
-            if (*fmt == '-') left_align = 1;
-            if (*fmt == '0') zero_pad = 1;
-            fmt++;
-        }
-        (void)left_align;
-
-        /* Parse width */
-        int width = 0;
-        if (*fmt == '*') {
-            width = (int)(*vp++);
-            fmt++;
-        } else {
-            while (*fmt >= '0' && *fmt <= '9')
-                width = width * 10 + (*fmt++ - '0');
-        }
-
-        /* Parse precision */
-        int precision = -1;
-        if (*fmt == '.') {
-            fmt++;
-            precision = 0;
-            if (*fmt == '*') {
-                precision = (int)(*vp++);
-                fmt++;
-            } else {
-                while (*fmt >= '0' && *fmt <= '9')
-                    precision = precision * 10 + (*fmt++ - '0');
-            }
-        }
-
-        /* Parse length modifier */
-        int is_long = 0;
-        if (*fmt == 'l') { is_long = 1; fmt++; }
-        if (*fmt == 'l') { fmt++; } /* ll */
-
-        /* Conversion */
-        switch (*fmt) {
-        case 's': {
-            /* In MSVC _vsnwprintf: %s = WCHAR* (wide string).
-             * %ls is also wide string. We treat both the same. */
-            uint32_t raw_ptr = *vp++;
-            const WCHAR *ws = (const WCHAR *)(uintptr_t)raw_ptr;
-            if (!ws) ws = (const WCHAR[]){'(','n','u','l','l',')',0};
-            int n = 0;
-            while (ws[n]) n++;
-            if (precision >= 0 && n > precision) n = precision;
-            for (int i = 0; i < n && pos < max; i++)
-                buf[pos++] = ws[i];
-            fmt++;
-            break;
-        }
-        case 'S': {
-            /* %S = narrow string in wide printf (MSVC: %S or %hs = char*) */
-            const char *ns = (const char *)(uintptr_t)(*vp++);
-            if (!ns) ns = "(null)";
-            int n = 0;
-            while (ns[n]) n++;
-            if (precision >= 0 && n > precision) n = precision;
-            for (int i = 0; i < n && pos < max; i++)
-                buf[pos++] = (WCHAR)(unsigned char)ns[i];
-            fmt++;
-            break;
-        }
-        case 'c': {
-            WCHAR c = (WCHAR)(*vp++);
-            if (pos < max) buf[pos++] = c;
-            fmt++;
-            break;
-        }
-        case 'd': case 'i': {
-            int32_t val32 = (int32_t)(*vp++);
-            long long val = (long long)val32;
-            int neg = 0;
-            if (val < 0) { neg = 1; val = -val; }
-            WCHAR tmp[24];
-            int len = 0;
-            if (val == 0) tmp[len++] = '0';
-            else while (val > 0) { tmp[len++] = '0' + (int)(val % 10); val /= 10; }
-            if (neg) tmp[len++] = '-';
-            int pad = width - len;
-            if (pad > 0 && zero_pad) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = '0';
-            else if (pad > 0) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = ' ';
-            for (int i = len - 1; i >= 0 && pos < max; i--) buf[pos++] = tmp[i];
-            fmt++;
-            break;
-        }
-        case 'u': {
-            uint32_t val = *vp++;
-            WCHAR tmp[24];
-            int len = 0;
-            if (val == 0) tmp[len++] = '0';
-            else while (val > 0) { tmp[len++] = '0' + (int)(val % 10); val /= 10; }
-            int pad = width - len;
-            if (pad > 0 && zero_pad) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = '0';
-            else if (pad > 0) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = ' ';
-            for (int i = len - 1; i >= 0 && pos < max; i--) buf[pos++] = tmp[i];
-            fmt++;
-            break;
-        }
-        case 'x': case 'X': {
-            int upper = (*fmt == 'X');
-            uint32_t val = *vp++;
-            const char *hex = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-            WCHAR tmp[20];
-            int len = 0;
-            if (val == 0) tmp[len++] = '0';
-            else while (val > 0) { tmp[len++] = hex[val & 0xF]; val >>= 4; }
-            int pad = width - len;
-            if (pad > 0 && zero_pad) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = '0';
-            else if (pad > 0) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = ' ';
-            for (int i = len - 1; i >= 0 && pos < max; i--) buf[pos++] = tmp[i];
-            fmt++;
-            break;
-        }
-        case 'p': {
-            uint32_t val = *vp++;
-            const char *hex = "0123456789abcdef";
-            WCHAR tmp[20];
-            int len = 0;
-            if (val == 0) tmp[len++] = '0';
-            else while (val > 0) { tmp[len++] = hex[val & 0xF]; val >>= 4; }
-            for (int i = len - 1; i >= 0 && pos < max; i--) buf[pos++] = tmp[i];
-            fmt++;
-            break;
-        }
-        case '%':
-            if (pos < max) buf[pos++] = '%';
-            fmt++;
-            break;
-        case 0:
-            break;
-        default:
-            /* Unknown format — output literal */
-            if (pos < max) buf[pos++] = '%';
-            if (pos < max) buf[pos++] = *fmt;
-            fmt++;
-            break;
-        }
+    if (!fmt || (!buf && count != 0)) {
+        if (buf && count) buf[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    if (buf && count == 0) {
+        *crt_errno() = CRT_ERANGE;
+        return -1;
     }
 
-    buf[pos] = 0;
-    return (int)pos;
+    WFMT_CTX ctx = { buf, count, 0, TRUE };
+    SIZE_T required;
+    if (g_compat32_mode) {
+        required = do_vformat_wide32(&ctx, fmt, (uint32_t *)(void *)ap);
+    } else {
+        int native_required = do_vformat_wide64(&ctx, fmt, ap);
+        if (native_required < 0) {
+            *crt_errno() = CRT_EOVERFLOW;
+            return -1;
+        }
+        required = (SIZE_T)native_required;
+    }
+    if (required > 0x7fffffffU) {
+        *crt_errno() = CRT_EOVERFLOW;
+        return -1;
+    }
+    return buf && required > count ? -1 : (int)required;
 }
 
 /* _wcsicmp — case-insensitive wide string compare */
