@@ -145,15 +145,15 @@ _start:
     movw $0x3f00, %ax
     int $0x21
     jnc fail
-    cmpw $21, %ax
+    cmpw $5, %ax /* INT 24h Fail maps to the handle API's DOS 2 error set. */
     jne fail
     movw %bx, %si
     xorw %bx, %bx
     movw $0x5900, %ax
     int $0x21
-    cmpw $21, %ax
+    cmpw $83, %ax
     jne fail
-    cmpb $4, %ch
+    cmpb $1, %ch
     jne fail
     movw %si, %bx
     movw $0x3e00, %ax
@@ -165,7 +165,7 @@ _start:
     movw $0x4000, %ax
     int $0x21
     jnc fail
-    cmpw $21, %ax
+    cmpw $5, %ax
     jne fail
 
     /* Independent opens have independent mode, duplicates share it. */

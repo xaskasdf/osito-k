@@ -57,7 +57,8 @@ enum {
     DOS_ERR_NOT_READY = 21,
     DOS_ERR_SHARING_VIOLATION = 32,
     DOS_ERR_FILE_EXISTS = 80,
-    DOS_ERR_CANNOT_MAKE = 82
+    DOS_ERR_CANNOT_MAKE = 82,
+    DOS_ERR_FAIL_I24 = 83
 };
 
 /* ── MZ (DOS EXE) header ────────────────────────────────────────── */
@@ -213,6 +214,8 @@ typedef struct dos_vm {
     uint8_t          allocation_strategy; /* INT 21h/AH=58h policy */
     uint8_t          uppermem_link;     /* zero until a UMB arena exists */
     uint8_t          indos_count;       /* published through INT 21h/AH=34h */
+    bool             critical_error_active;
+    const struct cpu8086_state *int21_request;
     bool             ctrl_break_enabled;
     uint16_t         extended_error;    /* last INT 21h carry error */
     uint8_t          extended_error_action;
@@ -222,7 +225,7 @@ typedef struct dos_vm {
     uint16_t         extended_error_offset;
     uint32_t         temp_file_serial;
     uint8_t          last_return_code;  /* INT 21h/AH=4Dh low byte */
-    uint8_t          last_return_type;  /* 0 normal, 1 Ctrl+Break/fault */
+    uint8_t          last_return_type;  /* 0 normal, 1 Ctrl+Break, 2 critical error */
     uint8_t          termination_type;
     bool             process_terminated;
     uint16_t         exec_depth;        /* nested INT 21h/AH=4Bh calls */

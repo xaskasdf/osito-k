@@ -76,6 +76,29 @@ static void dos_init_ivt(dos_vm_t *vm)
     vm->mem[DOS_ROM_BASE + DOS_DEFAULT_BREAK_OFF] = 0xF9; /* STC */
     vm->mem[DOS_ROM_BASE + DOS_DEFAULT_BREAK_OFF + 1u] = 0xCB; /* RETF */
     dos_mem_write16(vm, 0x23u * 4u, DOS_DEFAULT_BREAK_OFF);
+
+    /* A noninteractive shell fails unavailable devices. Programs can chain
+     * to this handler or install their own abort/retry/ignore policy. */
+    vm->mem[DOS_ROM_BASE + DOS_DEFAULT_CRITICAL_OFF] = 0xB0; /* MOV AL,3 */
+    vm->mem[DOS_ROM_BASE + DOS_DEFAULT_CRITICAL_OFF + 1u] = 3;
+    vm->mem[DOS_ROM_BASE + DOS_DEFAULT_CRITICAL_OFF + 2u] = 0xCF; /* IRET */
+    dos_mem_write16(vm, 0x24u * 4u, DOS_DEFAULT_CRITICAL_OFF);
+
+    static const char device_names[][9] = {
+        "CON     ", "AUX     ", "PRN     ", "NUL     "
+    };
+    static const uint16_t device_attributes[] = {0x8003, 0x8000, 0x8000, 0x8004};
+    for (unsigned i = 0; i < sizeof(device_attributes) / sizeof(uint16_t); i++) {
+        uint32_t header = DOS_ROM_BASE + DOS_DEVICE_HEADERS_OFF +
+                          i * DOS_DEVICE_HEADER_SIZE;
+        dos_mem_write32(vm, header, 0xFFFFFFFFu);
+        dos_mem_write16(vm, header + 4u, device_attributes[i]);
+        /* As with the List-of-Lists NUL header, dispatch stays in the host;
+         * these headers expose device identity, not guest driver entrypoints. */
+        dos_mem_write32(vm, header + 6u, 0);
+        for (unsigned n = 0; n < 8u; n++)
+            dos_mem_write8(vm, header + 10u + n, device_names[i][n]);
+    }
 }
 
 /* ── Initialize BDA (BIOS Data Area) ───────────────────────────── */

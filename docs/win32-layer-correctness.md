@@ -1589,6 +1589,82 @@ returns, and deeply nested handlers need dedicated negative coverage.
 No UT99 gameplay, physical audio integration, or legacy Unix/Linux binary
 was exercised in this slice. This does not complete the Win32/DOS layer goal.
 
+## 4.27 DOS real-mode critical-device errors (2026-09-05)
+
+Unavailable AUX/PRN transfers now deliver the installed real-mode INT 24h
+handler instead of bypassing it with error 21. The handler sees character
+device/read-write/allowed-action flags in AH, device status 2 in DI, and a
+BP:SI device header with the logical name and attributes. These host-owned
+headers expose identity; their strategy/interrupt offsets are not guest
+driver entrypoints. The standard user-stack frame includes the original
+INT 21h registers and return frame. InDOS is zero during the callback,
+and the preceding byte publishes the critical-error flag. A nested device
+failure cannot recursively invoke INT 24h.
+
+IRET responses implement ignore, retry, fail and abort. Retry yields and
+reissues the current device transfer without replaying completed bytes.
+Only explicit ignore permits an unsuccessful transfer to be treated as
+completed; unread buffer bytes are left unchanged. Cooked non-console I/O
+uses character-sized requests; raw I/O uses the requested block. Abort,
+including an unknown response, produces termination type 2 and code 0.
+An explicit AH=4Ch in the handler keeps its normal exit status. Invalid
+RETF returns produce a diagnostic and fail the request instead of unwinding
+the wrong guest stack. The default shell policy is noninteractive failure,
+and its saved vector remains callable for chaining.
+
+Handle reads/writes report CF with AX=5 after Fail; AH=59h reports 83,
+class 13, action 4 and locus 1. Within the handler, the underlying not-ready
+error is 21, class 5, action 7 and locus 4. The action/locus values were
+corrected after checking the source tables, not inferred from the passing
+probe. Legacy character calls retain this layer's existing CF/AX=21
+extension on failure; those calls have no specified DOS carry-error ABI.
+Invalid handles, access-mode failures, zero-length transfers and readiness
+queries do not become critical errors.
+
+Primary references are the published MS-DOS 4.0
+[critical-error dispatcher](https://github.com/microsoft/MS-DOS/blob/2d04cacc5322951f187bb17e017c12920ac8ebe2/v4.0/src/DOS/CTRLC.ASM),
+[device I/O](https://github.com/microsoft/MS-DOS/blob/2d04cacc5322951f187bb17e017c12920ac8ebe2/v4.0/src/DOS/DISK.ASM),
+[error mapping](https://github.com/microsoft/MS-DOS/blob/2d04cacc5322951f187bb17e017c12920ac8ebe2/v4.0/src/DOS/MS_CODE.ASM)
+and [classification tables](https://github.com/microsoft/MS-DOS/blob/2d04cacc5322951f187bb17e017c12920ac8ebe2/v4.0/src/DOS/MS_TABLE.ASM).
+
+```sh
+make -C arch/x86 CLANG=1 -j4 all build/test/doscrit.com \
+    build/test/dcchild.com build/test/dosioctl.com
+```
+
+Copy both critical-error COM files to the guest root and run `dosrun
+doscrit.com`, or use `dos_critical.autoload`. This probe requires no input
+and creates no writable fixture. It checks the frame, registers, device
+identity, InDOS/error flag, extended errors, raw/cooked ignore, retries
+after partial completion, recursion suppression, chaining, invalid RETF,
+ordinary and load-only EXEC aborts, explicit exits and default failure.
+The initial probe fails at stage 2 on kernel `682dc27e` in
+`/root/osito-dos-critical-before-20260905-92TtW4/`: no callback is delivered.
+This is a before/after test of Osito-K, not a differential run of MS-DOS.
+
+The full regression run is
+`/root/osito-dos-critical-verified-20260905-hShmma/`: DOS API/HOSTMEM
+(15 checks), real-mode Ctrl-C, DPMI16/native DPMI32 Ctrl-C, stdio, IOCTL
+and EXEC pass; the native DPMI probe exits with expected code 42. Win32
+module/ABI passes 45/45 and CRT format passes 194/194 for PE32 MSVCRT and
+PE64 UCRT. The critical-error probe also passes again after Win32.
+The expanded partial-retry probe passes twice in
+`/root/osito-dos-critical-retry-20260905-tGGFmc/`. Both runs use the same
+kernel with KVM, 8 GiB/four CPUs, isolated VNC :12/UDP 7790 and copied
+snapshot disks. Neither log contains a CPU fault or contract-failure marker;
+the invalid-INT-24-return diagnostic is intentional negative coverage.
+Both VMs were stopped and reaped. Built and booted kernel SHA-256:
+`433d37f14e972f0bc9a16a8e481f510f8e796f96ff99fa32c6853102314b9889`.
+
+Protected-mode INT 24h hooks are still not delivered: their locked-stack
+frame translation, including real-mode segment values and INT 31h/0300h
+reflection, remains a gap. These requests fail rather than invoking a
+real-mode handler on a protected stack. Actual UART/printer transports,
+block-filesystem error provenance, installed guest device drivers and
+handlers that unwind directly to the application also remain unfinished.
+No UT99 gameplay, physical audio integration or legacy Unix/Linux binary
+was exercised here. This does not complete the Win32/DOS layer goal.
+
 ## 5. Open questions / notes
 - `WINAPI` selects the Microsoft x64 ABI for native shims, not the kernel's
   SysV ABI. Export arg-count metadata also drives the **32-bit thunk's `RET n*4`**.

@@ -433,6 +433,18 @@ $(BUILD)/test/dbchild.com: $(BUILD)/test/dos_break_child.o test/dpmi_native.ld
 $(BUILD)/test/dos_break_child.o: test/dos_break_child.S | $(BUILD)/test
 	as --32 -o $@ $<
 
+$(BUILD)/test/doscrit.com: $(BUILD)/test/dos_critical.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_critical.o: test/dos_critical.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dcchild.com: $(BUILD)/test/dos_critical_child.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_critical_child.o: test/dos_critical_child.S | $(BUILD)/test
+	as --32 -o $@ $<
+
 $(BUILD)/test/dpbreak16.com: $(BUILD)/test/dpmi_break16.o test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 

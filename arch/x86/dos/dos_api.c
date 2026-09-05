@@ -79,7 +79,8 @@ enum {
 enum {
     DOS_ERROR_ACTION_DELAY_RETRY = 2,
     DOS_ERROR_ACTION_USER = 3,
-    DOS_ERROR_ACTION_ABORT = 4
+    DOS_ERROR_ACTION_ABORT = 4,
+    DOS_ERROR_ACTION_INTERVENTION_RETRY = 7
 };
 
 enum {
@@ -200,8 +201,10 @@ static void dos_publish_indos(dos_vm_t *vm)
 {
     if (!vm || !vm->mem) return;
     uint32_t address = dos_linear(DOS_SYSVARS_SEG, DOS_INDOS_OFF);
-    if (address < vm->total_mem_size)
+    if (address < vm->total_mem_size) {
+        dos_mem_write8(vm, address - 1u, vm->critical_error_active ? 1u : 0u);
         dos_mem_write8(vm, address, vm->indos_count);
+    }
 }
 
 static int dos_bind_device_handle(dos_vm_t *vm, int handle,
@@ -265,7 +268,7 @@ static void dos_record_extended_error(dos_vm_t *vm, uint8_t function,
     switch (error) {
     case DOS_ERR_NOT_READY:
         error_class = DOS_ERROR_CLASS_HARDWARE;
-        action = DOS_ERROR_ACTION_USER;
+        action = DOS_ERROR_ACTION_INTERVENTION_RETRY;
         break;
     case DOS_ERR_INVALID_FUNCTION:
     case DOS_ERR_INVALID_HANDLE:
@@ -361,6 +364,8 @@ void dos_api_init(dos_vm_t *vm)
     if (!vm) return;
     vm->ctrl_break_enabled = false;
     vm->indos_count = 0;
+    vm->critical_error_active = false;
+    vm->int21_request = NULL;
     vm->extended_error = 0;
     vm->extended_error_action = 0;
     vm->extended_error_class = 0;
@@ -2501,6 +2506,151 @@ static int dos_file_write(dos_sft_entry_t *entry, const void *buffer,
     return count;
 }
 
+static void dos_console_wait(void);
+
+enum {
+    DOS_CRITICAL_IGNORE = 0,
+    DOS_CRITICAL_RETRY = 1,
+    DOS_CRITICAL_ABORT = 2,
+    DOS_CRITICAL_FAIL = 3
+};
+
+static uint8_t dos_character_critical_error(dos_vm_t *vm,
+                                           uint8_t device, bool writing)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+    dos_record_extended_error(vm, cpu->ah, DOS_ERR_NOT_READY);
+    if (vm->critical_error_active || !cpu->running)
+        return DOS_CRITICAL_FAIL;
+
+    /* Protected clients require their own locked-stack INT 24h translation.
+     * Until that exists, retain the DPMI default of failing the DOS call. */
+    if (vm->dpmi.active)
+        return DOS_CRITICAL_FAIL;
+
+    uint16_t segment = dos_mem_read16(vm, 0x24u * 4u + 2u);
+    uint16_t offset = dos_mem_read16(vm, 0x24u * 4u);
+    if ((!segment && !offset) ||
+        (segment == DPMI_ENTRY_SEG && offset == DOS_DEFAULT_CRITICAL_OFF))
+        return DOS_CRITICAL_FAIL;
+
+    cpu8086_state_t saved = *cpu;
+    const cpu8086_state_t *request = vm->int21_request
+                                  ? vm->int21_request : &saved;
+    uint16_t stack = cpu->sp;
+    bool original_frame = vm->software_int_frame_bytes == 6u;
+    uint16_t extra = original_frame ? 24u : 30u;
+    if (!dos_exec_guest_buffer(vm, cpu->ss, (uint16_t)(stack - extra),
+                               extra, NULL) ||
+        !dos_exec_guest_buffer(vm, segment, offset, 1u, NULL)) {
+        serial_puts("[DOS] Invalid INT 24h stack or vector\n");
+        return DOS_CRITICAL_FAIL;
+    }
+
+    uint16_t flags = vm->software_int_frame_bytes
+                   ? (uint16_t)vm->software_int_return_flags : request->flags;
+    /* DOS frame: host IRET, AX/BX/CX/DX/SI/DI/BP/DS/ES, caller IRET.
+     * Normal INT 21h dispatch already put the caller IRET on this stack. */
+    if (!original_frame) {
+        cpu_push16(cpu, flags);
+        cpu_push16(cpu, request->cs);
+        cpu_push16(cpu, request->ip);
+    }
+    cpu_push16(cpu, request->es);
+    cpu_push16(cpu, request->ds);
+    cpu_push16(cpu, request->bp);
+    cpu_push16(cpu, request->di);
+    cpu_push16(cpu, request->si);
+    cpu_push16(cpu, request->dx);
+    cpu_push16(cpu, request->cx);
+    cpu_push16(cpu, request->bx);
+    cpu_push16(cpu, request->ax);
+    cpu_push16(cpu, flags);
+    cpu_push16(cpu, DPMI_ENTRY_SEG);
+    cpu_push16(cpu, DPMI_CONTROL_RETURN_OFF);
+    cpu->ax = (uint16_t)((0xB8u | (writing ? 1u : 0u)) << 8);
+    cpu->di = 2u; /* Device status "not ready", not DOS extended error 21. */
+    cpu->bp = DPMI_ENTRY_SEG;
+    cpu->si = DOS_DEVICE_HEADERS_OFF +
+              (uint16_t)(device - DOS_DEVICE_CON) * DOS_DEVICE_HEADER_SIZE;
+    cpu->cs = segment;
+    cpu->eip = offset;
+    cpu->flags = (flags | FLAGS_FIXED) & ~(FLAG_IF | FLAG_TF);
+    cpu->halted = false;
+
+    uint8_t saved_indos = vm->indos_count;
+    vm->critical_error_active = true;
+    vm->indos_count = 0;
+    dos_publish_indos(vm);
+    bool returned = cpu8086_run_until_real(vm, DPMI_ENTRY_SEG,
+                                           DPMI_CONTROL_RETURN_OFF);
+    bool valid = returned && cpu->ss == saved.ss &&
+                 cpu->sp == (uint16_t)(stack - extra + 6u);
+    uint8_t action = cpu->al;
+    bool running = cpu->running;
+    int32_t exit_code = cpu->exit_code;
+    uint64_t instructions = cpu->insn_count;
+    *cpu = saved;
+    cpu->insn_count = instructions;
+    vm->indos_count = saved_indos;
+    vm->critical_error_active = false;
+    dos_publish_indos(vm);
+    if (!running) {
+        cpu->running = false;
+        cpu->exit_code = exit_code;
+        return DOS_CRITICAL_FAIL;
+    }
+    if (!valid) {
+        serial_puts("[DOS] Invalid INT 24h return; failing device request\n");
+        return DOS_CRITICAL_FAIL;
+    }
+    if (action == DOS_CRITICAL_ABORT || action > DOS_CRITICAL_FAIL) {
+        vm->termination_type = 2u;
+        vm->process_terminated = true;
+        cpu->running = false;
+        cpu->exit_code = 0;
+        return DOS_CRITICAL_FAIL;
+    }
+    return action;
+}
+
+static int dos_character_device_transfer(dos_vm_t *vm, dos_sft_entry_t *entry,
+                                          uint8_t *buffer, uint16_t count,
+                                          bool writing, bool *ignored)
+{
+    if (ignored) *ignored = false;
+    if (!count) return 0;
+    for (;;) {
+        switch (entry->device_kind) {
+        case DOS_DEVICE_CON:
+            if (writing) {
+                for (unsigned i = 0; i < count; i++)
+                    dos_putchar(vm, (char)buffer[i]);
+                return count;
+            }
+            for (uint16_t i = 0; i < count; i++) {
+                if (!dos_console_input_ready(vm)) return i;
+                buffer[i] = dos_console_getchar(vm);
+            }
+            return count;
+        case DOS_DEVICE_NUL:
+            return writing ? count : 0;
+        default:
+            /* AUX/PRN have no transport yet. Reissue this request after each
+             * retry, without replaying bytes completed by the DOS service. */
+            break;
+        }
+        uint8_t action = dos_character_critical_error(vm, entry->device_kind,
+                                                       writing);
+        if (action == DOS_CRITICAL_IGNORE) {
+            if (ignored) *ignored = true;
+            return count; /* Explicit ignore leaves unread bytes untouched. */
+        }
+        if (action != DOS_CRITICAL_RETRY) return -DOS_ERR_FAIL_I24;
+        dos_console_wait();
+    }
+}
+
 /* CP/M-style calls address an SFT but talk directly to character drivers;
  * they do not inherit AH=3Fh/40h cooked-line or Ctrl-Z processing. */
 static int dos_raw_character_output(dos_vm_t *vm, dos_sft_entry_t *entry,
@@ -2511,11 +2661,8 @@ static int dos_raw_character_output(dos_vm_t *vm, dos_sft_entry_t *entry,
         int result = dos_file_write(entry, &ch, 1);
         return result < 0 ? result : 0;
     }
-    if (entry->device_kind == DOS_DEVICE_CON) {
-        dos_putchar(vm, (char)ch);
-        return 0;
-    }
-    return entry->device_kind == DOS_DEVICE_NUL ? 0 : -DOS_ERR_NOT_READY;
+    int result = dos_character_device_transfer(vm, entry, &ch, 1u, true, NULL);
+    return result < 0 ? result : 0;
 }
 
 static int dos_cooked_character_output(dos_vm_t *vm, dos_sft_entry_t *entry,
@@ -2665,7 +2812,9 @@ static int dos_raw_character_input(dos_vm_t *vm, dos_sft_entry_t *entry,
                 *ch = 0;
                 return 1;
             }
-            if (entry->device_kind != DOS_DEVICE_CON) return -DOS_ERR_NOT_READY;
+            if (entry->device_kind != DOS_DEVICE_CON)
+                return dos_character_device_transfer(vm, entry, ch, 1u,
+                                                       false, NULL);
             if (dos_console_input_ready(vm)) {
                 bool scan = vm->console_scan_pending != 0;
                 *ch = dos_console_getchar(vm);
@@ -2827,6 +2976,8 @@ void dos_int21_dispatch(dos_vm_t *vm)
     cpu8086_state_t *cpu = vm->cpu;
 dispatch_again:;
     cpu8086_state_t request = *cpu;
+    const cpu8086_state_t *previous_request = vm->int21_request;
+    vm->int21_request = &request;
     dos_psp_t *current_psp = NULL;
     if (dos_psp_location(vm, vm->current_psp, &current_psp, NULL)) {
         current_psp->last_ss_sp = ((uint32_t)cpu->ss << 16) |
@@ -3283,8 +3434,7 @@ dispatch_again:;
                     break;
                 }
                 if (result < 0) {
-                    cpu->ax = (uint16_t)-result;
-                    cpu->flags |= FLAG_CF;
+                    console_error = result;
                 } else {
                     cpu->ax = (uint16_t)result;
                     cpu->flags &= ~FLAG_CF;
@@ -3293,8 +3443,29 @@ dispatch_again:;
                 cpu->ax = 0;
                 cpu->flags &= ~FLAG_CF;
             } else {
-                cpu->flags |= FLAG_CF;
-                cpu->ax = DOS_ERR_NOT_READY;
+                uint32_t buf = 0;
+                if (count && dos_guest_buffer(vm, cpu->ds, cpu->dx, count,
+                                              &buf) < 0) {
+                    console_error = -DOS_ERR_ACCESS_DENIED;
+                    break;
+                }
+                uint16_t read = 0;
+                while (read < count) {
+                    bool ignored;
+                    uint16_t request_count = (fh->io_flags & DOS_IO_RAW)
+                                           ? (uint16_t)(count - read) : 1u;
+                    int result = dos_character_device_transfer(vm, fh,
+                        vm->mem + buf + read, request_count, false, &ignored);
+                    if (result < 0) { console_error = result; break; }
+                    if (!result) break;
+                    read += (uint16_t)result;
+                    if (!(fh->io_flags & DOS_IO_RAW) && !ignored) {
+                        uint8_t ch = dos_mem_read8(vm, buf + read - 1u);
+                        if (ch == 0x1Au || ch == '\r') break;
+                    }
+                }
+                cpu->ax = read;
+                cpu->flags &= ~FLAG_CF;
             }
             break;
         }
@@ -3403,8 +3574,26 @@ dispatch_again:;
                 cpu->ax = count;
                 cpu->flags &= ~FLAG_CF;
             } else {
-                cpu->flags |= FLAG_CF;
-                cpu->ax = DOS_ERR_NOT_READY;
+                uint32_t buf = 0;
+                if (count && dos_guest_buffer(vm, cpu->ds, cpu->dx, count,
+                                              &buf) < 0) {
+                    console_error = -DOS_ERR_ACCESS_DENIED;
+                    break;
+                }
+                uint16_t written = 0;
+                while (written < count) {
+                    bool raw = (fh->io_flags & DOS_IO_RAW) != 0;
+                    if (!raw && dos_mem_read8(vm, buf + written) == 0x1Au)
+                        break;
+                    int result = dos_character_device_transfer(vm, fh,
+                        vm->mem + buf + written,
+                        raw ? (uint16_t)(count - written) : 1u, true, NULL);
+                    if (result < 0) { console_error = result; break; }
+                    if (!result) break;
+                    written += (uint16_t)result;
+                }
+                cpu->ax = written;
+                cpu->flags &= ~FLAG_CF;
             }
             break;
         }
@@ -4137,6 +4326,7 @@ console_result:
         bool resume = dos_console_break(vm);
         vm->indos_count = previous_indos;
         dos_publish_indos(vm);
+        vm->int21_request = previous_request;
         if (resume) goto dispatch_again;
         return;
     }
@@ -4148,8 +4338,20 @@ console_result:
     if ((cpu->flags & FLAG_CF) && dos_int21_reports_carry_error(ah))
         dos_record_extended_error(vm, ah, cpu->ax);
 
+    if (console_error == -DOS_ERR_FAIL_I24) {
+        /* Handle I/O maps the critical failure to its DOS 2 error set;
+         * AH=59h retains 83. Legacy calls have no specified carry-error ABI. */
+        if (dos_int21_reports_carry_error(ah)) {
+            cpu->ax = DOS_ERR_ACCESS_DENIED;
+        } else {
+            cpu->ax = DOS_ERR_NOT_READY;
+            dos_record_extended_error(vm, ah, DOS_ERR_NOT_READY);
+        }
+    }
+
     vm->indos_count = previous_indos;
     dos_publish_indos(vm);
+    vm->int21_request = previous_request;
 }
 
 static void dos_selftest_write_asciiz(dos_vm_t *vm, uint16_t segment,
