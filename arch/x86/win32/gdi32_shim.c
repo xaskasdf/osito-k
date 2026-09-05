@@ -487,6 +487,7 @@ typedef struct {
     uint32_t brush_color;
     int      bk_mode;       /* TRANSPARENT=1, OPAQUE=2 */
     UINT     text_align;
+    int      current_x, current_y;
     int      map_mode;
     int      stretch_mode;
     int      viewport_x, viewport_y;
@@ -2220,6 +2221,12 @@ UINT WINAPI SetTextAlign(HDC hdc, UINT align)
     return prev;
 }
 
+UINT WINAPI GetTextAlign(HDC hdc)
+{
+    GDI_DC *dc = dc_from_handle(hdc);
+    return dc ? dc->text_align : 0xFFFFFFFFu;
+}
+
 BOOL WINAPI DeleteObject(HGDIOBJ ho)
 {
     if (((ULONG_PTR)ho & TAG_MASK) == BRUSH_TAG) {
@@ -2730,7 +2737,23 @@ BOOL WINAPI PatBlt(HDC hdc, int x, int y, int w, int h, DWORD rop)
 
 BOOL WINAPI MoveToEx(HDC hdc, int x, int y, PVOID lppt)
 {
-    (void)hdc; (void)x; (void)y; (void)lppt;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (!dc) { SetLastError(6); return FALSE; }
+    if (lppt) {
+        ((LONG *)lppt)[0] = dc->current_x;
+        ((LONG *)lppt)[1] = dc->current_y;
+    }
+    dc->current_x = x;
+    dc->current_y = y;
+    return TRUE;
+}
+
+BOOL WINAPI GetCurrentPositionEx(HDC hdc, PVOID point)
+{
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (!dc || !point) { SetLastError(!dc ? 6 : 87); return FALSE; }
+    ((LONG *)point)[0] = dc->current_x;
+    ((LONG *)point)[1] = dc->current_y;
     return TRUE;
 }
 
@@ -2753,6 +2776,12 @@ DWORD WINAPI SetTextColor(HDC hdc, DWORD color)
     return 0;
 }
 
+DWORD WINAPI GetTextColor(HDC hdc)
+{
+    GDI_DC *dc = dc_from_handle(hdc);
+    return dc ? dc->text_color : 0xFFFFFFFFu;
+}
+
 DWORD WINAPI SetBkColor(HDC hdc, DWORD color)
 {
     GDI_DC *dc = dc_from_handle(hdc);
@@ -2762,6 +2791,12 @@ DWORD WINAPI SetBkColor(HDC hdc, DWORD color)
         return prev;
     }
     return 0;
+}
+
+DWORD WINAPI GetBkColor(HDC hdc)
+{
+    GDI_DC *dc = dc_from_handle(hdc);
+    return dc ? dc->bk_color : 0xFFFFFFFFu;
 }
 
 int WINAPI SetBkMode(HDC hdc, int mode)
@@ -2781,38 +2816,103 @@ static uint32_t gdi_colorref_to_argb(DWORD color)
            (color & 0x0000FF00u) | ((color & 0x00FF0000u) >> 16);
 }
 
-static BOOL gdi_text_out(HDC hdc, int x, int y, PCVOID text, int count,
-                         BOOL wide)
+static BOOL gdi_text_pixel(GDI_DC *dc, int64_t x, int64_t y,
+                            uint32_t color, const GDI_RECT *clip)
+{
+    if (x < 0 || y < 0 || x >= dc->width || y >= dc->height) return FALSE;
+    if (clip && (x - dc->viewport_x < clip->left ||
+                 x - dc->viewport_x >= clip->right ||
+                 y - dc->viewport_y < clip->top ||
+                 y - dc->viewport_y >= clip->bottom)) return FALSE;
+    return gdi_write_dc_pixel(dc, (int)x, (int)y, color);
+}
+
+static BOOL gdi_text_fill(GDI_DC *dc, int64_t left, int64_t top,
+                           int64_t right, int64_t bottom, uint32_t color,
+                           const GDI_RECT *clip)
+{
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > dc->width) right = dc->width;
+    if (bottom > dc->height) bottom = dc->height;
+    BOOL wrote = FALSE;
+    for (int64_t y = top; y < bottom; y++)
+        for (int64_t x = left; x < right; x++)
+            wrote |= gdi_text_pixel(dc, x, y, color, clip);
+    return wrote;
+}
+
+static BOOL gdi_ext_text_out(HDC hdc, int x, int y, UINT options,
+                              const GDI_RECT *rect, PCWSTR text, UINT count,
+                              const int *spacing)
 {
     GDI_DC *dc = dc_from_handle(hdc);
-    if (!dc || count < 0 || (count && !text)) {
-        SetLastError(!dc ? 6 : 87); /* ERROR_INVALID_HANDLE/PARAMETER */
+    if (!dc || (count && !text)) {
+        SetLastError(!dc ? 6 : 87);
         return FALSE;
     }
-    if (!count) return TRUE;
+    int64_t advance_x = 0, advance_y = 0;
+    for (UINT i = 0; i < count; i++) {
+        advance_x += spacing ? spacing[i * ((options & 0x2000) ? 2 : 1)] : 8;
+        if (spacing && (options & 0x2000)) advance_y -= spacing[2*i+1];
+    }
+    int64_t origin_x = (dc->text_align & 1) ? dc->current_x : x;
+    int64_t origin_y = (dc->text_align & 1) ? dc->current_y : y;
+    UINT horizontal = dc->text_align & 6;
+    if (horizontal == 6) origin_x -= advance_x / 2;
+    else if (horizontal == 2) origin_x -= advance_x;
+    int64_t next_x = horizontal == 6 ? dc->current_x :
+                     (horizontal == 2 ? origin_x : origin_x + advance_x);
+    int64_t next_y = (int64_t)dc->current_y + advance_y;
+    if ((dc->text_align & 1) &&
+        (next_x < -2147483648LL || next_x > 2147483647LL ||
+         next_y < -2147483648LL || next_y > 2147483647LL)) {
+        SetLastError(87);
+        return FALSE;
+    }
+    if ((dc->text_align & 24) == 24) origin_y -= 12;
+    else if (dc->text_align & 8) origin_y -= 16;
+    origin_x += dc->viewport_x;
+    origin_y += dc->viewport_y;
 
     uint32_t foreground = gdi_colorref_to_argb(dc->text_color);
     uint32_t background = gdi_colorref_to_argb(dc->bk_color);
+    const GDI_RECT *clip = (options & 4) ? rect : NULL; /* ETO_CLIPPED */
     BOOL wrote = FALSE;
-    x += dc->viewport_x;
-    y += dc->viewport_y;
+    if ((options & 2) && rect) /* ETO_OPAQUE also works with no string. */
+        wrote |= gdi_text_fill(dc,
+            (int64_t)rect->left + dc->viewport_x,
+            (int64_t)rect->top + dc->viewport_y,
+            (int64_t)rect->right + dc->viewport_x,
+            (int64_t)rect->bottom + dc->viewport_y, background, NULL);
+    if (count && dc->bk_mode == 2)
+        wrote |= gdi_text_fill(dc, origin_x, origin_y,
+            origin_x + advance_x, origin_y + 16, background, clip);
 
-    for (int index = 0; index < count; index++) {
-        UINT codepoint = wide ? ((const WCHAR *)text)[index]
-                              : ((const BYTE *)text)[index];
+    int64_t glyph_x = origin_x, glyph_y = origin_y;
+    for (UINT index = 0; index < count; index++) {
+        UINT codepoint = text[index];
         if (codepoint < 32 || codepoint > 126) codepoint = '?';
         const uint8_t *glyph = gui_font8x16[codepoint - 32];
-        int glyph_x = x + index * 8;
-        for (int row = 0; row < 16; row++) {
+        BOOL visible = glyph_x < dc->width && glyph_x + 8 > 0 &&
+                       glyph_y < dc->height && glyph_y + 16 > 0;
+        if (clip && (glyph_x - dc->viewport_x >= clip->right ||
+                     glyph_x + 8 - dc->viewport_x <= clip->left ||
+                     glyph_y - dc->viewport_y >= clip->bottom ||
+                     glyph_y + 16 - dc->viewport_y <= clip->top)) visible = FALSE;
+        for (int row = 0; visible && row < 16; row++) {
             for (int column = 0; column < 8; column++) {
-                BOOL set = (glyph[row] & (0x80u >> column)) != 0;
-                if (set || dc->bk_mode == 2) {
-                    wrote |= gdi_write_dc_pixel(
-                        dc, glyph_x + column, y + row,
-                        set ? foreground : background);
-                }
+                if (glyph[row] & (0x80u >> column))
+                    wrote |= gdi_text_pixel(dc, glyph_x + column,
+                        glyph_y + row, foreground, clip);
             }
         }
+        glyph_x += spacing ? spacing[index * ((options & 0x2000) ? 2 : 1)] : 8;
+        if (spacing && (options & 0x2000)) glyph_y -= spacing[2*index+1];
+    }
+    if ((dc->text_align & 1) && count) {
+        dc->current_x = (int)next_x;
+        dc->current_y = (int)next_y;
     }
     if (wrote) mark_dc_dirty(dc);
     SetLastError(0);
@@ -2821,28 +2921,43 @@ static BOOL gdi_text_out(HDC hdc, int x, int y, PCVOID text, int count,
 
 BOOL WINAPI TextOutW(HDC hdc, int x, int y, PCWSTR lpString, int c)
 {
-    return gdi_text_out(hdc, x, y, lpString, c, TRUE);
+    if (c < 0) { SetLastError(87); return FALSE; }
+    return gdi_ext_text_out(hdc, x, y, 0, NULL, lpString, (UINT)c, NULL);
 }
 
 static BOOL WINAPI TextOutA_k32(HDC hdc, int x, int y, PCSTR text, int count)
 {
-    return gdi_text_out(hdc, x, y, text, count, FALSE);
+    if (count < 0) { SetLastError(87); return FALSE; }
+    return ExtTextOutA(hdc, x, y, 0, NULL, text, (UINT)count, NULL);
 }
 
 BOOL WINAPI ExtTextOutA(HDC hdc, int x, int y, UINT options,
                         PVOID lprect, PCSTR lpString, UINT c, PVOID lpDx)
 {
-    (void)hdc; (void)x; (void)y; (void)options;
-    (void)lprect; (void)lpString; (void)c; (void)lpDx;
-    return TRUE;
+    if (!dc_from_handle(hdc) || c > 0x7FFFFFFFu || (c && !lpString)) {
+        SetLastError(!dc_from_handle(hdc) ? 6 : 87);
+        return FALSE;
+    }
+    /* The ANSI entry point explicitly does not draw glyph-index input. */
+    if (options & 0x10) return TRUE;
+    if (!c) return gdi_ext_text_out(hdc, x, y, options, lprect, NULL, 0, NULL);
+    int length = MultiByteToWideChar(0, 0, lpString, (int)c, NULL, 0);
+    if (length <= 0) return FALSE;
+    WCHAR *wide = kmalloc((SIZE_T)length * sizeof(WCHAR));
+    if (!wide) { SetLastError(8); return FALSE; }
+    MultiByteToWideChar(0, 0, lpString, (int)c, wide, length);
+    BOOL result = gdi_ext_text_out(hdc, x, y, options, lprect, wide,
+                                    (UINT)length, lpDx);
+    kfree(wide);
+    return result;
 }
 
-static BOOL WINAPI ExtTextOutW_stub(HDC hdc, int x, int y, UINT options,
-                                     PVOID lprect, PCWSTR text, UINT count,
-                                     PVOID spacing)
+BOOL WINAPI ExtTextOutW(HDC hdc, int x, int y, UINT options,
+                         const GDI_RECT *rect, PCWSTR text, UINT count,
+                         const int *spacing)
 {
-    (void)options; (void)lprect; (void)spacing;
-    return TextOutW(hdc, x, y, text, (int)count);
+    if (count > 0x7FFFFFFFu) { SetLastError(87); return FALSE; }
+    return gdi_ext_text_out(hdc, x, y, options, rect, text, count, spacing);
 }
 
 static int WINAPI SetMapMode_stub(HDC hdc, int mode)
@@ -3999,13 +4114,12 @@ static BOOL WINAPI GetTextMetricsA_stub(HDC hdc, PVOID metrics)
     return TRUE;
 }
 
-static BOOL WINAPI GetTextMetricsW_stub(HDC hdc, PVOID metrics)
+BOOL WINAPI GetTextMetricsW(HDC hdc, PVOID metrics)
 {
     LONG *m;
     WCHAR *chars;
 
-    (void)hdc;
-    if (!metrics) return FALSE;
+    if (!dc_from_handle(hdc) || !metrics) return FALSE;
 
     gdi_memset(metrics, 0, 60); /* sizeof(TEXTMETRICW) */
     m = (LONG *)metrics;
@@ -4241,23 +4355,22 @@ static DWORD WINAPI GetFontData_k32(HDC hdc, DWORD table, DWORD offset,
 
 BOOL WINAPI GetTextExtentPoint32A(HDC hdc, PCSTR lpString, int c, PVOID lpSize)
 {
-    (void)hdc; (void)lpString;
-    if (lpSize) {
-        LONG *sz = (LONG *)lpSize;
-        sz[0] = c * 8;   /* cx */
-        sz[1] = 16;      /* cy */
-    }
+    if (!dc_from_handle(hdc) || !lpSize || c < 0 || (c && !lpString))
+        return FALSE;
+    int length = c ? MultiByteToWideChar(0, 0, lpString, c, NULL, 0) : 0;
+    if (c && length <= 0) return FALSE;
+    if (length > 0x7FFFFFFF / 8) return FALSE;
+    ((LONG *)lpSize)[0] = length * 8;
+    ((LONG *)lpSize)[1] = length ? 16 : 0;
     return TRUE;
 }
 
 BOOL WINAPI GetTextExtentPoint32W(HDC hdc, PCWSTR lpString, int c, PVOID lpSize)
 {
-    (void)hdc; (void)lpString;
-    if (lpSize) {
-        LONG *sz = (LONG *)lpSize;
-        sz[0] = c * 8;   /* cx */
-        sz[1] = 16;      /* cy */
-    }
+    if (!dc_from_handle(hdc) || !lpSize || c < 0 || c > 0x7FFFFFFF / 8 ||
+        (c && !lpString)) return FALSE;
+    ((LONG *)lpSize)[0] = c * 8;
+    ((LONG *)lpSize)[1] = c ? 16 : 0;
     return TRUE;
 }
 
@@ -7963,6 +8076,7 @@ static const SHIM_EXPORT gdi32_exports[] = {
     { "SetBrushOrgEx",       (PVOID)SetBrushOrgEx_k32, 4, CC_STDCALL },
     { "SetDCBrushColor",     (PVOID)SetDCBrushColor_k32, 2, CC_STDCALL },
     { "SetTextAlign",        (PVOID)SetTextAlign, 2, CC_STDCALL },
+    { "GetTextAlign",        (PVOID)GetTextAlign, 1, CC_STDCALL },
     { "DeleteObject",        (PVOID)DeleteObject, 1, CC_STDCALL },
     { "GetObjectA",          (PVOID)GetObjectA, 3, CC_STDCALL },
     { "GetObjectType",       (PVOID)GetObjectType_k32, 1, CC_STDCALL },
@@ -7986,16 +8100,19 @@ static const SHIM_EXPORT gdi32_exports[] = {
     { "AlphaBlend",               (PVOID)AlphaBlend_k32, 11, CC_STDCALL },
     { "PatBlt",                   (PVOID)PatBlt, 6, CC_STDCALL },
     { "MoveToEx",                 (PVOID)MoveToEx, 4, CC_STDCALL },
+    { "GetCurrentPositionEx",     (PVOID)GetCurrentPositionEx, 2, CC_STDCALL },
     { "LineTo",                   (PVOID)LineTo, 3, CC_STDCALL },
     { "Polyline",                 (PVOID)Polyline_k32, 3, CC_STDCALL },
     /* Text */
     { "SetTextColor",             (PVOID)SetTextColor, 2, CC_STDCALL },
+    { "GetTextColor",             (PVOID)GetTextColor, 1, CC_STDCALL },
     { "SetBkColor",               (PVOID)SetBkColor, 2, CC_STDCALL },
+    { "GetBkColor",               (PVOID)GetBkColor, 1, CC_STDCALL },
     { "SetBkMode",                (PVOID)SetBkMode, 2, CC_STDCALL },
     { "TextOutW",                 (PVOID)TextOutW, 5, CC_STDCALL },
     { "TextOutA",                 (PVOID)TextOutA_k32, 5, CC_STDCALL },
     { "ExtTextOutA",              (PVOID)ExtTextOutA, 8, CC_STDCALL },
-    { "ExtTextOutW",              (PVOID)ExtTextOutW_stub, 8, CC_STDCALL },
+    { "ExtTextOutW",              (PVOID)ExtTextOutW, 8, CC_STDCALL },
     { "GetTextExtentPoint32A",    (PVOID)GetTextExtentPoint32A, 4, CC_STDCALL },
     { "GetTextExtentPoint32W",    (PVOID)GetTextExtentPoint32W, 4, CC_STDCALL },
     { "GetTextFaceW",             (PVOID)GetTextFaceW_k32, 3, CC_STDCALL },
@@ -8007,7 +8124,7 @@ static const SHIM_EXPORT gdi32_exports[] = {
     { "GetWorldTransform",        (PVOID)GetWorldTransform_k32, 2, CC_STDCALL },
     { "ModifyWorldTransform",     (PVOID)ModifyWorldTransform_k32, 3, CC_STDCALL },
     { "GetTextMetricsA",          (PVOID)GetTextMetricsA_stub, 2, CC_STDCALL },
-    { "GetTextMetricsW",          (PVOID)GetTextMetricsW_stub, 2, CC_STDCALL },
+    { "GetTextMetricsW",          (PVOID)GetTextMetricsW, 2, CC_STDCALL },
     { "EnumFontFamiliesExA",      (PVOID)EnumFontFamiliesExA_stub, 5, CC_STDCALL },
     { "EnumFontFamiliesExW",      (PVOID)EnumFontFamiliesExW_k32, 5, CC_STDCALL },
     { "GetCharABCWidthsW",        (PVOID)GetCharABCWidthsW_stub, 4, CC_STDCALL },

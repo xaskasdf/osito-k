@@ -919,6 +919,7 @@ BOOL    WINAPI GetUpdateRect(HWND hWnd, PVOID lpRect, BOOL bErase);
 int     WINAPI FillRect(HDC hDC, PVOID lprc, HBRUSH hbr);
 BOOL    WINAPI DrawFocusRect(HDC hDC, PVOID lprc);
 int     WINAPI DrawTextA(HDC hdc, PCSTR lpchText, int cchText, PVOID lprc, UINT format);
+int     WINAPI DrawTextW(HDC hdc, PCWSTR text, int count, PVOID rect, UINT format);
 int     WINAPI DrawTextExA(HDC hdc, PSTR lpchText, int cchText, PVOID lprc,
                             UINT format, PVOID lpdtp);
 int     WINAPI DrawTextExW(HDC hdc, PWSTR lpchText, int cchText, PVOID lprc,

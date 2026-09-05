@@ -1,0 +1,5 @@
+LIBRARY USER32.dll
+EXPORTS
+    DrawTextA@20
+    DrawTextExA@24
+    DrawTextExW@24

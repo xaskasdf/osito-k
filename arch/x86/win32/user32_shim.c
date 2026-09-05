@@ -13290,28 +13290,6 @@ BOOL WINAPI DrawFocusRect(HDC hDC, PVOID lprc)
     return gdi32_draw_focus_rect(hDC, (const GDI_RECT *)lprc);
 }
 
-int WINAPI DrawTextA(HDC hdc, PCSTR lpchText, int cchText, PVOID lprc, UINT format)
-{
-    (void)hdc; (void)lpchText; (void)cchText; (void)lprc; (void)format;
-    return 0;
-}
-
-int WINAPI DrawTextExA(HDC hdc, PSTR lpchText, int cchText, PVOID lprc,
-                        UINT format, PVOID lpdtp)
-{
-    (void)hdc; (void)lpchText; (void)cchText; (void)lprc;
-    (void)format; (void)lpdtp;
-    return 0;
-}
-
-int WINAPI DrawTextExW(HDC hdc, PWSTR lpchText, int cchText, PVOID lprc,
-                        UINT format, PVOID lpdtp)
-{
-    (void)hdc; (void)lpchText; (void)cchText; (void)lprc;
-    (void)format; (void)lpdtp;
-    return 0;
-}
-
 DWORD WINAPI GetSysColor(int nIndex)
 {
     /* Default unthemed system palette, in COLORREF order (00BBGGRR). */
@@ -17387,6 +17365,7 @@ static const SHIM_EXPORT user32_exports[] = {
     { "FillRect",           (PVOID)FillRect, 3, CC_STDCALL },
     { "DrawFocusRect",      (PVOID)DrawFocusRect, 2, CC_STDCALL },
     { "DrawTextA",          (PVOID)DrawTextA, 5, CC_STDCALL },
+    { "DrawTextW",          (PVOID)DrawTextW, 5, CC_STDCALL },
     { "DrawTextExA",        (PVOID)DrawTextExA, 6, CC_STDCALL },
     { "DrawTextExW",        (PVOID)DrawTextExW, 6, CC_STDCALL },
     { "GetSysColor",        (PVOID)GetSysColor, 1, CC_STDCALL },

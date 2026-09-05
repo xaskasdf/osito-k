@@ -703,6 +703,61 @@ process-exit reclamation or concurrent GDI lifetime correctness. UT99's setup
 wizard was not visually validated on this final kernel, so this change does
 not establish that its controls or text render correctly.
 
+## 4.13 GDI text output and USER32 text layout (2026-09-04)
+
+`TextOut` and `ExtTextOut` now share ANSI/Unicode rendering, explicit character
+advances, ETO_PDY, per-call clipping, opaque rectangle fills, alignment, and
+TA_UPDATECP state. `MoveToEx`, `GetCurrentPositionEx`, and the text alignment
+and color getters expose the DC state used by those operations. Viewport,
+selected-region, and paint clipping remain in effect. Text measurement rejects
+invalid arguments and reports an empty string as a zero-sized extent.
+
+`DrawTextA/W` and `DrawTextExA/W` use a shared formatter, replacing the no-op
+stubs and adding the missing DrawTextW export. It handles measured lines,
+word wrapping, tabs, alignment, CALCRECT, clipping, mnemonic prefixes, Ex
+margins/length reporting, and end/path/word ellipsis. MODIFYSTRING edits source
+spans so untouched line endings and mnemonic markers are preserved. Coordinate
+arithmetic uses checked wide intermediates, and temporary allocations are
+released on failure as well as success.
+
+Validation commands:
+```sh
+make -C arch/x86 CLANG=1 -j4
+sh arch/x86/scripts/build-gdi-text-test.sh
+bash arch/x86/scripts/test-user32-text-layout.sh
+CC=clang bash arch/x86/scripts/test-user32-text-layout.sh
+```
+
+The generated `gdi_text_pe32.exe` and `gdi_text_pe64.exe` each pass 77 checks
+unchanged on native Windows and OsitoK. Raster comparisons use TextOut as the
+reference on the same platform; they do not assert identical fonts across OSes.
+Coverage includes explicit advances, clipping, opaque backgrounds, current
+position, layout geometry, ellipsis, source preservation, and long text runs.
+The host harness builds the production formatter with mocked GDI and runs
+20,000 cases under ASan/UBSan with both GCC and Clang, including allocation
+failure injection. Its allocation and bounds checks are not a rendering oracle.
+
+Final QEMU artifacts are under `/root/osito-gdi-text-20260904-r3/` (8 GiB,
+four CPUs, KVM, disposable snapshot disk). The booted kernel matches the build's
+SHA-256: `a20eb4c7dc76f2e584678795d18ac593350bb05a5a0d2596a47f616655e84c57`.
+Both text probes, USER32 paint 85/85 on PE32/PE64, both GDI paint probes, GDI
+DIB 32/32, GDI region 40/40, window-model 95/95, input 156/156, dialog 10/10,
+DirectDraw ABI, DirectSound, and DOS API with 15/15 host-memory checks pass.
+The PE32 text probe passes again after DOS API. No unexpected CPU fault appears
+in this run. The fixture still lacks the optional `diag/` directory.
+
+The UT99 integration run at `/root/osito-ut99-text-20260904-r1/` uses the same
+kernel. Its screenshot after pointer movement shows the wizard's light
+background, but child controls remain black without their labels. Default
+control painting and behavior still need implementation; these text contracts
+alone do not establish a usable UT99 wizard.
+
+Font rendering and metrics still use the existing fixed 8x16 bitmap font.
+Selected-font realization, Unicode shaping, general mapping modes, and full
+flag-combination coverage are not completed here. The tests explicitly release
+their objects and do not prove process-exit reclamation or concurrent GDI
+lifetime correctness. This change does not modify DOS or audio implementations.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of

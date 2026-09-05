@@ -25,6 +25,13 @@ typedef struct {
     LONG bottom;
 } GDI_RECT;
 
+typedef struct {
+    LONG height, ascent, descent, internal_leading, external_leading;
+    LONG average_width, maximum_width, weight, overhang, aspect_x, aspect_y;
+    WCHAR first_char, last_char, default_char, break_char;
+    BYTE italic, underlined, struck_out, pitch_and_family, charset;
+} GDI_TEXTMETRICW;
+
 /* Pixel format descriptor */
 typedef struct tagPIXELFORMATDESCRIPTOR {
     WORD  nSize;
@@ -92,6 +99,7 @@ int   WINAPI GetRgnBox(HGDIOBJ rgn, GDI_RECT *rect);
 int   WINAPI OffsetRgn(HGDIOBJ rgn, int x, int y);
 int   WINAPI SelectClipRgn(HDC hdc, HGDIOBJ rgn);
 UINT  WINAPI SetTextAlign(HDC hdc, UINT align);
+UINT  WINAPI GetTextAlign(HDC hdc);
 BOOL  WINAPI DeleteObject(HGDIOBJ ho);
 int   WINAPI GetObjectA(HGDIOBJ h, int c, PVOID pv);
 
@@ -118,15 +126,22 @@ BOOL  WINAPI BitBlt(HDC hdcDest, int x, int y, int cx, int cy,
                     HDC hdcSrc, int x1, int y1, DWORD rop);
 BOOL  WINAPI PatBlt(HDC hdc, int x, int y, int w, int h, DWORD rop);
 BOOL  WINAPI MoveToEx(HDC hdc, int x, int y, PVOID lppt);
+BOOL  WINAPI GetCurrentPositionEx(HDC hdc, PVOID point);
 BOOL  WINAPI LineTo(HDC hdc, int x, int y);
 
 /* Text */
 DWORD WINAPI SetTextColor(HDC hdc, DWORD color);
+DWORD WINAPI GetTextColor(HDC hdc);
 DWORD WINAPI SetBkColor(HDC hdc, DWORD color);
+DWORD WINAPI GetBkColor(HDC hdc);
 int   WINAPI SetBkMode(HDC hdc, int mode);
 BOOL  WINAPI TextOutW(HDC hdc, int x, int y, PCWSTR lpString, int c);
 BOOL  WINAPI ExtTextOutA(HDC hdc, int x, int y, UINT options,
                          PVOID lprect, PCSTR lpString, UINT c, PVOID lpDx);
+BOOL  WINAPI ExtTextOutW(HDC hdc, int x, int y, UINT options,
+                         const GDI_RECT *rect, PCWSTR text, UINT count,
+                         const int *spacing);
+BOOL  WINAPI GetTextMetricsW(HDC hdc, PVOID metrics);
 BOOL  WINAPI GetTextExtentPoint32A(HDC hdc, PCSTR lpString, int c, PVOID lpSize);
 BOOL  WINAPI GetTextExtentPoint32W(HDC hdc, PCWSTR lpString, int c, PVOID lpSize);
 
