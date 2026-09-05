@@ -1084,6 +1084,89 @@ The QEMU and GDB sessions were stopped. The base fixture remains unchanged at
 SHA-256 `cdec52eccec06dac6a24e83752f23fcbf59fba4eebd014f8f8fc79d2b307d350`;
 no application binary or persistent game configuration was patched.
 
+## 4.20 CRT classification and rounding ABIs (2026-09-05)
+
+The UT99 boundary trace exposed two additional CRT contract gaps. PE32
+`_isnan` supplied its double as two stack DWORDs, but the native shim read
+XMM0, which was unrelated caller state. `ceil` and `floor` had neither a
+double-argument adapter nor the required PE32 ST(0) result. Their native
+implementations also converted through `long`, losing signed zero and
+producing incorrect results outside the integer range, including infinities
+and NaNs. These arithmetic defects affected PE64 as well.
+
+`_isnan` now uses the existing integer-bits bridge pattern from `_finite`.
+The shared rounding implementation uses FRNDINT with directed rounding and
+restores the caller's x87 control word. PE32 `ceil` and `floor` reuse the
+existing `strtod` result-wrapper emitter: an integer-bits helper returns
+EDX:EAX, then the wrapper loads ST(0). A bounded registration table retains
+the original `strtod` offset and statically checks that all wrappers fit the
+runtime math page. Provider aliases share these contracts; there is no
+game-specific dispatch, binary patch, or change to the INT2E dispatcher.
+
+Build the independent probes with:
+
+```sh
+sh arch/x86/scripts/build-crt-classify-test.sh
+sh arch/x86/scripts/build-crt-round-test.sh
+```
+
+Copy the PE32/PE64 executables from `arch/x86/build/test-crt-classify/` and
+`arch/x86/build/test-crt-round/` into an image's `probes/` directory. Run
+`winexec probes/crt_classify_pe32.exe` and `winexec probes/crt_round_pe32.exe`,
+then the PE64 equivalents, with and without a trailing `ucrt` argument.
+`crt_classify.autoload` starts the PE32 MSVCRT classifier case. The same
+binaries run directly on Windows.
+
+The classifier covers 22 IEEE double patterns, including NaNs with payloads
+in either DWORD, unrelated zero/NaN XMM0 state, and a live x87 value below
+the call. Rounding covers signed zero, subnormals, fractions, large finite
+values, infinities and NaNs across all four x87 rounding modes and three
+precision settings. PE32 also checks a live underlying x87 value. Four
+`strtod` cases verify the reused return path and end-pointer behavior.
+
+| Probe | Native Windows PE32 | Native Windows PE64 | OsitoK PE32 | OsitoK PE64 |
+| --- | --- | --- | --- | --- |
+| Classify, each CRT alias | 133/133 | 67/67 | 133/133 | 67/67 |
+| Round/strtod, each CRT alias | 1305/1305 | 873/873 | 1305/1305 | 873/873 |
+
+The old-kernel classifier run in
+`/root/osito-crt-classify-before-20260905-tSLMqE/` failed 16 of 133 PE32
+checks through each alias; PE64 already passed. Before adding the eight
+`strtod` checks, the old-kernel rounding probe in
+`/root/osito-crt-round-before-20260905-oHShZQ/` failed 864 of 1297 PE32 and
+240 of 865 PE64 checks through each alias. The final extended probe was not
+rerun against that old kernel.
+
+Fixed-kernel artifacts are in
+`/root/osito-crt-math-fixed-20260905-EsWRHY/` and
+`/root/osito-crt-math-final-20260905-fFbYsM/`. Broader regressions in
+`/root/osito-crt-math-regress-20260905-7QejHS/` pass all four CRT-FP variants
+(48/50 PE32, 36/38 PE64 for MSVCRT/UCRT), DOS API with 15/15 host-memory
+checks, the UCRT x87 probe with 68/68 after DOS, and the module-image/ABI
+test with 45/45. The final PE32 rounding and classifier probes also pass
+again after DOS. No unexpected CPU fault is logged in these runs.
+
+The general PE32 console probe is not green: it exits with code 134 at
+`_fail_crt_fstat_time`, before its `strtod` assertions. That failure was not
+compared against the old kernel and remains a separate investigation; the
+direct `strtod` cases above do not replace the failing filesystem check.
+The probes do not establish errno/_matherr callbacks, unmasked-exception
+continuation, complete status-flag parity, or every MXCSR configuration.
+
+`make -C arch/x86 CLANG=1 -j4` and `git diff --check` pass. The built and
+booted kernel share SHA-256
+`8620de1dd48475e4b91b45bfa5a8802516fd648a02471671a7de755d844e97cd`.
+UT99 integration artifacts are in
+`/root/osito-ut99-math-fixed-20260905-3ArKTu/`, using the corrected fixture,
+8 GiB, four CPUs, KVM, a relative USB mouse and an isolated snapshot with no
+GDB attached. DM-Agony loads and the match advances, but `turning.png` still
+shows accumulated HUD text and incorrect rendering. These CRT fixes do not
+resolve the game's rendering defect. Console `quit` exits with code zero
+and releases 24 root-process modules; no unexpected CPU fault is logged.
+The QEMU session was stopped and the fixture retains SHA-256
+`cdec52eccec06dac6a24e83752f23fcbf59fba4eebd014f8f8fc79d2b307d350`.
+No DOS, audio, application binary, or persistent game configuration changed.
+
 ## 5. Open questions / notes
 - `WINAPI` selects the Microsoft x64 ABI for native shims, not the kernel's
   SysV ABI. Export arg-count metadata also drives the **32-bit thunk's `RET n*4`**.

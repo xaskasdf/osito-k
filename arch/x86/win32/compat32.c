@@ -1332,24 +1332,49 @@ void compat32_init(void)
      * to the i386 CRT's ST(0) return ABI without teaching the INT2E gateway
      * about floating-point state. */
     {
-        uint32_t helper_addr = compat32_make_thunk_runtime(
-            (uint64_t)(ULONG_PTR)crt_strtod_compat32,
-            "__osito_strtod_compat32_bits", 2, CC_CDECL);
-        uint32_t wrapper_offset = RUNTIME_MATH_PAGE * 4096U +
-                                  RUNTIME_X87_WRAPPER_OFFSET;
-        uint32_t wrapper_addr = compat32_runtime_addr + wrapper_offset;
-        if (helper_addr &&
-            emit_x87_cdecl_result_wrapper(
-                thunk_pool + wrapper_offset, wrapper_addr, helper_addr, 2) == 0) {
-            win32_abi_register_compat32_direct(
-                (const void *)crt_strtod, wrapper_addr);
-            serial_puts("[COMPAT32] strtod x87 wrapper at 0x");
-            serial_puthex(wrapper_addr, 8);
-            serial_puts(" helper=0x");
-            serial_puthex(helper_addr, 8);
-            serial_puts("\n");
-        } else {
-            serial_puts("[COMPAT32] Failed to install strtod x87 wrapper\n");
+        static const struct {
+            const void *native_target;
+            const void *bits_helper;
+            const char *name;
+            const char *helper_name;
+        } bridges[] = {
+            {(const void *)crt_strtod, (const void *)crt_strtod_compat32,
+             "strtod", "__osito_strtod_compat32_bits"},
+            {(const void *)crt_ceil, (const void *)crt_ceil_compat32,
+             "ceil", "__osito_ceil_compat32_bits"},
+            {(const void *)crt_floor, (const void *)crt_floor_compat32,
+             "floor", "__osito_floor_compat32_bits"},
+        };
+        _Static_assert(RUNTIME_X87_WRAPPER_OFFSET +
+                       sizeof(bridges) / sizeof(bridges[0]) *
+                           RUNTIME_X87_WRAPPER_SIZE <= 4096U,
+                       "x87 result wrappers must fit the runtime math page");
+        for (unsigned i = 0; i < sizeof(bridges) / sizeof(bridges[0]); i++) {
+            uint32_t helper_addr = compat32_make_thunk_runtime(
+                (uint64_t)(ULONG_PTR)bridges[i].bits_helper,
+                bridges[i].helper_name, 2, CC_CDECL);
+            uint32_t wrapper_offset = RUNTIME_MATH_PAGE * 4096U +
+                                      RUNTIME_X87_WRAPPER_OFFSET +
+                                      i * RUNTIME_X87_WRAPPER_SIZE;
+            uint32_t wrapper_addr = compat32_runtime_addr + wrapper_offset;
+            if (helper_addr &&
+                emit_x87_cdecl_result_wrapper(
+                    thunk_pool + wrapper_offset, wrapper_addr,
+                    helper_addr, 2) == 0) {
+                win32_abi_register_compat32_direct(
+                    bridges[i].native_target, wrapper_addr);
+                serial_puts("[COMPAT32] ");
+                serial_puts(bridges[i].name);
+                serial_puts(" x87 wrapper at 0x");
+                serial_puthex(wrapper_addr, 8);
+                serial_puts(" helper=0x");
+                serial_puthex(helper_addr, 8);
+                serial_puts("\n");
+            } else {
+                serial_puts("[COMPAT32] Failed to install ");
+                serial_puts(bridges[i].name);
+                serial_puts(" x87 wrapper\n");
+            }
         }
     }
 #endif

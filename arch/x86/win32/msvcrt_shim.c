@@ -6878,11 +6878,23 @@ static uint64_t WINAPI crt_finite_compat32(uint64_t low, uint64_t high)
 }
 
 /* _isnan — check for NaN (IEEE 754: exponent all 1s, mantissa non-zero) */
+static int crt_double_bits_nan(uint64_t bits)
+{
+    return ((bits >> 52) & 0x7FF) == 0x7FF &&
+           (bits & 0x000FFFFFFFFFFFFFULL) != 0;
+}
+
 int WINAPI crt_isnan(double x)
 {
     uint64_t bits;
     __builtin_memcpy(&bits, &x, 8);
-    return ((bits >> 52) & 0x7FF) == 0x7FF && (bits & 0x000FFFFFFFFFFFFFULL) != 0;
+    return crt_double_bits_nan(bits);
+}
+
+static uint64_t WINAPI crt_isnan_compat32(uint64_t low, uint64_t high)
+{
+    uint64_t bits = (uint32_t)low | ((uint64_t)(uint32_t)high << 32);
+    return (uint64_t)crt_double_bits_nan(bits);
 }
 
 static short crt_fpclass_from_parts(uint64_t exponent, uint64_t fraction,
@@ -7650,18 +7662,49 @@ int WINAPI crt_wtoi(const WCHAR *s)
 }
 
 /* ceil / floor — math functions */
+static double crt_round_integral(double x, uint16_t rounding)
+{
+    double result;
+    uint16_t saved_control, control;
+    __asm__ volatile ("fnstcw %0" : "=m"(saved_control));
+    control = (saved_control & ~0x0C00U) | rounding;
+    /* FRNDINT keeps the full floating-point range, signed zero and NaNs.
+     * Restore the caller's precision, rounding and exception-mask control. */
+    __asm__ volatile (
+        "fldcw %1; fldl %2; frndint; fstpl %0; fldcw %3"
+        : "=m"(result)
+        : "m"(control), "m"(x), "m"(saved_control)
+        : "st", "memory");
+    return result;
+}
+
 double WINAPI crt_ceil(double x)
 {
-    long i = (long)x;
-    if (x > 0.0 && (double)i != x) return (double)(i + 1);
-    return (double)i;
+    return crt_round_integral(x, 0x0800U);
 }
 
 double WINAPI crt_floor(double x)
 {
-    long i = (long)x;
-    if (x < 0.0 && (double)i != x) return (double)(i - 1);
-    return (double)i;
+    return crt_round_integral(x, 0x0400U);
+}
+
+static uint64_t crt_round_compat32(uint64_t low, uint64_t high,
+                                  uint16_t rounding)
+{
+    union { double value; uint64_t bits; } input, result;
+    input.bits = (uint32_t)low | ((uint64_t)(uint32_t)high << 32);
+    result.value = crt_round_integral(input.value, rounding);
+    return result.bits;
+}
+
+uint64_t WINAPI crt_ceil_compat32(uint64_t low, uint64_t high)
+{
+    return crt_round_compat32(low, high, 0x0800U);
+}
+
+uint64_t WINAPI crt_floor_compat32(uint64_t low, uint64_t high)
+{
+    return crt_round_compat32(low, high, 0x0400U);
 }
 
 double WINAPI crt_fabs(double x)
@@ -9746,5 +9789,7 @@ PVOID msvcrt_shim_init(void)
                                         (PVOID)crt_lseeki64_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_finite,
                                         (PVOID)crt_finite_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_isnan,
+                                        (PVOID)crt_isnan_compat32);
     return (PVOID)msvcrt_exports;
 }

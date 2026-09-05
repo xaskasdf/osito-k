@@ -374,6 +374,8 @@ WCHAR*  WINAPI crt_wcsupr(WCHAR *s);
 int     WINAPI crt_wtoi(const WCHAR *s);
 double  WINAPI crt_ceil(double x);
 double  WINAPI crt_floor(double x);
+uint64_t WINAPI crt_ceil_compat32(uint64_t low, uint64_t high);
+uint64_t WINAPI crt_floor_compat32(uint64_t low, uint64_t high);
 double  WINAPI crt_fabs(double x);
 double  WINAPI crt_sqrt(double x);
 double  WINAPI crt_difftime(crt_time_t t1, crt_time_t t0);
