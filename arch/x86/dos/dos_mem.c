@@ -169,6 +169,12 @@ void dos_mem_init(dos_vm_t *vm)
 
 uint16_t dos_mem_alloc(dos_vm_t *vm, uint16_t paragraphs, uint16_t *largest)
 {
+    return dos_mem_alloc_owned(vm, paragraphs, largest, vm ? vm->current_psp : 0);
+}
+
+uint16_t dos_mem_alloc_owned(dos_vm_t *vm, uint16_t paragraphs,
+                             uint16_t *largest, uint16_t owner)
+{
     if (largest) *largest = 0;
     if (dos_mcb_validate(vm) < 0) return 0;
 
@@ -219,8 +225,7 @@ uint16_t dos_mem_alloc(dos_vm_t *vm, uint16_t paragraphs, uint16_t *largest)
             dos_mcb_split(vm, selected_segment, selected, paragraphs);
         }
     }
-    selected->owner = vm->current_psp ? vm->current_psp
-                                      : (uint16_t)(selected_segment + 1u);
+    selected->owner = owner ? owner : (uint16_t)(selected_segment + 1u);
 
 #if DOS_DIAGNOSTICS
     serial_puts("[MCB] alloc mcb=");

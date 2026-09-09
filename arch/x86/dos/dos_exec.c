@@ -49,27 +49,41 @@ static void dos_jit_release(dos_vm_t *vm)
 
 /* ── IVT initialization: ROM stubs ──────────────────────────────── */
 
-static void dos_init_ivt(dos_vm_t *vm)
+void dos_init_ivt(dos_vm_t *vm)
 {
     uint16_t rom_seg = DOS_ROM_BASE >> 4;  /* 0xF000 */
-    uint16_t stub_off = 0;
 
-    /* Initialize a conventional real-mode IVT. A protected-mode client may
-     * later reuse this memory for its own GDT after loading GDTR. */
+    /* Unassigned PC BIOS vectors share a default IRET handler. Keep distinct
+     * entries only for installed host services and the DOS policies below. */
     for (int i = 0; i < 256; i++) {
-        /* ROM stub: IRET (0xCF) for all vectors */
-        vm->mem[DOS_ROM_BASE + stub_off] = 0xCF;
+        vm->mem[DOS_ROM_BASE + i] = 0xCF;
 
-        dos_mem_write16(vm, i * 4, stub_off);
+        dos_mem_write16(vm, i * 4, 0);
         dos_mem_write16(vm, i * 4 + 2, rom_seg);
-        stub_off++;
     }
-
-    /* Installed mouse drivers must not publish an IRET as the first byte of
-     * vector 33h; legacy programs use that probe before calling function 0.
-     * INT instructions are host-dispatched, while NOP;IRET remains a valid
-     * fallback if guest code reaches the ROM vector directly. */
-    vm->mem[DOS_ROM_BASE + 0x33U] = 0x90;
+    static const uint8_t service_vectors[] = {
+        0x08, 0x09, 0x10, 0x15, 0x16, 0x1A, 0x20, 0x21, 0x2F, 0x31, 0x33, 0x67
+    };
+    for (unsigned i = 0; i < sizeof(service_vectors); i++) {
+        uint8_t vector = service_vectors[i];
+        if (vector == 0x08) {
+            dos_mem_write16(vm, vector * 4u, vector);
+            continue;
+        }
+        uint16_t offset = DOS_RM_SERVICE_BASE_OFF +
+                           vector * DOS_RM_SERVICE_STUB_SIZE;
+        uint32_t stub = DOS_ROM_BASE + offset;
+        vm->mem[stub] = 0xCD;
+        vm->mem[stub + 1u] = DOS_RM_SERVICE_INT;
+        vm->mem[stub + 2u] = 0xCF;
+        vm->mem[stub + 3u] = 0x90;
+        dos_mem_write16(vm, vector * 4u, offset);
+    }
+    /* Default IRQ0 chains the user timer hook and acknowledges the PIC. */
+    static const uint8_t timer_handler[] = {
+        0x50, 0xCD, 0x1C, 0xB0, 0x60, 0xE6, 0x20, 0x58, 0xCF
+    };
+    memcpy(vm->mem + DOS_ROM_BASE + 8, timer_handler, sizeof(timer_handler));
 
     /* The shell's default Ctrl-C action is an abort, including when a
      * program chains to the saved real-mode vector. */
@@ -162,8 +176,176 @@ static int ends_with_com(const char *name)
 
 /* ── Run a DOS binary from OsitoFS ──────────────────────────────── */
 
+typedef struct {
+    const char *filename;
+    int argc;
+    const char **argv;
+    bool emulate_cpu;
+    uint64_t step_limit;
+} dos_run_options_t;
+
+static bool dos_parse_step_limit(const char *text, uint64_t *limit)
+{
+    if (!text || !*text) return false;
+    uint64_t value = 0;
+    for (const char *p = text; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+        unsigned digit = (unsigned)(*p - '0');
+        if (value > (UINT64_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+    }
+    if (!value) return false;
+    *limit = value;
+    return true;
+}
+
+static bool dos_parse_run_options(const char *filename, int argc,
+                                  const char **argv, dos_run_options_t *options)
+{
+    if (!filename || !*filename || argc < 0 || (argc && !argv)) return false;
+    for (int i = 0; i < argc; i++) if (!argv[i]) return false;
+    *options = (dos_run_options_t){0};
+    const char *token = filename;
+    int index = 0;
+    for (;;) {
+        if (strcmp(token, "--") == 0) {
+            if (++index >= argc) return false;
+            token = argv[index];
+            break;
+        }
+        if (strcmp(token, "--emulate") == 0) {
+            options->emulate_cpu = true;
+        } else if (strcmp(token, "--max-steps") == 0) {
+            if (options->step_limit || ++index >= argc ||
+                !dos_parse_step_limit(argv[index], &options->step_limit)) return false;
+        } else if (strlen(token) >= 12u && memcmp(token, "--max-steps=", 12u) == 0) {
+            if (options->step_limit ||
+                !dos_parse_step_limit(token + 12u, &options->step_limit)) return false;
+        } else {
+            if (token[0] == '-' && token[1] == '-') return false;
+            break;
+        }
+        if (++index >= argc) return false;
+        token = argv[index];
+    }
+    if (!*token || (options->step_limit && !options->emulate_cpu)) return false;
+    options->filename = token;
+    options->argc = argc - index;
+    options->argv = argv ? argv + index : NULL;
+    return true;
+}
+
+int dos_run_options_selftest(void)
+{
+    const struct {
+        const char *text;
+        uint64_t value;
+    } numbers[] = {
+        { "1", 1 }, { "00042", 42 },
+        { "18446744073709551615", UINT64_MAX },
+        { NULL, 0 }, { "", 0 }, { "0", 0 }, { "000", 0 },
+        { "-1", 0 }, { "+1", 0 }, { " 1", 0 }, { "1 ", 0 },
+        { "1x", 0 }, { "0x10", 0 }, { "18446744073709551616", 0 },
+        { "9999999999999999999999999999999999999999999", 0 }
+    };
+    const struct {
+        const char *argv[8];
+        int argc;
+        int file_index; /* -1 expects a rejected launch. */
+        bool emulate;
+        uint64_t limit;
+    } launches[] = {
+        { { "test.com" }, 1, 0, false, 0 },
+        { { "test.com", "--emulate", "--max-steps", "5" }, 4, 0, false, 0 },
+        { { "--emulate", "test.com", "-guest" }, 3, 1, true, 0 },
+        { { "--emulate", "--emulate", "test.com" }, 3, 2, true, 0 },
+        { { "--emulate", "--max-steps", "42", "test.com", "arg" }, 5, 3, true, 42 },
+        { { "--max-steps", "42", "--emulate", "test.com" }, 4, 3, true, 42 },
+        { { "--max-steps=42", "--emulate", "test.com" }, 3, 2, true, 42 },
+        { { "--emulate", "--max-steps=18446744073709551615", "test.com" },
+          3, 2, true, UINT64_MAX },
+        { { "--", "--emulate", "arg" }, 3, 1, false, 0 },
+        { { "--emulate", "--", "--max-steps", "5" }, 4, 2, true, 0 },
+        { { "--emulate", "--max-steps", "1", "--", "--test.com" }, 5, 4, true, 1 },
+        { { "--emulate" }, 1, -1, false, 0 },
+        { { "--max-steps" }, 1, -1, false, 0 },
+        { { "--max-steps", "5" }, 2, -1, false, 0 },
+        { { "--max-steps", "5", "test.com" }, 3, -1, false, 0 },
+        { { "--max-steps=5", "test.com" }, 2, -1, false, 0 },
+        { { "--emulate", "--max-steps=", "test.com" }, 3, -1, false, 0 },
+        { { "--emulate", "--max-steps", "0", "test.com" }, 4, -1, false, 0 },
+        { { "--emulate", "--max-steps", "-1", "test.com" }, 4, -1, false, 0 },
+        { { "--emulate", "--max-steps=18446744073709551616", "test.com" },
+          3, -1, false, 0 },
+        { { "--emulate", "--max-steps=1", "--max-steps", "2", "test.com" },
+          5, -1, false, 0 },
+        { { "--emulate", "--max-steps", "1", "--max-steps=2", "test.com" },
+          5, -1, false, 0 },
+        { { "--unknown", "test.com" }, 2, -1, false, 0 },
+        { { "--" }, 1, -1, false, 0 },
+        { { "" }, 1, -1, false, 0 },
+        { { "--emulate", "" }, 2, -1, false, 0 },
+        { { "test.com", NULL }, 2, -1, false, 0 }
+    };
+    int failures = 0;
+    unsigned checks = 0;
+    for (unsigned i = 0; i < sizeof(numbers) / sizeof(numbers[0]); i++) {
+        uint64_t value = 123;
+        bool valid = dos_parse_step_limit(numbers[i].text, &value);
+        if (valid != (numbers[i].value != 0) ||
+            value != (valid ? numbers[i].value : 123)) failures++;
+        checks++;
+    }
+    for (unsigned i = 0; i < sizeof(launches) / sizeof(launches[0]); i++) {
+        const char *argv[8];
+        for (unsigned j = 0; j < 8; j++) argv[j] = launches[i].argv[j];
+        dos_run_options_t options;
+        bool valid = dos_parse_run_options(argv[0], launches[i].argc, argv, &options);
+        int index = launches[i].file_index;
+        bool ok = valid == (index >= 0);
+        if (valid && index >= 0 &&
+            (options.filename != argv[index] ||
+             options.argc != launches[i].argc - index || options.argv != argv + index ||
+             options.emulate_cpu != launches[i].emulate ||
+             options.step_limit != launches[i].limit)) ok = false;
+        for (unsigned j = 0; j < 8; j++)
+            if (argv[j] != launches[i].argv[j]) ok = false;
+        if (!ok) {
+            serial_puts("[DOS-OPTIONS] launch mismatch case="); serial_putdec(i);
+            serial_puts("\n");
+            failures++;
+        }
+        checks++;
+    }
+    dos_run_options_t options;
+    const char *filename = "test.com";
+    if (!dos_parse_run_options(filename, 0, NULL, &options) ||
+        options.filename != filename || options.argc || options.argv ||
+        options.emulate_cpu || options.step_limit) failures++;
+    checks++;
+    if (dos_parse_run_options(filename, -1, NULL, &options)) failures++;
+    checks++;
+    if (dos_parse_run_options(filename, 1, NULL, &options)) failures++;
+    checks++;
+    if (dos_parse_run_options(NULL, 0, NULL, &options)) failures++;
+    checks++;
+    serial_puts("[DOS-OPTIONS] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec((uint64_t)failures);
+    serial_puts("\n");
+    return failures;
+}
+
 int dos_run(const char *filename, int argc, const char **argv)
 {
+    dos_run_options_t options;
+    if (!dos_parse_run_options(filename, argc, argv, &options)) {
+        serial_puts("Usage: dosrun [--emulate [--max-steps N]] [--] <file.com|file.exe> [args]\n"
+                    "[DOS] --max-steps requires --emulate and a positive decimal limit\n");
+        return -1;
+    }
+    filename = options.filename;
+    argc = options.argc;
+    argv = options.argv;
     if (!dos_is_initialized()) {
         extern void dos_init(void);
         dos_init();
@@ -218,6 +400,15 @@ int dos_run(const char *filename, int argc, const char **argv)
 
     vm.cpu = &cpu;
     cpu.vm = &vm;
+    vm.emulate_cpu = options.emulate_cpu;
+    vm.step_limit = options.step_limit;
+    if (vm.emulate_cpu)
+        serial_puts("[DOS] Software CPU, virtual IOPL3\n");
+    if (vm.step_limit) {
+        serial_puts("[DOS] Diagnostic interpreter step limit: ");
+        serial_putdec(vm.step_limit);
+        serial_puts(" (JIT disabled)\n");
+    }
 
     /* System RAM remains 16 MB; VBE contributes a separate 4 MB physical
      * aperture after it so framebuffer bytes never consume DPMI memory. */
@@ -302,8 +493,9 @@ int dos_run(const char *filename, int argc, const char **argv)
         return -1;
     }
 
-    /* Initialize the optional JIT only after the image loaded successfully. */
-    {
+    /* Native/JIT execution is not instruction-metered. A diagnostic quota
+     * therefore selects the interpreter for the entire DOS session. */
+    if (!vm.step_limit) {
         uint64_t jit_pages = (sizeof(jit_state_t) + 4095u) / 4096u;
         jit_state_t *jit = (jit_state_t *)dos_host_alloc_pages(jit_pages);
         if (jit) {
@@ -323,15 +515,22 @@ int dos_run(const char *filename, int argc, const char **argv)
     vm.dta_seg = vm.current_psp;
 
     /* Run! */
+    if (!dos_io_keyboard_acquire(&vm)) {
+        serial_puts("[DOS] Keyboard is owned by another session\n");
+        dos_native_cleanup(&vm);
+        return -1;
+    }
     serial_puts("[DOS] Starting...\n");
     dos_vga_bind_vm(&vm);
     int exit_code = cpu8086_run(&vm);
 
     serial_puts("[DOS] Exit code ");
-    serial_putdec((uint64_t)(uint32_t)exit_code);
+    if (exit_code < 0) serial_puts("-");
+    serial_putdec(exit_code < 0 ? (uint64_t)-(int64_t)exit_code : (uint64_t)exit_code);
     serial_puts(" (");
     serial_putdec(cpu.insn_count);
     serial_puts(" instructions)\n");
+    if (vm.jit) jit_print_stats((jit_state_t *)vm.jit);
 
     dos_native_cleanup(&vm);
 
@@ -429,7 +628,7 @@ void dos_native_ems_map_frame(dos_vm_t *vm, unsigned frame,
     }
 }
 
-void dos_native_map_vbe_window(dos_vm_t *vm)
+void dos_native_map_video(dos_vm_t *vm)
 {
     if (!vm || !vm->mem || !vm->native_cr3) return;
 
@@ -445,13 +644,16 @@ void dos_native_map_vbe_window(dos_vm_t *vm)
         return;
 
     uint64_t mem_pa = dos_nt_va_to_pa(vm->mem);
-    for (uint64_t offset = 0; offset < DOS_VBE_WINDOW_SIZE;
+    bool vga_mmio = vm->io && vm->vga_mode == 0x13u && !vm->vbe_active;
+    for (uint64_t offset = 0; offset < DOS_VGA_APERTURE_SIZE;
          offset += 4096u) {
+        uint64_t backing = offset < DOS_VBE_WINDOW_SIZE
+                         ? source + offset : DOS_VGA_APERTURE_BASE + offset;
+        uint64_t flags = PTE_PRESENT | PTE_WRITABLE;
+        if (!vga_mmio) flags |= PTE_USER;
         if (paging_map_page_in_cr3(vm->native_cr3,
                                    DOS_VBE_WINDOW_BASE + offset,
-                                   mem_pa + source + offset,
-                                   PTE_PRESENT | PTE_WRITABLE |
-                                   PTE_USER) == 0) {
+                                   mem_pa + backing, flags) == 0 && !vga_mmio) {
             dos_nt_propagate_user(vm->native_cr3,
                                   DOS_VBE_WINDOW_BASE + offset);
         }
@@ -481,13 +683,16 @@ typedef struct __attribute__((packed)) {
 
 extern dos_nt_idt_entry_t idt[];
 
-static const uint8_t dos_nt_idt_vectors[12] = {
-    0x01, 0x10, 0x16, 0x21, 0x2F, 0x31, 0x33,
+static const uint8_t dos_nt_idt_vectors[] = {
+    0x01, 0x10, 0x16, 0x1A, 0x21, 0x2F, 0x31, 0x33,
     0x67,
     DPMI_DEFAULT_REFLECT_INT, DPMI_CALLBACK_RETURN_INT,
     DPMI_EXCEPTION_RETURN_INT,
     DPMI_RAW_SWITCH_INT
 };
+_Static_assert(sizeof(dos_nt_idt_vectors) ==
+               sizeof(((dos_vm_t *)0)->native_saved_idt) / 16,
+               "native IDT backup must cover every installed gate");
 
 typedef struct __attribute__((packed)) {
     uint16_t limit;
@@ -688,9 +893,93 @@ int dos_hostmem_selftest(void)
         if (compiled == 0 && block->compiled) {
             cpu8086_state_t cpu = {0};
             dos_vm_t vm = { .cpu = &cpu };
-            jit_exec_block(&vm, block);
+            HOSTMEM_CHECK(!jit_exec_block(&vm, block));
             HOSTMEM_CHECK(cpu.ax == 0x1234 && cpu.ip == 0x103 &&
                           block->exec_count == 1);
+        }
+    }
+
+    /* Exercise zero-progress and partial-block exits without a live guest. */
+    static const struct {
+        uint8_t code[8];
+        uint8_t restart;
+        uint16_t ax;
+    } fallback_cases[] = {
+        {{0x39, 0x07}, 0, 0x5678},
+        {{0x66, 0x50}, 0, 0x5678},
+        {{0x50}, 0, 0x5678},
+        {{0x58}, 0, 0x5678},
+        {{0xE8, 0, 0}, 0, 0x5678},
+        {{0xC3}, 0, 0x5678},
+        {{0xB8, 0x34, 0x12, 0x39, 0x07}, 3, 0x1234},
+        {{0xB8, 0x34, 0x12, 0x50}, 3, 0x1234},
+        {{0xB8, 0x34, 0x12, 0x58}, 3, 0x1234},
+        {{0xB8, 0x34, 0x12, 0xE8, 0, 0}, 3, 0x1234},
+        {{0xB8, 0x34, 0x12, 0xC3}, 3, 0x1234},
+    };
+    for (unsigned i = 0; i < sizeof(fallback_cases) /
+                                      sizeof(fallback_cases[0]); i++) {
+        uint16_t ip = 0x200u + (uint16_t)i * 16u;
+        uint8_t *bytes = (uint8_t *)memory + ip;
+        for (unsigned j = 0; j < sizeof(fallback_cases[i].code); j++)
+            bytes[j] = fallback_cases[i].code[j];
+        cpu8086_state_t cpu = { .eax = 0xABCD5678u, .eip = ip,
+                               .esp = 0x1234, .eflags = FLAGS_FIXED };
+        dos_vm_t vm = { .cpu = &cpu, .mem = (uint8_t *)memory,
+                        .total_mem_size = 8192 };
+        cpu8086_reset_real_cs(&cpu, 0);
+        block = jit_get_block(jit, 0, ip);
+        HOSTMEM_CHECK(block && jit_decode_block(&vm, block) > 0 &&
+                      jit_compile_block(jit, block) == 0);
+        if (!block || !block->compiled) continue;
+        HOSTMEM_CHECK(!jit_exec_block(&vm, block));
+        HOSTMEM_CHECK(cpu.eax == (0xABCD0000u | fallback_cases[i].ax) &&
+                      cpu.ip == ip + fallback_cases[i].restart &&
+                      cpu.sp == 0x1234 && cpu.eflags == FLAGS_FIXED);
+    }
+
+    /* Guest arithmetic and branches must not import host carry or export
+     * guest control flags into the kernel's RFLAGS. */
+    for (unsigned op = 0; op < 4u; op++) {
+        uint16_t ip = 0x400u + (uint16_t)op * 16u;
+        block = jit_get_block(jit, 0, ip);
+        HOSTMEM_CHECK(block != NULL);
+        if (!block) continue;
+        block->length = 2;
+        block->ir_count = 1;
+        block->ir[0] = (ir_inst_t){
+            .op = op == 0 ? IR_INC : op == 1 ? IR_DEC : IR_JCC,
+            .a = op < 2 ? REG_AX : op == 2 ? 0x74 : 0x75,
+            .b = 0x500, .width = 2 };
+        HOSTMEM_CHECK(jit_compile_block(jit, block) == 0);
+        if (!block->compiled) continue;
+        for (unsigned bits = 0; bits < 4u; bits++) {
+            uint32_t guest_flags = FLAGS_FIXED | FLAG_DF |
+                ((bits & 1u) ? FLAG_CF : 0) | ((bits & 2u) ? FLAG_ZF : 0);
+            cpu8086_state_t cpu = { .eax = op == 0 ? 0xABCDFFFFu :
+                                    0xABCD0000u, .eip = ip,
+                                    .eflags = guest_flags };
+            dos_vm_t vm = { .cpu = &cpu };
+            uint64_t before, after;
+            __asm__ volatile ("pushfq; popq %0" : "=r"(before) :: "memory");
+            bool completed = jit_exec_block(&vm, block);
+            __asm__ volatile ("pushfq; popq %0; cld"
+                              : "=r"(after) :: "memory", "cc");
+            if (before & FLAG_IF) __asm__ volatile ("sti" ::: "memory");
+            else __asm__ volatile ("cli" ::: "memory");
+            HOSTMEM_CHECK(completed &&
+                          ((before ^ after) & (FLAG_IF | FLAG_DF |
+                                               FLAG_TF | 0x3000u)) == 0);
+            if (op < 2) {
+                HOSTMEM_CHECK(cpu.eax == (op == 0 ? 0xABCD0000u :
+                                          0xABCDFFFFu) && cpu.ip == ip + 2);
+                HOSTMEM_CHECK((cpu.eflags & (FLAG_CF | FLAG_DF | FLAG_IF)) ==
+                              (guest_flags & (FLAG_CF | FLAG_DF | FLAG_IF)));
+            } else {
+                bool taken = op == 2 ? (bits & 2u) != 0 : (bits & 2u) == 0;
+                HOSTMEM_CHECK(cpu.ip == (taken ? 0x500 : ip + 2) &&
+                              cpu.eflags == guest_flags);
+            }
         }
     }
 
@@ -788,6 +1077,12 @@ static void dos_native_sync_gdt(dos_vm_t *vm)
         | (((ldt_base >> 24) & 0xFFULL) << 56);
     native[DOS_LDT_GDT_SLOT + 1] = ldt_base >> 32;
     __asm__ volatile ("mfence" ::: "memory");
+}
+
+void dos_native_sync_tables(dos_vm_t *vm)
+{
+    dos_native_sync_ldt(vm);
+    dos_native_sync_gdt(vm);
 }
 
 static bool dos_nt_selector_descriptor(dos_vm_t *vm, uint16_t selector,
@@ -980,6 +1275,12 @@ void dos_native_cleanup(dos_vm_t *vm)
     vm->native_resume_armed = false;
     dos_vga_unbind_vm(vm);
 
+    if (vm->native_vga_faults) {
+        serial_puts("[DOS/VGA] native memory faults mediated=");
+        serial_putdec(vm->native_vga_faults);
+        serial_puts("\n");
+        vm->native_vga_faults = 0;
+    }
     dos_audio_shutdown(vm);
     dos_io_shutdown(vm);
     dos_api_close_all(vm);
@@ -1016,6 +1317,7 @@ void dos_native_suspend(dos_vm_t *vm)
 void dos_transfer_to_native(dos_vm_t *vm)
 {
     cpu8086_state_t *cpu = vm->cpu;
+    if (vm->emulate_cpu || vm->step_limit || cpu8086_uses_guest_idt(cpu)) return;
 
     /* A translated real-mode service may invoke a callback while its outer
      * native INT frame is still live. Interpret that nested protected-mode
@@ -1027,6 +1329,9 @@ void dos_transfer_to_native(dos_vm_t *vm)
         serial_puts("[DOS-NT] native entry has no interpreter context\n");
         return;
     }
+
+    if (!dos_native_prepare_return(vm)) return;
+    cpu = vm->cpu;
 
     serial_puts("[DOS-NT] enter cs=0x");  serial_puthex(cpu->cs, 4);
     serial_puts(" eip=0x");                serial_puthex(cpu->eip, 8);
@@ -1073,7 +1378,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
                 dos_native_ems_map_frame(vm, frame,
                                          vm->ems_frame_bases[frame]);
         }
-        dos_native_map_vbe_window(vm);
+        dos_native_map_video(vm);
         serial_puts("[DOS-NT] CR3=0x");    serial_puthex(vm->native_cr3, 16);
         serial_puts(" vm->mem pa=0x");     serial_puthex(mem_pa, 16);
         serial_puts(" mapped=");           serial_putdec(mapped >> 10);
@@ -1090,8 +1395,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
             return;
         }
 
-        dos_native_sync_ldt(vm);
-        dos_native_sync_gdt(vm);
+        dos_native_sync_tables(vm);
         serial_puts("[DOS-NT] private GDT/LDT prepared from guest tables\n");
         /* Install DOS INT handlers in the IDT with DPL=3 so ring-3 DOS
          * code can invoke them via the INT instruction. Without DPL=3
@@ -1099,6 +1403,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
         extern void dos_int08_stub(void);
         extern void dos_int10_stub(void);
         extern void dos_int16_stub(void);
+        extern void dos_int1a_stub(void);
         extern void dos_int20_stub(void);
         extern void dos_int21_stub(void);
         extern void dos_int2f_stub(void);
@@ -1119,6 +1424,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
             { 0x01, dos_exc01_stub },
             { 0x10, dos_int10_stub },
             { 0x16, dos_int16_stub },
+            { 0x1A, dos_int1a_stub },
             { 0x21, dos_int21_stub }, { 0x2F, dos_int2f_stub },
             { 0x31, dos_int31_stub }, { 0x33, dos_int33_stub },
             { 0x67, dos_int67_stub },
@@ -1154,8 +1460,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
 
     if (!vm->native_ready) return;
 
-    dos_native_sync_ldt(vm);
-    dos_native_sync_gdt(vm);
+    dos_native_sync_tables(vm);
 
     /* Native guests own FS/GS until exit or a raw-mode suspension. */
     if (!vm->native_host_tls.saved)
@@ -1246,7 +1551,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
         "movq %c[rdi](%%r11), %%rdi\n"
         "movq %c[rbp](%%r11), %%rbp\n"
         "movq %c[rax](%%r11), %%rax\n"
-        "iretq\n"
+        "jmp x86_compat_iret\n"
         :
         : [enter] "r"(enter),
           [gdtr] "i"(__builtin_offsetof(dos_nt_enter_state_t, gdtr)),

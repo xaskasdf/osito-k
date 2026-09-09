@@ -11,6 +11,7 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "../include/compat_iret.h"
 #include "smp.h"
 
 /* ── External functions ──────────────────────────────────────── */
@@ -945,6 +946,7 @@ void __initk paging_init(void)
     serial_puthex(KERNEL_VBASE, 16);
     serial_puts("...\n");
     paging_map_range_at(0, highest, KERNEL_VBASE, 0);
+    x86_compat_iret_init(kernel_pml4);
 
     serial_puts("[PAGE] Page tables built: ");
     serial_putdec(pt_pages_used);

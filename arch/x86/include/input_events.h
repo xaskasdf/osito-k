@@ -24,4 +24,12 @@ typedef struct {
 
 void input_get_mouse_snapshot(input_mouse_snapshot_t *snapshot);
 
+/* Exclusive raw set-1 stream. The owner is an identity token, never
+ * dereferenced by IRQ producers. Packets are enqueued atomically. */
+bool input_keyboard_acquire(const void *owner);
+void input_keyboard_release(const void *owner);
+bool input_keyboard_post_set1(const uint8_t *bytes, uint32_t count);
+bool input_keyboard_read_set1(const void *owner, uint8_t *byte);
+bool input_keyboard_is_owner(const void *owner);
+
 #endif

@@ -4,6 +4,8 @@
  * The USE32 half performs real IN/OUT instructions at CPL3. OsitoK must
  * route their #GP faults through the virtual DOS I/O bus, stream the DMA
  * buffer through the shared PCM scheduler, and reflect IRQ5 to vector 0Dh.
+ * Three single-cycle transfers verify rearming, DSP acknowledgement, PIC EOI,
+ * and virtual interrupt state on entry and return, not just the first IRQ.
  */
 
     .section .text
@@ -114,6 +116,8 @@ reset_ready:
     jne native_dsp_fail
 
     /* Program DMA channel 1 for the buffer's guest physical address. */
+next_transfer:
+    incb audio_irq_expected
     movzwl saved_real_cs, %ebx
     shll $4, %ebx
     addl $sample_buffer, %ebx
@@ -121,6 +125,20 @@ reset_ready:
     movw $0x0a, %dx
     movb $0x05, %al
     outb %al, %dx
+    /* Later rounds arm DSP while DMA still describes the exhausted transfer.
+     * No memory access or completion IRQ is allowed until DMA is unmasked. */
+    cmpb $1, audio_irq_expected
+    je program_dma
+    call start_dsp
+    movl $1000000, %ecx
+masked_dma_wait:
+    pause
+    loop masked_dma_wait
+    movb audio_irq_expected, %al
+    decb %al
+    cmpb %al, audio_irq_seen
+    jne native_dma_fail
+program_dma:
     movw $0x0c, %dx
     xorb %al, %al
     outb %al, %dx
@@ -145,6 +163,22 @@ reset_ready:
     movb $0x01, %al
     outb %al, %dx
 
+    cmpb $1, audio_irq_expected
+    jne wait_for_audio
+    call start_dsp
+wait_for_audio:
+    movl $200000000, %ecx
+irq_wait:
+    cmpb $0, audio_irq_error
+    jne native_pic_fail
+    movb audio_irq_expected, %al
+    cmpb %al, audio_irq_seen
+    je native_success
+    pause
+    loop irq_wait
+    jmp native_irq_fail
+
+start_dsp:
     /* 48 kHz, unsigned mono, single-cycle 4096-byte transfer. */
     movw $0x22c, %dx
     movb $0xd1, %al
@@ -164,13 +198,7 @@ reset_ready:
     movb $0x0f, %al
     outb %al, %dx
 
-    movl $200000000, %ecx
-irq_wait:
-    cmpb $1, audio_irq_seen
-    je native_success
-    pause
-    loop irq_wait
-    jmp native_irq_fail
+    ret
 
 native_success:
     movl $0x0902, %eax
@@ -213,6 +241,8 @@ native_success:
     cmpb $0xff, %al
     jne native_dma_fail
 
+    cmpb $3, audio_irq_seen
+    jb next_transfer
     movl $0x4c2a, %eax
     int $0x21
 native_vector_fail:
@@ -227,18 +257,51 @@ native_irq_fail:
 native_dma_fail:
     movl $0x4c75, %eax
     int $0x21
+native_pic_fail:
+    movl $0x4c76, %eax
+    int $0x21
 
 native_audio_irq:
     pushal
+    movl $0x0902, %eax
+    int $0x31
+    cmpw $0x0900, %ax
+    jne irq_contract_fail
+    /* IRQ5 is in service until software acknowledges the PIC as well as DSP. */
+    movb $0x0b, %al
+    outb %al, $0x20
+    inb $0x20, %al
+    testb $0x20, %al
+    jz irq_contract_fail
     movw $0x22e, %dx
     inb %dx, %al
-    movb $1, audio_irq_seen
+    movb $0x65, %al
+    outb %al, $0x20
+    inb $0x20, %al
+    testb $0x20, %al
+    jnz irq_contract_fail
+    incb audio_irq_seen
+    jmp irq_return
+irq_contract_fail:
+    movb $1, audio_irq_error
+    movw $0x22e, %dx
+    inb %dx, %al
+    movb $0x65, %al
+    outb %al, $0x20
+irq_return:
     popal
     sti
     iretl
 
 audio_irq_seen:
     .byte 0
+audio_irq_expected:
+    .byte 0
+audio_irq_error:
+    .byte 0
     .align 16
 sample_buffer:
-    .fill 4096, 1, 0xe0
+    .rept 8
+    .fill 256, 1, 0x40
+    .fill 256, 1, 0xc0
+    .endr

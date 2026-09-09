@@ -114,6 +114,7 @@ typedef struct {
     bool e2_dma_pending;
     bool midi_backend_warned;
     bool pending_dma_command;
+    bool waiting_for_dma;
     DOS_SB_TRANSFER_MODE transfer_mode;
     DOS_SB_ENCODING encoding;
     DOS_SB_MIDI_MODE midi_mode;
@@ -143,6 +144,8 @@ typedef struct {
     uint8_t e2_value;
     uint8_t pending_command;
     uint8_t pending_parameters[3];
+    uint8_t waiting_command;
+    uint8_t waiting_parameters[3];
     uint16_t direct_dac_head;
     uint16_t direct_dac_tail;
     uint16_t direct_dac_count;
@@ -263,6 +266,7 @@ static void dos_sb_parser_reset_locked(DOS_AUDIO_STATE *state)
     state->direct_dac_primed = false;
     state->e2_dma_pending = false;
     state->pending_dma_command = false;
+    state->waiting_for_dma = false;
     state->adpcm_reference = 0x80U;
     state->adpcm_step = 0;
     state->adpcm_portion = 0;
@@ -1401,6 +1405,35 @@ static bool dos_sb_is_single_cycle_dma_command(uint8_t command)
     }
 }
 
+enum {
+    DOS_SB_DMA_COMMAND = 1U,
+    DOS_SB_DMA_16BIT = 2U,
+    DOS_SB_DMA_CAPTURE = 4U,
+    DOS_SB_DMA_AUTOMATIC = 8U,
+};
+
+static unsigned dos_sb_dma_command_kind(uint8_t command)
+{
+    if (command >= 0xB0U && command <= 0xCFU)
+        return DOS_SB_DMA_COMMAND |
+            (command < 0xC0U ? DOS_SB_DMA_16BIT : 0U) |
+            ((command & 8U) ? DOS_SB_DMA_CAPTURE : 0U) |
+            ((command & 4U) ? DOS_SB_DMA_AUTOMATIC : 0U);
+    switch (command) {
+    case 0x14: case 0x16: case 0x17:
+    case 0x74: case 0x75: case 0x76: case 0x77: case 0x91:
+        return DOS_SB_DMA_COMMAND;
+    case 0x1C: case 0x1F: case 0x7D: case 0x7F: case 0x90:
+        return DOS_SB_DMA_COMMAND | DOS_SB_DMA_AUTOMATIC;
+    case 0x24: case 0x99:
+        return DOS_SB_DMA_COMMAND | DOS_SB_DMA_CAPTURE;
+    case 0x2C: case 0x98:
+        return DOS_SB_DMA_COMMAND | DOS_SB_DMA_CAPTURE | DOS_SB_DMA_AUTOMATIC;
+    default:
+        return 0;
+    }
+}
+
 static bool dos_sb_execute_locked(DOS_AUDIO_STATE *state, uint8_t command,
                                   bool *refresh, bool *started)
 {
@@ -1408,7 +1441,7 @@ static bool dos_sb_execute_locked(DOS_AUDIO_STATE *state, uint8_t command,
     *refresh = false;
     *started = false;
 
-    if (state->playing && state->auto_init &&
+    if ((state->playing || state->waiting_for_dma) && state->auto_init &&
         dos_sb_is_single_cycle_dma_command(command)) {
         if (!state->pending_dma_command) {
             state->pending_dma_command = true;
@@ -1418,6 +1451,33 @@ static bool dos_sb_execute_locked(DOS_AUDIO_STATE *state, uint8_t command,
         }
         state->exit_auto_init = true;
         return true;
+    }
+
+    unsigned dma_kind = dos_sb_dma_command_kind(command);
+    if (dma_kind) {
+        bool sixteen_bit = (dma_kind & DOS_SB_DMA_16BIT) != 0;
+        DOS_DMA_CHANNEL *channel = sixteen_bit ? &state->dma16 : &state->dma8;
+        state->waiting_for_dma = false;
+        if (state->present && (channel->masked ||
+            dos_dma_controller_disabled_locked(state, sixteen_bit))) {
+            /* DSP asserts a request; only DMA enable grants memory access.
+             * The guest may replace the exhausted descriptor while masked. */
+            state->waiting_for_dma = true;
+            state->waiting_command = command;
+            memcpy(state->waiting_parameters, p, sizeof(state->waiting_parameters));
+            state->playing = false;
+            state->paused = false;
+            state->sixteen_bit = sixteen_bit;
+            state->auto_init = (dma_kind & DOS_SB_DMA_AUTOMATIC) != 0;
+            state->exit_auto_init = false;
+            state->high_speed = false;
+            state->transfer_mode = (dma_kind & DOS_SB_DMA_CAPTURE)
+                ? DOS_SB_TRANSFER_CAPTURE : DOS_SB_TRANSFER_PLAYBACK;
+            *refresh = true;
+            return true;
+        }
+    } else if (command == 0x10U || command == 0x80U) {
+        state->waiting_for_dma = false;
     }
 
     switch (command) {
@@ -1581,13 +1641,13 @@ static bool dos_sb_execute_locked(DOS_AUDIO_STATE *state, uint8_t command,
         state->legacy_input_stereo = true;
         break;
     case 0xD0:
-        if (state->playing && !state->sixteen_bit &&
+        if ((state->playing || state->waiting_for_dma) && !state->sixteen_bit &&
             (state->transfer_mode == DOS_SB_TRANSFER_PLAYBACK ||
              state->transfer_mode == DOS_SB_TRANSFER_CAPTURE))
             state->paused = true;
         break;
     case 0xD5:
-        if (state->playing && state->sixteen_bit &&
+        if ((state->playing || state->waiting_for_dma) && state->sixteen_bit &&
             (state->transfer_mode == DOS_SB_TRANSFER_PLAYBACK ||
              state->transfer_mode == DOS_SB_TRANSFER_CAPTURE))
             state->paused = true;
@@ -1600,7 +1660,7 @@ static bool dos_sb_execute_locked(DOS_AUDIO_STATE *state, uint8_t command,
         state->speaker_enabled = false;
         break;
     case 0xD4:
-        if (state->playing && !state->sixteen_bit &&
+        if ((state->playing || state->waiting_for_dma) && !state->sixteen_bit &&
             (state->transfer_mode == DOS_SB_TRANSFER_PLAYBACK ||
              state->transfer_mode == DOS_SB_TRANSFER_CAPTURE)) {
             state->paused = false;
@@ -1608,7 +1668,7 @@ static bool dos_sb_execute_locked(DOS_AUDIO_STATE *state, uint8_t command,
         }
         break;
     case 0xD6:
-        if (state->playing && state->sixteen_bit &&
+        if ((state->playing || state->waiting_for_dma) && state->sixteen_bit &&
             (state->transfer_mode == DOS_SB_TRANSFER_PLAYBACK ||
              state->transfer_mode == DOS_SB_TRANSFER_CAPTURE)) {
             state->paused = false;
@@ -1781,7 +1841,8 @@ static uint8_t dos_dma_status_read_locked(DOS_AUDIO_STATE *state,
         ? &state->dma16 : &state->dma8;
     uint8_t dma_channel = sixteen_bit
         ? DOS_SB_DMA16_CHANNEL : DOS_SB_DMA8_CHANNEL;
-    bool hardware_request = state->playing && !state->paused &&
+    bool hardware_request = (state->playing || state->waiting_for_dma) &&
+        !state->paused &&
         state->transfer_mode != DOS_SB_TRANSFER_SILENCE &&
         state->sixteen_bit == sixteen_bit;
     uint8_t status = channel->terminal_count
@@ -2030,6 +2091,27 @@ bool dos_audio_port_write8(struct dos_vm *vm, uint16_t port, uint8_t value)
         handled = port >= DOS_SB_BASE && port <= DOS_SB_BASE + 0x0FU;
         break;
     }
+    if (state->waiting_for_dma && !state->paused &&
+        !(state->sixteen_bit ? state->dma16.masked : state->dma8.masked) &&
+        !dos_dma_controller_disabled_locked(state, state->sixteen_bit)) {
+        /* Keep a partially received DSP command intact when DMA is enabled
+         * between its parameter bytes. The pending request owns its payload. */
+        uint8_t saved_parameters[sizeof(state->parameters)];
+        memcpy(saved_parameters, state->parameters, sizeof(saved_parameters));
+        memcpy(state->parameters, state->waiting_parameters,
+               sizeof(state->waiting_parameters));
+        uint8_t command = state->waiting_command;
+        bool exit_auto_init = state->exit_auto_init;
+        state->waiting_for_dma = false;
+        state->auto_init = false;
+        bool dma_refresh = false, dma_started = false;
+        (void)dos_sb_execute_locked(state, command, &dma_refresh, &dma_started);
+        memcpy(state->parameters, saved_parameters, sizeof(saved_parameters));
+        if (dma_started) state->exit_auto_init = exit_auto_init;
+        refresh |= dma_refresh;
+        started |= dma_started;
+        reported_command = command;
+    }
     if (!state->test_mode &&
         state->midi_output_bytes != midi_output_bytes &&
         !state->midi_backend_warned) {
@@ -2198,6 +2280,141 @@ void dos_audio_shutdown(struct dos_vm *vm)
     dos_audio_transition_release(state);
     vm->audio = NULL;
     kfree(state);
+}
+
+static int dos_audio_dma_wait_selftest(dos_vm_t *vm)
+{
+    DOS_AUDIO_STATE *state = (DOS_AUDIO_STATE *)vm->audio;
+    uint8_t *memory = state->guest_memory;
+    int failures = 0;
+    unsigned checks = 0;
+#define DMA_WAIT_CHECK(expr) do { \
+    checks++; \
+    if (!(expr)) { \
+        failures++; \
+        serial_puts("[DOS-AUDIO-TEST] DMA wait failure line "); \
+        serial_putdec(__LINE__); \
+        serial_puts("\n"); \
+    } \
+} while (0)
+
+    for (unsigned wide = 0; wide < 2; wide++) {
+        for (unsigned capture = 0; capture < 2; capture++) {
+            for (unsigned gate = 0; gate < 3; gate++) {
+                dos_sb_parser_reset_locked(state);
+                DOS_DMA_CHANNEL *channel = wide ? &state->dma16 : &state->dma8;
+                *channel = (DOS_DMA_CHANNEL){ .address = 0xFFFFU,
+                    .count = 0xFFFFU, .masked = gate != 1U };
+                state->dma_command8 = state->dma_command16 = gate ? 4U : 0U;
+                state->output_rate = state->input_rate = AUDIO_OUTPUT_RATE_HZ;
+                state->output_rate_is_transfer_rate = false;
+                state->input_rate_is_transfer_rate = false;
+                uint8_t command = (wide ? 0xB0U : 0xC0U) | (capture ? 8U : 0U);
+                uint8_t count = wide ? 1U : 3U;
+                uint32_t errors = state->playback_errors + state->capture_errors;
+                memset(memory + 0x1000U, 0x5A, 4U);
+                dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, command);
+                dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0U);
+                dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, count);
+                dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0U);
+                DMA_WAIT_CHECK(state->waiting_for_dma && !state->playing &&
+                    !state->irq_pending && !state->irq_latched &&
+                    state->playback_errors + state->capture_errors == errors);
+                int16_t output[8];
+                DMA_WAIT_CHECK(!dos_audio_fill(state, output, 4U) &&
+                    memory[0x1000] == 0x5AU && memory[0x1003] == 0x5AU);
+                uint8_t status = 0;
+                dos_audio_port_read8(vm, wide ? 0xD0U : 0x08U, &status);
+                DMA_WAIT_CHECK(status & 0x20U);
+
+                dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C,
+                                      wide ? 0xD5U : 0xD0U);
+                dos_audio_port_write8(vm, wide ? 0xD8U : 0x0CU, 0U);
+                uint16_t address_port = wide ? 0xC4U : 0x02U;
+                uint16_t count_port = wide ? 0xC6U : 0x03U;
+                dos_audio_port_write8(vm, address_port, 0U);
+                dos_audio_port_write8(vm, address_port, wide ? 8U : 16U);
+                dos_audio_port_write8(vm, count_port, count);
+                dos_audio_port_write8(vm, count_port, 0U);
+                dos_audio_port_write8(vm, wide ? 0x8BU : 0x83U, 0U);
+                dos_audio_port_write8(vm, wide ? 0xD6U : 0x0BU,
+                                      capture ? 0x45U : 0x49U);
+                dos_audio_port_write8(vm, wide ? 0xD4U : 0x0AU, 1U);
+                dos_audio_port_write8(vm, wide ? 0xD0U : 0x08U, 0U);
+                DMA_WAIT_CHECK(state->waiting_for_dma && state->paused &&
+                    !state->playing && !state->irq_pending &&
+                    memory[0x1000] == 0x5AU && memory[0x1003] == 0x5AU);
+                dos_audio_port_read8(vm, wide ? 0xD0U : 0x08U, &status);
+                DMA_WAIT_CHECK(!(status & 0x20U));
+                dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C,
+                                      wide ? 0xD6U : 0xD4U);
+                DMA_WAIT_CHECK(!state->waiting_for_dma && state->playing &&
+                    !state->paused && !state->irq_pending &&
+                    state->dma_base == 0x1000U && state->block_bytes == 4U);
+                DMA_WAIT_CHECK(memory[0x1000] == (capture ? (wide ? 0U : 0x80U) : 0x5AU) &&
+                    memory[0x1003] == (capture ? 0x80U : 0x5AU));
+                DMA_WAIT_CHECK(dos_audio_fill(state, output, wide ? 2U : 4U) &&
+                    !state->playing && state->irq_pending == (wide ? 2U : 1U) &&
+                    state->playback_errors + state->capture_errors == errors);
+            }
+        }
+    }
+
+    dos_sb_parser_reset_locked(state);
+    state->dma8 = (DOS_DMA_CHANNEL){ .address = 0x1000U,
+        .count = 3U, .base_address = 0x1000U, .base_count = 3U,
+        .masked = true, .mode = 0x59U };
+    state->dma_command8 = 0;
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0x14U);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 3U);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0U);
+    /* DMA enable can arrive between the two bytes of a new rate command. */
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0x41U);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0x12U);
+    dos_audio_port_write8(vm, 0x0AU, 1U);
+    DMA_WAIT_CHECK(state->playing && state->block_bytes == 4U &&
+        state->command == 0x41U && state->parameter_expected == 2U &&
+        state->parameter_count == 1U && state->parameters[0] == 0x12U);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0x34U);
+    DMA_WAIT_CHECK(state->output_rate == 0x1234U && !state->parameter_expected);
+
+    /* A queued single-cycle command still follows a waiting auto-init block. */
+    dos_sb_parser_reset_locked(state);
+    state->dma8.masked = true;
+    state->block_units = 2U;
+    state->output_rate = AUDIO_OUTPUT_RATE_HZ;
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0x1CU);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0x14U);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0U);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0U);
+    DMA_WAIT_CHECK(state->waiting_for_dma && state->pending_dma_command &&
+        state->exit_auto_init);
+    dos_audio_port_write8(vm, 0x0AU, 1U);
+    int16_t output[8];
+    DMA_WAIT_CHECK(state->playing && state->auto_init && state->exit_auto_init &&
+        dos_audio_fill(state, output, 2U) && state->playing &&
+        !state->auto_init && !state->pending_dma_command &&
+        state->block_bytes == 1U);
+
+    /* ADPCM waits too; reset must cancel it before a later DMA enable. */
+    dos_sb_parser_reset_locked(state);
+    state->dma8.masked = true;
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0x75U);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 1U);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x0C, 0U);
+    DMA_WAIT_CHECK(state->waiting_for_dma && !state->playing);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x06, 1U);
+    dos_audio_port_write8(vm, DOS_SB_BASE + 0x06, 0U);
+    dos_audio_port_write8(vm, 0x0AU, 1U);
+    DMA_WAIT_CHECK(!state->waiting_for_dma && !state->playing &&
+        !state->pending_dma_command && !state->irq_pending);
+#undef DMA_WAIT_CHECK
+    serial_puts("[DOS-AUDIO-TEST] DMA wait checks=");
+    serial_putdec(checks);
+    serial_puts(" failures=");
+    serial_putdec(failures);
+    serial_puts("\n");
+    return failures;
 }
 
 int dos_audio_selftest(void)
@@ -2981,6 +3198,8 @@ int dos_audio_selftest(void)
         !dos_audio_take_irq(&vm, &vector, &pending) ||
         !(pending & DOS_SB_IRQ_8BIT))
         failures++;
+
+    failures += dos_audio_dma_wait_selftest(&vm);
 
     state->present = false;
     dos_audio_port_write8(&vm, DOS_SB_BASE + 0x06, 1U);

@@ -7,5 +7,6 @@
 bool dos_keyboard_ready(dos_vm_t *vm);
 uint16_t dos_keyboard_read(dos_vm_t *vm);
 void dos_keyboard_flush(dos_vm_t *vm);
+void dos_keyboard_irq(dos_vm_t *vm);
 
 #endif

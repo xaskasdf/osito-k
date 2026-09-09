@@ -14,6 +14,7 @@
 #include "dos_mouse.h"
 #include "dos_time.h"
 #include "dos_vbe.h"
+#include "../include/input_events.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -106,18 +107,145 @@ static bool dos_key_pending(dos_vm_t *vm)
     return vm->kb_head != vm->kb_tail;
 }
 
-static void dos_key_enqueue(dos_vm_t *vm, uint8_t ascii)
+static void dos_key_enqueue_word(dos_vm_t *vm, uint16_t key)
 {
     uint8_t next = (uint8_t)((vm->kb_head + 1U) & DOS_KEY_BUFFER_MASK);
     if (next == vm->kb_tail) return;
-    vm->kb_buffer[vm->kb_head] = dos_key_word(ascii);
+    vm->kb_buffer[vm->kb_head] = key;
     vm->kb_head = next;
+}
+
+static void dos_key_enqueue(dos_vm_t *vm, uint8_t ascii)
+{
+    dos_key_enqueue_word(vm, dos_key_word(ascii));
+}
+
+static bool dos_key_down(const dos_vm_t *vm, uint8_t key)
+{
+    return (vm->kb_down[key >> 3] & (1U << (key & 7U))) != 0;
+}
+
+static void dos_keyboard_decode(dos_vm_t *vm, uint8_t byte)
+{
+    if (vm->kb_pause_remaining) { vm->kb_pause_remaining--; return; }
+    if (byte == 0xE1) { vm->kb_pause_remaining = 5; vm->kb_set1_prefix = 0; return; }
+    if (byte == 0xE0) { vm->kb_set1_prefix = byte; return; }
+    bool extended = vm->kb_set1_prefix != 0;
+    vm->kb_set1_prefix = 0;
+    uint8_t scan = byte & 0x7F;
+    uint8_t key = scan | (extended ? 0x80 : 0);
+    bool pressed = !(byte & 0x80);
+    bool repeat = dos_key_down(vm, key);
+    if (pressed) vm->kb_down[key >> 3] |= 1U << (key & 7U);
+    else vm->kb_down[key >> 3] &= ~(1U << (key & 7U));
+    uint8_t flags = dos_mem_read8(vm, 0x417) & 0xF0;
+    if (dos_key_down(vm, 0x36)) flags |= 1;
+    if (dos_key_down(vm, 0x2A)) flags |= 2;
+    if (dos_key_down(vm, 0x1D) || dos_key_down(vm, 0x9D)) flags |= 4;
+    if (dos_key_down(vm, 0x38) || dos_key_down(vm, 0xB8)) flags |= 8;
+    if (pressed && !repeat) {
+        if (!extended && scan == 0x46) flags ^= 0x10;
+        if (!extended && scan == 0x45) flags ^= 0x20;
+        if (!extended && scan == 0x3A) flags ^= 0x40;
+        if (extended && scan == 0x52) flags ^= 0x80;
+    }
+    dos_mem_write8(vm, 0x417, flags);
+    dos_mem_write8(vm, 0x418,
+        (dos_key_down(vm, 0x1D) ? 1 : 0) |
+        (dos_key_down(vm, 0x38) ? 2 : 0) |
+        (dos_key_down(vm, 0x46) ? 0x10 : 0) |
+        (dos_key_down(vm, 0x45) ? 0x20 : 0) |
+        (dos_key_down(vm, 0x3A) ? 0x40 : 0) |
+        (dos_key_down(vm, 0xD2) ? 0x80 : 0));
+    dos_mem_write8(vm, 0x496, 0x10 |
+        (dos_key_down(vm, 0x9D) ? 4 : 0) |
+        (dos_key_down(vm, 0xB8) ? 8 : 0));
+    if (!pressed || !scan || scan == 0x1D || scan == 0x38 ||
+        scan == 0x2A || scan == 0x36 || scan == 0x3A ||
+        scan == 0x45 || scan == 0x46) return;
+
+    static const uint8_t normal[128] = {
+        [1]=27, [2]='1',[3]='2',[4]='3',[5]='4',[6]='5',[7]='6',[8]='7',
+        [9]='8',[10]='9',[11]='0',[12]='-',[13]='=',[14]='\b',[15]='\t',
+        [16]='q',[17]='w',[18]='e',[19]='r',[20]='t',[21]='y',[22]='u',
+        [23]='i',[24]='o',[25]='p',[26]='[',[27]=']',[28]='\r',
+        [30]='a',[31]='s',[32]='d',[33]='f',[34]='g',[35]='h',[36]='j',
+        [37]='k',[38]='l',[39]=';',[40]='\'',[41]='`',[43]='\\',
+        [44]='z',[45]='x',[46]='c',[47]='v',[48]='b',[49]='n',[50]='m',
+        [51]=',',[52]='.',[53]='/',[55]='*',[57]=' ',[74]='-',[78]='+'
+    };
+    static const uint8_t shifted[128] = {
+        [2]='!',[3]='@',[4]='#',[5]='$',[6]='%',[7]='^',[8]='&',
+        [9]='*',[10]='(',[11]=')',[12]='_',[13]='+',[26]='{',[27]='}',
+        [39]=':',[40]='"',[41]='~',[43]='|',[51]='<',[52]='>',[53]='?'
+    };
+    bool shift = (flags & 3) != 0;
+    uint8_t ascii = normal[scan];
+    if (extended) {
+        if (scan == 0x1C) ascii = '\r';
+        else if (scan == 0x35) ascii = '/';
+        else if (scan < 0x47 || scan > 0x53) return;
+        else ascii = 0;
+    } else if (scan >= 0x47 && scan <= 0x53 && scan != 0x4A && scan != 0x4E) {
+        static const char keypad[] = "789-456+1230.";
+        ascii = ((flags & 0x20) != 0) != shift ? keypad[scan - 0x47] : 0;
+    } else if (ascii >= 'a' && ascii <= 'z') {
+        if (shift != ((flags & 0x40) != 0)) ascii -= 'a' - 'A';
+    } else if (shift && shifted[scan]) ascii = shifted[scan];
+
+    if (flags & 4) {
+        if (ascii >= 'a' && ascii <= 'z') ascii -= 'a' - 1;
+        else if (ascii >= 'A' && ascii <= 'Z') ascii -= 'A' - 1;
+        else if (ascii >= '[' && ascii <= '_') ascii -= '@';
+        else if (scan == 0x1C) ascii = '\n';
+    }
+    if (flags & 8) ascii = 0;
+    if (scan >= 0x3B && scan <= 0x44)
+        scan += (flags & 8) ? 0x2D : (flags & 4) ? 0x23 : shift ? 0x19 : 0;
+    else if (scan == 0x57 || scan == 0x58)
+        scan = 0x85 + scan - 0x57 + ((flags & 8) ? 6 : (flags & 4) ? 4 : shift ? 2 : 0);
+    else if (!ascii && !extended && !(flags & 8) &&
+             (scan < 0x47 || scan > 0x53)) return;
+    dos_key_enqueue_word(vm, ((uint16_t)scan << 8) | ascii);
+}
+
+void dos_keyboard_irq(dos_vm_t *vm)
+{
+    if (dos_io_read8(vm, 0x64) & 1U)
+        dos_keyboard_decode(vm, dos_io_read8(vm, 0x60));
+    dos_io_write8(vm, 0x20, 0x61); /* Specific EOI for IRQ1. */
+}
+
+static void dos_keyboard_service(dos_vm_t *vm)
+{
+    if (!vm->cpu || !dos_io_keyboard_poll(vm)) return;
+    cpu8086_state_t *cpu = vm->cpu;
+    cpu8086_state_t saved = *cpu;
+    bool virtual_if = vm->dpmi.virtual_interrupts_enabled;
+    uint8_t vector;
+    /* BIOS keyboard services enable interrupts while waiting. Run the
+     * installed handler to its IRET even when this call originated in PM. */
+    cpu->flags |= FLAG_IF;
+    vm->dpmi.virtual_interrupts_enabled = true;
+    if (dos_io_irq_begin(vm, 1, &vector) && cpu_deliver_hw_interrupt(vm, vector)) {
+        bool returned = cpu8086_run_until(vm, saved.protected_mode, saved.cs, saved.eip);
+        uint64_t instructions = cpu->insn_count;
+        bool running = cpu->running;
+        int exit_code = cpu->exit_code;
+        *cpu = saved;
+        cpu->insn_count = instructions;
+        if (!returned) { cpu->running = running; cpu->exit_code = exit_code; }
+    } else {
+        *cpu = saved;
+    }
+    vm->dpmi.virtual_interrupts_enabled = virtual_if;
 }
 
 bool dos_keyboard_ready(dos_vm_t *vm)
 {
+    dos_keyboard_service(vm);
     if (dos_key_pending(vm)) return true;
-    if (kb_has_input()) {
+    if (!input_keyboard_is_owner(vm) && kb_has_input()) {
         dos_key_enqueue(vm, (uint8_t)kb_getchar());
     } else {
         int ch = serial_getc();
@@ -135,8 +263,15 @@ static uint16_t dos_key_pop(dos_vm_t *vm)
 
 uint16_t dos_keyboard_read(dos_vm_t *vm)
 {
-    if (!dos_key_pending(vm))
-        dos_key_enqueue(vm, (uint8_t)kb_getchar());
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; sti" : "=r"(flags) :: "memory");
+    while (!dos_keyboard_ready(vm)) {
+        if (vm->process_terminated) break;
+        /* The host timer also wakes us for polled USB and serial input. */
+        __asm__ volatile ("hlt" ::: "memory");
+    }
+    if (!(flags & (1ULL << 9))) __asm__ volatile ("cli" ::: "memory");
+    if (!dos_key_pending(vm)) return 0;
     return dos_key_pop(vm);
 }
 
@@ -213,6 +348,8 @@ void dos_int10_video(dos_vm_t *vm)
         dos_vbe_leave_mode(vm);
         vm->vga_mode = mode;
         vm->vga_page = 0;
+        dos_io_vga_set_mode(vm, mode, !(request & 0x80u));
+        dos_native_map_video(vm);
         dos_vga_set_mode(mode);
         dos_mouse_video_mode_changed(vm);
         vm->mem[0x449] = mode;
@@ -524,7 +661,11 @@ void dos_int16_keyboard(dos_vm_t *vm)
     /* AH=02h/12h: Get shift flags */
     case 0x02:
     case 0x12:
-        cpu->al = kb_get_bios_shift_flags();
+        cpu->al = input_keyboard_is_owner(vm) ? dos_mem_read8(vm, 0x417) :
+                                               kb_get_bios_shift_flags();
+        if (cpu->ah == 0x12)
+            cpu->ah = dos_mem_read8(vm, 0x418) |
+                      ((dos_mem_read8(vm, 0x496) & 0x0C) << 2);
         break;
 
     default:
@@ -669,6 +810,11 @@ static int dos_bios_video_selftest(void)
     vm.cursor_end = 7;
     cpu8086_init(&cpu, &vm);
 
+    if (!dos_io_init(&vm)) {
+        dos_host_free_pages(memory, pages);
+        return 1;
+    }
+
     int failures = 0;
     dos_mem_write16(&vm, 0x450, 0x0000);
     dos_mem_write16(&vm, 0x452, 0x0203);
@@ -761,12 +907,14 @@ static int dos_bios_video_selftest(void)
         failures++;
     }
 
-    memory[0xA0000U] = 0x5A;
-    memory[0xA0000U + 320U * 200U - 1U] = 0xA5;
     cpu.ax = 0x0013;
     dos_int10_video(&vm);
-    if (memory[0xA0000U] != 0 ||
-        memory[0xA0000U + 320U * 200U - 1U] != 0 ||
+    dos_mem_write8(&vm, 0xA0000U, 0x5A);
+    dos_mem_write8(&vm, 0xA0000U + 320U * 200U - 1U, 0xA5);
+    cpu.ax = 0x0013;
+    dos_int10_video(&vm);
+    if (dos_mem_read8(&vm, 0xA0000U) != 0 ||
+        dos_mem_read8(&vm, 0xA0000U + 320U * 200U - 1U) != 0 ||
         vm.vga_mode != 0x13 || memory[0x449] != 0x13 ||
         dos_mem_read16(&vm, 0x44A) != 40 ||
         dos_mem_read16(&vm, 0x44C) != 0xFA00U ||
@@ -775,10 +923,10 @@ static int dos_bios_video_selftest(void)
         failures++;
     }
 
-    memory[0xA0000U] = 0x5A;
+    dos_mem_write8(&vm, 0xA0000U, 0x5A);
     cpu.ax = 0x0093; /* mode 13h with no-clear bit */
     dos_int10_video(&vm);
-    if (memory[0xA0000U] != 0x5A || vm.vga_mode != 0x13) {
+    if (dos_mem_read8(&vm, 0xA0000U) != 0x5A || vm.vga_mode != 0x13) {
         serial_puts("[DOS-TEST] BIOS video no-clear mode\n");
         failures++;
     }
@@ -790,6 +938,7 @@ static int dos_bios_video_selftest(void)
         failures++;
     }
 
+    dos_io_shutdown(&vm);
     dos_host_free_pages(memory, pages);
     return failures;
 }
@@ -951,6 +1100,22 @@ int dos_bios_contract_selftest(void)
         failures++;
     }
 
+    dos_vm_t key_vm = {0};
+    key_vm.mem = dos_host_alloc_pages(1);
+    key_vm.total_mem_size = 4096;
+    if (!key_vm.mem) failures++;
+    else {
+        memset(key_vm.mem, 0, 4096);
+        const uint8_t keys[] = {0x1E,0x9E,0x2A,0x30,0xB0,0xAA,
+                               0xE0,0x48,0xE0,0xC8,0x1D,0x2E,0xAE,0x9D};
+        const uint16_t words[] = {0x1E61,0x3042,0x4800,0x2E03};
+        for (unsigned i = 0; i < sizeof(keys); i++) dos_keyboard_decode(&key_vm, keys[i]);
+        for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+            if (!dos_key_pending(&key_vm) || dos_key_pop(&key_vm) != words[i]) failures++;
+        }
+        if (dos_key_pending(&key_vm) || dos_mem_read8(&key_vm, 0x417)) failures++;
+        dos_host_free_pages(key_vm.mem, 1);
+    }
     failures += dos_bios_video_selftest();
     return failures;
 }

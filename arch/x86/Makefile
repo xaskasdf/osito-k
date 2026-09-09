@@ -190,7 +190,7 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/dhcp.c kernel/ntp.c kernel/ipv6.c kernel/mdns.c \
            kernel/tensor.c \
            kernel/tensor_avx2.c kernel/inference.c kernel/idt.c \
-           kernel/paging.c kernel/heap.c kernel/syscall.c \
+           kernel/paging.c kernel/compat_iret.c kernel/heap.c kernel/syscall.c \
            kernel/elf.c kernel/process.c \
            kernel/keyboard.c kernel/terminal.c kernel/shell.c kernel/pkg.c \
            kernel/crypto.c kernel/tls.c kernel/http.c kernel/claude.c \
@@ -225,7 +225,7 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/inferconnect.c kernel/inferconnect_rpc.c kernel/inferconnect_client.c \
            kernel/inferconnect_oict.c kernel/inference_shims.c kernel/agent_simple.c \
            kernel/cluster.c kernel/cluster_rendezvous.c
-ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
+ASM_SRC  = kernel/isr_stubs.S kernel/compat_iret_tail.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/rtl8111.c drivers/gpu.c drivers/gsp.c \
            drivers/intel_gfx.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c \
@@ -261,7 +261,7 @@ DOS_SRC  = dos/dos_init.c dos/dos_exec.c dos/dos_loader.c \
            dos/dos_api.c dos/dos_bios.c dos/dos_time.c dos/dos_find.c \
            dos/dos_vga.c dos/dos_vbe.c dos/dos_io.c dos/dos_mouse.c \
            dos/dos_audio.c \
-           dos/dos_dpmi.c dos/dos_vcpi.c dos/dos_jit.c
+           dos/dos_dpmi.c dos/dos_vcpi.c dos/dos_jit.c dos/dos_paging.c
 GUI_SRC  = ../../gui/gui_draw.c ../../gui/gui_text.c \
            ../../gui/gui_panel.c ../../gui/gui_dock.c \
            ../../gui/gui_desktop.c ../../gui/gui_window.c \
@@ -293,7 +293,7 @@ KERNEL_FLAGS_STAMP = $(BUILD)/.kernel-cflags-$(KERNEL_FLAGS_ID)
 KERN_MINIMAL = kernel/main.c kernel/serial.c kernel/framebuffer.c \
                kernel/pci.c kernel/memory.c kernel/mem_extern.c kernel/net.c \
                kernel/tensor.c kernel/tensor_avx2.c kernel/inference.c \
-               kernel/idt.c kernel/paging.c kernel/heap.c kernel/syscall.c \
+               kernel/idt.c kernel/paging.c kernel/compat_iret.c kernel/heap.c kernel/syscall.c \
                kernel/elf.c kernel/process.c \
                kernel/keyboard.c kernel/terminal.c kernel/shell.c kernel/pkg.c \
                kernel/crypto.c kernel/tls.c kernel/http.c kernel/claude.c \
@@ -313,7 +313,8 @@ ALL_MIN_OBJ  = $(KERN_MIN_OBJ) $(ASM_OBJ) $(DRV_MIN_OBJ) $(FS_MIN_OBJ) \
                $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
 
 .PHONY: all clean check-deps legacy tcc tcc-clean minimal libvulkan pxe \
-	dos-dpmi-test dos-vbe-native-test dos-audio-native-test dos-vga-test \
+	dos-dpmi-test dos-vbe-native-test dos-audio-native-test dos-flags-test dos-debug-test dos-string-io-test dos-exception-test dos-vga-test \
+	dos-record-service-test dos-real-exception-test dos-callback-entry-test dos-exec-primary-test \
 	oss-audio-elf-test \
 	oss-audio-execve-elf-test oss-audio-no-device-elf-test \
 	shm-surface-elf-test console-input-elf-test dos-console-input-test \
@@ -334,6 +335,71 @@ dos-dpmi-test: $(BUILD)/test/dpmi_native.com
 dos-vbe-native-test: $(BUILD)/test/dpmi_vbe.com
 
 dos-audio-native-test: $(BUILD)/test/dpmi_audio.com
+
+dos-flags-test: $(BUILD)/test/dpflags16.com $(BUILD)/test/dpflags32.com
+
+dos-rm-arguments-test: $(BUILD)/test/dpargs16.com $(BUILD)/test/dpargs32.com
+
+dos-record-service-test: $(BUILD)/test/dprs16.com $(BUILD)/test/dprs32.com \
+	$(BUILD)/test/dprss16.com $(BUILD)/test/dprss32.com
+
+dos-state-recovery-test: $(BUILD)/test/dpsr16.com $(BUILD)/test/dpsr32.com \
+	$(BUILD)/test/dpsrs16.com $(BUILD)/test/dpsrs32.com
+
+dos-callback-recovery-test: $(BUILD)/test/dpcr16.com $(BUILD)/test/dpcr32.com \
+	$(BUILD)/test/dpcrs16.com $(BUILD)/test/dpcrs32.com
+
+dos-callback-register-test: $(BUILD)/test/dprg16.com $(BUILD)/test/dprg32.com \
+	$(BUILD)/test/dprgs16.com $(BUILD)/test/dprgs32.com
+
+dos-real-exception-test: $(BUILD)/test/dpre16.com $(BUILD)/test/dpre32.com \
+                         $(BUILD)/test/dpres16.com $(BUILD)/test/dpres32.com
+
+dos-callback-entry-test: $(BUILD)/test/dpce16.com $(BUILD)/test/dpce32.com \
+	$(BUILD)/test/dpces16.com $(BUILD)/test/dpces32.com
+
+dos-exec-primary-test: $(BUILD)/test/dpxp16.com $(BUILD)/test/dpxp32.com \
+	$(BUILD)/test/dpxps16.com $(BUILD)/test/dpxps32.com $(BUILD)/test/dpxreal.com \
+	$(BUILD)/test/dpxleaf.com $(BUILD)/test/dpxnew.com
+
+$(BUILD)/test/dpxp16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 --defsym CHILD=0 -o $@ $<
+
+$(BUILD)/test/dpxp32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 --defsym CHILD=0 -o $@ $<
+
+$(BUILD)/test/dpxps16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 --defsym CHILD=0 -o $@ $<
+
+$(BUILD)/test/dpxps32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 --defsym CHILD=0 -o $@ $<
+
+$(BUILD)/test/dpxreal.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=1 -o $@ $<
+
+$(BUILD)/test/dpxleaf.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=2 -o $@ $<
+
+$(BUILD)/test/dpxnew.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=3 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dpxp16.com dpxp32.com dpxps16.com dpxps32.com dpxreal.com dpxleaf.com dpxnew.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+dos-extended-exception-test: $(BUILD)/test/dpee16.com $(BUILD)/test/dpee32.com \
+	$(BUILD)/test/dpees16.com $(BUILD)/test/dpees32.com
+
+dos-debug-test: $(BUILD)/test/dpdebug16.com $(BUILD)/test/dpdebug32.com
+
+dos-string-io-test: $(BUILD)/test/dpstr16.com $(BUILD)/test/dpstr32.com
+
+dos-exception-test: $(BUILD)/test/dpex16.com $(BUILD)/test/dpex32.com \
+	$(BUILD)/test/dpxf16.com $(BUILD)/test/dpxf32.com $(BUILD)/test/dpfault.com \
+	$(BUILD)/test/dpfalt32.com $(BUILD)/test/dpff16.com $(BUILD)/test/dpff32.com \
+	$(BUILD)/test/dplock16.com $(BUILD)/test/dplock32.com \
+	$(BUILD)/test/dpsw16.com $(BUILD)/test/dpsw32.com $(BUILD)/test/dpswn16.com $(BUILD)/test/dpswn32.com \
+	$(BUILD)/test/dpstate16.com $(BUILD)/test/dpstate32.com \
+	$(BUILD)/test/dpcbuf16.com $(BUILD)/test/dpcbuf32.com
 
 dos-vga-test: $(BUILD)/test/dosvga.com
 
@@ -381,11 +447,395 @@ $(BUILD)/test/dpmi_vbe.com: $(BUILD)/test/dpmi_vbe.o test/dpmi_native.ld
 $(BUILD)/test/dpmi_vbe.o: test/dpmi_vbe.S | $(BUILD)/test
 	as --32 -o $@ $<
 
+$(BUILD)/test/dpvgamem.com: $(BUILD)/test/dpmi_vga_memory.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_vga_memory.o: test/dpmi_vga_memory.S | $(BUILD)/test
+	as --32 -o $@ $<
+
 $(BUILD)/test/dpmi_audio.com: $(BUILD)/test/dpmi_audio.o test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
 $(BUILD)/test/dpmi_audio.o: test/dpmi_audio.S | $(BUILD)/test
 	as --32 -o $@ $<
+
+$(BUILD)/test/dpflags16.com: $(BUILD)/test/dpmi_flags16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpflags32.com: $(BUILD)/test/dpmi_flags32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_flags16.o: test/dpmi_flags.S | $(BUILD)/test
+	as --32 --defsym PM32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_flags32.o: test/dpmi_flags.S | $(BUILD)/test
+	as --32 --defsym PM32=1 -o $@ $<
+
+$(BUILD)/test/dpdebug16.com: $(BUILD)/test/dpmi_debug16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpdebug32.com: $(BUILD)/test/dpmi_debug32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_debug16.o: test/dpmi_debug.S | $(BUILD)/test
+	as --32 --defsym PM32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_debug32.o: test/dpmi_debug.S | $(BUILD)/test
+	as --32 --defsym PM32=1 -o $@ $<
+
+$(BUILD)/test/dpstr16.com: $(BUILD)/test/dpmi_string_io16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpstr32.com: $(BUILD)/test/dpmi_string_io32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_string_io16.o: test/dpmi_string_io.S | $(BUILD)/test
+	as --32 --defsym PM32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_string_io32.o: test/dpmi_string_io.S | $(BUILD)/test
+	as --32 --defsym PM32=1 -o $@ $<
+
+$(BUILD)/test/dpex16.com: $(BUILD)/test/dpmi_exception_defaults16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpex32.com: $(BUILD)/test/dpmi_exception_defaults32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_exception_defaults16.o: test/dpmi_exception_defaults.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym FATAL_CHAIN=0 -o $@ $<
+
+$(BUILD)/test/dpmi_exception_defaults32.o: test/dpmi_exception_defaults.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym FATAL_CHAIN=0 -o $@ $<
+
+$(BUILD)/test/dpxf16.com: $(BUILD)/test/dpmi_exception_fatal16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpxf32.com: $(BUILD)/test/dpmi_exception_fatal32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_exception_fatal16.o: test/dpmi_exception_defaults.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym FATAL_CHAIN=1 -o $@ $<
+
+$(BUILD)/test/dpmi_exception_fatal32.o: test/dpmi_exception_defaults.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym FATAL_CHAIN=1 -o $@ $<
+
+$(BUILD)/test/dpfault.com: $(BUILD)/test/dpmi_native_faults.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dplock16.com: $(BUILD)/test/dpmi_locked_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dplock32.com: $(BUILD)/test/dpmi_locked_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_locked_stack16.o: test/dpmi_locked_stack.S | $(BUILD)/test
+	as --32 --defsym PM32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_locked_stack32.o: test/dpmi_locked_stack.S | $(BUILD)/test
+	as --32 --defsym PM32=1 -o $@ $<
+
+$(BUILD)/test/dpsw16.com: $(BUILD)/test/dpmi_software_frame16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpsw32.com: $(BUILD)/test/dpmi_software_frame32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpswn16.com: $(BUILD)/test/dpmi_software_frame_native16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpswn32.com: $(BUILD)/test/dpmi_software_frame_native32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_software_frame16.o: test/dpmi_software_frame.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 --defsym NATIVE_GATE=0 -o $@ $<
+
+$(BUILD)/test/dpmi_software_frame32.o: test/dpmi_software_frame.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 --defsym NATIVE_GATE=0 -o $@ $<
+
+$(BUILD)/test/dpmi_software_frame_native16.o: test/dpmi_software_frame.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 --defsym NATIVE_GATE=1 -o $@ $<
+
+$(BUILD)/test/dpmi_software_frame_native32.o: test/dpmi_software_frame.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 --defsym NATIVE_GATE=1 -o $@ $<
+
+$(BUILD)/test/dpsb16.com: $(BUILD)/test/dpmi_service_buffer16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprs16.com: $(BUILD)/test/dpmi_record_service16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpsr16.com: $(BUILD)/test/dpmi_state_recovery16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpcr16.com: $(BUILD)/test/dpmi_callback_recovery16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprg16.com: $(BUILD)/test/dpmi_callback_register16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprg32.com: $(BUILD)/test/dpmi_callback_register32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprgs16.com: $(BUILD)/test/dpmi_callback_register_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprgs32.com: $(BUILD)/test/dpmi_callback_register_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_callback_register16.o: test/dpmi_callback_register.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_register32.o: test/dpmi_callback_register.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_register_stack16.o: test/dpmi_callback_register.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_register_stack32.o: test/dpmi_callback_register.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpce16.com: $(BUILD)/test/dpmi_callback_entry16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpce32.com: $(BUILD)/test/dpmi_callback_entry32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpces16.com: $(BUILD)/test/dpmi_callback_entry_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpces32.com: $(BUILD)/test/dpmi_callback_entry_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_callback_entry16.o: test/dpmi_callback_entry.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_entry32.o: test/dpmi_callback_entry.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_entry_stack16.o: test/dpmi_callback_entry.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_entry_stack32.o: test/dpmi_callback_entry.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpre16.com: $(BUILD)/test/dpmi_real_exception16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpre32.com: $(BUILD)/test/dpmi_real_exception32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpres16.com: $(BUILD)/test/dpmi_real_exception_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpres32.com: $(BUILD)/test/dpmi_real_exception_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_real_exception16.o: test/dpmi_real_exception.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_real_exception32.o: test/dpmi_real_exception.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_real_exception_stack16.o: test/dpmi_real_exception.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_real_exception_stack32.o: test/dpmi_real_exception.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpee16.com: $(BUILD)/test/dpmi_extended_exception16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpee32.com: $(BUILD)/test/dpmi_extended_exception32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpees16.com: $(BUILD)/test/dpmi_extended_exception_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpees32.com: $(BUILD)/test/dpmi_extended_exception_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_extended_exception16.o: test/dpmi_extended_exception.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_extended_exception32.o: test/dpmi_extended_exception.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_extended_exception_stack16.o: test/dpmi_extended_exception.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_extended_exception_stack32.o: test/dpmi_extended_exception.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpcr32.com: $(BUILD)/test/dpmi_callback_recovery32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpcrs16.com: $(BUILD)/test/dpmi_callback_recovery_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpcrs32.com: $(BUILD)/test/dpmi_callback_recovery_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_callback_recovery16.o: test/dpmi_callback_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_recovery32.o: test/dpmi_callback_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_recovery_stack16.o: test/dpmi_callback_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_recovery_stack32.o: test/dpmi_callback_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpsr32.com: $(BUILD)/test/dpmi_state_recovery32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpsrs16.com: $(BUILD)/test/dpmi_state_recovery_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpsrs32.com: $(BUILD)/test/dpmi_state_recovery_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_state_recovery16.o: test/dpmi_state_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_state_recovery32.o: test/dpmi_state_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_state_recovery_stack16.o: test/dpmi_state_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_state_recovery_stack32.o: test/dpmi_state_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dprs32.com: $(BUILD)/test/dpmi_record_service32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprss16.com: $(BUILD)/test/dpmi_record_service_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprss32.com: $(BUILD)/test/dpmi_record_service_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_record_service16.o: test/dpmi_record_service.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_record_service32.o: test/dpmi_record_service.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_record_service_stack16.o: test/dpmi_record_service.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_record_service_stack32.o: test/dpmi_record_service.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dprec16.com: $(BUILD)/test/dpmi_io_recovery16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprec32.com: $(BUILD)/test/dpmi_io_recovery32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprecs16.com: $(BUILD)/test/dpmi_io_recovery_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprecs32.com: $(BUILD)/test/dpmi_io_recovery_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_io_recovery16.o: test/dpmi_io_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_io_recovery32.o: test/dpmi_io_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_io_recovery_stack16.o: test/dpmi_io_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_io_recovery_stack32.o: test/dpmi_io_recovery.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpsb32.com: $(BUILD)/test/dpmi_service_buffer32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpsbs16.com: $(BUILD)/test/dpmi_service_buffer_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpsbs32.com: $(BUILD)/test/dpmi_service_buffer_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_service_buffer16.o: test/dpmi_service_buffer.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_service_buffer32.o: test/dpmi_service_buffer.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_service_buffer_stack16.o: test/dpmi_service_buffer.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_service_buffer_stack32.o: test/dpmi_service_buffer.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpsbnp32.com: $(BUILD)/test/dpmi_service_buffer_loaded_np.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_service_buffer_loaded_np.o: test/dpmi_service_buffer.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 --defsym LOADED_NP=1 -o $@ $<
+
+$(BUILD)/test/dpnseg16.com: $(BUILD)/test/dpmi_native_segments16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpnseg32.com: $(BUILD)/test/dpmi_native_segments32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_native_segments16.o: test/dpmi_native_segments.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_native_segments32.o: test/dpmi_native_segments.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpstate16.com: $(BUILD)/test/dpmi_mode_state16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpstate32.com: $(BUILD)/test/dpmi_mode_state32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_mode_state16.o: test/dpmi_mode_state.S | $(BUILD)/test
+	as --32 --defsym PM32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_mode_state32.o: test/dpmi_mode_state.S | $(BUILD)/test
+	as --32 --defsym PM32=1 -o $@ $<
+
+$(BUILD)/test/dpcbuf16.com: $(BUILD)/test/dpmi_callback_buffer16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpcbuf32.com: $(BUILD)/test/dpmi_callback_buffer32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_callback_buffer16.o: test/dpmi_callback_buffer.S | $(BUILD)/test
+	as --32 --defsym PM32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_callback_buffer32.o: test/dpmi_callback_buffer.S | $(BUILD)/test
+	as --32 --defsym PM32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_native_faults.o: test/dpmi_native_faults.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym FATAL_DEFAULT=0 -o $@ $<
+
+$(BUILD)/test/dpfalt32.com: $(BUILD)/test/dpmi_native_faults32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_native_faults32.o: test/dpmi_native_faults.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym FATAL_DEFAULT=0 -o $@ $<
+
+$(BUILD)/test/dpff16.com: $(BUILD)/test/dpmi_native_faults_fatal16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_native_faults_fatal16.o: test/dpmi_native_faults.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym FATAL_DEFAULT=1 -o $@ $<
+
+$(BUILD)/test/dpff32.com: $(BUILD)/test/dpmi_native_faults_fatal32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_native_faults_fatal32.o: test/dpmi_native_faults.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym FATAL_DEFAULT=1 -o $@ $<
 
 $(BUILD)/test/dosvga.com: $(BUILD)/test/dos_vga_text.o test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
@@ -398,6 +848,42 @@ $(BUILD)/test/doscon.com: $(BUILD)/test/dos_console_input.o \
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
 $(BUILD)/test/dos_console_input.o: test/dos_console_input.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dosjit.com: $(BUILD)/test/dos_jit_contract.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_jit_contract.o: test/dos_jit_contract.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dosivt.com: $(BUILD)/test/dos_ivt_contract.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_ivt_contract.o: test/dos_ivt_contract.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dprom16.com: $(BUILD)/test/dpmi_rom16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprom32.com: $(BUILD)/test/dpmi_rom32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_rom16.o: test/dpmi_rom_chain.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpmi_rom32.o: test/dpmi_rom_chain.S | $(BUILD)/test
+	as --32 --defsym CLIENT32=1 -o $@ $<
+
+$(BUILD)/test/dosbits.com: $(BUILD)/test/dos_bitops.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_bitops.o: test/dos_bitops.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dospop.com: $(BUILD)/test/dos_pop_contract.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_pop_contract.o: test/dos_pop_contract.S | $(BUILD)/test
 	as --32 -o $@ $<
 
 $(BUILD)/test/dosioctl.com: $(BUILD)/test/dos_ioctl.o test/dpmi_native.ld
@@ -445,6 +931,54 @@ $(BUILD)/test/dcchild.com: $(BUILD)/test/dos_critical_child.o test/dpmi_native.l
 $(BUILD)/test/dos_critical_child.o: test/dos_critical_child.S | $(BUILD)/test
 	as --32 -o $@ $<
 
+$(BUILD)/test/dpcrit16.com: $(BUILD)/test/dpmi_critical16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_critical16.o: test/dpmi_critical.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpargs16.com: $(BUILD)/test/dpmi_rm_arguments16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_rm_arguments16.o: test/dpmi_rm_arguments.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpargs32.com: $(BUILD)/test/dpmi_rm_arguments32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_rm_arguments32.o: test/dpmi_rm_arguments.S | $(BUILD)/test
+	as --32 --defsym CLIENT32=1 -o $@ $<
+
+$(BUILD)/test/dpcrit32.com: $(BUILD)/test/dpmi_critical32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_critical32.o: test/dpmi_critical.S | $(BUILD)/test
+	as --32 --defsym CLIENT32=1 -o $@ $<
+
+$(BUILD)/test/dpio16.com: $(BUILD)/test/dpmi_file_io16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_file_io16.o: test/dpmi_file_io.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpio32.com: $(BUILD)/test/dpmi_file_io32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_file_io32.o: test/dpmi_file_io.S | $(BUILD)/test
+	as --32 --defsym CLIENT32=1 -o $@ $<
+
+$(BUILD)/test/dpcon16.com: $(BUILD)/test/dpmi_console16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_console16.o: test/dpmi_console.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpcon32.com: $(BUILD)/test/dpmi_console32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_console32.o: test/dpmi_console.S | $(BUILD)/test
+	as --32 --defsym CLIENT32=1 -o $@ $<
+
 $(BUILD)/test/dpbreak16.com: $(BUILD)/test/dpmi_break16.o test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
@@ -455,6 +989,24 @@ $(BUILD)/test/dpbreak32.com: $(BUILD)/test/dpmi_break32.o test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
 $(BUILD)/test/dpmi_break32.o: test/dpmi_break.S | $(BUILD)/test
+	as --32 --defsym CLIENT32=1 -o $@ $<
+
+$(BUILD)/test/doskey.com: $(BUILD)/test/dos_keyboard_rm.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_keyboard_rm.o: test/dos_keyboard_irq.S | $(BUILD)/test
+	as --32 --defsym REALMODE=1 -o $@ $<
+
+$(BUILD)/test/dpkey16.com: $(BUILD)/test/dos_keyboard16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_keyboard16.o: test/dos_keyboard_irq.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpkey32.com: $(BUILD)/test/dos_keyboard32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dos_keyboard32.o: test/dos_keyboard_irq.S | $(BUILD)/test
 	as --32 --defsym CLIENT32=1 -o $@ $<
 
 $(BUILD)/test/dos_stdio_child.o: test/dos_stdio_child.S | $(BUILD)/test

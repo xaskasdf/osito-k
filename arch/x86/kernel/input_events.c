@@ -109,6 +109,105 @@ static int32_t  mouse_release_y[INPUT_MOUSE_BUTTON_COUNT];
 
 static uint8_t kb_modifiers;  /* current KEY_FLAG_* state */
 
+#define INPUT_KEYBOARD_BYTES 256U
+static const void *keyboard_owner;
+static uint8_t keyboard_bytes[INPUT_KEYBOARD_BYTES];
+static uint32_t keyboard_read, keyboard_write, keyboard_count;
+static bool keyboard_overrun;
+static uint8_t keyboard_lock;
+
+static uint64_t input_keyboard_lock(void)
+{
+    uint64_t flags = 0;
+#ifndef __EMSCRIPTEN__
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+    while (__atomic_test_and_set(&keyboard_lock, __ATOMIC_ACQUIRE)) { }
+    return flags;
+}
+
+static void input_keyboard_unlock(uint64_t flags)
+{
+    __atomic_clear(&keyboard_lock, __ATOMIC_RELEASE);
+#ifndef __EMSCRIPTEN__
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+#else
+    (void)flags;
+#endif
+}
+
+bool input_keyboard_acquire(const void *owner)
+{
+    if (!owner) return false;
+    uint64_t flags = input_keyboard_lock();
+    bool acquired = !keyboard_owner;
+    if (acquired) {
+        keyboard_read = keyboard_write = keyboard_count = 0;
+        keyboard_overrun = false;
+        keyboard_owner = owner;
+    }
+    input_keyboard_unlock(flags);
+    return acquired;
+}
+
+void input_keyboard_release(const void *owner)
+{
+    uint64_t flags = input_keyboard_lock();
+    if (owner && keyboard_owner == owner) {
+        keyboard_owner = NULL;
+        keyboard_read = keyboard_write = keyboard_count = 0;
+        keyboard_overrun = false;
+    }
+    input_keyboard_unlock(flags);
+}
+
+bool input_keyboard_is_owner(const void *owner)
+{
+    uint64_t flags = input_keyboard_lock();
+    bool owned = owner && keyboard_owner == owner;
+    input_keyboard_unlock(flags);
+    return owned;
+}
+
+bool input_keyboard_post_set1(const uint8_t *bytes, uint32_t count)
+{
+    uint64_t flags = input_keyboard_lock();
+    bool captured = keyboard_owner != NULL;
+    if (captured && bytes && count) {
+        if (count > INPUT_KEYBOARD_BYTES - keyboard_count) {
+            keyboard_overrun = true;
+        } else {
+            for (uint32_t i = 0; i < count; i++) {
+                keyboard_bytes[keyboard_write] = bytes[i];
+                keyboard_write = (keyboard_write + 1U) % INPUT_KEYBOARD_BYTES;
+            }
+            keyboard_count += count;
+        }
+    }
+    input_keyboard_unlock(flags);
+    return captured;
+}
+
+bool input_keyboard_read_set1(const void *owner, uint8_t *byte)
+{
+    if (!owner || !byte) return false;
+    uint64_t flags = input_keyboard_lock();
+    bool available = keyboard_owner == owner &&
+                     (keyboard_count || keyboard_overrun);
+    if (available) {
+        if (keyboard_count) {
+            *byte = keyboard_bytes[keyboard_read];
+            keyboard_read = (keyboard_read + 1U) % INPUT_KEYBOARD_BYTES;
+            keyboard_count--;
+        } else {
+            *byte = 0; /* Set-1 buffer-overrun indication. */
+            keyboard_overrun = false;
+        }
+    }
+    input_keyboard_unlock(flags);
+    return available;
+}
+
 /* ── Enqueue event (called from ISR context) ─────────────────── */
 
 static void input_enqueue(input_event_t *evt)

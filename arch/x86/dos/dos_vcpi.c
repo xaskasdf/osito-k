@@ -52,6 +52,9 @@ struct dos_vcpi_state {
     uint16_t server_idt_limit;
     uint16_t server_ldtr;
     uint16_t server_tr;
+    cpu_system_segment_t server_ldt_cache, server_tss_cache;
+    bool server_host_ldt;
+    bool server_guest_idt;
     bool server_dpmi_active;
     bool server_dpmi_is_32bit;
     bool server_context_valid;
@@ -552,17 +555,18 @@ static bool vcpi_code_selector_valid(dos_vm_t *vm, uint32_t gdt_base,
 
 static bool vcpi_system_selector_valid(dos_vm_t *vm, uint32_t gdt_base,
                                        uint16_t gdt_limit,
-                                       uint16_t selector, bool tss)
+                                       uint16_t selector, bool tss,
+                                       dpmi_descriptor_t *descriptor)
 {
+    *descriptor = (dpmi_descriptor_t){0};
     if (!selector) return true;
-    dpmi_descriptor_t descriptor;
     if (!vcpi_gdt_descriptor(vm, gdt_base, gdt_limit, selector,
-                             &descriptor) ||
-        !(descriptor.access & DESC_PRESENT) ||
-        (descriptor.access & DESC_SEGMENT))
+                             descriptor) ||
+        !(descriptor->access & DESC_PRESENT) ||
+        (descriptor->access & DESC_SEGMENT))
         return false;
 
-    uint8_t type = descriptor.access & 0x0Fu;
+    uint8_t type = descriptor->access & 0x0Fu;
     return tss ? (type == 0x09u || type == 0x0Bu) : type == 0x02u;
 }
 
@@ -593,12 +597,13 @@ static void vcpi_switch_to_pm(dos_vm_t *vm)
     uint32_t gdt_base = dos_mem_read32(vm, gdtr_ptr + 2u);
     uint16_t idt_limit = dos_mem_read16(vm, idtr_ptr);
     uint32_t idt_base = dos_mem_read32(vm, idtr_ptr + 2u);
+    dpmi_descriptor_t ldt, tss;
     if (!vcpi_code_selector_valid(vm, gdt_base, gdt_limit, new_cs,
                                   new_eip) ||
         !vcpi_system_selector_valid(vm, gdt_base, gdt_limit, new_ldt,
-                                    false) ||
+                                    false, &ldt) ||
         !vcpi_system_selector_valid(vm, gdt_base, gdt_limit, new_tr,
-                                    true) ||
+                                    true, &tss) ||
         !vcpi_guest_range(vm, idt_base, (uint32_t)idt_limit + 1u)) {
         cpu->ah = EMS_ERR_LOGICAL_PAGE;
         return;
@@ -617,6 +622,10 @@ static void vcpi_switch_to_pm(dos_vm_t *vm)
     state->server_idt_base = cpu->idtr.base;
     state->server_ldtr = cpu->ldtr;
     state->server_tr = cpu->tr;
+    state->server_ldt_cache = cpu->ldt_cache;
+    state->server_tss_cache = cpu->tss_cache;
+    state->server_host_ldt = cpu->host_ldt;
+    state->server_guest_idt = cpu->guest_idt;
     state->server_dpmi_active = vm->dpmi.active;
     state->server_dpmi_is_32bit = vm->dpmi.is_32bit;
     state->server_context_valid = true;
@@ -630,8 +639,12 @@ static void vcpi_switch_to_pm(dos_vm_t *vm)
     cpu->pm_cs_loaded = true;
     cpu->cr0 = (cpu->cr0 | 1u) & ~0x80000000u;
     if (new_cr3) cpu->cr0 |= 0x80000000u;
-    cpu->ldtr = new_ldt;
-    cpu->tr = new_tr;
+    if (new_tr) {
+        tss.access |= 2u;
+        dos_mem_write8(vm, gdt_base + (new_tr & ~7u) + 5u, tss.access);
+    }
+    cpu8086_cache_ldtr(cpu, new_ldt, new_ldt ? &ldt : NULL);
+    cpu8086_cache_tr(cpu, new_tr, new_tr ? &tss : NULL);
     cpu->cs = new_cs;
     cpu->eip = new_eip;
     cpu->ds = 0;
@@ -642,7 +655,10 @@ static void vcpi_switch_to_pm(dos_vm_t *vm)
                   FLAG_IOPL_MASK | FLAGS_FIXED;
     vm->dpmi.active = true;
     vm->dpmi.is_32bit = true;
+    cpu->guest_idt = true;
     cpu8086_sync_cs(cpu);
+    for (unsigned s = 0; s < 6; s++) if (s != 1 && s != 2)
+        cpu8086_cache_segment(cpu, s, 0, NULL);
     cpu->ah = 0;
 }
 
@@ -687,6 +703,7 @@ static void vcpi_switch_to_v86(dos_vm_t *vm)
     cpu->fs = (uint16_t)dos_mem_read32(vm, block + 0x24u);
     cpu->gs = (uint16_t)dos_mem_read32(vm, block + 0x28u);
     cpu->eflags = v86_flags;
+    cpu8086_reset_real_cs(cpu, cpu->cs);
     cpu->cr0 = state->server_cr0 | 1u;
     cpu->cr3 = state->server_cr3;
     cpu->gdtr.limit = state->server_gdt_limit;
@@ -695,7 +712,12 @@ static void vcpi_switch_to_v86(dos_vm_t *vm)
     cpu->idtr.base = state->server_idt_base;
     cpu->ldtr = state->server_ldtr;
     cpu->tr = state->server_tr;
+    cpu->ldt_cache = state->server_ldt_cache;
+    cpu->tss_cache = state->server_tss_cache;
+    cpu->host_ldt = state->server_host_ldt;
+    cpu->guest_idt = state->server_guest_idt;
     cpu->protected_mode = false;
+    cpu8086_sync_data(cpu);
     cpu->pm_cs_loaded = false;
     cpu->op_size_32 = false;
     cpu->addr_size_32 = false;
@@ -733,6 +755,14 @@ static void vcpi_dispatch(dos_vm_t *vm)
     case 0x0C: vcpi_switch_to_pm(vm);     break;
     default: vm->cpu->ah = VCPI_ERR_UNSUPPORTED; break;
     }
+}
+
+bool dos_vcpi_pm_entry_source(const dos_vm_t *vm, uint8_t vector)
+{
+    const cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    return cpu && cpu->protected_mode && cpu->guest_idt && vector == 0x67 &&
+           cpu->cs_cache.valid && cpu->eip == VCPI_PM_ENTRY_OFF + 2u &&
+           dpmi_desc_get_base(&cpu->cs_cache.descriptor) == ((uint32_t)DPMI_ENTRY_SEG << 4);
 }
 
 void dos_int67_dispatch(dos_vm_t *vm)
@@ -928,24 +958,54 @@ int dos_vcpi_selftest(void)
     cpu.gdtr.base = 0;
     cpu.idtr.limit = 0;
     cpu.idtr.base = 0;
-    cpu.ldtr = 0;
-    cpu.tr = 0;
+    dpmi_descriptor_t server_ldt = { .limit_lo = 0xFF, .base_hi = 0x12, .access = 0x82 };
+    dpmi_descriptor_t server_tss = { .limit_lo = 103, .base_hi = 0x34, .access = 0x8B };
+    cpu8086_cache_ldtr(&cpu, 0x80, &server_ldt);
+    cpu8086_cache_tr(&cpu, 0x88, &server_tss);
     cpu.protected_mode = false;
     cpu.pm_cs_loaded = false;
     cpu.eflags = FLAG_VM | FLAG_IF | FLAGS_FIXED;
     cpu.esi = mode_block;
     cpu.ax = 0xDE0C;
     dos_int67_dispatch(&vm);
-    if (cpu.ah != 0 || !cpu.protected_mode || !cpu.pm_cs_loaded ||
+    if (cpu.ah != 0 || !cpu.protected_mode || !cpu.pm_cs_loaded || !cpu.guest_idt ||
         !(cpu.cr0 & 1u) || (cpu.cr0 & 0x80000000u) ||
         cpu.cs != 0x0008u || cpu.eip != 0x1234u ||
         cpu.ldtr != 0x0010u || cpu.tr != 0x0018u ||
+        cpu.host_ldt || !cpu.ldt_cache.valid || !cpu.tss_cache.valid ||
+        dpmi_desc_get_base(&cpu.ldt_cache.descriptor) != ldt_base ||
+        dpmi_desc_get_base(&cpu.tss_cache.descriptor) != 0xD100u ||
+        cpu.tss_cache.descriptor.access != 0x8Bu ||
+        dos_mem_read8(&vm, gdt_base + 0x1Du) != 0x8Bu ||
         cpu.gdtr.base != gdt_base || cpu.gdtr.limit != 0x0027u ||
         cpu.idtr.base != idt_base || cpu.idtr.limit != 0x00FFu ||
         (cpu.eflags & FLAG_VM) ||
         (cpu.eflags & FLAG_IOPL_MASK) != FLAG_IOPL_MASK ||
         dpmi_translate(&vm, 0x000Fu, 0x20u) != 0x12360u)
         failures++;
+
+    cpu8086_state_t entered = cpu;
+    vm.emulate_cpu = true;
+    vm.step_limit = 32;
+    dos_mem_write8(&vm, gdt_base + 0x25u, 0x93);
+    cpu.ss = 0x20; cpu.esp = 0xF000;
+    cpu8086_sync_segment(&cpu, 2);
+    dos_mem_write16(&vm, idt_base + 0x80u, 0x3456);
+    dos_mem_write16(&vm, idt_base + 0x82u, 8);
+    dos_mem_write32(&vm, idt_base + 0x84u, 0x8E00);
+    vm.mem[0x1234] = 0xCD; vm.mem[0x1235] = 0x10;
+    vm.mem[0x3456] = 0xCF;
+    if (!cpu8086_run_one(&vm) || cpu.eip != 0x3456 || cpu.esp != 0xEFF4 ||
+        dos_mem_read32(&vm, 0xEFF4) != 0x1236 ||
+        !cpu8086_run_one(&vm) || cpu.eip != 0x1236 || cpu.esp != 0xF000 || !cpu.guest_idt)
+        failures++;
+    cpu.eip = VCPI_PM_ENTRY_OFF + 2;
+    if (dos_vcpi_pm_entry_source(&vm, 0x67)) failures++;
+    dpmi_desc_set_base(&cpu.cs_cache.descriptor, (uint32_t)DPMI_ENTRY_SEG << 4);
+    if (!dos_vcpi_pm_entry_source(&vm, 0x67) || dos_vcpi_pm_entry_source(&vm, 0x21)) failures++;
+    cpu.eip++;
+    if (dos_vcpi_pm_entry_source(&vm, 0x67)) failures++;
+    cpu = entered;
 
     dos_mem_write32(&vm, v86_frame + 0x08u, 0x3456u);
     dos_mem_write32(&vm, v86_frame + 0x0Cu, 0x1111u);
@@ -962,18 +1022,35 @@ int dos_vcpi_selftest(void)
     cpu.ax = 0xDE0C;
     dos_int67_dispatch(&vm);
     vm.native_dispatch_depth = 0;
-    if (cpu.protected_mode || cpu.pm_cs_loaded || cpu.cr0 != 1u ||
+    if (cpu.protected_mode || cpu.pm_cs_loaded || cpu.guest_idt || cpu.cr0 != 1u ||
         cpu.cr3 != 0 || cpu.cs != 0x1111u || cpu.eip != 0x3456u ||
         cpu.ss != 0x2222u || cpu.esp != 0x5678u ||
         cpu.es != 0x3333u || cpu.ds != 0x4444u ||
         cpu.fs != 0x5555u || cpu.gs != 0x6666u ||
         cpu.gdtr.base != 0 || cpu.gdtr.limit != 0 ||
         cpu.idtr.base != 0 || cpu.idtr.limit != 0 ||
-        cpu.ldtr != 0 || cpu.tr != 0 ||
+        cpu.ldtr != 0x80 || cpu.tr != 0x88 || cpu.host_ldt ||
+        !cpu.ldt_cache.valid || !cpu.tss_cache.valid ||
+        cpu.ldt_cache.descriptor.base_hi != 0x12 || cpu.tss_cache.descriptor.base_hi != 0x34 ||
+        cpu.ldt_cache.descriptor.limit_lo != 0xFF || cpu.tss_cache.descriptor.limit_lo != 103 ||
         cpu.eflags != (FLAG_VM | FLAG_IOPL_MASK |
                        FLAG_IF | FLAGS_FIXED) ||
         dos_mem_read32(&vm, v86_frame + 0x10u) != cpu.eflags)
         failures++;
+
+    cpu8086_use_host_ldt(&cpu);
+    cpu8086_cache_tr(&cpu, 0, NULL);
+    cpu.esi = mode_block;
+    cpu.ax = 0xDE0C;
+    dos_int67_dispatch(&vm);
+    if (cpu.ah || cpu.host_ldt || !cpu.ldt_cache.valid || !cpu.tss_cache.valid) failures++;
+    cpu.ss = 0x0020u;
+    cpu.esp = v86_frame;
+    vm.native_dispatch_depth = 1;
+    cpu.ax = 0xDE0C;
+    dos_int67_dispatch(&vm);
+    vm.native_dispatch_depth = 0;
+    if (!cpu.host_ldt || cpu.ldtr || cpu.tr || cpu.ldt_cache.valid || cpu.tss_cache.valid) failures++;
 
     cpu.ax = 0xDE0D;
     dos_int67_dispatch(&vm);

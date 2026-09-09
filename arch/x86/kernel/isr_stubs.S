@@ -45,7 +45,7 @@ isr_common:
     pop    %rcx
     pop    %rax
     add    $16, %rsp    /* skip vector + error_code */
-    iretq
+    jmp x86_compat_iret
 1:  pop    %rdx
     pop    %rcx
     pop    %rax
@@ -217,7 +217,7 @@ isr_common:
     /* Remove vector number and error code from stack */
     add $16, %rsp
 
-    iretq
+    jmp x86_compat_iret
 
 /* ── Macro for vectors WITHOUT error code ────────────────────── */
 
@@ -306,7 +306,7 @@ isr_stub_smp_ipi:
     movabs $0xFFFF800000000000 + 0xFEE000B0, %rax
     movl   $0, (%rax)
     pop    %rax
-    iretq
+    jmp x86_compat_iret
 
 /* ── Default stub for vectors 34-255 ─────────────────────────── */
 

@@ -424,6 +424,7 @@ typedef struct {
     int seh_dispatch_depth;
     uint64_t jmpbufs[MAX_CALLBACK_DEPTH][9];
     uint64_t saved_ist1[MAX_CALLBACK_DEPTH];
+    uint64_t saved_ist3[MAX_CALLBACK_DEPTH];
     uint32_t saved_stack_args[MAX_CALLBACK_DEPTH];
     uint32_t callback_int2e_depth[MAX_CALLBACK_DEPTH];
     uint8_t *stacks[MAX_CALLBACK_DEPTH];
@@ -2409,10 +2410,11 @@ void compat32_callback(uint32_t func_addr)
         serial_puts("\n");
     }
 
-    /* Save IST1 before callback — longjmp bypasses int2e_stub's restore */
+    /* Preserve the syscall and fault cursors across callback unwinding. */
     {
-        extern uint64_t *tss_ist1_ptr;
+        extern uint64_t *tss_ist1_ptr, *tss_ist3_ptr;
         if (tss_ist1_ptr) callback_state->saved_ist1[depth] = *tss_ist1_ptr;
+        if (tss_ist3_ptr) callback_state->saved_ist3[depth] = *tss_ist3_ptr;
     }
 
     /* Save SEH ExceptionList — 32-bit code may push SEH frames on the
@@ -2518,10 +2520,11 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
     callback_state->callback_int2e_depth[depth] =
         (uint32_t)callback_state->int2e_depth;
 
-    /* Save IST1 before callback — longjmp bypasses int2e_stub's restore */
+    /* Preserve the syscall and fault cursors across callback unwinding. */
     {
-        extern uint64_t *tss_ist1_ptr;
+        extern uint64_t *tss_ist1_ptr, *tss_ist3_ptr;
         if (tss_ist1_ptr) callback_state->saved_ist1[depth] = *tss_ist1_ptr;
+        if (tss_ist3_ptr) callback_state->saved_ist3[depth] = *tss_ist3_ptr;
     }
 
     /* Save SEH ExceptionList — 32-bit code may push SEH frames on the
@@ -2970,10 +2973,25 @@ static int compat32_abandon_callbacks(callback_owner_state_t *state,
         frame->saved_ist1 = first_frame->saved_ist1;
     }
 
+#ifndef TEST_HARNESS
+    /* A hardware SEH dispatch can be abandoned along with its callback.
+     * We are on IST1 here; discard only fault frames below the destination.
+     * An outer callback may still need its suspended isr_common frame. */
+    if (keep_callbacks) {
+        extern uint64_t *tss_ist3_ptr;
+        if (tss_ist3_ptr)
+            *tss_ist3_ptr = state->saved_ist3[keep_callbacks - 1];
+    } else {
+        extern void sched_reset_current_compat_ist3(void);
+        sched_reset_current_compat_ist3();
+    }
+#endif
+
     for (int i = old_callback_depth; i > keep_callbacks; i--) {
         int depth = i - 1;
         memset(state->jmpbufs[depth], 0, sizeof(state->jmpbufs[depth]));
         state->saved_ist1[depth] = 0;
+        state->saved_ist3[depth] = 0;
         state->saved_stack_args[depth] = 0;
         state->callback_int2e_depth[depth] = 0;
         state->retvals[depth] = 0;

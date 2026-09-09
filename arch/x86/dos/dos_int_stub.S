@@ -89,6 +89,7 @@ dos_int_common:
     movw $0x30, %ax         /* GDT_SEL_DATA64 = 0x30 */
     mov %ax, %ds
     mov %ax, %es
+    cld                    /* C ABI; the saved IRET frame retains client DF. */
 
     /* Call C dispatcher:
      *   RDI = interrupt number
@@ -134,7 +135,7 @@ dos_int_common:
     pop %rax
 
     addq $8, %rsp           /* discard interrupt number */
-    iretq
+    jmp x86_compat_iret
 
 /*
  * Individual INT stubs push the vector without changing guest registers.
@@ -153,6 +154,11 @@ dos_int10_stub:             /* BIOS Video */
 .globl dos_int16_stub
 dos_int16_stub:             /* BIOS Keyboard */
     pushq $0x16
+    jmp dos_int_common
+
+.globl dos_int1a_stub
+dos_int1a_stub:             /* BIOS clock */
+    pushq $0x1A
     jmp dos_int_common
 
 .globl dos_int20_stub

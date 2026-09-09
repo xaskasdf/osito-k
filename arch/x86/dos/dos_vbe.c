@@ -17,7 +17,7 @@ extern void dos_int10_video(dos_vm_t *vm);
 extern void dos_vga_flush(dos_vm_t *vm);
 extern void dos_vga_invalidate_text(dos_vm_t *vm);
 extern void dos_vga_vbe_update(dos_vm_t *vm);
-extern void dos_native_map_vbe_window(dos_vm_t *vm);
+extern void dos_native_map_video(dos_vm_t *vm);
 
 #define VBE_SUCCESS             0x004Fu
 #define VBE_FAILED              0x014Fu
@@ -336,7 +336,7 @@ void dos_vbe_leave_mode(dos_vm_t *vm)
     vm->vbe_display_y = 0;
     vm->vbe_bpp = 0;
     vm->vbe_bytes_per_pixel = 0;
-    dos_native_map_vbe_window(vm);
+    dos_native_map_video(vm);
 }
 
 static bool vbe_apply_mode(dos_vm_t *vm, const vbe_mode_t *mode,
@@ -369,7 +369,7 @@ static bool vbe_apply_mode(dos_vm_t *vm, const vbe_mode_t *mode,
     vm->mem[0x449] = 0xFFu;
     if (no_clear) vm->mem[0x487] |= 0x80u;
     else vm->mem[0x487] &= 0x7Fu;
-    dos_native_map_vbe_window(vm);
+    dos_native_map_video(vm);
     dos_vga_vbe_update(vm);
     dos_mouse_video_mode_changed(vm);
     return true;
@@ -582,7 +582,7 @@ static bool vbe_restore_mode_state(dos_vm_t *vm,
     if ((uint32_t)state->bank * DOS_VBE_WINDOW_SIZE < DOS_VBE_FB_SIZE)
         vm->vbe_bank = state->bank;
     vm->vbe_no_clear = state->no_clear != 0;
-    dos_native_map_vbe_window(vm);
+    dos_native_map_video(vm);
     dos_vga_vbe_update(vm);
     return true;
 }
@@ -682,7 +682,7 @@ static void vbe_window_control(dos_vm_t *vm)
         return;
     }
     vm->vbe_bank = cpu->dx;
-    dos_native_map_vbe_window(vm);
+    dos_native_map_video(vm);
     dos_vga_vbe_update(vm);
     vbe_set_status(cpu, VBE_SUCCESS);
 }
@@ -877,6 +877,7 @@ static void vbe_protected_mode_interface(dos_vm_t *vm)
         return;
     }
     cpu->es = VBE_ROM_SEGMENT;
+    cpu8086_sync_segment(cpu, 0);
     cpu->di = VBE_PM_TABLE_OFFSET;
     cpu->cx = VBE_PM_TABLE_SIZE;
     vbe_set_status(cpu, VBE_SUCCESS);

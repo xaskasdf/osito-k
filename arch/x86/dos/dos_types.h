@@ -160,6 +160,7 @@ typedef struct {
 
 struct cpu8086_state;
 struct dos_exec_context;
+struct dos_exec_parent_state;
 struct dos_vcpi_state;
 
 #define DOS_EMS_PAGE_FRAME_BASE 0x000E0000u
@@ -230,6 +231,7 @@ typedef struct dos_vm {
     bool             process_terminated;
     uint16_t         exec_depth;        /* nested INT 21h/AH=4Bh calls */
     struct dos_exec_context *exec_context; /* pending AH=4B01 process chain */
+    struct dos_exec_parent_state *exec_parent; /* executing AH=4B00/01 chain */
     uint32_t         software_int_return_flags;
     uint8_t          software_int_frame_bytes;
     dos_search_t     searches[DOS_MAX_SEARCHES];
@@ -284,6 +286,9 @@ typedef struct dos_vm {
     /* Keyboard buffer */
     uint16_t         kb_buffer[16];     /* circular buffer (scancode<<8 | ascii) */
     uint8_t          kb_head;
+    uint8_t          kb_set1_prefix;
+    uint8_t          kb_pause_remaining;
+    uint8_t          kb_down[32];
     uint8_t          kb_tail;
     uint8_t          console_scan_pending;
     uint8_t          console_column;   /* DOS cooked-output column, modulo 256 */
@@ -348,16 +353,25 @@ typedef struct dos_vm {
      * and restores the host descriptor tables before releasing guest RAM. */
     uint64_t         mem_pages;
     uint64_t         native_cr3;
+    uint64_t         native_vga_faults;
     void            *native_gdt;
     void            *native_ldt;
     dos_host_tls_t   native_host_tls;
-    uint8_t          native_saved_idt[12][16];
+    uint8_t          native_saved_idt[13][16];
     uint64_t         native_resume_jmpbuf[9];
     bool             native_idt_saved;
     bool             native_ready;
     bool             native_active;
     bool             native_resume_armed;
     uint8_t          native_dispatch_depth;
+    /* Session policy, inherited by EXEC children. All guest instructions
+     * stay mediated; virtual IOPL never grants access to host ports. */
+    bool             emulate_cpu;
+    /* Optional diagnostic interpreter quota, shared across EXEC/callbacks.
+     * Zero disables metering; a stop remains latched while frames unwind. */
+    uint64_t         step_limit;
+    uint64_t         step_count;
+    bool             step_limit_reached;
 
     /* A DPMI real-mode service can temporarily re-enter the interpreter.
      * The nested run stops before fetching the host-owned return address. */
@@ -367,6 +381,7 @@ typedef struct dos_vm {
     bool             interpreter_stop_protected;
     bool             interpreter_stop_active;
     bool             interpreter_stop_reached;
+    const bool      *interpreter_stop_signal;
 } dos_vm_t;
 
 /* ── CGA color palette ──────────────────────────────────────────── */

@@ -112,5 +112,5 @@ int2e_stub:
     pop %rcx
     pop %rbx
 
-    iretq
+    jmp x86_compat_iret
 .section .note.GNU-stack,"",%progbits

@@ -15,6 +15,7 @@
 #include "dos_io.h"
 #include "dos_keyboard.h"
 #include "dos_loader.h"
+#include "dos_mem.h"
 #include "dos_mouse.h"
 #include "dos_time.h"
 #include "dos_vbe.h"
@@ -379,6 +380,7 @@ void dos_api_init(dos_vm_t *vm)
     vm->process_terminated = false;
     vm->exec_depth = 0;
     vm->exec_context = NULL;
+    vm->exec_parent = NULL;
     vm->software_int_return_flags = 0;
     vm->software_int_frame_bytes = 0;
     vm->jft_external_segment = 0;
@@ -1366,7 +1368,8 @@ void dos_api_close_all(dos_vm_t *vm)
     dos_find_close_all(vm);
 }
 
-typedef struct {
+typedef struct dos_exec_parent_state {
+    struct dos_exec_parent_state *previous;
     cpu8086_state_t *cpu_pointer;
     cpu8086_state_t cpu;
     dpmi_state_t dpmi;
@@ -1379,13 +1382,17 @@ typedef struct {
     uint64_t native_cr3;
     void *native_gdt;
     void *native_ldt;
+    dos_host_tls_t native_host_tls;
+    uint8_t native_saved_idt[sizeof(((dos_vm_t *)0)->native_saved_idt)];
     uint16_t current_psp;
     uint16_t dta_seg;
     uint16_t dta_off;
     uint16_t jft_external_segment;
     uint16_t jft_external_psp;
     uint16_t interpreter_stop_cs;
-    uint16_t interpreter_stop_ip;
+    uint16_t interpreter_stop_psp;
+    uint32_t interpreter_stop_ip;
+    const bool *interpreter_stop_signal;
     uint16_t exec_depth;
     uint16_t next_search_token;
     uint32_t next_search_serial;
@@ -1405,7 +1412,9 @@ typedef struct {
     bool native_resume_armed;
     bool interpreter_stop_active;
     bool interpreter_stop_reached;
+    bool interpreter_stop_protected;
     bool backend_detached;
+    bool dpmi_replaced;
 } dos_exec_parent_state_t;
 
 struct dos_exec_context {
@@ -1577,6 +1586,8 @@ static int dos_exec_retain_inherited_handles(
 static void dos_exec_save_parent(dos_vm_t *vm,
                                  dos_exec_parent_state_t *parent)
 {
+    parent->previous = vm->exec_parent;
+    parent->dpmi_replaced = false;
     parent->cpu_pointer = vm->cpu;
     parent->cpu = *vm->cpu;
     parent->dpmi = vm->dpmi;
@@ -1593,6 +1604,8 @@ static void dos_exec_save_parent(dos_vm_t *vm,
     parent->native_cr3 = vm->native_cr3;
     parent->native_gdt = vm->native_gdt;
     parent->native_ldt = vm->native_ldt;
+    parent->native_host_tls = vm->native_host_tls;
+    memcpy(parent->native_saved_idt, vm->native_saved_idt, sizeof(parent->native_saved_idt));
     parent->current_psp = vm->current_psp;
     parent->dta_seg = vm->dta_seg;
     parent->dta_off = vm->dta_off;
@@ -1600,6 +1613,9 @@ static void dos_exec_save_parent(dos_vm_t *vm,
     parent->jft_external_psp = vm->jft_external_psp;
     parent->interpreter_stop_cs = vm->interpreter_stop_cs;
     parent->interpreter_stop_ip = vm->interpreter_stop_ip;
+    parent->interpreter_stop_psp = vm->interpreter_stop_psp;
+    parent->interpreter_stop_signal = vm->interpreter_stop_signal;
+    parent->interpreter_stop_protected = vm->interpreter_stop_protected;
     parent->exec_depth = vm->exec_depth;
     parent->next_search_token = vm->next_search_token;
     parent->next_search_serial = vm->next_search_serial;
@@ -1620,7 +1636,8 @@ static void dos_exec_save_parent(dos_vm_t *vm,
     parent->interpreter_stop_active = vm->interpreter_stop_active;
     parent->interpreter_stop_reached = vm->interpreter_stop_reached;
     parent->backend_detached = vm->native_ready || vm->native_active ||
-        vm->native_cr3 || vm->native_gdt || vm->native_ldt;
+        vm->native_cr3 || vm->native_gdt || vm->native_ldt ||
+        vm->native_idt_saved || vm->native_host_tls.saved;
 }
 
 static int dos_exec_hold_parent_files(const dos_exec_parent_state_t *parent)
@@ -1665,14 +1682,26 @@ static void dos_exec_begin_child(dos_vm_t *vm,
         vm->native_idt_saved = false;
         vm->native_ready = false;
         vm->native_active = false;
+        /* This token belongs to the same backend as CR3/GDT/LDT. Leaving it
+         * on the child lets child teardown invalidate the parent's LDTR. */
+        vm->native_host_tls = (dos_host_tls_t){0};
     }
     vm->native_resume_armed = false;
     vm->interpreter_stop_active = false;
     vm->interpreter_stop_reached = false;
+    vm->interpreter_stop_signal = NULL;
 
-    dpmi_init(vm);
-    for (unsigned i = 0; i < DPMI_EXT_BITMAP_SIZE; i++)
-        vm->dpmi.ext_page_bitmap[i] = parent->dpmi.ext_page_bitmap[i];
+    vm->exec_parent = parent;
+    /* EXEC creates a DOS process, not a DPMI client. Keep the primary
+     * client's complete state live while the child runs real-mode code. */
+    if (!vm->dpmi.active) {
+        dpmi_init(vm);
+        for (unsigned i = 0; i < DPMI_EXT_BITMAP_SIZE; i++)
+            vm->dpmi.ext_page_bitmap[i] = parent->dpmi.ext_page_bitmap[i];
+    } else if (vm->cpu->protected_mode) {
+        vm->dpmi.suspended_stack = (dpmi_stack_t){ vm->cpu->ss, vm->cpu->esp };
+        vm->dpmi.suspended_paging = (dpmi_paging_t){ vm->cpu->cr0, vm->cpu->cr3 };
+    }
     dos_find_init(vm);
     vm->last_return_code = 0;
     vm->last_return_type = 0;
@@ -1681,6 +1710,32 @@ static void dos_exec_begin_child(dos_vm_t *vm,
     vm->exec_depth = (uint16_t)(parent->exec_depth + 1u);
     vm->indos_count = 0;
     dos_publish_indos(vm);
+}
+
+bool dos_exec_begin_dpmi_client(dos_vm_t *vm)
+{
+    dos_exec_parent_state_t *parent = vm ? vm->exec_parent : NULL;
+    if (!parent || parent->dpmi_replaced || !vm->dpmi.active ||
+        vm->current_psp == vm->dpmi.owner_psp ||
+        vm->current_psp == parent->current_psp)
+        return false;
+
+    /* Snapshot only when the real child requests its own initial entry.
+     * Handler changes since EXEC belong to the primary, not to the child. */
+    parent->dpmi = vm->dpmi;
+    parent->dpmi_replaced = true;
+    dpmi_init(vm);
+    for (unsigned i = 0; i < DPMI_EXT_BITMAP_SIZE; i++)
+        vm->dpmi.ext_page_bitmap[i] = parent->dpmi.ext_page_bitmap[i];
+    return true;
+}
+
+void dos_exec_abort_dpmi_client(dos_vm_t *vm)
+{
+    dos_exec_parent_state_t *parent = vm ? vm->exec_parent : NULL;
+    if (!parent || !parent->dpmi_replaced) return;
+    vm->dpmi = parent->dpmi;
+    parent->dpmi_replaced = false;
 }
 
 static void dos_exec_restore_sft(dos_vm_t *vm,
@@ -1743,7 +1798,11 @@ static void dos_exec_restore_parent(dos_vm_t *vm,
     dos_mem_write32(vm, 0x22u * 4u, parent->int22);
     dos_mem_write32(vm, 0x23u * 4u, parent->int23);
     dos_mem_write32(vm, 0x24u * 4u, parent->int24);
+    if (!parent->dpmi_replaced && parent->dpmi.active &&
+        vm->dpmi.owner_psp == parent->dpmi.owner_psp)
+        parent->dpmi = vm->dpmi;
     vm->dpmi = parent->dpmi;
+    vm->exec_parent = parent->previous;
     vm->vcpi = parent->vcpi;
     vm->jit = parent->jit;
     for (unsigned i = 0; i < DOS_EMS_FRAME_PAGES; i++)
@@ -1752,6 +1811,8 @@ static void dos_exec_restore_parent(dos_vm_t *vm,
     vm->native_cr3 = parent->native_cr3;
     vm->native_gdt = parent->native_gdt;
     vm->native_ldt = parent->native_ldt;
+    vm->native_host_tls = parent->native_host_tls;
+    memcpy(vm->native_saved_idt, parent->native_saved_idt, sizeof(parent->native_saved_idt));
     vm->native_idt_saved = parent->native_idt_saved;
     vm->native_ready = parent->native_ready;
     vm->native_active = parent->native_active;
@@ -1761,6 +1822,9 @@ static void dos_exec_restore_parent(dos_vm_t *vm,
     vm->native_dispatch_depth = parent->native_dispatch_depth;
     vm->interpreter_stop_cs = parent->interpreter_stop_cs;
     vm->interpreter_stop_ip = parent->interpreter_stop_ip;
+    vm->interpreter_stop_psp = parent->interpreter_stop_psp;
+    vm->interpreter_stop_signal = parent->interpreter_stop_signal;
+    vm->interpreter_stop_protected = parent->interpreter_stop_protected;
     vm->interpreter_stop_active = parent->interpreter_stop_active;
     vm->interpreter_stop_reached = parent->interpreter_stop_reached;
 
@@ -1919,7 +1983,9 @@ static void dos_exec_finalize_load_return(dos_vm_t *vm)
     /* The saved state resumes after this INT 21h has unwound. */
     if (context->parent.indos_count)
         context->parent.indos_count--;
-    if (context->parent.native_dispatch_depth)
+    /* An interpreted INT has its own guest frame. Its completion does not
+     * unwind a native gate that may be suspended outside this interpreter. */
+    if (!context->return_frame_bytes && context->parent.native_dispatch_depth)
         context->parent.native_dispatch_depth--;
 }
 
@@ -2523,15 +2589,15 @@ static uint8_t dos_character_critical_error(dos_vm_t *vm,
     if (vm->critical_error_active || !cpu->running)
         return DOS_CRITICAL_FAIL;
 
-    /* Protected clients require their own locked-stack INT 24h translation.
-     * Until that exists, retain the DPMI default of failing the DOS call. */
-    if (vm->dpmi.active)
+    /* Untranslated protected services still need a real-mode call;
+     * never present protected selectors as segments in an INT 24h frame. */
+    if (vm->dpmi.active && cpu->protected_mode)
         return DOS_CRITICAL_FAIL;
 
     uint16_t segment = dos_mem_read16(vm, 0x24u * 4u + 2u);
     uint16_t offset = dos_mem_read16(vm, 0x24u * 4u);
-    if ((!segment && !offset) ||
-        (segment == DPMI_ENTRY_SEG && offset == DOS_DEFAULT_CRITICAL_OFF))
+    if (!vm->dpmi.active && ((!segment && !offset) ||
+        (segment == DPMI_ENTRY_SEG && offset == DOS_DEFAULT_CRITICAL_OFF)))
         return DOS_CRITICAL_FAIL;
 
     cpu8086_state_t saved = *cpu;
@@ -2541,8 +2607,9 @@ static uint8_t dos_character_critical_error(dos_vm_t *vm,
     bool original_frame = vm->software_int_frame_bytes == 6u;
     uint16_t extra = original_frame ? 24u : 30u;
     if (!dos_exec_guest_buffer(vm, cpu->ss, (uint16_t)(stack - extra),
-                               extra, NULL) ||
-        !dos_exec_guest_buffer(vm, segment, offset, 1u, NULL)) {
+                               30u, NULL) ||
+        (!vm->dpmi.active &&
+         !dos_exec_guest_buffer(vm, segment, offset, 1u, NULL))) {
         serial_puts("[DOS] Invalid INT 24h stack or vector\n");
         return DOS_CRITICAL_FAIL;
     }
@@ -2574,6 +2641,7 @@ static uint8_t dos_character_critical_error(dos_vm_t *vm,
     cpu->si = DOS_DEVICE_HEADERS_OFF +
               (uint16_t)(device - DOS_DEVICE_CON) * DOS_DEVICE_HEADER_SIZE;
     cpu->cs = segment;
+    cpu8086_load_real_cs(cpu, segment);
     cpu->eip = offset;
     cpu->flags = (flags | FLAGS_FIXED) & ~(FLAG_IF | FLAG_TF);
     cpu->halted = false;
@@ -2582,11 +2650,17 @@ static uint8_t dos_character_critical_error(dos_vm_t *vm,
     vm->critical_error_active = true;
     vm->indos_count = 0;
     dos_publish_indos(vm);
-    bool returned = cpu8086_run_until_real(vm, DPMI_ENTRY_SEG,
-                                           DPMI_CONTROL_RETURN_OFF);
-    bool valid = returned && cpu->ss == saved.ss &&
-                 cpu->sp == (uint16_t)(stack - extra + 6u);
-    uint8_t action = cpu->al;
+    uint8_t action;
+    bool valid = true;
+    if (vm->dpmi.active) {
+        action = dpmi_critical_error(vm);
+    } else {
+        bool returned = cpu8086_run_until_real(vm, DPMI_ENTRY_SEG,
+                                               DPMI_CONTROL_RETURN_OFF);
+        valid = returned && cpu->ss == saved.ss &&
+                cpu->sp == (uint16_t)(stack - extra + 6u);
+        action = cpu->al;
+    }
     bool running = cpu->running;
     int32_t exit_code = cpu->exit_code;
     uint64_t instructions = cpu->insn_count;
@@ -2758,6 +2832,7 @@ static bool dos_console_break(dos_vm_t *vm)
     cpu_push16(cpu, DPMI_ENTRY_SEG);
     cpu_push16(cpu, DPMI_CONTROL_RETURN_OFF);
     cpu->cs = segment;
+    cpu8086_load_real_cs(cpu, segment);
     cpu->eip = offset;
     cpu->flags &= ~(FLAG_IF | FLAG_TF);
     bool returned = cpu8086_run_until_real(vm, DPMI_ENTRY_SEG,
@@ -2774,7 +2849,12 @@ static bool dos_console_break(dos_vm_t *vm)
     cpu->ss = saved.ss;
     cpu->esp = saved.esp;
     cpu->eflags = saved.eflags;
-    cpu8086_sync_cs(cpu);
+    cpu->cs_cache = saved.cs_cache;
+    cpu->ss_cache = saved.ss_cache;
+    cpu->cpl = saved.cpl;
+    cpu->pm_cs_loaded = saved.pm_cs_loaded;
+    cpu->op_size_32 = saved.op_size_32;
+    cpu->addr_size_32 = saved.addr_size_32;
     if (!cpu->running) return false; /* A handler can use AH=4Ch itself. */
     if (resume) return true;
 abort:
@@ -2970,10 +3050,70 @@ static int dos_ioctl_handle(dos_vm_t *vm, cpu8086_state_t *cpu)
 
 /* ── INT 21h function dispatch ──────────────────────────────────── */
 
+static void dos_dpmi_interrupt_vector(dos_vm_t *vm, bool setting)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+    cpu8086_state_t request = *cpu;
+    cpu->ax = setting ? 0x0205u : 0x0204u;
+    cpu->bl = request.al;
+    if (setting) {
+        cpu->cx = request.ds;
+        cpu->edx = vm->dpmi.is_32bit ? request.edx : request.dx;
+    }
+    dos_int31_dpmi(vm);
+    uint16_t error = (cpu->flags & FLAG_CF) ? cpu->ax : 0;
+    uint16_t selector = cpu->cx;
+    uint32_t offset = cpu->edx;
+    *cpu = request;
+    if (error) {
+        cpu->ax = error;
+        cpu->flags |= FLAG_CF;
+    } else if (!setting) {
+        cpu->es = selector;
+        cpu8086_sync_segment(cpu, 0);
+        if (vm->dpmi.is_32bit) cpu->ebx = offset;
+        else cpu->bx = (uint16_t)offset;
+    }
+}
+
 void dos_int21_dispatch(dos_vm_t *vm)
 {
     if (!vm || !vm->cpu) return;
     cpu8086_state_t *cpu = vm->cpu;
+    if (cpu->protected_mode && vm->dpmi.active &&
+        cpu->ah >= 1u && cpu->ah <= 0x0Cu) {
+        uint8_t function = cpu->ah;
+        uint16_t error = dpmi_dos_console(vm);
+        if (error) {
+            cpu->ax = error;
+            cpu->flags |= FLAG_CF;
+            dos_record_extended_error(vm, function, error);
+        }
+        return;
+    }
+    if (cpu->protected_mode && vm->dpmi.active &&
+        (cpu->ah == 0x3Fu || cpu->ah == 0x40u)) {
+        uint8_t function = cpu->ah;
+        dos_sft_entry_t *entry = dos_handle_sft(vm, cpu->bx);
+        uint16_t error = !entry ? DOS_ERR_INVALID_HANDLE : 0;
+        if (entry && dos_open_access(entry->open_mode) ==
+            (function == 0x3Fu ? DOS_ACCESS_WRITE : DOS_ACCESS_READ))
+            error = DOS_ERR_ACCESS_DENIED;
+        if (!error) {
+            uint8_t terminator = 0;
+            if (function == 0x3Fu && entry->is_device &&
+                entry->device_kind == DOS_DEVICE_CON &&
+                !(entry->io_flags & DOS_IO_RAW))
+                terminator = (entry->io_flags & DOS_IO_CON_IN) ? '\n' : '\r';
+            error = dpmi_dos_file_io(vm, terminator);
+        }
+        if (error) {
+            cpu->ax = error;
+            cpu->flags |= FLAG_CF;
+            dos_record_extended_error(vm, function, error);
+        }
+        return;
+    }
 dispatch_again:;
     cpu8086_state_t request = *cpu;
     const cpu8086_state_t *previous_request = vm->int21_request;
@@ -3157,6 +3297,10 @@ dispatch_again:;
 
     /* ── AH=25h: Set interrupt vector ───────────────────────────── */
     case 0x25: {
+        if (cpu->protected_mode && vm->dpmi.active) {
+            dos_dpmi_interrupt_vector(vm, true);
+            break;
+        }
         uint32_t ivt_addr = (uint32_t)cpu->al * 4;
         dos_mem_write16(vm, ivt_addr, cpu->dx);
         dos_mem_write16(vm, ivt_addr + 2, cpu->ds);
@@ -3238,6 +3382,7 @@ dispatch_again:;
     /* ── AH=2Fh: Get DTA ────────────────────────────────────────── */
     case 0x2F:
         cpu->es = vm->dta_seg;
+        cpu8086_sync_segment(cpu, 0);
         cpu->bx = vm->dta_off;
         break;
 
@@ -3251,9 +3396,14 @@ dispatch_again:;
 
     /* ── AH=35h: Get interrupt vector ───────────────────────────── */
     case 0x35: {
+        if (cpu->protected_mode && vm->dpmi.active) {
+            dos_dpmi_interrupt_vector(vm, false);
+            break;
+        }
         uint32_t ivt_addr = (uint32_t)cpu->al * 4;
         cpu->bx = dos_mem_read16(vm, ivt_addr);
         cpu->es = dos_mem_read16(vm, ivt_addr + 2);
+        cpu8086_sync_segment(cpu, 0);
         break;
     }
 
@@ -4058,6 +4208,7 @@ dispatch_again:;
     case 0x34:
         cpu->es = cpu->protected_mode && vm->dpmi.active
                 ? dpmi_segment_selector(vm, DOS_SYSVARS_SEG) : DOS_SYSVARS_SEG;
+        cpu8086_sync_segment(cpu, 0);
         cpu->bx = DOS_INDOS_OFF;
         if (!cpu->es) console_error = -DOS_ERR_NOT_ENOUGH_MEMORY;
         break;
@@ -4079,6 +4230,7 @@ dispatch_again:;
     case 0x52:
         dos_sync_system_variables(vm);
         cpu->es = DOS_SYSVARS_SEG;
+        cpu8086_sync_segment(cpu, 0);
         cpu->bx = DOS_SYSVARS_OFF;
         break;
 
@@ -4210,6 +4362,7 @@ dispatch_again:;
         cpu->bh = vm->extended_error_class;
         cpu->ch = vm->extended_error_locus;
         cpu->es = vm->extended_error_segment;
+        cpu8086_sync_segment(cpu, 0);
         cpu->di = vm->extended_error_offset;
         cpu->flags &= ~FLAG_CF;
         break;
@@ -5862,6 +6015,203 @@ static void dos_selftest_accumulate(int *failures, const char *name,
     *failures += result;
 }
 
+static int dos_exec_continuation_selftest(void)
+{
+    unsigned vm_pages = (sizeof(dos_vm_t) + 4095u) / 4096u;
+    unsigned state_pages = (sizeof(struct dos_exec_context) + 4095u) / 4096u;
+    dos_vm_t *vm = dos_host_alloc_pages(vm_pages);
+    struct dos_exec_context *context = dos_host_alloc_pages(state_pages);
+    dos_exec_parent_state_t *parent = context ? &context->parent : NULL;
+    uint8_t *memory = dos_host_alloc_pages(256);
+    if (!vm || !parent || !memory) {
+        if (vm) dos_host_free_pages(vm, vm_pages);
+        if (context) dos_host_free_pages(context, state_pages);
+        if (memory) dos_host_free_pages(memory, 256);
+        return 1;
+    }
+    memset(vm, 0, vm_pages * 4096u);
+    memset(memory, 0, 256u * 4096u);
+    cpu8086_state_t cpu;
+    vm->mem = memory; vm->total_mem_size = 256u * 4096u; vm->cpu = &cpu;
+    cpu8086_init(&cpu, vm);
+    int failures = 0;
+    for (unsigned state = 0; state < 16; state++) {
+        dpmi_host_wait_t wait = { .psp = 0x650, .depth = 2 };
+        bool child_signal = true;
+        vm->current_psp = wait.psp;
+        vm->dpmi.host_wait = &wait;
+        vm->interpreter_stop_cs = 0x1237;
+        vm->interpreter_stop_ip = 0xFEDCBA98;
+        vm->interpreter_stop_psp = wait.psp;
+        vm->interpreter_stop_signal = state & 1u ? &wait.returned : NULL;
+        vm->interpreter_stop_active = (state & 2u) != 0;
+        vm->interpreter_stop_reached = (state & 4u) != 0;
+        vm->interpreter_stop_protected = (state & 8u) != 0;
+        vm->native_host_tls = (dos_host_tls_t){ .fs_base = 0x12340000,
+            .gs_base = 0x56780000, .saved = true };
+        memset(vm->native_saved_idt, 0xA5, sizeof(vm->native_saved_idt));
+        dos_exec_save_parent(vm, parent);
+        dos_exec_begin_child(vm, parent);
+        if (vm->interpreter_stop_active || vm->interpreter_stop_reached ||
+            vm->interpreter_stop_signal || vm->dpmi.host_wait ||
+            vm->native_host_tls.saved) failures++;
+        memset(vm->native_saved_idt, 0x5A, sizeof(vm->native_saved_idt));
+        vm->current_psp = 0x850;
+        vm->interpreter_stop_cs = 0x4567;
+        vm->interpreter_stop_ip = 0xABCD0123;
+        vm->interpreter_stop_psp = 0x850;
+        vm->interpreter_stop_signal = &child_signal;
+        vm->interpreter_stop_protected = !parent->interpreter_stop_protected;
+        dos_exec_restore_parent(vm, parent, 0, 17);
+        if (vm->current_psp != wait.psp || vm->dpmi.host_wait != &wait || wait.returned ||
+            vm->interpreter_stop_cs != 0x1237 || vm->interpreter_stop_ip != 0xFEDCBA98 ||
+            vm->interpreter_stop_psp != wait.psp || vm->interpreter_stop_signal != (state & 1u ? &wait.returned : NULL) ||
+            vm->interpreter_stop_active != ((state & 2u) != 0) ||
+            vm->interpreter_stop_reached != ((state & 4u) != 0) ||
+            vm->interpreter_stop_protected != ((state & 8u) != 0) ||
+            !vm->native_host_tls.saved || vm->native_host_tls.fs_base != 0x12340000 ||
+            vm->native_host_tls.gs_base != 0x56780000 ||
+            memcmp(vm->native_saved_idt, parent->native_saved_idt,
+                   sizeof(vm->native_saved_idt))) failures++;
+    }
+    for (unsigned frame = 0; frame < 3; frame++)
+    for (unsigned depth = 0; depth < 3; depth++) {
+        memset(context, 0, sizeof(*context));
+        vm->exec_context = context;
+        context->child_psp = vm->current_psp;
+        context->return_frame_bytes = frame * 6u;
+        context->parent.native_dispatch_depth = depth;
+        context->parent.indos_count = 1;
+        dos_exec_finalize_load_return(vm);
+        unsigned expected = !frame && depth ? depth - 1u : depth;
+        if (context->parent.native_dispatch_depth != expected ||
+            context->parent.indos_count != 0) failures++;
+    }
+    vm->exec_context = NULL;
+    dos_host_free_pages(memory, 256);
+    dos_host_free_pages(context, state_pages);
+    dos_host_free_pages(vm, vm_pages);
+    serial_puts("[DOS-EXEC-CONTINUATION] checks=41 failures=");
+    serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+int dos_exec_dpmi_selftest(void)
+{
+    enum { LEVELS = 3, MEMORY_PAGES = 512 };
+    unsigned vm_pages = (sizeof(dos_vm_t) + 4095u) / 4096u;
+    unsigned state_pages = (LEVELS * sizeof(dos_exec_parent_state_t) + 4095u) / 4096u;
+    unsigned dpmi_pages = (sizeof(dpmi_state_t) + 4095u) / 4096u;
+    dos_vm_t *vm = dos_host_alloc_pages(vm_pages);
+    dos_exec_parent_state_t *parents = dos_host_alloc_pages(state_pages);
+    dpmi_state_t *expected = dos_host_alloc_pages(dpmi_pages);
+    uint8_t *memory = dos_host_alloc_pages(MEMORY_PAGES);
+    if (!vm || !parents || !expected || !memory) {
+        if (vm) dos_host_free_pages(vm, vm_pages);
+        if (parents) dos_host_free_pages(parents, state_pages);
+        if (expected) dos_host_free_pages(expected, dpmi_pages);
+        if (memory) dos_host_free_pages(memory, MEMORY_PAGES);
+        return 1;
+    }
+    unsigned checks = 0, failures = 0;
+#define PRIMARY_CHECK(condition) do { checks++; if (!(condition)) { \
+    failures++; serial_puts("[DOS-EXEC-PRIMARY] failure line="); \
+    serial_putdec(__LINE__); serial_puts("\n"); } } while (0)
+    for (unsigned width = 0; width < 2; width++)
+    for (unsigned protected_parent = 0; protected_parent < 2; protected_parent++)
+    for (unsigned depth = 1; depth <= LEVELS; depth++)
+    for (unsigned policy = 0; policy < 5; policy++) {
+        memset(vm, 0, vm_pages * 4096u);
+        memset(memory, 0, MEMORY_PAGES * 4096u);
+        cpu8086_state_t cpu;
+        vm->mem = memory; vm->total_mem_size = MEMORY_PAGES * 4096u; vm->cpu = &cpu;
+        cpu8086_init(&cpu, vm);
+        dos_mem_init(vm);
+        dpmi_init(vm);
+        vm->current_psp = 0x600;
+        vm->dpmi.active = true;
+        vm->dpmi.owner_psp = vm->current_psp;
+        vm->dpmi.is_32bit = width;
+        vm->dpmi.callback_generation = 0x123400000000ull;
+        vm->dpmi.suspended_stack = (dpmi_stack_t){ 0x87, 0xA000 };
+        dpmi_host_wait_t wait = { .psp = vm->current_psp, .depth = 1 };
+        vm->dpmi.host_wait = &wait;
+        cpu.protected_mode = protected_parent;
+        cpu.cr0 = protected_parent;
+        cpu.cr3 = 0x5000;
+        cpu.ss = 0x97; cpu.esp = 0xF000;
+        uint16_t owned_segment = 0;
+        for (unsigned i = 0; i < depth; i++) {
+            dos_exec_save_parent(vm, &parents[i]);
+            dos_exec_begin_child(vm, &parents[i]);
+            PRIMARY_CHECK(vm->exec_parent == &parents[i] && !parents[i].dpmi_replaced &&
+                          vm->dpmi.active && vm->dpmi.owner_psp == 0x600 &&
+                          vm->dpmi.host_wait == &wait && vm->dpmi.is_32bit == width);
+            if (!i && protected_parent)
+                PRIMARY_CHECK(vm->dpmi.suspended_stack.ss == 0x97 &&
+                              vm->dpmi.suspended_stack.esp == 0xF000 &&
+                              vm->dpmi.suspended_paging.cr3 == 0x5000);
+            cpu8086_init(&cpu, vm);
+            vm->current_psp = (uint16_t)(0x900 + 0x100 * i);
+            vm->dpmi.real_exception_vectors[6].off = 0x1234 + i;
+            vm->dpmi.callback_generation++;
+            PRIMARY_CHECK(dpmi_ext_alloc_pages(vm, 1, false) != 0);
+            cpu.ax = 0x0100; cpu.bx = 2;
+            dos_int31_dpmi(vm);
+            owned_segment = cpu.ax;
+            PRIMARY_CHECK(!(cpu.flags & FLAG_CF) && vm->current_psp == 0x900 + 0x100 * i &&
+                          dos_mem_read16(vm, ((uint32_t)owned_segment - 1u) * 16u + 1u) == 0x600);
+        }
+        *expected = vm->dpmi;
+        uint16_t child_psp = vm->current_psp;
+        if (policy) {
+            cpu.ss = child_psp; cpu.sp = 0x8000;
+            cpu.ds = child_psp; cpu.cs = DPMI_ENTRY_SEG; cpu.ip = DPMI_ENTRY_OFF + 2u;
+            cpu.ax = policy == 2 ? 2 : !width;
+            dos_mem_write16(vm, ((uint32_t)child_psp << 4) + 0x8006, 0x100);
+            dos_mem_write16(vm, ((uint32_t)child_psp << 4) + 0x8008, child_psp);
+            if (policy == 3) vm->total_mem_size = 0x1000;
+            if (policy == 4) vm->current_psp = 0x600;
+            dpmi_enter_protected_mode(vm);
+            vm->total_mem_size = MEMORY_PAGES * 4096u;
+            vm->current_psp = child_psp;
+            if (policy == 1) {
+                PRIMARY_CHECK(!(cpu.flags & FLAG_CF) && cpu.protected_mode &&
+                              vm->dpmi.active && vm->dpmi.owner_psp == child_psp &&
+                              vm->dpmi.is_32bit == !width && !vm->dpmi.host_wait &&
+                              !vm->dpmi.callback_generation && parents[depth - 1].dpmi_replaced);
+                PRIMARY_CHECK(!memcmp(vm->dpmi.ext_page_bitmap, expected->ext_page_bitmap,
+                                       DPMI_EXT_BITMAP_SIZE) &&
+                              !memcmp(&parents[depth - 1].dpmi, expected, sizeof(*expected)));
+                cpu.ax = 0;
+                dpmi_enter_protected_mode(vm);
+                PRIMARY_CHECK((cpu.flags & FLAG_CF) && cpu.ax == 0x8011 &&
+                              vm->dpmi.owner_psp == child_psp);
+            } else {
+                PRIMARY_CHECK((cpu.flags & FLAG_CF) && !cpu.protected_mode &&
+                              !parents[depth - 1].dpmi_replaced &&
+                              !memcmp(&vm->dpmi, expected, sizeof(*expected)));
+            }
+        }
+        for (unsigned i = depth; i-- > 0;) {
+            dos_exec_restore_parent(vm, &parents[i], vm->current_psp, 7);
+            PRIMARY_CHECK(vm->exec_parent == (i ? &parents[i - 1] : NULL) &&
+                          !memcmp(&vm->dpmi, expected, sizeof(*expected)) && !wait.returned);
+        }
+        uint16_t size = 0;
+        PRIMARY_CHECK(vm->current_psp == 0x600 && vm->exec_depth == 0 &&
+                      dos_mem_query_block(vm, owned_segment, &size, NULL) == DOS_MEM_OK && size == 2);
+    }
+#undef PRIMARY_CHECK
+    dos_host_free_pages(memory, MEMORY_PAGES);
+    dos_host_free_pages(expected, dpmi_pages);
+    dos_host_free_pages(parents, state_pages);
+    dos_host_free_pages(vm, vm_pages);
+    serial_puts("[DOS-EXEC-PRIMARY] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return (int)failures + dos_exec_continuation_selftest();
+}
+
 int dos_api_selftest(void)
 {
     int failures = 0;
@@ -5949,12 +6299,14 @@ int dos_api_selftest(void)
         total_clusters != 8192)
         failures++;
 
+    dos_selftest_accumulate(&failures, "launch options", dos_run_options_selftest());
     dos_selftest_accumulate(&failures, "host memory", dos_hostmem_selftest());
     dos_selftest_accumulate(&failures, "memory", dos_mem_selftest());
     dos_selftest_accumulate(&failures, "system variables",
                             dos_system_variables_selftest());
     dos_selftest_accumulate(&failures, "PSP creation",
                             dos_psp_creation_selftest());
+    dos_selftest_accumulate(&failures, "EXEC continuation", dos_exec_continuation_selftest());
     dos_selftest_accumulate(&failures, "DPMI", dpmi_selftest());
     dos_selftest_accumulate(&failures, "BIOS memory",
                             dos_bios_memory_selftest());

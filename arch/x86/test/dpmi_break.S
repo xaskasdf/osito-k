@@ -111,7 +111,7 @@ initial_fail:
 2:
     cmpb $0, owned
     je 3f
-    movw $file_name, %dx
+    movl $file_name, %edx
     movw $0x4100, %ax
     int $0x21
     jnc 3f
@@ -121,6 +121,9 @@ initial_fail:
     .endm
 cleanup:
     CLEANUP
+real_break:
+    int $0x23
+    lret
 
     .ifdef CLIENT32
     .code32
@@ -206,22 +209,92 @@ protected_entry:
     movb $9, stage
     cmpb $0, handler_error
     jne fail
+    movb $10, stage
+    movw $0x0205, %ax
+    movb $0x23, %bl
+    movw %cs, %cx
+    movl $raw_handler, %edx
+    int $0x31
+    jc fail
+    movw real_segment, %ax
+    movw %ax, rm_regs + 44
+    movw %ax, rm_regs + 48
+    movw $0x4ff0, rm_regs + 46
+    movw $real_break, rm_regs + 42
+    movl $0, calls
+raw_again:
+    movl $0xabcd1234, rm_regs + 16
+    movw $0x0202, rm_regs + 32
+    cmpb $0, raw_if
+    jne raw_if_ready
+    movw $2, rm_regs + 32
+raw_if_ready:
+    movw $0x0301, %ax
+    cmpb $0, raw_simulated
+    je raw_invoke
+    movw $0x0300, %ax
+raw_invoke:
+    xorw %cx, %cx
+    movw $0x23, %bx
+    movl $rm_regs, %edi
+    int $0x31
+    jc fail
+    cmpl saved_sp, %esp
+    jne fail
+    cmpl $0xabcdbeef, rm_regs + 16
+    jne fail
+    testw $1, rm_regs + 32
+    jnz fail
+    cmpb $0, handler_error
+    jne fail
+    xorb $1, raw_if
+    jnz raw_again
+    xorb $1, raw_simulated
+    jnz raw_again
+    xorb $1, raw_retf
+    jnz raw_again
+    cmpl $8, calls
+    jne fail
     movb $0, stage
 fail:
     /* Restore input before any reporting or cleanup call can check it. */
     call protected_cleanup
-    movw $pass, %dx
+    movl $pass, %edx
     cmpb $0, stage
     je report
-    movw $failure, %dx
+    movl $failure, %edx
 report:
     movw $0x0900, %ax
     int $0x21
+    cmpb $'$', %al
+    je report_done
+    movb $21, stage
+report_done:
     movb stage, %al
     movb $0x4c, %ah
     int $0x21
 protected_cleanup:
     CLEANUP
+
+raw_handler:
+    pushal
+    pushw %ds
+    movw %cs:data_selector, %ax
+    movw %ax, %ds
+    incl calls
+    movw $0x0902, %ax
+    int $0x31
+    cmpb raw_if, %al
+    je raw_done
+    movb $2, handler_error
+raw_done:
+    popw %ds
+    popal
+    movw $0xbeef, %bx
+    cmpb $0, %cs:raw_retf
+    je break_iret
+    stc /* CF must not terminate a DPMI client even on a RETF. */
+    lret
 
 handler:
     pushal
@@ -249,6 +322,7 @@ handler_done:
     popw %es
     popw %ds
     popal
+break_iret:
     /* Even a set carry in the returned IRET frame must not request abort. */
     .ifdef CLIENT32
     pushl %ebp
@@ -267,6 +341,9 @@ stage: .byte 1
 owned: .byte 0
 chaining: .byte 0
 handler_error: .byte 0
+raw_if: .byte 0
+raw_simulated: .byte 0
+raw_retf: .byte 0
 saved_stdin: .word 0xffff
 file_handle: .word 0xffff
 real_segment: .word 0

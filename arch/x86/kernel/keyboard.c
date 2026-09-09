@@ -7,6 +7,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/input_events.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -115,7 +116,7 @@ void kb_push_esc(const char *seq)
 
 /* ── Core scancode processing (shared by IRQ and inject) ─────── */
 
-static void kb_process_scancode(uint8_t sc)
+static void kb_process_scancode(uint8_t sc, bool emit)
 {
     /* Extended scancode prefix — set flag and wait for next byte */
     if (sc == 0xE0) {
@@ -136,6 +137,8 @@ static void kb_process_scancode(uint8_t sc)
         kb_extended = false;
         /* Extended modifier keys */
         if (sc == SC_CTRL_PRESS) { kb_ctrl = true; return; }
+
+        if (!emit) return;
 
         switch (sc) {
         case 0x48: kb_push_esc("A");  return;  /* Up */
@@ -180,7 +183,7 @@ static void kb_process_scancode(uint8_t sc)
     }
 
     /* Ignore key releases for the ASCII buffer (bit 7 set) */
-    if (sc & 0x80) return;
+    if (!emit || (sc & 0x80)) return;
 
     /* Translate scancode to ASCII */
     char c;
@@ -213,6 +216,10 @@ static void kb_process_scancode(uint8_t sc)
 void keyboard_irq(void)
 {
     uint8_t sc = inb(KB_DATA_PORT);
+    if (input_keyboard_post_set1(&sc, 1)) {
+        kb_process_scancode(sc, false);
+        return;
+    }
     /* Post to input event system for USB games / compositor key_ring.
      * Only from hardware IRQ — kb_inject_scancode must NOT re-post
      * or we get an infinite loop. Skip 0xE0 prefix byte. */
@@ -224,14 +231,14 @@ void keyboard_irq(void)
      * events and pushes to kb_buf for the terminal when appropriate.
      * Without compositor (bare shell), process directly. */
     if (!(compositor_is_running && compositor_is_running()))
-        kb_process_scancode(sc);
+        kb_process_scancode(sc, true);
 }
 
 /* ── Inject scancode from compositor (no I/O port read) ──────── */
 
 void kb_inject_scancode(uint8_t sc)
 {
-    kb_process_scancode(sc);
+    kb_process_scancode(sc, true);
 }
 
 /* ── Public API ──────────────────────────────────────────────── */

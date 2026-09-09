@@ -552,6 +552,7 @@ native32_entry:
 
     movb $0, native_debug_seen
     .byte 0xf1                  /* ICEBP: DPMI processor exception 1 */
+native_debug_resume:
     cmpb $1, native_debug_seen
     jne native_exception_fail
     cmpb $1, native_pmfd_seen
@@ -678,9 +679,10 @@ native_pm07_handler:
 
 native_debug_handler:
     pushl %eax
-    /* Native INT1 leaves EIP on the ICEBP byte. The initial USE32 stack
-     * descriptor is Big, so the old-style frame is addressed through ESP. */
-    incl %ss:16(%esp)
+    /* ICEBP is a trap: validate the next EIP without adjusting it. The
+     * initial USE32 stack is Big, so address the old-style frame via ESP. */
+    cmpl $native_debug_resume, %ss:16(%esp)
+    jne native_exception_fail
     movb $1, native_debug_seen
     popl %eax
     lret

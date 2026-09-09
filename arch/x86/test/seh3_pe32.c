@@ -33,6 +33,7 @@ typedef void *PVOID;
 #define BOUND_MAGIC    0x424F554EUL
 
 DLLIMPORT void WINAPI ExitProcess(DWORD code);
+DLLIMPORT void WINAPI Sleep(DWORD milliseconds);
 DLLIMPORT PVOID WINAPI AddVectoredExceptionHandler(DWORD first,
                                                    PVOID handler);
 DLLIMPORT DWORD WINAPI RemoveVectoredExceptionHandler(PVOID handle);
@@ -296,6 +297,53 @@ __declspec(noinline) static DWORD exercise_vectored_software(void)
     return 0;
 }
 
+static volatile DWORD *nested_fault_page;
+static volatile DWORD nested_fault_count;
+static volatile DWORD nested_fault_result;
+
+static long WINAPI veh_continue_nested(EXCEPTION_POINTERS32 *pointers)
+{
+    if (!pointers || !pointers->ExceptionRecord || !pointers->ContextRecord ||
+        pointers->ExceptionRecord->ExceptionCode != STATUS_ARRAY_BOUNDS_EXCEEDED)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    DWORD saved_eip = pointers->ContextRecord->Eip;
+    DWORD saved_esp = pointers->ContextRecord->Esp;
+    for (DWORD i = 0; i < 8; i++) {
+        DWORD result = exercise_seh3(nested_fault_page);
+        if (result) {
+            nested_fault_result = result;
+            break;
+        }
+        nested_fault_count++;
+        Sleep(1);
+    }
+    if (pointers->ContextRecord->Eip != saved_eip ||
+        pointers->ContextRecord->Esp != saved_esp ||
+        pointers->ExceptionRecord->ExceptionAddress != saved_eip)
+        nested_fault_result = 70;
+    pointers->ContextRecord->Eip = saved_eip + 2;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+__declspec(noinline) static DWORD exercise_nested_faults(
+    volatile DWORD *fault_page)
+{
+    volatile long bounds[2] = { 0, 1 };
+    nested_fault_page = fault_page;
+    nested_fault_count = 0;
+    nested_fault_result = 0;
+    PVOID handler = AddVectoredExceptionHandler(1, (PVOID)veh_continue_nested);
+    if (!handler)
+        return 71;
+    trigger_bound_range((const long *)bounds);
+    if (RemoveVectoredExceptionHandler(handler) != 1)
+        return 72;
+    if (nested_fault_result || nested_fault_count != 8)
+        return 73;
+    return 0;
+}
+
 void mainCRTStartup(void)
 {
     DWORD result;
@@ -309,7 +357,11 @@ void mainCRTStartup(void)
                         &old_protection))
         ExitProcess(21);
 
-    result = exercise_seh3(fault_page);
+    result = 0;
+    for (DWORD i = 0; i < 8 && !result; i++)
+        result = exercise_seh3(fault_page);
+    if (!result)
+        result = exercise_nested_faults(fault_page);
     if (!result)
         result = exercise_loader_lock_raise();
     if (!result)

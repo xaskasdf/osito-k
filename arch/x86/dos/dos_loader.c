@@ -350,10 +350,11 @@ static void dos_initialize_process_cpu(dos_vm_t *vm,
         cpu->bp = 0x091Eu;
         cpu->flags = FLAG_IF | FLAGS_FIXED;
     }
-    cpu->cs = cs;
+    cpu8086_reset_real_cs(cpu, cs);
     cpu->ds = psp_seg;
     cpu->es = psp_seg;
     cpu->ss = ss;
+    cpu8086_sync_data(cpu);
     cpu->ip = ip;
     cpu->sp = sp;
     cpu->halted = false;

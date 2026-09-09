@@ -27,9 +27,8 @@ static const uint32_t dos_vga_text_palette[16] = {
     0xFFFF5555U, 0xFFFF55FFU, 0xFFFFFF55U, 0xFFFFFFFFU,
 };
 
-/* Timer callbacks may run under the client's private CR3. Keep only guest
- * memory values mapped there; the dos_vm object itself lives on the shell
- * stack and must never be dereferenced from the timer path. */
+/* Timer presentation switches to the kernel CR3 before using the bound VM,
+ * whose shell-stack address is absent from the client's private CR3. */
 static uint8_t *dos_vga_bound_memory;
 static uint32_t dos_vga_bound_memory_size;
 static uint8_t dos_vga_bound_mode;
@@ -49,6 +48,8 @@ static bool dos_vga_mode13_reported;
 static bool dos_vga_mode13_content_reported;
 static bool dos_vga_vbe_reported;
 static uint8_t dos_vga_direct_refresh_phase;
+static uint32_t dos_vga_last_width;
+static uint32_t dos_vga_last_height;
 static uint16_t dos_vga_mouse_x;
 static uint16_t dos_vga_mouse_y;
 static bool dos_vga_mouse_visible;
@@ -181,7 +182,8 @@ static bool dos_vga_arrow_inside(int32_t x, int32_t y)
 }
 
 static void dos_vga_draw_mode13_mouse(uint32_t *fb, uint32_t pitch,
-                                      uint32_t origin_x, uint32_t origin_y)
+                                      uint32_t origin_x, uint32_t origin_y,
+                                      uint32_t width, uint32_t height)
 {
     if (!dos_vga_mouse_visible) return;
 
@@ -192,11 +194,11 @@ static void dos_vga_draw_mode13_mouse(uint32_t *fb, uint32_t pitch,
         uint32_t color = pass == 0 ? 0xFF000000U : 0xFFFFFFFFU;
         for (int32_t y = 0; y < 14; y++) {
             int32_t py = cursor_y + y + shift;
-            if (py < 0 || py >= 200) continue;
+            if (py < 0 || (uint32_t)py >= height) continue;
             for (int32_t x = 0; x < 14; x++) {
                 if (!dos_vga_arrow_inside(x, y)) continue;
                 int32_t px = cursor_x + x + shift;
-                if (px < 0 || px >= 320) continue;
+                if (px < 0 || (uint32_t)px >= width) continue;
                 fb[(origin_y + (uint32_t)py) * pitch + origin_x +
                    (uint32_t)px] = color;
             }
@@ -364,9 +366,7 @@ static void dos_vga_vbe_present(void)
     dos_vga_mode13_dirty = false;
 }
 
-/* Present indexed VGA or VBE video to the GOP framebuffer. This symbol keeps
- * its historical name because both the interpreter and timer call it. */
-void dos_vga_mode13_present(void)
+static void dos_vga_present_bound(void)
 {
     if (dos_vga_vbe_active) {
         dos_vga_vbe_present();
@@ -374,20 +374,27 @@ void dos_vga_mode13_present(void)
     }
     if (!dos_vga_bound_memory || dos_vga_bound_mode != 0x13 ||
         dos_vga_bound_memory_size < DOS_CONV_TOP + 320U * 200U ||
-        (!dos_vga_mode13_dirty && !dos_vga_direct_writes))
+        !dos_vga_mode13_dirty)
         return;
 
     uint32_t *fb = fb_get_base();
     uint32_t  fw = fb_get_width();
     uint32_t  fh = fb_get_height();
     uint32_t  pp = fb_get_pitch();
-    if (!fb || fw < 320 || fh < 200) return;
+    uint32_t width, height;
+    if (!fb || !dos_io_vga_geometry(dos_vga_bound_vm, &width, &height) ||
+        fw < width || fh < height) return;
+    if (width != dos_vga_last_width || height != dos_vga_last_height) {
+        dos_vga_clear_surface = true;
+        dos_vga_last_width = width;
+        dos_vga_last_height = height;
+    }
 
-    const uint8_t *vram = &dos_vga_bound_memory[DOS_CONV_TOP];
-    uint32_t ox = (fw - 320) / 2;
-    uint32_t oy = (fh - 200) / 2;
+    uint8_t indices[DOS_VGA_MAX_WIDTH];
+    uint32_t ox = (fw - width) / 2;
+    uint32_t oy = (fh - height) / 2;
     uint32_t damage_top = oy;
-    uint32_t damage_bottom = oy + 200U;
+    uint32_t damage_bottom = oy + height;
     bool has_content = false;
     uint8_t first_index = 0;
     if (dos_vga_clear_surface) {
@@ -400,11 +407,12 @@ void dos_vga_mode13_present(void)
         damage_top = 0;
         damage_bottom = fh;
     }
-    for (uint32_t y = 0; y < 200; y++) {
+    for (uint32_t y = 0; y < height; y++) {
         uint32_t *dst = fb + (oy + y) * pp + ox;
-        const uint8_t *src = vram + y * 320;
-        for (uint32_t x = 0; x < 320; x++) {
-            uint8_t v = src[x];
+        if (!dos_io_vga_scanline(dos_vga_bound_vm, y, indices, sizeof(indices)))
+            return;
+        for (uint32_t x = 0; x < width; x++) {
+            uint8_t v = indices[x];
             if (!has_content && v != 0) {
                 has_content = true;
                 first_index = v;
@@ -418,7 +426,7 @@ void dos_vga_mode13_present(void)
             dst[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     }
-    dos_vga_draw_mode13_mouse(fb, pp, ox, oy);
+    dos_vga_draw_mode13_mouse(fb, pp, ox, oy, width, height);
     if (!dos_vga_mode13_reported) {
         serial_puts("[DOS/VGA] mode 13h presenter active, DAC[1]=");
         serial_puthex(dos_vga_dac[1][0], 2);
@@ -437,6 +445,23 @@ void dos_vga_mode13_present(void)
     }
     fb_present_rows(damage_top, damage_bottom);
     dos_vga_mode13_dirty = false;
+}
+
+/* Historical symbol used by the interpreter and the native timer path. */
+void dos_vga_mode13_present(void)
+{
+    if (!dos_vga_bound_vm || (!dos_vga_vbe_active &&
+        dos_vga_bound_mode != 0x13u))
+        return;
+    extern uint64_t paging_get_kernel_cr3(void);
+    uint64_t saved_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+    dos_vga_present_bound();
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
 }
 
 void dos_vga_invalidate_text(dos_vm_t *vm)

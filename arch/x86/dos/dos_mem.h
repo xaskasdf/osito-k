@@ -17,6 +17,8 @@
 void dos_mem_init(dos_vm_t *vm);
 uint16_t dos_mem_alloc(dos_vm_t *vm, uint16_t paragraphs,
                        uint16_t *largest);
+uint16_t dos_mem_alloc_owned(dos_vm_t *vm, uint16_t paragraphs,
+                             uint16_t *largest, uint16_t owner);
 int dos_mem_free(dos_vm_t *vm, uint16_t segment);
 int dos_mem_resize(dos_vm_t *vm, uint16_t segment, uint16_t new_size,
                    uint16_t *max_avail);

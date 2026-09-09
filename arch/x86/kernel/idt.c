@@ -965,6 +965,23 @@ void isr_handler(interrupt_frame_t *frame)
             return;
     }
 
+    if (vec == 14) {
+        extern bool dos_native_handle_memory_fault(
+            x86_interrupt_frame_t *frame, uint64_t fault_address);
+        uint64_t fault_address;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(fault_address));
+        if (dos_native_handle_memory_fault(frame, fault_address))
+            return;
+    }
+
+    /* Host mediation gets first refusal. Remaining CPL3 DOS faults belong
+     * to the client's DPMI chain, not to generic kernel panic recovery. */
+    if (vec < 32) {
+        extern bool dos_native_handle_exception(x86_interrupt_frame_t *frame);
+        if (dos_native_handle_exception(frame))
+            return;
+    }
+
 #ifdef COMPAT_TRACE
     /* Panorama probe: any exception taken while RSP lies inside IST1 (Win32
      * INT 0x2E) or IST2 (DOS native INTs). A hit on a page fault here is the
@@ -1205,9 +1222,12 @@ void isr_handler(interrupt_frame_t *frame)
                 x86_interrupt_frame_t *frame);
             extern bool dos_native_service_timer_irq(
                 x86_interrupt_frame_t *frame);
+            extern bool dos_native_service_keyboard_irq(
+                x86_interrupt_frame_t *frame);
             extern int dos_native_session_active(void);
-            if (!dos_native_service_audio_irq(frame))
-                (void)dos_native_service_timer_irq(frame);
+            if (!dos_native_service_timer_irq(frame) &&
+                !dos_native_service_keyboard_irq(frame))
+                (void)dos_native_service_audio_irq(frame);
             dos_native_active = dos_native_session_active() != 0;
         }
 

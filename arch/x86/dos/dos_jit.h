@@ -67,13 +67,24 @@ typedef struct {
 
 #define IR_MAX_PER_BLOCK  256
 
+struct jit_state;
+typedef struct { uint16_t prev, next; } jit_links_t;
+
 /* ── Basic block ────────────────────────────────────────────────── */
 
 typedef struct {
+    struct jit_state *owner;
+    jit_links_t links[2];    /* lookup LRU, then allocated-code LRU */
     /* Source location */
     uint16_t cs;
-    uint16_t ip;
+    uint32_t ip;
     uint16_t length;         /* bytes of 8086 code */
+    uint16_t instruction_count;
+    uint16_t hash_next;      /* one-based index, zero ends the chain */
+    uint16_t source_size;
+    uint32_t source_base, source_limit;
+    bool protected_mode, code32, source_valid;
+    uint8_t source[256];
 
     /* IR */
     ir_inst_t ir[IR_MAX_PER_BLOCK];
@@ -82,6 +93,8 @@ typedef struct {
     /* Native code */
     uint8_t  *native_code;   /* pointer into code cache */
     uint32_t  native_size;   /* bytes of x86-64 code */
+    uint32_t  native_capacity;
+    uint16_t  code_node;     /* buddy-tree allocation, zero if none */
 
     /* Profiling */
     uint32_t  exec_count;    /* times executed (for hotness) */
@@ -93,15 +106,23 @@ typedef struct {
 #define JIT_CACHE_SIZE      (256 * 1024)   /* 256KB for generated code */
 #define JIT_MAX_BLOCKS      4096           /* max cached blocks */
 #define JIT_HOT_THRESHOLD   50             /* interpret N times before JIT */
+#define JIT_CODE_MIN        64u
+#define JIT_CODE_UNITS      (JIT_CACHE_SIZE / JIT_CODE_MIN)
+#define JIT_EMIT_SIZE       (IR_MAX_PER_BLOCK * 64u + 32u)
 
-typedef struct {
+typedef struct jit_state {
     /* Block table (hash by CS:IP) */
     jit_block_t blocks[JIT_MAX_BLOCKS];
+    uint16_t    buckets[JIT_MAX_BLOCKS];
     uint32_t    block_count;
+    uint16_t    lru_head[2], lru_tail[2];
 
     /* Executable code cache */
     uint8_t    *code_buf;        /* RWX memory for generated code */
-    uint32_t    code_used;       /* bytes used in code_buf */
+    uint32_t    code_used;       /* allocated bytes, including size-class slack */
+    uint32_t    code_payload;
+    uint8_t     code_tree[2u * JIT_CODE_UNITS];
+    uint8_t     emit_buf[JIT_EMIT_SIZE];
 
     /* Hit counters for hot path detection */
     uint16_t    hit_count[65536]; /* indexed by IP (simplified) */
@@ -110,6 +131,10 @@ typedef struct {
     uint64_t    interpreted;     /* blocks interpreted */
     uint64_t    jit_executed;    /* blocks run from JIT cache */
     uint64_t    jit_compiled;    /* blocks compiled */
+    uint64_t    jit_instructions;
+    uint64_t    jit_pm_instructions;
+    uint64_t    lookup_evictions, code_evictions, cache_resets;
+    uint64_t    interpreter_backoffs;
 } jit_state_t;
 
 /* ── Register mapping ───────────────────────────────────────────── */
@@ -149,7 +174,7 @@ void jit_init(jit_state_t *jit);
 void jit_destroy(jit_state_t *jit);
 
 /* Look up or create a block for CS:IP */
-jit_block_t *jit_get_block(jit_state_t *jit, uint16_t cs, uint16_t ip);
+jit_block_t *jit_get_block(jit_state_t *jit, uint16_t cs, uint32_t ip);
 
 /* Decode 8086 bytes into IR for a basic block */
 int jit_decode_block(dos_vm_t *vm, jit_block_t *block);
@@ -157,13 +182,18 @@ int jit_decode_block(dos_vm_t *vm, jit_block_t *block);
 /* Compile IR to x86-64 native code */
 int jit_compile_block(jit_state_t *jit, jit_block_t *block);
 
-/* Execute a compiled block (returns next CS:IP) */
-void jit_exec_block(dos_vm_t *vm, jit_block_t *block);
+/* False requests one interpreted instruction at the returned CS:IP. */
+bool jit_exec_block(dos_vm_t *vm, jit_block_t *block);
+
+/* Validate executable context and source bytes before reusing a translation. */
+bool jit_block_current(dos_vm_t *vm, const jit_block_t *block);
 
 /* Invalidate all cached blocks (e.g., on PM switch) */
 void jit_invalidate_all(jit_state_t *jit);
 
 /* Print stats */
 void jit_print_stats(jit_state_t *jit);
+
+int jit_cache_selftest(dos_vm_t *vm, jit_state_t *jit);
 
 #endif /* DOS_JIT_H */

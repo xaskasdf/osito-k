@@ -636,6 +636,8 @@ static void cmd_help(void)
     sh_puts("  ipconf    Set static IP (ipconf <ip> [gw] [mask] [dns])\n");
     sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
     sh_puts("  dos-api-test  Validate DOS paths, seek, and disk geometry\n");
+    sh_puts("  dos-dpmi-stack-test  Validate paged DPMI handler frames\n");
+    sh_puts("  dos-dpmi-test Validate DPMI services and mode transitions\n");
     sh_puts("  oss-audio-test  Validate OSS playback and legacy PCM formats\n");
     sh_puts("  win32-wm-test  Validate USER32 hierarchy, geometry, z-order, and teardown\n");
     sh_puts("  win32-dialog-test  Validate USER32 resource and modal dialog contracts\n");
@@ -661,7 +663,7 @@ static void cmd_help(void)
     sh_puts("  win32-iocp-test  Validate IOCP lifecycle and the PE32 thunk path\n");
     sh_puts("  win32-wait-test  Validate registered-wait cancellation and completion\n");
     sh_puts("  msi       Install MSI/MSIX package (msi install file.msi | msix file.msix)\n");
-    sh_puts("  dosrun    Run a DOS 16-bit binary (dosrun file.com)\n");
+    sh_puts("  dosrun    Run DOS code (dosrun [--emulate [--max-steps N]] file.com|file.exe)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  desktop   Launch graphical desktop (desktop [hz])\n");
     sh_puts("  modes     List display modes\n");
@@ -7055,13 +7057,21 @@ q4kgdone:
         if (!found) sh_puts("No crash reports saved\n");
     } else if (strcmp(cmd, "httpd") == 0) {
         cmd_httpd(argc, argv);
-    } else if (strcmp(cmd, "dos-api-test") == 0) {
+    } else if (strcmp(cmd, "dos-api-test") == 0 || strcmp(cmd, "dos-dpmi-test") == 0 ||
+               strcmp(cmd, "dos-dpmi-stack-test") == 0) {
         extern int dos_api_selftest(void);
-        int failures = dos_api_selftest();
+        extern int dpmi_selftest(void);
+        extern int dos_dpmi_stack_selftest(void);
+        bool dpmi_only = strcmp(cmd, "dos-dpmi-test") == 0;
+        bool stack_only = strcmp(cmd, "dos-dpmi-stack-test") == 0;
+        int failures = stack_only ? dos_dpmi_stack_selftest()
+                     : dpmi_only ? dpmi_selftest() : dos_api_selftest();
+        sh_puts(stack_only ? "DOS DPMI stack test: "
+                : dpmi_only ? "DOS DPMI contract test: " : "DOS API contract test: ");
         if (!failures) {
-            sh_puts("DOS API contract test: PASS\n");
+            sh_puts("PASS\n");
         } else {
-            sh_puts("DOS API contract test: FAIL (");
+            sh_puts("FAIL (");
             sh_putdec((uint64_t)failures);
             sh_puts(")\n");
         }
@@ -7440,7 +7450,7 @@ q4kgdone:
         }
     } else if (strcmp(cmd, "dosrun") == 0) {
         if (argc < 2) {
-            sh_puts("Usage: dosrun <file.com|file.exe>\n");
+            sh_puts("Usage: dosrun [--emulate [--max-steps N]] [--] <file.com|file.exe> [args]\n");
         } else {
             extern int dos_run(const char *filename, int argc, const char **argv);
             extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));

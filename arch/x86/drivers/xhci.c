@@ -10,6 +10,7 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "../include/input_events.h"
 #include "xhci.h"
 
 /* ── External functions ──────────────────────────────────────── */
@@ -236,7 +237,7 @@ static void kbd_route_to_term(uint8_t code, bool shift, bool ctrl)
 
 /* HID usage (page 7) → PS/2 scancode set 1, for the non-extended main block.
  * 0 = unmapped/extended (handled separately in hid_route_to_win32). */
-static const uint8_t hid_to_ps2_set1[0x59] = {
+static const uint8_t hid_to_ps2_set1[0x66] = {
     [0x04]=0x1E,[0x05]=0x30,[0x06]=0x2E,[0x07]=0x20,[0x08]=0x12,[0x09]=0x21,
     [0x0A]=0x22,[0x0B]=0x23,[0x0C]=0x17,[0x0D]=0x24,[0x0E]=0x25,[0x0F]=0x26,
     [0x10]=0x32,[0x11]=0x31,[0x12]=0x18,[0x13]=0x19,[0x14]=0x10,[0x15]=0x13,
@@ -250,7 +251,58 @@ static const uint8_t hid_to_ps2_set1[0x59] = {
     [0x37]=0x34,[0x38]=0x35,[0x39]=0x3A/*Caps*/,
     [0x3A]=0x3B,[0x3B]=0x3C,[0x3C]=0x3D,[0x3D]=0x3E,[0x3E]=0x3F,[0x3F]=0x40,
     [0x40]=0x41,[0x41]=0x42,[0x42]=0x43,[0x43]=0x44,[0x44]=0x57,[0x45]=0x58,
+    [0x47]=0x46,[0x53]=0x45,[0x55]=0x37,[0x56]=0x4A,[0x57]=0x4E,
+    [0x59]=0x4F,[0x5A]=0x50,[0x5B]=0x51,[0x5C]=0x4B,[0x5D]=0x4C,
+    [0x5E]=0x4D,[0x5F]=0x47,[0x60]=0x48,[0x61]=0x49,[0x62]=0x52,
+    [0x63]=0x53,[0x64]=0x56,
 };
+
+static uint8_t hid_extended_set1(uint8_t code)
+{
+    switch (code) {
+    case 0x4F: return 0x4D;
+    case 0x50: return 0x4B;
+    case 0x51: return 0x50;
+    case 0x52: return 0x48;
+    case 0x4A: return 0x47;
+    case 0x4D: return 0x4F;
+    case 0x4B: return 0x49;
+    case 0x4E: return 0x51;
+    case 0x49: return 0x52;
+    case 0x4C: return 0x53;
+    case 0x54: return 0x35;
+    case 0x58: return 0x1C;
+    case 0x65: return 0x5D;
+    default: return 0;
+    }
+}
+
+static bool hid_capture_keyboard(uint8_t code, bool pressed)
+{
+    uint8_t packet[6];
+    uint32_t count = 0;
+    uint8_t sc = code < sizeof(hid_to_ps2_set1) ? hid_to_ps2_set1[code] : 0;
+    uint8_t ext = hid_extended_set1(code);
+    if (code >= 0xE0 && code <= 0xE7) {
+        static const uint8_t mods[] = {0x1D,0x2A,0x38,0x5B,0x1D,0x36,0x38,0x5C};
+        sc = mods[code - 0xE0];
+        if (code == 0xE3 || code == 0xE4 || code == 0xE6 || code == 0xE7)
+            ext = sc;
+    }
+    if (code == 0x48) {
+        static const uint8_t pause[] = {0xE1,0x1D,0x45,0xE1,0x9D,0xC5};
+        if (pressed) { memcpy(packet, pause, sizeof(pause)); count = sizeof(pause); }
+    } else if (code == 0x46) {
+        packet[0] = packet[2] = 0xE0;
+        packet[1] = pressed ? 0x2A : 0xB7;
+        packet[3] = pressed ? 0x37 : 0xAA;
+        count = 4;
+    } else if (sc || ext) {
+        if (ext) packet[count++] = 0xE0;
+        packet[count++] = (ext ? ext : sc) | (pressed ? 0 : 0x80);
+    }
+    return input_keyboard_post_set1(packet, count);
+}
 
 /* Deliver a USB HID key transition to the Win32 layer (UT99 etc.). Maps the
  * HID usage to a PS/2 set-1 scancode; extended keys (arrows / nav) are sent
@@ -261,26 +313,13 @@ static void hid_route_to_win32(uint8_t code, bool key_up)
     extern void win32_post_keyboard_event(uint8_t scancode, int key_up) __attribute__((weak));
     if (!win32_post_keyboard_event) return;
 
-    uint8_t ext = 0;  /* extended PS/2 scancode (after 0xE0), 0 = none */
-    switch (code) {
-    case 0x4F: ext = 0x4D; break; /* Right  */
-    case 0x50: ext = 0x4B; break; /* Left   */
-    case 0x51: ext = 0x50; break; /* Down   */
-    case 0x52: ext = 0x48; break; /* Up     */
-    case 0x4A: ext = 0x47; break; /* Home   */
-    case 0x4D: ext = 0x4F; break; /* End    */
-    case 0x4B: ext = 0x49; break; /* PageUp */
-    case 0x4E: ext = 0x51; break; /* PageDn */
-    case 0x49: ext = 0x52; break; /* Insert */
-    case 0x4C: ext = 0x53; break; /* Delete */
-    default: break;
-    }
+    uint8_t ext = hid_extended_set1(code);
     if (ext) {
         win32_post_keyboard_event(0xE0, key_up);
         win32_post_keyboard_event(ext, key_up);
         return;
     }
-    if (code < 0x59 && hid_to_ps2_set1[code])
+    if (code < sizeof(hid_to_ps2_set1) && hid_to_ps2_set1[code])
         win32_post_keyboard_event(hid_to_ps2_set1[code], key_up);
 }
 
@@ -414,6 +453,7 @@ static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r,
         for (int i = 0; i < 8; i++) {
             if (changed & (1 << i)) {
                 bool pressed = (mods & (1 << i)) != 0;
+                if (hid_capture_keyboard(0xE0 + i, pressed)) continue;
                 input_post_key(0xE0 + i, pressed, false);
                 /* PS/2 set-1 scancodes for L/R Ctrl,Shift,Alt,Gui. */
                 extern void win32_post_keyboard_event(uint8_t, int) __attribute__((weak));
@@ -435,6 +475,7 @@ static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r,
         for (int j = 0; j < n_keys; j++)
             if (keys[j] == prev_code) { still = true; break; }
         if (!still) {
+            if (hid_capture_keyboard(prev_code, false)) continue;
             input_post_key(prev_code, false, false);
             hid_route_to_win32(prev_code, true);
         }
@@ -447,6 +488,7 @@ static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r,
         for (int i = 0; i < 6; i++)
             if (dev->prev_keys[i] == code) { was_pressed = true; break; }
         if (was_pressed) continue;
+        if (hid_capture_keyboard(code, true)) continue;
 
         input_post_key(code, true, false);
         hid_route_to_win32(code, false);
