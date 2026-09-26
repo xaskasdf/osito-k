@@ -9,5 +9,7 @@ void user32_control_release(U32_CONTROL *control);
 BOOL user32_control_message(U32_CONTROL *control, HWND window, UINT message,
                             WPARAM wparam, LPARAM lparam, LRESULT *result);
 PWSTR user32_copy_window_text(HWND window);
+BOOL user32_control_is_groupbox(const U32_CONTROL *control, DWORD style);
+void user32_set_control_pixel_alpha(HWND window, BOOL enabled);
 
 #endif

@@ -340,6 +340,24 @@ static void ownership(void)
     DeleteObject(bitmap);
 }
 
+static void groupbox_contracts(void)
+{
+    HANDLE group = child("BUTTON", "Group", 7, 401);
+    unsigned before = colors;
+    print(group);
+    check(colors > before, "group box requests CTLCOLORSTATIC");
+    check((bits[18*240+100] & 0xffffff) == 0x112233,
+          "group box does not erase interior pixels supplied by the caller");
+    check(SendMessageA(group, 0x84, 0, 0) == -1,
+          "group box hit testing is transparent");
+    check((SendMessageA(group, 0x87, 0, 0) & 0x100) != 0,
+          "group box does not advertise an interactive button");
+    before = clicks;
+    SendMessageA(group, 0xF5, 0, 0);
+    check(clicks == before+1, "explicit BM_CLICK still notifies a group box owner");
+    DestroyWindow(group);
+}
+
 static DWORD CALL text_worker(void *unused)
 {
     (void)unused;
@@ -390,7 +408,7 @@ void mainCRTStartup(void)
     if (!parent || !dc || !dib) ExitProcess(2);
     HANDLE old = SelectObject(dc, dib);
     ink = CreateSolidBrush(0x0033AA55); tint = CreateSolidBrush(0x00664422);
-    text_contracts(); buttons(); ownership(); threaded_text();
+    text_contracts(); buttons(); ownership(); groupbox_contracts(); threaded_text();
     DestroyWindow(parent); UnregisterClassA(class_name, instance);
     SelectObject(dc, old); DeleteObject(dib); DeleteDC(dc);
     DeleteObject(ink); DeleteObject(tint);

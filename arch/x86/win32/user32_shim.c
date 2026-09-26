@@ -57,6 +57,7 @@ extern uint32_t compat32_get_last_caller_eip(void);
 extern void ddraw_present_hook(void) __attribute__((weak));
 extern DWORD ddraw_present_poll_interval(void) __attribute__((weak));
 extern void xhci_poll(void) __attribute__((weak));
+extern void ps2_poll(void) __attribute__((weak));
 extern bool compositor_is_running(void) __attribute__((weak));
 
 static void msg_read_from(const void *src, MSG *out);
@@ -98,6 +99,8 @@ extern void compositor_set_z_order(uint32_t window_id, uint32_t z_order)
     __attribute__((weak));
 extern void compositor_set_clip_rect(uint32_t window_id, bool enabled,
     int16_t x, int16_t y, uint16_t width, uint16_t height)
+    __attribute__((weak));
+extern void compositor_set_pixel_alpha(uint32_t window_id, bool enabled)
     __attribute__((weak));
 extern void compositor_set_size(uint32_t window_id, uint16_t width, uint16_t height)
     __attribute__((weak));
@@ -407,12 +410,15 @@ typedef struct {
     U32_LISTBOX *listbox;
     BOOL        unicode;
     WNDPROC     wndproc;
+    WNDPROC     initial_control_proc;
     DWORD       style;
     DWORD       ex_style;
     DWORD       layered_color_key;
     DWORD       layered_flags;
     BYTE        layered_alpha;
     int         x, y, width, height;
+    RECT        client;           /* client bounds relative to the outer surface */
+    RECT        nc_outer;
     HWND        parent;
     HWND        owner;
     HMENU       menu;
@@ -452,6 +458,45 @@ static int window_count = 0;
 static ULONG_PTR next_hwnd = 0xA0000001;
 static int defer_sync_depth;
 static unsigned show_trace_count;
+
+static void recalc_window_client(WINDOW *w, BOOL valid_rects);
+static void paint_window_frame(WINDOW *w);
+
+static int window_client_width(const WINDOW *w)
+{
+    return w->client.right - w->client.left;
+}
+
+static int window_client_height(const WINDOW *w)
+{
+    return w->client.bottom - w->client.top;
+}
+
+static RECT window_frame_margins(DWORD style, DWORD ex, BOOL menu)
+{
+    int border = (style & WS_THICKFRAME) ? 4 :
+                 (style & WS_DLGFRAME) ? 3 : (style & WS_BORDER) ? 1 : 0;
+    if (ex & 0x00000100u) border++; /* WS_EX_WINDOWEDGE */
+    if (ex & 0x00000200u) border += 2; /* WS_EX_CLIENTEDGE */
+    if (ex & 0x00020000u) border++; /* WS_EX_STATICEDGE */
+    RECT margins = {border, border, border, border};
+    if ((style & WS_CAPTION) == WS_CAPTION)
+        margins.top += (ex & WS_EX_TOOLWINDOW) ? 18 : 23;
+    if (menu && !(style & WS_CHILD)) margins.top += 20;
+    return margins;
+}
+
+static void default_client_rect(WINDOW *w, RECT *rect)
+{
+    if (w->directdraw_exclusive) return;
+    RECT margin = window_frame_margins(w->style, w->ex_style, w->menu != NULL);
+    rect->left += margin.left;
+    rect->top += margin.top;
+    rect->right -= margin.right;
+    rect->bottom -= margin.bottom;
+    if (rect->right < rect->left) rect->right = rect->left;
+    if (rect->bottom < rect->top) rect->bottom = rect->top;
+}
 
 static int32_t user32_current_task(void)
 {
@@ -582,25 +627,34 @@ uint32_t user32_get_window_compositor_id(HWND hwnd)
     return 0;
 }
 
-BOOL user32_get_window_surface(HWND hwnd, void **pixels, int *width,
-                               int *height, int *pitch)
+BOOL user32_get_window_dc_surface(HWND hwnd, void **pixels, int *width,
+                                   int *height, int *pitch, BOOL whole)
 {
     WINDOW *w = find_window(hwnd);
     if (!w || !w->shm_pixels || w->surface_width <= 0 || w->surface_height <= 0)
         return FALSE;
 
-    int visible_width = w->width;
-    int visible_height = w->height;
-    if (visible_width > w->surface_width) visible_width = w->surface_width;
-    if (visible_height > w->surface_height) visible_height = w->surface_height;
+    int left = whole ? 0 : w->client.left, top = whole ? 0 : w->client.top;
+    int visible_width = whole ? w->width : window_client_width(w);
+    int visible_height = whole ? w->height : window_client_height(w);
+    if (left > w->surface_width) left = w->surface_width;
+    if (top > w->surface_height) top = w->surface_height;
+    if (visible_width > w->surface_width-left) visible_width = w->surface_width-left;
+    if (visible_height > w->surface_height-top) visible_height = w->surface_height-top;
     if (visible_width < 0) visible_width = 0;
     if (visible_height < 0) visible_height = 0;
 
-    if (pixels) *pixels = w->shm_pixels;
+    if (pixels) *pixels = (BYTE *)w->shm_pixels + ((SIZE_T)top*w->surface_width+left)*4;
     if (width) *width = visible_width;
     if (height) *height = visible_height;
     if (pitch) *pitch = w->surface_width * 4;
     return TRUE;
+}
+
+BOOL user32_get_window_surface(HWND hwnd, void **pixels, int *width,
+                               int *height, int *pitch)
+{
+    return user32_get_window_dc_surface(hwnd, pixels, width, height, pitch, FALSE);
 }
 
 void user32_mark_window_dirty(HWND hwnd)
@@ -608,6 +662,13 @@ void user32_mark_window_dirty(HWND hwnd)
     WINDOW *w = find_window(hwnd);
     if (w && w->compositor_id && compositor_signal_dirty)
         compositor_signal_dirty(w->compositor_id);
+}
+
+void user32_set_control_pixel_alpha(HWND hwnd, BOOL enabled)
+{
+    WINDOW *w = find_window(hwnd);
+    if (w && w->control && w->compositor_id && compositor_set_pixel_alpha)
+        compositor_set_pixel_alpha(w->compositor_id, enabled != FALSE);
 }
 
 static void sync_window_surface(WINDOW *w, int width, int height)
@@ -872,11 +933,21 @@ static void window_screen_origin(const WINDOW *w, int *screen_x, int *screen_y)
         WINDOW *parent = find_window(current->parent);
         if (!parent || parent == current)
             break;
+        x += parent->client.left;
+        y += parent->client.top;
         current = parent;
     }
 
     if (screen_x) *screen_x = x;
     if (screen_y) *screen_y = y;
+}
+
+static void window_client_origin(const WINDOW *w, int *screen_x, int *screen_y)
+{
+    int x, y;
+    window_screen_origin(w, &x, &y);
+    if (screen_x) *screen_x = x + (w ? w->client.left : 0);
+    if (screen_y) *screen_y = y + (w ? w->client.top : 0);
 }
 
 static WINDOW *window_root(WINDOW *w, int *out_depth)
@@ -1051,7 +1122,11 @@ BOOL user32_accessibility_snapshot(HWND handle,
     info->window_rect.top = screen_y;
     info->window_rect.right = screen_x + w->width;
     info->window_rect.bottom = screen_y + w->height;
-    info->client_rect = info->window_rect;
+    info->client_rect = w->client;
+    info->client_rect.left += screen_x;
+    info->client_rect.top += screen_y;
+    info->client_rect.right += screen_x;
+    info->client_rect.bottom += screen_y;
     info->visible = !w->message_only && window_style_is_visible(w);
     info->message_only = w->message_only ? TRUE : FALSE;
 
@@ -1161,22 +1236,22 @@ static BOOL window_parent_clip_rect(const WINDOW *w, RECT *clip)
         return FALSE;
 
     int parent_x, parent_y;
-    window_screen_origin(parent, &parent_x, &parent_y);
+    window_client_origin(parent, &parent_x, &parent_y);
     clip->left = parent_x;
     clip->top = parent_y;
-    clip->right = parent_x + parent->width;
-    clip->bottom = parent_y + parent->height;
+    clip->right = parent_x + window_client_width(parent);
+    clip->bottom = parent_y + window_client_height(parent);
 
     for (int depth = 0; parent->parent && depth < MAX_WINDOWS; depth++) {
         if (hwnd_is_desktop(parent->parent))
             break;
         parent = find_window(parent->parent);
         if (!parent) break;
-        window_screen_origin(parent, &parent_x, &parent_y);
+        window_client_origin(parent, &parent_x, &parent_y);
         int left = parent_x;
         int top = parent_y;
-        int right = parent_x + parent->width;
-        int bottom = parent_y + parent->height;
+        int right = parent_x + window_client_width(parent);
+        int bottom = parent_y + window_client_height(parent);
         if (left > clip->left) clip->left = left;
         if (top > clip->top) clip->top = top;
         if (right < clip->right) clip->right = right;
@@ -1353,6 +1428,7 @@ typedef struct {
 } NATIVE_MOVE_STATE;
 
 static NATIVE_MOVE_STATE native_move;
+static struct { HWND window; UINT hit; } native_caption_press;
 
 #define INPUT_SEQUENCE_STATE_SLOTS 256
 typedef struct {
@@ -1448,10 +1524,17 @@ static ULONG_PTR next_user_timer_id = 1;
 #define USER_WINDOWPOS_STRIDE    32
 #define USER_CREATE_MAX_DEPTH    16
 #define USER_CREATE_STRIDE       48
+#define USER_NCCALC_MAX_DEPTH      8
+#define USER_NCCALC_STRIDE        96
 #define USER_WINDOWPOS_OFFSET \
     (USER_HOOK_MAX_DEPTH * USER_HOOK_SCRATCH_STRIDE)
 #define USER_CREATE_OFFSET \
     (USER_WINDOWPOS_OFFSET + USER_WINDOWPOS_MAX_DEPTH * USER_WINDOWPOS_STRIDE)
+#define USER_NCCALC_OFFSET \
+    (USER_CREATE_OFFSET + USER_CREATE_MAX_DEPTH * USER_CREATE_STRIDE)
+
+_Static_assert(USER_NCCALC_OFFSET + USER_NCCALC_MAX_DEPTH * USER_NCCALC_STRIDE <= 0x1000,
+               "Nonclient callback scratch exceeds one page");
 
 _Static_assert(USER_CREATE_OFFSET +
                USER_CREATE_MAX_DEPTH * USER_CREATE_STRIDE <= 0x1000,
@@ -1482,6 +1565,7 @@ typedef struct {
     int depth;
     int windowpos_depth;
     int create_depth;
+    int nccalc_depth;
     BOOL unicode_message;
     PVOID scratch_page;
     USER_HOOK_FRAME frames[USER_HOOK_MAX_DEPTH];
@@ -2891,7 +2975,7 @@ static void msg_capture_pending_input(WINDOW *capture)
 
     if (!capture)
         return;
-    window_screen_origin(capture, &origin_x, &origin_y);
+    window_client_origin(capture, &origin_x, &origin_y);
 
     uint64_t flags = msg_lock_irqsave();
     uint64_t retrieved_sequence =
@@ -2938,13 +3022,13 @@ static void invalidate_window(WINDOW *w, const RECT *rect, BOOL erase)
         dirty = *rect;
         if (dirty.left < 0) dirty.left = 0;
         if (dirty.top < 0) dirty.top = 0;
-        if (dirty.right > w->width) dirty.right = w->width;
-        if (dirty.bottom > w->height) dirty.bottom = w->height;
+        if (dirty.right > window_client_width(w)) dirty.right = window_client_width(w);
+        if (dirty.bottom > window_client_height(w)) dirty.bottom = window_client_height(w);
     } else {
         dirty.left = 0;
         dirty.top = 0;
-        dirty.right = w->width;
-        dirty.bottom = w->height;
+        dirty.right = window_client_width(w);
+        dirty.bottom = window_client_height(w);
     }
     if (dirty.left >= dirty.right || dirty.top >= dirty.bottom) return;
 
@@ -3354,6 +3438,7 @@ static BYTE extended_scancode_to_vk(BYTE sc)
     case 0x1C: return VK_RETURN;   /* Numpad Enter */
     case 0x1D: return VK_RCONTROL;
     case 0x35: return VK_DIVIDE;   /* Numpad / */
+    case 0x37: return 0x2C;        /* VK_SNAPSHOT */
     case 0x38: return VK_RMENU;    /* Right Alt */
     case 0x47: return VK_HOME;
     case 0x48: return VK_UP;
@@ -3367,6 +3452,7 @@ static BYTE extended_scancode_to_vk(BYTE sc)
     case 0x53: return VK_DELETE;
     case 0x5B: return VK_LWIN;
     case 0x5C: return VK_RWIN;
+    case 0x5D: return 0x5D;        /* VK_APPS */
     default:   return 0;
     }
 }
@@ -3801,8 +3887,9 @@ static void relative_pointer_note_warp(POINT point)
         centered = point_near(point, center, 2);
     } else if (owns_hidden_cursor && target) {
         int x, y;
-        window_screen_origin(target, &x, &y);
-        POINT center = { x + target->width / 2, y + target->height / 2 };
+        window_client_origin(target, &x, &y);
+        POINT center = { x + window_client_width(target) / 2,
+                         y + window_client_height(target) / 2 };
         centered = point_near(point, center, 2);
     }
 
@@ -4327,8 +4414,8 @@ static void dispatch_wm_size(WINDOW *w)
     if (!w || !w->wndproc) return;
     UINT size_type = (w->style & WS_MINIMIZE) ? SIZE_MINIMIZED :
                      ((w->style & WS_MAXIMIZE) ? SIZE_MAXIMIZED : SIZE_RESTORED);
-    int width = size_type == SIZE_MINIMIZED ? 0 : w->width;
-    int height = size_type == SIZE_MINIMIZED ? 0 : w->height;
+    int width = size_type == SIZE_MINIMIZED ? 0 : window_client_width(w);
+    int height = size_type == SIZE_MINIMIZED ? 0 : window_client_height(w);
     if (size_type != SIZE_MINIMIZED && (width <= 0 || height <= 0)) return;
     serial_puts("[USER32] WM_SIZE hwnd=");
     serial_puthex((uint64_t)(ULONG_PTR)w->handle, 8);
@@ -4400,6 +4487,69 @@ static BOOL dispatch_windowpos_message(WINDOW *w, DWORD message,
         position->flags = wire->flags;
     }
     return TRUE;
+}
+
+static void recalc_window_client(WINDOW *w, BOOL valid_rects)
+{
+    RECT proposed = { w->x, w->y, w->x+w->width, w->y+w->height };
+    RECT result = proposed;
+    default_client_rect(w, &result);
+    if (window_on_current_thread(w) && w->wndproc) {
+        RECT old_client = w->client;
+        old_client.left += w->nc_outer.left;
+        old_client.top += w->nc_outer.top;
+        old_client.right += w->nc_outer.left;
+        old_client.bottom += w->nc_outer.top;
+        if (!g_compat32_mode) {
+            struct { RECT rects[3]; WINDOWPOS *position; } params;
+            WINDOWPOS pos = { w->handle, HWND_TOP, w->x, w->y,
+                               w->width, w->height, 0 };
+            params.rects[0] = proposed;
+            params.rects[1] = w->nc_outer;
+            params.rects[2] = old_client;
+            params.position = &pos;
+            dispatch_wndproc(w->wndproc, w->handle, WM_NCCALCSIZE, valid_rects,
+                             (LPARAM)(ULONG_PTR)&params);
+            result = params.rects[0];
+        } else {
+            USER_HOOK_CONTEXT *context = user_hook_context_get(TRUE);
+            PVOID scratch = user32_callback_scratch_page(context);
+            if (context && scratch && context->nccalc_depth < USER_NCCALC_MAX_DEPTH) {
+                BYTE *wire = (BYTE *)scratch + USER_NCCALC_OFFSET +
+                             context->nccalc_depth * USER_NCCALC_STRIDE;
+                RECT *rects = (RECT *)wire;
+                WINDOWPOS32 *pos = (WINDOWPOS32 *)(wire+52);
+                rects[0] = proposed;
+                rects[1] = w->nc_outer;
+                rects[2] = old_client;
+                *(uint32_t *)(wire+48) = (uint32_t)(ULONG_PTR)pos;
+                *pos = (WINDOWPOS32){ (uint32_t)(ULONG_PTR)w->handle, 0,
+                                      w->x, w->y, w->width, w->height, 0 };
+                context->nccalc_depth++;
+                dispatch_wndproc(w->wndproc, w->handle, WM_NCCALCSIZE, valid_rects,
+                                 (LPARAM)(ULONG_PTR)wire);
+                context->nccalc_depth--;
+                result = rects[0];
+            }
+        }
+    }
+    if (!w->used || w->destroying) return;
+    w->nc_outer = proposed;
+    result.left -= proposed.left;
+    result.right -= proposed.left;
+    result.top -= proposed.top;
+    result.bottom -= proposed.top;
+    if (result.left < 0) result.left = 0;
+    if (result.top < 0) result.top = 0;
+    if (result.right < 0) result.right = 0;
+    if (result.bottom < 0) result.bottom = 0;
+    if (result.left > w->width) result.left = w->width;
+    if (result.top > w->height) result.top = w->height;
+    if (result.right > w->width) result.right = w->width;
+    if (result.bottom > w->height) result.bottom = w->height;
+    if (result.left > result.right) result.left = result.right;
+    if (result.top > result.bottom) result.top = result.bottom;
+    w->client = result;
 }
 
 static void dispatch_focus_message(HWND target, DWORD message, HWND other)
@@ -4642,6 +4792,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     if (class_name) u32_strcpy(w->class_name, class_name, 128);
     if (window_name) u32_strcpy(w->title, window_name, 256);
     w->wndproc  = wndproc;
+    w->initial_control_proc = cls->system_class ? wndproc : NULL;
     w->unicode  = cls->unicode;
     w->style    = dwStyle;
     w->ex_style = dwExStyle;
@@ -4652,6 +4803,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     w->y        = Y;
     w->width    = nWidth;
     w->height   = nHeight;
+    w->client = (RECT){0, 0, nWidth, nHeight};
     w->parent   = (dwStyle & WS_CHILD) && !message_only ? hWndParent : NULL;
     w->owner    = !(dwStyle & WS_CHILD) && !message_only &&
                   !hwnd_is_desktop(hWndParent) ? hWndParent : NULL;
@@ -4787,10 +4939,12 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
             };
             nc_result = dispatch_wndproc(w->wndproc, w->handle, WM_NCCREATE, 0,
                                          (LPARAM)(ULONG_PTR)&cs);
-            if (nc_result)
+            if (nc_result) {
+                recalc_window_client(w, FALSE);
                 create_result = dispatch_wndproc(w->wndproc, w->handle,
                                                  WM_CREATE, 0,
                                                  (LPARAM)(ULONG_PTR)&cs);
+            }
         }
 
         uint32_t wwindow_addr = (uint32_t)(ULONG_PTR)lpParam;
@@ -4823,10 +4977,12 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
                 nc_result = dispatch_wndproc(w->wndproc, w->handle,
                                              WM_NCCREATE, 0,
                                              (LPARAM)(uintptr_t)cs);
-                if (nc_result)
+                if (nc_result) {
+                    recalc_window_client(w, FALSE);
                     create_result = dispatch_wndproc(w->wndproc, w->handle,
                                                      WM_CREATE, 0,
                                                      (LPARAM)(uintptr_t)cs);
+                }
                 context->create_depth--;
             } else {
                 nc_result = 0;
@@ -4856,6 +5012,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
      * WndProc can resolve the window. */
     dispatch_wm_size(w);
     if (w->visible) {
+        dispatch_window_message(w, WM_NCPAINT, 1, 0);
         if (w->wndproc)
             dispatch_wndproc(w->wndproc, w->handle, WM_SHOWWINDOW, TRUE, 0);
         invalidate_window(w, NULL, TRUE);
@@ -4959,6 +5116,8 @@ static void release_window(WINDOW *w)
         native_move.pointer_offset_x = 0;
         native_move.pointer_offset_y = 0;
     }
+    if (native_caption_press.window == w->handle)
+        native_caption_press.window = NULL;
     if (caret_hwnd == w->handle) {
         caret_hwnd = NULL;
     }
@@ -5186,8 +5345,8 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
             w->x = 0;
             w->y = 0;
             WINDOW *parent = find_window(w->parent);
-            w->width = parent ? parent->width : GetSystemMetrics(SM_CXSCREEN);
-            w->height = parent ? parent->height : GetSystemMetrics(SM_CYSCREEN);
+            w->width = parent ? window_client_width(parent) : GetSystemMetrics(SM_CXSCREEN);
+            w->height = parent ? window_client_height(parent) : GetSystemMetrics(SM_CYSCREEN);
             sync_window_surface(w, w->width, w->height);
         } else if (nCmdShow == SW_SHOWNORMAL || nCmdShow == SW_RESTORE ||
                    nCmdShow == SW_SHOWDEFAULT) {
@@ -5207,6 +5366,9 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
         w->style |= WS_VISIBLE;
     else
         w->style &= ~WS_VISIBLE;
+
+    if (old_state != (w->style & (WS_MINIMIZE | WS_MAXIMIZE)))
+        recalc_window_client(w, TRUE);
 
     sync_all_window_compositor_state();
 
@@ -5241,6 +5403,7 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
         }
     }
     if ((!was_visible && w->visible) || old_state != new_state) {
+        dispatch_window_message(w, WM_NCPAINT, 1, 0);
         dispatch_wm_size(w);
         if (!(w->style & WS_MINIMIZE))
             invalidate_window(w, NULL, TRUE);
@@ -5302,6 +5465,7 @@ static BOOL window_set_text(HWND hWnd, PCVOID input, BOOL wide)
     if (w->compositor_id && compositor_set_title)
         compositor_set_title(w->compositor_id, w->title);
     invalidate_window(w, NULL, TRUE);
+    dispatch_window_message(w, WM_NCPAINT, 1, 0);
     return TRUE;
 }
 
@@ -5449,6 +5613,11 @@ BOOL WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertAfter,
         sync_window_surface(w, cx, cy);
     }
 
+    if (resized || (uFlags & SWP_FRAMECHANGED))
+        recalc_window_client(w, TRUE);
+    else if (moved)
+        w->nc_outer = (RECT){w->x,w->y,w->x+w->width,w->y+w->height};
+
     if (moved || resized)
         update_normal_rect(w);
 
@@ -5476,6 +5645,8 @@ BOOL WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertAfter,
     if ((moved || resized) && !(uFlags & SWP_NOREDRAW) &&
         window_should_render(w))
         invalidate_window(w, NULL, TRUE);
+    if ((resized || (uFlags & SWP_FRAMECHANGED)) && !(uFlags & SWP_NOREDRAW))
+        dispatch_window_message(w, WM_NCPAINT, 1, 0);
 
     if (!(uFlags & SWP_NOACTIVATE) && w->visible && !w->parent)
         SetFocus(hWnd);
@@ -5584,12 +5755,15 @@ BOOL user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
     }
 
     if (!exclusive || !allow_window_changes) {
+        recalc_window_client(win, TRUE);
         sync_all_window_compositor_state();
+        if (!exclusive)
+            dispatch_window_message(win, WM_NCPAINT, 1, 0);
         return TRUE;
     }
 
     BOOL result = SetWindowPos(hWnd, HWND_TOP, 0, 0, width, height,
-                               SWP_NOZORDER | SWP_NOACTIVATE);
+                               SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     if (result) {
         /* The primary surface, rather than GDI, supplies the exclusive frame. */
         win->paint_pending = 0;
@@ -5617,8 +5791,9 @@ static DWORD service_message_pump(void)
     }
 
     BOOL compositor_active = compositor_is_running && compositor_is_running();
-    if (xhci_poll && dispatch_depth == 0 && !compositor_active) {
-        xhci_poll();
+    if ((xhci_poll || ps2_poll) && dispatch_depth == 0 && !compositor_active) {
+        if (ps2_poll) ps2_poll();
+        if (xhci_poll) xhci_poll();
         if (poll_interval > 10)
             poll_interval = 10;
     }
@@ -6029,6 +6204,123 @@ static void native_move_update(POINT point)
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+static BOOL window_caption_rect(const WINDOW *w, RECT *rect)
+{
+    if (!w || (w->style & WS_CAPTION) != WS_CAPTION) return FALSE;
+    int height = (w->ex_style & WS_EX_TOOLWINDOW) ? 18 : 23;
+    if (w->client.top < height) return FALSE;
+    RECT margin = window_frame_margins(w->style, w->ex_style, FALSE);
+    int border = margin.top - height;
+    *rect = (RECT){ margin.left, border, w->width-margin.right, border+height };
+    return rect->right > rect->left && rect->bottom <= w->client.top;
+}
+
+static BOOL caption_button_rect(const WINDOW *w, UINT hit, RECT *rect)
+{
+    RECT caption;
+    if (!(w->style & WS_SYSMENU) || !window_caption_rect(w, &caption)) return FALSE;
+    int size = caption.bottom-caption.top-4, index = 0;
+    if (hit == HTMAXBUTTON) {
+        if (!(w->style & WS_MAXIMIZEBOX)) return FALSE;
+        index = 1;
+    } else if (hit == HTMINBUTTON) {
+        if (!(w->style & WS_MINIMIZEBOX)) return FALSE;
+        index = 1 + ((w->style & WS_MAXIMIZEBOX) != 0);
+    } else if (hit != HTCLOSE) return FALSE;
+    int right = caption.right - 2 - index*(size+2);
+    *rect = (RECT){right-size, caption.top+2, right, caption.bottom-2};
+    return rect->left >= caption.left;
+}
+
+static LRESULT default_nonclient_hit(WINDOW *w, POINT screen)
+{
+    if (!w) return 0;
+    int x, y;
+    window_screen_origin(w, &x, &y);
+    POINT point = { screen.x-x, screen.y-y };
+    if (point.x < 0 || point.y < 0 || point.x >= w->width || point.y >= w->height)
+        return 0;
+    if (PtInRect(&w->client, point)) return HTCLIENT;
+    if ((w->style & WS_THICKFRAME) && !(w->style & WS_MAXIMIZE)) {
+        BOOL left = point.x < w->client.left;
+        BOOL right = point.x >= w->client.right;
+        BOOL top = point.y < 4, bottom = point.y >= w->client.bottom;
+        if (top) return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
+        if (bottom) return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
+        if (left) return HTLEFT;
+        if (right) return HTRIGHT;
+    }
+    const UINT hits[] = {HTCLOSE, HTMAXBUTTON, HTMINBUTTON};
+    for (UINT i=0; i<3; i++) {
+        RECT rect;
+        if (caption_button_rect(w, hits[i], &rect) && PtInRect(&rect, point)) return hits[i];
+    }
+    RECT caption;
+    if (window_caption_rect(w, &caption) && PtInRect(&caption, point)) return HTCAPTION;
+    return HTBORDER;
+}
+
+static void frame_fill(HDC dc, int left, int top, int right, int bottom, HGDIOBJ brush)
+{
+    GDI_RECT rect = {left, top, right, bottom};
+    if (right>left && bottom>top) gdi32_fill_rect(dc, &rect, brush);
+}
+
+static void paint_window_frame(WINDOW *w)
+{
+    if (!w || !w->used || !w->shm_pixels ||
+        (!w->client.left && !w->client.top && w->client.right==w->width &&
+         w->client.bottom==w->height)) return;
+    HDC dc = gdi32_alloc_nonclient_dc(w->handle);
+    if (!dc) return;
+    HGDIOBJ frame = CreateSolidBrush(GetSysColor(15));
+    frame_fill(dc,0,0,w->width,w->client.top,frame);
+    frame_fill(dc,0,w->client.top,w->client.left,w->height,frame);
+    frame_fill(dc,w->client.right,w->client.top,w->width,w->height,frame);
+    frame_fill(dc,w->client.left,w->client.bottom,w->client.right,w->height,frame);
+    RECT caption;
+    if (window_caption_rect(w, &caption)) {
+        BOOL active = user32_foreground_active && active_hwnd == w->handle;
+        HGDIOBJ title = CreateSolidBrush(GetSysColor(active ? 2 : 3));
+        frame_fill(dc,caption.left,caption.top,caption.right,caption.bottom,title);
+        DeleteObject(title);
+        const UINT hits[] = {HTCLOSE, HTMAXBUTTON, HTMINBUTTON};
+        HGDIOBJ ink = CreateSolidBrush(GetSysColor(18));
+        int text_right = caption.right;
+        for (UINT i=0; i<3; i++) {
+            RECT r;
+            if (!caption_button_rect(w,hits[i],&r)) continue;
+            text_right = r.left-4;
+            frame_fill(dc,r.left,r.top,r.right,r.bottom,frame);
+            int left=r.left+5, right=r.right-5, top=r.top+5, bottom=r.bottom-5;
+            if (hits[i]==HTCLOSE) {
+                int n=right-left;
+                for (int j=0;j<n;j++) {
+                    frame_fill(dc,left+j,top+j,left+j+1,top+j+1,ink);
+                    frame_fill(dc,right-j-1,top+j,right-j,top+j+1,ink);
+                }
+            } else if (hits[i]==HTMINBUTTON) {
+                frame_fill(dc,left,bottom-2,right,bottom,ink);
+            } else {
+                frame_fill(dc,left,top,right,top+2,ink);
+                frame_fill(dc,left,top,left+1,bottom,ink);
+                frame_fill(dc,right-1,top,right,bottom,ink);
+                frame_fill(dc,left,bottom-1,right,bottom,ink);
+            }
+        }
+        DeleteObject(ink);
+        GDI_RECT clip = {caption.left+4,caption.top,text_right,caption.bottom};
+        DWORD old_color = SetTextColor(dc,GetSysColor(active ? 9 : 19));
+        int old_mode = SetBkMode(dc,1);
+        UINT count=0; while(w->title[count]) count++;
+        ExtTextOutA(dc,clip.left,caption.top+3,4,&clip,w->title,count,NULL);
+        SetTextColor(dc,old_color);
+        SetBkMode(dc,old_mode);
+    }
+    DeleteObject(frame);
+    user32_mark_window_dirty(w->handle);
+}
+
 static BOOL dispatch_nonclient_press(const MSG *message, LRESULT *result)
 {
     WINDOW *target = message ? find_window(message->hwnd) : NULL;
@@ -6044,11 +6336,11 @@ static BOOL dispatch_nonclient_press(const MSG *message, LRESULT *result)
     LPARAM screen_position = screen_point_lparam(message->pt);
     LRESULT hit = dispatch_wndproc(host->wndproc, host->handle,
                                    WM_NCHITTEST, 0, screen_position);
-    if (hit != HTCAPTION)
+    if (hit <= HTCLIENT)
         return FALSE;
 
     *result = dispatch_wndproc(host->wndproc, host->handle,
-                               WM_NCLBUTTONDOWN, HTCAPTION,
+                               WM_NCLBUTTONDOWN, (WPARAM)hit,
                                screen_position);
     return TRUE;
 }
@@ -6065,6 +6357,21 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
     BOOL input_message =
         msg_last_retrieved_source(GetCurrentProcessId(),
                                   GetCurrentThreadId()) == MSG_SOURCE_INPUT;
+    if (input_message && native_caption_press.window && m.message == WM_LBUTTONUP) {
+        HWND handle = native_caption_press.window;
+        UINT hit = native_caption_press.hit;
+        native_caption_press.window = NULL;
+        if (capture_hwnd == handle) ReleaseCapture();
+        WINDOW *window = find_window(handle);
+        if (window_on_current_thread(window) &&
+            default_nonclient_hit(window,m.pt) == (LRESULT)hit) {
+            UINT command = hit == HTCLOSE ? SC_CLOSE : hit == HTMINBUTTON ? SC_MINIMIZE :
+                           (window->style & WS_MAXIMIZE) ? SC_RESTORE : SC_MAXIMIZE;
+            dispatch_wndproc(window->wndproc,handle,WM_NCLBUTTONUP,hit,screen_point_lparam(m.pt));
+            SendMessageA(handle,WM_SYSCOMMAND,command,screen_point_lparam(m.pt));
+        }
+        return 0;
+    }
     if (input_message && native_move.window) {
         if (m.message == WM_MOUSEMOVE) {
             native_move_update(m.pt);
@@ -6406,7 +6713,18 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
         SetBkColor((HDC)(ULONG_PTR)wParam, GetSysColor(background));
         return (LRESULT)(ULONG_PTR)GetSysColorBrush_u32(background);
     }
-    case WM_NCHITTEST:  return HTCLIENT;
+    case WM_NCCALCSIZE: {
+        WINDOW *window = find_window(hWnd);
+        if (window && lParam) default_client_rect(window, (RECT *)(ULONG_PTR)lParam);
+        return 0;
+    }
+    case WM_NCPAINT:
+        paint_window_frame(find_window(hWnd));
+        return 0;
+    case WM_NCHITTEST: {
+        POINT point = {(short)(lParam & 0xFFFF), (short)((lParam >> 16) & 0xFFFF)};
+        return default_nonclient_hit(find_window(hWnd), point);
+    }
     case WM_NCLBUTTONDOWN:
         if (wParam == HTCAPTION) {
             POINT point = {
@@ -6414,11 +6732,25 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
                 .y = (short)((lParam >> 16) & 0xFFFF),
             };
             native_move_begin(hWnd, point);
+        } else if (wParam == HTCLOSE || wParam == HTMINBUTTON || wParam == HTMAXBUTTON) {
+            WINDOW *w = find_window(hWnd);
+            RECT button;
+            if (w && caption_button_rect(w,(UINT)wParam,&button)) {
+                WNDCLASS_ENTRY *cls = lookup_class_for_pid(w->class_name,w->owner_pid);
+                if (wParam == HTCLOSE && cls && (cls->style & CS_NOCLOSE)) return 0;
+                SetCapture(hWnd);
+                if (GetCapture() == hWnd) {
+                    native_caption_press.window = hWnd;
+                    native_caption_press.hit = (UINT)wParam;
+                }
+            }
         }
         return 0;
     case WM_NCLBUTTONUP:
         return 0;
-    case WM_NCACTIVATE: return 1;
+    case WM_NCACTIVATE:
+        paint_window_frame(find_window(hWnd));
+        return 1;
     case WM_SETCURSOR:  return 1;
     case WM_ACTIVATE:   return 0;
     case WM_SYSKEYDOWN:
@@ -6461,8 +6793,8 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
         if (!(flags & SWP_NOMOVE))
             dispatch_window_message(
                 w, WM_MOVE, 0,
-                ((uint32_t)x & 0xFFFFU) |
-                (((uint32_t)y & 0xFFFFU) << 16));
+                ((uint32_t)(x+w->client.left) & 0xFFFFU) |
+                (((uint32_t)(y+w->client.top) & 0xFFFFU) << 16));
         return 0;
     }
     case WM_SYSCOMMAND:
@@ -6643,8 +6975,8 @@ BOOL WINAPI GetClientRect(HWND hWnd, LPRECT lpRect)
         return FALSE;
     lpRect->left   = 0;
     lpRect->top    = 0;
-    lpRect->right  = w->width;
-    lpRect->bottom = w->height;
+    lpRect->right  = window_client_width(w);
+    lpRect->bottom = window_client_height(w);
     {
         static int n = 0;
         if (u32_input_diagnostics_active() && n < 32 &&
@@ -6675,6 +7007,38 @@ BOOL WINAPI GetWindowRect(HWND hWnd, LPRECT lpRect)
     lpRect->top    = screen_y;
     lpRect->right  = screen_x + w->width;
     lpRect->bottom = screen_y + w->height;
+    return TRUE;
+}
+
+typedef struct {
+    DWORD size;
+    RECT window, client;
+    DWORD style, ex_style, status;
+    UINT border_x, border_y;
+    USHORT atom, version;
+} U32_WINDOWINFO;
+
+_Static_assert(sizeof(U32_WINDOWINFO) == 60, "WINDOWINFO ABI changed");
+
+static BOOL WINAPI GetWindowInfo_u32(HWND handle, U32_WINDOWINFO *info)
+{
+    WINDOW *w = find_window(handle);
+    if (!w || !info || info->size != sizeof(*info)) {
+        SetLastError(!w ? 1400 : 87);
+        return FALSE;
+    }
+    int x,y;
+    window_screen_origin(w,&x,&y);
+    *info = (U32_WINDOWINFO){
+        .size=sizeof(*info), .window={x,y,x+w->width,y+w->height},
+        .client={x+w->client.left,y+w->client.top,x+w->client.right,y+w->client.bottom},
+        .style=w->style, .ex_style=w->ex_style,
+        .status=active_hwnd==handle ? 1 : 0,
+        .border_x=(UINT)w->client.left, .border_y=(UINT)(w->height-w->client.bottom),
+        .version=0x0400,
+    };
+    WNDCLASS_ENTRY *cls = lookup_class_for_pid(w->class_name,w->owner_pid);
+    if (cls) info->atom=cls->atom;
     return TRUE;
 }
 
@@ -6728,11 +7092,8 @@ BOOL WINAPI SetWindowPlacement(HWND hWnd, const WINDOWPLACEMENT *placement)
     UINT show_cmd = placement->showCmd;
     if (show_cmd == SW_SHOWNORMAL || show_cmd == SW_RESTORE ||
         show_cmd == SW_SHOWDEFAULT) {
-        w->x = normal.left;
-        w->y = normal.top;
-        w->width = normal.right - normal.left;
-        w->height = normal.bottom - normal.top;
-        sync_window_surface(w, w->width, w->height);
+        SetWindowPos(hWnd, NULL, normal.left, normal.top,
+                     width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     ShowWindow(hWnd, (int)show_cmd);
@@ -6833,16 +7194,18 @@ int WINAPI SetWindowRgn(HWND hWnd, HRGN hRgn, BOOL bRedraw)
 
 BOOL WINAPI AdjustWindowRect(LPRECT lpRect, DWORD dwStyle, BOOL bMenu)
 {
-    (void)dwStyle;
-    (void)bMenu;
-    /* In our borderless framebuffer model, no adjustment needed */
-    return lpRect ? TRUE : FALSE;
+    return AdjustWindowRectEx(lpRect, dwStyle, bMenu, 0);
 }
 
 BOOL WINAPI AdjustWindowRectEx(LPRECT lpRect, DWORD dwStyle, BOOL bMenu, DWORD dwExStyle)
 {
-    (void)dwExStyle;
-    return AdjustWindowRect(lpRect, dwStyle, bMenu);
+    if (!lpRect) { SetLastError(87); return FALSE; }
+    RECT margin = window_frame_margins(dwStyle, dwExStyle, bMenu);
+    lpRect->left -= margin.left;
+    lpRect->top -= margin.top;
+    lpRect->right += margin.right;
+    lpRect->bottom += margin.bottom;
+    return TRUE;
 }
 
 /* ── SystemParametersInfo / Timer stubs ──────────────────────── */
@@ -7031,13 +7394,13 @@ BOOL WINAPI SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UI
         metrics.iBorderWidth = 1;
         metrics.iScrollWidth = 17;
         metrics.iScrollHeight = 17;
-        metrics.iCaptionWidth = 18;
-        metrics.iCaptionHeight = 18;
-        metrics.iSmCaptionWidth = 16;
-        metrics.iSmCaptionHeight = 16;
-        metrics.iMenuWidth = 18;
-        metrics.iMenuHeight = 18;
-        metrics.iPaddedBorderWidth = 1;
+        metrics.iCaptionWidth = GetSystemMetrics(30);
+        metrics.iCaptionHeight = GetSystemMetrics(4)-1;
+        metrics.iSmCaptionWidth = GetSystemMetrics(52);
+        metrics.iSmCaptionHeight = GetSystemMetrics(51)-1;
+        metrics.iMenuWidth = 19;
+        metrics.iMenuHeight = GetSystemMetrics(15)-1;
+        metrics.iPaddedBorderWidth = 0;
         spi_init_font_a(&metrics.lfCaptionFont, -12, 700);
         spi_init_font_a(&metrics.lfSmCaptionFont, -11, 400);
         spi_init_font_a(&metrics.lfMenuFont, -12, 400);
@@ -7073,13 +7436,13 @@ BOOL WINAPI SystemParametersInfoW(UINT uiAction, UINT uiParam,
         metrics.iBorderWidth = 1;
         metrics.iScrollWidth = 17;
         metrics.iScrollHeight = 17;
-        metrics.iCaptionWidth = 18;
-        metrics.iCaptionHeight = 18;
-        metrics.iSmCaptionWidth = 16;
-        metrics.iSmCaptionHeight = 16;
-        metrics.iMenuWidth = 18;
-        metrics.iMenuHeight = 18;
-        metrics.iPaddedBorderWidth = 1;
+        metrics.iCaptionWidth = GetSystemMetrics(30);
+        metrics.iCaptionHeight = GetSystemMetrics(4)-1;
+        metrics.iSmCaptionWidth = GetSystemMetrics(52);
+        metrics.iSmCaptionHeight = GetSystemMetrics(51)-1;
+        metrics.iMenuWidth = 19;
+        metrics.iMenuHeight = GetSystemMetrics(15)-1;
+        metrics.iPaddedBorderWidth = 0;
         spi_init_font_w(&metrics.lfCaptionFont, -12, 700);
         spi_init_font_w(&metrics.lfSmCaptionFont, -11, 400);
         spi_init_font_w(&metrics.lfMenuFont, -12, 400);
@@ -7390,6 +7753,15 @@ static int current_mode_cy(void)
 int WINAPI GetSystemMetrics(int nIndex)
 {
     switch (nIndex) {
+    case 4: return 23; /* SM_CYCAPTION */
+    case 5: case 6: return 1; /* border */
+    case 7: case 8: return 3; /* dialog frame */
+    case 30: case 31: return 19; /* caption buttons */
+    case 32: case 33: return 4; /* sizing frame */
+    case 51: return 18; /* small caption */
+    case 52: case 53: return 14; /* small caption buttons */
+    case 15: return 20; /* menu height */
+    case 45: case 46: return 2; /* edge */
     case SM_CXSCREEN:      return current_mode_cx();
     case SM_CYSCREEN:      return current_mode_cy();
     case SM_CXICON:
@@ -8527,6 +8899,11 @@ HWND WINAPI WindowFromPoint(POINT point)
     for (int i = 0; i < window_count; i++) {
         WINDOW *w = &windows[i];
         if (!w->used || !window_should_render(w))
+            continue;
+        /* The stock group box is a non-interactive frame, not an input
+         * surface covering its siblings. Do not infer a subclass's result. */
+        if (w->wndproc == w->initial_control_proc &&
+            user32_control_is_groupbox(w->control, w->style))
             continue;
         int screen_x, screen_y;
         window_screen_origin(w, &screen_x, &screen_y);
@@ -9733,6 +10110,8 @@ HWND WINAPI SetCapture(HWND hWnd)
     capture_hwnd = hWnd;
     if (old && old != hWnd && native_move.window == old)
         native_move.window = NULL;
+    if (old && old != hWnd && native_caption_press.window == old)
+        native_caption_press.window = NULL;
     if (old && old != hWnd && find_window(old))
         SendMessageA(old, WM_CAPTURECHANGED, 0, (LPARAM)hWnd);
     if (capture_hwnd == hWnd)
@@ -9751,6 +10130,8 @@ BOOL WINAPI ReleaseCapture(void)
     capture_hwnd = NULL;
     if (native_move.window == old)
         native_move.window = NULL;
+    if (native_caption_press.window == old)
+        native_caption_press.window = NULL;
     if (old && find_window(old))
         SendMessageA(old, WM_CAPTURECHANGED, 0, 0);
     return TRUE;
@@ -11080,7 +11461,7 @@ HDC WINAPI GetWindowDC(HWND hWnd)
         SetLastError(1400);
         return NULL;
     }
-    return GetDC(hWnd);
+    return gdi32_alloc_nonclient_dc(hWnd);
 }
 
 HWND WINAPI WindowFromDC(HDC hDC)
@@ -11497,6 +11878,10 @@ static HWND dialog_create_template(HINSTANCE instance, PCVOID template_data,
     int height = dialog_dlu_y(dialog.cy);
     if (width <= 0) width = 1;
     if (height <= 0) height = 1;
+    RECT outer = {0,0,width,height};
+    AdjustWindowRectEx(&outer,dialog.style,FALSE,dialog.ex_style);
+    width = outer.right-outer.left;
+    height = outer.bottom-outer.top;
     int x = dialog_dlu_x(dialog.x);
     int y = dialog_dlu_y(dialog.y);
     if (dialog.style & U32_DS_CENTER) {
@@ -12214,26 +12599,17 @@ static void mouse_focus_target(HWND target, DWORD message)
 
 static BYTE prev_was_e0 = 0;
 
-void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
+void win32_post_keyboard_scan(WORD scan, BOOL key_up)
 {
-    if (!win32_input_active()) {
-        prev_was_e0 = 0;
-        return;
-    }
-
-    /* Handle 0xE0 prefix byte */
-    if (scancode == 0xE0) {
-        prev_was_e0 = 1;
-        return;
-    }
-
+    if (!win32_input_active()) return;
+    BYTE scancode = (BYTE)scan;
+    BOOL extended = (scan & 0xFF00) == 0xE000;
     BYTE vk;
-    BOOL extended = prev_was_e0;
-    prev_was_e0 = 0;
-
-    if (extended) {
+    if (scan == 0xE145) {
+        vk = 0x13; /* VK_PAUSE; not an E0 extended-key message. */
+    } else if (extended) {
         vk = extended_scancode_to_vk(scancode);
-    } else if (scancode < 0x59) {
+    } else if (scan < 0x59) {
         vk = scancode_to_vk[scancode];
     } else {
         return; /* unknown scancode */
@@ -12262,6 +12638,21 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
 
     msg_enqueue_input(target, key_message.message, key_message.wParam,
                        key_message.lParam);
+}
+
+void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
+{
+    if (!win32_input_active()) {
+        prev_was_e0 = 0;
+        return;
+    }
+    if (scancode == 0xE0) {
+        prev_was_e0 = 1;
+        return;
+    }
+    WORD scan = scancode | (prev_was_e0 ? 0xE000 : 0);
+    prev_was_e0 = 0;
+    win32_post_keyboard_scan(scan, key_up);
 }
 
 /*
@@ -13506,14 +13897,8 @@ BOOL WINAPI EnumChildWindows(HWND hWndParent, WNDENUMPROC lpEnumFunc,
     return TRUE;
 }
 
-/* Client→screen translation. Our windows are borderless (client rect ==
- * window rect), so the client origin in screen space is simply (w->x, w->y).
- * POINT is two LONGs (int32) — identical layout for 32-bit callers.
- * WinDrv's captured-mouse recenter does ClientToScreen+SetCursorPos
- * (windrv.bin 0x11108B0A-0x11108B18) and SetMouseCapture computes its rect via
- * GetClientRect+MapWindowPoints (0x11106682-0x111066A4); the old no-op stubs
- * were only correct because the game window happens to sit at 0,0 — make the
- * coordinate spaces correct by construction. */
+/* Client coordinates include every ancestor's nonclient inset. POINT has the
+ * same two-LONG layout in both PE ABIs. */
 BOOL WINAPI ClientToScreen(HWND hWnd, PVOID lpPoint)
 {
     WINDOW *w = find_window(hWnd);
@@ -13521,7 +13906,7 @@ BOOL WINAPI ClientToScreen(HWND hWnd, PVOID lpPoint)
     if (!pt || (!w && !hwnd_is_desktop(hWnd))) return FALSE;
     if (w) {
         int screen_x, screen_y;
-        window_screen_origin(w, &screen_x, &screen_y);
+        window_client_origin(w, &screen_x, &screen_y);
         pt[0] += screen_x;
         pt[1] += screen_y;
     }
@@ -13535,7 +13920,7 @@ BOOL WINAPI ScreenToClient(HWND hWnd, PVOID lpPoint)
     if (!pt || (!w && !hwnd_is_desktop(hWnd))) return FALSE;
     if (w) {
         int screen_x, screen_y;
-        window_screen_origin(w, &screen_x, &screen_y);
+        window_client_origin(w, &screen_x, &screen_y);
         pt[0] -= screen_x;
         pt[1] -= screen_y;
     }
@@ -14853,13 +15238,7 @@ BOOL WINAPI IsWindowVisible(HWND hWnd)
 
 int WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cPoints)
 {
-    /* NT: translate points from hWndFrom's client space to hWndTo's client
-     * space (NULL = screen). Borderless model: a window's client origin in
-     * screen space is (x, y). Return value packs the applied delta
-     * (LOWORD=dx, HIWORD=dy) like real user32. Used by WinDrv SetMouseCapture
-     * to convert its client rect to screen for the recenter math
-     * (windrv.bin 0x11106682-0x111066A4) — the old no-op was only right
-     * because the game window sits at 0,0. */
+    /* NULL denotes screen space; the result packs the applied client-origin delta. */
     LONG dx = 0, dy = 0;
     WINDOW *from = hWndFrom ? find_window(hWndFrom) : NULL;
     WINDOW *to   = hWndTo   ? find_window(hWndTo)   : NULL;
@@ -14870,12 +15249,12 @@ int WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cP
     }
     if (from) {
         int x, y;
-        window_screen_origin(from, &x, &y);
+        window_client_origin(from, &x, &y);
         dx += x; dy += y;
     }
     if (to) {
         int x, y;
-        window_screen_origin(to, &x, &y);
+        window_client_origin(to, &x, &y);
         dx -= x; dy -= y;
     }
     LONG *pt = (LONG *)lpPoints;
@@ -16047,15 +16426,20 @@ int user32_window_model_selftest(void)
     popup_menu = popup_submenu = NULL;
 
     RECT rect = {0};
+    RECT frame = {0, 0, 320, 240};
+    AdjustWindowRectEx(&frame, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    int inset_x = -frame.left, inset_y = -frame.top;
     wm_test_expect(GetWindowRect(child_a, &rect) &&
-                   wm_test_rect_is(&rect, 110, 100, 190, 160),
+                   wm_test_rect_is(&rect, 110+inset_x, 100+inset_y,
+                                    190+inset_x, 160+inset_y),
                    "child screen rectangle", &checks, &failures);
     wm_test_expect(GetWindowRect(grandchild, &rect) &&
-                   wm_test_rect_is(&rect, 115, 106, 135, 116),
+                   wm_test_rect_is(&rect, 115+inset_x, 106+inset_y,
+                                    135+inset_x, 116+inset_y),
                    "nested child screen rectangle", &checks, &failures);
     POINT origin = {0, 0};
     MapWindowPoints(child_a, NULL, &origin, 1);
-    wm_test_expect(origin.x == 110 && origin.y == 100,
+    wm_test_expect(origin.x == 110+inset_x && origin.y == 100+inset_y,
                    "MapWindowPoints to screen", &checks, &failures);
 
     WM_TEST_ENUM_CONTEXT child_enum = {
@@ -16109,9 +16493,10 @@ int user32_window_model_selftest(void)
                    wm_test_rect_is(&rect, 140, 110, 460, 350),
                    "deferred parent geometry", &checks, &failures);
     wm_test_expect(GetWindowRect(grandchild, &rect) &&
-                   wm_test_rect_is(&rect, 165, 141, 185, 151),
+                   wm_test_rect_is(&rect, 165+inset_x, 141+inset_y,
+                                    185+inset_x, 151+inset_y),
                    "descendant follows deferred move", &checks, &failures);
-    POINT child_hit = { 166, 142 };
+    POINT child_hit = { 166+inset_x, 142+inset_y };
     wm_test_expect(WindowFromPoint(child_hit) == grandchild,
                    "WindowFromPoint selects deepest visible child",
                    &checks, &failures);
@@ -17541,6 +17926,7 @@ static const SHIM_EXPORT user32_exports[] = {
     /* Window info */
     { "GetClientRect",      (PVOID)GetClientRect, 2, CC_STDCALL },
     { "GetWindowRect",      (PVOID)GetWindowRect, 2, CC_STDCALL },
+    { "GetWindowInfo",      (PVOID)GetWindowInfo_u32, 2, CC_STDCALL },
     { "GetWindowPlacement", (PVOID)GetWindowPlacement, 2, CC_STDCALL },
     { "SetWindowPlacement", (PVOID)SetWindowPlacement, 2, CC_STDCALL },
     { "IsRectEmpty",        (PVOID)IsRectEmpty, 1, CC_STDCALL },

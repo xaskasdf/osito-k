@@ -120,6 +120,18 @@ typedef LRESULT (WINAPI *HOOKPROC)(int, WPARAM, LPARAM);
 /* WM_NCHITTEST results. */
 #define HTCLIENT            1
 #define HTCAPTION           2
+#define HTMINBUTTON         8
+#define HTMAXBUTTON         9
+#define HTLEFT             10
+#define HTRIGHT            11
+#define HTTOP              12
+#define HTTOPLEFT          13
+#define HTTOPRIGHT         14
+#define HTBOTTOM           15
+#define HTBOTTOMLEFT       16
+#define HTBOTTOMRIGHT      17
+#define HTBORDER            18
+#define HTCLOSE             20
 
 #define TME_HOVER           0x00000001
 #define TME_LEAVE           0x00000002
@@ -761,6 +773,7 @@ int     WINAPI ToUnicodeEx(DWORD uVirtKey, DWORD uScanCode,
  * These are NOT Win32 API; they feed events into the message queue.
  */
 void win32_post_keyboard_event(BYTE scancode, BOOL key_up);
+void win32_post_keyboard_scan(WORD scan, BOOL key_up);
 void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta);
 void win32_post_mouse_screen(int screen_x, int screen_y,
                              int raw_dx, int raw_dy,

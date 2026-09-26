@@ -98,6 +98,11 @@ static UINT button_max_check(UINT type)
     return type == 5 || type == 6 ? 2 : button_check(type) ? 1 : 0;
 }
 
+BOOL user32_control_is_groupbox(const U32_CONTROL *control, DWORD style)
+{
+    return control && control->atom == 0x80 && (style & BS_TYPEMASK) == 7;
+}
+
 static void button_uncheck_group(U32_CONTROL *control, HWND window)
 {
     HWND first = GetWindow(window, 0), start = first;
@@ -118,7 +123,7 @@ static void button_click(U32_CONTROL *control, HWND window)
 {
     DWORD style = control_style(window);
     UINT type = style & BS_TYPEMASK;
-    if (control->dead || (style & WS_DISABLED) || type == 7) return;
+    if (control->dead || (style & WS_DISABLED)) return;
     if (type == 3) control->check = !control->check;
     else if (type == 6) control->check = (control->check+1) % 3;
     else if (type == 9) {
@@ -239,14 +244,17 @@ static void control_paint(U32_CONTROL *control, HWND window, HDC dc)
     SetTextColor(dc, GetSysColor(18));
     SetBkColor(dc, GetSysColor(15));
     HWND parent = GetParent(window);
-    UINT message = control->atom == 0x80 ? 0x0135 : 0x0138;
+    BOOL group = user32_control_is_groupbox(control, style);
+    UINT message = control->atom == 0x80 && !group ? 0x0135 : 0x0138;
     BOOL narrow = g_compat32_mode;
     LRESULT answer = parent ? SendMessageA(parent, message,
         (WPARAM)(ULONG_PTR)dc, (LPARAM)(ULONG_PTR)window) : 0;
     HBRUSH brush = (HBRUSH)(narrow ? (ULONG_PTR)(UINT)answer : (ULONG_PTR)answer);
     if (control->dead) goto restore;
-    if (brush) FillRect(dc, &rect, brush);
-    else control_fill(dc, rect, 15);
+    if (!group) {
+        if (brush) FillRect(dc, &rect, brush);
+        else control_fill(dc, rect, 15);
+    }
     BOOL disabled = (style & WS_DISABLED) != 0;
     if (disabled && !(control->atom == 0x82 && type == 11))
         SetTextColor(dc, GetSysColor(17));
@@ -285,7 +293,8 @@ static void control_paint(U32_CONTROL *control, HWND window, HDC dc)
         RECT label = {rect.left+8, rect.top, rect.right-8, rect.bottom};
         RECT measured = label;
         DrawTextW(dc, caption, -1, &measured, 0x420);
-        control_fill(dc, measured, 15);
+        if (brush) FillRect(dc, &measured, brush);
+        else control_fill(dc, measured, 15);
         DrawTextW(dc, caption, -1, &label, 0x20);
     } else {
         RECT label = rect;
@@ -332,6 +341,11 @@ restore:
 
 static void control_render(U32_CONTROL *control, HWND window, HDC dc)
 {
+    if (WindowFromDC(dc) == window) {
+        BOOL group = user32_control_is_groupbox(control, control_style(window));
+        user32_set_control_pixel_alpha(window, group);
+        if (group) gdi32_clear_window_coverage(dc);
+    }
     /* STATIC bitmap printing uses the supplied DC's clip. A window DC is
      * already bounded to its client; BUTTON also clips owner-draw callbacks. */
     if (control->atom != 0x80) { control_paint(control, window, dc); return; }
@@ -350,6 +364,12 @@ static BOOL control_message(U32_CONTROL *control, HWND window, UINT message,
     UINT type = style & BS_TYPEMASK;
     *result = 0;
     switch (message) {
+    case WM_NCHITTEST:
+        if (user32_control_is_groupbox(control, style)) {
+            *result = -1; /* HTTRANSPARENT */
+            return TRUE;
+        }
+        break;
     case WM_GETFONT: *result = (LRESULT)(ULONG_PTR)control->font; return TRUE;
     case WM_SETFONT:
         control->font = (HFONT)(ULONG_PTR)wp;

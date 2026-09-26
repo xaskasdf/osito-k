@@ -34,6 +34,7 @@ extern void *mem_alloc_pages(uint64_t count);
 extern void mem_free_pages(void *addr, uint64_t count);
 extern void *kcalloc(uint64_t count, uint64_t size);
 extern void kfree(void *ptr);
+extern void *memmove(void *destination, const void *source, uint64_t size);
 extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
 extern void kern_longjmp(uint64_t *buf, int val) __attribute__((noreturn));
 extern DWORD win32_current_process_id(void);
@@ -427,6 +428,7 @@ typedef struct {
     uint64_t saved_ist3[MAX_CALLBACK_DEPTH];
     uint32_t saved_stack_args[MAX_CALLBACK_DEPTH];
     uint32_t callback_int2e_depth[MAX_CALLBACK_DEPTH];
+    uint32_t callback_entry_sp[MAX_CALLBACK_DEPTH];
     uint8_t *stacks[MAX_CALLBACK_DEPTH];
     DWORD stack_process_ids[MAX_CALLBACK_DEPTH];
     uint32_t retvals[MAX_CALLBACK_DEPTH];
@@ -2445,6 +2447,7 @@ void compat32_callback(uint32_t func_addr)
         uint32_t *sp = (uint32_t *)(stack + CALLBACK_STACK_SIZE);
         sp--;
         *sp = callback_return_stub_addr;  /* return address for the function */
+        callback_state->callback_entry_sp[depth] = (uint32_t)(uintptr_t)sp;
 
         uint64_t cs64 = GDT_SEL_CODE32;
         uint64_t ip64 = func_addr;
@@ -2476,6 +2479,7 @@ void compat32_callback(uint32_t func_addr)
     callback_state->current_stack_args =
         callback_state->saved_stack_args[depth];
     callback_state->callback_int2e_depth[depth] = 0;
+    callback_state->callback_entry_sp[depth] = 0;
     callback_state->depth--;
     if (depth >= 16) {
         serial_puts("[CB32] depth=");
@@ -2576,6 +2580,7 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
         /* Push return stub as return address */
         sp--;
         *sp = callback_return_stub_addr;
+        callback_state->callback_entry_sp[depth] = (uint32_t)(uintptr_t)sp;
 
         static uint32_t callback_arg_trace_count;
         if (callback_arg_trace_count < 12) {
@@ -2629,6 +2634,7 @@ static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
     callback_state->current_stack_args =
         callback_state->saved_stack_args[depth];
     callback_state->callback_int2e_depth[depth] = 0;
+    callback_state->callback_entry_sp[depth] = 0;
     callback_state->depth--;
     __asm__ volatile ("pushq %0; popfq" :: "r"(saved_flags) : "memory", "cc");
     return callback_state->retvals[depth];
@@ -2946,7 +2952,19 @@ static int compat32_abandon_callbacks(callback_owner_state_t *state,
     if (!target_region)
         return 0;
 
-    int keep_callbacks = target_region == 1 ? 0 : target_region - 1;
+    /* WndProc and thread callbacks can share the application's stack. A
+     * destination below their return slot is still inside that callback,
+     * even when seh32_stack_region classifies it as the main stack. */
+    int keep_callbacks = 0;
+    for (int i = state->depth - 1; i >= 0; i--) {
+        uint32_t entry_sp = state->callback_entry_sp[i];
+        if (entry_sp && target_esp <= entry_sp &&
+            seh32_stack_region(teb, state, entry_sp, sizeof(uint32_t)) ==
+                target_region) {
+            keep_callbacks = i + 1;
+            break;
+        }
+    }
     if (keep_callbacks < 0 || keep_callbacks >= state->depth)
         return 0;
 
@@ -2994,6 +3012,7 @@ static int compat32_abandon_callbacks(callback_owner_state_t *state,
         state->saved_ist3[depth] = 0;
         state->saved_stack_args[depth] = 0;
         state->callback_int2e_depth[depth] = 0;
+        state->callback_entry_sp[depth] = 0;
         state->retvals[depth] = 0;
     }
 
@@ -3816,6 +3835,91 @@ static int cxx32_collect_unwind_actions(uint32_t unwind_map,
     return state == target_state;
 }
 
+static int cxx32_adjust_object(uint32_t object,
+                               const CXX_CATCHABLE_TYPE32 *type,
+                               uint32_t *adjusted)
+{
+    int64_t address = object;
+    if (type->pdisp >= 0) {
+        int64_t vbptr = address + type->pdisp;
+        if (vbptr < 0 || vbptr > UINT32_MAX ||
+            !seh32_range_readable((uint32_t)vbptr, sizeof(uint32_t)))
+            return 0;
+        int64_t entry = *(const uint32_t *)(uintptr_t)vbptr;
+        entry += type->vdisp;
+        if (entry < 0 || entry > UINT32_MAX ||
+            !seh32_range_readable((uint32_t)entry, sizeof(int32_t)))
+            return 0;
+        address = vbptr + *(const int32_t *)(uintptr_t)entry;
+    }
+    address += type->mdisp;
+    if (address < 0 || address > UINT32_MAX)
+        return 0;
+    *adjusted = (uint32_t)address;
+    return 1;
+}
+
+static int cxx32_initialize_catch(const EXCEPTION_RECORD32 *record,
+                                 const TEB32 *teb,
+                                 const callback_owner_state_t *state,
+                                 uint32_t destination, uint32_t type_address,
+                                 uint32_t adjectives)
+{
+    if (!seh32_range_readable(type_address, sizeof(CXX_CATCHABLE_TYPE32)))
+        return 0;
+    const CXX_CATCHABLE_TYPE32 *type =
+        (const CXX_CATCHABLE_TYPE32 *)(uintptr_t)type_address;
+    uint32_t source = record->ExceptionInformation[1];
+    uint32_t pointer = 0;
+    uint32_t size;
+    int store_pointer = 0;
+
+    /* HT_IsReference binds the exception object, whereas a value catch
+     * copies it. For a thrown pointer the exception object is the pointer
+     * slot, not the pointed-to string/object. */
+    if (adjectives & 8U) {
+        if (type->properties & 1U)
+            pointer = source;
+        else if (!cxx32_adjust_object(source, type, &pointer))
+            return 0;
+        if (!seh32_range_readable(pointer, 1))
+            return 0;
+        size = sizeof(uint32_t);
+        store_pointer = 1;
+    } else {
+        if (type->size_or_offset <= 0)
+            return 0;
+        size = (uint32_t)type->size_or_offset;
+        if (!(type->properties & 1U)) {
+            if (type->copy_function) {
+                serial_puts("[SEH32] catch copy constructor not supported\n");
+                return 0;
+            }
+            if (!cxx32_adjust_object(source, type, &source))
+                return 0;
+        }
+        if (!seh32_range_readable(source, size))
+            return 0;
+        if ((type->properties & 1U) && size == sizeof(uint32_t) &&
+            (type->mdisp || type->pdisp >= 0)) {
+            pointer = *(const uint32_t *)(uintptr_t)source;
+            if (pointer && !cxx32_adjust_object(pointer, type, &pointer))
+                return 0;
+            store_pointer = 1;
+        }
+    }
+    if (!seh32_stack_region(teb, state, destination, size) ||
+        !win32_user_range_writable((void *)(uintptr_t)destination, size, TRUE))
+        return 0;
+    if (store_pointer) {
+        *(uint32_t *)(uintptr_t)destination = pointer;
+    } else {
+        memmove((void *)(uintptr_t)destination,
+                (const void *)(uintptr_t)source, size);
+    }
+    return 1;
+}
+
 /* Accessor for msvcrt_shim.c's crt_except_handler3 compat32 path */
 PVOID seh32_ep_addr_for_filter(void)
 {
@@ -3837,25 +3941,10 @@ static int compat32_seh_dispatch_impl(PEXCEPTION_RECORD ExceptionRecord,
     EXCEPTION_POINTERS32 *pointers32 = &slot->exception_pointers;
     CONTEXT32 *context32 = &slot->context;
 
-    /* Track reentrant catch dispatch.
-     * When a catch handler throws (e.g., appUnwindf re-throws), skip the
-     * current frame (which is corrupted by the first dispatch) and start
-     * searching from the NEXT frame in the SEH chain. */
-    if (state->in_catch_dispatch &&
-        ExceptionRecord->ExceptionCode == 0xE06D7363) {
-        serial_puts("[SEH32] Re-throw from catch — using saved next frame 0x");
-        serial_puthex(state->saved_next_frame, 8);
-        serial_puts("\n");
-        state->in_catch_dispatch = 0;
-        /* Use the saved Next (from before the catch handler corrupted the frame) */
-        teb->ExceptionList = state->saved_next_frame;
-    } else if (state->in_catch_dispatch) {
-        /* A hardware fault raised by a catch funclet is a new exception, not
-         * C++ `throw;`. The catching frame was already unlinked before entry,
-         * so continue from the live chain without rewriting it. */
-        state->in_catch_dispatch = 0;
-        state->saved_next_frame = 0;
-    }
+    /* The catcher was unlinked before entering its funclet. Use the live
+     * chain: a nested try or a later throw may have installed new frames. */
+    state->in_catch_dispatch = 0;
+    state->saved_next_frame = 0;
 
     /* Read the 32-bit ExceptionList from the current thread's TEB. */
     uint32_t frame_addr = teb->ExceptionList;
@@ -4288,6 +4377,7 @@ static int compat32_seh_dispatch_impl(PEXCEPTION_RECORD ExceptionRecord,
                      * Handlers are tested in source order. */
                     uint32_t catch_handler = 0;
                     int32_t catch_disp = 0;
+                    uint32_t catch_type = 0, catch_adjectives = 0;
                     for (int32_t c = 0; c < nCatches; c++) {
                         uint32_t *ch = (uint32_t *)(uintptr_t)(pHandlerArray + c * 16);
                         uint32_t pType = ch[1];
@@ -4308,6 +4398,8 @@ static int compat32_seh_dispatch_impl(PEXCEPTION_RECORD ExceptionRecord,
                                                   pType, &matched_type)) {
                             catch_handler = addr;
                             catch_disp = disp;
+                            catch_type = matched_type;
+                            catch_adjectives = ch[0];
                             serial_puts("[SEH32] typed catch type=0x");
                             serial_puthex(pType, 8);
                             serial_puts(" catchable=0x");
@@ -4357,17 +4449,16 @@ static int compat32_seh_dispatch_impl(PEXCEPTION_RECORD ExceptionRecord,
                             goto next_frame;
                         }
 
-                        int64_t catch_obj_address = 0;
-                        if (catch_disp != 0 &&
+                        if (catch_type && catch_disp != 0 &&
                             record32->NumberParameters >= 2) {
-                            catch_obj_address = (int64_t)catch_ebp +
-                                                (int64_t)catch_disp;
+                            int64_t catch_obj_address = (int64_t)catch_ebp +
+                                                        (int64_t)catch_disp;
                             if (catch_obj_address < 0 ||
                                 catch_obj_address > UINT32_MAX ||
-                                !seh32_stack_region(
-                                    teb, state, (uint32_t)catch_obj_address,
-                                    sizeof(uint32_t))) {
-                                serial_puts("[SEH32] invalid catch object slot\n");
+                                !cxx32_initialize_catch(record32, teb, state,
+                                    (uint32_t)catch_obj_address, catch_type,
+                                    catch_adjectives)) {
+                                serial_puts("[SEH32] cannot initialize catch object\n");
                                 goto next_frame;
                             }
                         }
@@ -4382,15 +4473,6 @@ static int compat32_seh_dispatch_impl(PEXCEPTION_RECORD ExceptionRecord,
                          * with the SEH registration at [EBP-4/-8/-C], so the
                          * frame must be unlinked before the handler runs. */
                         teb->ExceptionList = next32;
-
-                        /* If catch has a catch object (dispCatchObj != 0),
-                         * store the exception object pointer at EBP+disp */
-                        if (catch_obj_address) {
-                            uint32_t exc_obj = record32->ExceptionInformation[1];
-                            uint32_t *catch_obj_ptr =
-                                (uint32_t *)(uintptr_t)catch_obj_address;
-                            *catch_obj_ptr = exc_obj;
-                        }
 
                         serial_puts("[SEH32] dispatching to catch @0x");
                         serial_puthex(catch_handler, 8);

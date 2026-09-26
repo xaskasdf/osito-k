@@ -3320,10 +3320,11 @@ static uint64_t WINAPI dd_EnumDisplayModes(
     uint64_t _this, uint64_t dwFlags, uint64_t lpDesc,
     uint64_t lpContext, uint64_t lpCallback)
 {
-    (void)dwFlags;
     IDirectDraw7 *self = (IDirectDraw7 *)(ULONG_PTR)(uint32_t)_this;
     DDRAW_PROCESS_STATE *state = ddraw_state_from_object(self);
-    if (!state) return DDERR_INVALIDPARAMS;
+    if (!state || !lpCallback ||
+        (dwFlags & ~(DDEDM_REFRESHRATES | DDEDM_STANDARDVGAMODES)))
+        return DDERR_INVALIDPARAMS;
     uint8_t version = ddraw_interface_version(self);
     uint32_t descriptor_size = ddraw_descriptor_size_for_version(version);
 
@@ -3332,13 +3333,18 @@ static uint64_t WINAPI dd_EnumDisplayModes(
      * enumerates once per color depth with a pixel-format filter, storing each
      * depth's modes in a separate per-ColorBytes array; feeding ALL bpps into
      * every array breaks its mode bookkeeping. Honor bpp/width/height filters. */
-    uint32_t f_flags = 0, f_bpp = 0, f_w = 0, f_h = 0;
+    uint32_t f_flags = 0, f_bpp = 0, f_w = 0, f_h = 0, f_refresh = 0;
     if (lpDesc) {
         const uint32_t *fd = (const uint32_t *)(uintptr_t)(uint32_t)lpDesc;
+        if (fd[0] != descriptor_size) return DDERR_INVALIDPARAMS;
         f_flags = fd[1];
-        if (f_flags & DDSD_PIXELFORMAT) f_bpp = fd[21];  /* dwRGBBitCount @84 */
+        if (f_flags & DDSD_PIXELFORMAT) {
+            if (fd[18] != sizeof(DDPIXELFORMAT)) return DDERR_INVALIDPARAMS;
+            f_bpp = fd[21];  /* dwRGBBitCount @84 */
+        }
         if (f_flags & DDSD_WIDTH)       f_w   = fd[3];
         if (f_flags & DDSD_HEIGHT)      f_h   = fd[2];
+        if (f_flags & DDSD_REFRESHRATE) f_refresh = fd[6];
     }
 
     serial_puts("[DDRAW] EnumDisplayModes cb=0x");
@@ -3347,7 +3353,7 @@ static uint64_t WINAPI dd_EnumDisplayModes(
     serial_putdec(f_bpp);
     serial_puts("\n");
 
-    if (!lpCallback) return 0; /* DD_OK */
+    if (f_refresh && f_refresh != 60) return DD_OK;
 
     uint32_t resolution_count = user32_get_display_resolution_count
         ? user32_get_display_resolution_count() : 0;
@@ -3386,12 +3392,14 @@ static uint64_t WINAPI dd_EnumDisplayModes(
             for (int j = 0; j < 128; j++) desc_buf[j] = 0;
             uint32_t *d = (uint32_t *)desc_buf;
             d[0]  = descriptor_size;      /* dwSize */
-            d[1]  = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH |
-                    DDSD_PIXELFORMAT | 0x00040000; /* DDSD_REFRESHRATE */
+            d[1]  = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_PIXELFORMAT;
             d[2]  = height;
             d[3]  = width;
             d[4]  = width * (bpp / 8);
-            d[5]  = 60;
+            if (dwFlags & DDEDM_REFRESHRATES) {
+                d[1] |= DDSD_REFRESHRATE;
+                d[6] = 60;              /* dwRefreshRate union @24, not @20 */
+            }
             fill_pixfmt32((uint32_t *)(desc_buf + 72), bpp);
 
             uint32_t args[2] = {
@@ -4008,22 +4016,70 @@ HRESULT WINAPI DirectDrawCreateEx(LPGUID lpGUID, PVOID *lplpDD,
     return DD_OK;
 }
 
-HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA lpCallback, PVOID lpContext)
+static HRESULT ddraw_enumerate(PVOID callback, PVOID context, DWORD flags,
+                                BOOL wide, BOOL extended)
 {
-    if (lpCallback) {
-        /* Call 32-bit callback via compat32 mode switch.
-         * lpCallback is a 32-bit function — can't call directly from 64-bit. */
-        static const char dd_driver_desc[] = "Primary Display Driver";
-        static const char dd_driver_name[] = "display";
-        uint32_t args[4] = {
-            0,                                          /* lpGUID = NULL */
-            (uint32_t)(uintptr_t)dd_driver_desc,        /* lpDriverDescription */
-            (uint32_t)(uintptr_t)dd_driver_name,        /* lpDriverName */
-            (uint32_t)(uintptr_t)lpContext               /* lpContext */
-        };
-        compat32_callback_args((uint32_t)(uintptr_t)lpCallback, 4, args);
+    if (!callback || (flags & ~(DDENUM_ATTACHEDSECONDARYDEVICES |
+                                DDENUM_DETACHEDSECONDARYDEVICES |
+                                DDENUM_NONDISPLAYDEVICES)))
+        return DDERR_INVALIDPARAMS;
+    BOOL compat32 = g_compat32_mode;
+    if (compat32 && (ULONG_PTR)callback > UINT32_MAX)
+        return DDERR_INVALIDPARAMS;
+
+    static const char description[] = "OsitoK Software Display";
+    static const char name[] = "display";
+    SIZE_T characters = sizeof(description) + sizeof(name);
+    BYTE *text = VirtualAlloc(NULL, characters * (wide ? sizeof(WCHAR) : 1),
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!text || (compat32 && (ULONG_PTR)text > UINT32_MAX)) {
+        if (text) VirtualFree(text, 0, MEM_RELEASE);
+        return E_OUTOFMEMORY;
     }
+    PVOID driver_name = text + sizeof(description) * (wide ? sizeof(WCHAR) : 1);
+    if (wide) {
+        for (SIZE_T i = 0; i < sizeof(description); i++) ((WCHAR *)text)[i] = description[i];
+        for (SIZE_T i = 0; i < sizeof(name); i++) ((WCHAR *)driver_name)[i] = name[i];
+    } else {
+        for (SIZE_T i = 0; i < sizeof(description); i++) text[i] = description[i];
+        for (SIZE_T i = 0; i < sizeof(name); i++) ((BYTE *)driver_name)[i] = name[i];
+    }
+
+    /* This backend exposes one GDI-shared primary device. The callback's
+     * strings must remain in user memory, including when running PE32. */
+    if (compat32) {
+        uint32_t args[5] = {0, (uint32_t)(ULONG_PTR)text,
+            (uint32_t)(ULONG_PTR)driver_name, (uint32_t)(ULONG_PTR)context, 0};
+        compat32_callback_args((uint32_t)(ULONG_PTR)callback, extended ? 5 : 4, args);
+    } else if (extended) {
+        typedef BOOL (WINAPI *ENUM_CALLBACK_EX)(LPGUID, PVOID, PVOID, PVOID, HANDLE);
+        ((ENUM_CALLBACK_EX)callback)(NULL, text, driver_name, context, NULL);
+    } else {
+        typedef BOOL (WINAPI *ENUM_CALLBACK)(LPGUID, PVOID, PVOID, PVOID);
+        ((ENUM_CALLBACK)callback)(NULL, text, driver_name, context);
+    }
+    VirtualFree(text, 0, MEM_RELEASE);
     return DD_OK;
+}
+
+HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA callback, PVOID context)
+{
+    return ddraw_enumerate((PVOID)callback, context, 0, FALSE, FALSE);
+}
+
+static HRESULT WINAPI DirectDrawEnumerateW_dd(PVOID callback, PVOID context)
+{
+    return ddraw_enumerate(callback, context, 0, TRUE, FALSE);
+}
+
+static HRESULT WINAPI DirectDrawEnumerateExA_dd(PVOID callback, PVOID context, DWORD flags)
+{
+    return ddraw_enumerate(callback, context, flags, FALSE, TRUE);
+}
+
+static HRESULT WINAPI DirectDrawEnumerateExW_dd(PVOID callback, PVOID context, DWORD flags)
+{
+    return ddraw_enumerate(callback, context, flags, TRUE, TRUE);
 }
 
 /* ── Export table ──────────────────────────────────────────── */
@@ -4034,6 +4090,9 @@ static const SHIM_EXPORT ddraw_exports[] = {
     { "DirectDrawCreate",      (PVOID)DirectDrawCreate,     3, CC_STDCALL },
     { "DirectDrawCreateEx",    (PVOID)DirectDrawCreateEx,   4, CC_STDCALL },
     { "DirectDrawEnumerateA",  (PVOID)DirectDrawEnumerateA, 2, CC_STDCALL },
+    { "DirectDrawEnumerateW",  (PVOID)DirectDrawEnumerateW_dd, 2, CC_STDCALL },
+    { "DirectDrawEnumerateExA", (PVOID)DirectDrawEnumerateExA_dd, 3, CC_STDCALL },
+    { "DirectDrawEnumerateExW", (PVOID)DirectDrawEnumerateExW_dd, 3, CC_STDCALL },
     { NULL, NULL, 0, CC_STDCALL }
 };
 

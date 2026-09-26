@@ -26,10 +26,14 @@ extern uint32_t *fb_get_base(void)   __attribute__((weak));
 extern uint32_t  fb_get_width(void)  __attribute__((weak));
 extern uint32_t  fb_get_height(void) __attribute__((weak));
 extern uint32_t  fb_get_pitch(void)  __attribute__((weak));
+extern void fb_present_rows(uint32_t top, uint32_t bottom) __attribute__((weak));
 extern uint32_t  display_get_width(void)  __attribute__((weak));
 extern uint32_t  display_get_height(void) __attribute__((weak));
 extern BOOL user32_get_window_surface(HANDLE window, void **pixels, int *width,
                                       int *height, int *pitch)
+    __attribute__((weak));
+extern BOOL user32_get_window_dc_surface(HANDLE window, void **pixels, int *width,
+                                         int *height, int *pitch, BOOL whole)
     __attribute__((weak));
 extern void user32_mark_window_dirty(HANDLE window) __attribute__((weak));
 extern BOOL user32_get_current_display_mode(uint32_t *width, uint32_t *height,
@@ -477,11 +481,29 @@ typedef struct GDI_PAINT_CLIP {
 } GDI_PAINT_CLIP;
 
 typedef struct {
+    DWORD red, green, blue;
+    UINT color_count;
+    DWORD colors[256];
+} GDI_PIXEL_FORMAT;
+
+typedef struct {
+    DWORD size;
+    LONG width, height;
+    USHORT planes, bpp;
+    DWORD compression, image_size;
+    LONG xppm, yppm;
+    DWORD colors_used, colors_important;
+} GDI_BITMAP_HEADER;
+
+_Static_assert(sizeof(GDI_BITMAP_HEADER) == 40, "BITMAPINFOHEADER layout changed");
+
+typedef struct {
     int      in_use;
     void    *surface;       /* pixel buffer (NULL = no bitmap selected yet) */
     int      width, height;
     int      bpp;
     int      pitch;         /* bytes per scanline */
+    const GDI_PIXEL_FORMAT *format; /* NULL for the native device format */
     uint32_t text_color;
     uint32_t bk_color;
     uint32_t brush_color;
@@ -503,6 +525,7 @@ typedef struct {
     GDI_PAINT_CLIP *paint_clip;
     int      is_screen;     /* DC targets the GOP framebuffer (window/screen DC) */
     int      pooled_window; /* GetDC/BeginPaint DC, retained across ReleaseDC */
+    BOOL     whole_window;
     ULONG_PTR owner_window; /* HWND associated with a pooled window DC */
     int      bottomup;      /* selected bitmap is a bottom-up DIB */
 } GDI_DC;
@@ -520,7 +543,17 @@ typedef struct {
     int      bottomup;      /* DIB with positive biHeight (rows stored bottom-up) */
     int      virtual_alloc; /* pixels from VirtualAlloc (DIB section) */
     void    *mapping_base;  /* MapViewOfFile base for section-backed DIBs */
+    GDI_PIXEL_FORMAT format;
+    int      dib_section;
+    GDI_BITMAP_HEADER dib_header;
+    HANDLE   section;
+    DWORD    section_offset;
 } GDI_BITMAP;
+
+static BOOL gdi_read_pixel(const BYTE *row, int x, int bpp,
+                            const GDI_PIXEL_FORMAT *format, uint32_t *color);
+static int gdi_get_dibits(GDI_BITMAP *bmp, UINT start, UINT count,
+                           PVOID bits, PVOID info, UINT usage);
 
 typedef struct {
     LONG lfHeight;
@@ -740,12 +773,12 @@ static GDI_DC *dc_from_handle(HDC h)
     /* A window DC survives ReleaseDC and may be retained by EGL for the
      * lifetime of a window.  Keep it attached to user32's current backing
      * store when that store is replaced by a resize. */
-    if (dc->pooled_window && dc->owner_window &&
-        user32_get_window_surface) {
+    if (dc->pooled_window && dc->owner_window && !dc->is_screen &&
+        user32_get_window_dc_surface) {
         void *surface = NULL;
         int width = 0, height = 0, pitch = 0;
-        if (user32_get_window_surface((HANDLE)dc->owner_window, &surface,
-                                      &width, &height, &pitch)) {
+        if (user32_get_window_dc_surface((HANDLE)dc->owner_window, &surface,
+                                         &width, &height, &pitch, dc->whole_window)) {
             if (dc->surface != surface || dc->width != width ||
                 dc->height != height || dc->pitch != pitch) {
                 static uint32_t refresh_trace_count;
@@ -969,6 +1002,8 @@ static void mark_dc_dirty(GDI_DC *dc)
     if (dc && dc->pooled_window && dc->owner_window &&
         user32_mark_window_dirty)
         user32_mark_window_dirty((HANDLE)dc->owner_window);
+    else if (dc && dc->is_screen && fb_present_rows)
+        fb_present_rows(0, (uint32_t)dc->height);
 }
 
 /* ── GetDeviceCaps ───────────────────────────────────────────── */
@@ -1130,11 +1165,12 @@ BOOL WINAPI DeleteDC(HDC hdc)
 
 /* ── Screen DC helpers (called from user32 GetDC/ReleaseDC) ──── */
 
-HDC gdi32_alloc_window_dc(HANDLE window)
+static HDC gdi_alloc_window_dc(HANDLE window, BOOL whole)
 {
     int idx = -1;
     for (int i = 0; i < MAX_GDI_DCS; i++) {
         if (gdi_dcs[i].in_use && gdi_dcs[i].pooled_window &&
+            gdi_dcs[i].whole_window == whole &&
             gdi_dcs[i].owner_window == (ULONG_PTR)window) {
             idx = i;
             break;
@@ -1149,8 +1185,8 @@ HDC gdi32_alloc_window_dc(HANDLE window)
     void *base = NULL;
     int is_screen = 1;
 
-    if (window && user32_get_window_surface &&
-        user32_get_window_surface(window, &base, &w, &h, &p)) {
+    if (window && user32_get_window_dc_surface &&
+        user32_get_window_dc_surface(window, &base, &w, &h, &p, whole)) {
         is_screen = 0;
     } else {
         base = get_screen_surface(&w, &h, &p);
@@ -1160,13 +1196,25 @@ HDC gdi32_alloc_window_dc(HANDLE window)
     dc->width   = w;
     dc->height  = h;
     dc->bpp     = 32;
+    dc->format  = NULL;
     dc->pitch   = p;
     dc->is_screen = is_screen;
     dc->pooled_window = 1;
+    dc->whole_window = whole;
     dc->owner_window = (ULONG_PTR)window;
     dc->current_font = STOCK_SYSTEM_FONT;
 
     return (HDC)(ULONG_PTR)(DC_TAG | (unsigned)idx);
+}
+
+HDC gdi32_alloc_window_dc(HANDLE window)
+{
+    return gdi_alloc_window_dc(window, FALSE);
+}
+
+HDC gdi32_alloc_nonclient_dc(HANDLE window)
+{
+    return gdi_alloc_window_dc(window, TRUE);
 }
 
 HDC gdi32_alloc_screen_dc(void)
@@ -1362,6 +1410,7 @@ HBITMAP WINAPI CreateCompatibleBitmap(HDC hdc, int cx, int cy)
     gdi_bmps[idx].height = cy;
     gdi_bmps[idx].bpp    = bpp;
     gdi_bmps[idx].pitch  = pitch;
+    if (dc && dc->format) gdi_bmps[idx].format = *dc->format;
 
     HBITMAP bitmap = (HBITMAP)(ULONG_PTR)(BMP_TAG | (unsigned)idx);
     serial_puts("[GDI32] CreateCompatibleBitmap -> 0x");
@@ -1390,76 +1439,45 @@ static BOOL gdi_native_color_masks(int bpp, DWORD *red, DWORD *green,
     return FALSE;
 }
 
+static void gdi_format_masks(int bpp, const GDI_PIXEL_FORMAT *format,
+                              DWORD *red, DWORD *green, DWORD *blue)
+{
+    if (format && format->red) {
+        *red = format->red;
+        *green = format->green;
+        *blue = format->blue;
+    } else {
+        *red = *green = *blue = 0;
+        gdi_native_color_masks(bpp, red, green, blue);
+    }
+}
+
+static BOOL gdi_formats_equal(const GDI_DC *a, const GDI_DC *b)
+{
+    if (a->bpp != b->bpp) return FALSE;
+    if (a->bpp == 16 || a->bpp == 32) {
+        DWORD ar, ag, ab, br, bg, bb;
+        gdi_format_masks(a->bpp, a->format, &ar, &ag, &ab);
+        gdi_format_masks(b->bpp, b->format, &br, &bg, &bb);
+        return ar == br && ag == bg && ab == bb;
+    }
+    if (a->bpp <= 8) {
+        UINT ac = a->format ? a->format->color_count : 0;
+        UINT bc = b->format ? b->format->color_count : 0;
+        if (ac != bc) return FALSE;
+        for (UINT i = 0; i < ac; i++)
+            if (a->format->colors[i] != b->format->colors[i]) return FALSE;
+    }
+    return TRUE;
+}
+
 int WINAPI GetDIBits(HDC hdc, HBITMAP bitmap, UINT start_scan,
                      UINT scan_lines, PVOID bits, PVOID bitmap_info,
                      UINT usage)
 {
     (void)hdc;
-    (void)usage;
     GDI_BITMAP *bmp = bmp_from_handle(bitmap);
-    if (!bmp || !bitmap_info || start_scan >= (UINT)bmp->height)
-        return 0;
-
-    BYTE *header = (BYTE *)bitmap_info;
-    DWORD header_size = *(DWORD *)(header + 0);
-    if (header_size < 40)
-        return 0;
-
-    USHORT requested_bpp = *(USHORT *)(header + 14);
-    DWORD requested_compression = *(DWORD *)(header + 16);
-    BOOL format_query = !bits && requested_bpp == 0;
-    USHORT output_bpp = format_query ? (USHORT)bmp->bpp : requested_bpp;
-    DWORD output_compression = format_query ? GDI_BI_RGB
-                                            : requested_compression;
-
-    if (!output_bpp)
-        output_bpp = (USHORT)bmp->bpp;
-    if (output_bpp != (USHORT)bmp->bpp)
-        return 0; /* Pixel-format conversion is not implemented yet. */
-    if (output_compression != GDI_BI_RGB &&
-        output_compression != GDI_BI_BITFIELDS)
-        return 0;
-
-    DWORD red_mask = 0, green_mask = 0, blue_mask = 0;
-    if (output_compression == GDI_BI_BITFIELDS &&
-        !gdi_native_color_masks(output_bpp, &red_mask, &green_mask,
-                                &blue_mask))
-        return 0;
-
-    *(DWORD *)(header + 0) = header_size;        /* biSize */
-    *(LONG *)(header + 4) = bmp->width;         /* biWidth */
-    *(LONG *)(header + 8) = bmp->height;        /* biHeight */
-    *(USHORT *)(header + 12) = 1;               /* biPlanes */
-    *(USHORT *)(header + 14) = output_bpp;       /* biBitCount */
-    *(DWORD *)(header + 16) = output_compression;
-    *(DWORD *)(header + 20) = (DWORD)(bmp->pitch * bmp->height);
-
-    if (output_compression == GDI_BI_BITFIELDS) {
-        *(DWORD *)(header + 40) = red_mask;
-        *(DWORD *)(header + 44) = green_mask;
-        *(DWORD *)(header + 48) = blue_mask;
-
-        static UINT bitfields_trace_count;
-        if (bitfields_trace_count++ < 8) {
-            serial_puts("[GDI32] GetDIBits BI_BITFIELDS bpp=");
-            serial_putdec(output_bpp);
-            serial_puts(" masks=0x");
-            serial_puthex(red_mask, 8);
-            serial_puts("/0x");
-            serial_puthex(green_mask, 8);
-            serial_puts("/0x");
-            serial_puthex(blue_mask, 8);
-            serial_puts("\n");
-        }
-    }
-
-    UINT available = (UINT)bmp->height - start_scan;
-    UINT copied = scan_lines < available ? scan_lines : available;
-    if (bits && copied) {
-        gdi_memcpy(bits, (BYTE *)bmp->pixels + start_scan * bmp->pitch,
-                   (SIZE_T)copied * bmp->pitch);
-    }
-    return (int)copied;
+    return gdi_get_dibits(bmp, start_scan, scan_lines, bits, bitmap_info, usage);
 }
 
 HBITMAP WINAPI CreateBitmap(int nWidth, int nHeight, UINT nPlanes,
@@ -1531,6 +1549,7 @@ HBITMAP gdi32_clone_bitmap(HBITMAP bitmap)
     gdi_bmps[idx].bpp = source->bpp;
     gdi_bmps[idx].pitch = source->pitch;
     gdi_bmps[idx].bottomup = source->bottomup;
+    gdi_bmps[idx].format = source->format;
     return (HBITMAP)(ULONG_PTR)(BMP_TAG | (unsigned)idx);
 }
 
@@ -1544,28 +1563,12 @@ static BOOL gdi_read_bitmap_pixel(const GDI_BITMAP *bitmap, int x, int y,
     int stored_y = bitmap->bottomup ? bitmap->height - 1 - y : y;
     const BYTE *row = (const BYTE *)bitmap->pixels +
                       (SIZE_T)stored_y * bitmap->pitch;
-    if (bitmap->bpp == 32) {
+    if (bitmap->bpp == 32 && (!bitmap->format.red ||
+        (bitmap->format.red == 0xFF0000 && bitmap->format.green == 0xFF00 &&
+         bitmap->format.blue == 0xFF))) {
         *color = ((const uint32_t *)row)[x];
-    } else if (bitmap->bpp == 24) {
-        const BYTE *pixel = row + (SIZE_T)x * 3;
-        *color = 0xFF000000u | ((uint32_t)pixel[2] << 16) |
-                 ((uint32_t)pixel[1] << 8) | pixel[0];
-    } else if (bitmap->bpp == 16) {
-        USHORT value = ((const USHORT *)row)[x];
-        DWORD r = (value >> 11) & 0x1F;
-        DWORD g = (value >> 5) & 0x3F;
-        DWORD b = value & 0x1F;
-        *color = 0xFF000000u | ((r * 255 / 31) << 16) |
-                 ((g * 255 / 63) << 8) | (b * 255 / 31);
-    } else if (bitmap->bpp == 8) {
-        BYTE value = row[x];
-        *color = 0xFF000000u | ((uint32_t)value << 16) |
-                 ((uint32_t)value << 8) | value;
-    } else if (bitmap->bpp == 1) {
-        BYTE bit = (BYTE)((row[x >> 3] >> (7 - (x & 7))) & 1);
-        *color = bit ? 0xFFFFFFFFu : 0xFF000000u;
     } else {
-        return FALSE;
+        return gdi_read_pixel(row, x, bitmap->bpp, &bitmap->format, color);
     }
     return TRUE;
 }
@@ -1664,6 +1667,7 @@ HGDIOBJ WINAPI SelectObject(HDC hdc, HGDIOBJ h)
     if (h == STOCK_BITMAP) {
         HGDIOBJ prev = dc->prev_bitmap;
         dc->surface = NULL;
+        dc->format = NULL;
         dc->bottomup = 0;
         dc->prev_bitmap = STOCK_BITMAP;
         return prev;
@@ -1680,6 +1684,7 @@ HGDIOBJ WINAPI SelectObject(HDC hdc, HGDIOBJ h)
             dc->bpp         = bmp->bpp;
             dc->pitch       = bmp->pitch;
             dc->bottomup    = bmp->bottomup;
+            dc->format      = &bmp->format;
             dc->prev_bitmap = h;
             return prev ? prev : h;
         }
@@ -2314,6 +2319,24 @@ _Static_assert(sizeof(GDI_BITMAP_INFO32) == 24,
 _Static_assert(sizeof(GDI_BITMAP_INFO64) == 32,
                "64-bit BITMAP layout changed");
 
+typedef struct {
+    GDI_BITMAP_INFO32 bitmap;
+    GDI_BITMAP_HEADER header;
+    DWORD masks[3];
+    uint32_t section, offset;
+} GDI_DIBSECTION32;
+
+typedef struct {
+    GDI_BITMAP_INFO64 bitmap;
+    GDI_BITMAP_HEADER header;
+    DWORD masks[3];
+    HANDLE section;
+    DWORD offset;
+} GDI_DIBSECTION64;
+
+_Static_assert(sizeof(GDI_DIBSECTION32) == 84, "32-bit DIBSECTION layout changed");
+_Static_assert(sizeof(GDI_DIBSECTION64) == 104, "64-bit DIBSECTION layout changed");
+
 static int gdi_get_object(HGDIOBJ h, int c, PVOID pv, BOOL wide)
 {
     GDI_BRUSH brush;
@@ -2331,7 +2354,7 @@ static int gdi_get_object(HGDIOBJ h, int c, PVOID pv, BOOL wide)
     GDI_LOGFONTW stock_font;
     const GDI_LOGFONTW *logfont = font ? &font->logfont : NULL;
     GDI_BITMAP *bmp = bmp_from_handle((HBITMAP)h);
-    int width, height, pitch, bpp, virtual_alloc;
+    int width, height, pitch, bpp, dib_section;
     int required = g_compat32_mode ? (int)sizeof(GDI_BITMAP_INFO32)
                                    : (int)sizeof(GDI_BITMAP_INFO64);
 
@@ -2366,13 +2389,13 @@ static int gdi_get_object(HGDIOBJ h, int c, PVOID pv, BOOL wide)
         height = bmp->height;
         pitch = bmp->pitch;
         bpp = bmp->bpp;
-        virtual_alloc = bmp->virtual_alloc;
+        dib_section = bmp->dib_section;
     } else if (h == STOCK_BITMAP) {
         width = 1;
         height = 1;
         pitch = 2;
         bpp = 1;
-        virtual_alloc = 0;
+        dib_section = 0;
     } else {
         if (h) {
             serial_puts("[GDI32] GetObject invalid handle=0x");
@@ -2393,6 +2416,35 @@ static int gdi_get_object(HGDIOBJ h, int c, PVOID pv, BOOL wide)
     if (!pv) return required;
     if (c < required) return 0;
 
+    int extended_size = g_compat32_mode ? (int)sizeof(GDI_DIBSECTION32)
+                                       : (int)sizeof(GDI_DIBSECTION64);
+    BOOL extended = dib_section && c >= extended_size;
+    if (extended) {
+        required = extended_size;
+        gdi_memset(pv, 0, required);
+        GDI_BITMAP_HEADER *header;
+        DWORD *masks;
+        if (g_compat32_mode) {
+            GDI_DIBSECTION32 *out = pv;
+            header = &out->header;
+            masks = out->masks;
+            out->section = (uint32_t)(ULONG_PTR)bmp->section;
+            out->offset = bmp->section_offset;
+        } else {
+            GDI_DIBSECTION64 *out = pv;
+            header = &out->header;
+            masks = out->masks;
+            out->section = bmp->section;
+            out->offset = bmp->section_offset;
+        }
+        *header = bmp->dib_header;
+        if (header->compression == GDI_BI_BITFIELDS) {
+            masks[0] = bmp->format.red;
+            masks[1] = bmp->format.green;
+            masks[2] = bmp->format.blue;
+        }
+    }
+
     if (g_compat32_mode) {
         GDI_BITMAP_INFO32 *out = (GDI_BITMAP_INFO32 *)pv;
         gdi_memset(out, 0, sizeof(*out));
@@ -2401,7 +2453,7 @@ static int gdi_get_object(HGDIOBJ h, int c, PVOID pv, BOOL wide)
         out->bmWidthBytes = pitch;
         out->bmPlanes = 1;
         out->bmBitsPixel = (USHORT)bpp;
-        out->bmBits = (bmp && virtual_alloc)
+        out->bmBits = (bmp && dib_section)
             ? (uint32_t)(ULONG_PTR)bmp->pixels : 0;
     } else {
         GDI_BITMAP_INFO64 *out = (GDI_BITMAP_INFO64 *)pv;
@@ -2411,7 +2463,7 @@ static int gdi_get_object(HGDIOBJ h, int c, PVOID pv, BOOL wide)
         out->bmWidthBytes = pitch;
         out->bmPlanes = 1;
         out->bmBitsPixel = (USHORT)bpp;
-        out->bmBits = (bmp && virtual_alloc) ? bmp->pixels : NULL;
+        out->bmBits = (bmp && dib_section) ? bmp->pixels : NULL;
     }
     return required;
 }
@@ -2642,31 +2694,6 @@ BOOL WINAPI BitBlt(HDC hdcDest, int x, int y, int cx, int cy,
         GDI_DC *src = dc_from_handle(hdcSrc);
         if (!src || !src->surface) return FALSE;
 
-        /* Blit to the window/screen DC = PRESENT. This is UT99 SoftDrv's
-         * windowed frame present (render into a DIB section, BitBlt the memory
-         * DC to the window DC). Route it through the shared scaled present
-         * (bpp-convert + nearest-neighbor fill of the GOP + shadow flush) —
-         * the same pipeline DirectDraw Flip/Blt uses — instead of a raw
-         * unscaled, unflushed memcpy. Bottom-up DIBs present inverted via a
-         * negative pitch starting at the last memory row. */
-        if (dst->is_screen) {
-            extern void ddraw_present_pixels(const void *pixels, uint32_t sw,
-                                             uint32_t sh, uint32_t bpp,
-                                             int32_t pitch_bytes,
-                                             const uint32_t *pal256);
-            extern void ddraw_suspend_present_hook(void);
-            ddraw_suspend_present_hook();
-            const uint8_t *px = (const uint8_t *)src->surface;
-            int32_t p = src->pitch;
-            if (src->bottomup && src->height > 1) {
-                px += (size_t)(src->height - 1) * (size_t)src->pitch;
-                p = -p;
-            }
-            ddraw_present_pixels(px, (uint32_t)src->width, (uint32_t)src->height,
-                                 (uint32_t)src->bpp, p, NULL);
-            return TRUE;
-        }
-
         /* Clip source coordinates */
         int sx = x1, sy = y1;
         int dx = x, dy = y;
@@ -2689,7 +2716,7 @@ BOOL WINAPI BitBlt(HDC hdcDest, int x, int y, int cx, int cy,
         int src_bytes = src->bpp / 8;
         int dst_bytes = dst->bpp / 8;
         BOOL identical_format = !dst->clip_active && !dst->paint_clip &&
-                                src->bpp == dst->bpp && src_bytes > 0 &&
+                                gdi_formats_equal(src, dst) && src_bytes > 0 &&
                                 src_bytes <= 4;
 
         if (identical_format) {
@@ -3079,10 +3106,23 @@ static BOOL gdi_abs_i32(int value, int *absolute)
     return TRUE;
 }
 
+static BOOL gdi_valid_color_masks(int bpp, DWORD red, DWORD green, DWORD blue)
+{
+    DWORD masks[3] = { red, green, blue };
+    if ((red & green) || (red & blue) || (green & blue)) return FALSE;
+    for (UINT i = 0; i < 3; i++) {
+        DWORD mask = masks[i];
+        if (!mask || (bpp == 16 && (mask >> 16))) return FALSE;
+        mask >>= __builtin_ctz(mask);
+        if (mask & (mask + 1u)) return FALSE;
+    }
+    return TRUE;
+}
+
 static BOOL gdi_parse_dib(PCVOID bitmap_info, PCVOID bits, UINT usage,
                           GDI_DIB_VIEW *view)
 {
-    if (!bitmap_info || !bits || !view || usage != GDI_DIB_RGB_COLORS)
+    if (!bitmap_info || !view || usage != GDI_DIB_RGB_COLORS)
         return FALSE;
 
     const BYTE *info = (const BYTE *)bitmap_info;
@@ -3123,7 +3163,8 @@ static BOOL gdi_parse_dib(PCVOID bitmap_info, PCVOID bits, UINT usage,
             view->red_mask = gdi_read_u32(masks);
             view->green_mask = gdi_read_u32(masks + 4);
             view->blue_mask = gdi_read_u32(masks + 8);
-            if (!view->red_mask || !view->green_mask || !view->blue_mask)
+            if (!gdi_valid_color_masks(view->bpp, view->red_mask,
+                                        view->green_mask, view->blue_mask))
                 return FALSE;
         } else if (view->compression != GDI_BI_RGB) {
             return FALSE;
@@ -3160,6 +3201,10 @@ static BOOL gdi_parse_dib(PCVOID bitmap_info, PCVOID bits, UINT usage,
         view->red_mask = 0x7C00;
         view->green_mask = 0x03E0;
         view->blue_mask = 0x001F;
+    } else if (view->compression == GDI_BI_RGB && view->bpp == 32) {
+        view->red_mask = 0xFF0000;
+        view->green_mask = 0x00FF00;
+        view->blue_mask = 0x0000FF;
     }
     return TRUE;
 }
@@ -3167,12 +3212,28 @@ static BOOL gdi_parse_dib(PCVOID bitmap_info, PCVOID bits, UINT usage,
 static BYTE gdi_expand_mask(DWORD pixel, DWORD mask)
 {
     if (!mask) return 0;
-    unsigned shift = 0;
-    while (shift < 32 && !(mask & (1u << shift))) shift++;
+    unsigned shift = (unsigned)__builtin_ctz(mask);
     DWORD maximum = mask >> shift;
     DWORD component = (pixel & mask) >> shift;
-    return maximum ? (BYTE)(((uint64_t)component * 255 + maximum / 2) /
-                            maximum) : 0;
+    unsigned bits = 32u - (unsigned)__builtin_clz(maximum);
+    if (bits >= 8) return (BYTE)(component >> (bits - 8));
+    DWORD expanded = component;
+    unsigned filled = bits;
+    while (filled < 8) {
+        expanded = (expanded << bits) | component;
+        filled += bits;
+    }
+    return (BYTE)(expanded >> (filled - 8));
+}
+
+static DWORD gdi_compress_mask(BYTE value, DWORD mask)
+{
+    if (!mask) return 0;
+    unsigned shift = (unsigned)__builtin_ctz(mask);
+    unsigned bits = 32u - (unsigned)__builtin_clz(mask >> shift);
+    DWORD component = bits <= 8 ? (DWORD)value >> (8 - bits)
+                               : (DWORD)value << (bits - 8);
+    return (component << shift) & mask;
 }
 
 static uint32_t gdi_palette_pixel(const GDI_DIB_VIEW *view, DWORD index)
@@ -3183,10 +3244,70 @@ static uint32_t gdi_palette_pixel(const GDI_DIB_VIEW *view, DWORD index)
            ((uint32_t)entry[1] << 8) | entry[0];
 }
 
+static void gdi_format_from_dib(const GDI_DIB_VIEW *view, GDI_PIXEL_FORMAT *format)
+{
+    gdi_memset(format, 0, sizeof(*format));
+    format->red = view->red_mask;
+    format->green = view->green_mask;
+    format->blue = view->blue_mask;
+    if (view->bpp <= 8) {
+        format->color_count = view->color_count;
+        for (UINT i = 0; i < format->color_count; i++)
+            format->colors[i] = gdi_palette_pixel(view, i);
+    }
+}
+
+static BOOL gdi_read_pixel(const BYTE *row, int x, int bpp,
+                            const GDI_PIXEL_FORMAT *format, uint32_t *color)
+{
+    if (bpp <= 8) {
+        UINT index;
+        if (bpp == 1) index = (row[x >> 3] >> (7 - (x & 7))) & 1;
+        else if (bpp == 4) index = (row[x >> 1] >> ((x & 1) ? 0 : 4)) & 15;
+        else if (bpp == 8) index = row[x];
+        else return FALSE;
+        if (format && format->color_count) {
+            *color = index < format->color_count ? format->colors[index] : 0xFF000000u;
+        } else {
+            DWORD gray = index * 255 / ((1u << bpp) - 1);
+            *color = 0xFF000000u | (gray << 16) | (gray << 8) | gray;
+        }
+        return TRUE;
+    }
+    if (bpp == 24) {
+        const BYTE *p = row + (SIZE_T)x * 3;
+        *color = 0xFF000000u | ((DWORD)p[2] << 16) | ((DWORD)p[1] << 8) | p[0];
+        return TRUE;
+    }
+    if (bpp != 16 && bpp != 32) return FALSE;
+    DWORD red, green, blue;
+    gdi_format_masks(bpp, format, &red, &green, &blue);
+    DWORD value = bpp == 16 ? gdi_read_u16(row + (SIZE_T)x * 2)
+                           : gdi_read_u32(row + (SIZE_T)x * 4);
+    if (red == 0xFF0000 && green == 0xFF00 && blue == 0xFF) {
+        *color = 0xFF000000u | (value & 0xFFFFFFu);
+        return TRUE;
+    }
+    if (bpp == 16 && blue == 0x1F &&
+        ((red == 0x7C00 && green == 0x3E0) ||
+         (red == 0xF800 && green == 0x7E0))) {
+        DWORD r = (value >> (red == 0x7C00 ? 10 : 11)) & 31;
+        DWORD g = (value & green) >> 5, b = value & 31;
+        r = (r << 3) | (r >> 2);
+        g = green == 0x3E0 ? (g << 3) | (g >> 2) : (g << 2) | (g >> 4);
+        b = (b << 3) | (b >> 2);
+        *color = 0xFF000000u | (r << 16) | (g << 8) | b;
+        return TRUE;
+    }
+    *color = 0xFF000000u | ((DWORD)gdi_expand_mask(value, red) << 16) |
+             ((DWORD)gdi_expand_mask(value, green) << 8) | gdi_expand_mask(value, blue);
+    return TRUE;
+}
+
 static BOOL gdi_read_dib_pixel(const GDI_DIB_VIEW *view, int x, int y,
                                uint32_t *color)
 {
-    if (!view || !color || x < 0 || y < 0 ||
+    if (!view || !view->bits || !color || x < 0 || y < 0 ||
         x >= view->width || y >= view->height)
         return FALSE;
 
@@ -3415,23 +3536,7 @@ static BOOL gdi_read_dc_pixel(const GDI_DC *dc, int x, int y,
     int stored_y = dc->bottomup ? dc->height - 1 - y : y;
     const BYTE *pixel = (const BYTE *)dc->surface +
                         (SIZE_T)stored_y * dc->pitch;
-    if (dc->bpp == 32) {
-        *color = 0xFF000000u | (((const uint32_t *)pixel)[x] & 0x00FFFFFFu);
-    } else if (dc->bpp == 24) {
-        pixel += (SIZE_T)x * 3;
-        *color = 0xFF000000u | ((uint32_t)pixel[2] << 16) |
-                 ((uint32_t)pixel[1] << 8) | pixel[0];
-    } else if (dc->bpp == 16) {
-        USHORT value = ((const USHORT *)pixel)[x];
-        DWORD r = (value >> 11) & 0x1F;
-        DWORD g = (value >> 5) & 0x3F;
-        DWORD b = value & 0x1F;
-        *color = 0xFF000000u | ((r * 255 / 31) << 16) |
-                 ((g * 255 / 63) << 8) | (b * 255 / 31);
-    } else {
-        return FALSE;
-    }
-    return TRUE;
+    return gdi_read_pixel(pixel, x, dc->bpp, dc->format, color);
 }
 
 static BOOL gdi_write_dc_pixel(GDI_DC *dc, int x, int y, uint32_t color)
@@ -3442,24 +3547,138 @@ static BOOL gdi_write_dc_pixel(GDI_DC *dc, int x, int y, uint32_t color)
     if (!gdi_dc_point_visible(dc, x, y)) return TRUE;
     int stored_y = dc->bottomup ? dc->height - 1 - y : y;
     BYTE *pixel = (BYTE *)dc->surface + (SIZE_T)stored_y * dc->pitch;
-    if (dc->bpp == 32) {
-        ((uint32_t *)pixel)[x] = color;
+    if (dc->bpp == 16 || dc->bpp == 32) {
+        DWORD red, green, blue;
+        gdi_format_masks(dc->bpp, dc->format, &red, &green, &blue);
+        DWORD value;
+        if (dc->bpp == 32 && red == 0xFF0000 && green == 0xFF00 && blue == 0xFF)
+            value = color; /* Preserve coverage/alpha on native 32-bit surfaces. */
+        else
+            value = gdi_compress_mask((BYTE)(color >> 16), red) |
+                    gdi_compress_mask((BYTE)(color >> 8), green) |
+                    gdi_compress_mask((BYTE)color, blue);
+        if (dc->bpp == 16) ((USHORT *)pixel)[x] = (USHORT)value;
+        else ((DWORD *)pixel)[x] = value;
     } else if (dc->bpp == 24) {
         pixel += (SIZE_T)x * 3;
         pixel[0] = (BYTE)color;
         pixel[1] = (BYTE)(color >> 8);
         pixel[2] = (BYTE)(color >> 16);
-    } else if (dc->bpp == 16) {
-        DWORD r = (color >> 16) & 0xFF;
-        DWORD g = (color >> 8) & 0xFF;
-        DWORD b = color & 0xFF;
-        ((USHORT *)pixel)[x] = (USHORT)(((r * 31 + 127) / 255) << 11 |
-                                       ((g * 63 + 127) / 255) << 5 |
-                                       ((b * 31 + 127) / 255));
+    } else if (dc->bpp == 1 || dc->bpp == 4 || dc->bpp == 8) {
+        UINT index = 0;
+        if (dc->format && dc->format->color_count) {
+            UINT best = ~0u;
+            for (UINT i = 0; i < dc->format->color_count; i++) {
+                DWORD p = dc->format->colors[i];
+                int r = (int)((p >> 16) & 255) - (int)((color >> 16) & 255);
+                int g = (int)((p >> 8) & 255) - (int)((color >> 8) & 255);
+                int b = (int)(p & 255) - (int)(color & 255);
+                UINT distance = (UINT)(r*r + g*g + b*b);
+                if (distance < best) { best = distance; index = i; }
+            }
+        } else {
+            UINT gray = (((color >> 16) & 255) + ((color >> 8) & 255) + (color & 255)) / 3;
+            index = gray >> (8 - dc->bpp);
+        }
+        if (dc->bpp == 8) pixel[x] = (BYTE)index;
+        else {
+            UINT shift = dc->bpp == 1 ? 7 - (x & 7) : (x & 1) ? 0 : 4;
+            UINT at = dc->bpp == 1 ? (UINT)x >> 3 : (UINT)x >> 1;
+            UINT mask = ((1u << dc->bpp) - 1) << shift;
+            pixel[at] = (BYTE)((pixel[at] & ~mask) | (index << shift));
+        }
     } else {
         return FALSE;
     }
     return TRUE;
+}
+
+static int gdi_get_dibits(GDI_BITMAP *bmp, UINT start, UINT count,
+                           PVOID bits, PVOID info, UINT usage)
+{
+    if (!bmp || !info || usage != GDI_DIB_RGB_COLORS) return 0;
+    GDI_BITMAP_HEADER *header = info;
+    if (header->size < 40) return 0;
+    BOOL query = !bits && !header->bpp;
+    if (query) {
+        header->bpp = (USHORT)bmp->bpp;
+        header->compression = GDI_BI_RGB;
+        header->height = bmp->height;
+        header->width = bmp->width;
+        header->planes = 1;
+        header->image_size = (DWORD)((((uint64_t)(UINT)bmp->width * bmp->bpp + 31) / 32) *
+                                     4 * (UINT)bmp->height);
+        header->colors_used = header->colors_important = 0;
+        return 1; /* Header-only query; the caller need not supply a color table. */
+    }
+    int height;
+    if (!gdi_abs_i32(header->height, &height)) return 0;
+    if (!height) height = bmp->height;
+    if (height != bmp->height) return 0;
+    header->height = header->height < 0 ? -height : height;
+    header->width = bmp->width;
+    header->planes = 1;
+    if (header->compression == GDI_BI_BITFIELDS) {
+        DWORD *masks = (DWORD *)((BYTE *)info + 40);
+        /* A query with BI_BITFIELDS asks for the device/bitmap's masks. */
+        if (!bits || !(masks[0] | masks[1] | masks[2])) {
+            if (header->bpp != 16 && header->bpp != 32) return 0;
+            gdi_format_masks(header->bpp,
+                              header->bpp == bmp->bpp ? &bmp->format : NULL,
+                              &masks[0], &masks[1], &masks[2]);
+        }
+    }
+    if (header->bpp <= 8) {
+        if (header->bpp != bmp->bpp) return 0;
+        UINT colors = 1u << header->bpp;
+        DWORD *table = (DWORD *)((BYTE *)info + header->size);
+        for (UINT i = 0; i < colors; i++) {
+            DWORD gray = i * 255 / (colors - 1);
+            table[i] = i < bmp->format.color_count ? bmp->format.colors[i] & 0xFFFFFFu
+                       : (gray << 16) | (gray << 8) | gray;
+        }
+        header->colors_used = colors;
+    } else {
+        header->colors_used = 0;
+    }
+    GDI_DIB_VIEW view;
+    if (!gdi_parse_dib(info, bits, usage, &view)) return 0;
+    uint64_t size = (uint64_t)(UINT)view.pitch * (UINT)view.height;
+    if (size > 0xFFFFFFFFu) return 0;
+    header->image_size = (DWORD)size;
+    if (!bits) return query ? 1 : height;
+    if (start >= (UINT)bmp->height) return 0;
+    if (count > (UINT)bmp->height - start) count = (UINT)bmp->height - start;
+    GDI_PIXEL_FORMAT format;
+    gdi_format_from_dib(&view, &format);
+    GDI_DC output = {0};
+    output.surface = bits;
+    output.width = view.width;
+    output.height = (int)count;
+    output.pitch = view.pitch;
+    output.bpp = view.bpp;
+    output.format = &format;
+    for (UINT row = 0; row < count; row++) {
+        int y = view.top_down ? (int)(start + row) : bmp->height - 1 - (int)(start + row);
+        for (int x = 0; x < view.width; x++) {
+            uint32_t color;
+            if (!gdi_read_bitmap_pixel(bmp, x, y, &color) ||
+                !gdi_write_dc_pixel(&output, x, (int)row, color)) return 0;
+        }
+    }
+    return (int)count;
+}
+
+void gdi32_clear_window_coverage(HDC hdc)
+{
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (!dc || !dc->pooled_window || !dc->owner_window || dc->bpp != 32)
+        return;
+    /* Retained transparent controls erase coverage, not the pixels below
+     * them. Preserve the application's clip and BeginPaint update region. */
+    for (int y = 0; y < dc->height; y++)
+        for (int x = 0; x < dc->width; x++)
+            gdi_write_dc_pixel(dc, x, y, 0);
 }
 
 static int gdi_stretch_dib(GDI_DC *dc, int x, int y, int width, int height,
@@ -3524,7 +3743,52 @@ static BOOL WINAPI StretchBlt_k32(HDC destination, int x, int y,
     if (width == source_width && height == source_height)
         return BitBlt(destination, x, y, width, height, source,
                       source_x, source_y, rop);
-    return dc_from_handle(destination) && dc_from_handle(source);
+    GDI_DC *src = dc_from_handle(source), *dst = dc_from_handle(destination);
+    int dw, dh, sw, sh;
+    if (!src || !dst || !src->surface || !dst->surface || rop != ROP_SRCCOPY ||
+        !gdi_abs_i32(width, &dw) || !gdi_abs_i32(height, &dh) ||
+        !gdi_abs_i32(source_width, &sw) || !gdi_abs_i32(source_height, &sh) ||
+        !dw || !dh || !sw || !sh) return FALSE;
+
+    int64_t left = (int64_t)x + dst->viewport_x - (width < 0 ? dw : 0);
+    int64_t top = (int64_t)y + dst->viewport_y - (height < 0 ? dh : 0);
+    int64_t right = left + dw, bottom = top + dh;
+    int64_t clip_left = left < 0 ? 0 : left, clip_top = top < 0 ? 0 : top;
+    if (right > dst->width) right = dst->width;
+    if (bottom > dst->height) bottom = dst->height;
+    if (right <= clip_left || bottom <= clip_top) return TRUE;
+
+    /* A source snapshot keeps overlapping scaled copies independent of write order. */
+    uint32_t *saved = NULL;
+    if (src->surface == dst->surface) {
+        uint64_t size = (uint64_t)(UINT)src->width * (UINT)src->height * 4;
+        saved = kmalloc(size);
+        if (!saved) return FALSE;
+        for (int yy = 0; yy < src->height; yy++)
+            for (int xx = 0; xx < src->width; xx++)
+                gdi_read_dc_pixel(src, xx, yy, &saved[(SIZE_T)yy * src->width + xx]);
+    }
+    for (int64_t dy = clip_top; dy < bottom; dy++) {
+        int64_t v = dy - top;
+        if (height < 0) v = dh - 1 - v;
+        int64_t sy = v * sh / dh;
+        sy = (int64_t)source_y + src->viewport_y + (source_height > 0 ? sy : -sy - 1);
+        if (sy < 0 || sy >= src->height) continue;
+        for (int64_t dx = clip_left; dx < right; dx++) {
+            int64_t u = dx - left;
+            if (width < 0) u = dw - 1 - u;
+            int64_t sx = u * sw / dw;
+            sx = (int64_t)source_x + src->viewport_x + (source_width > 0 ? sx : -sx - 1);
+            if (sx < 0 || sx >= src->width) continue;
+            uint32_t color;
+            if (saved) color = saved[(SIZE_T)sy * src->width + sx];
+            else if (!gdi_read_dc_pixel(src, (int)sx, (int)sy, &color)) continue;
+            gdi_write_dc_pixel(dst, (int)dx, (int)dy, color);
+        }
+    }
+    if (saved) kfree(saved);
+    mark_dc_dirty(dst);
+    return TRUE;
 }
 
 static int WINAPI StretchDIBits_k32(HDC hdc, int x, int y, int width,
@@ -3535,7 +3799,7 @@ static int WINAPI StretchDIBits_k32(HDC hdc, int x, int y, int width,
 {
     GDI_DC *dc = dc_from_handle(hdc);
     GDI_DIB_VIEW view;
-    if (!dc || !gdi_parse_dib(bitmap_info, bits, usage, &view)) {
+    if (!dc || !bits || !gdi_parse_dib(bitmap_info, bits, usage, &view)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return 0;
     }
@@ -3573,7 +3837,7 @@ static int WINAPI SetDIBitsToDevice_k32(HDC hdc, int x, int y, DWORD width,
 {
     GDI_DC *dc = dc_from_handle(hdc);
     GDI_DIB_VIEW view;
-    if (!dc || !width || !height || !scan_lines ||
+    if (!dc || !bits || !width || !height || !scan_lines ||
         width > 0x7FFFFFFFu || height > 0x7FFFFFFFu ||
         !gdi_parse_dib(bitmap_info, bits, usage, &view) ||
         start_scan >= (UINT)view.height) {
@@ -4491,7 +4755,7 @@ static PVOID WINAPI CreateFontIndirectW_stub(const void *logfont)
 static PVOID WINAPI CreateDIBSection_impl(HDC hdc, PVOID pbmi, UINT usage,
                                            void **ppvBits, PVOID hSection, DWORD offset)
 {
-    (void)hdc; (void)usage;
+    (void)hdc;
     serial_puts("[GDI32] CreateDIBSection request pbmi=0x");
     serial_puthex((uint64_t)(ULONG_PTR)pbmi, 16);
     serial_puts(" section=0x");
@@ -4503,30 +4767,14 @@ static PVOID WINAPI CreateDIBSection_impl(HDC hdc, PVOID pbmi, UINT usage,
         if (g_compat32_mode) *(uint32_t *)ppvBits = 0;
         else *ppvBits = NULL;
     }
-    if (!pbmi) {
-        serial_puts("[GDI32] CreateDIBSection failed: null BITMAPINFO\n");
+    GDI_DIB_VIEW view;
+    if (!ppvBits || !gdi_parse_dib(pbmi, NULL, usage, &view) ||
+        view.width > 8192 || view.height > 8192) {
+        SetLastError(87);
+        serial_puts("[GDI32] CreateDIBSection failed: invalid format\n");
         return NULL;
     }
-
-    const uint8_t *bi = (const uint8_t *)pbmi;     /* BITMAPINFOHEADER (32-bit) */
-    int32_t  w    = *(const int32_t  *)(bi + 4);   /* biWidth */
-    int32_t  hraw = *(const int32_t  *)(bi + 8);   /* biHeight (<0 = top-down) */
-    uint16_t bpp  = *(const uint16_t *)(bi + 14);  /* biBitCount */
-    int32_t  h    = hraw < 0 ? -hraw : hraw;
-    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) {
-        serial_puts("[GDI32] CreateDIBSection failed: dimensions w=0x");
-        serial_puthex((uint64_t)(uint32_t)w, 8);
-        serial_puts(" h=0x");
-        serial_puthex((uint64_t)(uint32_t)hraw, 8);
-        serial_puts("\n");
-        return NULL;
-    }
-    if (bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32) {
-        serial_puts("[GDI32] CreateDIBSection failed: bpp=");
-        serial_putdec(bpp);
-        serial_puts("\n");
-        return NULL;
-    }
+    int w = view.width, h = view.height, bpp = view.bpp;
 
     int idx = alloc_bmp();
     if (idx < 0) {
@@ -4534,7 +4782,7 @@ static PVOID WINAPI CreateDIBSection_impl(HDC hdc, PVOID pbmi, UINT usage,
         return NULL;
     }
 
-    uint32_t pitch = (((uint32_t)w * bpp + 31) / 32) * 4;  /* DWORD-aligned */
+    uint32_t pitch = (uint32_t)view.pitch;
     uint64_t size  = (uint64_t)pitch * (uint64_t)h;
     void *pixels = NULL;
     void *mapping_base = NULL;
@@ -4582,9 +4830,19 @@ static PVOID WINAPI CreateDIBSection_impl(HDC hdc, PVOID pbmi, UINT usage,
     gdi_bmps[idx].height = h;
     gdi_bmps[idx].bpp    = bpp;
     gdi_bmps[idx].pitch  = (int)pitch;
-    gdi_bmps[idx].bottomup    = (hraw > 0);  /* positive biHeight = bottom-up */
+    gdi_bmps[idx].bottomup    = !view.top_down;
     gdi_bmps[idx].virtual_alloc = mapping_base ? 0 : 1;
     gdi_bmps[idx].mapping_base  = mapping_base;
+    GDI_BITMAP *bitmap = &gdi_bmps[idx];
+    gdi_format_from_dib(&view, &bitmap->format);
+    bitmap->dib_section = 1;
+    bitmap->section = hSection;
+    bitmap->section_offset = hSection ? offset : 0;
+    bitmap->dib_header = (GDI_BITMAP_HEADER){
+        .size = 40, .width = w, .height = h, .planes = 1, .bpp = (USHORT)bpp,
+        .compression = bpp == 16 ? GDI_BI_BITFIELDS : view.compression,
+        .image_size = (DWORD)size,
+    };
 
     if (ppvBits) {
         if (g_compat32_mode)
@@ -4596,6 +4854,10 @@ static PVOID WINAPI CreateDIBSection_impl(HDC hdc, PVOID pbmi, UINT usage,
     serial_puts("[GDI32] CreateDIBSection ");
     serial_putdec((uint64_t)w); serial_puts("x"); serial_putdec((uint64_t)h);
     serial_puts("x"); serial_putdec(bpp);
+    serial_puts(" compression="); serial_putdec(view.compression);
+    serial_puts(" masks="); serial_puthex(view.red_mask, 8);
+    serial_puts("/"); serial_puthex(view.green_mask, 8);
+    serial_puts("/"); serial_puthex(view.blue_mask, 8);
     serial_puts(" bits=0x"); serial_puthex((uint64_t)(uintptr_t)pixels, 8);
     if (mapping_base) {
         serial_puts(" shared-base=0x");

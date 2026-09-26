@@ -118,6 +118,7 @@ typedef struct {
     int16_t  clip_x, clip_y;
     uint16_t clip_width, clip_height;
     bool     clip_enabled;
+    bool     pixel_alpha;
     uint8_t  flags;
     char     title[MAX_TITLE_LEN];
 } window_t;
@@ -289,6 +290,7 @@ static uint32_t compositor_create_window_internal(uint32_t shm_handle,
     w->clip_x = w->clip_y = 0;
     w->clip_width = w->clip_height = 0;
     w->clip_enabled = false;
+    w->pixel_alpha = false;
     w->flags = WND_ACTIVE | WND_VISIBLE | WND_DIRTY;
 
     /* Copy title */
@@ -488,6 +490,19 @@ void compositor_set_clip_rect(uint32_t window_id, bool enabled,
             w->clip_y = y;
             w->clip_width = width;
             w->clip_height = height;
+            compositor_request_frame();
+        }
+        return;
+    }
+}
+
+void compositor_set_pixel_alpha(uint32_t window_id, bool enabled)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        window_t *w = &windows[i];
+        if (!(w->flags & WND_ACTIVE) || w->id != window_id) continue;
+        if (w->pixel_alpha != enabled) {
+            w->pixel_alpha = enabled;
             compositor_request_frame();
         }
         return;
@@ -765,6 +780,8 @@ static void blit_band_worker(void *arg, void *result)
     }
 }
 
+static inline uint32_t compositor_blend_pixel(uint32_t dst, uint32_t src);
+
 static void blit_window(uint32_t *dst, uint32_t dst_pitch,
                         uint32_t dst_w, uint32_t dst_h,
                         const window_t *w)
@@ -799,6 +816,16 @@ static void blit_window(uint32_t *dst, uint32_t dst_pitch,
         if (dy + bh > clip_bottom) bh = clip_bottom - dy;
     }
     if (bw <= 0 || bh <= 0) return;
+
+    if (w->pixel_alpha) {
+        for (int32_t y = 0; y < bh; y++) {
+            uint32_t *d = dst + (uint32_t)(dy + y) * dst_pitch + (uint32_t)dx;
+            const uint32_t *s = w->pixels + (uint32_t)(sy + y) * w->surface_pitch + (uint32_t)sx;
+            for (int32_t x = 0; x < bw; x++)
+                d[x] = compositor_blend_pixel(d[x], s[x]);
+        }
+        return;
+    }
 
     extern int ap_worker_count;
 
@@ -916,7 +943,7 @@ static void compositor_init_cursor(void)
 
 /* ── Draw Cursor ─────────────────────────────────────────────── */
 
-static inline uint32_t cursor_blend(uint32_t dst, uint32_t src)
+static inline uint32_t compositor_blend_pixel(uint32_t dst, uint32_t src)
 {
     uint32_t a = src >> 24;
     if (a == 0) return dst;
@@ -943,7 +970,7 @@ static void draw_cursor(uint32_t *dst, uint32_t pitch,
             if (a == 0) continue;
             uint32_t shadow = ((a >> 2) << 24); /* 25% alpha shadow */
             uint32_t *p = &dst[(uint32_t)sy * pitch + (uint32_t)sx];
-            *p = cursor_blend(*p, shadow);
+            *p = compositor_blend_pixel(*p, shadow);
         }
     }
 
@@ -957,7 +984,7 @@ static void draw_cursor(uint32_t *dst, uint32_t pitch,
             uint32_t src = cursor_rgba[y * CURSOR_W + x];
             if ((src >> 24) == 0) continue;
             uint32_t *p = &dst[(uint32_t)py * pitch + (uint32_t)px];
-            *p = cursor_blend(*p, src);
+            *p = compositor_blend_pixel(*p, src);
         }
     }
 }
