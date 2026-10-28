@@ -192,7 +192,7 @@ QEMU. The kernel ships approximately one hundred (100) modules, twenty
     workqueue, lockdep, PSI, kobject, kallsyms, kprof.
 
 For the complete x86-64 capabilities table (140+ entries) see
-`CLAUDE.md`. For implementation details see `docs/x86-features-detail.md`.
+`docs/roadmap.md`. For implementation details see `docs/x86-features-detail.md`.
 
 
 ## V. XTENSA LX106 EMBEDDED KERNEL
@@ -345,7 +345,7 @@ osito-k/
 │   ├── smoke-test.sh       QEMU smoke test (30 sec headless)
 │   └── smoke-screenshot.sh QEMU + screendump via monitor socket
 ├── docs/                   31+ Markdown design documents
-├── CLAUDE.md               Developer notes and complete feature roster
+├── CLAUDE.md               Developer notes (build, test, dev loop)
 └── README.md               This file
 ```
 
@@ -360,7 +360,8 @@ to consult the following entry points:
 +----------------------------------+--------------------------------------+
 | DOCUMENT                         | TOPIC                                |
 +----------------------------------+--------------------------------------+
-| CLAUDE.md                        | Master feature table + dev notes     |
+| CLAUDE.md                        | Build, test and dev-loop notes       |
+| docs/roadmap.md                  | Master feature table (all arches)    |
 | docs/x86-features-detail.md      | Per-feature deep dives (x86-64)      |
 | docs/kernel-demencial.md         | 10 advanced kernel features          |
 | docs/kernel-diagram.md           | 5 Mermaid diagrams of architecture   |

@@ -1,6 +1,6 @@
 # OsitoK x86-64 — Feature Details
 
-> Referenced from [CLAUDE.md](../CLAUDE.md). See roadmap table there for status overview.
+> Referenced from [CLAUDE.md](../CLAUDE.md). See [roadmap.md](roadmap.md) for the status overview.
 > This file contains implementation details for each x86-64 feature.
 
 ### F12: DOOM Wireframe 2.5D
