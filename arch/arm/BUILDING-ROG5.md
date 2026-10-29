@@ -331,6 +331,45 @@ burn ending, it released them to the top levels.
 
 ---
 
+## Storage (UFS), read-only
+
+The phone's storage is a **Samsung KLUEG8UHDC-B0E1** (256 GB, UFS 3.1) on the
+`ufshc@1d84000` controller (UFSHCI 3.0, 32 request slots, 64-bit DMA). It holds
+every partition the phone has, so `platform/sm8350/ufs.c` **never writes to it**:
+- `scsi()` sends only TEST UNIT READY, INQUIRY, READ CAPACITY(10) and READ(10).
+  It refuses any other opcode.
+- The data direction is always device-to-host, the UPIU's W flag is never set,
+  and inline crypto (ICE) stays off. `userdata` is file-based encrypted, so its
+  blocks read back as ciphertext.
+
+ABL boots from UFS and leaves the controller up: the power domain
+(`gcc_ufs_phy_gdsc`, GCC `0x77004`) and all ten UFS clocks are on, the link is
+active (`HCS` = `0x10F`: device present, both lists and UIC ready), and its
+transfer request list (at `0x9EA59000`) is running and idle. The controller DMAs
+as SMMU stream `0xE0`, which ABL puts in context bank 0 with translation off, so
+it's 1:1 like USB's (`smmu.c` checks both).
+
+The first read takes the request list over: stop it (`UTRLRSR` = 0), point
+`UTRLBA` at a list in the DMA window, and start it again. Those are the only
+three writes, all to the controller. Then one slot, one command at a time,
+polled, with the same `readl`/`writel` barriers as the USB gadget. A `kload`ed
+kernel finds the list where the previous kernel left it, and takes it over the
+same way.
+
+- `ufs` shows the power domain and clocks. If the interface and bus clocks run
+  (an unclocked access can hang the bus), it adds the UFSHCI registers and the
+  SMMU check.
+- `ufs luns` shows the device and each LUN's size: LUN 0 236 GB (`userdata`,
+  `super`, `persist`…), 1 and 2 `xbl_a` / `xbl_b`, 3 `cdt`/`ddr`, 4 2.3 GB
+  (`tz`, `hyp`, `modem`…), 5 and 6 32 MB. There is no LUN 7.
+- `ufs gpt <lun>` lists a LUN's partitions from its GPT (header at LBA 1, blocks
+  of 4096 bytes). LUN 1 matches Android's `sgdisk` dump. The `last_parti` entry
+  Android also shows has a zero type GUID, which the UEFI spec calls unused.
+- `ufs read <lun> <lba> [offset]` hexdumps 256 bytes of a block (numbers in
+  decimal or `0x` hex).
+
+---
+
 ## Keys
 
 `platform/sm8350/keys.c` reads the three keys from the PMICs over SPMI
@@ -558,6 +597,12 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
 21. **Screen modes (2026-10-29).** The progress bars, heartbeat squares, `start.S`
     markers and the `cpufreq try` bar became debug mode (`SCREEN_DEBUG`, shell
     `screen`). By default the console has the whole panel.
+22. **UFS, read-only (2026-10-29).** ABL leaves the UFS controller up with its
+    SMMU stream untranslated, so taking over its request list was enough (see
+    "Storage (UFS)"). The first `ufs luns` identified the Samsung part and its
+    seven LUNs, and `ufs gpt 0` listed 23 partitions, `super` and `userdata`
+    among them. The A55s' 300 MHz level came back the same day: it was the USB
+    bug too.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1081,6 +1126,8 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/thermal.c` | TSENS sensors (`temp`) and the big clusters' thermal cap |
 | `arch/arm/platform/sm8350/pmic_arb.c` | SPMI PMIC arbiter v5: single-byte PMIC reads and writes |
 | `arch/arm/platform/sm8350/keys.c` | Power / volume keys: console history, fastboot and status shortcuts |
+| `arch/arm/platform/sm8350/ufs.c` | UFS host controller, read-only: LUNs, GPT, block dumps |
+| `arch/arm/platform/sm8350/smmu.c` | Checks a DMA master's stream is 1:1 through the apps SMMU |
 | `arch/arm/scripts/rog5-kload.ps1` | Host side of `kload` (used by `rog5-boot.sh --usb`) |
 | `arch/arm/include/sm8350.h` | Hardware register definitions (verified) |
 | `arch/arm/include/aarch64.h` | System register helpers |

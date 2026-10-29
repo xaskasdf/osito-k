@@ -34,6 +34,7 @@ void platform_cpufreq_cmd(int argc, char **argv);
 void platform_start_tasks(void);
 void platform_temp_cmd(int argc, char **argv);   /* shell `temp` */
 void platform_keys_cmd(int argc, char **argv);   /* shell `keys` */
+void platform_ufs_cmd(int argc, char **argv);    /* shell `ufs` */
 
 /* ========================================================================
  * UART (platform-specific low-level)
