@@ -9,27 +9,9 @@
 #include "../include/hal.h"
 #include "../include/aarch64.h"
 
-/* GIC MMIO as single ldr/str on a base register, in asm so the compiler
- * can't pick another form. The SM8350 hypervisor traps GIC accesses and
- * emulates them from the abort syndrome, which a write-back or pair access
- * doesn't have: a post-indexed `str w0, [x1], #4` that gcc made of the
- * IPRIORITYR loop came back as a synchronous external abort (ESR
- * 0x96000010). Linux's readl/writel are asm for the same reason. */
-static inline uint32_t mmio_rd32(uint64_t addr) {
-    uint32_t v;
-    __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(addr) : "memory");
-    return v;
-}
-static inline uint64_t mmio_rd64(uint64_t addr) {
-    uint64_t v;
-    __asm__ volatile("ldr %0, [%1]" : "=r"(v) : "r"(addr) : "memory");
-    return v;
-}
-static inline void mmio_wr32(uint64_t addr, uint32_t v) {
-    __asm__ volatile("str %w0, [%1]" : : "r"(v), "r"(addr) : "memory");
-}
-
-/* MMIO accessors using platform-provided base addresses */
+/* MMIO accessors using platform-provided base addresses. Only through the
+ * asm mmio_* of aarch64.h: the SM8350 hypervisor emulates GIC accesses and
+ * can't emulate the write-back forms gcc picks for loops. */
 static inline uint32_t gicd_read(uint32_t off) {
     return mmio_rd32(platform_gicd_base() + off);
 }

@@ -41,6 +41,7 @@ static void cmd_help(void)
     serial_puts("  ping     Ping IP address\n");
     serial_puts("  cpus     List the online CPUs\n");
     serial_puts("  cpubench Timed task per CPU, all at once (any: not pinned)\n");
+    serial_puts("  cpufreq  CPU frequencies [max | min | <domain> <level>]\n");
     serial_puts("  echo     Print text\n");
     serial_puts("  hexdump  Hex dump file\n");
     serial_puts("  df       Filesystem free space\n");
@@ -324,6 +325,9 @@ void shell_run(void)
         }
         else if (strcmp(argv[0], "cpubench") == 0) {
             smp_bench(argc > 1 && strcmp(argv[1], "any") == 0);
+        }
+        else if (strcmp(argv[0], "cpufreq") == 0) {
+            platform_cpufreq_cmd(argc, argv);
         }
         else if (strcmp(argv[0], "svctest") == 0) {
             /* Inline SVC test — no ELF loading */

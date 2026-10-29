@@ -158,6 +158,32 @@ static inline void write_icc_eoir1_el1(uint64_t v) {
 }
 
 /* ========================================================================
+ * MMIO the SM8350 hypervisor can emulate
+ *
+ * It traps some device regions (the GIC at least) and emulates each access
+ * from the abort syndrome, which only a single load/store without writeback
+ * has: a post-indexed `str w0, [x1], #4` that gcc made of a register loop
+ * came back as a synchronous external abort (ESR 0x96000010). These are asm
+ * so the compiler can't pick another form, like Linux's readl/writel.
+ * ======================================================================== */
+
+static inline uint32_t mmio_rd32(uint64_t addr) {
+    uint32_t v;
+    __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(addr) : "memory");
+    return v;
+}
+
+static inline uint64_t mmio_rd64(uint64_t addr) {
+    uint64_t v;
+    __asm__ volatile("ldr %0, [%1]" : "=r"(v) : "r"(addr) : "memory");
+    return v;
+}
+
+static inline void mmio_wr32(uint64_t addr, uint32_t v) {
+    __asm__ volatile("str %w0, [%1]" : : "r"(v), "r"(addr) : "memory");
+}
+
+/* ========================================================================
  * Interrupt enable/disable
  * ======================================================================== */
 

@@ -323,6 +323,9 @@ void kernel_main(void *dtb)
         smp_boot_aps(4, 0);
     else
         smp_boot_aps(8, 1);
+    /* With the cores on: a domain whose cores are all off doesn't report
+     * the new frequency yet */
+    platform_cpufreq_init();
 
     /* Bar 8: GREY = devices done */
     for (int r = 300; r < 330; r++) fb_debug_bar(r, 0x00808080);

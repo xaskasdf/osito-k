@@ -40,6 +40,18 @@ int platform_kload(void)
     return -1;
 }
 
+/* QEMU's CPUs have no frequency to set */
+void platform_cpufreq_init(void)
+{
+}
+
+void platform_cpufreq_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    serial_puts("cpufreq: only on SM8350\n");
+}
+
 void platform_reboot(void)
 {
     /* PSCI SYSTEM_RESET via SMC */

@@ -23,6 +23,9 @@ void platform_probe_devices(void);
 /* Receive a kernel Image from the host and run it (shell `kload`).
  * Returns only on failure. */
 int platform_kload(void);
+/* CPU frequency: set at boot, shell `cpufreq` to show or change it */
+void platform_cpufreq_init(void);
+void platform_cpufreq_cmd(int argc, char **argv);
 
 /* ========================================================================
  * UART (platform-specific low-level)

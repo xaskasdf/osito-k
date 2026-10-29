@@ -170,17 +170,41 @@ scheduler in its own idle task.
 
 ```
 task  cpu   core          time    ~MHz          (cpubench, 2026-10-29)
-   0   0    Cortex-A55  213 ms  1496
-   4   4    Cortex-A78  450 ms  710
-   7   7    Cortex-X1   379 ms  844
-wall 460 ms, sum of the tasks 2586 ms, 8 tasks, 0 changed CPU
+   0   0    Cortex-A55  177 ms  1802
+   4   4    Cortex-A78  132 ms  2418
+   7   7    Cortex-X1   112 ms  2840
+wall 192 ms, sum of the tasks 1219 ms, 8 tasks, 0 changed CPU
 ```
 
 **GIC MMIO goes through asm.** The hypervisor traps GIC accesses and emulates
 them from the abort syndrome, which only single loads and stores without
 writeback have. A post-indexed `str` that gcc chose for a loop came back as a
-synchronous external abort, so `kernel/gic.c` does every access with a one-line
-`ldr`/`str` asm (as Linux's `readl`/`writel` do).
+synchronous external abort. So the GIC is accessed only through `mmio_rd32` /
+`mmio_wr32` / `mmio_rd64` from `include/aarch64.h`, one-line `ldr`/`str` asm (as
+Linux's `readl`/`writel` do). New drivers for regions the hypervisor may trap
+should use them too.
+
+---
+
+## CPU frequency
+
+Each cluster is an EPSS frequency domain (`qcom,cpufreq-hw-epss` in the phone's
+device tree): domain 0 at `0x18591000` = cpu0-3 (A55), 1 at `0x18592000` = cpu4-6
+(A78), 2 at `0x18593000` = cpu7 (X1). The hardware holds the table of levels and
+sequences the voltage itself; `platform/sm8350/cpufreq.c` reads the table
+(`0x100`, `0x200`) and writes the index of the level it wants to `0x320`, as Linux's
+`qcom-cpufreq-hw` does. `0x020` reports the L value a domain actually runs at
+(× 19.2 MHz), after the limits hardware (LMh), which still throttles on
+temperature. Nothing in Osito-K manages heat.
+
+The bootloader leaves the A78s at 710 MHz and the X1 at 844 MHz, their lowest
+levels. Boot moves every domain to its top level: A55 1804 MHz, A78 2419 MHz,
+X1 2841 MHz. A domain with all its cores off reports the new level only once
+they run, so this happens after `smp_boot_aps`. The setting survives a `kload`.
+
+- `cpufreq` lists each domain's levels, current frequency and level.
+- `cpufreq max` / `cpufreq min` set every domain to its top / lowest level.
+- `cpufreq <domain> <level>` sets one.
 
 ---
 
@@ -305,10 +329,11 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     `cpubench` measured the clocks the bootloader leaves: A55s at ~1.5 GHz, but the
     A78s at ~710 MHz and the X1 at ~845 MHz, so the big cores are the slow ones until
     something sets CPU frequencies.
+13. **CPU frequency (2026-10-29).** Boot sets every cluster to its top level through
+    EPSS (see "CPU frequency"). `cpubench` now reads 1802 / 2418 / 2840 MHz, and the
+    pinned run went from 460 to 192 ms.
 
 Still open:
-- **The big cores run at ~710–845 MHz** (the little ones at ~1.5 GHz). Nothing
-  programs CPU frequency yet.
 - **Wakeups wait for a tick.** A CPU picks up a task made READY by another CPU on
   its next tick (≤10 ms); there is no reschedule IPI.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
