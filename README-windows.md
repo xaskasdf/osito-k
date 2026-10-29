@@ -1,120 +1,114 @@
 # OsitoK en Windows — arranque rápido
 
-Guía para compilar y correr el kernel bare-metal x86-64 de OsitoK en Windows,
-y continuar el debugging de UT99 (Win32 compat layer) en paralelo.
+Guía para compilar y correr el kernel bare-metal x86-64 de OsitoK en la máquina
+de desarrollo Windows (repo en `D:\projects\osito-k`, msys2 en `C:\msys64`).
 
-El proyecto se sincroniza desde el Mac vía `rsync` sobre SSH a
-`C:\Users\xasko\osito-k`. El toolchain bundleado en `tools/` es Linux/Mac y
-**no corre en Windows** — hay que tener un `x86_64-elf-gcc` + `gnu-efi`
-nativos (ver paso 2).
-
----
-
-## 0. Requisitos base
-
-- **msys2** en `C:\msys64` (https://www.msys2.org). Trae `bash`, `pacman`,
-  y la rama `mingw64` donde viven `make`, `mtools`, `qemu`.
-- **PowerShell 5.1+** (el de Windows alcanza).
-- (Opcional pero recomendado para acelerar QEMU) **Windows Hypervisor
-  Platform** activado: *Activar o desactivar características de Windows* →
-  marcar "Plataforma de hipervisor de Windows" → reiniciar. Sin esto, usar
-  `-Accel tcg` (más lento).
+| Tarea | Dónde |
+|-------|-------|
+| Build x86 (`make -C arch/x86 CLANG=1`) | Acá, en msys2/mingw64 |
+| Boot en QEMU | Acá, con TCG (sin aceleración por hardware) |
+| Tests de host (`arch/x86/scripts/test-*.sh`) | WSL de kerberus, vía `arch/x86/scripts/remote-test.sh` |
+| QEMU con KVM | Ninguna máquina lo tiene instalado hoy (ver `docs/windows-qemu-whpx.md`) |
 
 ---
 
-## 1. Flujo con `build-windows.ps1`
-
-Desde PowerShell, parado en `C:\Users\xasko\osito-k`:
+## 1. Dependencias
 
 ```powershell
-# 1) Ver qué falta
-.\build-windows.ps1 -Check
-
-# 2) Instalar lo que está en pacman (make, mtools, qemu + firmware edk2)
-.\build-windows.ps1 -Install
-
-# 3) (tras tener el cross-toolchain, ver paso 2 abajo) compilar y correr
-.\build-windows.ps1                 # WHPX + ventana gtk
-.\build-windows.ps1 -Accel tcg      # si no tenés WHPX
-.\build-windows.ps1 -BuildOnly      # solo compilar
-.\build-windows.ps1 -Rebuild        # forzar recompilación
+.\build-windows.ps1 -Check     # qué falta
+.\build-windows.ps1 -Install   # pacman: make, mtools, qemu, clang, lld, llvm-tools
 ```
 
-El `.ps1` es un puente: hace todo el trabajo pesado a través del shell
-`mingw64` de msys2, delegando build + QEMU en
-`arch/x86/scripts/qemu-windows.sh`.
+No hace falta un cross-gcc `x86_64-elf`: el build usa `clang --target=x86_64-elf`
++ `ld.lld`. Lo único que no está en pacman es **gnu-efi** (para `boot.efi`):
+compilar https://github.com/ncroxon/gnu-efi e instalarlo bajo `/usr/local` de
+msys2 (`C:\msys64\usr\local`). `arch/x86/Makefile` lo detecta ahí; si no, pasar
+`EFI_PREFIX=<ruta>` a make.
 
 ---
 
-## 2. El cross-toolchain (lo único que pacman NO resuelve)
+## 2. Build + boot
 
-`build-windows.ps1 -Check` te marcará en amarillo:
+Desde PowerShell, parado en la raíz del repo:
 
-- **`x86_64-elf-gcc` / `-ld` / `-objcopy`** — compilador cruzado ELF
-  bare-metal. Opciones:
-  - Prebuilt Windows (buscar binarios `x86_64-elf-tools` análogos a
-    `lordmilko/i686-elf-tools`), o
-  - construirlo con `crosstool-ng` dentro de msys2.
-  - Dejá su `bin/` en el PATH de mingw64 (agregalo a `~/.bashrc` de msys2:
-    `export PATH="/c/ruta/al/cross/bin:$PATH"`).
-- **`gnu-efi`** — headers/libs EFI. Clonar https://github.com/ncroxon/gnu-efi
-  y `make` con el cross-gcc; instalar bajo `/mingw64` (o exportar
-  `EFI_PREFIX=/ruta` y pasarlo al make).
-
-Una vez que `-Check` los muestre en verde, el paso 3 funciona.
-
----
-
-## 3. Qué corre QEMU
-
-`qemu-windows.sh` espeja la invocación validada en macOS (`qemu-cocoa.sh`),
-con tres cambios para Windows:
-
-| macOS            | Windows                         |
-|------------------|---------------------------------|
-| `-accel hvf`     | `-accel whpx,kernel-irqchip=off` (fallback TCG) |
-| `-display cocoa` | `-display gtk`                  |
-| firmware OVMF    | `edk2-x86_64-code.fd` del mingw-qemu |
-
-Config: `q35`, `-m 512M`, `-smp 4`, virtio-net con `hostfwd udp:7778->7777`
-y `tcp:50052->50052`, xHCI + teclado/tablet USB. Si existe
-`arch/x86/build/nvme.img` (la imagen con UT99/DOOM) se adjunta como NVMe.
-
-**Serial log** (clave para el debugging): `arch\x86\build\serial.log`.
-
----
-
-## 4. Imagen NVMe con UT99
-
-El runner adjunta `arch/x86/build/nvme.img` si existe. Para armarla en
-Windows hay que portar el flujo de `tools/ositofs/` (mkfs/write) y meter
-`Core.dll`, `Engine.u`, `UnrealTournament.exe` (ya sincronizados en la raíz
-del repo). Mientras tanto, se puede copiar la `nvme.img` ya construida desde
-el Mac vía el mismo rsync.
-
----
-
-## 5. Contexto de debugging (memorias de Claude)
-
-Todo el journey de UT99 (root causes, breakthroughs, patches quirúrgicos)
-está en las memorias de Claude, sincronizadas a:
-
-```
-C:\Users\xasko\.claude\projects\C--Users-xasko-osito-k\memory\
+```powershell
+.\build-windows.ps1                          # build + QEMU con ventana gtk
+.\build-windows.ps1 -Display none            # headless: todo va al serial log
+.\build-windows.ps1 -Nvme .\nvme_ut99.img    # adjunta la imagen de UT99
+.\build-windows.ps1 -BuildOnly               # solo compilar
+.\build-windows.ps1 -NoBuild                 # bootear el kernel.elf ya compilado
 ```
 
-`MEMORY.md` es el índice. Las más relevantes para seguir el debugging de
-Win32/UT99:
+O desde un shell **MSYS2 MINGW64**, con el runner directo:
 
-- `project_ut99_processregistrants_throw.md` — cascade root en
-  ProcessRegistrants Phase 2 (estado más reciente del Phase 7).
-- `project_ut99_register_chain_decoded.md` / `_works.md` — cómo funciona la
-  cadena GObjRegistrants.
-- `project_ut99_fname_*` — saga FName::Names (root cause "package 0").
-- `project_wdbg_toolkit.md` — primitivas de debug Win32 reutilizables.
-- `project_ut99_binary_patch_methodology.md` — workflow de parches binarios
-  vía `compat32_dispatch`.
-- `project_compat32_jmpbuf_overflow.md` — fix del overflow de jmpbuf.
+```bash
+OK_BUILD=1 arch/x86/scripts/run-windows.sh               # build + boot headless
+OK_DISPLAY=gtk OK_NVME=nvme_ut99.img arch/x86/scripts/run-windows.sh
+```
 
-Al abrir el proyecto con Claude Code en Windows, esas memorias se
-auto-cargan (el slug del proyecto es `C--Users-xasko-osito-k`).
+`run-windows.sh` acepta además `OK_MEM` (default 2048M), `OK_CPU` (default
+`max`), `OK_MONITOR=1` (monitor QEMU en `127.0.0.1:55555`) y `OK_PCAP=1`
+(captura de red en `build/net.pcap`).
+
+- **Serial log**: `arch\x86\build\serial.log`. Sin NVMe, TCG llega al prompt
+  `osito>` en menos de un minuto.
+- QEMU: `q35`, 4 vCPU (TCG multi-thread), OVMF de edk2 (del qemu de mingw) por
+  `-bios`, virtio-net con `hostfwd udp:7778->7777` y `tcp:50052->50052`, xHCI
+  con teclado y tablet USB.
+- La imagen NVMe se monta **read-write**: el guest puede escribirla. Trabajar
+  sobre una copia si importa conservarla.
+
+---
+
+## 3. Por qué no hay aceleración
+
+WHPX (Windows Hypervisor Platform) no puede bootear OVMF: rechaza un `WRMSR`
+temprano en `PlatformPei` e inyecta un `#GP` antes de llegar a `boot.efi`. Es
+una limitación de QEMU sin workaround por línea de comandos. Detalle y plan de
+patch en `docs/windows-qemu-whpx.md`.
+
+Para velocidad de TCG en runs largos (UT99/Steam) conviene compilar con
+`QUIET=1` (menos serial, que bajo emulación es caro) y `SKIP_MODEL=1` (no
+carga el modelo GGUF al boot).
+
+---
+
+## 4. Tests de host en kerberus
+
+Los tests de host compilan con gcc y clang de Linux, casi siempre con
+ASan/UBSan, cosa que msys2 no da. Corren en la WSL (Ubuntu-24.04) de
+`xasko@kerberus`, por SSH con clave:
+
+```bash
+arch/x86/scripts/remote-test.sh boot-diag gdi-screen      # sincroniza y corre test-boot-diag.sh + test-gdi-screen.sh
+arch/x86/scripts/remote-test.sh dos-fpu-compare -- /tmp/fpu.log   # argumentos para un test
+arch/x86/scripts/remote-test.sh --exec 'make -C arch/x86 serial-host-test'
+arch/x86/scripts/remote-test.sh --no-sync boot-diag       # re-run sin sincronizar
+arch/x86/scripts/remote-test.sh --full --sync             # borra la copia remota y la manda entera
+```
+
+- Sincroniza `arch/x86`, `include/common`, `gui` y `tools/ositofs` a
+  `~/osito-k` en la WSL remota. Después de la primera vez manda solo lo
+  modificado; los borrados locales no se propagan (usar `--full`).
+- Paquetes que hoy faltan en kerberus (los tiene que instalar alguien con sudo):
+  `sudo apt install -y libmpfr-dev libgmp-dev lld llvm`. MPFR/GMP los usan los
+  tests `dos-fpu-*`; `lld` y `llvm-dlltool` los tests que arman binarios PE.
+- Algunos tests esperan fixtures pregenerados en `arch/x86/build/` (por ejemplo
+  `test-intel-d3d9-shader.sh`), que no se sincronizan.
+- El shell SSH de kerberus es PowerShell 5.1. Para comandos a mano, desde Git
+  Bash: `ssh xasko@kerberus "wsl -d Ubuntu-24.04 -e bash -lc '<cmd>'"`, sin
+  comillas simples ni dobles dentro de `<cmd>`. Para cualquier cosa más
+  compleja, `remote-test.sh --exec`.
+
+---
+
+## 5. Gotchas
+
+- **Symlinks creados desde WSL**: el `clang.exe` nativo no los puede abrir.
+  Pasó con `arch/x86/lib/tinyssh/upstream/*_optblocker.c`, que se reemplazaron
+  por copias del archivo destino.
+- **Finales de línea**: `.gitattributes` fuerza LF. Un editor que guarde CRLF
+  genera diffs de archivo entero.
+- **Memorias de Claude**: las de la etapa UT99 quedaron bajo el slug viejo
+  `C:\Users\xasko\.claude\projects\C--Users-xasko-osito-k\memory\`. Abriendo el
+  repo desde `D:\projects\osito-k` no se cargan solas.

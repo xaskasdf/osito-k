@@ -8,22 +8,22 @@
 # near-native speed and OVMF boots fine. This is the fast path for UT99/menu
 # debugging where TCG (every instruction emulated) is the bottleneck.
 #
-# Run from a WSL2 (Debian) shell:
+# Run from a Linux / WSL2 shell with a readable /dev/kvm (the dev machine no
+# longer has WSL; see docs/windows-qemu-whpx.md):
 #   ./arch/x86/scripts/run-wsl-kvm.sh
-#   OK_DISPLAY=gtk OK_NVME=/mnt/c/Users/xasko/osito-k/nvme_ut99.img \
-#       ./arch/x86/scripts/run-wsl-kvm.sh
+#   OK_DISPLAY=gtk OK_NVME=nvme_ut99.img ./arch/x86/scripts/run-wsl-kvm.sh
 #
-# The kernel.elf/boot.efi are built on the Windows side (msys2 clang); this
-# script reads them from /mnt/c and stages everything onto the WSL ext4 fs
-# (fast) before booting. Serial log -> $STAGE/serial.log.
+# By default it boots this checkout's arch/x86/build. OK_WIN_BUILD points it at
+# a build elsewhere, e.g. a Windows-side msys2 build under /mnt/<drive>/...
+# Everything is staged onto the native ext4 fs (fast) before booting.
+# Serial log -> $STAGE/serial.log.
 set -e
 
 info() { printf '\033[1;36m[run-wsl]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[run-wsl] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# Source build outputs live on the Windows side (msys2 build).
-WIN_BUILD="${OK_WIN_BUILD:-/mnt/c/Users/xasko/osito-k/arch/x86/build}"
-[ -f "$WIN_BUILD/kernel.elf" ] || die "no $WIN_BUILD/kernel.elf — build on Windows first (make -C arch/x86 CLANG=1)"
+WIN_BUILD="${OK_WIN_BUILD:-$(cd "$(dirname "$0")/.." && pwd)/build}"
+[ -f "$WIN_BUILD/kernel.elf" ] || die "no $WIN_BUILD/kernel.elf — build first (make -C arch/x86 CLANG=1) or set OK_WIN_BUILD"
 [ -f "$WIN_BUILD/boot.efi" ]   || die "no $WIN_BUILD/boot.efi"
 
 command -v qemu-system-x86_64 >/dev/null || die "install qemu: sudo apt install -y qemu-system-x86 ovmf mtools"

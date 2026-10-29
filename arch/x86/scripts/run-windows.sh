@@ -13,7 +13,7 @@
 #   ./arch/x86/scripts/run-windows.sh                       # headless, serial -> build/serial.log
 #   OK_DISPLAY=gtk ./arch/x86/scripts/run-windows.sh        # ventana interactiva
 #   OK_BUILD=1 ./arch/x86/scripts/run-windows.sh            # recompila kernel.elf + boot.efi (CLANG=1) antes
-#   OK_NVME=/c/Users/xasko/osito-k/nvme_ut99.img OK_DISPLAY=gtk ./arch/x86/scripts/run-windows.sh
+#   OK_NVME=nvme_ut99.img OK_DISPLAY=gtk ./arch/x86/scripts/run-windows.sh
 #                                                           # ^ el run de UT99: adjunta el NVMe y abre la ventana
 #
 # El [NAMEHASH] del walker Phase 7l aparece en build/serial.log durante el
@@ -37,6 +37,12 @@ if [ "${OK_BUILD:-0}" = "1" ]; then
 fi
 [ -f "$BUILD/kernel.elf" ] || die "no hay build/kernel.elf — corré con OK_BUILD=1"
 [ -f "$BUILD/boot.efi" ]   || die "no hay build/boot.efi — corré con OK_BUILD=1"
+
+# OK_NVME puede venir relativa al directorio actual; el cd de abajo la rompería.
+if [ -n "${OK_NVME:-}" ]; then
+    [ -f "$OK_NVME" ] || die "OK_NVME no existe: $OK_NVME"
+    OK_NVME="$(cd "$(dirname "$OK_NVME")" && pwd)/$(basename "$OK_NVME")"
+fi
 
 cd "$BUILD"
 

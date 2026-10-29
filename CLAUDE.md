@@ -62,14 +62,19 @@ tools/deploy.sh <elf> [--gl] [--auto] [--tail]                # write an ELF int
 **The serial log is the debugging lifeline**: `arch/x86/build/serial.log`. Exit QEMU with `Ctrl-A X`. Poke the in-OS UDP inference server from the host: `echo "hola osito" | nc -u localhost 7777`.
 
 ### Windows (this machine)
-The checkout is `D:\projects\osito-k`. Build in msys2 (`C:\msys64`) with `make -C arch/x86 CLANG=1`. Background in `README-windows.md` and `docs/windows-qemu-whpx.md`.
-- **WHPX cannot boot OsitoK**: OVMF takes a #GP in `PlatformPei` on an early `WRMSR`, before `boot.efi` runs. This is an upstream QEMU limitation with no command-line workaround, so `build-windows.ps1`'s default `-Accel whpx` does not work.
-- **TCG**: from an MSYS2 MINGW64 shell, `OK_BUILD=1 arch/x86/scripts/run-windows.sh`. Add `OK_DISPLAY=gtk` for a window and `OK_NVME=<path>/nvme_ut99.img` to attach a game image.
-- **KVM (fast path)**: from WSL2, `arch/x86/scripts/run-wsl-kvm.sh`. It reads the Windows-side build from `OK_WIN_BUILD`, which defaults to the old `/mnt/c/Users/xasko/osito-k/...` path, so point it at `/mnt/d/projects/osito-k/arch/x86/build`. It stages files onto ext4 and writes the serial log to `$OK_STAGE/serial.log` (default `~/osito-run`).
+The checkout is `D:\projects\osito-k`; msys2 lives in `C:\msys64` (clang, lld, llvm-tools, mtools, qemu; gnu-efi installed by hand under msys2's `/usr/local`). There is **no WSL on this machine**. Details in `README-windows.md`.
+- **Build + boot (TCG)**: run `.\build-windows.ps1` from PowerShell; it takes `-Display none|gtk|sdl`, `-Nvme <img>`, `-BuildOnly` and `-NoBuild`. The equivalent from an MSYS2 MINGW64 shell is `OK_BUILD=1 arch/x86/scripts/run-windows.sh`, with `OK_DISPLAY` and `OK_NVME`. Booted without NVMe, the kernel reaches the `osito>` prompt in under a minute. The NVMe image is attached read-write, so the guest can modify it.
+- **No hardware acceleration**: WHPX cannot boot OVMF (a #GP in `PlatformPei` on an early `WRMSR`, before `boot.efi` runs). This is an upstream QEMU limitation with no command-line workaround; see `docs/windows-qemu-whpx.md`. `arch/x86/scripts/run-wsl-kvm.sh` (KVM) only works on a Linux/WSL host that has QEMU installed, and none is set up right now.
+- **Native clang can't read symlinks created from WSL.** If the build fails with "no such file" on a file that exists, check `find <dir> -type l` and replace the symlinks with copies.
 
 ### Tests
 CI runs no tests. Three kinds of test exist in `arch/x86/`:
-- **Host tests** (the majority): `arch/x86/scripts/test-*.sh`. Most of them compile an `arch/x86/test/*_host.c` harness against the real kernel sources with gcc and clang, often under ASan/UBSan, and run it natively. They need Linux or WSL. Run one with `bash arch/x86/scripts/test-<name>.sh`; some take an output dir as `$1`. Also `make -C arch/x86 serial-host-test`.
+- **Host tests** (the majority): `arch/x86/scripts/test-*.sh`. Most of them compile an `arch/x86/test/*_host.c` harness against the real kernel sources with gcc and clang, often under ASan/UBSan, and run it natively. They need Linux. From this machine, run them on the `xasko@kerberus` WSL (Ubuntu-24.04) with `arch/x86/scripts/remote-test.sh <name>...`, e.g. `remote-test.sh boot-diag`. It syncs the tree incrementally over SSH and runs `test-<name>.sh` there.
+  - Arguments for a single test go after `--`, e.g. `remote-test.sh dos-fpu-compare -- /tmp/out.log`.
+  - Run arbitrary commands with `--exec`, e.g. `remote-test.sh --exec 'make -C arch/x86 serial-host-test'`.
+  - kerberus's SSH shell is PowerShell 5.1, so send remote commands through this script rather than raw `ssh`.
+  - kerberus still lacks `libmpfr-dev libgmp-dev lld llvm` (used by the `dos-fpu-*` and PE-building tests); installing them needs the user's sudo.
+  - Some tests expect fixtures pre-generated into `arch/x86/build/`, which is not synced.
 - **QEMU tests**: about 20 of the `test-*.sh` / `test-*-qemu.py` scripts boot the kernel and assert on the serial log. They need a built `kernel.elf` and often an `nvme.img`.
 - **In-OS fixtures**: `arch/x86/scripts/build-*-test.sh` cross-build PE32/PE64 Win32 fixtures (`clang --target=*-windows-msvc` + `lld-link` + `llvm-dlltool`, so no Windows SDK is needed). `make -C arch/x86 dos-*-test` builds DOS `.COM` fixtures into `build/test/`. Linux-ABI ELF test programs (`hello_c`, `fork_test`, `mmap_test`…) and in-OS tools (`tcc.elf`, `qjs.elf`) are built with the minimal libc via `make -C arch/x86/libc <name>.elf` (uses `tcc` and the `x86_64-elf` binutils). Copy them onto the NVMe/ESP image with `tools/ositofs` and run them from the in-OS shell.
 

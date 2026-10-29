@@ -1,39 +1,35 @@
 #requires -Version 5.0
 <#
 .SYNOPSIS
-    OsitoK x86-64 — arranque rapido en Windows (build + QEMU).
+    OsitoK x86-64 en Windows: build con clang + QEMU con TCG.
 
 .DESCRIPTION
-    Orquesta el build del kernel bare-metal x86-64 y lo corre en QEMU sobre
-    Windows, apoyandose en el entorno msys2/mingw64 (donde viven make, mtools,
-    qemu y bash). Hace de puente: chequea dependencias, instala las que estan
-    en pacman, y delega el build+run a arch/x86/scripts/qemu-windows.sh.
+    Puente PowerShell hacia el entorno msys2/mingw64. Compila boot.efi +
+    kernel.elf con clang (make -C arch/x86 CLANG=1) y los bootea con
+    arch/x86/scripts/run-windows.sh (QEMU TCG multi-thread, serial log en
+    arch\x86\build\serial.log).
 
-    Equivalencias respecto al flujo macOS del repo:
-      HVF           -> WHPX (Windows Hypervisor Platform)  [-Accel whpx|tcg]
-      -display cocoa-> -display gtk                         [-Display gtk|sdl|none]
-      toolchain bundleado en tools/ (Linux/Mac) -> NO sirve en Windows;
-      hace falta un x86_64-elf-gcc + gnu-efi nativos (ver -Check).
+    No hay aceleracion por hardware: WHPX no puede bootear OVMF (#GP en
+    PlatformPei antes de llegar a boot.efi; ver docs/windows-qemu-whpx.md).
+    Para los tests de host (necesitan Linux) ver arch/x86/scripts/remote-test.sh.
 
 .PARAMETER Check
     Solo reporta el estado de las dependencias y sale.
 
 .PARAMETER Install
-    Instala via pacman las dependencias disponibles en msys2
-    (make, mtools, mingw-w64-x86_64-qemu).
-
-.PARAMETER Rebuild
-    Fuerza recompilacion aunque kernel.elf ya exista.
+    Instala via pacman las dependencias disponibles (todas menos gnu-efi).
 
 .PARAMETER BuildOnly
     Compila pero no lanza QEMU.
 
-.PARAMETER Accel
-    whpx (default) o tcg. WHPX requiere activar "Windows Hypervisor Platform"
-    en "Caracteristicas de Windows".
+.PARAMETER NoBuild
+    Lanza QEMU con el kernel.elf ya compilado, sin pasar por make.
 
 .PARAMETER Display
-    gtk (default), sdl o none.
+    gtk (default), sdl o none (headless: todo queda en el serial log).
+
+.PARAMETER Nvme
+    Imagen NVMe a adjuntar, p.ej. .\nvme_ut99.img.
 
 .PARAMETER Msys2Root
     Raiz de msys2. Default: C:\msys64.
@@ -43,18 +39,18 @@
 .EXAMPLE
     .\build-windows.ps1 -Install
 .EXAMPLE
-    .\build-windows.ps1                 # build + run con WHPX + gtk
+    .\build-windows.ps1                              # build + QEMU con ventana gtk
 .EXAMPLE
-    .\build-windows.ps1 -Accel tcg      # si no tienes WHPX
+    .\build-windows.ps1 -Display none -Nvme .\nvme_ut99.img
 #>
 [CmdletBinding()]
 param(
     [switch]$Check,
     [switch]$Install,
-    [switch]$Rebuild,
     [switch]$BuildOnly,
-    [ValidateSet('whpx','tcg')] [string]$Accel = 'whpx',
+    [switch]$NoBuild,
     [ValidateSet('gtk','sdl','none')] [string]$Display = 'gtk',
+    [string]$Nvme = '',
     [string]$Msys2Root = 'C:\msys64'
 )
 
@@ -71,50 +67,55 @@ if (-not (Test-Path $Bash)) {
     Fail "No encuentro bash de msys2 en $Bash. Instala msys2 (https://www.msys2.org) o pasa -Msys2Root <ruta>."
 }
 
-# Ruta msys ( /c/Users/... ) del repo, derivada de la ubicacion del script.
-# Ej: C:\Users\xasko\osito-k  ->  /c/Users/xasko/osito-k
-$RepoWin  = $PSScriptRoot
-$drive    = $RepoWin.Substring(0,1).ToLower()
-$RepoMsys = "/$drive" + ($RepoWin.Substring(2) -replace '\\','/')
+# Ruta msys de un path de Windows. Ej: D:\projects\osito-k -> /d/projects/osito-k
+function ConvertTo-MsysPath([string]$Path) {
+    $full = (Resolve-Path -LiteralPath $Path).Path
+    return "/" + $full.Substring(0,1).ToLower() + ($full.Substring(2) -replace '\\','/')
+}
+$RepoMsys = ConvertTo-MsysPath $PSScriptRoot
 
 # Ejecuta un comando en el shell de login mingw64 (PATH con /mingw64/bin).
+# La salida va directo a la consola: si no, se mezclaria con el exit code
+# que devuelve la funcion.
 function Invoke-Mingw([string]$Cmd) {
-    $env:MSYSTEM      = 'MINGW64'
+    $env:MSYSTEM        = 'MINGW64'
     $env:CHERE_INVOKING = '1'
-    & $Bash -lc $Cmd
+    & $Bash -lc $Cmd | Out-Host
     return $LASTEXITCODE
 }
 
 # --- Chequeo de dependencias -------------------------------------------------
 $deps = @(
-    @{ name='bash';            cmd='bash';            pacman='';                          note='msys2 base' },
-    @{ name='make';            cmd='make';            pacman='make';                      note='' },
-    @{ name='mtools (mcopy)';  cmd='mcopy';           pacman='mtools';                    note='arma la ESP image' },
-    @{ name='qemu';            cmd='qemu-system-x86_64'; pacman='mingw-w64-x86_64-qemu';  note='emulador + firmware edk2' },
-    @{ name='dd';              cmd='dd';              pacman='coreutils';                 note='' },
-    @{ name='x86_64-elf-gcc';  cmd='x86_64-elf-gcc';  pacman='';                          note='CROSS toolchain bare-metal (NO esta en pacman)' },
-    @{ name='gnu-efi';         cmd='';                file='/mingw64/include/efi/efi.h';  pacman='';  note='headers EFI (NO esta en pacman)' }
+    @{ name='make';         cmd='make';               pacman='make';                        note='' },
+    @{ name='mtools';       cmd='mcopy';              pacman='mingw-w64-x86_64-mtools';     note='arma la ESP image' },
+    @{ name='qemu';         cmd='qemu-system-x86_64'; pacman='mingw-w64-x86_64-qemu';       note='emulador + firmware edk2' },
+    @{ name='clang';        cmd='clang';              pacman='mingw-w64-x86_64-clang';      note='compila con --target=x86_64-elf' },
+    @{ name='ld.lld';       cmd='ld.lld';             pacman='mingw-w64-x86_64-lld';        note='' },
+    @{ name='llvm-objcopy'; cmd='llvm-objcopy';       pacman='mingw-w64-x86_64-llvm-tools'; note='' },
+    @{ name='gnu-efi';      cmd=''; file='/usr/local/lib/elf_x86_64_efi.lds'; pacman='';    note='NO esta en pacman' }
 )
 
 function Test-Deps {
     Info "Verificando dependencias en mingw64..."
     $missing = @()
     foreach ($d in $deps) {
-        $present = $false
-        if ($d.cmd) {
-            Invoke-Mingw "command -v $($d.cmd) >/dev/null 2>&1" | Out-Null
-            $present = ($LASTEXITCODE -eq 0)
-        } elseif ($d.file) {
-            Invoke-Mingw "test -f $($d.file)" | Out-Null
-            $present = ($LASTEXITCODE -eq 0)
-        }
+        if ($d.cmd) { $probe = "command -v $($d.cmd) >/dev/null 2>&1" }
+        else        { $probe = "test -f $($d.file)" }
+        Invoke-Mingw $probe | Out-Null
+        $present = ($LASTEXITCODE -eq 0)
         $tag = if ($present) { 'OK   ' } else { 'FALTA' }
         $col = if ($present) { 'Green' } else { 'Yellow' }
         $extra = if ($d.note) { "  ($($d.note))" } else { '' }
-        Write-Host ("  [{0}] {1,-18}{2}" -f $tag, $d.name, $extra) -ForegroundColor $col
+        Write-Host ("  [{0}] {1,-14}{2}" -f $tag, $d.name, $extra) -ForegroundColor $col
         if (-not $present) { $missing += $d }
     }
     return ,$missing
+}
+
+function Show-GnuEfiHelp {
+    Warn "gnu-efi se instala a mano: compilar https://github.com/ncroxon/gnu-efi e"
+    Warn "  instalar headers/libs bajo /usr/local de msys2 (C:\msys64\usr\local)."
+    Warn "  arch/x86/Makefile lo detecta ahi; si no, pasar EFI_PREFIX=<ruta> a make."
 }
 
 $missing = Test-Deps
@@ -122,18 +123,10 @@ $missing = Test-Deps
 if ($Check) {
     if ($missing.Count -eq 0) { Ok "Todas las dependencias presentes." }
     else {
-        Warn "Faltan $($missing.Count). Para las de pacman corre:  .\build-windows.ps1 -Install"
-        $crossMissing = $missing | Where-Object { -not $_.pacman }
-        if ($crossMissing) {
-            Warn "Sin paquete pacman (instalacion manual):"
-            Warn "  - x86_64-elf-gcc/ld/objcopy: cross toolchain ELF bare-metal."
-            Warn "      Opciones: build con crosstool-ng, o un prebuilt x86_64-elf de"
-            Warn "      https://github.com/lordmilko/i686-elf-tools / equivalentes x86_64."
-            Warn "      Luego agrega su bin al PATH de mingw64 (~/.bashrc o variable)."
-            Warn "  - gnu-efi: clona https://github.com/ncroxon/gnu-efi y 'make' con el"
-            Warn "      cross-gcc; instala headers/libs bajo /mingw64 (o ajusta EFI_PREFIX)."
-            Warn "  NOTA: el toolchain bundleado en tools/ es Linux/Mac y NO corre en Windows."
+        if ($missing | Where-Object { $_.pacman }) {
+            Warn "Para las que estan en pacman corre:  .\build-windows.ps1 -Install"
         }
+        if ($missing | Where-Object { $_.name -eq 'gnu-efi' }) { Show-GnuEfiHelp }
     }
     exit 0
 }
@@ -145,35 +138,30 @@ if ($Install) {
     $rc = Invoke-Mingw "pacman -S --needed --noconfirm $pkgs"
     if ($rc -ne 0) { Fail "pacman fallo (rc=$rc). Abre 'MSYS2 MINGW64' y reintenta manualmente." }
     Ok "Paquetes pacman listos."
-    Warn "Recorda: x86_64-elf-gcc y gnu-efi NO estan en pacman — ver  .\build-windows.ps1 -Check"
+    if ($missing | Where-Object { $_.name -eq 'gnu-efi' }) { Show-GnuEfiHelp }
     exit 0
 }
 
 # --- Build + Run -------------------------------------------------------------
-$cross = $missing | Where-Object { $_.name -eq 'x86_64-elf-gcc' -or $_.name -eq 'gnu-efi' }
-if ($cross) {
-    Fail "Falta el cross toolchain / gnu-efi. Corre primero:  .\build-windows.ps1 -Check"
+if ($missing.Count -gt 0) {
+    Fail "Faltan dependencias. Corre primero:  .\build-windows.ps1 -Check"
 }
 
-$env:OK_ACCEL   = $Accel
-$env:OK_DISPLAY = $Display
-if ($Rebuild) { $env:OK_REBUILD = '1' } else { $env:OK_REBUILD = '0' }
-
-if ($BuildOnly) {
-    Info "Compilando (sin lanzar QEMU)..."
-    $rc = Invoke-Mingw "cd '$RepoMsys' && make -C arch/x86"
+if (-not $NoBuild) {
+    Info "Compilando boot.efi + kernel.elf (clang)..."
+    $rc = Invoke-Mingw "cd '$RepoMsys' && make -C arch/x86 CLANG=1 -j`$(nproc) build/boot.efi build/kernel.elf"
     if ($rc -ne 0) { Fail "Build fallo (rc=$rc)." }
-    Ok "Build OK: arch/x86/build/{boot.efi,kernel.elf}"
-    exit 0
+    Ok "Build OK: arch\x86\build\{boot.efi,kernel.elf}"
+}
+if ($BuildOnly) { exit 0 }
+
+$nvmeMsys = ''
+if ($Nvme) {
+    if (-not (Test-Path -LiteralPath $Nvme)) { Fail "No existe la imagen NVMe: $Nvme" }
+    $nvmeMsys = ConvertTo-MsysPath $Nvme
 }
 
-Info "Build + QEMU (accel=$Accel, display=$Display)..."
-$runner = "$RepoMsys/arch/x86/scripts/qemu-windows.sh"
-$rc = Invoke-Mingw "cd '$RepoMsys' && chmod +x '$runner' && OK_ACCEL='$Accel' OK_DISPLAY='$Display' OK_REBUILD='$($env:OK_REBUILD)' bash '$runner'"
-if ($rc -ne 0) {
-    if ($Accel -eq 'whpx') {
-        Warn "QEMU salio con rc=$rc. Si fue WHPX, reintenta:  .\build-windows.ps1 -Accel tcg"
-    }
-    exit $rc
-}
+Info "QEMU TCG (display=$Display). Serial log: arch\x86\build\serial.log"
+$rc = Invoke-Mingw "cd '$RepoMsys' && OK_DISPLAY='$Display' OK_NVME='$nvmeMsys' bash arch/x86/scripts/run-windows.sh"
+if ($rc -ne 0) { Warn "QEMU salio con rc=$rc."; exit $rc }
 Ok "QEMU termino. Serial log: arch\x86\build\serial.log"

@@ -6,15 +6,21 @@
 
 ## TL;DR — cómo correr
 
-Desde un shell **MSYS2 MINGW64** (no PowerShell — `build-windows.ps1` usa `&&`,
-que no parsea en PS 5.1):
+Desde PowerShell, parado en la raíz del repo:
+
+```powershell
+.\build-windows.ps1                                  # build (clang) + QEMU TCG con ventana gtk
+.\build-windows.ps1 -Display none -Nvme .\nvme_ut99.img
+```
+
+O desde un shell **MSYS2 MINGW64**:
 
 ```bash
 # build + run headless
 OK_BUILD=1 ./arch/x86/scripts/run-windows.sh
 
 # run de UT99 (ventana + NVMe), captura [NAMEHASH] en build/serial.log
-OK_DISPLAY=gtk OK_NVME=/c/Users/xasko/osito-k/nvme_ut99.img ./arch/x86/scripts/run-windows.sh
+OK_DISPLAY=gtk OK_NVME=nvme_ut99.img ./arch/x86/scripts/run-windows.sh
 ```
 
 Build del kernel/boot con clang: `make -C arch/x86 CLANG=1 build/boot.efi build/kernel.elf`
@@ -99,6 +105,13 @@ bloqueante para el debugging de UT99.
 ---
 
 ## SOLUCIÓN (2026-06-06): QEMU en WSL2 con KVM
+
+> **2026-10-28:** la máquina de desarrollo ya no tiene WSL, así que este camino
+> no está activo y las rutas `/mnt/c/Users/xasko/osito-k` de abajo son
+> históricas. Hoy se usa TCG local (TL;DR). La WSL de kerberus (`xasko@kerberus`)
+> se usa para los tests de host (`arch/x86/scripts/remote-test.sh`) y no tiene
+> QEMU instalado. Para volver a usar KVM ahí habría que instalar
+> `qemu-system-x86 ovmf mtools` y agregar el usuario al grupo `kvm`.
 
 WHPX no se pudo arreglar sin recompilar QEMU. El camino que SÍ funciona y evita
 WHPX por completo: **correr QEMU dentro de WSL2, que expone `/dev/kvm` real vía
