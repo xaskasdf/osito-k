@@ -44,6 +44,7 @@ struct cpu_sched {
     int         last;           /* round-robin cursor into task_pool */
     uint64_t    ticks;          /* this CPU's timer ticks */
     uint64_t    mpidr;          /* SGI target */
+    uint32_t    capacity;       /* relative speed, 0 = unknown (all equal) */
 };
 
 extern task_tcb_t       task_pool[MAX_TASKS];

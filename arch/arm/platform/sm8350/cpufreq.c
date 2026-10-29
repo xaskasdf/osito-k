@@ -38,6 +38,7 @@ struct domain {
     uint64_t    base;
     int         first_cpu, ncpus;
     const char *core;
+    uint32_t    dmips_mhz;          /* capacity-dmips-mhz in the device tree */
     int         nlevels;
     int         top;                /* highest level that isn't boost */
     uint32_t    khz[LUT_MAX];
@@ -46,9 +47,12 @@ struct domain {
 };
 
 static struct domain domains[] = {
-    { .base = 0x18591000UL, .first_cpu = 0, .ncpus = 4, .core = "Cortex-A55" },
-    { .base = 0x18592000UL, .first_cpu = 4, .ncpus = 3, .core = "Cortex-A78" },
-    { .base = 0x18593000UL, .first_cpu = 7, .ncpus = 1, .core = "Cortex-X1" },
+    { .base = 0x18591000UL, .first_cpu = 0, .ncpus = 4, .core = "Cortex-A55",
+      .dmips_mhz = 1024 },
+    { .base = 0x18592000UL, .first_cpu = 4, .ncpus = 3, .core = "Cortex-A78",
+      .dmips_mhz = 1946 },
+    { .base = 0x18593000UL, .first_cpu = 7, .ncpus = 1, .core = "Cortex-X1",
+      .dmips_mhz = 2048 },
 };
 #define NDOMAINS (int)(sizeof(domains) / sizeof(domains[0]))
 
@@ -79,13 +83,17 @@ static uint32_t current_khz(const struct domain *d)
     return LUT_L_VAL(mmio_rd32(d->base + REG_DOMAIN_STATE)) * XO_KHZ;
 }
 
-/* Request a level, then wait up to 10 ms for the domain to report it */
+/* Request a level, then wait up to 10 ms for the domain to report it. The
+ * scheduler gets the new speed of each CPU (per-MHz performance x MHz, as
+ * Linux computes capacity): A55 1.85M, A78 4.71M, X1 5.82M at the top. */
 static uint32_t set_level(struct domain *d, int level)
 {
     int per_core = mmio_rd32(d->base + REG_DCVS_CTRL) & 1;
     mmio_wr32(d->base + REG_PERF_STATE, (uint32_t)level);
     for (int c = 1; per_core && c < d->ncpus; c++)
         mmio_wr32(d->base + REG_PERF_STATE + c * 4, (uint32_t)level);
+    for (int c = 0; c < d->ncpus; c++)
+        sched_set_capacity(d->first_cpu + c, d->dmips_mhz * (d->khz[level] / 1000));
     uint64_t t0 = timer_ms();
     while (current_khz(d) != d->khz[level] && timer_ms() - t0 < 10)
         ;

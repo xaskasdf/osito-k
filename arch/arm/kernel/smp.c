@@ -350,6 +350,11 @@ void smp_print_cpus(void)
         serial_putdec((cpus[i].midr >> 20) & 0xF);
         serial_puts("p");
         serial_putdec(cpus[i].midr & 0xF);
+        if (cpu_sched[i].capacity) {
+            serial_puts("  capacity ");
+            serial_putdec(cpu_sched[i].capacity / 1000);
+            serial_puts("k");
+        }
         task_tcb_t *t = cpu_sched[i].current;
         if (t) {
             serial_puts("  running ");
@@ -408,10 +413,16 @@ static void print_ms(uint64_t ticks, uint64_t freq)
     serial_puts(" ms");
 }
 
-/* Pinned: one task per online CPU, task i on CPU i. `any`: two per online
- * CPU, not pinned, so CPUs share them and pick up each other's. */
-void smp_bench(int any)
+/* Pinned: one task per online CPU, task i on CPU i. `any`: `count` tasks
+ * (default two per online CPU), not pinned, so the scheduler places them:
+ * fewer than the CPUs shows which ones it picks, more shows them shared. */
+void smp_bench(int any, int count)
 {
+    int online = 0;
+    for (int i = 0; i < MAX_CPUS; i++)
+        online += cpus[i].online;
+    if (count <= 0 || count > BENCH_SLOTS)
+        count = 2 * online;
     uint64_t freq;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
 
@@ -422,7 +433,7 @@ void smp_bench(int any)
         int cpu = i % MAX_CPUS;
         bench[i].done = 0;
         bench[i].ticks = 0;
-        bench[i].used = cpus[cpu].online && (any || i < MAX_CPUS);
+        bench[i].used = any ? i < count : i < MAX_CPUS && cpus[cpu].online;
         if (!bench[i].used)
             continue;
         bench[i].created = read_cntpct_el0();

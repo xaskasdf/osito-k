@@ -87,7 +87,7 @@ void smp_cpu_off(void);         /* this CPU, for good (SGI_STOP) */
 int  smp_this_core(void);       /* core number from MPIDR */
 int  smp_get_cpu_count(void);
 void smp_print_cpus(void);
-void smp_bench(int any);        /* shell `cpubench [any]` */
+void smp_bench(int any, int count);     /* shell `cpubench [any [n]]` */
 int  smp_cpu_id(void);          /* kernel/sched.c: this CPU's core number */
 
 /* ========================================================================
@@ -161,6 +161,8 @@ int  task_create(const char *name, task_func_t func, void *arg, int priority);
 /* cpu: a core number, or -1 (TASK_ANY_CPU) for whichever CPU is free */
 int  task_create_on(const char *name, task_func_t func, void *arg, int priority,
                     int cpu);
+/* Relative speed of a CPU (cpufreq): unpinned tasks prefer the fastest */
+void sched_set_capacity(int cpu, uint32_t capacity);
 void task_yield(void);
 void task_delay_ms(uint32_t ms);
 void sched_start(void);

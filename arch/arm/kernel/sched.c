@@ -114,26 +114,40 @@ void sched_init(void) {
     serial_puts("[SCHED] Ready\n");
 }
 
+/* In the scheduler and running its idle task. Caller holds sched_lock. */
+static int cpu_idle(const struct cpu_sched *c) {
+    return c->idle && c->current == c->idle;
+}
+
+/* cpufreq: the CPU's speed, so unpinned tasks go to the fastest free one */
+void sched_set_capacity(int cpu, uint32_t capacity) {
+    cpu_sched[cpu].capacity = capacity;
+}
+
 /* Send the reschedule SGI to CPUs sitting in their idle task that could
- * take a READY task, one CPU per task, instead of leaving it to their next
- * tick (up to 10 ms: avg 5.7 ms to start a task on another CPU before).
- * This CPU is left out: it just scheduled, or keeps its task until its own
- * tick. Caller holds sched_lock. */
+ * take a READY task, one CPU per task and the fastest first, instead of
+ * leaving it to their next tick (up to 10 ms: avg 5.7 ms to start a task
+ * on another CPU before). This CPU is left out: it just scheduled, or
+ * keeps its task until its own tick. Caller holds sched_lock. */
 static void kick_idle_cpus(void) {
     uint32_t kicked = 1u << this_cpu()->id;
     for (int i = 0; i < MAX_TASKS; i++) {
         task_tcb_t *t = &task_pool[i];
         if (t->state != TASK_STATE_READY || t->idle)
             continue;
+        int pick = -1;
         for (int n = 0; n < MAX_CPUS; n++) {
             struct cpu_sched *c = &cpu_sched[n];
-            if ((kicked & (1u << n)) || !c->idle || c->current != c->idle)
+            if ((kicked & (1u << n)) || !cpu_idle(c))
                 continue;
             if (t->cpu != TASK_ANY_CPU && t->cpu != n)
                 continue;
-            kicked |= 1u << n;
-            gic_send_sgi(c->mpidr, SGI_YIELD);
-            break;
+            if (pick < 0 || c->capacity > cpu_sched[pick].capacity)
+                pick = n;
+        }
+        if (pick >= 0) {
+            kicked |= 1u << pick;
+            gic_send_sgi(cpu_sched[pick].mpidr, SGI_YIELD);
         }
     }
 }
@@ -181,6 +195,21 @@ void schedule(void) {
             prev->state = TASK_STATE_FREE;      /* off its stack for good */
     }
 
+    /* Unpinned tasks go to faster CPUs first: leave them to the idle CPUs
+     * faster than this one (kicked below), unless there are more of them
+     * than such CPUs. This also moves a task up from a little core at its
+     * next tick once a big one is free. */
+    int faster_idle = 0, ready_any = 0;
+    for (int n = 0; n < MAX_CPUS; n++)
+        if (n != c->id && cpu_idle(&cpu_sched[n]) &&
+            cpu_sched[n].capacity > c->capacity)
+            faster_idle++;
+    for (int i = 0; faster_idle && i < MAX_TASKS; i++)
+        if (task_pool[i].state == TASK_STATE_READY && !task_pool[i].idle &&
+            task_pool[i].cpu == TASK_ANY_CPU)
+            ready_any++;
+    int leave_any = ready_any <= faster_idle && faster_idle > 0;
+
     /* Highest priority wins; the scan starts after the last pick, so equal
      * priorities take turns */
     int best = -1, best_pri = -1;
@@ -190,6 +219,8 @@ void schedule(void) {
         if (t->state != TASK_STATE_READY || t->idle)
             continue;
         if (t->cpu != TASK_ANY_CPU && t->cpu != c->id)
+            continue;
+        if (t->cpu == TASK_ANY_CPU && leave_any)
             continue;
         if (t->priority > best_pri) {
             best = i;

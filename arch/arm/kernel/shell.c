@@ -40,7 +40,7 @@ static void cmd_help(void)
     serial_puts("  exec     Run ELF binary\n");
     serial_puts("  ping     Ping IP address\n");
     serial_puts("  cpus     List the online CPUs\n");
-    serial_puts("  cpubench Timed task per CPU, all at once (any: not pinned)\n");
+    serial_puts("  cpubench Timed task per CPU, all at once [any [n]: n unpinned]\n");
     serial_puts("  cpufreq  CPU frequencies [max | min | <domain> <level>]\n");
     serial_puts("  echo     Print text\n");
     serial_puts("  hexdump  Hex dump file\n");
@@ -324,7 +324,11 @@ void shell_run(void)
             smp_print_cpus();
         }
         else if (strcmp(argv[0], "cpubench") == 0) {
-            smp_bench(argc > 1 && strcmp(argv[1], "any") == 0);
+            int any = argc > 1 && strcmp(argv[1], "any") == 0;
+            int count = 0;
+            for (const char *p = argc > 2 ? argv[2] : ""; *p >= '0' && *p <= '9'; p++)
+                count = count * 10 + (*p - '0');
+            smp_bench(any, count);
         }
         else if (strcmp(argv[0], "cpufreq") == 0) {
             platform_cpufreq_cmd(argc, argv);

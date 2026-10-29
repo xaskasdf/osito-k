@@ -151,6 +151,12 @@ scheduler in its own idle task.
   for one core keeps running serialized there; the shell is one of them. Use
   `task_create_on(..., cpu)` to put a task on another core, or `TASK_ANY_CPU` to
   let any idle CPU take it (it may move between CPUs).
+- **Big cores first.** Unpinned tasks go to the fastest idle CPU. Each CPU has a
+  capacity, set by `cpufreq` as `capacity-dmips-mhz` (device tree: A55 1024, A78
+  1946, X1 2048) × its MHz, the way Linux computes it. A CPU leaves unpinned tasks
+  to idle CPUs faster than itself unless there are more tasks than such CPUs. So
+  a task that started on an A55 moves to a big core at the A55's next tick once
+  one is free. Performance first: there is no load tracking or energy model.
 - **Per-CPU state.** `TPIDR_EL1` points at the CPU's `struct cpu_sched` (`task.h`):
   current task, IRQ stack, idle task. `irq_vector_entry` saves the context on the
   task's stack, then runs the handler on the CPU's own IRQ stack. Once
@@ -209,6 +215,9 @@ they run, so this happens after `smp_boot_aps`. The setting survives a `kload`.
 - `cpufreq` lists each domain's levels, current frequency and level.
 - `cpufreq max` / `cpufreq min` set every domain to its top / lowest level.
 - `cpufreq <domain> <level>` sets one.
+
+Each level change also updates the scheduler's capacity for those CPUs (see "Big
+cores first"). `cpus` shows it.
 
 ---
 
@@ -341,10 +350,15 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     `task_create_on` to the task running on another CPU: 5.7 ms on average (7 ms
     max) waiting for ticks, now 4 µs (5 µs max). With `cpubench any` it stays in
     milliseconds, which is queueing, not wakeup: 16 tasks for 8 CPUs.
+15. **Big cores first (2026-10-29).** Unpinned tasks take the fastest idle CPU (see
+    "SMP scheduling"). `cpubench any 1` runs on the X1, `any 3` on the X1 and two
+    A78s, `any 4` on all four big cores. With `any 8`, the four that start on A55s
+    move up as the big cores free: 172 ms wall, against 183–192 ms pinned one per
+    CPU. Before this change the IPI went to the lowest-numbered idle CPU, an A55.
 
 Still open:
-- **Nothing balances load.** Unpinned tasks go to whichever CPU is idle or
-  reschedules first, regardless of core type; pinned ones stay put.
+- **Placement is performance-first.** No load tracking or energy model: a light
+  unpinned task also takes a big core.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
 
