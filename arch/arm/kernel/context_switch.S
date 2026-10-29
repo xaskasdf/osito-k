@@ -60,8 +60,10 @@ irq_vector_entry:
     adrp    x0, current_task
     add     x0, x0, :lo12:current_task
     ldr     x1, [x0]
+    cbz     x1, 2f                  /* No task yet: return on this stack */
     ldr     x2, [x1]               /* x2 = new task's sp */
     mov     sp, x2
+2:
 
     /* Restore ELR_EL1 and SPSR_EL1 */
     ldp     x0, x1, [sp, #256]

@@ -67,6 +67,13 @@ The checkout is `D:\projects\osito-k`; msys2 lives in `C:\msys64` (clang, lld, l
 - **No hardware acceleration**: WHPX cannot boot OVMF (a #GP in `PlatformPei` on an early `WRMSR`, before `boot.efi` runs). This is an upstream QEMU limitation with no command-line workaround; see `docs/windows-qemu-whpx.md`. `arch/x86/scripts/run-wsl-kvm.sh` (KVM) only works on a Linux/WSL host that has QEMU installed, and none is set up right now.
 - **Native clang can't read symlinks created from WSL.** If the build fails with "no such file" on a file that exists, check `find <dir> -type l` and replace the symlinks with copies.
 
+### AArch64 on the ROG Phone 5 (SM8350)
+Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fastboot in `C:\platform-tools`); the toolchain and the boot-image pieces (shim, DTBs, `mkbootimg.py`, stock backups) live on the Mac `cortessamuel@192.168.1.20` in `~/phone_breaker2`.
+- `arch/arm/scripts/rog5-boot.sh [--virt-check] [--flash]` ships the working tree to the Mac, builds with `aarch64-elf-gcc`, packs `boot.img` and flashes the active slot. clang can't build `arch/arm` (no `__builtin_setjmp` on aarch64).
+- `fastboot boot` bootloops on this device, so images are always flashed. Get back to fastboot with Power + Vol-Down.
+- There is no UART output, so the screen is the only feedback: progress bars, a blinking heartbeat, and an orange/purple panic band with ESR/ELR/`_start` as bit cells. The guide explains how to decode them.
+- Status 2026-10-28: boots to the scheduler. Nothing past that is visible yet because the shell only uses the UART.
+
 ### Tests
 CI runs no tests. Three kinds of test exist in `arch/x86/`:
 - **Host tests** (the majority): `arch/x86/scripts/test-*.sh`. Most of them compile an `arch/x86/test/*_host.c` harness against the real kernel sources with gcc and clang, often under ASan/UBSan, and run it natively. They need Linux. From this machine, run them on the `xasko@kerberus` WSL (Ubuntu-24.04) with `arch/x86/scripts/remote-test.sh <name>...`, e.g. `remote-test.sh boot-diag`. It syncs the tree incrementally over SSH and runs `test-<name>.sh` there.

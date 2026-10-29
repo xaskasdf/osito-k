@@ -69,8 +69,10 @@ _entry:
     msr     VBAR_EL1, x0
     isb
 
-    /* Stack: provided by linker script (_stack_top) */
-    ldr     x0, =_stack_top
+    /* Stack: provided by linker script (_stack_top). PC-relative, because
+     * on SM8350 the actual load address differs from the link address. */
+    adrp    x0, _stack_top
+    add     x0, x0, :lo12:_stack_top
     mov     sp, x0
 
     /* === MARKER 3: cyan line = stack OK === */

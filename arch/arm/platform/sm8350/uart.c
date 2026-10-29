@@ -18,18 +18,26 @@
  * Discovered on real hardware -- infinite loop caused black screen. */
 #define TX_TIMEOUT  100000
 
+/* Set on the first TX timeout. Once the FIFO stops draining, paying the full
+ * timeout on every character stalled boot for minutes on the device
+ * (2026-10-28), so all further output is dropped. */
+static int tx_stuck;
+
 void uart_init(void) {
     /* ABL pre-configures GENI UART -- nothing to do */
 }
 
 void uart_putc(char c) {
+    if (tx_stuck)
+        return;
     for (int i = 0; i < TX_TIMEOUT; i++) {
         if ((mmio_read32(UART_REG(SE_GENI_TX_FIFO_STATUS)) & TX_FIFO_WC_MASK) < TX_FIFO_DEPTH) {
             mmio_write32(UART_REG(SE_GENI_TX_FIFOn), (uint32_t)c);
             return;
         }
     }
-    /* Timeout -- silently drop character rather than hang */
+    /* Timeout -- drop this and every later character rather than hang */
+    tx_stuck = 1;
 }
 
 void uart_puts(const char *s) {

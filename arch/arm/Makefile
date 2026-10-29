@@ -24,10 +24,8 @@ PLAT_DIR := platform/$(PLATFORM)
 # Platform-specific linker script
 ifeq ($(PLATFORM),virt)
   LDSCRIPT := boot/linker_virt.ld
-  STACK_ADDR := 0x44000000
 else ifeq ($(PLATFORM),sm8350)
   LDSCRIPT := boot/linker_sm8350.ld
-  STACK_ADDR := 0x85000000
 else
   $(error Unknown PLATFORM=$(PLATFORM). Use virt or sm8350.)
 endif
@@ -45,7 +43,7 @@ ASFLAGS := -ffreestanding -nostdlib -nostartfiles \
 LDFLAGS := -nostdlib -T $(LDSCRIPT)
 
 # Sources
-ASM_SRCS := boot/start.S kernel/context_switch.S
+ASM_SRCS := boot/start.S kernel/context_switch.S kernel/mem.S
 C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/memory.c kernel/paging.c kernel/heap.c kernel/sched.c \
             kernel/syscall.c kernel/elf.c kernel/process.c \

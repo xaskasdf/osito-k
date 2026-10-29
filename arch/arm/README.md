@@ -96,7 +96,7 @@ fastboot reboot
 
 ## Porting Priority
 
-1. **start.S + linker.ld** — EL1 entry, stack at 0x85000000, BSS clear
+1. **start.S + linker.ld** — EL1 entry, stack 64 KB past the image end (PC-relative), BSS clear
 2. **GENI UART** — serial console (ABL pre-configured, just write FIFO)
 3. **Exception vectors** — VBAR_EL1, sync/irq/fiq/serror handlers
 4. **ARM Generic Timer** — scheduler tick via CNTP_TVAL_EL0

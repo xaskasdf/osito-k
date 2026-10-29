@@ -47,8 +47,10 @@ SECTIONS
 
     _image_end = .;
 
-    /* Stack top: 0x85000000 (inside DDR bank 0, below reserved regions) */
-    _stack_top = 0x85000000;
+    /* Stack: 64 KB above image end (grows down), wherever ABL loaded us.
+     * Not a fixed address: 0x85000000 sits inside cdsp_secure_heap
+     * (0x80C00000-0x85200000 in the device's reserved-memory). */
+    _stack_top = _image_end + 0x10000;
 
     /DISCARD/ : {
         *(.comment)

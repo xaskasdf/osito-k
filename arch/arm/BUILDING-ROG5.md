@@ -1,30 +1,107 @@
 # Building & Booting Osito-K on ASUS ROG Phone 5
 
 Target: ASUS ROG Phone 5 (I005DA), Qualcomm SM8350 (Snapdragon 888)
-Last verified: 2026-03-08 on physical device
+Last verified: 2026-10-28 on physical device. Boots through the shim to the
+scheduler: all progress bars plus the blinking heartbeat (see below).
 
 ---
 
 ## Quick Start
 
+From the Windows dev box (Git Bash or MSYS2), phone in fastboot mode (Power + Vol-Down):
+
 ```bash
-# 1. Build Osito-K kernel
-cd ~/osito-k/arch/arm
-make PLATFORM=sm8350
-
-# 2. Inject into combined boot image (replaces Linux at offset 1.5MB)
-dd if=build/Image of=~/phone_breaker/combined_boot.bin bs=1024 seek=1536 conv=notrunc
-
-# 3. Repack as flashable boot.img
-cd ~/phone_breaker && ./repack_boot.sh
-
-# 4. Flash (device must be in fastboot mode)
-fastboot flash boot linux-boot-rog5.img
-fastboot reboot
+arch/arm/scripts/rog5-boot.sh                # build + pack -> arch/arm/build/rog5/osito-boot-rog5.img
+arch/arm/scripts/rog5-boot.sh --flash        # ... + fastboot flash boot_<active slot> + reboot
+arch/arm/scripts/rog5-boot.sh --virt-check   # also build PLATFORM=virt and boot it in local QEMU
 ```
 
-The sm8350-boot shim menu will appear on-screen. Osito-K is option 1 ("Linux/Osito-K").
-Press `2` on UART, or wait for the 1-second auto-boot timeout.
+The script ships the working tree (`arch/arm`, `gui`, `include/common`) to the Mac,
+builds there, packs the boot image with the pieces in `~/phone_breaker2`, brings it
+back, checks its SHA-256 and, with `--flash`, flashes it. A full cycle takes ~10 s.
+
+Where things live:
+
+| What | Where |
+|------|-------|
+| Toolchain | Mac `cortessamuel@192.168.1.20`: Homebrew `aarch64-elf-gcc` 15.2 in `/opt/homebrew/bin` |
+| Shim, DTBs, `mkbootimg.py`, UEFI payload, stock backups | Mac, `~/phone_breaker2` (read-only for the script) |
+| Build + pack scratch | Mac, `~/osito-arm-build` |
+| fastboot | Windows, `C:\platform-tools\fastboot.exe` (phone on this machine's USB) |
+
+- From the Windows box, port 22 on the Mac times out, so the script reaches it
+  through `xasko@kerberus` (`OK_MAC_JUMP`; empty = direct).
+- clang can't build the ARM kernel (no `__builtin_setjmp`/`__builtin_longjmp` on
+  aarch64), so msys2's clang is not an option. Any aarch64 gcc works:
+  `make PLATFORM=sm8350 CROSS=aarch64-elf-` (Mac) or the default
+  `aarch64-linux-gnu-` prefix on Linux.
+- Windows needs a WinUSB driver for the fastboot interface (`VID_0B05&PID_4DAF`),
+  otherwise `fastboot devices` is empty: Google USB Driver, "Have Disk", pick
+  **Android Bootloader Interface**.
+
+The sm8350-boot shim menu appears on-screen and auto-boots the payload at 1.5 MB
+(Osito-K) after 1 second.
+
+---
+
+## Reading the screen (no UART)
+
+The GENI UART TX FIFO does not drain once Osito-K runs, and there is no serial cable,
+so the framebuffer is the only output. `uart_putc` gives up on the first TX timeout
+and drops all later output (before that, ~100k MMIO polls per character made the
+banner take minutes).
+
+`kernel_main` paints 30-px bars as it advances:
+
+| Rows | Color | Meaning |
+|------|-------|---------|
+| 20–49 | red | `kernel_main` reached |
+| 60–89 | green | `platform_init` done |
+| 100–129 | blue | banner + CPU info printed |
+| 140–169 | yellow | GIC up |
+| 180–209 | cyan | timer programmed |
+| 220–249 | magenta | page allocator up |
+| 260–289 | white | paging step done (skipped on SM8350) |
+| 300–329 | grey | device probing done (virt-only probes skipped on SM8350) |
+| 340–369 | dark green | scheduler starting |
+| 420–449 | white square, blinking every 0.5 s | timer IRQs + context switches alive |
+
+The tiny lines at the very top come from `start.S` (red/green/cyan/white = entry,
+EL1, stack, BSS cleared).
+
+**Panic telemetry.** A synchronous exception paints an **orange** band at rows 500–529
+(an SError paints a **purple** one), followed by three rows of 32 cells, MSB first,
+white = 1, grey = 0:
+
+1. `ESR_EL1`
+2. `ELR_EL1[31:0]`
+3. runtime address of `_start` (so far always `0xA0200000`)
+
+The faulting symbol is at link address `0x80080000 + (ELR - _start)`; look it up
+with `aarch64-elf-addr2line -f -e kernel.elf <addr>` on the Mac
+(`~/osito-arm-build/src/arch/arm/build/kernel.elf`). Example from 2026-10-28:
+ESR `0x96000010` (data abort, synchronous external abort) at ELR `0xA020603C` was
+offset `0x603C` = a config-space read in `pci_scan`.
+
+### Bring-up log (2026-10-28)
+
+1. **Stack in a secure carve-out.** `_stack_top` was fixed at `0x85000000`, inside
+   `cdsp_secure_heap` (`0x80C00000–0x85200000` in the device's reserved-memory). It is
+   now `_image_end + 64 KB`, loaded PC-relative in `start.S`.
+2. **UART stall.** See above: the green → blue step took minutes.
+3. **QEMU virt devices probed on the phone.** `pci_scan` (ECAM), virtio-blk/net
+   (virtio-mmio) and `smp_boot_aps` (virt MPIDR numbering) caused a synchronous
+   external abort. `kernel_main` now runs them only when `platform_ram_base()` is
+   virt's `0x40000000`.
+4. **IRQ before the first task.** The timer is programmed long before
+   `sched_start`, so an IRQ is pending as soon as `irq_enable()` runs.
+   `irq_vector_entry` loaded `current_task->sp` on exit without checking for NULL
+   and read physical address 0. It now returns on the current stack when there is
+   no task.
+
+Still open: the shell only talks to the UART, so nothing past the heartbeat is
+visible; the next step is a framebuffer console. `PLATFORM=virt` needs `-m 4G` in
+QEMU because `start.S` paints `0xE5000000` before it knows the platform.
 
 ---
 
@@ -78,18 +155,17 @@ for ARM64 kernel images.
 
 ## Build Instructions
 
+`arch/arm/scripts/rog5-boot.sh` does all of this; the manual steps are here for
+reference or for building on another machine.
+
 ### Prerequisites
 
 ```bash
-# Cross-compiler (Ubuntu/Debian)
-sudo apt install gcc-aarch64-linux-gnu
+# Cross-compiler: any aarch64 gcc (not clang, see Quick Start)
+sudo apt install gcc-aarch64-linux-gnu      # Linux: default CROSS=aarch64-linux-gnu-
+brew install aarch64-elf-gcc                # macOS: make ... CROSS=aarch64-elf-
 
-# Boot image tool
-sudo apt install mkbootimg      # or: pip install mkbootimg
-
-# Verify
-aarch64-linux-gnu-gcc --version
-mkbootimg --help
+# Boot image tool: phone_breaker2 ships mu_aloha_platforms/ImageResources/mkbootimg.py
 ```
 
 ### Build Osito-K
@@ -97,7 +173,7 @@ mkbootimg --help
 ```bash
 cd ~/osito-k/arch/arm
 make clean
-make PLATFORM=sm8350
+make PLATFORM=sm8350                        # add CROSS=aarch64-elf- on the Mac
 ```
 
 Output: `build/Image` (raw AArch64 binary with ARM64 header at offset 0).
@@ -111,34 +187,25 @@ The Makefile uses:
 ### Build the shim (if modified)
 
 ```bash
-cd ~/phone_breaker/sm8350-boot
+cd ~/phone_breaker2/sm8350-boot
 make clean all
 ```
 
 Note: the shim uses `aarch64-elf-gcc` (bare-metal toolchain), NOT `aarch64-linux-gnu-gcc`.
 If you don't have it, install via your distro or build from source. The shim binary
-lands at `build/Image` (~15KB).
+lands at `build/Image` (~27KB, v0.8).
 
 ### Integrate Osito-K into the combined image
 
-**Option A: Replace kernel in existing combined_boot.bin**
+`phone_breaker2/repack_boot.sh` rebuilds `combined_boot.bin` from scratch with the
+**Linux** kernel (`linux-sm8350/arch/arm64/boot/Image`) at 1.5 MB, so injecting
+Osito-K into `combined_boot.bin` and then running it just packs Linux again. Use the
+full manual repack below (what `rog5-boot.sh` runs on the Mac).
+
+**Full manual repack**
 
 ```bash
-# Inject Osito-K at the kernel offset (1.5MB = 1536 * 1024)
-dd if=~/osito-k/arch/arm/build/Image \
-   of=~/phone_breaker/combined_boot.bin \
-   bs=1024 seek=1536 conv=notrunc
-```
-
-Then repack:
-```bash
-cd ~/phone_breaker && ./repack_boot.sh
-```
-
-**Option B: Full manual repack**
-
-```bash
-cd ~/phone_breaker
+cd ~/phone_breaker2
 
 # Create 45MB zero container
 dd if=/dev/zero of=combined_boot.bin bs=1M count=45
@@ -165,10 +232,10 @@ mkbootimg \
     --os_version 13.0.0 --os_patch_level 2023-01 \
     --header_version 2 --pagesize 4096 \
     --cmdline "clk_ignore_unused pd_ignore_unused" \
-    -o linux-boot-rog5.img
+    -o osito-boot-rog5.img
 ```
 
-**Option C: Standalone boot.img (no shim)**
+**Standalone boot.img (no shim)**
 
 For a simpler setup without the multi-boot menu:
 
@@ -177,7 +244,7 @@ cd ~/osito-k/arch/arm
 mkbootimg \
     --kernel build/Image \
     --ramdisk /dev/null \
-    --dtb ~/phone_breaker/rog5-patched.dtb \
+    --dtb ~/phone_breaker2/rog5-patched.dtb \
     --base 0x00000000 --kernel_offset 0x00080000 \
     --header_version 2 --pagesize 4096 \
     --cmdline "clk_ignore_unused pd_ignore_unused" \
@@ -196,25 +263,32 @@ Not recommended for development — use the shim approach until the kernel is st
 ```bash
 # Device must be in fastboot mode (hold vol-down + power during boot)
 fastboot devices                        # Verify connection
-fastboot flash boot linux-boot-rog5.img # Flash to active boot slot
+fastboot getvar current-slot            # a, as of 2026-10-28
+fastboot flash boot_a osito-boot-rog5.img
 fastboot reboot                         # Boot
 ```
 
 **NEVER use `fastboot boot`** — it causes bootloop on this device. Always flash.
 
+- `fastboot set_active` is refused ("Slot Change is not allowed in Lock State")
+  even though `getvar unlocked` says yes; slot changes need the critical unlock.
+- Osito-K never marks a boot successful, so ABL decrements
+  `slot-retry-count:a` on every boot. Flashing resets it (to 3 on 2026-10-28).
+- To get back to fastboot from a hung kernel: hold Power + Vol-Down.
+
 ### Recovery
 
-Always keep a backup before flashing:
+`boot_a` can't be read back over fastboot, so keep the images to restore:
 
 ```bash
-# Restore stock Android boot
-fastboot flash boot_a ~/phone_breaker/recovery-kit/stock-boot-original.img
+# Restore stock Android boot (also copied to arch/arm/build/rog5/ on the Windows box)
+fastboot flash boot_a ~/phone_breaker2/recovery-kit/stock-boot-original.img
 fastboot reboot
 
-# Alternative: switch to slot B (if stock Android is there)
-fastboot set_active b
-fastboot reboot
+# Linux through the shim: ~/phone_breaker2/linux-boot-rog5.img
 ```
+
+Full firmware backup: `~/phone_breaker2/backups/` (WW_ZS673KS_18.0840.2106.83).
 
 ### Emergency recovery (EDL)
 
@@ -273,7 +347,8 @@ This rule is mandatory until we set up MMU with proper relocation.
 | Address          | Description |
 |------------------|-------------|
 | `0x80000000`     | DDR Bank 0 start (880MB) |
-| `0x85000000`     | Osito-K stack (set in linker script) |
+| `0x80000000`–`0x9BC00000` | Reserved-memory carve-outs (hyp, smem, `cdsp_secure_heap` `0x80C00000–0x85200000`, PIL regions, modem…). Don't touch |
+| `_image_end` + 64 KB | Osito-K boot stack (~`0xA0340000`; follows the actual load address) |
 | `0x0098C000`     | GENI UART (serial console) |
 | `0x0A600000`     | USB DWC3 (side port) |
 | `0x0A800000`     | USB DWC3 (bottom port) |
@@ -438,8 +513,11 @@ VBAR_EL1     = shim's vectors (must set our own)
    ARM64 Image header (branch instruction, magic "ARM\x64" at offset 0x38).
    `start.S` already provides this.
 
-8. **Stack alignment**: AArch64 ABI requires 16-byte stack alignment. The linker
-   script sets `_stack_top = 0x85000000` which is aligned.
+8. **Stack placement**: AArch64 ABI requires 16-byte stack alignment. The linker
+   script sets `_stack_top = _image_end + 0x10000` (`_image_end` is 16-aligned) and
+   `start.S` loads it PC-relative. Never use a fixed address in DDR bank 0: most of
+   `0x80000000–0x9BC00000` is reserved (the old `0x85000000` was inside
+   `cdsp_secure_heap`).
 
 9. **Do NOT touch WDT**: Register `0x17980004` is TZ-protected. Instant crash.
 
@@ -452,28 +530,14 @@ VBAR_EL1     = shim's vectors (must set our own)
 ## Development Workflow
 
 ```
-Edit code → make PLATFORM=sm8350 → dd into combined_boot.bin → repack → flash → observe
-```
-
-Typical iteration cycle:
-
-```bash
-# Build
-cd ~/osito-k/arch/arm && make PLATFORM=sm8350
-
-# Inject (1 command — overwrites kernel slot in existing image)
-dd if=build/Image of=~/phone_breaker/combined_boot.bin bs=1024 seek=1536 conv=notrunc
-
-# Repack
-cd ~/phone_breaker && ./repack_boot.sh
-
-# Flash + boot
-fastboot flash boot linux-boot-rog5.img && fastboot reboot
+Edit code → rog5-boot.sh --virt-check (QEMU regression) → put phone in fastboot
+          → rog5-boot.sh --flash → read the bars / panic cells → Power + Vol-Down
 ```
 
 Output appears on:
-- **Phone screen** (framebuffer console, if FB driver is active)
-- **UART** (if you have a serial cable — ROG Phone 5 supports debug UART on 3.5mm jack)
+- **Phone screen**: progress bars, heartbeat and panic cells (see "Reading the screen")
+- **UART** (if you have a serial cable — ROG Phone 5 supports debug UART on 3.5mm jack).
+  As of 2026-10-28 TX stops draining once Osito-K runs.
 
 ### Debugging a crash
 
@@ -498,7 +562,9 @@ If nothing happens (stays on ROG boot logo):
 |------|-------------|
 | `arch/arm/Makefile` | Build system (`make PLATFORM=sm8350`) |
 | `arch/arm/boot/start.S` | Entry point + exception vectors |
-| `arch/arm/boot/linker_sm8350.ld` | Linker script (base 0x80080000, stack 0x85000000) |
+| `arch/arm/boot/linker_sm8350.ld` | Linker script (base 0x80080000, stack 64 KB past image end) |
+| `arch/arm/scripts/rog5-boot.sh` | Build on the Mac, pack, fetch, optionally flash |
+| `arch/arm/kernel/mem.S` | Out-of-line memset/memcpy/memmove (GCC and gui/ need the symbols) |
 | `arch/arm/include/sm8350.h` | Hardware register definitions (verified) |
 | `arch/arm/include/aarch64.h` | System register helpers |
 | `arch/arm/platform/sm8350/` | Platform-specific code |
@@ -509,7 +575,7 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/kernel/gic.c` | GICv3 interrupt controller |
 | `arch/arm/kernel/sched.c` | Preemptive scheduler |
 | `arch/arm/kernel/context_switch.S` | AArch64 context frame (272B min) |
-| `~/phone_breaker/sm8350-boot/` | Boot shim (v0.8) |
-| `~/phone_breaker/repack_boot.sh` | Image packing script |
-| `~/phone_breaker/rog5-patched.dtb` | Stock DTB + simplefb node |
-| `~/phone_breaker/recovery-kit/` | Stock boot backup |
+| `~/phone_breaker2/sm8350-boot/` (Mac) | Boot shim (v0.8) |
+| `~/phone_breaker2/repack_boot.sh` (Mac) | Packs the **Linux** image; Osito-K uses `rog5-boot.sh` |
+| `~/phone_breaker2/rog5-patched.dtb` (Mac) | Stock DTB + simplefb node |
+| `~/phone_breaker2/recovery-kit/` (Mac) | Stock boot backup |

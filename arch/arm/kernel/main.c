@@ -108,9 +108,40 @@ static void print_cpu_info(void)
  * Weak default exception handlers
  * ======================================================================== */
 
+/* QEMU virt has RAM at 0x40000000. SM8350 has none of virt's devices (PCI
+ * ECAM, virtio-mmio) and touching them is a synchronous external abort;
+ * virt in turn has no splash framebuffer at 0xE5000000. */
+static int on_qemu_virt(void)
+{
+    return platform_ram_base() == 0x40000000UL;
+}
+
+/* Panic telemetry on the SM8350 splash FB, for when no UART is attached:
+ * a colored band at rows 500-529, then three rows of 32 cells (MSB first,
+ * white = 1, grey = 0): ESR, ELR[31:0] and the runtime address of _start.
+ * Symbol of the fault = 0x80080000 + (ELR - _start). */
+extern char _start[];
+
+static void fb_panic(uint32_t color, uint32_t esr, uint32_t elr)
+{
+    if (on_qemu_virt())
+        return;
+    volatile uint32_t *fb = (volatile uint32_t *)0xE5000000UL;
+    for (int y = 500; y < 530; y++)
+        for (int x = 0; x < 1080; x++)
+            fb[y * 1080 + x] = color;
+    uint32_t vals[3] = { esr, elr, (uint32_t)(uintptr_t)_start };
+    for (int v = 0; v < 3; v++)
+        for (int y = 540 + v * 40; y < 570 + v * 40; y++)
+            for (int x = 0; x < 32 * 32; x++)
+                fb[y * 1080 + x] = (x % 32 == 31) ? 0 :
+                    ((vals[v] >> (31 - x / 32)) & 1) ? 0x00FFFFFF : 0x00404040;
+}
+
 __attribute__((weak))
 void exception_handler(uint64_t esr, uint64_t elr, uint64_t far)
 {
+    fb_panic(0x00FF8000, (uint32_t)esr, (uint32_t)elr);  /* orange */
     serial_puts("\n[PANIC] Synchronous exception!\n");
     serial_puts("  ESR_EL1 = ");
     serial_puthex(esr, 8);
@@ -138,6 +169,16 @@ void irq_handler(void)
 
         /* Wake sleeping tasks */
         uint64_t now = timer_get_tick_count();
+
+        /* SM8350 heartbeat: a square at rows 420-449 that toggles every
+         * 0.5 s, proof that timer IRQs and the scheduler are alive. */
+        if (!on_qemu_virt() && now % 50 == 0) {
+            volatile uint32_t *fb = (volatile uint32_t *)0xE5000000UL;
+            uint32_t color = (now / 50) & 1 ? 0x00FFFFFF : 0x00000000;
+            for (int y = 420; y < 450; y++)
+                for (int x = 0; x < 60; x++)
+                    fb[y * 1080 + x] = color;
+        }
         for (int i = 0; i < MAX_TASKS; i++) {
             if (task_pool[i].state == TASK_STATE_BLOCKED &&
                 task_pool[i].wake_tick != 0 &&
@@ -168,6 +209,7 @@ void irq_handler(void)
 __attribute__((weak))
 void serror_handler(uint64_t esr)
 {
+    fb_panic(0x008000FF, (uint32_t)esr, 0);  /* purple */
     serial_puts("\n[PANIC] SError!\n");
     serial_puts("  ESR_EL1 = ");
     serial_puthex(esr, 8);
@@ -194,6 +236,8 @@ static void shell_wrapper(void *arg)
 /* Debug: paint a fat bar on the framebuffer to show we reached C code */
 static void fb_debug_bar(int row, uint32_t color)
 {
+    if (on_qemu_virt())
+        return;
     volatile uint32_t *fb = (volatile uint32_t *)(0xE5000000UL + row * 4320);
     for (int i = 0; i < 1080 * 4; i++)  /* 4 rows wide, full width */
         fb[i] = color;
@@ -240,7 +284,7 @@ void kernel_main(void *dtb)
      * SM8350: ABL leaves MMU ON with identity map + EL2 traps some
      * system registers. Skip paging to avoid crash.
      * QEMU virt (RAM at 0x40000000): needs paging_init. */
-    if (platform_ram_base() == 0x40000000UL) {
+    if (on_qemu_virt()) {
         paging_init();  /* QEMU virt only */
     } else {
         serial_puts("[PAGE] Skipping (ABL identity map active)\n");
@@ -252,9 +296,9 @@ void kernel_main(void *dtb)
     /* Step 6: Heap */
     heap_init();
 
-    /* Step 7: PCI + HDA */
-    pci_scan();
-    {
+    /* Step 7: PCI + HDA (QEMU virt only: no ECAM on SM8350) */
+    if (on_qemu_virt()) {
+        pci_scan();
         pci_dev_t *hda = pci_get_hda();
         if (hda && hda->bar[0]) {
             hda_init(hda->bar[0], hda->bus, hda->dev, hda->func);
@@ -264,25 +308,28 @@ void kernel_main(void *dtb)
     /* Enable IRQs early — needed for QEMU TCG DMA completion processing */
     irq_enable();
 
-    /* Step 8: VirtIO-blk (MMIO transport) + OsitoFS */
-    if (virtio_blk_init(0, 0, 0, (uint64_t[]){0,0,0,0,0,0}) == 0)
-        osfs2_mount(0);  /* Mount at offset 0 (no GPT) */
+    /* Steps 8-10 probe QEMU virt devices (virtio-mmio) and CPU numbering
+     * (MPIDR Aff0 = cpu_id), neither of which exists on SM8350. */
+    if (on_qemu_virt()) {
+        /* Step 8: VirtIO-blk (MMIO transport) + OsitoFS */
+        if (virtio_blk_init(0, 0, 0, (uint64_t[]){0,0,0,0,0,0}) == 0)
+            osfs2_mount(0);  /* Mount at offset 0 (no GPT) */
 
-    /* Step 9: VirtIO-net + network stack */
-    {
+        /* Step 9: VirtIO-net + network stack */
         extern int virtio_net_init(void);
         extern void net_init(const uint8_t ip[4]);
         if (virtio_net_init() == 0) {
             uint8_t ip[] = {10, 0, 2, 15};  /* QEMU SLIRP default */
             net_init(ip);
         }
-    }
 
-    /* Step 10: SMP — boot secondary CPUs */
-    {
+        /* Step 10: SMP — boot secondary CPUs */
         extern void smp_boot_aps(int num_cpus);
         smp_boot_aps(4);  /* QEMU virt default: try 4 cores */
     }
+
+    /* Bar 8: GREY = devices done */
+    for (int r = 300; r < 330; r++) fb_debug_bar(r, 0x00808080);
 
     /* Step 11: Scheduler + shell */
     sched_init();
@@ -290,5 +337,9 @@ void kernel_main(void *dtb)
     task_create("shell", shell_wrapper, (void *)0, 1);
 
     serial_puts("[KERN] Boot complete.\n");
+
+    /* Bar 9: DARK GREEN = scheduler starting (heartbeat square follows) */
+    for (int r = 340; r < 370; r++) fb_debug_bar(r, 0x00008000);
+
     sched_start();  /* Never returns */
 }

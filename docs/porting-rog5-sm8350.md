@@ -337,7 +337,8 @@ framebuffer updates. First boot with uart-first showed black screen.
 - CPU: Cortex-A55 (little core, MIDR part 0xD05), r4p0
 - Exception Level: EL1
 - Timer: 19.2 MHz (CNTFRQ_EL0 = 0x124F800)
-- Stack: set our own at 0x85000000
+- Stack: set our own, 64 KB past the image end. The original fixed 0x85000000
+  is inside `cdsp_secure_heap` (0x80C00000–0x85200000); see arch/arm/BUILDING-ROG5.md
 - x0 = DTB address (~0xAF4FE000)
 - Caches ON, interrupts disabled
 
