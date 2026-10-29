@@ -137,5 +137,6 @@ int platform_kload(void)
     }
     mdelay(200);        /* let the host app read it before the port disappears */
     acm_stop();
+    smp_stop_aps();     /* they run from memory the new kernel will reuse */
     mmu_off_and_jump((uint64_t)(uintptr_t)buf);
 }

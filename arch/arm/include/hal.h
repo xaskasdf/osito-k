@@ -63,6 +63,15 @@ void fb_putdec(uint64_t val);
  * ======================================================================== */
 uint64_t platform_ram_base(void);
 uint64_t platform_ram_size(void);
+const char *cpu_core_name(uint64_t midr);  /* "Cortex-A55"..., NULL if unknown */
+
+/* ========================================================================
+ * SMP (kernel/smp.c)
+ * ======================================================================== */
+void smp_boot_aps(int num_cpus, int psci_use_smc);
+void smp_stop_aps(void);        /* before handing the machine to another kernel */
+int  smp_get_cpu_count(void);
+void smp_print_cpus(void);
 
 /* ========================================================================
  * Memory manager (kernel/memory.c)

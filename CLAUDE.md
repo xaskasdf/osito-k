@@ -75,7 +75,7 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - `--virt-check` also boots the virt build in local QEMU.
 - There is no UART output. Feedback comes from the USB console (`dmesg` replays the boot log) and from the screen: progress bars, a blinking heartbeat, an orange/purple panic band with ESR/ELR/`_start` as bit cells, and a text console (pixel rows 700 and below) that mirrors everything `serial_*` prints. The panic band is the only clue when the kernel dies before USB is up; the guide explains how to decode it.
 - MMU and caches are on (`platform/sm8350/mmu.c`, flat map). Anything a device DMAs to must come from `dma_alloc()` (uncached window), not the page allocator.
-- Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
+- Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. All 8 cores start through PSCI (SMC) and park in `wfe`; the scheduler still runs only on cpu0 (`kernel/smp.c`). The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
 - The kernel is a PIE linked at 0 that relocates itself in `start.S`, so it runs at any load address and stored pointers work. Linker-script symbols that C reads must be section-relative (an absolute symbol's GOT entry gets no relocation). After linking, `readelf -r kernel.elf` should show only `R_AARCH64_RELATIVE`.
 
 ### Tests

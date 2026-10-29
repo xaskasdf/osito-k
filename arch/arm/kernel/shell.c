@@ -11,7 +11,6 @@ extern bool hda_is_ready(void);
 extern int proc_run(const char *filename);
 extern void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
 extern void net_poll(void);
-extern int  smp_get_cpu_count(void);
 
 #define MAX_ARGS 16
 
@@ -40,7 +39,7 @@ static void cmd_help(void)
     serial_puts("  cat      Show file contents\n");
     serial_puts("  exec     Run ELF binary\n");
     serial_puts("  ping     Ping IP address\n");
-    serial_puts("  cpus     Show CPU count\n");
+    serial_puts("  cpus     List the online CPUs\n");
     serial_puts("  echo     Print text\n");
     serial_puts("  hexdump  Hex dump file\n");
     serial_puts("  df       Filesystem free space\n");
@@ -316,9 +315,7 @@ void shell_run(void)
             }
         }
         else if (strcmp(argv[0], "cpus") == 0) {
-            serial_puts("CPUs online: ");
-            serial_putdec(smp_get_cpu_count());
-            serial_puts("\n");
+            smp_print_cpus();
         }
         else if (strcmp(argv[0], "svctest") == 0) {
             /* Inline SVC test — no ELF loading */

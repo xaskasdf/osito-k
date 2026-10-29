@@ -232,9 +232,17 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     console"). The scale-2 glyph path writes two pixels per 64-bit store with no
     per-pixel divide. That cut a scroll from 8 to ~4.5 ms, and jump scrolling does
     the rest.
+11. **All eight cores start (2026-10-29).** `smp_boot_aps` uses PSCI `CPU_ON` over
+    SMC with the MT-style MPIDRs (see "PSCI"). Each AP turns on its MMU with the
+    BSP's tables and parks; `cpus` lists them. Before handing over to another
+    kernel, `kload` turns them off again with `CPU_OFF`. That was verified by
+    chain-loading: the next kernel's `CPU_ON` succeeds for all seven, and it would
+    return ALREADY_ON if they were still running.
 
 Still open:
-- **Secondary CPUs aren't started.** `smp_boot_aps` assumes virt's MPIDR numbering.
+- **Nothing runs on the secondary cores yet.** They park in `wfe` with interrupts
+  masked. Scheduling on them needs their GIC redistributors and timers set up,
+  and locking in the scheduler and the console.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
 
@@ -576,6 +584,22 @@ smc    #0
 ```
 
 Must use `ldr x0, =imm` (not `mov`) — the immediate is too large for MOV encoding.
+
+The conduit is SMC (QEMU virt uses HVC). `kernel/smp.c` also uses `CPU_ON`
+(`0xC4000003`), `CPU_OFF` (`0x84000002`) and `AFFINITY_INFO` (`0xC4000004`). MPIDR
+has MT set, so Aff0 is the thread (always 0) and the core number is Aff1:
+
+| Core | MPIDR        | Type                |
+|------|--------------|---------------------|
+| 0–3  | `0x81000000`–`0x81000300` | Cortex-A55 r2p0 (cpu0 is the boot CPU) |
+| 4–6  | `0x81000400`–`0x81000600` | Cortex-A78 r1p0 |
+| 7    | `0x81000700` | Cortex-X1 r1p0      |
+
+`CPU_ON` takes the target MPIDR, a physical entry address and a context ID that
+arrives in `x0`. The core enters at EL1 with the MMU and caches off, so whatever
+it reads before turning its MMU on has to be cleaned to PoC first. `smp.c` passes
+a 64-byte block holding the BSP's MAIR/TCR/TTBR/CPACR/SCTLR and a stack, and the
+entry is assembly because gcc ignores `naked` on aarch64.
 
 ---
 

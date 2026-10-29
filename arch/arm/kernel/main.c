@@ -46,6 +46,23 @@ static void print_banner(void)
  * CPU info
  * ======================================================================== */
 
+/* Core name from MIDR_EL1, or NULL if unknown */
+const char *cpu_core_name(uint64_t midr)
+{
+    if (((midr >> 24) & 0xFF) != 0x41)     /* ARM Ltd */
+        return NULL;
+    switch ((midr >> 4) & 0xFFF) {
+    case 0xD05: return "Cortex-A55";
+    case 0xD0B: return "Cortex-A76";
+    case 0xD41: return "Cortex-A78";
+    case 0xD44: return "Cortex-X1";
+    case 0xD08: return "Cortex-A72";
+    case 0xD07: return "Cortex-A57";
+    case 0xD03: return "Cortex-A53";
+    }
+    return NULL;
+}
+
 static void print_cpu_info(void)
 {
     uint64_t midr = read_midr_el1();
@@ -74,21 +91,13 @@ static void print_cpu_info(void)
 
     /* Identify core */
     serial_puts("[CPU ] Core: ");
-    if (implementer == 0x41) {  /* ARM Ltd */
-        switch (part) {
-        case 0xD05: serial_puts("Cortex-A55"); break;
-        case 0xD0B: serial_puts("Cortex-A76"); break;
-        case 0xD41: serial_puts("Cortex-A78"); break;
-        case 0xD44: serial_puts("Cortex-X1");  break;
-        case 0xD08: serial_puts("Cortex-A72"); break;
-        case 0xD07: serial_puts("Cortex-A57"); break;
-        case 0xD03: serial_puts("Cortex-A53"); break;
-        default:
-            serial_puts("ARM unknown (");
-            serial_puthex(part, 3);
-            serial_puts(")");
-            break;
-        }
+    const char *name = cpu_core_name(midr);
+    if (name) {
+        serial_puts(name);
+    } else if (implementer == 0x41) {  /* ARM Ltd */
+        serial_puts("ARM unknown (");
+        serial_puthex(part, 3);
+        serial_puts(")");
     } else {
         serial_puts("Unknown implementer ");
         serial_puthex(implementer, 2);
@@ -302,8 +311,7 @@ void kernel_main(void *dtb)
     /* Enable IRQs early — needed for QEMU TCG DMA completion processing */
     irq_enable();
 
-    /* Steps 8-10 probe QEMU virt devices (virtio-mmio) and CPU numbering
-     * (MPIDR Aff0 = cpu_id), neither of which exists on SM8350. */
+    /* Steps 8-9 probe QEMU virt devices (virtio-mmio), absent on SM8350 */
     if (on_qemu_virt()) {
         /* Step 8: VirtIO-blk (MMIO transport) + OsitoFS */
         if (virtio_blk_init(0, 0, 0, (uint64_t[]){0,0,0,0,0,0}) == 0)
@@ -316,12 +324,16 @@ void kernel_main(void *dtb)
             uint8_t ip[] = {10, 0, 2, 15};  /* QEMU SLIRP default */
             net_init(ip);
         }
-
-        /* Step 10: SMP — boot secondary CPUs */
-        extern void smp_boot_aps(int num_cpus);
-        smp_boot_aps(4);  /* QEMU virt default: try 4 cores */
     }
     platform_probe_devices();
+
+    /* Step 10: SMP. The APs come up and park; nothing runs on them yet.
+     * PSCI is HVC on QEMU virt (try 4 cores, the -smp default here), SMC
+     * on SM8350 (8 cores). */
+    if (on_qemu_virt())
+        smp_boot_aps(4, 0);
+    else
+        smp_boot_aps(8, 1);
 
     /* Bar 8: GREY = devices done */
     for (int r = 300; r < 330; r++) fb_debug_bar(r, 0x00808080);
