@@ -119,7 +119,8 @@ static int on_qemu_virt(void)
 /* Panic telemetry on the SM8350 splash FB, for when no UART is attached:
  * a colored band at rows 500-529, then three rows of 32 cells (MSB first,
  * white = 1, grey = 0): ESR, ELR[31:0] and the runtime address of _start.
- * Symbol of the fault = 0x80080000 + (ELR - _start). */
+ * The kernel is linked at 0, so ELR - _start is the faulting symbol's
+ * address in kernel.elf. */
 extern char _start[];
 
 static void fb_panic(uint32_t color, uint32_t esr, uint32_t elr)

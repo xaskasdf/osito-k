@@ -1,17 +1,16 @@
 /*
  * linker_virt.ld -- Osito-K AArch64 linker script for QEMU virt
  *
- * Base at 0x40080000 (64 KB into RAM at 0x40000000).
- * QEMU -kernel loads the binary at the start of RAM, but the ARM64
- * image header text_offset field can adjust. We use a small offset
- * to keep page 0 clear.
+ * Linked at 0 like SM8350: the kernel is a PIE that relocates itself in
+ * start.S. QEMU -kernel loads the Image at RAM base + 0x80000 (0x40080000;
+ * the header's image_size is 0), which keeps page 0 of RAM clear.
  */
 
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x40080000;
+    . = 0;
 
     __text_start = .;
     .text.boot : {
@@ -35,6 +34,16 @@ SECTIONS
         *(.data .data.*)
     }
 
+    .got : {
+        *(.got .got.plt)
+    }
+
+    .rela.dyn : ALIGN(8) {
+        __rela_start = .;
+        *(.rela .rela.*)
+        __rela_end = .;
+    }
+
     . = ALIGN(4096);
     __bss_start = .;
     .bss : {
@@ -46,12 +55,18 @@ SECTIONS
 
     _image_end = .;
 
-    /* Stack: 64 KB above image end (grows down) */
-    _stack_top = _image_end + 0x10000;
+    /* Stack: 64 KB above image end (grows down). In a section so that
+     * _stack_top is section-relative and gets relocated (see sm8350). */
+    .stack (NOLOAD) : {
+        . = . + 0x10000;
+        _stack_top = .;
+    }
 
     /DISCARD/ : {
         *(.comment)
         *(.note*)
         *(.eh_frame*)
+        *(.interp .dynamic)
+        *(.dynsym .dynstr .hash .gnu.hash)
     }
 }

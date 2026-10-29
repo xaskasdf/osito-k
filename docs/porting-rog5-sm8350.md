@@ -297,23 +297,14 @@ any theoretical assumptions above.
 ABL loads the kernel binary at **~0xA0080000**, NOT 0x80080000 as the boot.img
 header and linker script suggest. DTB was observed at ~0xAF4FE000.
 
-**Consequence**: Any stored pointer in `.data` or `.rodata` that contains a
-link-time address will be wrong at runtime. GCC aarch64 at -O2 uses ADRP
-(PC-relative) for direct symbol references, which works at any address. But
-stored pointers break:
+**Consequence**: with a fixed link address, any pointer stored in `.data` or
+`.rodata` is wrong at runtime. That includes the tables GCC builds for some
+`switch` statements.
 
-```c
-// BROKEN — pointer in .data stores link-time 0x8008xxxx address:
-static const char *msg = "hello";
-static const char *labels[] = { "one", "two" };
-
-// SAFE — array contents accessed via PC-relative ADRP:
-static const char msg[] = "hello";
-static const char labels[][8] = { "one", "two" };
-```
-
-**Fix**: Use `char arr[] = "str"` instead of `char *ptr = "str"` everywhere.
-Use 2D arrays `char labels[][N]` instead of pointer arrays `char *labels[]`.
+**Fix (2026-10-29)**: the kernel is a PIE linked at 0 that applies its own
+`R_AARCH64_RELATIVE` relocations in `start.S`. It runs at any load address,
+stored pointers included. See arch/arm/BUILDING-ROG5.md, "Load address and
+self-relocation".
 
 ### 9.2 UART TX Hangs
 `uart_putc()` with an infinite polling loop HANGS the system. ABL may not leave

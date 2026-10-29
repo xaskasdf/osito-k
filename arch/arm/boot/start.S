@@ -5,12 +5,13 @@
  *   x0 = DTB physical address (or 0)
  *   EL1, interrupts disabled
  *
- * SM8350 (ABL): caches ON, MMU may be ON (identity mapped),
- *   UART at 0x98C000 already configured. Actual load ~0xA0080000.
- * QEMU virt: -kernel loads Image at RAM base (0x40000000).
+ * SM8350: the sm8350-boot shim enters with the MMU and D-cache off and the
+ *   GENI UART configured by ABL; load address ~0xA0200000, or wherever
+ *   `kload` put us. QEMU virt: -kernel loads the Image at 0x40080000.
  *
- * All code must be position-independent (ADRP/ADR, no stored pointers).
- * Stack address provided by linker script symbol _stack_top.
+ * The kernel is a PIE linked at 0: before any C code runs, _entry adds the
+ * load address to every R_AARCH64_RELATIVE entry in .rela.dyn (the stored
+ * pointers). Stack address provided by linker script symbol _stack_top.
  */
 
 .section .text.boot
@@ -74,6 +75,26 @@ _entry:
     adrp    x0, _stack_top
     add     x0, x0, :lo12:_stack_top
     mov     sp, x0
+
+    /* Self-relocate. Linked at 0, so the load address is the offset to add:
+     * *(base + r_offset) = base + r_addend for each R_AARCH64_RELATIVE.
+     * The linker (-z text, -pie) emits no other dynamic relocation type;
+     * anything else is skipped. The D-cache is off, so no maintenance. */
+    adr     x9, _start
+    adrp    x10, __rela_start
+    add     x10, x10, :lo12:__rela_start
+    adrp    x11, __rela_end
+    add     x11, x11, :lo12:__rela_end
+7:  cmp     x10, x11
+    b.hs    8f
+    ldp     x12, x13, [x10], #16    // r_offset, r_info
+    ldr     x14, [x10], #8          // r_addend
+    cmp     w13, #1027              // R_AARCH64_RELATIVE
+    b.ne    7b
+    add     x14, x14, x9
+    str     x14, [x9, x12]
+    b       7b
+8:
 
     /* === MARKER 3: cyan line = stack OK === */
     ldr     x10, =0xE50021C0          /* row 2: 0xE5000000 + 8640 */

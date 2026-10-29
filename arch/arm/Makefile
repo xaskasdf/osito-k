@@ -30,8 +30,10 @@ else
   $(error Unknown PLATFORM=$(PLATFORM). Use virt or sm8350.)
 endif
 
-# Compiler flags
-CFLAGS := -ffreestanding -nostdlib -nostartfiles \
+# Compiler flags. The kernel is a PIE linked at 0 that relocates itself in
+# start.S (R_AARCH64_RELATIVE only): ABL loads it ~0x20180000 above where
+# a fixed link address would put it, and kload runs it wherever it lands.
+CFLAGS := -ffreestanding -nostdlib -nostartfiles -fpie \
           -march=armv8.2-a -mtune=cortex-a78 -O2 \
           -mgeneral-regs-only \
           -Wall -Wextra -Wno-unused-parameter \
@@ -40,7 +42,7 @@ CFLAGS := -ffreestanding -nostdlib -nostartfiles \
 ASFLAGS := -ffreestanding -nostdlib -nostartfiles \
            -march=armv8.2-a -D__ASSEMBLY__
 
-LDFLAGS := -nostdlib -T $(LDSCRIPT)
+LDFLAGS := -nostdlib -pie --no-dynamic-linker -z text -T $(LDSCRIPT)
 
 # Sources
 ASM_SRCS := boot/start.S kernel/context_switch.S kernel/mem.S

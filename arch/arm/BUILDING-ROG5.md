@@ -33,7 +33,7 @@ Where things live:
 
 | What | Where |
 |------|-------|
-| Toolchain | Mac `cortessamuel@192.168.1.20`: Homebrew `aarch64-elf-gcc` 15.2 in `/opt/homebrew/bin` |
+| Toolchain | Mac `cortessamuel@192.168.1.4`: Homebrew `aarch64-elf-gcc` 15.2 in `/opt/homebrew/bin` |
 | Shim, DTBs, `mkbootimg.py`, UEFI payload, stock backups | Mac, `~/phone_breaker2` (read-only for the script) |
 | Build + pack scratch | Mac, `~/osito-arm-build` |
 | fastboot | Windows, `C:\platform-tools\fastboot.exe` (phone on this machine's USB) |
@@ -92,8 +92,8 @@ little-endian each), then the raw Image. It stores the Image in freshly allocate
 pages, checks the CRC and the ARM64 header magic, waits for its reply to reach
 the host, disconnects USB, stops the timer, invalidates the I-cache and jumps
 with the shim's entry state. The Image runs wherever it landed. That works because
-the kernel is PC-relative and `mem_init` reserves everything from the RAM base up
-to the running kernel's end; the old kernel's memory is simply abandoned. Each
+the kernel relocates itself, and `mem_init` reserves everything from the RAM base
+up to the running kernel's end. The old kernel's memory is simply abandoned. Each
 generation lands a little higher (e.g. `0xA86A9000`). 500 KB transfer in ~2.5 s.
 
 ---
@@ -140,11 +140,12 @@ white = 1, grey = 0:
 2. `ELR_EL1[31:0]`
 3. runtime address of `_start` (so far always `0xA0200000`)
 
-The faulting symbol is at link address `0x80080000 + (ELR - _start)`; look it up
-with `aarch64-elf-addr2line -f -e kernel.elf <addr>` on the Mac
-(`~/osito-arm-build/src/arch/arm/build/kernel.elf`). Example from 2026-10-28:
-ESR `0x96000010` (data abort, synchronous external abort) at ELR `0xA020603C` was
-offset `0x603C` = a config-space read in `pci_scan`.
+The kernel is linked at 0, so `ELR - _start` is the faulting address in
+`kernel.elf`. Look it up with `aarch64-elf-addr2line -f -e kernel.elf <addr>` on the
+Mac (`~/osito-arm-build/src/arch/arm/build/kernel.elf`). Example from 2026-10-28,
+when the link base was still `0x80080000`: ESR `0x96000010` (data abort, synchronous
+external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
+`pci_scan`.
 
 ### Bring-up log (2026-10-28)
 
@@ -173,16 +174,15 @@ offset `0x603C` = a config-space read in `pci_scan`.
    every test build. The edit-build-boot loop went from fastboot plus buttons
    (~1 min) to ~15 s, hands-off.
 
+8. **Self-relocating kernel (2026-10-29).** Stored pointers were wrong at the real
+   load address. Before this, `drivers/gpu.o` (86), `gui/gui_desktop.o` (19),
+   `fs/gguf.o` (14), `kernel/claude.o` (7), `kernel/shell.o` (4: the task-state
+   names in `ps`) and `drivers/gsp.o` (4) all had them. The kernel is now a PIE
+   linked at 0 that relocates itself (see "Load address and self-relocation").
+   Verified with `ps` on the device and with two chained `kload`s at different
+   addresses.
+
 Still open:
-- **Stored pointers.** The kernel runs ~0x20180000 above its link address, so any
-  pointer stored in `.data`/`.rodata` is wrong. GCC also creates such pointers
-  itself: a `switch` that picks a string becomes a pointer table
-  (`R_AARCH64_ABS64`). On 2026-10-28 these objects had them: `drivers/gpu.o` (86),
-  `gui/gui_desktop.o` (19), `fs/gguf.o` (14), `kernel/claude.o` (7),
-  `kernel/shell.o` (4: the task-state names in `ps`, so `ps` should fault),
-  `drivers/gsp.o` (4). Check new code with `aarch64-elf-objdump -r <obj> | grep ABS64`.
-  The real fix is a self-relocating kernel (`-fpie` plus applying
-  `R_AARCH64_RELATIVE` in `start.S`).
 - **Caches are off.** The shim enters with the MMU and D-cache disabled, so every
   load and store goes to DRAM uncached. That is why the console had to stop
   scrolling. Turning on the MMU with cacheable RAM would speed everything up.
@@ -406,28 +406,25 @@ When the shim (or ABL) jumps to Osito-K:
 | D-Cache       | ON                     | |
 | I-Cache       | ON                     | |
 
-### Load Address Mismatch (CRITICAL)
+### Load address and self-relocation
 
-The linker script (`linker_sm8350.ld`) uses base `0x80080000`, but ABL actually
-loads the kernel at **~0xA0080000**. This is a 512MB offset.
+The kernel doesn't know its load address in advance. Through the shim it lands at
+`0xA0200000`; with `kload` it lands wherever free pages were. It used to be linked
+at a fixed `0x80080000`, so every pointer stored in `.data`/`.rodata` pointed into
+reserved memory. That included GCC's own `switch` tables (`ps` faulted).
 
-**Consequence**: stored pointers in `.data`/`.rodata` contain the wrong address.
-
-```c
-// BROKEN — pointer stores link-time address 0x8008xxxx:
-static const char *msg = "hello";
-static const char *labels[] = { "one", "two" };
-
-// SAFE — array contents accessed via PC-relative ADRP:
-static const char msg[] = "hello";
-static const char labels[][8] = { "one", "two" };
-```
-
-GCC at -O2 generates ADRP (PC-relative) for direct symbol references, which works
-at any load address. But stored pointers in `.data` contain link-time addresses.
-**Use char arrays, not char pointers. Use 2D arrays, not pointer arrays.**
-
-This rule is mandatory until we set up MMU with proper relocation.
+Since 2026-10-29 the kernel is a **PIE linked at 0** (`-fpie`, `-pie
+--no-dynamic-linker -z text`):
+- The linker emits only `R_AARCH64_RELATIVE` entries in `.rela.dyn` (37 of them
+  at the time).
+- Before any C code, `start.S` adds the load address to each of them. Stored
+  pointers, function-pointer tables and string tables work normally.
+- Linker-script symbols that C reads through the GOT must be section-relative.
+  An absolute symbol gets no relocation. That's why `_stack_top` is defined
+  inside a `.stack` section.
+- Check after linking: `aarch64-elf-readelf -rW kernel.elf` should list only
+  `R_AARCH64_RELATIVE`, and `aarch64-elf-nm kernel.elf | grep " A "` should be
+  empty.
 
 ### Memory Map
 
@@ -581,8 +578,10 @@ VBAR_EL1     = shim's vectors (must set our own)
 
 ## Key Constraints & Gotchas
 
-1. **Position-independent code**: Use `char arr[]` not `char *ptr`. Use `char labels[][N]`
-   not `char *labels[]`. See "Load Address Mismatch" above.
+1. **Relocation**: the kernel relocates itself, so pointers are fine. Linker-script
+   symbols that C reads must be section-relative, not absolute. After linking,
+   `readelf -r` must show only `R_AARCH64_RELATIVE`. See "Load address and
+   self-relocation" above.
 
 2. **D-Cache OFF for framebuffer**: Without MMU, cached writes to `0xE5000000` won't
    reach the display. Either disable D-Cache before FB writes or use DC CVAC to flush.
@@ -649,7 +648,7 @@ If nothing happens (stays on ROG boot logo):
 |------|-------------|
 | `arch/arm/Makefile` | Build system (`make PLATFORM=sm8350`) |
 | `arch/arm/boot/start.S` | Entry point + exception vectors |
-| `arch/arm/boot/linker_sm8350.ld` | Linker script (base 0x80080000, stack 64 KB past image end) |
+| `arch/arm/boot/linker_sm8350.ld` | Linker script (PIE linked at 0, `.rela.dyn`, 64 KB `.stack` past the image) |
 | `arch/arm/scripts/rog5-boot.sh` | Build on the Mac, pack, fetch, optionally flash |
 | `arch/arm/kernel/mem.S` | Out-of-line memset/memcpy/memmove (GCC and gui/ need the symbols) |
 | `arch/arm/platform/sm8350/usb.c` | USB state report, SMMU 1:1 check, gadget start |

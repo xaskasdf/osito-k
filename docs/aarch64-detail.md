@@ -18,7 +18,7 @@ arch/arm/drivers/spmi.c        SPMI PMIC buttons (WIP, data abort on observer pr
 ```
 
 **Critical rules for AArch64 SM8350**:
-- ABL loads at ~0xA0080000, NOT 0x80080000. Never use stored pointers (`char *p = "str"`), always use arrays (`char p[] = "str"`)
+- The load address isn't fixed (~0xA0200000 through the shim, anywhere with `kload`). The kernel is a PIE linked at 0 that relocates itself in `start.S`, so stored pointers work
 - UART TX MUST have timeout (~100k iterations) or system hangs
 - FB output BEFORE UART output in dual-output wrappers
 - PSCI reboot: `ldr x0, =0x84000009` then `smc #0` (not mov — immediate too large)

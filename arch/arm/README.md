@@ -28,27 +28,10 @@ arch/arm/
 ABL loads kernel at **~0xA0080000**, NOT 0x80080000 as boot.img header suggests.
 DTB observed at ~0xAF4FE000.
 
-**This means**: any stored pointer in `.data`/`.rodata` that contains a link-time
-address (0x8008xxxx) will be WRONG at runtime (actual address is 0xA008xxxx).
-
-**Fix**: GCC aarch64 -O2 uses ADRP (PC-relative) for direct symbol references.
-This is safe at any load address. BUT stored pointers break:
-
-```c
-// BROKEN — pointer stores link-time address in .data:
-static const char *msg = "hello";
-
-// SAFE — array contents accessed via PC-relative ADRP:
-static const char msg[] = "hello";
-
-// BROKEN — array of pointers stores link-time addresses:
-static const char *labels[] = { "one", "two" };
-
-// SAFE — 2D array, no stored pointers:
-static const char labels[][8] = { "one", "two" };
-```
-
-Until we set up MMU with proper relocation, this rule is **mandatory**.
+With a fixed link address, every stored pointer in `.data`/`.rodata` was wrong at
+runtime. Since 2026-10-29 the kernel is a PIE linked at 0 that applies its own
+`R_AARCH64_RELATIVE` relocations in `start.S`, so stored pointers are fine (see
+BUILDING-ROG5.md, "Load address and self-relocation").
 
 ### 2. UART TX Hangs
 ABL may not leave UART TX fully functional. uart_putc() with infinite polling

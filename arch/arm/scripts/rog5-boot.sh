@@ -23,7 +23,7 @@
 # changes included.
 #
 # Environment:
-#   OK_MAC       Mac with the toolchain + phone_breaker2 (default cortessamuel@192.168.1.20)
+#   OK_MAC       Mac with the toolchain + phone_breaker2 (default cortessamuel@192.168.1.4)
 #   OK_MAC_JUMP  SSH jump host (default xasko@kerberus; set it empty to connect directly).
 #                Port 22 on the Mac times out from the Windows dev box, not from kerberus.
 #   OK_MAC_DIR   build dir on the Mac, under ~ (default osito-arm-build)
@@ -38,7 +38,7 @@ REPO="$(cd "$ARCH_DIR/../.." && pwd)"
 OUT_DIR="$ARCH_DIR/build/rog5"
 OUT_REL="arch/arm/build/rog5/osito-boot-rog5.img"
 
-MAC="${OK_MAC:-cortessamuel@192.168.1.20}"
+MAC="${OK_MAC:-cortessamuel@192.168.1.4}"
 JUMP="${OK_MAC_JUMP-xasko@kerberus}"
 MAC_DIR="${OK_MAC_DIR:-osito-arm-build}"
 PB="${OK_PB:-phone_breaker2}"

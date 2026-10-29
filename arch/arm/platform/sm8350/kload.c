@@ -8,10 +8,10 @@
  * Image size and its CRC-32 (u32 little-endian each), then the Image. Bytes
  * before the magic are skipped (e.g. a stray '\n' after the command line).
  *
- * The Image runs where it lands, in freshly allocated pages: the kernel is
- * PC-relative and derives its stack, BSS and page-allocator reservation from
- * its own load address (mem_init reserves from the RAM base up to the end
- * of the running kernel). The old kernel's memory is simply abandoned. The
+ * The Image runs where it lands, in freshly allocated pages: the kernel
+ * relocates itself and derives its stack, BSS and page-allocator reservation
+ * from its own load address (mem_init reserves from the RAM base up to the
+ * end of the running kernel). The old kernel's memory is simply abandoned. The
  * entry state matches the shim's: EL1, MMU and D-cache off, DAIF masked,
  * x0 = 0 (Osito-K ignores the DTB).
  */

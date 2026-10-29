@@ -10,10 +10,6 @@
  *
  * Programming model: Linux drivers/usb/dwc3 (core.h, gadget.c, ep0.c).
  * The D-cache is off on SM8350, so DMA buffers need no cache maintenance.
- *
- * No pointer tables anywhere (descriptors are byte arrays, strings are
- * passed directly): stored pointers hold link-time addresses, which are
- * wrong at the real load address.
  */
 
 #include "../../include/hal.h"

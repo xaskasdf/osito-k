@@ -78,9 +78,6 @@ static uint64_t read64(uint64_t pa)
     return mmio_read32(pa) | ((uint64_t)mmio_read32(pa + 4) << 32);
 }
 
-/* No string tables or ?: chains choosing between literals: GCC can turn
- * those into pointer tables in .rodata, which hold link-time addresses and
- * break at the real load address (see BUILDING-ROG5.md). */
 static void put_bit(const char *name, int on)
 {
     serial_puts(" ");
