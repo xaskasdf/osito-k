@@ -4,6 +4,7 @@
 #include "../../include/hal.h"
 #include "../../include/types.h"
 #include "sm8350.h"
+#include "usb.h"
 
 #define SM8350_RAM_BASE  0xA8000000UL
 #define SM8350_RAM_SIZE  0x18000000UL   /* 384 MB usable range */
@@ -23,6 +24,10 @@ void platform_init(void *dtb) {
     fb_init_platform(SPLASH_FB_BASE, DISPLAY_WIDTH, DISPLAY_HEIGHT,
                      DISPLAY_WIDTH, 32);
     fb_set_text_top(CONSOLE_TOP);
+}
+
+void platform_probe_devices(void) {
+    usb_probe();
 }
 
 void platform_reboot(void) {

@@ -327,6 +327,7 @@ void kernel_main(void *dtb)
         extern void smp_boot_aps(int num_cpus);
         smp_boot_aps(4);  /* QEMU virt default: try 4 cores */
     }
+    platform_probe_devices();
 
     /* Bar 8: GREY = devices done */
     for (int r = 300; r < 330; r++) fb_debug_bar(r, 0x00808080);

@@ -176,41 +176,40 @@ static void fb_draw_char(uint32_t col, uint32_t row, char c,
     }
 }
 
-static void fb_scroll(void)
+static void fb_clear_row(uint32_t row)
 {
-    if (!fb_base) return;
-    uint32_t line_px = FONT_H * scale * fb_pitch;   /* one text row */
-    volatile uint32_t *dst = fb_base + text_y0 * fb_pitch;
-    volatile uint32_t *src = dst + line_px;
-    uint32_t copy = (max_rows - 1) * line_px;
-    for (uint32_t i = 0; i < copy; i++)
-        dst[i] = src[i];
-    volatile uint32_t *bot = dst + copy;
+    uint32_t line_px = FONT_H * scale * fb_pitch;
+    volatile uint32_t *p = fb_base + (text_y0 + row * FONT_H * scale) * fb_pitch;
     for (uint32_t i = 0; i < line_px; i++)
-        bot[i] = BG_COLOR;
+        p[i] = BG_COLOR;
+}
+
+/* No scrolling: copying the text area goes through uncached memory (the
+ * D-cache is off on SM8350) and took ~1 s per line, stalling the shell. Wrap
+ * to the top instead and blank the row after the current one, so the newest
+ * line is always followed by an empty row. */
+static void fb_newline(void)
+{
+    text_col = 0;
+    if (++text_row >= max_rows)
+        text_row = 0;
+    fb_clear_row(text_row);
+    fb_clear_row((text_row + 1) % max_rows);
 }
 
 void fb_putc(char c)
 {
     if (!fb_base) return;
     if (c == '\n') {
-        text_col = 0;
-        text_row++;
+        fb_newline();
     } else if (c == '\r') {
         text_col = 0;
     } else if (c == '\b') {
         if (text_col > 0) text_col--;
     } else {
         fb_draw_char(text_col, text_row, c, FG_COLOR, BG_COLOR);
-        text_col++;
-        if (text_col >= max_cols) {
-            text_col = 0;
-            text_row++;
-        }
-    }
-    if (text_row >= max_rows) {
-        fb_scroll();
-        text_row = max_rows - 1;
+        if (++text_col >= max_cols)
+            fb_newline();
     }
 }
 
@@ -227,19 +226,11 @@ void fb_puts_color(const char *s, uint32_t color)
     }
     while (*s) {
         if (*s == '\n') {
-            text_col = 0;
-            text_row++;
+            fb_newline();
         } else {
             fb_draw_char(text_col, text_row, *s, color, BG_COLOR);
-            text_col++;
-            if (text_col >= max_cols) {
-                text_col = 0;
-                text_row++;
-            }
-        }
-        if (text_row >= max_rows) {
-            fb_scroll();
-            text_row = max_rows - 1;
+            if (++text_col >= max_cols)
+                fb_newline();
         }
         s++;
     }

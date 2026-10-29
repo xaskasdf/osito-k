@@ -7,9 +7,15 @@
  *
  * CRITICAL: TX FIFO polling can hang if ABL didn't leave TX functional.
  * Always use timeout in uart_putc. See sm8350-boot session notes.
+ *
+ * There is no serial cable, so the console also runs over the USB CDC-ACM
+ * gadget (dwc3_acm.c): every byte is queued for the host, and reads poll the
+ * gadget before the GENI RX FIFO. The shell's read loop is what services USB.
  */
 
+#include "../../include/hal.h"
 #include "sm8350.h"
+#include "usb.h"
 
 #define UART_BASE   GENI_UART_BASE
 #define UART_REG(off)   (UART_BASE + (off))
@@ -28,6 +34,7 @@ void uart_init(void) {
 }
 
 void uart_putc(char c) {
+    acm_putc(c);
     if (tx_stuck)
         return;
     for (int i = 0; i < TX_TIMEOUT; i++) {
@@ -53,12 +60,17 @@ int uart_rx_ready(void) {
 }
 
 char uart_getc(void) {
-    while (!uart_rx_ready())
+    int c;
+    while ((c = uart_trygetc()) < 0)
         ;
-    return (char)(mmio_read32(UART_REG(SE_GENI_RX_FIFOn)) & 0xFF);
+    return (char)c;
 }
 
 int uart_trygetc(void) {
+    acm_poll();
+    int c = acm_getc();
+    if (c >= 0)
+        return c;
     if (!uart_rx_ready())
         return -1;
     return (int)(mmio_read32(UART_REG(SE_GENI_RX_FIFOn)) & 0xFF);

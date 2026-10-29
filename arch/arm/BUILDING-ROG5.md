@@ -2,8 +2,9 @@
 
 Target: ASUS ROG Phone 5 (I005DA), Qualcomm SM8350 (Snapdragon 888)
 Last verified: 2026-10-28 on physical device. Boots through the shim to the
-`shell>` prompt on the framebuffer console, with the heartbeat blinking (see below).
-There is no input yet.
+`shell>` prompt, shown on the framebuffer console with the heartbeat blinking. The
+shell is interactive over USB: the side USB-C port enumerates on the PC as a USB
+serial port (see "Console over USB").
 
 ---
 
@@ -45,18 +46,54 @@ The sm8350-boot shim menu appears on-screen and auto-boots the payload at 1.5 MB
 
 ---
 
+## Console over USB
+
+With the cable in the **side** USB-C port (the bottom one is damaged on our unit),
+Osito-K presents itself as a CDC-ACM serial device: `VID_1209&PID_0001` (pid.codes
+test IDs), serial `0001`. Windows 10+ binds its inbox `usbser.sys` and creates a COM
+port (COM3 on the dev box); find it with
+`Get-CimInstance Win32_SerialPort | ? PNPDeviceID -match VID_1209`. Open it with
+PuTTY or any terminal; the baud rate doesn't matter. Everything the kernel prints
+goes there as well as to the screen, and keystrokes feed the shell.
+
+How it works (`platform/sm8350/usb.c`, `dwc3_acm.c`):
+- **State left by ABL.** ABL leaves `usb_1` (DWC_usb31, `0x0A600000`) powered,
+  clocked and in device mode after fastboot, with the USB2 PHY up. `usb_2` is off.
+  So there is no PHY init, only a device-controller soft reset.
+- **PIPE clock.** ABL ran fastboot at SuperSpeed and shut the USB3 PHY down on exit,
+  taking the PIPE clock with it. Without it every endpoint command after
+  `DEPSTARTCFG` hangs (CMDACT never clears). The fix is Linux's
+  `qcom,select-utmi-as-pipe-clk` sequence in `QSCRATCH_GENERAL_CFG`, which clocks
+  that logic from UTMI. The gadget is high-speed only.
+- **VBUS.** There is no PMIC/extcon hookup, so `QSCRATCH_HS_PHY_CTRL` overrides
+  VBUS-valid; without it the controller never sees the host.
+- **DMA and the SMMU.** The controller DMAs as apps-SMMU stream `0x0`. ABL maps it
+  to context bank 5 with stage-1 translation off (`SCTLR.M = 0`), so physical
+  addresses work as-is. `usb.c` checks this on every boot (and can walk the stage-1
+  tables if a future ABL turns translation on) and won't start the gadget otherwise.
+  The D-cache is off, so no cache maintenance is needed either.
+- **Polled, no IRQs.** `uart_trygetc` calls `acm_poll()`, so USB is serviced while
+  the shell waits for input. Output is queued in an 8 KB ring and drains once the
+  shell is back at the prompt; a long-running command's output arrives at the end.
+  Bytes sent before the host opens the port are discarded by Windows.
+
+---
+
 ## Reading the screen (no UART)
 
-The GENI UART TX FIFO does not drain once Osito-K runs, and there is no serial cable,
-so the framebuffer is the only output. `uart_putc` gives up on the first TX timeout
+The GENI UART TX FIFO does not drain once Osito-K runs, and there is no serial cable.
+Until the USB console is up (and whenever the kernel dies before or inside it), the
+framebuffer is the only output. `uart_putc` gives up on the first TX timeout
 and drops all later output (before that, ~100k MMIO polls per character made the
 banner take minutes).
 
 **Text console.** `platform_init` points `kernel/framebuffer.c` at the splash
 framebuffer and confines it to pixel rows 700 and below. `serial.c` writes every
 console byte there before the UART, so the boot log and the shell show up on screen.
-Glyphs are the 8×16 font at 2× (67 columns × 54 rows); scrolling and `fb_clear` stay
-inside the text area.
+Glyphs are the 8×16 font at 2× (67 columns × 54 rows). The console doesn't scroll:
+with the D-cache off, copying the text area took ~1 s per line and stalled the shell,
+USB included. At the bottom it wraps to the top and always blanks the row after
+the current one, so look for the line just above the empty one.
 
 Above the console, `kernel_main` paints 30-px bars as it advances:
 
@@ -110,11 +147,23 @@ offset `0x603C` = a config-space read in `pci_scan`.
    `0x81000000`), GICv3 with 1024 IRQs, 19.2 MHz timer at 100 Hz, 384 MB page
    allocator at `0xA8000000`, then the scheduler and `shell>`. There were no
    unhandled IRQs.
+6. **USB serial console.** See "Console over USB". Getting there took the PIPE-clock
+   switch, which fixed the endpoint commands that hung, and the VBUS override. The
+   console scroll also had to go, because it delayed shell output by ~1 s per line.
 
 Still open:
-- **No input.** The shell waits on UART RX. The options are a USB serial gadget
-  over the cable already on the PC, the buttons over SPMI (an earlier probe
-  data-aborted), or the touchscreen.
+- **Stored pointers.** The kernel runs ~0x20180000 above its link address, so any
+  pointer stored in `.data`/`.rodata` is wrong. GCC also creates such pointers
+  itself: a `switch` that picks a string becomes a pointer table
+  (`R_AARCH64_ABS64`). On 2026-10-28 these objects had them: `drivers/gpu.o` (86),
+  `gui/gui_desktop.o` (19), `fs/gguf.o` (14), `kernel/claude.o` (7),
+  `kernel/shell.o` (4: the task-state names in `ps`, so `ps` should fault),
+  `drivers/gsp.o` (4). Check new code with `aarch64-elf-objdump -r <obj> | grep ABS64`.
+  The real fix is a self-relocating kernel (`-fpie` plus applying
+  `R_AARCH64_RELATIVE` in `start.S`).
+- **Caches are off.** The shim enters with the MMU and D-cache disabled, so every
+  load and store goes to DRAM uncached. That is why the console had to stop
+  scrolling. Turning on the MMU with cacheable RAM would speed everything up.
 - **Secondary CPUs aren't started.** `smp_boot_aps` assumes virt's MPIDR numbering.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
@@ -581,6 +630,8 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/boot/linker_sm8350.ld` | Linker script (base 0x80080000, stack 64 KB past image end) |
 | `arch/arm/scripts/rog5-boot.sh` | Build on the Mac, pack, fetch, optionally flash |
 | `arch/arm/kernel/mem.S` | Out-of-line memset/memcpy/memmove (GCC and gui/ need the symbols) |
+| `arch/arm/platform/sm8350/usb.c` | USB state report, SMMU 1:1 check, gadget start |
+| `arch/arm/platform/sm8350/dwc3_acm.c` | Polled DWC3 device driver + CDC-ACM serial function |
 | `arch/arm/include/sm8350.h` | Hardware register definitions (verified) |
 | `arch/arm/include/aarch64.h` | System register helpers |
 | `arch/arm/platform/sm8350/` | Platform-specific code |

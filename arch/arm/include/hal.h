@@ -16,6 +16,8 @@
  * ======================================================================== */
 void platform_init(void *dtb);
 void platform_reboot(void);
+/* Board devices beyond the core (called from kernel_main after the heap) */
+void platform_probe_devices(void);
 
 /* ========================================================================
  * UART (platform-specific low-level)

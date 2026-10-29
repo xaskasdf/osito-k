@@ -23,6 +23,11 @@ void platform_init(void *dtb)
     uart_init();
 }
 
+/* virt's PCI/virtio/SMP probes still live in kernel_main */
+void platform_probe_devices(void)
+{
+}
+
 void platform_reboot(void)
 {
     /* PSCI SYSTEM_RESET via SMC */

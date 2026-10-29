@@ -72,7 +72,8 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
 - `arch/arm/scripts/rog5-boot.sh [--virt-check] [--flash]` ships the working tree to the Mac, builds with `aarch64-elf-gcc`, packs `boot.img` and flashes the active slot. clang can't build `arch/arm` (no `__builtin_setjmp` on aarch64).
 - `fastboot boot` bootloops on this device, so images are always flashed. Get back to fastboot with Power + Vol-Down.
 - There is no UART output, so the screen is the only feedback: progress bars, a blinking heartbeat, an orange/purple panic band with ESR/ELR/`_start` as bit cells, and a text console (pixel rows 700 and below) that mirrors everything `serial_*` prints. The guide explains how to decode the panic cells.
-- Status 2026-10-28: boots to `shell>` on the framebuffer console. There is no input yet.
+- Status 2026-10-28: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
+- The kernel runs ~0x20180000 above its link address, so any pointer stored in `.data`/`.rodata` is wrong on the device. That includes the pointer tables GCC builds for a `switch` that picks strings. Check new objects with `aarch64-elf-objdump -r <obj> | grep ABS64`.
 
 ### Tests
 CI runs no tests. Three kinds of test exist in `arch/x86/`:
