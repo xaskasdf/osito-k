@@ -49,7 +49,8 @@ static void cmd_help(void)
     serial_puts("  resolve  DNS lookup\n");
     serial_puts("  beep     Play a tone\n");
     serial_puts("  desktop  Launch graphical desktop\n");
-    serial_puts("  reboot   Reboot system\n");
+    serial_puts("  reboot   Reboot system [bootloader: into fastboot]\n");
+    serial_puts("  pmic     PMIC arbiter + restart reason [<sid> <hex addr>]\n");
     serial_puts("  kload    Receive a kernel over USB and run it\n");
     serial_puts("  dmesg    Show the console log since boot\n");
     serial_puts("  clear    Clear screen\n");
@@ -121,7 +122,9 @@ static void cmd_mem(void)
 
 static void cmd_uname(void)
 {
-    serial_puts("OsitoK AArch64 v0.1 (bare-metal)\n");
+    /* The build stamp tells kernels apart: rog5-boot.sh --flash compares
+     * it with the one in the boot.img it flashed */
+    serial_puts("OsitoK AArch64 v0.1 (bare-metal), built " __DATE__ " " __TIME__ "\n");
 }
 
 static void cmd_uptime(void)
@@ -355,7 +358,13 @@ void shell_run(void)
         else if (strcmp(argv[0], "resolve") == 0) cmd_resolve(argc, argv);
         else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
         else if (strcmp(argv[0], "desktop") == 0) cmd_desktop();
-        else if (strcmp(argv[0], "reboot") == 0)  platform_reboot();
+        else if (strcmp(argv[0], "reboot") == 0) {
+            if (argc > 1 && strcmp(argv[1], "bootloader") == 0)
+                platform_reboot_bootloader();
+            else
+                platform_reboot();
+        }
+        else if (strcmp(argv[0], "pmic") == 0)    platform_pmic_cmd(argc, argv);
         else if (strcmp(argv[0], "clear") == 0)   serial_puts("\033[2J\033[H");
         else {
             serial_puts("Unknown: ");

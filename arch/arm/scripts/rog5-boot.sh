@@ -19,6 +19,12 @@
 # each loaded kernel can load the next). It leaves boot_a untouched, so a
 # reboot goes back to the flashed kernel.
 #
+# --flash makes the kernel survive reboots. With the phone in fastboot it just
+# flashes; with Osito-K running instead it first sends `reboot bootloader`
+# (kernels from 2026-10-29 on), so no buttons are needed. After flashing it
+# waits for the console and checks that `uname` reports the build stamp found
+# in the boot.img.
+#
 # It ships the working tree (arch/arm, gui, include/common), uncommitted
 # changes included.
 #
@@ -151,12 +157,44 @@ fi
 # the active slot's boot partition is touched.
 if [ "$FLASH" = 1 ]; then
     FB="${FASTBOOT:-$(command -v fastboot || echo /c/platform-tools/fastboot.exe)}"
-    "$FB" devices | grep -q 'fastboot' || die "no device in fastboot mode (Power + Vol-Down)"
+    in_fastboot() { "$FB" devices | grep -q 'fastboot'; }
+    HAVE_PS=0
+    command -v powershell.exe >/dev/null && HAVE_PS=1
+    console() {
+        powershell.exe -NoProfile -ExecutionPolicy Bypass \
+            -File "$(cygpath -w "$SCRIPT_DIR/rog5-console.ps1")" "$@" | tr -d '\r'
+    }
+
+    if ! in_fastboot; then
+        [ "$HAVE_PS" = 1 ] || die "no device in fastboot mode (Power + Vol-Down)"
+        info "Asking the running Osito-K to reboot into fastboot..."
+        REPLY="$(console -Command 'reboot bootloader' -Expect 'rebooting to fastboot|could not' -Timeout 5)" || true
+        case "$REPLY" in
+            *"rebooting to fastboot"*) ;;
+            *"could not"*) die "Osito-K couldn't: $REPLY. Use Power + Vol-Down" ;;
+            "") die "no Osito-K console and no fastboot device: put the phone in fastboot (Power + Vol-Down)" ;;
+            *) die "this kernel has no \`reboot bootloader\` (it may have rebooted normally); put the phone in fastboot with Power + Vol-Down" ;;
+        esac
+        for _ in $(seq 60); do in_fastboot && break; sleep 1; done
+        in_fastboot || die "the phone didn't show up in fastboot within 60 s"
+    fi
+
     SLOT="$("$FB" getvar current-slot 2>&1 | sed -n 's/^current-slot: *//p' | tr -d '\r')"
     [ -n "$SLOT" ] || die "could not read current-slot"
+    STAMP="$(grep -a -o 'bare-metal), built [A-Z][a-z][a-z] [ 0-9][0-9] [0-9]* [0-9:]*' "$OUT_REL" | head -1 | sed 's/^bare-metal), //')"
     info "Flashing boot_$SLOT and rebooting..."
     "$FB" flash "boot_$SLOT" "$OUT_REL"
     "$FB" reboot
+
+    if [ "$HAVE_PS" = 1 ] && [ -n "$STAMP" ]; then
+        info "Waiting for the flashed kernel ($STAMP)..."
+        UNAME="$(console -WaitPort 120 -Command uname -Expect 'built .*[0-9][0-9]:[0-9][0-9]:[0-9][0-9]' -Timeout 5)" || true
+        case "$UNAME" in
+            *"$STAMP"*) info "boot_$SLOT boots this build: $UNAME" ;;
+            "") die "no Osito-K console within 120 s of the reboot (check the screen)" ;;
+            *) die "a different kernel answered: $UNAME (expected $STAMP)" ;;
+        esac
+    fi
 fi
 
 # --- Optional: load over USB --------------------------------------------------

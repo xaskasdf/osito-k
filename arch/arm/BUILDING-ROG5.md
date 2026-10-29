@@ -10,11 +10,12 @@ serial port (see "Console over USB").
 
 ## Quick Start
 
-From the Windows dev box (Git Bash or MSYS2), phone in fastboot mode (Power + Vol-Down):
+From the Windows dev box (Git Bash or MSYS2), with Osito-K running on the phone
+(or the phone in fastboot mode, Power + Vol-Down):
 
 ```bash
 arch/arm/scripts/rog5-boot.sh --usb          # build, send to the running kernel over USB, boot it (~15 s)
-arch/arm/scripts/rog5-boot.sh --flash        # build + pack + fastboot flash boot_<active slot> + reboot
+arch/arm/scripts/rog5-boot.sh --flash        # build + pack + flash boot_<active slot> + reboot + verify (~75 s)
 arch/arm/scripts/rog5-boot.sh                # build + pack only -> arch/arm/build/rog5/osito-boot-rog5.img
 arch/arm/scripts/rog5-boot.sh --virt-check   # also build PLATFORM=virt and boot it in local QEMU
 ```
@@ -25,9 +26,14 @@ back and checks its SHA-256. Then it either:
 - `--usb`: hands the raw `Image` to `rog5-kload.ps1`, which runs `kload` on the live
   kernel's USB console. This is the normal development loop: no buttons, and
   `boot_a` is untouched, so a reboot returns to the flashed kernel.
-- `--flash`: flashes the image. Needed once, to get a kernel with `kload` onto the
-  phone, or for a build that must survive a reboot. Requires fastboot mode
-  (Power + Vol-Down).
+- `--flash`: flashes the image, for a build that must survive a reboot. If Osito-K
+  is running, the script first sends `reboot bootloader` (see "Rebooting into
+  fastboot"), so no buttons are needed. A kernel older than that needs
+  Power + Vol-Down. After `fastboot reboot` it waits for the console and checks
+  that `uname` reports the build stamp found in the flashed `boot.img`.
+
+`rog5-console.ps1 -Command <line>` runs one shell command on the console and prints
+the answer (`-WaitPort <s>` waits for the phone to enumerate first).
 
 Where things live:
 
@@ -355,10 +361,19 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     A78s, `any 4` on all four big cores. With `any 8`, the four that start on A55s
     move up as the big cores free: 172 ms wall, against 183–192 ms pinned one per
     CPU. Before this change the IPI went to the lowest-numbered idle CPU, an A55.
+16. **Flashing without buttons (2026-10-29).** `reboot bootloader` sets the restart
+    reason in the PMIC over SPMI (see "Rebooting into fastboot"), and
+    `rog5-boot.sh --flash` uses it. From a running Osito-K to the new build
+    answering from `boot_a` takes ~75 s, with the build stamp checked. The same run
+    was the first cold boot of the SMP kernel: all eight cores came up, and cpufreq
+    moved the A78s from 710 to 2419 MHz.
 
 Still open:
 - **Placement is performance-first.** No load tracking or energy model: a light
   unpinned task also takes a big core.
+- **Boots are never marked successful**, so ABL counts down `slot-retry-count`
+  (see "Flash"). Every `--flash` resets it, but many reboots in a row without
+  one could exhaust slot a.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
 
@@ -529,11 +544,38 @@ fastboot reboot                         # Boot
 
 **NEVER use `fastboot boot`** — it causes bootloop on this device. Always flash.
 
+### Rebooting into fastboot
+
+`reboot bootloader` in the Osito-K shell writes ABL's restart reason and reboots;
+ABL comes up in fastboot ~16 s later. Android does the same (`qcom,reboot-reason`
+in the phone's device tree). The reason is an nvmem cell in the PMK8350 PMIC
+(SPMI SID 0): SDAM `0x7100`, byte `0x48`, bits 7:1, where 2 = bootloader. The PMIC
+keeps it through any reset. ABL clears it once used, so the next boot is normal.
+
+The PMIC is reached through the SPMI PMIC arbiter (`platform/sm8350/pmic_arb.c`,
+v5.2 here: version register `0x50020000`):
+
+| Region | Address | Use |
+|--------|---------|-----|
+| core | `0x0C440000` | APID map at `0x900 + 4n`: PPID (SID:peripheral) in bits 19:8 |
+| cnfg | `0x0C40A000` | owner table at `0x700 + 4n`: the EE that may write through APID n |
+| chnls | `0x0C600000` | write channel of APID n at `+ 0x10000 n` |
+| obsrvr | `0x0E600000` | read channel of APID n at `+ 0x80 n` (EE 0's page) |
+
+A one-byte access writes `(op << 27) | (reg << 4)` to the channel's CMD (`0x00`)
+and polls STATUS (`0x08`); data is in WDATA0 (`0x10`) / RDATA0 (`0x18`). Writes
+need an APID owned by EE 0 (HLOS), as Linux requires. `pmic` in the shell prints
+the arbiter version and the restart reason, and `pmic <sid> <hex addr>` reads any
+register: `pmic 0 0105` returns `0x2f`, the PMK8350 subtype. `spmi.c` is an
+earlier attempt that guessed a v7 layout with a fixed channel and data-aborted;
+nothing uses it.
+
 - `fastboot set_active` is refused ("Slot Change is not allowed in Lock State")
   even though `getvar unlocked` says yes; slot changes need the critical unlock.
 - Osito-K never marks a boot successful, so ABL decrements
   `slot-retry-count:a` on every boot. Flashing resets it (to 3 on 2026-10-28).
-- To get back to fastboot from a hung kernel: hold Power + Vol-Down.
+- To get back to fastboot from a hung kernel: hold Power + Vol-Down. From a live
+  one, `reboot bootloader` (see "Rebooting into fastboot").
 
 ### Recovery
 

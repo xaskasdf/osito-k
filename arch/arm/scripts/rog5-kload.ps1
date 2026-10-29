@@ -29,42 +29,7 @@ $ErrorActionPreference = 'Stop'
 function Info($m) { Write-Host "[kload] $m" -ForegroundColor Cyan }
 function Fail($m) { Write-Host "[kload] ERROR: $m" -ForegroundColor Red; exit 1 }
 
-function Find-OsitoPort {
-    $p = Get-CimInstance Win32_SerialPort -ErrorAction SilentlyContinue |
-         Where-Object { $_.PNPDeviceID -match 'VID_1209&PID_0001' } | Select-Object -First 1
-    if ($p) { return $p.DeviceID }
-    return ''
-}
-
-function Open-Port([string]$Name) {
-    for ($i = 0; $i -lt 20; $i++) {         # usbser may need a moment after enumeration
-        try {
-            $sp = New-Object System.IO.Ports.SerialPort $Name, 115200, 'None', 8, 'One'
-            $sp.DtrEnable = $true
-            $sp.WriteTimeout = 20000
-            $sp.Open()
-            return $sp
-        } catch { Start-Sleep -Milliseconds 250 }
-    }
-    Fail "could not open $Name"
-}
-
-# Read until $Pattern matches the accumulated text, $Seconds pass, or the
-# device disconnects (it does right after accepting an Image)
-function Read-Until($sp, [string]$Pattern, [double]$Seconds) {
-    $buf = ''
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    while ((Get-Date) -lt $deadline) {
-        try { $buf += $sp.ReadExisting() } catch { break }
-        if ($buf -match $Pattern) { break }
-        Start-Sleep -Milliseconds 20
-    }
-    return $buf
-}
-
-function Close-Port($sp) {
-    try { if ($sp.IsOpen) { $sp.Close() } } catch { }
-}
+. (Join-Path $PSScriptRoot 'rog5-serial.ps1')
 
 Add-Type -TypeDefinition @'
 public static class OsitoCrc32 {
@@ -88,6 +53,7 @@ Info ("{0}: {1} bytes, crc32 {2:x8}" -f $Port, $data.Length, $crc)
 
 # --- Send ---------------------------------------------------------------------
 $sp = Open-Port $Port
+if (-not $sp) { Fail "could not open $Port" }
 try {
     Start-Sleep -Milliseconds 200
     $null = $sp.ReadExisting()
@@ -128,6 +94,7 @@ while ((Get-Date) -lt $deadline -and -not $newPort) {
 if (-not $newPort) { Fail 'the new kernel did not come back on USB within 60 s (check the screen)' }
 
 $sp = Open-Port $newPort
+if (-not $sp) { Fail "could not open $newPort" }
 try {
     Start-Sleep -Milliseconds 300
     $null = $sp.ReadExisting()

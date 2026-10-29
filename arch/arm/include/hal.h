@@ -16,6 +16,10 @@
  * ======================================================================== */
 void platform_init(void *dtb);
 void platform_reboot(void);
+/* Into the bootloader's fastboot mode, for flashing (shell `reboot
+ * bootloader`). Returns only if it can't. */
+void platform_reboot_bootloader(void);
+void platform_pmic_cmd(int argc, char **argv);  /* shell `pmic` */
 /* MMU + caches (called from kernel_main after mem_init) */
 void platform_mmu_init(void);
 /* Board devices beyond the core (called from kernel_main after the heap) */

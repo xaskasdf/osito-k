@@ -40,6 +40,18 @@ int platform_kload(void)
     return -1;
 }
 
+void platform_reboot_bootloader(void)
+{
+    serial_puts("reboot bootloader: only on SM8350\n");
+}
+
+void platform_pmic_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    serial_puts("pmic: only on SM8350\n");
+}
+
 /* QEMU's CPUs have no frequency to set */
 void platform_cpufreq_init(void)
 {
