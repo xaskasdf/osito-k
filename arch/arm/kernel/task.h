@@ -8,6 +8,15 @@
 #define TASK_STACK_SIZE 8192
 #define TASK_ANY_CPU    (-1)
 
+/* Utilization, sampled each tick: running pushes it toward UTIL_MAX,
+ * sleeping toward 0, with a time constant of 2^UTIL_SHIFT ticks (80 ms).
+ * Unpinned tasks under UTIL_LIGHT prefer slow CPUs, over UTIL_HEAVY fast
+ * ones; in between they stay where they are. */
+#define UTIL_MAX        1024
+#define UTIL_SHIFT      3
+#define UTIL_LIGHT      192     /* ~19% */
+#define UTIL_HEAVY      320     /* ~31% */
+
 typedef enum {
     TASK_STATE_FREE    = 0,
     TASK_STATE_READY   = 1,
@@ -25,6 +34,7 @@ typedef struct {
     int8_t          cpu;        /* CPU it may run on, or TASK_ANY_CPU */
     int8_t          on_cpu;     /* CPU running it, or that ran it last */
     uint8_t         idle;       /* a CPU's idle task: only runs when nothing else can */
+    uint16_t        util;       /* share of ticks it was running, 0-UTIL_MAX */
     uint32_t        ticks_run;
     uint64_t        wake_tick;
     uint8_t        *stack_base;

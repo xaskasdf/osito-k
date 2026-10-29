@@ -41,6 +41,7 @@ static void cmd_help(void)
     serial_puts("  ping     Ping IP address\n");
     serial_puts("  cpus     List the online CPUs\n");
     serial_puts("  cpubench Timed task per CPU, all at once [any [n]: n unpinned]\n");
+    serial_puts("           [mix: busy + light unpinned tasks, where they settle]\n");
     serial_puts("  cpufreq  CPU frequencies [max | min | <domain> <level>]\n");
     serial_puts("  echo     Print text\n");
     serial_puts("  hexdump  Hex dump file\n");
@@ -58,8 +59,8 @@ static void cmd_help(void)
 
 static void cmd_ps(void)
 {
-    serial_puts("ID  State    Pri  CPU  Ticks   Name\n");
-    serial_puts("--  -------  ---  ---  ------  ----\n");
+    serial_puts("ID  State    Pri  CPU  Util  Ticks   Name\n");
+    serial_puts("--  -------  ---  ---  ----  ------  ----\n");
     for (int i = 0; i < MAX_TASKS; i++) {
         if (task_pool[i].state == TASK_STATE_FREE) continue;
 
@@ -88,6 +89,16 @@ static void cmd_ps(void)
         /* CPU it runs or last ran on; '*' = not pinned */
         serial_putdec(task_pool[i].on_cpu);
         serial_puts(task_pool[i].cpu == TASK_ANY_CPU ? "*   " : "    ");
+
+        /* Utilization the scheduler places it by; idle tasks have none */
+        if (task_pool[i].idle) {
+            serial_puts("   -  ");
+        } else {
+            uint32_t pct = task_pool[i].util * 100u / UTIL_MAX;
+            serial_puts(pct < 10 ? "  " : pct < 100 ? " " : "");
+            serial_putdec(pct);
+            serial_puts("%  ");
+        }
 
         /* Ticks */
         serial_putdec(task_pool[i].ticks_run);
@@ -325,6 +336,10 @@ void shell_run(void)
         }
         else if (strcmp(argv[0], "cpus") == 0) {
             smp_print_cpus();
+        }
+        else if (strcmp(argv[0], "cpubench") == 0 && argc > 1 &&
+                 strcmp(argv[1], "mix") == 0) {
+            smp_bench_mix();
         }
         else if (strcmp(argv[0], "cpubench") == 0) {
             int any = argc > 1 && strcmp(argv[1], "any") == 0;

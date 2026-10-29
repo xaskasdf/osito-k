@@ -92,6 +92,7 @@ int  smp_this_core(void);       /* core number from MPIDR */
 int  smp_get_cpu_count(void);
 void smp_print_cpus(void);
 void smp_bench(int any, int count);     /* shell `cpubench [any [n]]` */
+void smp_bench_mix(void);               /* shell `cpubench mix` */
 int  smp_cpu_id(void);          /* kernel/sched.c: this CPU's core number */
 
 /* ========================================================================

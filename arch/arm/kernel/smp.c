@@ -520,3 +520,87 @@ void smp_bench(int any, int count)
         serial_puts(" us\n");
     }
 }
+
+/* ── cpubench mix: busy and light unpinned tasks together ── */
+
+#define MIX_BUSY        2
+#define MIX_LIGHT       4
+#define MIX_MS          1500        /* each task runs this long */
+#define MIX_WARMUP_MS   300         /* utilization settles before CPUs count */
+
+struct mix_slot {
+    int light;                      /* 1 ms of work every ~10 ms, or spin */
+    uint32_t cpus;                  /* CPUs it ran on after the warm-up */
+    volatile int done;
+};
+
+static struct mix_slot mix[MIX_BUSY + MIX_LIGHT];
+
+static void mix_task(void *arg)
+{
+    struct mix_slot *s = arg;
+    uint64_t freq;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    uint64_t t0 = read_cntpct_el0();
+    uint64_t warm = t0 + MIX_WARMUP_MS * freq / 1000;
+    uint64_t end = t0 + MIX_MS * freq / 1000;
+    for (uint64_t now; (now = read_cntpct_el0()) < end; ) {
+        if (now >= warm)
+            s->cpus |= 1u << smp_cpu_id();
+        if (s->light) {
+            while (read_cntpct_el0() - now < freq / 1000)
+                ;
+            task_delay_ms(10);
+        }
+    }
+    __asm__ volatile("dmb ish" : : : "memory");
+    s->done = 1;
+}
+
+/* Busy tasks should settle on the big cores and light ones on the A55s */
+void smp_bench_mix(void)
+{
+    int n = MIX_BUSY + MIX_LIGHT;
+    for (int i = 0; i < n; i++) {
+        mix[i].light = i >= MIX_BUSY;
+        mix[i].cpus = 0;
+        mix[i].done = 0;
+        if (task_create_on(mix[i].light ? "light" : "busy", mix_task, &mix[i],
+                           1, TASK_ANY_CPU) < 0)
+            mix[i].done = -1;
+    }
+    for (int waited = 0; waited < MIX_MS * 4; waited += 10) {
+        int pending = 0;
+        for (int i = 0; i < n; i++)
+            pending += !mix[i].done;
+        if (!pending)
+            break;
+        task_delay_ms(10);
+    }
+    __asm__ volatile("dmb ish" : : : "memory");
+
+    serial_puts("task  kind   CPUs after the first ");
+    serial_putdec(MIX_WARMUP_MS);
+    serial_puts(" ms\n");
+    for (int i = 0; i < n; i++) {
+        serial_puts("   ");
+        serial_putdec(i);
+        serial_puts("  ");
+        serial_puts(mix[i].light ? "light " : "busy  ");
+        if (mix[i].done != 1) {
+            serial_puts(mix[i].done ? "no task slot\n" : "did not finish\n");
+            continue;
+        }
+        for (int c = 0; c < MAX_CPUS; c++) {
+            if (!(mix[i].cpus & (1u << c)))
+                continue;
+            const char *name = cpu_core_name(cpus[c].midr);
+            serial_puts(" ");
+            serial_putdec(c);
+            serial_puts(":");
+            /* "Cortex-A55" -> "A55" */
+            serial_puts(name ? name + 7 : "?");
+        }
+        serial_puts("\n");
+    }
+}

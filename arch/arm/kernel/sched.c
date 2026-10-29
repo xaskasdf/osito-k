@@ -71,6 +71,9 @@ static task_tcb_t *task_alloc(const char *name, task_func_t func, void *arg,
     t->cpu = (int8_t)cpu;
     t->on_cpu = (int8_t)(cpu >= 0 ? cpu : boot_cpu);
     t->idle = (uint8_t)idle;
+    /* Busy until it shows otherwise: start on a big core. Idle tasks don't
+     * take part. */
+    t->util = idle ? 0 : UTIL_MAX;
     t->name = name;
     t->ticks_run = 0;
     t->wake_tick = 0;
@@ -125,16 +128,18 @@ void sched_set_capacity(int cpu, uint32_t capacity) {
 }
 
 /* Send the reschedule SGI to CPUs sitting in their idle task that could
- * take a READY task, one CPU per task and the fastest first, instead of
- * leaving it to their next tick (up to 10 ms: avg 5.7 ms to start a task
- * on another CPU before). This CPU is left out: it just scheduled, or
- * keeps its task until its own tick. Caller holds sched_lock. */
+ * take a READY task, one CPU per task, instead of leaving it to their next
+ * tick (up to 10 ms: avg 5.7 ms to start a task on another CPU before).
+ * Light tasks go to the slowest such CPU, the rest to the fastest. This
+ * CPU is left out: it just scheduled, or keeps its task until its own
+ * tick. Caller holds sched_lock. */
 static void kick_idle_cpus(void) {
     uint32_t kicked = 1u << this_cpu()->id;
     for (int i = 0; i < MAX_TASKS; i++) {
         task_tcb_t *t = &task_pool[i];
         if (t->state != TASK_STATE_READY || t->idle)
             continue;
+        int slow = t->util < UTIL_LIGHT;
         int pick = -1;
         for (int n = 0; n < MAX_CPUS; n++) {
             struct cpu_sched *c = &cpu_sched[n];
@@ -142,7 +147,8 @@ static void kick_idle_cpus(void) {
                 continue;
             if (t->cpu != TASK_ANY_CPU && t->cpu != n)
                 continue;
-            if (pick < 0 || c->capacity > cpu_sched[pick].capacity)
+            if (pick < 0 || (slow ? c->capacity < cpu_sched[pick].capacity
+                                  : c->capacity > cpu_sched[pick].capacity))
                 pick = n;
         }
         if (pick >= 0) {
@@ -195,20 +201,29 @@ void schedule(void) {
             prev->state = TASK_STATE_FREE;      /* off its stack for good */
     }
 
-    /* Unpinned tasks go to faster CPUs first: leave them to the idle CPUs
-     * faster than this one (kicked below), unless there are more of them
-     * than such CPUs. This also moves a task up from a little core at its
-     * next tick once a big one is free. */
-    int faster_idle = 0, ready_any = 0;
-    for (int n = 0; n < MAX_CPUS; n++)
-        if (n != c->id && cpu_idle(&cpu_sched[n]) &&
-            cpu_sched[n].capacity > c->capacity)
+    /* Busy unpinned tasks go to faster CPUs, light ones to slower: leave
+     * them to idle CPUs faster (or slower) than this one, kicked below,
+     * unless there are more such tasks than CPUs. This also moves a busy
+     * task up from a little core, or a light one down from a big core, at
+     * the next tick once a CPU of the right kind is free. */
+    int faster_idle = 0, slower_idle = 0, ready_heavy = 0, ready_light = 0;
+    for (int n = 0; n < MAX_CPUS; n++) {
+        if (n == c->id || !cpu_idle(&cpu_sched[n]))
+            continue;
+        if (cpu_sched[n].capacity > c->capacity)
             faster_idle++;
-    for (int i = 0; faster_idle && i < MAX_TASKS; i++)
-        if (task_pool[i].state == TASK_STATE_READY && !task_pool[i].idle &&
-            task_pool[i].cpu == TASK_ANY_CPU)
-            ready_any++;
-    int leave_any = ready_any <= faster_idle && faster_idle > 0;
+        else if (cpu_sched[n].capacity < c->capacity)
+            slower_idle++;
+    }
+    for (int i = 0; (faster_idle || slower_idle) && i < MAX_TASKS; i++) {
+        task_tcb_t *t = &task_pool[i];
+        if (t->state != TASK_STATE_READY || t->idle || t->cpu != TASK_ANY_CPU)
+            continue;
+        ready_heavy += t->util > UTIL_HEAVY;
+        ready_light += t->util < UTIL_LIGHT;
+    }
+    int leave_heavy = faster_idle > 0 && ready_heavy <= faster_idle;
+    int leave_light = slower_idle > 0 && ready_light <= slower_idle;
 
     /* Highest priority wins; the scan starts after the last pick, so equal
      * priorities take turns */
@@ -220,7 +235,9 @@ void schedule(void) {
             continue;
         if (t->cpu != TASK_ANY_CPU && t->cpu != c->id)
             continue;
-        if (t->cpu == TASK_ANY_CPU && leave_any)
+        if (t->cpu == TASK_ANY_CPU &&
+            ((leave_heavy && t->util > UTIL_HEAVY) ||
+             (leave_light && t->util < UTIL_LIGHT)))
             continue;
         if (t->priority > best_pri) {
             best = i;
@@ -246,14 +263,23 @@ void sched_tick(void) {
     struct cpu_sched *c = this_cpu();
     uint64_t now = timer_get_tick_count();
     spin_lock(&sched_lock);
-    if (c->current)
-        c->current->ticks_run++;
+    task_tcb_t *cur = c->current;
+    if (cur) {
+        cur->ticks_run++;
+        if (!cur->idle)
+            cur->util += (UTIL_MAX - cur->util) >> UTIL_SHIFT;
+    }
     for (int i = 0; i < MAX_TASKS; i++) {
-        if (task_pool[i].state == TASK_STATE_BLOCKED &&
-            task_pool[i].wake_tick != 0 &&
-            (int64_t)(now - task_pool[i].wake_tick) >= 0) {
-            task_pool[i].wake_tick = 0;
-            task_pool[i].state = TASK_STATE_READY;
+        task_tcb_t *t = &task_pool[i];
+        if (t->state != TASK_STATE_BLOCKED)
+            continue;
+        /* Sleeping decays once per tick of time, on the boot CPU. READY
+         * tasks keep theirs: they want a CPU, they just don't have one. */
+        if (c->boot)
+            t->util -= t->util >> UTIL_SHIFT;
+        if (t->wake_tick != 0 && (int64_t)(now - t->wake_tick) >= 0) {
+            t->wake_tick = 0;
+            t->state = TASK_STATE_READY;
         }
     }
     spin_unlock(&sched_lock);

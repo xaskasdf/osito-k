@@ -157,12 +157,19 @@ scheduler in its own idle task.
   for one core keeps running serialized there; the shell is one of them. Use
   `task_create_on(..., cpu)` to put a task on another core, or `TASK_ANY_CPU` to
   let any idle CPU take it (it may move between CPUs).
-- **Big cores first.** Unpinned tasks go to the fastest idle CPU. Each CPU has a
-  capacity, set by `cpufreq` as `capacity-dmips-mhz` (device tree: A55 1024, A78
-  1946, X1 2048) × its MHz, the way Linux computes it. A CPU leaves unpinned tasks
-  to idle CPUs faster than itself unless there are more tasks than such CPUs. So
-  a task that started on an A55 moves to a big core at the A55's next tick once
-  one is free. Performance first: there is no load tracking or energy model.
+- **Placement by load.** Busy unpinned tasks go to the fastest idle CPU, light
+  ones to the slowest. Each CPU has a capacity, set by `cpufreq` as
+  `capacity-dmips-mhz` (device tree: A55 1024, A78 1946, X1 2048) × its MHz, the way
+  Linux computes it. Each task has a utilization (`util`, `ps` shows it) sampled per
+  tick. The task a CPU is running moves toward 100% on that CPU's ticks, and
+  sleeping tasks move toward 0% on the boot CPU's, with an 80 ms time constant.
+  READY tasks keep theirs. New tasks start at 100%, on a big core.
+  - Under ~19% a task counts as light, over ~31% as busy; in between it stays put.
+  - A CPU leaves busy tasks to idle CPUs faster than itself, and light ones to
+    slower idle CPUs, unless there are more such tasks than CPUs. So tasks move up
+    or down at the next tick once a CPU of the right kind is free.
+  - This is sampling, not Linux's PELT: no frequency invariance and no energy
+    model.
 - **Per-CPU state.** `TPIDR_EL1` points at the CPU's `struct cpu_sched` (`task.h`):
   current task, IRQ stack, idle task. `irq_vector_entry` saves the context on the
   task's stack, then runs the handler on the CPU's own IRQ stack. Once
@@ -182,7 +189,8 @@ scheduler in its own idle task.
   tick. Starting a task on another CPU went from 5.7 ms on average to 4 µs.
 - **Ticks.** Every CPU ticks at 100 Hz, but only the boot CPU's ticks count as time.
 - **Try it:** `cpus` shows what each CPU runs. `cpubench` starts one timed task
-  pinned to each CPU, and `cpubench any` starts two unpinned tasks per CPU:
+  pinned to each CPU, `cpubench any [n]` starts n unpinned tasks (default two per
+  CPU), and `cpubench mix` shows where busy and light unpinned tasks settle:
 
 ```
 task  cpu   core          time    ~MHz          (cpubench, 2026-10-29)
@@ -222,8 +230,8 @@ they run, so this happens after `smp_boot_aps`. The setting survives a `kload`.
 - `cpufreq max` / `cpufreq min` set every domain to its top / lowest level.
 - `cpufreq <domain> <level>` sets one.
 
-Each level change also updates the scheduler's capacity for those CPUs (see "Big
-cores first"). `cpus` shows it.
+Each level change also updates the scheduler's capacity for those CPUs (see
+"Placement by load"). `cpus` shows it.
 
 ---
 
@@ -368,9 +376,13 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     was the first cold boot of the SMP kernel: all eight cores came up, and cpufreq
     moved the A78s from 710 to 2419 MHz.
 
+17. **Light tasks on the A55s (2026-10-29).** Per-task utilization (see "Placement by
+    load"). `cpubench mix` runs 2 busy and 4 light unpinned tasks; light ones do 1 ms
+    of work every ~10 ms. After the first 300 ms, the busy ones were on the X1 and an
+    A78 and the light ones only on cpu0-3, the same in three runs.
+    `cpubench any 3` and the pinned run didn't change.
+
 Still open:
-- **Placement is performance-first.** No load tracking or energy model: a light
-  unpinned task also takes a big core.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
 
