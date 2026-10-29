@@ -2,7 +2,8 @@
 
 Target: ASUS ROG Phone 5 (I005DA), Qualcomm SM8350 (Snapdragon 888)
 Last verified: 2026-10-28 on physical device. Boots through the shim to the
-scheduler: all progress bars plus the blinking heartbeat (see below).
+`shell>` prompt on the framebuffer console, with the heartbeat blinking (see below).
+There is no input yet.
 
 ---
 
@@ -51,7 +52,13 @@ so the framebuffer is the only output. `uart_putc` gives up on the first TX time
 and drops all later output (before that, ~100k MMIO polls per character made the
 banner take minutes).
 
-`kernel_main` paints 30-px bars as it advances:
+**Text console.** `platform_init` points `kernel/framebuffer.c` at the splash
+framebuffer and confines it to pixel rows 700 and below. `serial.c` writes every
+console byte there before the UART, so the boot log and the shell show up on screen.
+Glyphs are the 8×16 font at 2× (67 columns × 54 rows); scrolling and `fb_clear` stay
+inside the text area.
+
+Above the console, `kernel_main` paints 30-px bars as it advances:
 
 | Rows | Color | Meaning |
 |------|-------|---------|
@@ -98,10 +105,19 @@ offset `0x603C` = a config-space read in `pci_scan`.
    `irq_vector_entry` loaded `current_task->sp` on exit without checking for NULL
    and read physical address 0. It now returns on the current stack when there is
    no task.
+5. **Framebuffer console.** The shell only talked to the UART. The console above
+   made the full boot log visible: Cortex-A55 r2p0 (MIDR `0x412FD050`, MPIDR
+   `0x81000000`), GICv3 with 1024 IRQs, 19.2 MHz timer at 100 Hz, 384 MB page
+   allocator at `0xA8000000`, then the scheduler and `shell>`. There were no
+   unhandled IRQs.
 
-Still open: the shell only talks to the UART, so nothing past the heartbeat is
-visible; the next step is a framebuffer console. `PLATFORM=virt` needs `-m 4G` in
-QEMU because `start.S` paints `0xE5000000` before it knows the platform.
+Still open:
+- **No input.** The shell waits on UART RX. The options are a USB serial gadget
+  over the cable already on the PC, the buttons over SPMI (an earlier probe
+  data-aborted), or the touchscreen.
+- **Secondary CPUs aren't started.** `smp_boot_aps` assumes virt's MPIDR numbering.
+- `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
+  before it knows the platform.
 
 ---
 

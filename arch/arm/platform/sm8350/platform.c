@@ -11,9 +11,18 @@
 uint64_t platform_ram_base(void) { return SM8350_RAM_BASE; }
 uint64_t platform_ram_size(void) { return SM8350_RAM_SIZE; }
 
+/* Pixel rows above this belong to main.c's boot progress bars (to 449) and
+ * panic band + cells (500-649); the text console gets the rest of the panel. */
+#define CONSOLE_TOP  700
+
 void platform_init(void *dtb) {
     (void)dtb;
     uart_init();
+    /* ABL leaves the splash framebuffer scanning out; there is no serial
+     * cable, so it doubles as the console. */
+    fb_init_platform(SPLASH_FB_BASE, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                     DISPLAY_WIDTH, 32);
+    fb_set_text_top(CONSOLE_TOP);
 }
 
 void platform_reboot(void) {

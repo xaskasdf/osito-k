@@ -3,7 +3,8 @@
  *
  * 32bpp text rendering using embedded 8x16 bitmap font (ported from x86).
  * All functions gracefully no-op when fb_base == NULL (e.g. QEMU virt).
- * For SM8350, platform_init() calls fb_init_platform() with splash FB address.
+ * For SM8350, platform_init() calls fb_init_platform() with splash FB address,
+ * and serial.c mirrors every console byte here.
  */
 
 #include "../include/hal.h"
@@ -19,6 +20,8 @@
 static volatile uint32_t *fb_base;
 static uint32_t fb_width, fb_height, fb_pitch;
 static uint32_t text_col, text_row, max_cols, max_rows;
+static uint32_t text_y0;    /* first pixel row of the text area */
+static uint32_t scale;      /* glyph magnification (2 on the 1080-wide phone panel) */
 
 /* ── Minimal 8×16 bitmap font (ASCII 32-126) ─────────────────── */
 /* Each glyph: 16 bytes (one byte per row, MSB left) */
@@ -131,17 +134,28 @@ void fb_init_platform(uint64_t base, uint32_t width, uint32_t height,
     fb_width  = width;
     fb_height = height;
     fb_pitch  = stride;
-    text_col  = 0;
-    text_row  = 0;
-    max_cols  = width / FONT_W;
-    max_rows  = height / FONT_H;
+    scale     = width >= 1024 ? 2 : 1;
+    fb_set_text_top(0);
 }
 
+/* Confine the console to pixel rows [y, height): on SM8350 the rows above
+ * hold the boot progress bars and panic cells painted by main.c. */
+void fb_set_text_top(uint32_t y)
+{
+    text_y0  = y;
+    text_col = 0;
+    text_row = 0;
+    max_cols = fb_width / (FONT_W * scale);
+    max_rows = (fb_height - y) / (FONT_H * scale);
+}
+
+/* Clears the text area only */
 void fb_clear(void)
 {
     if (!fb_base) return;
-    for (uint32_t i = 0; i < fb_width * fb_height; i++)
-        fb_base[i] = BG_COLOR;
+    volatile uint32_t *p = fb_base + text_y0 * fb_pitch;
+    for (uint32_t i = 0; i < (fb_height - text_y0) * fb_pitch; i++)
+        p[i] = BG_COLOR;
     text_col = 0;
     text_row = 0;
 }
@@ -151,28 +165,28 @@ static void fb_draw_char(uint32_t col, uint32_t row, char c,
 {
     if (!fb_base) return;
     if (c < 32 || c > 126) return;
-    uint32_t px = col * FONT_W;
-    uint32_t py = row * FONT_H;
+    uint32_t px = col * FONT_W * scale;
+    uint32_t py = text_y0 + row * FONT_H * scale;
     const uint8_t *glyph = font8x16[c - 32];
-    for (uint32_t y = 0; y < FONT_H; y++) {
-        uint8_t bits = glyph[y];
-        for (uint32_t x = 0; x < FONT_W; x++) {
-            uint32_t color = (bits & (0x80 >> x)) ? fg : bg;
-            fb_base[(py + y) * fb_pitch + (px + x)] = color;
-        }
+    for (uint32_t y = 0; y < FONT_H * scale; y++) {
+        uint8_t bits = glyph[y / scale];
+        volatile uint32_t *line = fb_base + (py + y) * fb_pitch + px;
+        for (uint32_t x = 0; x < FONT_W * scale; x++)
+            line[x] = (bits & (0x80 >> (x / scale))) ? fg : bg;
     }
 }
 
 static void fb_scroll(void)
 {
     if (!fb_base) return;
-    volatile uint32_t *dst = fb_base;
-    volatile uint32_t *src = fb_base + FONT_H * fb_pitch;
-    uint32_t copy = fb_pitch * (fb_height - FONT_H);
+    uint32_t line_px = FONT_H * scale * fb_pitch;   /* one text row */
+    volatile uint32_t *dst = fb_base + text_y0 * fb_pitch;
+    volatile uint32_t *src = dst + line_px;
+    uint32_t copy = (max_rows - 1) * line_px;
     for (uint32_t i = 0; i < copy; i++)
         dst[i] = src[i];
-    volatile uint32_t *bot = fb_base + (fb_height - FONT_H) * fb_pitch;
-    for (uint32_t i = 0; i < fb_pitch * FONT_H; i++)
+    volatile uint32_t *bot = dst + copy;
+    for (uint32_t i = 0; i < line_px; i++)
         bot[i] = BG_COLOR;
 }
 

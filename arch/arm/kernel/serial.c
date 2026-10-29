@@ -6,6 +6,15 @@
 
 #include "../include/hal.h"
 
+/* Every byte also goes to the framebuffer console (a no-op until
+ * fb_init_platform, so always on virt). Framebuffer first: if the UART
+ * stalls, the screen still shows the text. */
+static void out(char c)
+{
+    fb_putc(c);
+    uart_putc(c);
+}
+
 void serial_init(void)
 {
     uart_init();
@@ -14,8 +23,8 @@ void serial_init(void)
 void serial_putchar(char c)
 {
     if (c == '\n')
-        uart_putc('\r');
-    uart_putc(c);
+        out('\r');
+    out(c);
 }
 
 void serial_putc(char c)
@@ -27,8 +36,8 @@ void serial_puts(const char *s)
 {
     while (*s) {
         if (*s == '\n')
-            uart_putc('\r');
-        uart_putc(*s);
+            out('\r');
+        out(*s);
         s++;
     }
 }
@@ -37,14 +46,14 @@ void serial_puthex(uint64_t val, int digits)
 {
     static const char hex[] = "0123456789abcdef";
 
-    uart_putc('0');
-    uart_putc('x');
+    out('0');
+    out('x');
 
     if (digits <= 0) digits = 16;
 
     for (int i = digits - 1; i >= 0; i--) {
         int nibble = (val >> (i * 4)) & 0xF;
-        uart_putc(hex[nibble]);
+        out(hex[nibble]);
     }
 }
 
@@ -54,7 +63,7 @@ void serial_putdec(uint64_t val)
     int i = 0;
 
     if (val == 0) {
-        uart_putc('0');
+        out('0');
         return;
     }
 
@@ -65,7 +74,7 @@ void serial_putdec(uint64_t val)
 
     /* Print in reverse */
     while (i > 0)
-        uart_putc(buf[--i]);
+        out(buf[--i]);
 }
 
 char serial_getc(void)

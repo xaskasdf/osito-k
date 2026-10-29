@@ -334,7 +334,8 @@ framebuffer updates. First boot with uart-first showed black screen.
 - Font: 8x16 VGA bitmap works great (135 cols x 153 rows)
 
 ### 9.5 CPU State at Entry (Confirmed)
-- CPU: Cortex-A55 (little core, MIDR part 0xD05), r4p0
+- CPU: Cortex-A55 (little core, MIDR part 0xD05), r2p0 (MIDR 0x412FD050, read by
+  Osito-K on 2026-10-28)
 - Exception Level: EL1
 - Timer: 19.2 MHz (CNTFRQ_EL0 = 0x124F800)
 - Stack: set our own, 64 KB past the image end. The original fixed 0x85000000

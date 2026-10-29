@@ -43,6 +43,7 @@ char serial_getc(void);
  * ======================================================================== */
 void fb_init_platform(uint64_t base, uint32_t width, uint32_t height,
                       uint32_t stride, uint32_t bpp);
+void fb_set_text_top(uint32_t y);
 void fb_clear(void);
 void fb_putc(char c);
 void fb_puts(const char *s);
