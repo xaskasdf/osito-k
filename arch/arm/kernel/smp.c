@@ -371,6 +371,7 @@ void smp_print_cpus(void)
 
 struct bench_slot {
     uint64_t ticks;                 /* CNTPCT ticks the loop took */
+    uint64_t created, started;      /* CNTPCT at task_create_on, at entry */
     int started_on, ran_on;
     int used;
     volatile int done;
@@ -384,8 +385,9 @@ static void bench_task(void *arg)
 {
     struct bench_slot *s = arg;
     uint64_t x = 0, n = BENCH_ITERS;
-    s->started_on = smp_cpu_id();
     uint64_t t0 = read_cntpct_el0();
+    s->started = t0;
+    s->started_on = smp_cpu_id();
     __asm__ volatile(
         "1:\n"
         ".rept 16\n"
@@ -414,6 +416,7 @@ void smp_bench(int any)
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
 
     int n = 0;
+    int self = smp_cpu_id();
     uint64_t t0 = read_cntpct_el0();
     for (int i = 0; i < BENCH_SLOTS; i++) {
         int cpu = i % MAX_CPUS;
@@ -422,6 +425,7 @@ void smp_bench(int any)
         bench[i].used = cpus[cpu].online && (any || i < MAX_CPUS);
         if (!bench[i].used)
             continue;
+        bench[i].created = read_cntpct_el0();
         if (task_create_on("bench", bench_task, &bench[i], 1,
                            any ? TASK_ANY_CPU : cpu) < 0) {
             bench[i].done = -1;
@@ -443,8 +447,8 @@ void smp_bench(int any)
     uint64_t wall = read_cntpct_el0() - t0;
     __asm__ volatile("dmb ish" : : : "memory");
 
-    uint64_t sum = 0;
-    int moved = 0;
+    uint64_t sum = 0, lat_sum = 0, lat_max = 0;
+    int moved = 0, started = 0;
     serial_puts("task  cpu   core          time    ~MHz\n");
     for (int i = 0; i < BENCH_SLOTS; i++) {
         if (!bench[i].used)
@@ -477,6 +481,16 @@ void smp_bench(int any)
         serial_putdec(16 * BENCH_ITERS * freq / 1000000 / bench[i].ticks);
         serial_puts("\n");
         sum += bench[i].ticks;
+        /* From task_create_on to the task running, on the other CPUs (on
+         * this one it waits for the shell to sleep): how long a CPU took
+         * to notice the new task */
+        if (c0 != self) {
+            uint64_t lat = bench[i].started - bench[i].created;
+            lat_sum += lat;
+            if (lat > lat_max)
+                lat_max = lat;
+            started++;
+        }
     }
     serial_puts("wall ");
     print_ms(wall, freq);
@@ -487,4 +501,11 @@ void smp_bench(int any)
     serial_puts(" tasks, ");
     serial_putdec(moved);
     serial_puts(" changed CPU\n");
+    if (started) {
+        serial_puts("start latency on the other CPUs: avg ");
+        serial_putdec(lat_sum / started * 1000000 / freq);
+        serial_puts(" us, max ");
+        serial_putdec(lat_max * 1000000 / freq);
+        serial_puts(" us\n");
+    }
 }

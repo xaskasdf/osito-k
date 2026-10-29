@@ -164,6 +164,10 @@ scheduler in its own idle task.
 - **SGIs.** SGI 0 = yield, SGI 1 = stop: `kload` calls `smp_stop_aps`, which turns
   the scheduling CPUs off (they take the SGI as soon as IRQs are on, so never while
   holding a lock) before jumping into memory they might still be running from.
+- **Wakeups.** When a task becomes READY (created, woken, or preempted without
+  being picked again) and a CPU that may run it sits in its idle task, the
+  scheduler sends that CPU SGI 0, so it reschedules at once instead of on its next
+  tick. Starting a task on another CPU went from 5.7 ms on average to 4 µs.
 - **Ticks.** Every CPU ticks at 100 Hz, but only the boot CPU's ticks count as time.
 - **Try it:** `cpus` shows what each CPU runs. `cpubench` starts one timed task
   pinned to each CPU, and `cpubench any` starts two unpinned tasks per CPU:
@@ -332,10 +336,15 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
 13. **CPU frequency (2026-10-29).** Boot sets every cluster to its top level through
     EPSS (see "CPU frequency"). `cpubench` now reads 1802 / 2418 / 2840 MHz, and the
     pinned run went from 460 to 192 ms.
+14. **Reschedule IPI (2026-10-29).** Idle CPUs get SGI 0 when there is a task they
+    could run (see "SMP scheduling"). `cpubench` measures the delay from
+    `task_create_on` to the task running on another CPU: 5.7 ms on average (7 ms
+    max) waiting for ticks, now 4 µs (5 µs max). With `cpubench any` it stays in
+    milliseconds, which is queueing, not wakeup: 16 tasks for 8 CPUs.
 
 Still open:
-- **Wakeups wait for a tick.** A CPU picks up a task made READY by another CPU on
-  its next tick (≤10 ms); there is no reschedule IPI.
+- **Nothing balances load.** Unpinned tasks go to whichever CPU is idle or
+  reschedules first, regardless of core type; pinned ones stay put.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
 
