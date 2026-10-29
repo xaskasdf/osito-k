@@ -15,5 +15,7 @@ int  acm_start(uint64_t dwc3_base, uint64_t dma);
 void acm_poll(void);        /* process controller events, push pending TX */
 int  acm_getc(void);        /* next received byte, or -1 */
 void acm_putc(char c);      /* queue a byte for the host (dropped when full) */
+int  acm_tx_idle(void);     /* everything queued has reached the host */
+void acm_stop(void);        /* disconnect from the host and halt the controller */
 
 #endif

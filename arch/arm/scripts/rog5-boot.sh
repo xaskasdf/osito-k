@@ -11,7 +11,13 @@
 # Usage (Git Bash / MSYS2 on Windows, or any Unix shell):
 #   arch/arm/scripts/rog5-boot.sh                 # build + pack -> arch/arm/build/rog5/osito-boot-rog5.img
 #   arch/arm/scripts/rog5-boot.sh --flash         # ... then fastboot flash boot_<slot> + reboot
+#   arch/arm/scripts/rog5-boot.sh --usb           # ... then send the kernel to the running Osito-K
+#                                                 #     over its USB console (`kload`), no flashing
 #   arch/arm/scripts/rog5-boot.sh --virt-check    # also build PLATFORM=virt and boot it in local QEMU
+#
+# --usb needs a kernel with `kload` already running (the flashed one is enough:
+# each loaded kernel can load the next). It leaves boot_a untouched, so a
+# reboot goes back to the flashed kernel.
 #
 # It ships the working tree (arch/arm, gui, include/common), uncommitted
 # changes included.
@@ -40,15 +46,17 @@ PB="${OK_PB:-phone_breaker2}"
 info() { printf '\033[1;36m[rog5]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[rog5] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-FLASH=0; VIRT=0
+FLASH=0; VIRT=0; USB=0
 for a in "$@"; do
     case "$a" in
         --flash)        FLASH=1 ;;
+        --usb)          USB=1 ;;
         --virt-check)   VIRT=1 ;;
         -h|--help)      sed -n '3,/^set -e/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
         *)              die "unknown option: $a (see --help)" ;;
     esac
 done
+[ "$FLASH" = 1 ] && [ "$USB" = 1 ] && die "--flash and --usb are alternatives"
 
 # OpenSSH 10 warns on every connection without a post-quantum kex; the option
 # that silences it doesn't exist in older clients.
@@ -149,4 +157,15 @@ if [ "$FLASH" = 1 ]; then
     info "Flashing boot_$SLOT and rebooting..."
     "$FB" flash "boot_$SLOT" "$OUT_REL"
     "$FB" reboot
+fi
+
+# --- Optional: load over USB --------------------------------------------------
+# The raw Image, not boot.img: the running kernel jumps straight into it.
+if [ "$USB" = 1 ]; then
+    command -v powershell.exe >/dev/null || die "--usb needs powershell.exe (Windows)"
+    mac "cat ~/$MAC_DIR/Image-sm8350" > "$OUT_DIR/Image-sm8350"
+    info "Sending the kernel over USB..."
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+        -File "$(cygpath -w "$SCRIPT_DIR/rog5-kload.ps1")" \
+        -Image "$(cygpath -w "$OUT_DIR/Image-sm8350")"
 fi

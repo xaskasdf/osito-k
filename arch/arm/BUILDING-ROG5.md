@@ -13,14 +13,21 @@ serial port (see "Console over USB").
 From the Windows dev box (Git Bash or MSYS2), phone in fastboot mode (Power + Vol-Down):
 
 ```bash
-arch/arm/scripts/rog5-boot.sh                # build + pack -> arch/arm/build/rog5/osito-boot-rog5.img
-arch/arm/scripts/rog5-boot.sh --flash        # ... + fastboot flash boot_<active slot> + reboot
+arch/arm/scripts/rog5-boot.sh --usb          # build, send to the running kernel over USB, boot it (~15 s)
+arch/arm/scripts/rog5-boot.sh --flash        # build + pack + fastboot flash boot_<active slot> + reboot
+arch/arm/scripts/rog5-boot.sh                # build + pack only -> arch/arm/build/rog5/osito-boot-rog5.img
 arch/arm/scripts/rog5-boot.sh --virt-check   # also build PLATFORM=virt and boot it in local QEMU
 ```
 
 The script ships the working tree (`arch/arm`, `gui`, `include/common`) to the Mac,
 builds there, packs the boot image with the pieces in `~/phone_breaker2`, brings it
-back, checks its SHA-256 and, with `--flash`, flashes it. A full cycle takes ~10 s.
+back and checks its SHA-256. Then it either:
+- `--usb`: hands the raw `Image` to `rog5-kload.ps1`, which runs `kload` on the live
+  kernel's USB console. This is the normal development loop: no buttons, and
+  `boot_a` is untouched, so a reboot returns to the flashed kernel.
+- `--flash`: flashes the image. Needed once, to get a kernel with `kload` onto the
+  phone, or for a build that must survive a reboot. Requires fastboot mode
+  (Power + Vol-Down).
 
 Where things live:
 
@@ -76,6 +83,18 @@ How it works (`platform/sm8350/usb.c`, `dwc3_acm.c`):
   the shell waits for input. Output is queued in an 8 KB ring and drains once the
   shell is back at the prompt; a long-running command's output arrives at the end.
   Bytes sent before the host opens the port are discarded by Windows.
+- **Flow control.** Bulk OUT is armed only when a full 2 KB transfer fits in the
+  8 KB receive ring; until then the controller NAKs the host.
+
+**Loading kernels (`kload`, `platform/sm8350/kload.c`).** The shell command prints
+`kload: ready` and expects `"OKLD"`, the Image size and its CRC-32 (u32
+little-endian each), then the raw Image. It stores the Image in freshly allocated
+pages, checks the CRC and the ARM64 header magic, waits for its reply to reach
+the host, disconnects USB, stops the timer, invalidates the I-cache and jumps
+with the shim's entry state. The Image runs wherever it landed. That works because
+the kernel is PC-relative and `mem_init` reserves everything from the RAM base up
+to the running kernel's end; the old kernel's memory is simply abandoned. Each
+generation lands a little higher (e.g. `0xA86A9000`). 500 KB transfer in ~2.5 s.
 
 ---
 
@@ -150,6 +169,9 @@ offset `0x603C` = a config-space read in `pci_scan`.
 6. **USB serial console.** See "Console over USB". Getting there took the PIPE-clock
    switch, which fixed the endpoint commands that hung, and the VBUS override. The
    console scroll also had to go, because it delayed shell output by ~1 s per line.
+7. **Kernels over USB.** `kload` plus `rog5-boot.sh --usb` replaced flashing for
+   every test build. The edit-build-boot loop went from fastboot plus buttons
+   (~1 min) to ~15 s, hands-off.
 
 Still open:
 - **Stored pointers.** The kernel runs ~0x20180000 above its link address, so any
@@ -632,6 +654,8 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/kernel/mem.S` | Out-of-line memset/memcpy/memmove (GCC and gui/ need the symbols) |
 | `arch/arm/platform/sm8350/usb.c` | USB state report, SMMU 1:1 check, gadget start |
 | `arch/arm/platform/sm8350/dwc3_acm.c` | Polled DWC3 device driver + CDC-ACM serial function |
+| `arch/arm/platform/sm8350/kload.c` | `kload`: receive a kernel Image over USB and jump to it |
+| `arch/arm/scripts/rog5-kload.ps1` | Host side of `kload` (used by `rog5-boot.sh --usb`) |
 | `arch/arm/include/sm8350.h` | Hardware register definitions (verified) |
 | `arch/arm/include/aarch64.h` | System register helpers |
 | `arch/arm/platform/sm8350/` | Platform-specific code |

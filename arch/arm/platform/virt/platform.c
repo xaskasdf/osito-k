@@ -28,6 +28,13 @@ void platform_probe_devices(void)
 {
 }
 
+/* QEMU loads the kernel itself (-kernel) */
+int platform_kload(void)
+{
+    serial_puts("kload: only on SM8350 (USB console)\n");
+    return -1;
+}
+
 void platform_reboot(void)
 {
     /* PSCI SYSTEM_RESET via SMC */

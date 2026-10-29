@@ -118,6 +118,7 @@
 #define EP0_MPS             64
 #define BULK_MPS            512
 #define TX_CHUNK            511             /* < BULK_MPS: every transfer ends short, no ZLP needed */
+#define RX_XFER             2048            /* multiple of BULK_MPS; a short packet ends it early */
 
 /* ── Descriptors ─────────────────────────────────────────────── */
 
@@ -161,7 +162,7 @@ static int rx_active, tx_active;
 static uint32_t tx_rsc, rx_rsc;
 
 #define TX_RING 8192
-#define RX_RING 512
+#define RX_RING 8192
 static volatile uint8_t tx_ring[TX_RING];
 static volatile uint32_t tx_head, tx_tail;
 static volatile uint8_t rx_ring[RX_RING];
@@ -312,6 +313,8 @@ static void ep0_recv(uint8_t req)
     ep0_rsc = start_xfer(0, TRB_EP0, DMA_EP0BUF, EP0_MPS, TRB_DATA);
 }
 
+static void rx_refill(void);
+
 static void acm_configure(void)
 {
     ep_config(2, 2, BULK_MPS, 0, 0);
@@ -320,8 +323,8 @@ static void acm_configure(void)
     wr(DALEPENA, rd(DALEPENA) | (1U << 2) | (1U << 3) | (1U << 5));
     configured = 1;
     tx_active = 0;
-    rx_active = 1;
-    rx_rsc = start_xfer(2, TRB_RX, DMA_RXBUF, BULK_MPS, TRB_NORMAL);
+    rx_active = 0;
+    rx_refill();
 }
 
 static void acm_deconfigure(void)
@@ -472,19 +475,32 @@ static void ep0_event(int phys, uint32_t type, uint32_t status)
 
 /* ── Bulk data ───────────────────────────────────────────────── */
 
+static uint32_t rx_free(void)
+{
+    return (rx_tail + RX_RING - rx_head - 1) % RX_RING;
+}
+
+/* Arm bulk OUT only when a whole transfer fits in the ring. Until then the
+ * controller NAKs the host, which is the flow control for bulk uploads. */
+static void rx_refill(void)
+{
+    if (!configured || rx_active || rx_free() < RX_XFER)
+        return;
+    rx_active = 1;
+    rx_rsc = start_xfer(2, TRB_RX, DMA_RXBUF, RX_XFER, TRB_NORMAL);
+}
+
 static void rx_complete(void)
 {
     volatile uint32_t *trb = (volatile uint32_t *)dma_ptr(DMA_TRB(TRB_RX));
-    uint32_t n = BULK_MPS - (trb[2] & 0xFFFFFF);
+    uint32_t n = RX_XFER - (trb[2] & 0xFFFFFF);
     volatile uint8_t *buf = dma_ptr(DMA_RXBUF);
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t next = (rx_head + 1) % RX_RING;
-        if (next == rx_tail)
-            break;                              /* full: drop */
-        rx_ring[rx_head] = buf[i];
-        rx_head = next;
+        rx_ring[rx_head] = buf[i];              /* rx_refill guaranteed room */
+        rx_head = (rx_head + 1) % RX_RING;
     }
-    rx_rsc = start_xfer(2, TRB_RX, DMA_RXBUF, BULK_MPS, TRB_NORMAL);
+    rx_active = 0;
+    rx_refill();
 }
 
 static void tx_kick(void)
@@ -562,6 +578,7 @@ void acm_poll(void)
     }
     if (count)
         wr(GEVNTCOUNT, count);
+    rx_refill();
     tx_kick();
 }
 
@@ -572,6 +589,21 @@ int acm_getc(void)
     int c = rx_ring[rx_tail];
     rx_tail = (rx_tail + 1) % RX_RING;
     return c;
+}
+
+int acm_tx_idle(void)
+{
+    return !started || !configured || (!tx_active && tx_head == tx_tail);
+}
+
+void acm_stop(void)
+{
+    if (!started)
+        return;
+    wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);        /* host sees a disconnect */
+    for (int i = 0; i < 1000 && !(rd(DSTS) & DSTS_DEVCTRLHLT); i++)
+        udelay(100);
+    started = configured = 0;
 }
 
 void acm_putc(char c)

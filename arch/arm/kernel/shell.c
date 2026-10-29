@@ -49,6 +49,7 @@ static void cmd_help(void)
     serial_puts("  beep     Play a tone\n");
     serial_puts("  desktop  Launch graphical desktop\n");
     serial_puts("  reboot   Reboot system\n");
+    serial_puts("  kload    Receive a kernel over USB and run it\n");
     serial_puts("  clear    Clear screen\n");
 }
 
@@ -285,6 +286,7 @@ void shell_run(void)
         else if (strcmp(argv[0], "mem") == 0)     cmd_mem();
         else if (strcmp(argv[0], "uname") == 0)   cmd_uname();
         else if (strcmp(argv[0], "uptime") == 0)  cmd_uptime();
+        else if (strcmp(argv[0], "kload") == 0)   platform_kload();
         else if (strcmp(argv[0], "ls") == 0)      cmd_ls();
         else if (strcmp(argv[0], "cat") == 0)    cmd_cat(argc, argv);
         else if (strcmp(argv[0], "exec") == 0) {
