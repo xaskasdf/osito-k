@@ -44,6 +44,7 @@ void serial_puts(const char *s);
 void serial_puthex(uint64_t val, int digits);
 void serial_putdec(uint64_t val);
 char serial_getc(void);
+void klog_dump(void);       /* replay the console log (shell `dmesg`) */
 
 /* ========================================================================
  * Framebuffer

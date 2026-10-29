@@ -61,7 +61,9 @@ test IDs), serial `0001`. Windows 10+ binds its inbox `usbser.sys` and creates a
 port (COM3 on the dev box); find it with
 `Get-CimInstance Win32_SerialPort | ? PNPDeviceID -match VID_1209`. Open it with
 PuTTY or any terminal; the baud rate doesn't matter. Everything the kernel prints
-goes there as well as to the screen, and keystrokes feed the shell.
+goes there as well as to the screen, and keystrokes feed the shell. Boot messages
+come out before the port can be opened. `dmesg` replays them from a 16 KB log
+(`kernel/serial.c`).
 
 How it works (`platform/sm8350/usb.c`, `dwc3_acm.c`):
 - **State left by ABL.** ABL leaves `usb_1` (DWC_usb31, `0x0A600000`) powered,
@@ -83,7 +85,10 @@ How it works (`platform/sm8350/usb.c`, `dwc3_acm.c`):
 - **Polled, no IRQs.** `uart_trygetc` calls `acm_poll()`, so USB is serviced while
   the shell waits for input. Output is queued in an 8 KB ring and drains once the
   shell is back at the prompt; a long-running command's output arrives at the end.
-  Bytes sent before the host opens the port are discarded by Windows.
+  If the ring fills while the host has the port open (DTR), `acm_putc` services USB
+  until there is room, so long output arrives whole. With nobody reading, it drops
+  bytes instead of stalling. Bytes sent before the host opens the port are
+  discarded by Windows; use `dmesg`.
 - **Flow control.** Bulk OUT is armed only when a full 2 KB transfer fits in the
   8 KB receive ring; until then the controller NAKs the host.
 

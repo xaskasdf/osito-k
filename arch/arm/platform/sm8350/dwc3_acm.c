@@ -156,6 +156,9 @@ static uint8_t ep0_out_req;                 /* class request waiting for OUT dat
 
 static int rx_active, tx_active;
 static uint32_t tx_rsc, rx_rsc;
+static int dtr;                 /* the host has the port open */
+static int in_poll;             /* acm_poll runs and may print: don't recurse */
+static int tx_stalled;          /* a wait for TX room timed out; drop until TX moves */
 
 #define TX_RING 8192
 #define RX_RING 8192
@@ -331,7 +334,7 @@ static void acm_deconfigure(void)
         end_xfer(3, tx_rsc);
     rx_active = tx_active = 0;
     wr(DALEPENA, 3);
-    configured = 0;
+    configured = dtr = 0;
 }
 
 static void ep0_get_descriptor(uint16_t wvalue, uint16_t wlength)
@@ -422,13 +425,15 @@ static void ep0_setup(void)
             ep0_send(line_coding, 7, wlength);
             return;
         case 0x22:                              /* SET_CONTROL_LINE_STATE */
-            if (log_ok()) {
+            /* Windows repeats it several times per open/close: log changes */
+            if ((wvalue & 1) != dtr && log_ok()) {
                 serial_puts("[USB ] host port ");
                 if (wvalue & 1)
                     serial_puts("open\n");
                 else
                     serial_puts("closed\n");
             }
+            dtr = wvalue & 1;
             ep0_ack();
             return;
         case 0x23:                              /* SEND_BREAK */
@@ -551,8 +556,9 @@ static void dev_event(uint32_t ev)
 
 void acm_poll(void)
 {
-    if (!started)
+    if (!started || in_poll)
         return;
+    in_poll = 1;
     uint32_t count = rd(GEVNTCOUNT) & 0xFFFC;
     for (uint32_t done = 0; done < count; done += 4) {
         uint32_t ev = *(volatile uint32_t *)dma_ptr(DMA_EVT + evt_pos);
@@ -570,12 +576,13 @@ void acm_poll(void)
         else if (type == DEPEVT_XFERCOMPLETE && phys == 2 && rx_active)
             rx_complete();
         else if (type == DEPEVT_XFERCOMPLETE && phys == 3)
-            tx_active = 0;
+            tx_active = tx_stalled = 0;
     }
     if (count)
         wr(GEVNTCOUNT, count);
     rx_refill();
     tx_kick();
+    in_poll = 0;
 }
 
 int acm_getc(void)
@@ -605,6 +612,17 @@ void acm_stop(void)
 void acm_putc(char c)
 {
     uint32_t next = (tx_head + 1) % TX_RING;
+    /* Ring full: if a host is reading, service USB until there is room, so
+     * long output (dmesg, help) arrives whole. With no reader, or one that
+     * stopped reading for ~50 ms, drop instead of stalling the kernel. */
+    for (int i = 0; next == tx_tail && configured && dtr && !in_poll && !tx_stalled; i++) {
+        if (i == 50000) {
+            tx_stalled = 1;
+            break;
+        }
+        acm_poll();
+        udelay(1);
+    }
     if (next == tx_tail)
         return;                                 /* full: drop */
     tx_ring[tx_head] = (uint8_t)c;

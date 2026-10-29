@@ -6,13 +6,39 @@
 
 #include "../include/hal.h"
 
+/* Kernel log: the last KLOG_SIZE bytes of console output, for `dmesg`. On
+ * SM8350 the boot messages are printed before the host can open the USB
+ * console, and the framebuffer console wraps over them. */
+#define KLOG_SIZE 16384
+static char klog[KLOG_SIZE];
+static uint32_t klog_total;         /* bytes ever logged; wraps the ring */
+static int klog_muted;
+
+static void out_raw(char c)
+{
+    fb_putc(c);
+    uart_putc(c);
+}
+
 /* Every byte also goes to the framebuffer console (a no-op until
  * fb_init_platform, so always on virt). Framebuffer first: if the UART
  * stalls, the screen still shows the text. */
 static void out(char c)
 {
-    fb_putc(c);
-    uart_putc(c);
+    if (!klog_muted)
+        klog[klog_total++ % KLOG_SIZE] = c;
+    out_raw(c);
+}
+
+/* Replay the log; muted so the replay doesn't log itself over the ring */
+void klog_dump(void)
+{
+    uint32_t end = klog_total;
+    uint32_t start = end > KLOG_SIZE ? end - KLOG_SIZE : 0;
+    klog_muted = 1;
+    for (uint32_t i = start; i < end; i++)
+        out_raw(klog[i % KLOG_SIZE]);
+    klog_muted = 0;
 }
 
 void serial_init(void)
