@@ -9,7 +9,9 @@
  * usb.c handles clocks and checks the SMMU.
  *
  * Programming model: Linux drivers/usb/dwc3 (core.h, gadget.c, ep0.c).
- * The D-cache is off on SM8350, so DMA buffers need no cache maintenance.
+ * The event buffer, TRBs and data buffers come from the uncached DMA window
+ * (mmu.c), so they need no cache maintenance, but they do need barriers
+ * against the registers (rd/wr).
  */
 
 #include "../../include/hal.h"
@@ -171,8 +173,25 @@ static int log_budget = 40;                 /* enumeration log lines on the cons
 
 /* ── Low level ───────────────────────────────────────────────── */
 
-static uint32_t rd(uint32_t off) { return mmio_read32(dwc + off); }
-static void wr(uint32_t off, uint32_t v) { mmio_write32(dwc + off, v); }
+/* As Linux's readl/writel. The DMA window is Normal non-cacheable memory and
+ * the registers are Device memory, and Arm orders neither against the
+ * other: a TRB store could land after the DEPCMD write that starts the
+ * transfer, and the event buffer or a SETUP packet could be read before the
+ * GEVNTCOUNT read that says it's there. Until these barriers, servicing
+ * the gadget from an A55 at 403 MHz wedged EP0 within seconds (2026-10-29);
+ * at 1.8 GHz, and from the big cores, it never showed. */
+static uint32_t rd(uint32_t off)
+{
+    uint32_t v = mmio_read32(dwc + off);
+    __asm__ volatile("dmb oshld" ::: "memory");
+    return v;
+}
+
+static void wr(uint32_t off, uint32_t v)
+{
+    __asm__ volatile("dmb oshst" ::: "memory");
+    mmio_write32(dwc + off, v);
+}
 
 static volatile uint8_t *dma_ptr(uint32_t off)
 {
@@ -578,8 +597,12 @@ void acm_poll(void)
         else if (type == DEPEVT_XFERCOMPLETE && phys == 3)
             tx_active = tx_stalled = 0;
     }
-    if (count)
+    if (count) {
+        /* The event reads above finish before the controller may reuse
+         * those slots (wr only orders stores) */
+        __asm__ volatile("dmb osh" ::: "memory");
         wr(GEVNTCOUNT, count);
+    }
     rx_refill();
     tx_kick();
     in_poll = 0;

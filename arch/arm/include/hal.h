@@ -98,6 +98,7 @@ void smp_bench(int any, int count);     /* shell `cpubench [any [n]]` */
 void smp_bench_mix(void);               /* shell `cpubench mix` */
 void smp_burn(int cpu, int seconds);    /* shell `burn`; cpu -1 = all */
 int  smp_cpu_id(void);          /* kernel/sched.c: this CPU's core number */
+uint64_t smp_cpu_ticks(int cpu);    /* timer ticks it took: 0 = never ran */
 
 /* ========================================================================
  * Memory manager (kernel/memory.c)
@@ -173,6 +174,10 @@ int  task_create_on(const char *name, task_func_t func, void *arg, int priority,
                     int cpu);
 /* Relative speed of a CPU (cpufreq): unpinned tasks prefer the fastest */
 void sched_set_capacity(int cpu, uint32_t capacity);
+int  task_self(void);                   /* the calling task's id */
+/* Move task id to cpu (or TASK_ANY_CPU); the caller moves before this
+ * returns. Returns where it was pinned, -2 for a bad id or CPU. */
+int  task_pin(int id, int cpu);
 void task_yield(void);
 void task_delay_ms(uint32_t ms);
 void sched_start(void);

@@ -43,6 +43,7 @@ static void cmd_help(void)
     serial_puts("  cpubench Timed task per CPU, all at once [any [n]: n unpinned]\n");
     serial_puts("           [mix: busy + light unpinned tasks, where they settle]\n");
     serial_puts("  cpufreq  CPU frequencies [max | min | <domain> <level>]\n");
+    serial_puts("           [l3 | try <domain> <level> <s> [stay|busy]: watched run]\n");
     serial_puts("  temp     Temperature sensors, CPU thermal limit [limit <cap> <release>]\n");
     serial_puts("  burn     Keep CPUs busy in the background <cpu|all> <seconds>\n");
     serial_puts("  echo     Print text\n");

@@ -87,7 +87,20 @@ How it works (`platform/sm8350/usb.c`, `dwc3_acm.c`):
   addresses work as-is. `usb.c` checks this on every boot (and can walk the stage-1
   tables if a future ABL turns translation on) and won't start the gadget otherwise.
   The DMA buffers come from the uncached DMA window (see "MMU and caches"), so
-  they need no cache maintenance.
+  they need no cache maintenance. They do need barriers: see below.
+- **Barriers.** The DMA window is Normal non-cacheable memory, and the
+  controller's registers are Device memory. Arm orders neither against the other.
+  So `rd()` / `wr()` in `dwc3_acm.c` work as Linux's `readl` / `writel`:
+  - `dmb oshld` after a register read, so the event buffer and SETUP packet are
+    read only after `GEVNTCOUNT` says they are there;
+  - `dmb oshst` before a register write, so a TRB is complete before `DEPCMD`
+    starts it;
+  - `dmb osh` before handing event slots back.
+
+  Without them, servicing the gadget from an A55 at 403 MHz wedged EP0 on the
+  second port open/close. The CPUs kept running, and the console stayed dead even
+  at full speed. At 1.8 GHz, or from a big core, it never showed. Any new driver
+  that DMAs needs the same.
 - **Polled, no IRQs.** `uart_trygetc` calls `acm_poll()`, so USB is serviced while
   the shell waits for input. Output is queued in an 8 KB ring and drains once the
   shell is back at the prompt; a long-running command's output arrives at the end.
@@ -242,19 +255,42 @@ It works both ways: A78s at 1670 MHz (764 mV) keep the X1 at 2035 MHz (740 mV).
 So lowering one big cluster alone does nothing; this looked like a drop that
 "took seconds" until the X1 came down too.
 
-**The A55s stay at their top level.** Lowering them hung the machine twice within
-seconds (to the alternate clock, level 0, and to 403 MHz, level 1): the USB console
-stopped answering, with no panic band. In a photo of the hung screen, cpu0-3's
-heartbeat squares were dark and cpu4-7's lit. Linux lowers this domain all the time,
-so something it sets up is missing here; one suspect is the L3 cache's frequency,
-which Linux votes on and Osito-K leaves alone. Until that is understood, `cpufreq`
-refuses to change domain 0, and the A55s barely warm up anyway.
+**Lowering the A55s once "hung the machine".** Twice, the USB console died a
+few seconds after the A55s went down (to the alternate clock, then to 403 MHz),
+with no panic band. `cpufreq try` (below) showed what was actually happening:
+- With the shell moved to a big core, all four A55s ran 10 s at 403 MHz, idle
+  or busy, without missing a tick.
+- With the shell, and so the USB polling, left on cpu0, the console wedged on the
+  second port open/close. Meanwhile, every A55 kept ticking.
+
+The bug was in the USB gadget, which lacked barriers (see "Console over USB").
+With them, the A55s at 403 MHz took 48 shell commands in a row, each with its own
+port open/close, including `cpubench` (402 MHz) and `dmesg`. The L3 cache, which
+has its own EPSS block (`0x18590000`, `cpufreq l3`), stayed at 1248 MHz / 712 mV
+in every `cpufreq try` run, whatever the A55s did. The alternate-clock level 0 is
+still unused.
 
 - `cpufreq` lists each domain's frequency and voltage now, and its levels as
   MHz@mV.
-- `cpufreq max` / `cpufreq min` set the big clusters to their top / lowest level.
+- `cpufreq max` / `cpufreq min` set every domain to its top / lowest PLL level.
 - `cpufreq <domain> <level>` sets one and reports every domain on its rail, e.g.
   `cpu4-6: 1440 MHz, set to 710 MHz (the other cluster holds their shared rail up)`.
+- `cpufreq try <domain> <level> <seconds> [stay | busy]` runs a level that might take
+  its CPUs down, under a watcher.
+  - A task pinned outside the domain samples every 50 ms, with its IRQs off: the
+    domain's state, the L3's, and each of the domain's CPUs' timer ticks.
+  - If a CPU goes 1 s without a tick, the watcher puts the level back at once.
+  - It prints a table: per 0.5 s, the MHz / mV / level and the ticks (50 = none
+    missed).
+  - The shell (and the USB console) moves out of the domain for the run, unless
+    `stay` is given.
+  - `busy` keeps the domain's CPUs busy meanwhile.
+  - A bar under the heartbeat squares, drawn without the console lock, gives the
+    verdict even if the console dies: yellow while it runs, green if every CPU
+    kept ticking, red if one stopped.
+- `cpufreq l3` dumps the L3 block read-only: its level table (`0x100`, 300–1593
+  MHz) and the words around the state (`0x020`, same layout as a CPU domain's)
+  and vote registers.
 
 Each level change also updates the scheduler's capacity for those CPUs (see
 "Placement by load"). `cpus` shows it.
@@ -438,11 +474,19 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
 18. **Temperature limit (2026-10-29).** TSENS sensors, the `temp` command and a
     thermal task that caps the big clusters (see "Temperature"). Two findings on
     the way, both in "CPU frequency". First, the A78s and the X1 share a voltage
-    rail, so the governor lowers them together. Second, lowering the A55s hangs
-    the machine, so they stay at their top level.
+    rail, so the governor lowers them together. Second, lowering the A55s seemed
+    to hang the machine, so for a while they stayed at their top level (item 19).
+19. **USB barriers (2026-10-29).** The A55 "hang" was the USB gadget. Its driver
+    had no barriers between the DMA window (Normal non-cacheable) and the
+    controller's registers (Device). It was written while the D-cache was off,
+    when every access was Device memory and ordered. With the shell polling USB
+    from an A55 at 403 MHz, EP0 wedged on the second port open/close, while all
+    four A55s kept ticking. With `readl`/`writel`-style barriers, 48 commands in a
+    row went through at 403 MHz, and the A55s can be lowered again (see "Console
+    over USB" and "CPU frequency"). `cpufreq try` found it: it moves the shell to
+    a big core and watches the lowered CPUs' ticks from another.
 
 Still open:
-- Why lowering the A55 cluster hangs (see "CPU frequency").
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
 

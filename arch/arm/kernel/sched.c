@@ -51,6 +51,10 @@ int smp_cpu_id(void) {
     return this_cpu()->id;
 }
 
+uint64_t smp_cpu_ticks(int cpu) {
+    return ((volatile struct cpu_sched *)&cpu_sched[cpu])->ticks;
+}
+
 /* Take a free slot and build the task's first context. Caller holds
  * sched_lock. */
 static task_tcb_t *task_alloc(const char *name, task_func_t func, void *arg,
@@ -186,6 +190,31 @@ int task_create_on(const char *name, task_func_t func, void *arg, int priority,
 
 int task_create(const char *name, task_func_t func, void *arg, int priority) {
     return task_create_on(name, func, arg, priority, boot_cpu);
+}
+
+int task_self(void) {
+    return current_task->id;
+}
+
+/* Pin a task to a CPU that runs the scheduler, or let it run anywhere. The
+ * calling task moves at once; another one at its CPU's next reschedule. */
+int task_pin(int id, int cpu) {
+    if (id < 0 || id >= MAX_TASKS ||
+        (cpu != TASK_ANY_CPU && (cpu < 0 || cpu >= MAX_CPUS || !cpu_sched[cpu].current)))
+        return -2;
+    uint64_t flags = spin_lock_irqsave(&sched_lock);
+    task_tcb_t *t = &task_pool[id];
+    int was = t->cpu;
+    t->cpu = (int8_t)cpu;
+    int self = t == current_task;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    if (self) {
+        task_yield();
+        /* until the yield SGI lands and another CPU picks this task up */
+        while (cpu != TASK_ANY_CPU && smp_cpu_id() != cpu)
+            ;
+    }
+    return was;
 }
 
 /* From the IRQ handler (IRQs off), on this CPU's IRQ stack */

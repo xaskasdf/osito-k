@@ -11,8 +11,8 @@
  * The limit: every 100 ms the "thermal" task takes the hottest big-core
  * sensor and moves the cpufreq caps of both big clusters one level down
  * above 95 C, one level up below 85 C. Both together: they share a voltage
- * rail, so capping one alone changes nothing (cpufreq.c). The A55s stay
- * at their top level (cpufreq.c too) and barely warm up anyway. Android's die trips for these zones are 108-125
+ * rail, so capping one alone changes nothing (cpufreq.c). The A55s barely
+ * warm up, so they aren't capped. Android's die trips for these zones are 108-125
  * C; its everyday control works from skin temperature, which Osito-K
  * doesn't read, so these are lower. The limits hardware (LMh) still
  * throttles on its own.
