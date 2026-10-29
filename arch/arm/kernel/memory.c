@@ -8,6 +8,10 @@
 
 #include "../include/hal.h"
 #include "../include/types.h"
+#include "../include/spinlock.h"
+
+/* Tasks on several CPUs allocate; the zeroing happens outside the lock */
+static spinlock_t mem_lock;
 
 /* ── Bitmap allocator ────────────────────────────────────── */
 
@@ -93,6 +97,7 @@ int mem_reserve_range(uint64_t phys, uint64_t count)
 {
     uint64_t start_page = phys >> PAGE_SHIFT;
     uint64_t reserved = 0;
+    uint64_t flags = spin_lock_irqsave(&mem_lock);
     for (uint64_t i = 0; i < count; i++) {
         uint64_t p = start_page + i;
         if (bitmap_test(p)) {
@@ -101,6 +106,7 @@ int mem_reserve_range(uint64_t phys, uint64_t count)
             reserved++;
         }
     }
+    spin_unlock_irqrestore(&mem_lock, flags);
     return (int)reserved;
 }
 
@@ -108,7 +114,7 @@ int mem_reserve_range(uint64_t phys, uint64_t count)
 
 void *mem_alloc_pages(uint64_t count)
 {
-    if (count == 0 || free_pages < count)
+    if (count == 0)
         return (void *)0;
 
     uint64_t start_page = ram_base >> PAGE_SHIFT;
@@ -116,8 +122,11 @@ void *mem_alloc_pages(uint64_t count)
 
     uint64_t run_start = 0;
     uint64_t run_len = 0;
+    void *addr = (void *)0;
 
-    for (uint64_t p = start_page; p < end_page && p < MAX_PHYS_PAGES; p++) {
+    uint64_t flags = spin_lock_irqsave(&mem_lock);
+    for (uint64_t p = start_page; p < end_page && p < MAX_PHYS_PAGES &&
+                                  free_pages >= count; p++) {
         if (bitmap_test(p)) {
             if (run_len == 0) run_start = p;
             run_len++;
@@ -126,16 +135,18 @@ void *mem_alloc_pages(uint64_t count)
                     bitmap_clear(run_start + i);
                     free_pages--;
                 }
-                void *addr = (void *)(run_start << PAGE_SHIFT);
-                memset(addr, 0, count * PAGE_SIZE);
-                return addr;
+                addr = (void *)(run_start << PAGE_SHIFT);
+                break;
             }
         } else {
             run_len = 0;
         }
     }
+    spin_unlock_irqrestore(&mem_lock, flags);
 
-    return (void *)0;
+    if (addr)
+        memset(addr, 0, count * PAGE_SIZE);
+    return addr;
 }
 
 /* ── Allocate aligned pages (for page tables, DMA) ──────── */
@@ -148,7 +159,9 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
 
     uint64_t start_page = ram_base >> PAGE_SHIFT;
     uint64_t end_page = start_page + ram_pages;
+    void *addr = (void *)0;
 
+    uint64_t flags = spin_lock_irqsave(&mem_lock);
     for (uint64_t p = start_page; p < end_page && p < MAX_PHYS_PAGES; p++) {
         if (p % align_pages != 0) continue;
 
@@ -162,15 +175,16 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
                 bitmap_clear(p + i);
                 free_pages--;
             }
-            void *addr = (void *)(p << PAGE_SHIFT);
-            /* Skip memset for large allocs (>64KB) — too slow on QEMU TCG */
-            if (pages <= 16)
-                memset(addr, 0, pages * PAGE_SIZE);
-            return addr;
+            addr = (void *)(p << PAGE_SHIFT);
+            break;
         }
     }
+    spin_unlock_irqrestore(&mem_lock, flags);
 
-    return (void *)0;
+    /* Skip memset for large allocs (>64KB) — too slow on QEMU TCG */
+    if (addr && pages <= 16)
+        memset(addr, 0, pages * PAGE_SIZE);
+    return addr;
 }
 
 /* ── Free pages ─────────────────────────────────────────── */
@@ -178,10 +192,12 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
 void mem_free_pages(void *addr, uint64_t count)
 {
     uint64_t start_page = (uint64_t)addr >> PAGE_SHIFT;
+    uint64_t flags = spin_lock_irqsave(&mem_lock);
     for (uint64_t i = 0; i < count; i++) {
         bitmap_set(start_page + i);
         free_pages++;
     }
+    spin_unlock_irqrestore(&mem_lock, flags);
 }
 
 /* ── Info ────────────────────────────────────────────────── */

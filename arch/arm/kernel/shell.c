@@ -40,6 +40,7 @@ static void cmd_help(void)
     serial_puts("  exec     Run ELF binary\n");
     serial_puts("  ping     Ping IP address\n");
     serial_puts("  cpus     List the online CPUs\n");
+    serial_puts("  cpubench Timed task per CPU, all at once (any: not pinned)\n");
     serial_puts("  echo     Print text\n");
     serial_puts("  hexdump  Hex dump file\n");
     serial_puts("  df       Filesystem free space\n");
@@ -55,8 +56,8 @@ static void cmd_help(void)
 
 static void cmd_ps(void)
 {
-    serial_puts("ID  State    Pri  Ticks   Name\n");
-    serial_puts("--  -------  ---  ------  ----\n");
+    serial_puts("ID  State    Pri  CPU  Ticks   Name\n");
+    serial_puts("--  -------  ---  ---  ------  ----\n");
     for (int i = 0; i < MAX_TASKS; i++) {
         if (task_pool[i].state == TASK_STATE_FREE) continue;
 
@@ -81,6 +82,10 @@ static void cmd_ps(void)
         if (task_pool[i].priority < 10) serial_puts(" ");
         serial_putdec(task_pool[i].priority);
         serial_puts("   ");
+
+        /* CPU it runs or last ran on; '*' = not pinned */
+        serial_putdec(task_pool[i].on_cpu);
+        serial_puts(task_pool[i].cpu == TASK_ANY_CPU ? "*   " : "    ");
 
         /* Ticks */
         serial_putdec(task_pool[i].ticks_run);
@@ -316,6 +321,9 @@ void shell_run(void)
         }
         else if (strcmp(argv[0], "cpus") == 0) {
             smp_print_cpus();
+        }
+        else if (strcmp(argv[0], "cpubench") == 0) {
+            smp_bench(argc > 1 && strcmp(argv[1], "any") == 0);
         }
         else if (strcmp(argv[0], "svctest") == 0) {
             /* Inline SVC test — no ELF loading */

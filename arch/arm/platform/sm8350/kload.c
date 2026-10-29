@@ -27,15 +27,21 @@
 
 /* Next byte from the USB console; -1 after BYTE_TIMEOUT_MS of silence. The
  * controller is only serviced when the ring is empty: polling it per byte
- * (an uncached MMIO read each time) held uploads to ~80 KB/s. */
+ * (an uncached MMIO read each time) held uploads to ~80 KB/s. The gadget is
+ * shared with other CPUs' output, hence the console lock, taken per access
+ * so they aren't held off for the whole transfer. */
 static int read_byte(void)
 {
+    uint64_t flags = console_lock();
     int c = acm_getc();
+    console_unlock(flags);
     if (c >= 0)
         return c;
     for (uint32_t waited_us = 0; waited_us < BYTE_TIMEOUT_MS * 1000; waited_us += 20) {
+        flags = console_lock();
         acm_poll();
         c = acm_getc();
+        console_unlock(flags);
         if (c >= 0)
             return c;
         udelay(20);
@@ -131,12 +137,14 @@ int platform_kload(void)
     serial_puts(" bytes, crc ok, starting it at ");
     serial_puthex((uint64_t)(uintptr_t)buf, 10);
     serial_puts("\n");
+    /* Stop the other CPUs first: they run from memory the new kernel will
+     * reuse, and they could print into the gadget being shut down */
+    smp_stop_aps();
     for (int i = 0; i < 25000 && !acm_tx_idle(); i++) {     /* up to ~0.5 s */
         acm_poll();
         udelay(20);
     }
     mdelay(200);        /* let the host app read it before the port disappears */
     acm_stop();
-    smp_stop_aps();     /* they run from memory the new kernel will reuse */
     mmu_off_and_jump((uint64_t)(uintptr_t)buf);
 }

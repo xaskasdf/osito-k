@@ -45,6 +45,10 @@ void serial_puthex(uint64_t val, int digits);
 void serial_putdec(uint64_t val);
 char serial_getc(void);
 void klog_dump(void);       /* replay the console log (shell `dmesg`) */
+/* Exclusive use of the console devices (USB gadget, framebuffer) across
+ * CPUs, IRQs off; nests on one CPU. serial_* take it themselves. */
+uint64_t console_lock(void);
+void     console_unlock(uint64_t flags);
 
 /* ========================================================================
  * Framebuffer
@@ -53,6 +57,9 @@ void fb_init_platform(uint64_t base, uint32_t width, uint32_t height,
                       uint32_t stride, uint32_t bpp);
 void fb_set_text_top(uint32_t y);
 void fb_clear(void);
+void fb_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
+/* Per-CPU status square in the heartbeat row (SM8350 screen) */
+#define FB_CPU_MARK(cpu, color)  fb_fill((cpu) * 70, 420, 60, 30, (color))
 void fb_putc(char c);
 void fb_puts(const char *s);
 void fb_puts_color(const char *s, uint32_t color);
@@ -68,10 +75,17 @@ const char *cpu_core_name(uint64_t midr);  /* "Cortex-A55"..., NULL if unknown *
 /* ========================================================================
  * SMP (kernel/smp.c)
  * ======================================================================== */
+#define MAX_CPUS    8
+
 void smp_boot_aps(int num_cpus, int psci_use_smc);
+void smp_release_aps(void);     /* online APs start scheduling (sched_start) */
 void smp_stop_aps(void);        /* before handing the machine to another kernel */
+void smp_cpu_off(void);         /* this CPU, for good (SGI_STOP) */
+int  smp_this_core(void);       /* core number from MPIDR */
 int  smp_get_cpu_count(void);
 void smp_print_cpus(void);
+void smp_bench(int any);        /* shell `cpubench [any]` */
+int  smp_cpu_id(void);          /* kernel/sched.c: this CPU's core number */
 
 /* ========================================================================
  * Memory manager (kernel/memory.c)
@@ -108,9 +122,14 @@ uint64_t heap_get_total(void);
 /* ========================================================================
  * GIC (Generic Interrupt Controller)
  * ======================================================================== */
-void     gic_init(void);
+#define SGI_YIELD   0       /* task_yield: reschedule this CPU */
+#define SGI_STOP    1       /* smp_stop_aps: turn this CPU off */
+
+void     gic_init(void);            /* distributor + this CPU (boot CPU) */
+int      gic_init_cpu(void);        /* this CPU's redistributor + interface */
 uint32_t gic_ack_irq(void);
 void     gic_end_irq(uint32_t irq);
+void     gic_send_sgi(uint64_t mpidr, uint32_t sgi_id);
 void     gic_send_sgi_self(uint32_t sgi_id);
 
 uint64_t platform_gicd_base(void);
@@ -119,13 +138,14 @@ uint64_t platform_gicr_base(void);
 /* ========================================================================
  * Timer
  * ======================================================================== */
-void     timer_init(uint32_t hz);
+void     timer_init(uint32_t hz);       /* boot CPU */
+void     timer_init_cpu(void);          /* start the tick on a secondary CPU */
 uint64_t timer_get_ticks(void);
 uint64_t timer_ms(void);
 uint64_t timer_get_tick_count(void);
 void     udelay(uint32_t us);
 void     mdelay(uint32_t ms);
-void     timer_tick_handler(void);
+void     timer_tick_handler(int count);  /* count: advance the tick count (boot CPU) */
 
 /* ========================================================================
  * Scheduler
@@ -133,7 +153,11 @@ void     timer_tick_handler(void);
 typedef void (*task_func_t)(void *arg);
 
 void sched_init(void);
+/* Runs on the boot CPU, like before SMP */
 int  task_create(const char *name, task_func_t func, void *arg, int priority);
+/* cpu: a core number, or -1 (TASK_ANY_CPU) for whichever CPU is free */
+int  task_create_on(const char *name, task_func_t func, void *arg, int priority,
+                    int cpu);
 void task_yield(void);
 void task_delay_ms(uint32_t ms);
 void sched_start(void);

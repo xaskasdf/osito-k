@@ -136,6 +136,54 @@ memory is never speculated.
 
 ---
 
+## SMP scheduling
+
+`smp_boot_aps` starts the other seven cores with PSCI `CPU_ON` (see "PSCI"); they
+park until `sched_start`, then each one sets up its GIC redistributor (found by
+matching `GICR_TYPER` affinity to its MPIDR) and its virtual timer, and joins the
+scheduler in its own idle task.
+
+- **One task pool, one lock.** `kernel/sched.c` keeps `task_pool` under `sched_lock`.
+  Each CPU reschedules on its own tick or yield SGI and takes the best READY task
+  it may run. A RUNNING task belongs to the CPU running it, so two CPUs never pick
+  the same one.
+- **Placement.** `task_create` still puts tasks on the boot CPU, so code written
+  for one core keeps running serialized there; the shell is one of them. Use
+  `task_create_on(..., cpu)` to put a task on another core, or `TASK_ANY_CPU` to
+  let any idle CPU take it (it may move between CPUs).
+- **Per-CPU state.** `TPIDR_EL1` points at the CPU's `struct cpu_sched` (`task.h`):
+  current task, IRQ stack, idle task. `irq_vector_entry` saves the context on the
+  task's stack, then runs the handler on the CPU's own IRQ stack. Once
+  `schedule()` makes the task READY, another CPU may resume it on its own stack.
+- **Locks.** The scheduler, heap, page allocator and console take spinlocks
+  (`include/spinlock.h`: `ldaxr`/`stxr` + `wfe`; GCC's `__atomic` would emit LSE
+  atomics, which virt's Cortex-A72 doesn't have). They are held with IRQs off and
+  skipped until secondary CPUs run tasks (`smp_running`). The console lock nests on
+  one CPU, so a CPU that faults while printing can still report it. It also covers
+  `uart_trygetc` and kload's reads, since USB polling sends queued output too.
+- **SGIs.** SGI 0 = yield, SGI 1 = stop: `kload` calls `smp_stop_aps`, which turns
+  the scheduling CPUs off (they take the SGI as soon as IRQs are on, so never while
+  holding a lock) before jumping into memory they might still be running from.
+- **Ticks.** Every CPU ticks at 100 Hz, but only the boot CPU's ticks count as time.
+- **Try it:** `cpus` shows what each CPU runs. `cpubench` starts one timed task
+  pinned to each CPU, and `cpubench any` starts two unpinned tasks per CPU:
+
+```
+task  cpu   core          time    ~MHz          (cpubench, 2026-10-29)
+   0   0    Cortex-A55  213 ms  1496
+   4   4    Cortex-A78  450 ms  710
+   7   7    Cortex-X1   379 ms  844
+wall 460 ms, sum of the tasks 2586 ms, 8 tasks, 0 changed CPU
+```
+
+**GIC MMIO goes through asm.** The hypervisor traps GIC accesses and emulates
+them from the abort syndrome, which only single loads and stores without
+writeback have. A post-indexed `str` that gcc chose for a loop came back as a
+synchronous external abort, so `kernel/gic.c` does every access with a one-line
+`ldr`/`str` asm (as Linux's `readl`/`writel` do).
+
+---
+
 ## Reading the screen (no UART)
 
 The GENI UART TX FIFO does not drain once Osito-K runs, and there is no serial cable.
@@ -168,7 +216,13 @@ Above the console, `kernel_main` paints 30-px bars as it advances:
 | 260–289 | white | MMU and caches on |
 | 300–329 | grey | device probing done (virt-only probes skipped on SM8350) |
 | 340–369 | dark green | scheduler starting |
-| 420–449 | white square, blinking every 0.5 s | timer IRQs + context switches alive |
+| 420–449 | one square per CPU, blinking every 0.5 s | that CPU's timer IRQs + scheduler alive |
+
+The heartbeat row has a 60-px square per CPU at x = 70 × cpu (cpu0 on the left).
+While a secondary CPU starts, its square shows the stage: **blue** up and parked,
+**yellow** GIC redistributor up (**red**: it failed), **cyan** timer started,
+**green** entering the scheduler. Then it blinks white/black on its own ticks, so a
+square stuck on a color or frozen points at the CPU that died and where.
 
 The tiny lines at the very top come from `start.S` (red/green/cyan/white = entry,
 EL1, stack, BSS cleared).
@@ -238,11 +292,25 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     kernel, `kload` turns them off again with `CPU_OFF`. That was verified by
     chain-loading: the next kernel's `CPU_ON` succeeds for all seven, and it would
     return ALREADY_ON if they were still running.
+12. **Tasks run on all eight cores (2026-10-29).** See "SMP scheduling". Two
+    bugs only showed up on the device:
+    - The APs entered with SP_EL0 selected, so their first IRQ would have used an
+      uninitialized SP_EL1; `ap_entry` now does `msr spsel, #1`.
+    - The GIC refactor made gcc emit a post-indexed `str w0, [x1], #4` for the
+      `GICR_IPRIORITYR` loop. The hypervisor traps GIC MMIO and emulates it from
+      the abort syndrome, which a write-back access doesn't have, so it came back
+      as a synchronous external abort (ESR `0x96000010`, FAR `0x17A70400`) before
+      USB was up. GIC accesses are now single `ldr`/`str` in asm.
+
+    `cpubench` measured the clocks the bootloader leaves: A55s at ~1.5 GHz, but the
+    A78s at ~710 MHz and the X1 at ~845 MHz, so the big cores are the slow ones until
+    something sets CPU frequencies.
 
 Still open:
-- **Nothing runs on the secondary cores yet.** They park in `wfe` with interrupts
-  masked. Scheduling on them needs their GIC redistributors and timers set up,
-  and locking in the scheduler and the console.
+- **The big cores run at ~710–845 MHz** (the little ones at ~1.5 GHz). Nothing
+  programs CPU frequency yet.
+- **Wakeups wait for a tick.** A CPU picks up a task made READY by another CPU on
+  its next tick (≤10 ms); there is no reschedule IPI.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
 

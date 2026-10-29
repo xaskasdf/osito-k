@@ -4,6 +4,7 @@
  */
 #include "../include/hal.h"
 #include "../include/types.h"
+#include "../include/spinlock.h"
 
 #define PAGE_SIZE       4096
 #define HEAP_INIT_PAGES 64      /* 256 KB initial */
@@ -111,10 +112,10 @@ static void block_split(block_hdr_t *block, uint64_t needed) {
     if (free_list == block) free_list = nb;
 }
 
-void *kmalloc(uint64_t size) {
-    if (size == 0) return (void *)0;
-    size = align_up(size, ALIGNMENT);
-    if (size < MIN_ALLOC) size = MIN_ALLOC;
+/* Tasks on several CPUs share the heap */
+static spinlock_t heap_lock;
+
+static void *kmalloc_locked(uint64_t size) {
     block_hdr_t *block = free_list;
     while (block) {
         if (block->size >= size) {
@@ -128,7 +129,17 @@ void *kmalloc(uint64_t size) {
         block = block->next;
     }
     if (heap_grow(sizeof(block_hdr_t) + size) < 0) return (void *)0;
-    return kmalloc(size);
+    return kmalloc_locked(size);
+}
+
+void *kmalloc(uint64_t size) {
+    if (size == 0) return (void *)0;
+    size = align_up(size, ALIGNMENT);
+    if (size < MIN_ALLOC) size = MIN_ALLOC;
+    uint64_t flags = spin_lock_irqsave(&heap_lock);
+    void *p = kmalloc_locked(size);
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return p;
 }
 
 void kfree(void *ptr) {
@@ -140,7 +151,9 @@ void kfree(void *ptr) {
         serial_puts("\n");
         return;
     }
+    uint64_t flags = spin_lock_irqsave(&heap_lock);
     if (block->flags != BLOCK_USED) {
+        spin_unlock_irqrestore(&heap_lock, flags);
         serial_puts("[HEAP] DOUBLE FREE at ");
         serial_puthex((uint64_t)ptr, 16);
         serial_puts("\n");
@@ -150,6 +163,7 @@ void kfree(void *ptr) {
     alloc_count--;
     free_list_insert(block);
     coalesce(block);
+    spin_unlock_irqrestore(&heap_lock, flags);
 }
 
 void *kcalloc(uint64_t count, uint64_t size) {

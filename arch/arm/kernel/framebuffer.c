@@ -308,6 +308,16 @@ void fb_putchar(char c)
     fb_putc(c);
 }
 
+/* Solid rectangle, for status markers outside the text area. Any CPU,
+ * no lock: markers don't overlap. No-op without a framebuffer. */
+void fb_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color)
+{
+    if (!fb_base) return;
+    for (uint32_t r = y; r < y + h && r < fb_height; r++)
+        for (uint32_t c = x; c < x + w && c < fb_width; c++)
+            fb_base[r * fb_pitch + c] = color;
+}
+
 void fb_putdec(uint64_t val)
 {
     char buf[21];

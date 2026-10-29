@@ -2,9 +2,10 @@
  * smp.c -- Multi-core SMP boot for AArch64 via PSCI
  *
  * Starts the secondary cores (APs) with PSCI CPU_ON. Each AP turns on its
- * MMU and caches with the BSP's page tables, reports its MIDR/MPIDR and parks
- * in wfe with interrupts masked: nothing schedules on it yet. Before a kload
- * handoff they are turned off again with CPU_OFF (smp_stop_aps).
+ * MMU and caches with the BSP's page tables, reports its MIDR/MPIDR and waits
+ * in wfe, interrupts masked, until sched_start releases it: then it sets up
+ * its GIC redistributor and timer and joins the scheduler (sched.c). Before
+ * a kload handoff they are turned off again with CPU_OFF (smp_stop_aps).
  *
  * QEMU virt: PSCI over HVC, -smp N cores numbered in MPIDR Aff0.
  * SM8350: PSCI over SMC, 8 cores (4x A55, 3x A78, 1x X1) with MPIDR.MT set,
@@ -14,8 +15,8 @@
 #include "../include/hal.h"
 #include "../include/aarch64.h"
 #include "../include/types.h"
+#include "task.h"
 
-#define MAX_CPUS        8
 #define AP_STACK_SIZE   8192
 
 #define PSCI_CPU_OFF        0x84000002ULL
@@ -39,6 +40,7 @@ _Static_assert(sizeof(struct ap_boot) == 64, "ap_entry offsets");
 struct cpu_info {
     uint64_t mpidr, midr;
     volatile int online;
+    volatile int scheduling;        /* in the scheduler: stop it with SGI_STOP */
     int started;                    /* CPU_ON accepted (BSP-owned) */
 };
 
@@ -47,7 +49,9 @@ static struct cpu_info cpus[MAX_CPUS];
 static uint8_t ap_stacks[MAX_CPUS][AP_STACK_SIZE] __attribute__((aligned(16)));
 static int cpu_count = 1;           /* BSP + online APs */
 static int psci_smc;                /* conduit: SMC on SM8350, HVC on virt */
-static volatile int stop_req;
+static volatile int stop_req;       /* parked APs: turn off */
+static volatile int sched_go;       /* parked APs: join the scheduler */
+volatile int smp_running;           /* APs schedule: spinlocks are live */
 
 /* ── PSCI ───────────────────────────────────────────────── */
 
@@ -84,12 +88,18 @@ static int core_number(uint64_t mpidr)
     return (mpidr & (1ULL << 24)) ? (mpidr >> 8) & 0xFF : mpidr & 0xFF;
 }
 
+int smp_this_core(void)
+{
+    return core_number(read_mpidr_el1());
+}
+
 /* ── AP side ────────────────────────────────────────────── */
 
 /* PSCI CPU_ON entry: EL1, MMU and caches off, interrupts masked,
  * x0 = context_id = this AP's struct ap_boot. Loads the BSP's translation
  * regime and vectors, turns the MMU on (the map is identity, so the next
- * instruction is still valid) and calls ap_main(boot) on the AP's stack. */
+ * instruction is still valid) and calls ap_main(boot) on the AP's stack,
+ * as SP_EL1 (the entry may select SP_EL0). */
 __asm__(
     ".pushsection .text\n"
     ".balign 4\n"
@@ -116,6 +126,8 @@ __asm__(
     "    ldp   x1, x2, [x0, #40]\n"
     "    msr   sctlr_el1, x1\n"
     "    isb\n"
+    /* PSCI doesn't promise SP_EL1: exceptions always use it, so run on it */
+    "    msr   spsel, #1\n"
     "    mov   sp, x2\n"
     "    bl    ap_main\n"
     "1:  wfe\n"
@@ -128,19 +140,49 @@ void ap_main(struct ap_boot *boot);
 
 void ap_main(struct ap_boot *boot)
 {
-    uint64_t cpu = boot->cpu;
-    __asm__ volatile("msr tpidr_el1, %0" : : "r"(cpu));
+    int cpu = (int)boot->cpu;
+    sched_cpu_init(cpu, 0);
 
-    /* No printing here: the console (USB) isn't safe to share between
-     * CPUs. The BSP reports what each AP left in cpus[]. */
+    /* No printing until smp_running: the console takes no lock before.
+     * The BSP reports what each AP left in cpus[]. */
     cpus[cpu].mpidr = read_mpidr_el1();
     cpus[cpu].midr = read_midr_el1();
     __asm__ volatile("dmb ish" : : : "memory");
     cpus[cpu].online = 1;
 
-    while (!stop_req)
+    /* Stage colors in this CPU's heartbeat square, which then blinks:
+     * blue parked, yellow GIC up (red: failed), cyan timer, green scheduler */
+    FB_CPU_MARK(cpu, 0x000000FF);
+    while (!sched_go && !stop_req)
         __asm__ volatile("wfe");
 
+    if (!stop_req) {
+        if (gic_init_cpu() == 0) {
+            FB_CPU_MARK(cpu, 0x00FFFF00);
+            timer_init_cpu();
+            FB_CPU_MARK(cpu, 0x0000FFFF);
+            cpus[cpu].scheduling = 1;
+            FB_CPU_MARK(cpu, 0x0000FF00);
+            sched_ap_start();           /* returns only if the pool is full */
+            cpus[cpu].scheduling = 0;
+        } else {
+            FB_CPU_MARK(cpu, 0x00FF0000);
+        }
+    }
+    while (!stop_req)
+        __asm__ volatile("wfe");
+    smp_cpu_off();
+}
+
+/* Turn this CPU off for good: the scheduler's SGI_STOP or a parked AP */
+void smp_cpu_off(void)
+{
+    int cpu = smp_cpu_id();
+    irq_disable();
+    write_cntv_ctl_el0(0);
+    write_icc_igrpen1_el1(0);
+    __asm__ volatile("isb");
+    cpus[cpu].scheduling = 0;
     cpus[cpu].online = 0;
     __asm__ volatile("dsb ish" : : : "memory");
     psci_call(PSCI_CPU_OFF, 0, 0, 0);   /* returns only on failure */
@@ -238,16 +280,33 @@ void smp_boot_aps(int num_cpus, int psci_use_smc)
     serial_puts(" CPUs online\n");
 }
 
+/* sched_start, on the BSP: the online APs join the scheduler */
+void smp_release_aps(void)
+{
+    if (cpu_count <= 1)
+        return;                 /* single CPU: no locking needed */
+    smp_running = 1;
+    __asm__ volatile("dsb ish" : : : "memory");
+    sched_go = 1;
+    __asm__ volatile("dsb ish\nsev" : : : "memory");
+}
+
 /* Turn the APs off (before jumping to another kernel, which reuses their
- * memory). Waits up to 100 ms for PSCI to report each one off. */
+ * memory). Parked ones see stop_req; scheduling ones get SGI_STOP, which
+ * they take as soon as they unmask IRQs, so never while holding a lock.
+ * Waits up to 100 ms for PSCI to report each one off. */
 void smp_stop_aps(void)
 {
     uint64_t bsp = read_mpidr_el1();
+    int self = core_number(bsp);
 
     stop_req = 1;
     __asm__ volatile("dsb ish\nsev" : : : "memory");
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (i != self && cpus[i].scheduling)
+            gic_send_sgi(core_mpidr(bsp, i), SGI_STOP);
     for (int i = 0; i < MAX_CPUS; i++) {
-        if (!cpus[i].started) continue;
+        if (i == self || !cpus[i].started) continue;
         uint64_t t0 = timer_ms();
         int64_t r;
         while ((r = psci_call(PSCI_AFFINITY_INFO, core_mpidr(bsp, i), 0, 0))
@@ -261,6 +320,7 @@ void smp_stop_aps(void)
         cpus[i].started = 0;
     }
     cpu_count = 1;
+    smp_running = 0;
 }
 
 int smp_get_cpu_count(void)
@@ -290,9 +350,141 @@ void smp_print_cpus(void)
         serial_putdec((cpus[i].midr >> 20) & 0xF);
         serial_puts("p");
         serial_putdec(cpus[i].midr & 0xF);
+        task_tcb_t *t = cpu_sched[i].current;
+        if (t) {
+            serial_puts("  running ");
+            serial_puts(t->name);
+        } else {
+            serial_puts("  parked");    /* not (yet) in the scheduler */
+        }
         serial_puts("\n");
     }
     serial_puts("CPUs online: ");
     serial_putdec(cpu_count);
     serial_puts("\n");
+}
+
+/* ── cpubench: timed tasks on every CPU at once ──────────── */
+
+#define BENCH_ITERS     20000000ULL     /* x 16 dependent adds */
+#define BENCH_SLOTS     (2 * MAX_CPUS)
+
+struct bench_slot {
+    uint64_t ticks;                 /* CNTPCT ticks the loop took */
+    int started_on, ran_on;
+    int used;
+    volatile int done;
+};
+
+static struct bench_slot bench[BENCH_SLOTS];
+
+/* A chain of dependent adds retires one per cycle on these cores, so
+ * cycles ~ 16 per iteration and the rate gives the clock */
+static void bench_task(void *arg)
+{
+    struct bench_slot *s = arg;
+    uint64_t x = 0, n = BENCH_ITERS;
+    s->started_on = smp_cpu_id();
+    uint64_t t0 = read_cntpct_el0();
+    __asm__ volatile(
+        "1:\n"
+        ".rept 16\n"
+        "add   %0, %0, %2\n"
+        ".endr\n"
+        "subs  %1, %1, #1\n"
+        "b.ne  1b\n"
+        : "+r"(x), "+r"(n) : "r"(1ULL) : "cc");
+    s->ticks = read_cntpct_el0() - t0;
+    s->ran_on = smp_cpu_id();
+    __asm__ volatile("dmb ish" : : : "memory");
+    s->done = 1;
+}
+
+static void print_ms(uint64_t ticks, uint64_t freq)
+{
+    serial_putdec(ticks * 1000 / freq);
+    serial_puts(" ms");
+}
+
+/* Pinned: one task per online CPU, task i on CPU i. `any`: two per online
+ * CPU, not pinned, so CPUs share them and pick up each other's. */
+void smp_bench(int any)
+{
+    uint64_t freq;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+
+    int n = 0;
+    uint64_t t0 = read_cntpct_el0();
+    for (int i = 0; i < BENCH_SLOTS; i++) {
+        int cpu = i % MAX_CPUS;
+        bench[i].done = 0;
+        bench[i].ticks = 0;
+        bench[i].used = cpus[cpu].online && (any || i < MAX_CPUS);
+        if (!bench[i].used)
+            continue;
+        if (task_create_on("bench", bench_task, &bench[i], 1,
+                           any ? TASK_ANY_CPU : cpu) < 0) {
+            bench[i].done = -1;
+            continue;
+        }
+        n++;
+    }
+
+    /* Wait for all of them, sleeping so the bench on this CPU can run */
+    for (int waited = 0; waited < 30000; waited += 10) {
+        int pending = 0;
+        for (int i = 0; i < BENCH_SLOTS; i++)
+            if (bench[i].used && !bench[i].done)
+                pending++;
+        if (!pending)
+            break;
+        task_delay_ms(10);
+    }
+    uint64_t wall = read_cntpct_el0() - t0;
+    __asm__ volatile("dmb ish" : : : "memory");
+
+    uint64_t sum = 0;
+    int moved = 0;
+    serial_puts("task  cpu   core          time    ~MHz\n");
+    for (int i = 0; i < BENCH_SLOTS; i++) {
+        if (!bench[i].used)
+            continue;
+        serial_puts(i < 10 ? "   " : "  ");
+        serial_putdec(i);
+        serial_puts("   ");
+        if (bench[i].done != 1) {
+            serial_puts(bench[i].done ? "no task slot\n" : "did not finish\n");
+            continue;
+        }
+        /* Where it started, and where it finished if it moved */
+        int c0 = bench[i].started_on, c1 = bench[i].ran_on;
+        serial_putdec(c0);
+        if (c1 != c0) {
+            serial_puts(">");
+            serial_putdec(c1);
+            moved++;
+        } else {
+            serial_puts("  ");
+        }
+        serial_puts("  ");
+        const char *name = cpu_core_name(cpus[c1].midr);
+        serial_puts(name ? name : "?");
+        serial_puts("  ");
+        print_ms(bench[i].ticks, freq);
+        serial_puts("  ");
+        /* MHz = cycles / us = 16 * ITERS / (ticks / freq * 1e6); only
+         * meaningful when the task had its CPU to itself */
+        serial_putdec(16 * BENCH_ITERS * freq / 1000000 / bench[i].ticks);
+        serial_puts("\n");
+        sum += bench[i].ticks;
+    }
+    serial_puts("wall ");
+    print_ms(wall, freq);
+    serial_puts(", sum of the tasks ");
+    print_ms(sum, freq);
+    serial_puts(", ");
+    serial_putdec(n);
+    serial_puts(" tasks, ");
+    serial_putdec(moved);
+    serial_puts(" changed CPU\n");
 }

@@ -45,22 +45,25 @@ irq_vector_entry:
     mrs     x1, SPSR_EL1
     stp     x0, x1, [sp, #256]
 
-    /* Save SP to current_task->sp (offset 0) */
-    adrp    x0, current_task
-    add     x0, x0, :lo12:current_task
-    ldr     x1, [x0]               /* x1 = current_task */
+    /* TPIDR_EL1 = this CPU's struct cpu_sched (task.h): current task at
+     * offset 0, IRQ stack top at 8. x19/x20 survive the C call; the
+     * interrupted values are already in the frame. */
+    mrs     x20, TPIDR_EL1
+    mov     x19, sp                 /* x19 = the interrupted context's frame */
+    ldr     x1, [x20]               /* x1 = current task */
     cbz     x1, 1f                  /* Skip if no current task yet */
-    mov     x2, sp
-    str     x2, [x1]               /* current_task->sp = sp */
+    str     x19, [x1]               /* current->sp = frame */
 1:
-    /* Call C IRQ handler */
+    /* Run the handler on this CPU's IRQ stack: once schedule() makes the
+     * interrupted task READY, another CPU may resume it on its own stack */
+    ldr     x2, [x20, #8]
+    mov     sp, x2
     bl      irq_handler
 
-    /* Load (possibly different) current_task->sp */
-    adrp    x0, current_task
-    add     x0, x0, :lo12:current_task
-    ldr     x1, [x0]
-    cbz     x1, 2f                  /* No task yet: return on this stack */
+    /* Resume the (possibly different) current task */
+    ldr     x1, [x20]
+    mov     sp, x19                 /* No task yet: back to the same frame */
+    cbz     x1, 2f
     ldr     x2, [x1]               /* x2 = new task's sp */
     mov     sp, x2
 2:

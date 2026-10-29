@@ -66,12 +66,13 @@ char uart_getc(void) {
     return (char)c;
 }
 
+/* Under the console lock: polling the gadget can also send queued output */
 int uart_trygetc(void) {
+    uint64_t flags = console_lock();
     acm_poll();
     int c = acm_getc();
-    if (c >= 0)
-        return c;
-    if (!uart_rx_ready())
-        return -1;
-    return (int)(mmio_read32(UART_REG(SE_GENI_RX_FIFOn)) & 0xFF);
+    if (c < 0 && uart_rx_ready())
+        c = (int)(mmio_read32(UART_REG(SE_GENI_RX_FIFOn)) & 0xFF);
+    console_unlock(flags);
+    return c;
 }

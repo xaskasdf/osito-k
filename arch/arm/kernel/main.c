@@ -167,48 +167,34 @@ void exception_handler(uint64_t esr, uint64_t elr, uint64_t far)
         __asm__ volatile("wfe");
 }
 
+/* On every CPU, on its IRQ stack (context_switch.S) */
 void irq_handler(void)
 {
+    struct cpu_sched *c = this_cpu();
     uint32_t irqnr = gic_ack_irq();
 
     if (irqnr == 27) {  /* Virtual timer PPI (CNTV) */
-        /* Timer PPI */
-        timer_tick_handler();
-        if (current_task)
-            current_task->ticks_run++;
+        timer_tick_handler(c->boot);
 
-        /* Wake sleeping tasks */
-        uint64_t now = timer_get_tick_count();
-
-        /* SM8350 heartbeat: a square at rows 420-449 that toggles every
-         * 0.5 s, proof that timer IRQs and the scheduler are alive. */
-        if (!on_qemu_virt() && now % 50 == 0) {
-            volatile uint32_t *fb = (volatile uint32_t *)0xE5000000UL;
-            uint32_t color = (now / 50) & 1 ? 0x00FFFFFF : 0x00000000;
-            for (int y = 420; y < 450; y++)
-                for (int x = 0; x < 60; x++)
-                    fb[y * 1080 + x] = color;
-        }
-        for (int i = 0; i < MAX_TASKS; i++) {
-            if (task_pool[i].state == TASK_STATE_BLOCKED &&
-                task_pool[i].wake_tick != 0 &&
-                (int64_t)(now - task_pool[i].wake_tick) >= 0) {
-                task_pool[i].wake_tick = 0;
-                task_pool[i].state = TASK_STATE_READY;
-            }
-        }
-        need_schedule = 1;
-    } else if (irqnr == 0) {
-        /* SGI 0 — yield */
-        need_schedule = 1;
+        /* SM8350 heartbeat: each CPU's square at rows 420-449 (x = 70 *
+         * cpu) toggles every 0.5 s, proof that its timer IRQs and the
+         * scheduler are alive. */
+        if (++c->ticks % 50 == 0)
+            FB_CPU_MARK(c->id, (c->ticks / 50) & 1 ? 0x00FFFFFF : 0x00000000);
+        sched_tick();
+    } else if (irqnr == SGI_YIELD) {
+        c->need_schedule = 1;
+    } else if (irqnr == SGI_STOP) {
+        gic_end_irq(irqnr);
+        smp_cpu_off();
     } else if (irqnr != 1023) {
         serial_puts("[IRQ ] Unhandled INTID: ");
         serial_putdec(irqnr);
         serial_puts("\n");
     }
 
-    if (need_schedule && current_task) {
-        need_schedule = 0;
+    if (c->need_schedule && c->current) {
+        c->need_schedule = 0;
         schedule();
     }
 
@@ -261,6 +247,9 @@ void kernel_main(void *dtb)
     for (int r = 20; r < 50; r++) fb_debug_bar(r, 0x00FF0000);
 
     platform_init(dtb);
+    /* TPIDR_EL1 -> this CPU's scheduler state, which irq_vector_entry
+     * reads on every IRQ */
+    sched_cpu_init(smp_this_core(), 1);
 
     /* Bar 2: GREEN = platform_init OK */
     for (int r = 60; r < 90; r++) fb_debug_bar(r, 0x0000FF00);
@@ -327,9 +316,9 @@ void kernel_main(void *dtb)
     }
     platform_probe_devices();
 
-    /* Step 10: SMP. The APs come up and park; nothing runs on them yet.
-     * PSCI is HVC on QEMU virt (try 4 cores, the -smp default here), SMC
-     * on SM8350 (8 cores). */
+    /* Step 10: SMP. The APs come up and park until sched_start releases
+     * them into the scheduler. PSCI is HVC on QEMU virt (try 4 cores),
+     * SMC on SM8350 (8 cores). */
     if (on_qemu_virt())
         smp_boot_aps(4, 0);
     else

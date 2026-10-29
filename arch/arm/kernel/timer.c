@@ -47,7 +47,15 @@ void timer_init(uint32_t hz) {
     write_cntv_ctl_el0(1);  /* ENABLE=1, IMASK=0 */
 }
 
-void timer_tick_handler(void) {
-    tick_count++;
+/* Each CPU has its own CNTV; timer_init (boot CPU) set the interval */
+void timer_init_cpu(void) {
+    write_cntv_tval_el0(tick_interval);
+    write_cntv_ctl_el0(1);
+}
+
+/* Every CPU ticks, only the boot CPU's ticks count as time */
+void timer_tick_handler(int count) {
+    if (count)
+        tick_count++;
     write_cntv_tval_el0(tick_interval);  /* Reload for next tick */
 }
