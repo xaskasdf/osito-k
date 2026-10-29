@@ -33,6 +33,7 @@
 
 #define REG_ENABLE          0x000
 #define REG_DOMAIN_STATE    0x020   /* what it runs at, after limits */
+#define STATE_LEVEL(s)      (((s) >> 8) & 0x1F)
 #define STATE_MV(s)         ((s) >> 20)     /* matches the level's VOLT_LUT */
 #define REG_DCVS_CTRL       0x0b0   /* bit 0: a perf-state register per core */
 #define REG_FREQ_LUT        0x100
@@ -57,7 +58,6 @@ struct domain {
     uint32_t    dmips_mhz;          /* capacity-dmips-mhz in the device tree */
     int         nlevels;
     int         top;                /* highest level that isn't boost */
-    int         floor;              /* lowest level off a PLL (see read_lut) */
     int         want;               /* level asked for */
     int         cap;                /* thermal limit, nlevels - 1 = none */
     int         rail;               /* domains on one rail pull each other up */
@@ -78,18 +78,15 @@ static struct domain domains[] = {
 #define NDOMAINS (int)(sizeof(domains) / sizeof(domains[0]))
 
 /* The table ends where a row repeats the previous frequency (as in Linux).
- * Rows with source 0 run off the alternate clock, GPLL0 / 2, which Linux
- * votes on (the cpufreq node's "alternate" clock) and Osito-K doesn't.
- * The one time the A55s were asked for level 0 (2026-10-29), the USB
- * console died, most likely from the gadget's missing barriers (dwc3_acm.c)
- * rather than the clock; untested since, so nothing here asks for those
- * rows. */
+ * Rows with source 0 run off the alternate clock, GPLL0 / 2: the A55s'
+ * level 0, 300 MHz. Linux names GPLL0 the cpufreq node's "alternate" clock
+ * but only reads its rate; ABL leaves it running. `cpufreq try` held the
+ * A55s there for 20 s with the USB console on cpu0 (2026-10-29). */
 static void read_lut(struct domain *d)
 {
     uint32_t prev = 0;
     d->nlevels = 0;
     d->top = -1;
-    d->floor = -1;
     for (int i = 0; i < LUT_MAX; i++) {
         uint32_t f = mmio_rd32(d->base + REG_FREQ_LUT + i * 4);
         uint32_t v = mmio_rd32(d->base + REG_VOLT_LUT + i * 4);
@@ -101,21 +98,27 @@ static void read_lut(struct domain *d)
         d->boost[i] = LUT_CORE_COUNT(f) == LUT_TURBO;
         d->alt[i] = LUT_SRC(f) == 0;
         if (!d->boost[i])
-            d->top = i;
-        if (!d->alt[i] && d->floor < 0)
-            d->floor = i;
+            d->top = i;             /* -1 when there's none: left alone */
         d->nlevels = i + 1;
         prev = khz;
     }
-    if (d->floor < 0 || d->floor > d->top)
-        d->top = -1;                /* nothing usable: leave the domain alone */
     d->want = d->top;
     d->cap = d->nlevels - 1;
 }
 
+/* What a REG_DOMAIN_STATE value runs at. Its L value is right for the PLL
+ * rows only: on the alternate clock it reads 15 (288 MHz) for GPLL0 / 2. */
+static uint32_t state_khz(const struct domain *d, uint32_t state)
+{
+    uint32_t level = STATE_LEVEL(state);
+    if (level < (uint32_t)d->nlevels && d->alt[level])
+        return d->khz[level];
+    return LUT_L_VAL(state) * XO_KHZ;
+}
+
 static uint32_t current_khz(const struct domain *d)
 {
-    return LUT_L_VAL(mmio_rd32(d->base + REG_DOMAIN_STATE)) * XO_KHZ;
+    return state_khz(d, mmio_rd32(d->base + REG_DOMAIN_STATE));
 }
 
 /* The shell's `cpufreq` and the thermal task both change levels */
@@ -172,7 +175,7 @@ int cpufreq_cap_step(int dom, int dir)
     if (dir < 0) {
         /* Below what it's set to now, or lowering the cap does nothing */
         int eff = effective(d);
-        d->cap = eff > d->floor ? eff - 1 : d->floor;
+        d->cap = eff > 0 ? eff - 1 : 0;
     } else if (d->cap < d->nlevels - 1) {
         d->cap++;
     }
@@ -287,7 +290,7 @@ static void show(void)
             if (d->boost[l])
                 serial_puts("(boost)");
             if (d->alt[l])
-                serial_puts("(alt, unused)");
+                serial_puts("(alt)");
         }
         serial_puts("\n");
     }
@@ -391,9 +394,9 @@ static void try_row(const struct domain *d, int from, int to)
 {
     const struct try_sample *s = &samples[to - 1];
     put_pad(s->ms, 7);
-    put_pad(LUT_L_VAL(s->state) * XO_KHZ / 1000, 6);
+    put_pad(state_khz(d, s->state) / 1000, 6);
     put_pad(STATE_MV(s->state), 6);
-    put_pad((s->state >> 8) & 0x1F, 4);
+    put_pad(STATE_LEVEL(s->state), 4);
     serial_puts("  ");
     serial_puthex(s->l3, 8);
     serial_puts(" ");
@@ -506,7 +509,7 @@ static void try_cmd(int argc, char **argv)
     const char *opt = argc == 6 ? argv[5] : "";
     if (argc < 5 || argc > 6 || parse_uint(argv[2], &dom) ||
         parse_uint(argv[3], &level) || parse_uint(argv[4], &secs) ||
-        dom >= NDOMAINS || domains[dom].top < 0 || level < domains[dom].floor ||
+        dom >= NDOMAINS || domains[dom].top < 0 ||
         level >= domains[dom].nlevels || secs < 1 || secs > TRY_MAX_S ||
         (*opt && strcmp(opt, "stay") != 0 && strcmp(opt, "busy") != 0)) {
         serial_puts("usage: cpufreq try <domain> <level> <seconds, up to 20> [stay | busy]\n");
@@ -569,7 +572,7 @@ static void try_cmd(int argc, char **argv)
 }
 
 /* Shell `cpufreq`: show the domains; `cpufreq max|min`: every domain to its
- * top regular / lowest PLL level; `cpufreq <domain> <level>`. Reports every
+ * top regular / lowest level; `cpufreq <domain> <level>`. Reports every
  * domain on the rail it changed. `cpufreq l3`, `cpufreq try`: see above. */
 void platform_cpufreq_cmd(int argc, char **argv)
 {
@@ -590,7 +593,7 @@ void platform_cpufreq_cmd(int argc, char **argv)
         for (int i = 0; i < NDOMAINS; i++) {
             struct domain *d = &domains[i];
             if (d->top >= 0)
-                set_level(d, argv[1][1] == 'a' ? d->top : d->floor);
+                set_level(d, argv[1][1] == 'a' ? d->top : 0);
         }
         for (int i = 0; i < NDOMAINS; i++)
             if (domains[i].top >= 0)
@@ -598,10 +601,8 @@ void platform_cpufreq_cmd(int argc, char **argv)
         return;
     }
     if (argc != 3 || parse_uint(argv[1], &dom) || parse_uint(argv[2], &level) ||
-        dom >= NDOMAINS || domains[dom].top < 0 || level >= domains[dom].nlevels ||
-        level < domains[dom].floor) {
-        serial_puts("usage: cpufreq [max | min | <domain> <level>], levels from "
-                    "the domain's first PLL one\n");
+        dom >= NDOMAINS || domains[dom].top < 0 || level >= domains[dom].nlevels) {
+        serial_puts("usage: cpufreq [max | min | <domain> <level>]\n");
         return;
     }
     set_level(&domains[dom], level);

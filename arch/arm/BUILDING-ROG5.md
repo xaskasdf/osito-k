@@ -235,6 +235,11 @@ domain actually runs at: bits 7:0 the L value (× 19.2 MHz), 12:8 the level,
 31:20 the voltage in mV. That can differ from the level it is set to: the limits
 hardware (LMh) throttles hot silicon, and the big clusters share a rail (below).
 
+The A55s' level 0 runs off the alternate clock (LUT source 0, GPLL0 / 2 =
+300 MHz) instead of a PLL. Its L value reads 15 (288 MHz), so on that row the
+frequency comes from the table instead. `cpubench` measures 298–299 MHz there.
+Levels 0–4 (300–691 MHz) share 568 mV, so below 691 MHz only the clock drops.
+
 The bootloader leaves the A78s at 710 MHz and the X1 at 844 MHz, their lowest
 levels. Boot moves every domain to its top level: A55 1804 MHz, A78 2419 MHz,
 X1 2841 MHz. A domain with all its cores off reports the new level only once
@@ -267,12 +272,13 @@ The bug was in the USB gadget, which lacked barriers (see "Console over USB").
 With them, the A55s at 403 MHz took 48 shell commands in a row, each with its own
 port open/close, including `cpubench` (402 MHz) and `dmesg`. The L3 cache, which
 has its own EPSS block (`0x18590000`, `cpufreq l3`), stayed at 1248 MHz / 712 mV
-in every `cpufreq try` run, whatever the A55s did. The alternate-clock level 0 is
-still unused.
+in every `cpufreq try` run, whatever the A55s did. Level 0, on the alternate
+clock, was the same story: 20 s with the console on cpu0, 38 commands in a row.
 
 - `cpufreq` lists each domain's frequency and voltage now, and its levels as
   MHz@mV.
-- `cpufreq max` / `cpufreq min` set every domain to its top / lowest PLL level.
+- `cpufreq max` / `cpufreq min` set every domain to its top / lowest level
+  (300 / 710 / 844 MHz).
 - `cpufreq <domain> <level>` sets one and reports every domain on its rail, e.g.
   `cpu4-6: 1440 MHz, set to 710 MHz (the other cluster holds their shared rail up)`.
 - `cpufreq try <domain> <level> <seconds> [stay | busy]` runs a level that might take
