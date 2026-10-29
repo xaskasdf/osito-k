@@ -285,9 +285,9 @@ still unused.
   - The shell (and the USB console) moves out of the domain for the run, unless
     `stay` is given.
   - `busy` keeps the domain's CPUs busy meanwhile.
-  - A bar under the heartbeat squares, drawn without the console lock, gives the
-    verdict even if the console dies: yellow while it runs, green if every CPU
-    kept ticking, red if one stopped.
+  - In screen debug mode, a bar under the heartbeat squares, drawn without the
+    console lock, gives the verdict even if the console dies: yellow while it runs,
+    green if every CPU kept ticking, red if one stopped.
 - `cpufreq l3` dumps the L3 block read-only: its level table (`0x100`, 300–1593
   MHz) and the words around the state (`0x020`, same layout as a CPU domain's)
   and vote registers.
@@ -325,6 +325,39 @@ burn ending, it released them to the top levels.
 
 ---
 
+## Keys
+
+`platform/sm8350/keys.c` reads the three keys from the PMICs over SPMI
+(`pmic_arb.c`), at the registers Linux's `pm8941-pwrkey` and
+`pinctrl-spmi-gpio` use:
+
+| Key | Register | Pressed |
+|-----|----------|---------|
+| Power | PMK8350 (SID 0) PON_HLOS `0x1300`, RT_STS `0x1310` | bit 7 (kpdpwr) set |
+| Vol-Down | the same register | bit 6 (resin) set |
+| Vol-Up | PM8350 (SID 1) GPIO 6 (`0x8D00`), RT_STS `0x8D10` | bit 0 clear (pull-up) |
+
+ABL leaves GPIO 6 an input with pull-up: `0x8D40` = 0 (digital in), `0x8D42` = 0
+(30 µA pull-up), `0x8D46` = `0x80` (enabled). The keys' interrupts go through the
+arbiter, which Osito-K doesn't route, so a task polls every 20 ms. A level counts
+once two polls in a row agree (the device tree debounces 15 ms). `pmic_arb.c`
+serializes the shell, the reboot path and this task with a lock, and caches the
+channel each peripheral maps to (a lookup scans up to 512 registers).
+
+- **Vol-Up / Vol-Down** page the screen back / forward 24 lines through the
+  console history (see "Reading the screen"). Held, they repeat every 150 ms after
+  0.5 s.
+- **Both volume keys held 2 s:** `reboot bootloader`, into fastboot. Pressing
+  both first returns to the live console and says so; letting go earlier cancels.
+- **Power, shorter than 1 s:** two `[STAT]` lines: kernel uptime, CPUs online,
+  free memory, USB state, and each cluster's MHz and hottest sensor. Holding Power
+  ~10 s still resets the phone; the PMIC does that on its own.
+- Every press and release also enters the GUI's input queue
+  (`input_post_key`) as its PS/2 key: `E0 5E` Power, `E0 2E` / `E0 30` volume.
+- `keys` shows each key's state and press count.
+
+---
+
 ## Reading the screen (no UART)
 
 The GENI UART TX FIFO does not drain once Osito-K runs, and there is no serial cable.
@@ -333,10 +366,23 @@ framebuffer is the only output. `uart_putc` gives up on the first TX timeout
 and drops all later output (before that, ~100k MMIO polls per character made the
 banner take minutes).
 
+**Two screen modes.**
+- **Normal (the default):** the text console takes the whole panel (67 columns ×
+  76 rows), on a cleared screen.
+- **Debug:** the console starts at pixel row 700, and the rows above it show
+  how far the boot got and whether each CPU is alive (below).
+- **Choosing:** `SCREEN_DEBUG=1` at build time (`rog5-boot.sh --screen-debug`)
+  boots in debug mode. The shell's `screen debug` / `screen normal` switches
+  modes live; the console is laid out again from the log, so nothing on it is
+  lost.
+- **Use debug** for anything that might die before USB is up: in normal mode,
+  the only clues are the text console and the panic band.
+
 **Text console.** `platform_init` points `kernel/framebuffer.c` at the splash
-framebuffer and confines it to pixel rows 700 and below. `serial.c` writes every
-console byte there before the UART, so the boot log and the shell show up on screen.
-Glyphs are the 8×16 font at 2× (67 columns × 54 rows). The console never reads
+framebuffer: the whole panel, or pixel rows 700 and below in debug mode.
+`serial.c` writes every console byte there before the UART, so the boot log and
+the shell show up on screen. Glyphs are the 8×16 font at 2× (67 columns; 76 rows,
+54 in debug mode). The console never reads
 the framebuffer back, because reads from it are uncached. It keeps the text in a
 cached cell array (character + color), and a scroll redraws only the cells that
 change. A scroll costs ~4.5 ms however far it moves, bound by writes to the
@@ -344,7 +390,17 @@ framebuffer. So at the bottom the text jumps up a quarter of the area (13 lines)
 at a time, which keeps the cost close to plain drawing: `dmesg` (~50 lines) takes
 ~35 ms, against ~250 ms scrolling line by line.
 
-Above the console, `kernel_main` paints 30-px bars as it advances:
+**History.** What scrolls off the screen is still in `serial.c`'s log (`dmesg`'s
+16 KB ring), and the volume keys page through it (see "Keys"):
+- `fb_history` lays the log out the way `fb_put` lays out live text (wrapping,
+  `\r`, `\b`), in the default color. The last row, in yellow, says how far back
+  the view is.
+- The view is anchored to its top line. While it's up, new output only reaches
+  the log, and the status row says so.
+- Paging to the end, or any shortcut, redraws the live console from the log's
+  tail, with the cursor after it.
+
+In debug mode, `kernel_main` paints 30-px bars above the console as it advances:
 
 | Rows | Color | Meaning |
 |------|-------|---------|
@@ -366,9 +422,11 @@ While a secondary CPU starts, its square shows the stage: **blue** up and parked
 square stuck on a color or frozen points at the CPU that died and where.
 
 The tiny lines at the very top come from `start.S` (red/green/cyan/white = entry,
-EL1, stack, BSS cleared).
+EL1, stack, BSS cleared), only in a `SCREEN_DEBUG=1` build. They're drawn before
+the platform is known.
 
-**Panic telemetry.** A synchronous exception paints an **orange** band at rows 500–529
+**Panic telemetry**, in both modes: it needs no lock, and the console's may be held
+by another CPU. A synchronous exception paints an **orange** band at rows 500–529
 (an SError paints a **purple** one), followed by three rows of 32 cells, MSB first,
 white = 1, grey = 0:
 
@@ -485,10 +543,19 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     row went through at 403 MHz, and the A55s can be lowered again (see "Console
     over USB" and "CPU frequency"). `cpufreq try` found it: it moves the shell to
     a big core and watches the lowered CPUs' ticks from another.
+20. **Keys (2026-10-29).** Power, Vol-Down and Vol-Up read over SPMI (see
+    "Keys"). The first presses came back as 120, 100 and 460 ms. The older
+    `spmi.c` guessed a v7 arbiter and a fixed channel, and data-aborted;
+    `pmic_arb.c` looks the channel up. The volume keys page the screen through the
+    console log, which `dmesg` already kept: the screen only ever had the lines
+    it showed.
+21. **Screen modes (2026-10-29).** The progress bars, heartbeat squares, `start.S`
+    markers and the `cpufreq try` bar became debug mode (`SCREEN_DEBUG`, shell
+    `screen`). By default the console has the whole panel.
 
 Still open:
-- `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
-  before it knows the platform.
+- With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
+  paints `0xE5000000` before it knows the platform.
 
 ---
 
@@ -1004,12 +1071,16 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/dwc3_acm.c` | Polled DWC3 device driver + CDC-ACM serial function |
 | `arch/arm/platform/sm8350/kload.c` | `kload`: receive a kernel Image over USB and jump to it |
 | `arch/arm/platform/sm8350/mmu.c` | Flat MMU map, caches on, uncached DMA window, clean-and-disable handoff |
+| `arch/arm/platform/sm8350/cpufreq.c` | EPSS CPU frequency: levels, shared-rail report, `cpufreq try`, `cpufreq l3` |
+| `arch/arm/platform/sm8350/thermal.c` | TSENS sensors (`temp`) and the big clusters' thermal cap |
+| `arch/arm/platform/sm8350/pmic_arb.c` | SPMI PMIC arbiter v5: single-byte PMIC reads and writes |
+| `arch/arm/platform/sm8350/keys.c` | Power / volume keys: console history, fastboot and status shortcuts |
 | `arch/arm/scripts/rog5-kload.ps1` | Host side of `kload` (used by `rog5-boot.sh --usb`) |
 | `arch/arm/include/sm8350.h` | Hardware register definitions (verified) |
 | `arch/arm/include/aarch64.h` | System register helpers |
 | `arch/arm/platform/sm8350/` | Platform-specific code |
 | `arch/arm/kernel/main.c` | Kernel entry (kernel_main) |
-| `arch/arm/kernel/framebuffer.c` | Splash FB console |
+| `arch/arm/kernel/framebuffer.c` | Splash FB console and its history view of the log |
 | `arch/arm/kernel/serial.c` | GENI UART driver |
 | `arch/arm/kernel/timer.c` | ARM Generic Timer |
 | `arch/arm/kernel/gic.c` | GICv3 interrupt controller |

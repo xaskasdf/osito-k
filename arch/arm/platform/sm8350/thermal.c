@@ -22,6 +22,7 @@
 #include "../../include/aarch64.h"
 #include "../../include/types.h"
 #include "cpufreq.h"
+#include "thermal.h"
 
 #define SROT_CTRL           0x004   /* bit 0 enabled, bit 3 + n sensor n */
 #define TM_SN_STATUS(n)     (0x0A0 + 4 * (n))
@@ -185,7 +186,7 @@ static void thermal_task(void *arg)
     }
 }
 
-void platform_start_tasks(void)
+void thermal_start(void)
 {
     if (!(mmio_rd32(tsens[0].srot + SROT_CTRL) & 1)) {
         serial_puts("[TEMP] tsens0 is off: no thermal limit\n");
@@ -207,6 +208,22 @@ static int parse_c(const char *s)
     for (; *s >= '0' && *s <= '9'; s++)
         v = v * 10 + (*s - '0');
     return *s ? -1 : v;
+}
+
+/* One line per call, for the Power key's status (keys.c):
+ * "A55 1804 MHz 38.1 C  A78 2419 MHz 37.8 C  X1 2841 MHz 38.4 C" */
+void thermal_summary(void)
+{
+    for (int dom = 0; dom < CPUFREQ_DOMAINS; dom++) {
+        serial_puts(dom ? "  " : "");
+        serial_puts(clusters[dom].core);
+        serial_puts(" ");
+        print_mhz(cpufreq_now_khz(dom));
+        serial_puts(" ");
+        print_temp(hottest(dom));
+        serial_puts(cpufreq_capped(dom) ? " C capped" : " C");
+    }
+    serial_puts("\n");
 }
 
 /* Shell `temp`: every sensor, then per cluster the hottest one and the

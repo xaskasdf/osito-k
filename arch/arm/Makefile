@@ -30,6 +30,11 @@ else
   $(error Unknown PLATFORM=$(PLATFORM). Use virt or sm8350.)
 endif
 
+# SCREEN_DEBUG=1: the SM8350 screen boots in debug mode (start.S markers,
+# progress bars, heartbeat squares, the console from pixel row 700); 0, the
+# console on the whole panel. The shell's `screen` switches it at runtime.
+SCREEN_DEBUG ?= 0
+
 # Compiler flags. The kernel is a PIE linked at 0 that relocates itself in
 # start.S (R_AARCH64_RELATIVE only): ABL loads it ~0x20180000 above where
 # a fixed link address would put it, and kload runs it wherever it lands.
@@ -37,10 +42,11 @@ CFLAGS := -ffreestanding -nostdlib -nostartfiles -fpie \
           -march=armv8.2-a -mtune=cortex-a78 -O2 \
           -mgeneral-regs-only \
           -Wall -Wextra -Wno-unused-parameter \
-          -Iinclude -I$(PLAT_DIR) -I../../gui -D__KERNEL_ARM__=1
+          -Iinclude -I$(PLAT_DIR) -I../../gui -D__KERNEL_ARM__=1 \
+          -DSCREEN_DEBUG=$(SCREEN_DEBUG)
 
 ASFLAGS := -ffreestanding -nostdlib -nostartfiles \
-           -march=armv8.2-a -D__ASSEMBLY__
+           -march=armv8.2-a -D__ASSEMBLY__ -DSCREEN_DEBUG=$(SCREEN_DEBUG)
 
 LDFLAGS := -nostdlib -pie --no-dynamic-linker -z text -T $(LDSCRIPT)
 

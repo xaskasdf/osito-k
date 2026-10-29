@@ -16,6 +16,10 @@ void acm_poll(void);        /* process controller events, push pending TX */
 int  acm_getc(void);        /* next received byte, or -1 */
 void acm_putc(char c);      /* queue a byte for the host (dropped when full) */
 int  acm_tx_idle(void);     /* everything queued has reached the host */
+#define ACM_UNCONFIGURED    0   /* no host, or not enumerated yet */
+#define ACM_PORT_CLOSED     1   /* enumerated, the COM port isn't open */
+#define ACM_PORT_OPEN       2
+int  acm_state(void);
 void acm_stop(void);        /* disconnect from the host and halt the controller */
 
 #endif

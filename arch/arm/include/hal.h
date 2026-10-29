@@ -30,9 +30,10 @@ int platform_kload(void);
 /* CPU frequency: set at boot, shell `cpufreq` to show or change it */
 void platform_cpufreq_init(void);
 void platform_cpufreq_cmd(int argc, char **argv);
-/* Board tasks, once the scheduler exists (SM8350: the thermal limit) */
+/* Board tasks, once the scheduler exists (SM8350: the thermal limit, keys) */
 void platform_start_tasks(void);
 void platform_temp_cmd(int argc, char **argv);   /* shell `temp` */
+void platform_keys_cmd(int argc, char **argv);   /* shell `keys` */
 
 /* ========================================================================
  * UART (platform-specific low-level)
@@ -55,6 +56,12 @@ void serial_puthex(uint64_t val, int digits);
 void serial_putdec(uint64_t val);
 char serial_getc(void);
 void klog_dump(void);       /* replay the console log (shell `dmesg`) */
+/* Page the screen's text area through the console log: `lines` further
+ * back (negative: forward). At 0 lines back it is the live console again,
+ * with whatever came meanwhile. Returns how many lines back it shows. */
+#define CONSOLE_LIVE    (-(1 << 30))
+int  console_scroll(int lines);
+void console_redraw(void);  /* the log's tail, after the text area moved */
 /* Exclusive use of the console devices (USB gadget, framebuffer) across
  * CPUs, IRQs off; nests on one CPU. serial_* take it themselves. */
 uint64_t console_lock(void);
@@ -68,12 +75,23 @@ void fb_init_platform(uint64_t base, uint32_t width, uint32_t height,
 void fb_set_text_top(uint32_t y);
 void fb_clear(void);
 void fb_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
-/* Per-CPU status square in the heartbeat row (SM8350 screen) */
-#define FB_CPU_MARK(cpu, color)  fb_fill((cpu) * 70, 420, 60, 30, (color))
+/* SM8350 screen debug mode (SCREEN_DEBUG, shell `screen`): boot progress
+ * bars, a heartbeat square per CPU and the console from pixel row 700. Off,
+ * the console has the whole panel. */
+extern volatile int screen_debug;
+void platform_screen_cmd(int argc, char **argv);    /* shell `screen` */
+/* Per-CPU status square in the heartbeat row, in debug mode */
+#define FB_CPU_MARK(cpu, color) \
+    do { if (screen_debug) fb_fill((cpu) * 70, 420, 60, 30, (color)); } while (0)
 void fb_putc(char c);
 void fb_puts(const char *s);
 void fb_puts_color(const char *s, uint32_t color);
 void fb_putdec(uint64_t val);
+/* Show the log in `ring` (`total` bytes ever written) `lines` further back;
+ * console_scroll calls it under the console lock. fb_redraw_log: just the
+ * live console, laid out again from the log (console_redraw). */
+int  fb_history(const char *ring, uint32_t size, uint32_t total, int lines);
+void fb_redraw_log(const char *ring, uint32_t size, uint32_t total);
 
 /* ========================================================================
  * Platform info

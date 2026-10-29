@@ -27,8 +27,14 @@ static uint32_t scale;      /* glyph magnification (2 on the 1080-wide phone pan
  * whatever their color. Scrolling redraws from here and never reads the
  * framebuffer, which is uncached. 0 = not drawn by us yet (BSS). */
 #define TEXT_MAX_CELLS  24576      /* 135 x 153: 8x16 glyphs on 1080x2448 */
+#define TEXT_MAX_COLS   256
 #define CELL_BLANK      ' '
 static uint32_t cells[TEXT_MAX_CELLS];
+
+/* History view (fb_history) */
+static int viewing;         /* the text area shows the log, not the console */
+static uint32_t view_top;   /* log offset of its top line, which stays put */
+static int view_missed;     /* output arrived while it was up */
 
 /* ── Minimal 8×16 bitmap font (ASCII 32-126) ─────────────────── */
 /* Each glyph: 16 bytes (one byte per row, MSB left) */
@@ -154,6 +160,9 @@ void fb_set_text_top(uint32_t y)
     text_row = 0;
     max_cols = fb_width / (FONT_W * scale);
     max_rows = (fb_height - y) / (FONT_H * scale);
+    viewing = 0;
+    if (max_cols > TEXT_MAX_COLS)
+        max_cols = TEXT_MAX_COLS;
     if (!max_cols) return;
     if (max_cols * max_rows > TEXT_MAX_CELLS)
         max_rows = TEXT_MAX_CELLS / max_cols;
@@ -172,6 +181,7 @@ void fb_clear(void)
         cells[i] = CELL_BLANK;
     text_col = 0;
     text_row = 0;
+    viewing = 0;
 }
 
 /* Anything outside the font draws as a space */
@@ -266,6 +276,12 @@ static void fb_newline(void)
 static void fb_put(char c, uint32_t color)
 {
     if (!fb_base || !max_cols) return;
+    if (viewing) {
+        /* Showing history: the text only reaches the log (serial.c), and
+         * going back to the live console redraws from there */
+        view_missed = 1;
+        return;
+    }
     if (c == '\n') {
         fb_newline();
     } else if (c == '\r') {
@@ -306,6 +322,151 @@ void fb_puthex(uint64_t val, int digits)
 void fb_putchar(char c)
 {
     fb_putc(c);
+}
+
+/* ── History: the console log on screen ─────────────────────────
+ *
+ * The text area keeps only what fits; serial.c's log (`dmesg`'s ring) has
+ * the rest. fb_history lays the log out the way fb_put lays out live text
+ * (wrapping at max_cols, '\r', '\b'), in the default color, and shows it
+ * any number of lines back, with the last row saying where. The view is
+ * anchored to its top line, so output that arrives meanwhile doesn't move
+ * it; scrolling down to the end, or going live, redraws the log's tail with
+ * the cursor after it, and that output shows up then. */
+#define HIST_LINES      4096                /* line starts kept: the last ones */
+#define HIST_COLOR      0x00FFFF00
+static uint32_t line_start[HIST_LINES];     /* log offsets, a ring */
+
+/* Breaks the log into lines; returns how many (the last is the cursor's) */
+static uint32_t hist_layout(const char *ring, uint32_t size, uint32_t total)
+{
+    uint32_t i = total > size ? total - size : 0;
+    uint32_t n = 0, col = 0;
+    line_start[n++ % HIST_LINES] = i;
+    for (; i < total; i++) {
+        char c = ring[i % size];
+        if (c == '\n') {
+            col = 0;
+            line_start[n++ % HIST_LINES] = i + 1;
+        } else if (c == '\r') {
+            col = 0;
+        } else if (c == '\b') {
+            if (col > 0) col--;
+        } else if (++col >= max_cols) {
+            col = 0;
+            line_start[n++ % HIST_LINES] = i + 1;
+        }
+    }
+    return n;
+}
+
+/* Draws log line `line` (of n) in screen row `row`; returns the column after
+ * its text, where the cursor goes if it's the last line */
+static uint32_t hist_row(const char *ring, uint32_t size, uint32_t total,
+                         uint32_t line, uint32_t n, uint32_t row)
+{
+    static uint32_t text[TEXT_MAX_COLS];
+    uint32_t to = line + 1 < n ? line_start[(line + 1) % HIST_LINES] : total;
+    uint32_t col = 0;
+    for (uint32_t c = 0; c < max_cols; c++)
+        text[c] = CELL_BLANK;
+    for (uint32_t i = line_start[line % HIST_LINES]; i < to; i++) {
+        char c = ring[i % size];
+        if (c == '\n')
+            break;
+        if (c == '\r') {
+            col = 0;
+        } else if (c == '\b') {
+            if (col > 0) col--;
+        } else if (col < max_cols) {
+            text[col++] = (c > 32 && c <= 126)
+                ? ((FG_COLOR & 0xFFFFFF) << 8) | (uint8_t)c : CELL_BLANK;
+        }
+    }
+    for (uint32_t c = 0; c < max_cols; c++)
+        fb_set_cell(row, c, text[c]);
+    return col;
+}
+
+static void hist_status(const char *s, uint32_t *col)
+{
+    for (; *s && *col < max_cols; s++, (*col)++)
+        fb_set_cell(max_rows - 1, *col,
+                    *s == ' ' ? CELL_BLANK : (HIST_COLOR << 8) | (uint8_t)*s);
+}
+
+static void hist_status_dec(uint32_t v, uint32_t *col)
+{
+    char buf[11];
+    int i = sizeof(buf) - 1;
+    buf[i] = 0;
+    do {
+        buf[--i] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v && i > 0);
+    hist_status(&buf[i], col);
+}
+
+/* The live console: the log's tail, the cursor after it */
+static void hist_live(const char *ring, uint32_t size, uint32_t total, uint32_t n)
+{
+    uint32_t first = n > max_rows ? n - max_rows : 0;
+    uint32_t row = 0, col = 0;
+    for (uint32_t l = first; l < n; l++, row++)
+        col = hist_row(ring, size, total, l, n, row);
+    text_row = row - 1;
+    text_col = col;
+    for (; row < max_rows; row++)
+        fb_blank_row(row);
+    viewing = view_missed = 0;
+}
+
+void fb_redraw_log(const char *ring, uint32_t size, uint32_t total)
+{
+    if (!fb_base || !max_rows)
+        return;
+    hist_live(ring, size, total, hist_layout(ring, size, total));
+}
+
+int fb_history(const char *ring, uint32_t size, uint32_t total, int lines)
+{
+    if (!fb_base || max_rows < 2 || (!viewing && lines <= 0))
+        return 0;
+    uint32_t n = hist_layout(ring, size, total);
+    uint32_t rows = max_rows - 1;               /* the last row is the status */
+    uint32_t oldest = n > HIST_LINES ? n - HIST_LINES : 0;
+    uint32_t end_top = n > rows ? n - rows : 0; /* the top line at the end */
+
+    /* Where the view's top line is now (live: the end) */
+    uint32_t top = end_top;
+    if (viewing) {
+        top = oldest;
+        for (uint32_t l = oldest; l < n && line_start[l % HIST_LINES] <= view_top; l++)
+            top = l;
+    }
+    int64_t t = (int64_t)top - lines;
+    if (t < (int64_t)oldest)
+        t = oldest;
+
+    if (t >= (int64_t)end_top) {
+        hist_live(ring, size, total, n);
+        return 0;
+    }
+
+    viewing = 1;
+    view_top = line_start[t % HIST_LINES];
+    for (uint32_t r = 0; r < rows; r++)
+        hist_row(ring, size, total, (uint32_t)t + r, n, r);
+    uint32_t col = 0;
+    hist_status("-- history: ", &col);
+    hist_status_dec(end_top - (uint32_t)t, &col);
+    hist_status(" of ", &col);
+    hist_status_dec(end_top - oldest, &col);
+    hist_status(" lines back", &col);
+    hist_status(view_missed ? ", new output below --" : " --", &col);
+    while (col < max_cols)
+        fb_set_cell(max_rows - 1, col++, CELL_BLANK);
+    return (int)(end_top - (uint32_t)t);
 }
 
 /* Solid rectangle, for status markers outside the text area. Any CPU,

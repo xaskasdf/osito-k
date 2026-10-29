@@ -125,11 +125,17 @@ static int on_qemu_virt(void)
     return platform_ram_base() == 0x40000000UL;
 }
 
+#ifndef SCREEN_DEBUG
+#define SCREEN_DEBUG 0
+#endif
+volatile int screen_debug = SCREEN_DEBUG;
+
 /* Panic telemetry on the SM8350 splash FB, for when no UART is attached:
  * a colored band at rows 500-529, then three rows of 32 cells (MSB first,
  * white = 1, grey = 0): ESR, ELR[31:0] and the runtime address of _start.
  * The kernel is linked at 0, so ELR - _start is the faulting symbol's
- * address in kernel.elf. */
+ * address in kernel.elf. Drawn outside debug mode too, over the console:
+ * it needs no lock, and the CPU that panicked may not get the console. */
 extern char _start[];
 
 static void fb_panic(uint32_t color, uint32_t esr, uint32_t elr)
@@ -229,10 +235,10 @@ static void shell_wrapper(void *arg)
  * Kernel entry
  * ======================================================================== */
 
-/* Debug: paint a fat bar on the framebuffer to show we reached C code */
+/* Screen debug mode: boot progress, one bar per step reached */
 static void fb_debug_bar(int row, uint32_t color)
 {
-    if (on_qemu_virt())
+    if (!screen_debug || on_qemu_virt())
         return;
     volatile uint32_t *fb = (volatile uint32_t *)(0xE5000000UL + row * 4320);
     for (int i = 0; i < 1080 * 4; i++)  /* 4 rows wide, full width */

@@ -40,6 +40,10 @@ _entry:
     /* Save DTB address (callee-saved register) */
     mov     x19, x0
 
+    /* Screen debug mode (SCREEN_DEBUG=1): four 200-pixel marker lines on
+     * the SM8350 splash FB, rows 0-3. Before the platform is known, so
+     * virt needs RAM at 0xE5000000 (-m 4G) for them. */
+#if SCREEN_DEBUG
     /* === EARLY FB TEST: paint top-left 200px red === */
     /* Splash FB at 0xE5000000, ARGB8888 */
     ldr     x10, =0xE5000000
@@ -49,6 +53,7 @@ _entry:
 3:  str     w11, [x10], #4
     subs    x12, x12, #1
     b.ne    3b
+#endif
 
     /* Verify EL1 */
     mrs     x1, CurrentEL
@@ -56,6 +61,7 @@ _entry:
     cmp     x1, #1
     b.ne    _hang
 
+#if SCREEN_DEBUG
     /* === MARKER 2: green line = EL1 OK === */
     ldr     x10, =0xE50010E0          /* row 1: 0xE5000000 + 4320 */
     mov     w11, #0xFF00
@@ -64,6 +70,7 @@ _entry:
 4:  str     w11, [x10], #4
     subs    x12, x12, #1
     b.ne    4b
+#endif
 
     /* Set up exception vectors */
     adr     x0, _vectors
@@ -96,6 +103,7 @@ _entry:
     b       7b
 8:
 
+#if SCREEN_DEBUG
     /* === MARKER 3: cyan line = stack OK === */
     ldr     x10, =0xE50021C0          /* row 2: 0xE5000000 + 8640 */
     mov     w11, #0xFFFF
@@ -104,6 +112,7 @@ _entry:
 5:  str     w11, [x10], #4
     subs    x12, x12, #1
     b.ne    5b
+#endif
 
     /* Clear BSS (use adrp+add for large BSS — adr only reaches ±1MB) */
     adrp    x0, __bss_start
@@ -116,6 +125,7 @@ _entry:
     b       1b
 2:
 
+#if SCREEN_DEBUG
     /* === MARKER 4: white line = BSS clear done === */
     ldr     x10, =0xE50032A0          /* row 3: 0xE5000000 + 12960 */
     mov     w11, #0xFFFF
@@ -124,6 +134,7 @@ _entry:
 6:  str     w11, [x10], #4
     subs    x12, x12, #1
     b.ne    6b
+#endif
 
     /* Jump to C kernel entry */
     mov     x0, x19                 // x0 = DTB

@@ -622,6 +622,11 @@ int acm_tx_idle(void)
     return !started || !configured || (!tx_active && tx_head == tx_tail);
 }
 
+int acm_state(void)
+{
+    return !started || !configured ? ACM_UNCONFIGURED : dtr ? ACM_PORT_OPEN : ACM_PORT_CLOSED;
+}
+
 void acm_stop(void)
 {
     if (!started)

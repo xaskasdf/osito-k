@@ -7,9 +7,10 @@
 #include "../include/hal.h"
 #include "../include/spinlock.h"
 
-/* Kernel log: the last KLOG_SIZE bytes of console output, for `dmesg`. On
- * SM8350 the boot messages are printed before the host can open the USB
- * console, and the framebuffer console wraps over them. */
+/* Kernel log: the last KLOG_SIZE bytes of console output, for `dmesg` and
+ * the screen's history view (console_scroll). On SM8350 the boot messages
+ * are printed before the host can open the USB console, and the
+ * framebuffer console scrolls them away. */
 #define KLOG_SIZE 16384
 static char klog[KLOG_SIZE];
 static uint32_t klog_total;         /* bytes ever logged; wraps the ring */
@@ -74,6 +75,21 @@ void klog_dump(void)
     for (uint32_t i = start; i < end; i++)
         out_raw(klog[i % KLOG_SIZE]);
     klog_muted = 0;
+    console_unlock(flags);
+}
+
+int console_scroll(int lines)
+{
+    uint64_t flags = console_lock();
+    int back = fb_history(klog, KLOG_SIZE, klog_total, lines);
+    console_unlock(flags);
+    return back;
+}
+
+void console_redraw(void)
+{
+    uint64_t flags = console_lock();
+    fb_redraw_log(klog, KLOG_SIZE, klog_total);
     console_unlock(flags);
 }
 

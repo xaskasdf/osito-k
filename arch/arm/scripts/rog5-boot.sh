@@ -14,6 +14,8 @@
 #   arch/arm/scripts/rog5-boot.sh --usb           # ... then send the kernel to the running Osito-K
 #                                                 #     over its USB console (`kload`), no flashing
 #   arch/arm/scripts/rog5-boot.sh --virt-check    # also build PLATFORM=virt and boot it in local QEMU
+#   arch/arm/scripts/rog5-boot.sh --screen-debug  # boot in screen debug mode (SCREEN_DEBUG=1):
+#                                                 #     progress bars, heartbeat squares; with any of the above
 #
 # --usb needs a kernel with `kload` already running (the flashed one is enough:
 # each loaded kernel can load the next). It leaves boot_a untouched, so a
@@ -52,12 +54,13 @@ PB="${OK_PB:-phone_breaker2}"
 info() { printf '\033[1;36m[rog5]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[rog5] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-FLASH=0; VIRT=0; USB=0
+FLASH=0; VIRT=0; USB=0; SCREEN_DEBUG=0
 for a in "$@"; do
     case "$a" in
         --flash)        FLASH=1 ;;
         --usb)          USB=1 ;;
         --virt-check)   VIRT=1 ;;
+        --screen-debug) SCREEN_DEBUG=1 ;;
         -h|--help)      sed -n '3,/^set -e/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
         *)              die "unknown option: $a (see --help)" ;;
     esac
@@ -88,15 +91,15 @@ tar czf - -T "$TMP/files" | mac "rm -rf ~/$MAC_DIR/src && mkdir -p ~/$MAC_DIR/sr
 # --- Build + pack on the Mac ------------------------------------------------
 # Same layout and mkbootimg arguments as phone_breaker2/repack_boot.sh, with
 # Osito-K instead of Linux at 1.5 MB.
-info "Building PLATFORM=sm8350$([ "$VIRT" = 1 ] && echo ' + virt') and packing boot.img..."
-REMOTE_SHA="$(mac "MAC_DIR=$MAC_DIR PB=$PB VIRT=$VIRT bash -s" <<'EOF'
+info "Building PLATFORM=sm8350$([ "$VIRT" = 1 ] && echo ' + virt')$([ "$SCREEN_DEBUG" = 1 ] && echo ', screen debug') and packing boot.img..."
+REMOTE_SHA="$(mac "MAC_DIR=$MAC_DIR PB=$PB VIRT=$VIRT SCREEN_DEBUG=$SCREEN_DEBUG bash -s" <<'EOF'
 set -e
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 D=$HOME/$MAC_DIR; P=$HOME/$PB
 build() {
     cd "$D/src/arch/arm"
     rm -rf build
-    if ! make -j8 PLATFORM=$1 CROSS=aarch64-elf- > "$D/build-$1.log" 2>&1; then
+    if ! make -j8 PLATFORM=$1 CROSS=aarch64-elf- SCREEN_DEBUG=$SCREEN_DEBUG > "$D/build-$1.log" 2>&1; then
         grep -E 'error|undefined' "$D/build-$1.log" | head -20 >&2
         echo "build $1 failed, full log: ~/$MAC_DIR/build-$1.log" >&2
         exit 1
@@ -132,8 +135,9 @@ mv -f "$OUT_REL.tmp" "$OUT_REL"
 info "boot.img: $OUT_REL (sha256 ${LOCAL_SHA:0:16}...)"
 
 # --- Optional: virt smoke test in local QEMU --------------------------------
-# -m 4G because start.S paints the SM8350 framebuffer (0xE5000000) before it
-# knows the platform; with less RAM nothing is mapped there and virt aborts.
+# -m 4G because with --screen-debug start.S paints the SM8350 framebuffer
+# (0xE5000000) before it knows the platform; with less RAM nothing is mapped
+# there and virt aborts.
 if [ "$VIRT" = 1 ]; then
     QEMU="${QEMU:-$(command -v qemu-system-aarch64 || echo /c/msys64/mingw64/bin/qemu-system-aarch64.exe)}"
     [ -x "$QEMU" ] || die "qemu-system-aarch64 not found (set QEMU)"

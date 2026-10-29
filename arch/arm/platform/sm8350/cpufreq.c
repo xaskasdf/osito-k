@@ -359,10 +359,11 @@ static void l3_show(void)
 #define TRY_MAX_S       20
 #define TRY_SAMPLES     ((TRY_MAX_S + 1) * 1000 / TRY_STEP_MS + 2)
 #define TRY_ROW         10              /* samples per report row: 0.5 s */
-/* A bar under the heartbeat squares, drawn without the console lock (a
- * stopped CPU may hold it): yellow while it runs, then red if a CPU missed
- * its ticks, green if none did */
-#define TRY_BAR(color)  fb_fill(0, 460, 560, 20, (color))
+/* In screen debug mode, a bar under the heartbeat squares, drawn without
+ * the console lock (a stopped CPU may hold it): yellow while it runs, then
+ * red if a CPU missed its ticks, green if none did */
+#define TRY_BAR(color) \
+    do { if (screen_debug) fb_fill(0, 460, 560, 20, (color)); } while (0)
 
 static struct try_sample {
     uint32_t ms;

@@ -7,6 +7,8 @@
 #include "mmu.h"
 #include "usb.h"
 #include "pmic_arb.h"
+#include "thermal.h"
+#include "keys.h"
 
 /* Page allocator range. DDR bank 0 ends at 0xB5000000 (device memory node;
  * the next bank starts at 0xC0000000): the old 384 MB size ran 176 MB past
@@ -17,9 +19,11 @@
 uint64_t platform_ram_base(void) { return SM8350_RAM_BASE; }
 uint64_t platform_ram_size(void) { return SM8350_RAM_SIZE; }
 
-/* Pixel rows above this belong to main.c's boot progress bars (to 449) and
- * panic band + cells (500-649); the text console gets the rest of the panel. */
-#define CONSOLE_TOP  700
+/* In screen debug mode, pixel rows above this belong to main.c's boot
+ * progress bars (to 449), the cpufreq try bar (460-479) and the panic band
+ * + cells (500-649); the text console gets the rest of the panel. Out of
+ * debug mode it gets all of it (the panic band still goes over it). */
+#define DEBUG_CONSOLE_TOP  700
 
 void platform_init(void *dtb) {
     (void)dtb;
@@ -28,7 +32,34 @@ void platform_init(void *dtb) {
      * cable, so it doubles as the console. */
     fb_init_platform(SPLASH_FB_BASE, DISPLAY_WIDTH, DISPLAY_HEIGHT,
                      DISPLAY_WIDTH, 32);
-    fb_set_text_top(CONSOLE_TOP);
+    if (screen_debug) {
+        fb_set_text_top(DEBUG_CONSOLE_TOP);
+    } else {
+        fb_set_text_top(0);
+        fb_clear();                     /* ABL's splash */
+    }
+}
+
+/* Shell `screen`: the mode; `screen debug` / `screen normal` switches it,
+ * moving the console and laying it out again from the log */
+void platform_screen_cmd(int argc, char **argv) {
+    if (argc == 2 && (strcmp(argv[1], "debug") == 0 || strcmp(argv[1], "normal") == 0)) {
+        int debug = argv[1][0] == 'd';
+        uint64_t flags = console_lock();
+        screen_debug = debug;
+        console_scroll(CONSOLE_LIVE);
+        if (debug)
+            fb_fill(0, 0, DISPLAY_WIDTH, DEBUG_CONSOLE_TOP, 0);
+        fb_set_text_top(debug ? DEBUG_CONSOLE_TOP : 0);
+        console_unlock(flags);
+        console_redraw();
+    } else if (argc != 1) {
+        serial_puts("usage: screen [debug | normal]\n");
+        return;
+    }
+    serial_puts(screen_debug
+        ? "screen: debug (heartbeat squares, console from pixel row 700)\n"
+        : "screen: normal (the console on the whole panel)\n");
 }
 
 void platform_probe_devices(void) {
@@ -92,6 +123,12 @@ void platform_reboot_bootloader(void) {
     }
     mdelay(200);
     platform_reboot();
+}
+
+/* Once the scheduler exists: the thermal limit and the keys */
+void platform_start_tasks(void) {
+    thermal_start();
+    keys_start();
 }
 
 /* Shell `pmic`: the arbiter version and the restart reason; `pmic <sid>
