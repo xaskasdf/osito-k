@@ -334,6 +334,7 @@ void kernel_main(void *dtb)
     sched_init();
     term_init();
     task_create("shell", shell_wrapper, (void *)0, 1);
+    platform_start_tasks();
 
     serial_puts("[KERN] Boot complete.\n");
 

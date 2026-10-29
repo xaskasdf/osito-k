@@ -30,6 +30,9 @@ int platform_kload(void);
 /* CPU frequency: set at boot, shell `cpufreq` to show or change it */
 void platform_cpufreq_init(void);
 void platform_cpufreq_cmd(int argc, char **argv);
+/* Board tasks, once the scheduler exists (SM8350: the thermal limit) */
+void platform_start_tasks(void);
+void platform_temp_cmd(int argc, char **argv);   /* shell `temp` */
 
 /* ========================================================================
  * UART (platform-specific low-level)
@@ -93,6 +96,7 @@ int  smp_get_cpu_count(void);
 void smp_print_cpus(void);
 void smp_bench(int any, int count);     /* shell `cpubench [any [n]]` */
 void smp_bench_mix(void);               /* shell `cpubench mix` */
+void smp_burn(int cpu, int seconds);    /* shell `burn`; cpu -1 = all */
 int  smp_cpu_id(void);          /* kernel/sched.c: this CPU's core number */
 
 /* ========================================================================
@@ -163,7 +167,8 @@ typedef void (*task_func_t)(void *arg);
 void sched_init(void);
 /* Runs on the boot CPU, like before SMP */
 int  task_create(const char *name, task_func_t func, void *arg, int priority);
-/* cpu: a core number, or -1 (TASK_ANY_CPU) for whichever CPU is free */
+/* cpu: a core number, or TASK_ANY_CPU for whichever CPU is free */
+#define TASK_ANY_CPU    (-1)
 int  task_create_on(const char *name, task_func_t func, void *arg, int priority,
                     int cpu);
 /* Relative speed of a CPU (cpufreq): unpinned tasks prefer the fastest */

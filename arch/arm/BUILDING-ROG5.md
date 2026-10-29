@@ -216,22 +216,76 @@ Each cluster is an EPSS frequency domain (`qcom,cpufreq-hw-epss` in the phone's
 device tree): domain 0 at `0x18591000` = cpu0-3 (A55), 1 at `0x18592000` = cpu4-6
 (A78), 2 at `0x18593000` = cpu7 (X1). The hardware holds the table of levels and
 sequences the voltage itself; `platform/sm8350/cpufreq.c` reads the table
-(`0x100`, `0x200`) and writes the index of the level it wants to `0x320`, as Linux's
-`qcom-cpufreq-hw` does. `0x020` reports the L value a domain actually runs at
-(× 19.2 MHz), after the limits hardware (LMh), which still throttles on
-temperature. Nothing in Osito-K manages heat.
+(`0x100` frequencies, `0x200` voltages) and writes the index of the level it
+wants to `0x320`, as Linux's `qcom-cpufreq-hw` does. `0x020` reports what the
+domain actually runs at: bits 7:0 the L value (× 19.2 MHz), 12:8 the level,
+31:20 the voltage in mV. That can differ from the level it is set to: the limits
+hardware (LMh) throttles hot silicon, and the big clusters share a rail (below).
 
 The bootloader leaves the A78s at 710 MHz and the X1 at 844 MHz, their lowest
 levels. Boot moves every domain to its top level: A55 1804 MHz, A78 2419 MHz,
 X1 2841 MHz. A domain with all its cores off reports the new level only once
 they run, so this happens after `smp_boot_aps`. The setting survives a `kload`.
 
-- `cpufreq` lists each domain's levels, current frequency and level.
-- `cpufreq max` / `cpufreq min` set every domain to its top / lowest level.
-- `cpufreq <domain> <level>` sets one.
+**The A78s and the X1 share a voltage rail.** The rail follows whichever domain
+needs the higher voltage, and the EPSS runs the other one at its fastest level
+that voltage allows, whatever it was set to. Measured with the A78s set to
+710 MHz:
+
+| X1 set to | rail | A78s run at |
+|---|---|---|
+| 1900 MHz | 720 mV | 1440 MHz (708 mV) |
+| 2496 MHz | 884 mV | 1996 MHz (856 mV) |
+| 2841 MHz | 1008 mV | 2419 MHz (1000 mV) |
+
+It works both ways: A78s at 1670 MHz (764 mV) keep the X1 at 2035 MHz (740 mV).
+So lowering one big cluster alone does nothing; this looked like a drop that
+"took seconds" until the X1 came down too.
+
+**The A55s stay at their top level.** Lowering them hung the machine twice within
+seconds (to the alternate clock, level 0, and to 403 MHz, level 1): the USB console
+stopped answering, with no panic band. In a photo of the hung screen, cpu0-3's
+heartbeat squares were dark and cpu4-7's lit. Linux lowers this domain all the time,
+so something it sets up is missing here; one suspect is the L3 cache's frequency,
+which Linux votes on and Osito-K leaves alone. Until that is understood, `cpufreq`
+refuses to change domain 0, and the A55s barely warm up anyway.
+
+- `cpufreq` lists each domain's frequency and voltage now, and its levels as
+  MHz@mV.
+- `cpufreq max` / `cpufreq min` set the big clusters to their top / lowest level.
+- `cpufreq <domain> <level>` sets one and reports every domain on its rail, e.g.
+  `cpu4-6: 1440 MHz, set to 710 MHz (the other cluster holds their shared rail up)`.
 
 Each level change also updates the scheduler's capacity for those CPUs (see
 "Placement by load"). `cpus` shows it.
+
+### Temperature
+
+`platform/sm8350/thermal.c` reads the two TSENS v2 controllers
+(`qcom,tsens24xx`): tsens0 (SROT `0x0C222000`, TM `0x0C263000`) has the CPU
+sensors, tsens1 (SROT `0x0C223000`, TM `0x0C265000`) the GPU, NPU, video, DDR,
+modem and camera ones. Each sensor's status register (TM + `0xA0` + 4n) holds the
+last reading in 0.1 °C, 12-bit signed, with a valid bit (21). The names come from
+the device tree's thermal zones. cpu-0-0..3 are the A55s, cpu-1-0..7 the four big
+cores, two sensors each in order: `burn 7` heats cpu-1-6/7 and `burn 4` heats
+cpu-1-0/1.
+
+A "thermal" task checks every 100 ms. Above 95 °C on any big-core sensor, it lowers
+the caps of **both** big clusters one level (the shared rail makes one alone
+useless); below 85 °C it raises them one level. A capped domain runs at the lower
+of the level asked for and its cap. Android's die trips for these zones are
+108–125 °C; its everyday control works from skin temperature, which Osito-K
+doesn't read, so these trips are lower. LMh still throttles on its own.
+
+- `temp` shows every sensor, then per cluster the hottest one, its peak, and the
+  frequency it runs at (and its cap).
+- `temp limit <cap> <release>` moves the trips, in °C, until the next boot.
+- `burn <cpu|all> <seconds>` keeps CPUs busy in the background, to make heat.
+
+At rest everything reads 33–38 °C, and one core busy for 25 s reaches ~42 °C. With
+`temp limit 45 41` and `burn all 45`, the cap went from 2419 / 2841 MHz down to
+1996 / 2496 MHz within 22 s and held the big cores at 43–44 °C. Within ~2 s of the
+burn ending, it released them to the top levels.
 
 ---
 
@@ -381,8 +435,14 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     of work every ~10 ms. After the first 300 ms, the busy ones were on the X1 and an
     A78 and the light ones only on cpu0-3, the same in three runs.
     `cpubench any 3` and the pinned run didn't change.
+18. **Temperature limit (2026-10-29).** TSENS sensors, the `temp` command and a
+    thermal task that caps the big clusters (see "Temperature"). Two findings on
+    the way, both in "CPU frequency". First, the A78s and the X1 share a voltage
+    rail, so the governor lowers them together. Second, lowering the A55s hangs
+    the machine, so they stay at their top level.
 
 Still open:
+- Why lowering the A55 cluster hangs (see "CPU frequency").
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
 

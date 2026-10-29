@@ -52,6 +52,18 @@ void platform_pmic_cmd(int argc, char **argv)
     serial_puts("pmic: only on SM8350\n");
 }
 
+/* No temperature sensors either */
+void platform_start_tasks(void)
+{
+}
+
+void platform_temp_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    serial_puts("temp: only on SM8350\n");
+}
+
 /* QEMU's CPUs have no frequency to set */
 void platform_cpufreq_init(void)
 {

@@ -78,7 +78,10 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
 - MMU and caches are on (`platform/sm8350/mmu.c`, flat map). Anything a device DMAs to must come from `dma_alloc()` (uncached window), not the page allocator.
 - SMP: tasks run on all 8 cores (`kernel/sched.c`, `kernel/smp.c`). `task_create` keeps a task on the boot CPU, as before SMP; `task_create_on(..., cpu)` places it elsewhere, or anywhere with `TASK_ANY_CPU`. Shared state needs a lock from `include/spinlock.h`. The scheduler, heap, page allocator and console already have one. Don't use `__atomic` builtins: they emit LSE, which virt's Cortex-A72 lacks.
 - The hypervisor traps GIC MMIO and emulates it from the abort syndrome, so a load/store with writeback or a pair (`str w0, [x1], #4`, `stp`) becomes a synchronous external abort. Access the GIC (and any other region it might trap) only through the asm `mmio_rd32`/`mmio_wr32`/`mmio_rd64` in `include/aarch64.h`.
-- Boot sets every CPU cluster to its top frequency through the EPSS hardware (`platform/sm8350/cpufreq.c`, shell `cpufreq`): A55 1.8 GHz, A78 2.42 GHz, X1 2.84 GHz. The bootloader leaves the big cores at 710/844 MHz. Only the hardware limiter (LMh) watches temperature.
+- Boot sets every CPU cluster to its top frequency through the EPSS hardware (`platform/sm8350/cpufreq.c`, shell `cpufreq`): A55 1.8 GHz, A78 2.42 GHz, X1 2.84 GHz. The bootloader leaves the big cores at 710/844 MHz.
+  - The A78s and the X1 share a voltage rail, so lowering one alone changes nothing.
+  - Never lower the A55s: it hung the machine twice, and `cpufreq` refuses it.
+  - `platform/sm8350/thermal.c` reads the TSENS sensors (shell `temp`), and its task caps both big clusters together above 95 °C.
 - Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
 - The kernel is a PIE linked at 0 that relocates itself in `start.S`, so it runs at any load address and stored pointers work. Linker-script symbols that C reads must be section-relative (an absolute symbol's GOT entry gets no relocation). After linking, `readelf -r kernel.elf` should show only `R_AARCH64_RELATIVE`.
 

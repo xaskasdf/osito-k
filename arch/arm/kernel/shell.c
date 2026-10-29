@@ -43,6 +43,8 @@ static void cmd_help(void)
     serial_puts("  cpubench Timed task per CPU, all at once [any [n]: n unpinned]\n");
     serial_puts("           [mix: busy + light unpinned tasks, where they settle]\n");
     serial_puts("  cpufreq  CPU frequencies [max | min | <domain> <level>]\n");
+    serial_puts("  temp     Temperature sensors, CPU thermal limit [limit <cap> <release>]\n");
+    serial_puts("  burn     Keep CPUs busy in the background <cpu|all> <seconds>\n");
     serial_puts("  echo     Print text\n");
     serial_puts("  hexdump  Hex dump file\n");
     serial_puts("  df       Filesystem free space\n");
@@ -350,6 +352,23 @@ void shell_run(void)
         }
         else if (strcmp(argv[0], "cpufreq") == 0) {
             platform_cpufreq_cmd(argc, argv);
+        }
+        else if (strcmp(argv[0], "temp") == 0) {
+            platform_temp_cmd(argc, argv);
+        }
+        else if (strcmp(argv[0], "burn") == 0) {
+            int cpu = -1, secs = 0;
+            if (argc == 3 && strcmp(argv[1], "all") != 0) {
+                cpu = 0;
+                for (const char *p = argv[1]; *p >= '0' && *p <= '9'; p++)
+                    cpu = cpu * 10 + (*p - '0');
+            }
+            for (const char *p = argc == 3 ? argv[2] : ""; *p >= '0' && *p <= '9'; p++)
+                secs = secs * 10 + (*p - '0');
+            if (argc != 3 || secs <= 0 || cpu >= MAX_CPUS)
+                serial_puts("usage: burn <cpu|all> <seconds>\n");
+            else
+                smp_burn(cpu, secs);
         }
         else if (strcmp(argv[0], "svctest") == 0) {
             /* Inline SVC test — no ELF loading */

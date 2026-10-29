@@ -6,7 +6,6 @@
 
 #define MAX_TASKS       32      /* includes one idle task per CPU */
 #define TASK_STACK_SIZE 8192
-#define TASK_ANY_CPU    (-1)
 
 /* Utilization, sampled each tick: running pushes it toward UTIL_MAX,
  * sleeping toward 0, with a time constant of 2^UTIL_SHIFT ticks (80 ms).

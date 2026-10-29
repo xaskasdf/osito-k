@@ -604,3 +604,24 @@ void smp_bench_mix(void)
         serial_puts("\n");
     }
 }
+
+/* ── burn: keep CPUs busy for a while (heat, thermal tests) ── */
+
+static void burn_task(void *arg)
+{
+    uint64_t end = (uint64_t)(uintptr_t)arg;
+    while (read_cntpct_el0() < end)
+        ;
+}
+
+/* Shell `burn <cpu|all> <seconds>`: busy tasks pinned to one CPU or to
+ * each online CPU, in the background */
+void smp_burn(int cpu, int seconds)
+{
+    uint64_t freq;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    void *end = (void *)(uintptr_t)(read_cntpct_el0() + (uint64_t)seconds * freq);
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (cpus[i].online && (cpu < 0 || cpu == i))
+            task_create_on("burn", burn_task, end, 1, i);
+}
