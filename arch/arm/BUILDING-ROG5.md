@@ -33,7 +33,7 @@ Where things live:
 
 | What | Where |
 |------|-------|
-| Toolchain | Mac `cortessamuel@192.168.1.4`: Homebrew `aarch64-elf-gcc` 15.2 in `/opt/homebrew/bin` |
+| Toolchain | Mac `cortessamuel@192.168.1.7`: Homebrew `aarch64-elf-gcc` 15.2 in `/opt/homebrew/bin` |
 | Shim, DTBs, `mkbootimg.py`, UEFI payload, stock backups | Mac, `~/phone_breaker2` (read-only for the script) |
 | Build + pack scratch | Mac, `~/osito-arm-build` |
 | fastboot | Windows, `C:\platform-tools\fastboot.exe` (phone on this machine's USB) |
@@ -147,10 +147,13 @@ banner take minutes).
 **Text console.** `platform_init` points `kernel/framebuffer.c` at the splash
 framebuffer and confines it to pixel rows 700 and below. `serial.c` writes every
 console byte there before the UART, so the boot log and the shell show up on screen.
-Glyphs are the 8×16 font at 2× (67 columns × 54 rows). The console doesn't scroll:
-with the D-cache off, copying the text area took ~1 s per line and stalled the shell,
-USB included. At the bottom it wraps to the top and always blanks the row after
-the current one, so look for the line just above the empty one.
+Glyphs are the 8×16 font at 2× (67 columns × 54 rows). The console never reads
+the framebuffer back, because reads from it are uncached. It keeps the text in a
+cached cell array (character + color), and a scroll redraws only the cells that
+change. A scroll costs ~4.5 ms however far it moves, bound by writes to the
+framebuffer. So at the bottom the text jumps up a quarter of the area (13 lines)
+at a time, which keeps the cost close to plain drawing: `dmesg` (~50 lines) takes
+~35 ms, against ~250 ms scrolling line by line.
 
 Above the console, `kernel_main` paints 30-px bars as it advances:
 
@@ -224,10 +227,13 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
    ~10× faster. Verified by chain-loading from an MMU-on kernel, which exercises
    the clean-and-disable handoff. This also fixed the page allocator's range,
    which extended past the end of DDR bank 0.
+10. **Console scrolls again (2026-10-29).** It had wrapped to the top since item 6.
+    Scrolling now redraws changed cells from a cached copy of the text (see "Text
+    console"). The scale-2 glyph path writes two pixels per 64-bit store with no
+    per-pixel divide. That cut a scroll from 8 to ~4.5 ms, and jump scrolling does
+    the rest.
 
 Still open:
-- **The console still wraps instead of scrolling.** Framebuffer reads are uncached,
-  so scrolling may still be slow; worth re-measuring now that writes merge.
 - **Secondary CPUs aren't started.** `smp_boot_aps` assumes virt's MPIDR numbering.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.

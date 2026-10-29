@@ -23,6 +23,13 @@ static uint32_t text_col, text_row, max_cols, max_rows;
 static uint32_t text_y0;    /* first pixel row of the text area */
 static uint32_t scale;      /* glyph magnification (2 on the 1080-wide phone panel) */
 
+/* What each text cell shows: (fg << 8) | char, spaces stored as CELL_BLANK
+ * whatever their color. Scrolling redraws from here and never reads the
+ * framebuffer, which is uncached. 0 = not drawn by us yet (BSS). */
+#define TEXT_MAX_CELLS  24576      /* 135 x 153: 8x16 glyphs on 1080x2448 */
+#define CELL_BLANK      ' '
+static uint32_t cells[TEXT_MAX_CELLS];
+
 /* ── Minimal 8×16 bitmap font (ASCII 32-126) ─────────────────── */
 /* Each glyph: 16 bytes (one byte per row, MSB left) */
 
@@ -147,6 +154,11 @@ void fb_set_text_top(uint32_t y)
     text_row = 0;
     max_cols = fb_width / (FONT_W * scale);
     max_rows = (fb_height - y) / (FONT_H * scale);
+    if (!max_cols) return;
+    if (max_cols * max_rows > TEXT_MAX_CELLS)
+        max_rows = TEXT_MAX_CELLS / max_cols;
+    for (uint32_t i = 0; i < max_cols * max_rows; i++)
+        cells[i] = 0;
 }
 
 /* Clears the text area only */
@@ -156,18 +168,39 @@ void fb_clear(void)
     volatile uint32_t *p = fb_base + text_y0 * fb_pitch;
     for (uint32_t i = 0; i < (fb_height - text_y0) * fb_pitch; i++)
         p[i] = BG_COLOR;
+    for (uint32_t i = 0; i < max_cols * max_rows; i++)
+        cells[i] = CELL_BLANK;
     text_col = 0;
     text_row = 0;
 }
 
+/* Anything outside the font draws as a space */
 static void fb_draw_char(uint32_t col, uint32_t row, char c,
                          uint32_t fg, uint32_t bg)
 {
     if (!fb_base) return;
-    if (c < 32 || c > 126) return;
+    if (c < 32 || c > 126) c = ' ';
     uint32_t px = col * FONT_W * scale;
     uint32_t py = text_y0 + row * FONT_H * scale;
     const uint8_t *glyph = font8x16[c - 32];
+    if (scale == 2 && !(fb_pitch & 1)) {
+        /* The phone panel. Each font bit is two equal pixels, one 64-bit
+         * store, and each font row is two pixel rows. A scroll redraws
+         * ~1800 glyphs: 8 ms with the generic loop below (a divide and a
+         * 32-bit store per pixel), ~4.5 ms with this. */
+        uint64_t fg2 = fg | (uint64_t)fg << 32;
+        uint64_t bg2 = bg | (uint64_t)bg << 32;
+        uint64_t *line = (uint64_t *)(fb_base + py * fb_pitch + px);
+        for (uint32_t y = 0; y < FONT_H; y++) {
+            uint64_t pair[FONT_W];
+            for (uint32_t x = 0; x < FONT_W; x++)
+                pair[x] = (glyph[y] & (0x80 >> x)) ? fg2 : bg2;
+            for (uint32_t r = 0; r < 2; r++, line += fb_pitch / 2)
+                for (uint32_t x = 0; x < FONT_W; x++)
+                    line[x] = pair[x];
+        }
+        return;
+    }
     for (uint32_t y = 0; y < FONT_H * scale; y++) {
         uint8_t bits = glyph[y / scale];
         volatile uint32_t *line = fb_base + (py + y) * fb_pitch + px;
@@ -176,30 +209,63 @@ static void fb_draw_char(uint32_t col, uint32_t row, char c,
     }
 }
 
-static void fb_clear_row(uint32_t row)
+/* Set a cell, drawing it only if it changes */
+static void fb_set_cell(uint32_t row, uint32_t col, uint32_t v)
 {
-    uint32_t line_px = FONT_H * scale * fb_pitch;
-    volatile uint32_t *p = fb_base + (text_y0 + row * FONT_H * scale) * fb_pitch;
-    for (uint32_t i = 0; i < line_px; i++)
-        p[i] = BG_COLOR;
+    uint32_t *cell = &cells[row * max_cols + col];
+    if (*cell == v) return;
+    *cell = v;
+    fb_draw_char(col, row, (char)(v & 0xFF), v >> 8, BG_COLOR);
 }
 
-/* No scrolling: copying the text area goes through uncached memory (the
- * D-cache is off on SM8350) and took ~1 s per line, stalling the shell. Wrap
- * to the top instead and blank the row after the current one, so the newest
- * line is always followed by an empty row. */
+static void fb_blank_row(uint32_t row)
+{
+    for (uint32_t col = 0; col < max_cols; col++)
+        fb_set_cell(row, col, CELL_BLANK);
+}
+
+/* Scroll up by `lines`. Each cell takes the one `lines` rows below it and is
+ * redrawn only if that differs, so blank runs cost nothing. */
+static void fb_scroll(uint32_t lines)
+{
+    uint32_t shift = lines * max_cols;
+    uint32_t n = (max_rows - lines) * max_cols;
+    uint32_t row = 0, col = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t v = cells[i + shift];
+        if (cells[i] != v) {
+            cells[i] = v;
+            fb_draw_char(col, row, (char)(v & 0xFF), v >> 8, BG_COLOR);
+        }
+        if (++col == max_cols) {
+            col = 0;
+            row++;
+        }
+    }
+    for (row = max_rows - lines; row < max_rows; row++)
+        fb_blank_row(row);
+}
+
+/* Jump scroll: at the bottom, move the text up a quarter of the area at
+ * once. A scroll costs about a redraw of the visible text whatever the
+ * distance (~4.5 ms on the phone, bound by writes to the uncached
+ * framebuffer); line by line that made `dmesg` take ~0.25 s. */
 static void fb_newline(void)
 {
     text_col = 0;
-    if (++text_row >= max_rows)
-        text_row = 0;
-    fb_clear_row(text_row);
-    fb_clear_row((text_row + 1) % max_rows);
+    if (text_row + 1 < max_rows) {
+        /* Rows below the cursor still hold whatever ABL left there */
+        fb_blank_row(++text_row);
+        return;
+    }
+    uint32_t jump = max_rows / 4 ? max_rows / 4 : 1;
+    fb_scroll(jump);
+    text_row = max_rows - jump;
 }
 
-void fb_putc(char c)
+static void fb_put(char c, uint32_t color)
 {
-    if (!fb_base) return;
+    if (!fb_base || !max_cols) return;
     if (c == '\n') {
         fb_newline();
     } else if (c == '\r') {
@@ -207,10 +273,17 @@ void fb_putc(char c)
     } else if (c == '\b') {
         if (text_col > 0) text_col--;
     } else {
-        fb_draw_char(text_col, text_row, c, FG_COLOR, BG_COLOR);
+        uint32_t v = (c > 32 && c <= 126)
+            ? ((color & 0xFFFFFF) << 8) | (uint8_t)c : CELL_BLANK;
+        fb_set_cell(text_row, text_col, v);
         if (++text_col >= max_cols)
             fb_newline();
     }
+}
+
+void fb_putc(char c)
+{
+    fb_put(c, FG_COLOR);
 }
 
 void fb_puts(const char *s)
@@ -220,20 +293,7 @@ void fb_puts(const char *s)
 
 void fb_puts_color(const char *s, uint32_t color)
 {
-    if (!fb_base) {
-        fb_puts(s);
-        return;
-    }
-    while (*s) {
-        if (*s == '\n') {
-            fb_newline();
-        } else {
-            fb_draw_char(text_col, text_row, *s, color, BG_COLOR);
-            if (++text_col >= max_cols)
-                fb_newline();
-        }
-        s++;
-    }
+    while (*s) fb_put(*s++, color);
 }
 
 void fb_puthex(uint64_t val, int digits)
