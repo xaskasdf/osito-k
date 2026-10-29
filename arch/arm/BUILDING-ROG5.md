@@ -371,9 +371,6 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
 Still open:
 - **Placement is performance-first.** No load tracking or energy model: a light
   unpinned task also takes a big core.
-- **Boots are never marked successful**, so ABL counts down `slot-retry-count`
-  (see "Flash"). Every `--flash` resets it, but many reboots in a row without
-  one could exhaust slot a.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
 
@@ -572,8 +569,10 @@ nothing uses it.
 
 - `fastboot set_active` is refused ("Slot Change is not allowed in Lock State")
   even though `getvar unlocked` says yes; slot changes need the critical unlock.
-- Osito-K never marks a boot successful, so ABL decrements
-  `slot-retry-count:a` on every boot. Flashing resets it (to 3 on 2026-10-28).
+- Osito-K never marks a boot successful (`slot-successful:a:no`), but this ABL
+  doesn't count that against the slot: `slot-retry-count:a` stayed at 3 over four
+  boots without flashing on 2026-10-29 (`fastboot reboot`, two plain `reboot`s,
+  `reboot bootloader`), and slot a stayed bootable. Slot b: retry count 0.
 - To get back to fastboot from a hung kernel: hold Power + Vol-Down. From a live
   one, `reboot bootloader` (see "Rebooting into fastboot").
 
