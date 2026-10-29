@@ -4,10 +4,14 @@
 #include "../../include/hal.h"
 #include "../../include/types.h"
 #include "sm8350.h"
+#include "mmu.h"
 #include "usb.h"
 
+/* Page allocator range. DDR bank 0 ends at 0xB5000000 (device memory node;
+ * the next bank starts at 0xC0000000): the old 384 MB size ran 176 MB past
+ * it, into the hole. The top 2 MB is the DMA window, reserved by mmu.c. */
 #define SM8350_RAM_BASE  0xA8000000UL
-#define SM8350_RAM_SIZE  0x18000000UL   /* 384 MB usable range */
+#define SM8350_RAM_SIZE  (RAM_END - SM8350_RAM_BASE)    /* 208 MB */
 
 uint64_t platform_ram_base(void) { return SM8350_RAM_BASE; }
 uint64_t platform_ram_size(void) { return SM8350_RAM_SIZE; }

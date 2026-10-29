@@ -281,15 +281,8 @@ void kernel_main(void *dtb)
     /* Bar 6: MAGENTA = mem OK */
     for (int r = 220; r < 250; r++) fb_debug_bar(r, 0x00FF00FF);
 
-    /* Step 5: Paging / MMU
-     * SM8350: ABL leaves MMU ON with identity map + EL2 traps some
-     * system registers. Skip paging to avoid crash.
-     * QEMU virt (RAM at 0x40000000): needs paging_init. */
-    if (on_qemu_virt()) {
-        paging_init();  /* QEMU virt only */
-    } else {
-        serial_puts("[PAGE] Skipping (ABL identity map active)\n");
-    }
+    /* Step 5: MMU + caches (virt: kernel/paging.c, SM8350: platform/sm8350/mmu.c) */
+    platform_mmu_init();
 
     /* Bar 7: WHITE = ALL INIT OK! */
     for (int r = 260; r < 290; r++) fb_debug_bar(r, 0x00FFFFFF);

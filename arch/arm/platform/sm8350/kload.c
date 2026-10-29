@@ -18,6 +18,7 @@
 
 #include "../../include/hal.h"
 #include "../../include/types.h"
+#include "mmu.h"
 #include "usb.h"
 
 #define KLOAD_MAX       (32U << 20)
@@ -61,21 +62,6 @@ static uint32_t crc32_byte(uint32_t crc, uint8_t b)
     for (int k = 0; k < 8; k++)
         crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1)));
     return crc;
-}
-
-static void __attribute__((noreturn)) jump_to(uint64_t entry)
-{
-    register uint64_t target __asm__("x1") = entry;
-    __asm__ volatile(
-        "msr  daifset, #0xf\n"
-        "msr  cntv_ctl_el0, xzr\n"      /* stop the scheduler tick */
-        "ic   iallu\n"                  /* the new code was written as data */
-        "dsb  sy\n"
-        "isb\n"
-        "mov  x0, xzr\n"
-        "br   x1\n"
-        : : "r"(target) : "x0", "memory");
-    __builtin_unreachable();
 }
 
 int platform_kload(void)
@@ -151,5 +137,5 @@ int platform_kload(void)
     }
     mdelay(200);        /* let the host app read it before the port disappears */
     acm_stop();
-    jump_to((uint64_t)(uintptr_t)buf);
+    mmu_off_and_jump((uint64_t)(uintptr_t)buf);
 }

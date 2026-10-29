@@ -23,6 +23,11 @@ void platform_init(void *dtb)
     uart_init();
 }
 
+void platform_mmu_init(void)
+{
+    paging_init();
+}
+
 /* virt's PCI/virtio/SMP probes still live in kernel_main */
 void platform_probe_devices(void)
 {

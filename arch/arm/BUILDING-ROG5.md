@@ -78,7 +78,8 @@ How it works (`platform/sm8350/usb.c`, `dwc3_acm.c`):
   to context bank 5 with stage-1 translation off (`SCTLR.M = 0`), so physical
   addresses work as-is. `usb.c` checks this on every boot (and can walk the stage-1
   tables if a future ABL turns translation on) and won't start the gadget otherwise.
-  The D-cache is off, so no cache maintenance is needed either.
+  The DMA buffers come from the uncached DMA window (see "MMU and caches"), so
+  they need no cache maintenance.
 - **Polled, no IRQs.** `uart_trygetc` calls `acm_poll()`, so USB is serviced while
   the shell waits for input. Output is queued in an 8 KB ring and drains once the
   shell is back at the prompt; a long-running command's output arrives at the end.
@@ -90,11 +91,43 @@ How it works (`platform/sm8350/usb.c`, `dwc3_acm.c`):
 `kload: ready` and expects `"OKLD"`, the Image size and its CRC-32 (u32
 little-endian each), then the raw Image. It stores the Image in freshly allocated
 pages, checks the CRC and the ARM64 header magic, waits for its reply to reach
-the host, disconnects USB, stops the timer, invalidates the I-cache and jumps
-with the shim's entry state. The Image runs wherever it landed. That works because
-the kernel relocates itself, and `mem_init` reserves everything from the RAM base
-up to the running kernel's end. The old kernel's memory is simply abandoned. Each
-generation lands a little higher (e.g. `0xA86A9000`). 500 KB transfer in ~2.5 s.
+the host and disconnects USB. Then `mmu_off_and_jump` stops the timer, cleans and
+invalidates the whole cached range, turns the MMU and caches off, invalidates the
+I-cache and TLB, and jumps with the shim's entry state. The Image runs wherever it
+landed. That works because the kernel relocates itself, and `mem_init` reserves
+everything from the RAM base up to the running kernel's end. The old kernel's
+memory is simply abandoned. Each generation lands a little higher (e.g.
+`0xA86AB000`). A 500 KB transfer takes ~0.3 s with caches on (~2.5 s without).
+
+## MMU and caches
+
+The shim enters with the MMU and D-cache off, so every access is
+Device-nGnRnE: uncached and unmerged. `platform/sm8350/mmu.c`, called from
+`kernel_main` after `mem_init`, builds a flat map (VA == PA) and turns the MMU
+and both caches on:
+
+| Range | Attributes | Use |
+|-------|-----------|-----|
+| `0x00000000`–`0x3FFFFFFF` | Device-nGnRE (1 GB block) | MMIO: GCC, UART, USB, SMMU, GIC… |
+| `0xA0000000`–`0xB4DFFFFF` | Normal write-back | kernel, heap, page allocator, kload buffers |
+| `0xB4E00000`–`0xB4FFFFFF` | Normal non-cacheable | DMA window (`dma_alloc`): USB event buffer and TRBs |
+| `0xE5000000`–`0xE5BFFFFF` | Normal non-cacheable | splash framebuffer; writes merge, display sees them |
+
+Everything else is unmapped. That matters for the firmware carve-outs below
+`0xA0000000`: Normal memory may be read speculatively, and those regions belong to
+other processors. The holes in the MMIO gigabyte are harmless, because Device
+memory is never speculated.
+
+- **Before enabling**, `dc ivac` runs over the whole cached range. Everything there
+  was written with the D-cache off, so no stale line may survive. Under the
+  hypervisor this behaves as clean+invalidate. That's safe only because whatever
+  ran before us left no dirty lines: ABL cleans on exit, and `kload` cleans before
+  its jump.
+- **The page allocator** stops at `0xB5000000`, the end of DDR bank 0. The next
+  bank starts at `0xC0000000`. Until 2026-10-29 it claimed 384 MB up to
+  `0xC0000000`, which ran 176 MB into the hole; no allocation had gone that high.
+- **Effect:** `help` round trip over USB went from 315 ms to 31 ms, and kload
+  uploads from 2.5 s to 0.3 s.
 
 ---
 
@@ -124,7 +157,7 @@ Above the console, `kernel_main` paints 30-px bars as it advances:
 | 140–169 | yellow | GIC up |
 | 180–209 | cyan | timer programmed |
 | 220–249 | magenta | page allocator up |
-| 260–289 | white | paging step done (skipped on SM8350) |
+| 260–289 | white | MMU and caches on |
 | 300–329 | grey | device probing done (virt-only probes skipped on SM8350) |
 | 340–369 | dark green | scheduler starting |
 | 420–449 | white square, blinking every 0.5 s | timer IRQs + context switches alive |
@@ -181,11 +214,15 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
    linked at 0 that relocates itself (see "Load address and self-relocation").
    Verified with `ps` on the device and with two chained `kload`s at different
    addresses.
+9. **MMU and caches (2026-10-29).** See "MMU and caches": a flat map with cached
+   RAM, an uncached DMA window and an uncached framebuffer. Shell round trips got
+   ~10× faster. Verified by chain-loading from an MMU-on kernel, which exercises
+   the clean-and-disable handoff. This also fixed the page allocator's range,
+   which extended past the end of DDR bank 0.
 
 Still open:
-- **Caches are off.** The shim enters with the MMU and D-cache disabled, so every
-  load and store goes to DRAM uncached. That is why the console had to stop
-  scrolling. Turning on the MMU with cacheable RAM would speed everything up.
+- **The console still wraps instead of scrolling.** Framebuffer reads are uncached,
+  so scrolling may still be slow; worth re-measuring now that writes merge.
 - **Secondary CPUs aren't started.** `smp_boot_aps` assumes virt's MPIDR numbering.
 - `PLATFORM=virt` needs `-m 4G` in QEMU because `start.S` paints `0xE5000000`
   before it knows the platform.
@@ -432,6 +469,8 @@ Since 2026-10-29 the kernel is a **PIE linked at 0** (`-fpie`, `-pie
 |------------------|-------------|
 | `0x80000000`     | DDR Bank 0 start (880MB) |
 | `0x80000000`–`0x9BC00000` | Reserved-memory carve-outs (hyp, smem, `cdsp_secure_heap` `0x80C00000–0x85200000`, PIL regions, modem…). Don't touch |
+| `0x80000000`–`0xB5000000` | DDR bank 0 per the DTB memory node (next bank: `0xC0000000`) |
+| `0xA8000000`–`0xB5000000` | Osito-K page allocator; its top 2 MB (`0xB4E00000`) is the uncached DMA window |
 | `_image_end` + 64 KB | Osito-K boot stack (~`0xA0340000`; follows the actual load address) |
 | `0x0098C000`     | GENI UART (serial console) |
 | `0x0A600000`     | USB DWC3 (side port) |
@@ -464,8 +503,9 @@ initialization needed — just write pixels directly.
 **Stride is 1080 pixels, NOT 1088**. Using 1088 (Qualcomm's usual 64-pixel alignment)
 causes diagonal "Matrix" skewing. Verified empirically.
 
-**D-cache must be OFF** (or flushed) when writing to the framebuffer without MMU,
-because cached writes won't reach the display controller.
+**The framebuffer must not be cached write-back**, or writes sit in the D-cache and
+never reach the display controller. Osito-K maps it Normal non-cacheable (see
+"MMU and caches"). Before the MMU is on, every access is uncached anyway.
 
 ### UART (GENI Serial Engine)
 
@@ -583,8 +623,9 @@ VBAR_EL1     = shim's vectors (must set our own)
    `readelf -r` must show only `R_AARCH64_RELATIVE`. See "Load address and
    self-relocation" above.
 
-2. **D-Cache OFF for framebuffer**: Without MMU, cached writes to `0xE5000000` won't
-   reach the display. Either disable D-Cache before FB writes or use DC CVAC to flush.
+2. **No write-back caching for anything a device reads.** That covers the
+   framebuffer and DMA buffers. Both are mapped Normal non-cacheable in `mmu.c`; take
+   DMA memory from `dma_alloc()`, not the page allocator.
 
 3. **UART TX timeout**: Never infinite-poll. Use `for (int i = 0; i < 100000; i++)`.
 
@@ -654,6 +695,7 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/usb.c` | USB state report, SMMU 1:1 check, gadget start |
 | `arch/arm/platform/sm8350/dwc3_acm.c` | Polled DWC3 device driver + CDC-ACM serial function |
 | `arch/arm/platform/sm8350/kload.c` | `kload`: receive a kernel Image over USB and jump to it |
+| `arch/arm/platform/sm8350/mmu.c` | Flat MMU map, caches on, uncached DMA window, clean-and-disable handoff |
 | `arch/arm/scripts/rog5-kload.ps1` | Host side of `kload` (used by `rog5-boot.sh --usb`) |
 | `arch/arm/include/sm8350.h` | Hardware register definitions (verified) |
 | `arch/arm/include/aarch64.h` | System register helpers |

@@ -20,6 +20,7 @@
 
 #include "../../include/hal.h"
 #include "../../include/types.h"
+#include "mmu.h"
 #include "usb.h"
 
 #define GCC_BASE            0x00100000UL
@@ -246,13 +247,14 @@ void usb_probe(void)
     put_bit("on", clk_on(GCC_USB_PRIM + GCC_USB_UTMI_CBCR));
     serial_puts("\n");
 
-    void *buf = mem_alloc_pages(USB_DMA_PAGES);
+    /* Uncached: the controller's event writes must be visible to the CPU
+     * and its TRB reads must see the CPU's stores, with no cache maintenance */
+    void *buf = dma_alloc(USB_DMA_PAGES * 4096);
     if (!buf) {
         serial_puts("[USB ] no memory for DMA\n");
         return;
     }
     uint64_t dma = (uint64_t)(uintptr_t)buf;
-    memset(buf, 0, USB_DMA_PAGES * 4096);
 
     if (!smmu_dma_identity(USB1_SID, dma, USB_DMA_PAGES * 4096)) {
         serial_puts("[USB ] DMA not 1:1 through the SMMU, gadget not started\n");

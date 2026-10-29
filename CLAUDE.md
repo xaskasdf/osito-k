@@ -74,7 +74,8 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - `--flash` packs `boot.img` and flashes the active slot. It needs fastboot mode (Power + Vol-Down), and is only for a kernel that must survive a reboot. `fastboot boot` bootloops on this device.
   - `--virt-check` also boots the virt build in local QEMU.
 - There is no UART output, so the screen is the only feedback: progress bars, a blinking heartbeat, an orange/purple panic band with ESR/ELR/`_start` as bit cells, and a text console (pixel rows 700 and below) that mirrors everything `serial_*` prints. The guide explains how to decode the panic cells.
-- Status 2026-10-28: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
+- MMU and caches are on (`platform/sm8350/mmu.c`, flat map). Anything a device DMAs to must come from `dma_alloc()` (uncached window), not the page allocator.
+- Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
 - The kernel is a PIE linked at 0 that relocates itself in `start.S`, so it runs at any load address and stored pointers work. Linker-script symbols that C reads must be section-relative (an absolute symbol's GOT entry gets no relocation). After linking, `readelf -r kernel.elf` should show only `R_AARCH64_RELATIVE`.
 
 ### Tests
