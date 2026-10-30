@@ -8,7 +8,7 @@
 
 extern void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
 extern bool hda_is_ready(void);
-extern int proc_run(const char *filename);
+extern int proc_run(const char *path, int argc, char **argv);
 extern void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
 extern void net_poll(void);
 
@@ -37,7 +37,7 @@ static void cmd_help(void)
     serial_puts("  uptime   Show uptime\n");
     serial_puts("  ls       List files\n");
     serial_puts("  cat      Show file contents\n");
-    serial_puts("  exec     Run ELF binary\n");
+    serial_puts("  exec     Run a program from the filesystem <name> [args...]\n");
     serial_puts("  ping     Ping IP address\n");
     serial_puts("  cpus     List the online CPUs\n");
     serial_puts("  cpubench Timed task per CPU, all at once [any [n]: n unpinned]\n");
@@ -331,8 +331,8 @@ void shell_run(void)
         else if (strcmp(argv[0], "ls") == 0)      cmd_ls();
         else if (strcmp(argv[0], "cat") == 0)    cmd_cat(argc, argv);
         else if (strcmp(argv[0], "exec") == 0) {
-            if (argc < 2) serial_puts("Usage: exec <filename>\n");
-            else proc_run(argv[1]);
+            if (argc < 2) serial_puts("Usage: exec <filename> [args...]\n");
+            else proc_run(argv[1], argc - 1, argv + 1);
         }
         else if (strcmp(argv[0], "ping") == 0) {
             if (argc < 2) { serial_puts("Usage: ping <ip>\n"); }

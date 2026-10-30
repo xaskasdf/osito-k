@@ -154,9 +154,13 @@ static void fb_panic(uint32_t color, uint32_t esr, uint32_t elr)
                     ((vals[v] >> (31 - x / 32)) & 1) ? 0x00FFFFFF : 0x00404040;
 }
 
+/* syscall.c: ends the running program instead, if the fault is its own */
+extern void proc_fault(uint64_t esr, uint64_t elr, uint64_t far);
+
 __attribute__((weak))
 void exception_handler(uint64_t esr, uint64_t elr, uint64_t far)
 {
+    proc_fault(esr, elr, far);
     fb_panic(0x00FF8000, (uint32_t)esr, (uint32_t)elr);  /* orange */
     serial_puts("\n[PANIC] Synchronous exception!\n");
     serial_puts("  ESR_EL1 = ");

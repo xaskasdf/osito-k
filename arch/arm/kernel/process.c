@@ -1,92 +1,102 @@
 /*
- * process.c -- Simplified process execution for AArch64
+ * process.c -- running a program from OsitoFS (shell `exec <name> [args]`)
  *
- * Phase 3: single-process. Loads ELF from OsitoFS,
- * sets up user stack, calls entry point directly (EL1).
- * Process uses SVC for syscalls, exits via SVC exit.
+ * One at a time, in the calling task (the shell), at EL1 in the kernel's
+ * address space: elf.c loads it, it gets its own 256 KB stack and a 32 MB
+ * heap region for brk, and its Linux syscalls go through syscall.c. It ends
+ * by calling exit (a longjmp back here), by returning from its entry point,
+ * or by faulting in its own code (proc_fault). Then everything it took is
+ * freed, and the IRQ state it left is put back: an exit or a fault comes
+ * back through an exception, with IRQs masked, and on the boot CPU that
+ * would stop the tick every sleeping task waits on.
  */
 
 #include "../include/hal.h"
 #include "../include/types.h"
+#include "../include/aarch64.h"
+#include "elf.h"
 
-/* From elf.c */
-typedef struct {
-    uint64_t entry;
-    uint64_t stack_top;
-    uint64_t brk_base;
-} elf_info_t;
-
-extern int elf_load(const void *data, uint64_t size, elf_info_t *info);
+#define HEAP_PAGES  8192                /* 32 MB */
 
 /* From syscall.c */
-extern void proc_set_brk(uint64_t base);
-extern void proc_mark_running(void);
-extern int  proc_is_running(void);
+extern void proc_begin(uint64_t heap, uint64_t heap_size, uint64_t image, uint64_t image_size);
+extern void proc_end(void);
+extern void proc_set_exit_code(int code);
 extern int  proc_get_exit_code(void);
 extern void proc_set_exit_jmpbuf(void *buf[5]);
 
-/* ── Run an ELF binary from OsitoFS ──────────────────────── */
+/* entry(argc, argv) on the stack at `sp`, then back on ours */
+int proc_call_on_stack(uint64_t entry, int argc, char **argv, uint64_t sp);
+__asm__(
+    ".text\n"
+    ".global proc_call_on_stack\n"
+    ".type proc_call_on_stack, %function\n"
+    "proc_call_on_stack:\n"
+    "    stp   x29, x30, [sp, #-16]!\n"
+    "    mov   x29, sp\n"
+    "    mov   x9, x0\n"
+    "    mov   w0, w1\n"
+    "    mov   x1, x2\n"
+    "    mov   sp, x3\n"
+    "    blr   x9\n"
+    "    mov   sp, x29\n"
+    "    ldp   x29, x30, [sp], #16\n"
+    "    ret\n");
 
-int proc_run(const char *filename)
+static elf_info_t info;                 /* the running program's */
+
+/* The program in file `name`, with argc/argv as its main gets them */
+int proc_run(const char *name, int argc, char **argv)
 {
-    serial_puts("[PROC] Loading: ");
-    serial_puts(filename);
-    serial_puts("\n");
-
-    /* Find file in OsitoFS */
-    osfs2_file_t *f = osfs2_find(filename);
+    osfs2_file_t *f = osfs2_find(name);
     if (!f) {
-        serial_puts("[PROC] File not found\n");
+        serial_puts(name);
+        serial_puts(": not found\n");
         return -1;
     }
-
-    /* Allocate buffer and read file */
     uint64_t pages = (f->size + 4095) / 4096;
     void *buf = mem_alloc_pages(pages);
     if (!buf) {
-        serial_puts("[PROC] alloc failed\n");
+        serial_puts("exec: out of memory\n");
         return -1;
     }
-
     if (osfs2_read(f, 0, buf, f->size) < 0) {
-        serial_puts("[PROC] read failed\n");
+        serial_puts("exec: read failed\n");
         mem_free_pages(buf, pages);
         return -1;
     }
-
-    /* Load ELF */
-    elf_info_t info;
     memset(&info, 0, sizeof(info));
-    if (elf_load(buf, f->size, &info) < 0) {
-        mem_free_pages(buf, pages);
+    int loaded = elf_load(buf, f->size, &info);
+    mem_free_pages(buf, pages);
+    if (loaded < 0)
+        return -1;
+    void *heap = mem_alloc_pages(HEAP_PAGES);
+    if (!heap) {
+        serial_puts("exec: out of memory for the heap\n");
+        elf_unload(&info);
         return -1;
     }
 
-    /* Free the file buffer (segments copied to allocated pages) */
-    mem_free_pages(buf, pages);
-
-    /* Set up process state */
-    proc_set_brk(info.brk_base);
-    proc_mark_running();
-
-    serial_puts("[PROC] Running at ");
-    serial_puthex(info.entry, 16);
-    serial_puts("\n");
-
-    /* Set up longjmp for sys_exit to return here */
+    proc_begin((uint64_t)(uintptr_t)heap, HEAP_PAGES * 4096ULL,
+               info.image, info.image_pages * 4096);
+    uint64_t daif = read_daif();
     void *jmpbuf[5];
     if (__builtin_setjmp(jmpbuf) == 0) {
         proc_set_exit_jmpbuf(jmpbuf);
-        /* Call entry point directly (EL1, identity-mapped, kernel stack). */
-        typedef void (*entry_fn_t)(void);
-        ((entry_fn_t)info.entry)();
+        proc_set_exit_code(proc_call_on_stack(info.entry, argc, argv, info.stack_top));
     }
-    /* sys_exit longjmps here */
+    irq_restore(daif);
 
     int code = proc_get_exit_code();
-    serial_puts("[PROC] Exit code ");
-    serial_putdec(code);
-    serial_puts("\n");
-
+    proc_end();
+    elf_unload(&info);
+    mem_free_pages(heap, HEAP_PAGES);
+    if (code) {
+        serial_puts("[PROC] ");
+        serial_puts(name);
+        serial_puts(": exit code ");
+        serial_putdec((uint32_t)code);
+        serial_puts("\n");
+    }
     return code;
 }

@@ -33,9 +33,13 @@ void vec_add_avx2(float *a, const float *b, int n) { vec_add_neon(a, b, n); }
 void vec_mul_avx2(float *a, const float *b, int n) { vec_mul_neon(a, b, n); }
 
 /* Process execution — redirect to ARM's proc_run */
-extern int proc_run(const char *filename);
+extern int proc_run(const char *path, int argc, char **argv);
 int proc_exec(const char *path, const char **argv, const char **envp)
 {
-    (void)argv; (void)envp;
-    return proc_run(path);
+    (void)envp;
+    char *only[2] = { (char *)path, (char *)0 };
+    int argc = 0;
+    while (argv && argv[argc])
+        argc++;
+    return argc ? proc_run(path, argc, (char **)argv) : proc_run(path, 1, only);
 }

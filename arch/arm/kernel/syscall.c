@@ -7,6 +7,7 @@
 
 #include "../include/hal.h"
 #include "../include/types.h"
+#include "../include/aarch64.h"
 
 /* Linux AArch64 syscall numbers (from asm-generic/unistd.h) */
 #define SYS_close           57
@@ -16,6 +17,7 @@
 #define SYS_exit            93
 #define SYS_exit_group      94
 #define SYS_set_tid_address 96
+#define SYS_nanosleep       101
 #define SYS_clock_gettime   113
 #define SYS_brk             214
 #define SYS_mmap            222
@@ -36,22 +38,50 @@
 #define SYS_mprotect        226
 #define SYS_getrandom       278
 
-/* ── Process state (simplified for Phase 3) ──────────────── */
+/* ── Process state: one program at a time (process.c) ────── */
 
 static int process_running;
 static int process_exit_code;
-static uint64_t brk_current;
-static uint64_t brk_base;
+static int process_cpu;                 /* where it runs: its faults are its own */
+static uint64_t image_lo, image_hi;     /* its code and data */
+/* brk moves within a heap region process.c set aside, contiguous: the
+ * page allocator hands out pages anywhere */
+static uint64_t brk_base, brk_current, brk_limit;
 
-void proc_set_brk(uint64_t base)
+/* mmap'd regions, freed when the program ends if it didn't */
+#define MAX_MAPS 64
+static struct { uint64_t addr, pages; } maps[MAX_MAPS];
+
+static void fd_init(void);
+
+void proc_begin(uint64_t heap, uint64_t heap_size, uint64_t image, uint64_t image_size)
 {
-    brk_base = base;
-    brk_current = base;
+    fd_init();
+    for (int i = 0; i < MAX_MAPS; i++)
+        maps[i].addr = 0;
+    brk_base = brk_current = heap;
+    brk_limit = heap + heap_size;
+    image_lo = image;
+    image_hi = image + image_size;
+    process_exit_code = 0;
+    process_cpu = smp_cpu_id();
+    process_running = 1;
 }
 
+void proc_end(void)
+{
+    for (int i = 0; i < MAX_MAPS; i++)
+        if (maps[i].addr) {
+            mem_free_pages((void *)(uintptr_t)maps[i].addr, maps[i].pages);
+            maps[i].addr = 0;
+        }
+    fd_init();
+    process_running = 0;
+}
+
+void proc_set_exit_code(int code) { process_exit_code = code; }
 int proc_get_exit_code(void) { return process_exit_code; }
 int proc_is_running(void) { return process_running; }
-void proc_mark_running(void) { process_running = 1; }
 
 /* ── File Descriptor Table ───────────────────────────────── */
 
@@ -125,14 +155,30 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
     if (fd == 0) {
-        /* stdin: read one char from UART */
+        /* stdin: a line from the console, echoed, with backspace. A wait
+         * that can last: IRQs on meanwhile (the SVC came in with them off),
+         * or the tick, and every task sleeping on it, would stop. */
         char *dst = (char *)buf;
-        for (uint64_t i = 0; i < count; i++) {
-            dst[i] = uart_getc();
-            if (dst[i] == '\r') dst[i] = '\n';
-            if (dst[i] == '\n') return (int64_t)(i + 1);
+        uint64_t i = 0, daif = read_daif();
+        irq_enable();
+        while (i < count) {
+            char c = uart_getc();
+            if (c == '\r')
+                c = '\n';
+            if (c == '\b' || c == 0x7F) {
+                if (i) {
+                    i--;
+                    serial_puts("\b \b");
+                }
+                continue;
+            }
+            serial_putc(c);
+            dst[i++] = c;
+            if (c == '\n')
+                break;
         }
-        return (int64_t)count;
+        irq_restore(daif);
+        return (int64_t)i;
     }
     if (fd >= 3 && fd < MAX_FDS && fd_table[fd].file) {
         osfs2_file_t *f = fd_table[fd].file;
@@ -210,18 +256,30 @@ static int64_t sys_exit_impl(uint64_t code, uint64_t *frame)
     return 0;  /* unreachable */
 }
 
+/* A synchronous exception (main.c): when it's the running program's own
+ * code on the CPU running it, the program ends instead of the kernel.
+ * Returns otherwise. */
+void proc_fault(uint64_t esr, uint64_t elr, uint64_t far)
+{
+    if (!process_running || smp_cpu_id() != process_cpu || elr < image_lo || elr >= image_hi)
+        return;
+    serial_puts("[PROC] fault: ESR ");
+    serial_puthex(esr, 8);
+    serial_puts(" at +");
+    serial_puthex(elr - image_lo, 6);
+    serial_puts(" in the program, FAR ");
+    serial_puthex(far, 16);
+    serial_puts("\n");
+    process_running = 0;
+    process_exit_code = 139;        /* as a shell reports SIGSEGV */
+    __builtin_longjmp(exit_jmpbuf, 1);
+}
+
+/* Within the heap region: a failed move returns the current break, as Linux */
 static int64_t sys_brk(uint64_t addr)
 {
-    if (addr == 0 || addr < brk_base)
-        return (int64_t)brk_current;
-
-    /* Grow brk (no actual page allocation in identity-mapped kernel) */
-    if (addr > brk_current) {
-        uint64_t new_pages = (addr - brk_current + 4095) / 4096;
-        void *p = mem_alloc_pages(new_pages);
-        if (!p) return (int64_t)brk_current;
-    }
-    brk_current = addr;
+    if (addr >= brk_base && addr <= brk_limit)
+        brk_current = addr;
     return (int64_t)brk_current;
 }
 
@@ -229,18 +287,30 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                         uint64_t flags, uint64_t fd, uint64_t offset)
 {
     (void)addr; (void)prot; (void)flags; (void)fd; (void)offset;
-    /* Anonymous mmap only */
+    /* Anonymous mmap only, zeroed as Linux gives it */
     uint64_t pages = (len + 4095) / 4096;
-    void *p = mem_alloc_pages(pages);
+    int slot = -1;
+    for (int i = 0; i < MAX_MAPS && slot < 0; i++)
+        if (!maps[i].addr)
+            slot = i;
+    void *p = slot >= 0 && pages ? mem_alloc_pages(pages) : (void *)0;
     if (!p) return (int64_t)-12;  /* -ENOMEM */
+    memset(p, 0, pages * 4096);
+    maps[slot].addr = (uint64_t)(uintptr_t)p;
+    maps[slot].pages = pages;
     return (int64_t)(uint64_t)p;
 }
 
 static int64_t sys_munmap(uint64_t addr, uint64_t len)
 {
-    uint64_t pages = (len + 4095) / 4096;
-    mem_free_pages((void *)addr, pages);
-    return 0;
+    (void)len;
+    for (int i = 0; i < MAX_MAPS; i++)
+        if (maps[i].addr == addr) {
+            mem_free_pages((void *)(uintptr_t)addr, maps[i].pages);
+            maps[i].addr = 0;
+            return 0;
+        }
+    return -22;  /* -EINVAL: not one of its mappings */
 }
 
 static int64_t sys_writev(uint64_t fd, uint64_t iov_ptr, uint64_t iovcnt)
@@ -256,13 +326,35 @@ static int64_t sys_writev(uint64_t fd, uint64_t iov_ptr, uint64_t iovcnt)
     return total;
 }
 
+/* From the generic counter (since the phone booted; there is no RTC), for
+ * every clock */
 static int64_t sys_clock_gettime(uint64_t clk, uint64_t tp)
 {
     (void)clk;
     struct { uint64_t sec; uint64_t nsec; } *ts = (void *)tp;
-    uint64_t ms = timer_ms();
-    ts->sec = ms / 1000;
-    ts->nsec = (ms % 1000) * 1000000;
+    uint64_t cnt, freq;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(cnt));
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    ts->sec = cnt / freq;
+    ts->nsec = (cnt % freq) * 1000000000ULL / freq;
+    return 0;
+}
+
+/* Sleeps in 10 ms ticks, the scheduler's; anything shorter just yields.
+ * IRQs on, so the yield is taken here and the tick keeps going. */
+static int64_t sys_nanosleep(uint64_t req)
+{
+    const struct { uint64_t sec; uint64_t nsec; } *ts = (const void *)req;
+    uint64_t ms = ts->sec * 1000 + ts->nsec / 1000000;
+    if (ms > 0xFFFFFFFFULL)
+        ms = 0xFFFFFFFFULL;
+    uint64_t daif = read_daif();
+    irq_enable();
+    if (ms)
+        task_delay_ms((uint32_t)ms);
+    else
+        task_yield();
+    irq_restore(daif);
     return 0;
 }
 
@@ -308,6 +400,7 @@ void svc_handler(uint64_t *frame)
     case SYS_rt_sigprocmask:  ret = 0; break;    /* stub */
     case SYS_getrandom:       ret = sys_getrandom(a0, a1, a2); break;
     case SYS_clock_gettime:   ret = sys_clock_gettime(a0, a1); break;
+    case SYS_nanosleep:       ret = sys_nanosleep(a0); break;
     default:
         serial_puts("[SYS ] Unknown syscall ");
         serial_putdec(nr);

@@ -389,11 +389,70 @@ same way.
   device's cache, reads the file back from UFS and checks the CRC before
   saying "stored and verified". 5 MB of random bytes took 3 s (~1.65 MB/s, the
   USB console's pace).
-- **Apps:** `exec <name>` loads a static AArch64 ELF from it and runs it (EL1,
-  Linux syscall numbers, `kernel/syscall.c`). `elf.c` now cleans the D-cache
-  and invalidates the I-cache over what it loads, since with the caches on the
-  copied code could otherwise run stale. `test/hello.S`, linked with
-  `aarch64-elf-gcc -nostdlib -static -Wl,-N`, ran from UFS on 2026-10-29.
+- **Apps:** `exec <name> [args]` runs a program stored there (see "Apps").
+
+---
+
+## Apps
+
+Programs are C files in `arch/arm/apps/`, linked against a small libc in
+`arch/arm/libc/` into static PIEs:
+- **Build and copy:** `arch/arm/scripts/rog5-app.sh [app...]` builds them on the
+  Mac (`make -C arch/arm/libc CROSS=aarch64-elf-`). It fetches the ELFs into
+  `arch/arm/build/apps/` and copies them onto the phone's OsitoFS with `put`.
+- **Run:** `rog5-app.sh --run hello uno dos` does that and runs
+  `exec hello.elf uno dos`.
+- **Check:** `make check` makes sure each ELF is a PIE whose relocations are
+  all `R_AARCH64_RELATIVE`.
+
+**The libc:**
+- startup (`_start(argc, argv)` → `main` → `exit`);
+- Linux AArch64 syscalls over `svc #0`;
+- `string.h`, `ctype.h`;
+- `stdio.h`: a full `printf` family with flags, width, precision and
+  `hh`/`h`/`l`/`ll`/`z`, `%d %u %x %o %p %s %c %f %e %g`; line-buffered stdout;
+  `fgets`/`getchar` from the console; read-only `fopen`/`fread`/`fseek`;
+- `stdlib.h`: first-fit `malloc` over `brk`, `strtol`/`strtod`, `qsort`,
+  `bsearch`, `rand`, `atexit`/`exit`;
+- `time.h`, `sleep`/`usleep`, `errno`, `assert`.
+
+**How a program runs** (`kernel/process.c`, `elf.c`, `syscall.c`):
+- **Placement:** one at a time, in the shell's task, at EL1 in the kernel's
+  address space. `elf.c` puts every PT_LOAD into one contiguous allocation at
+  its original distances, and applies a PIE's RELATIVE relocations (as
+  `start.S` does for the kernel), so pointers in its data work wherever it
+  lands. It also cleans the D-cache and invalidates the I-cache over the
+  code.
+- **Memory:** the program gets its own 256 KB stack, a contiguous 32 MB heap
+  region for `brk`, and anonymous `mmap`.
+- **When it ends:** all of it is freed, open files included. The IRQ state is
+  restored too: `exit` comes back through the SVC exception with IRQs masked,
+  and on cpu0 that stopped the tick every sleeping task waits on. That was a
+  bug in the old `exec` until 2026-10-30.
+- **Waits:** a console `read` and `nanosleep` unmask IRQs while they wait, for
+  the same reason.
+- **Faults:** a fault in the program's own code ends the program with exit code
+  139 and the fault's ESR and offset; the shell goes on. A fault anywhere else
+  is still a kernel panic.
+
+Examples, all run on the phone on 2026-10-30:
+
+| App | Run on the phone |
+|---|---|
+| `hello` | arguments, a table of strings, `printf` formats |
+| `primes [n]` | sieve over `malloc`'d memory: 664 579 primes up to 10 M in 0.28 s on an A55 |
+| `cat <file>...` | OsitoFS files through `fopen`/`fread`, `perror` on a missing one |
+| `guess` | reads guesses with `fgets`, echoed (found 10 in 6 tries) |
+| `countdown [s]` | `sleep(1)` in a loop, measured 2.99 s for 3 |
+| `crash` | writes through a null pointer: exit code 139, the kernel lives |
+
+**Limits:**
+- There is no memory protection: a stray pointer can corrupt the kernel.
+- Files are read-only from programs.
+- The shell doesn't parse quotes.
+- The context switch doesn't save FP/SIMD registers. A program may use them
+  as long as no other task on its CPU does (the kernel is built with
+  `-mgeneral-regs-only`, NEON inference aside).
 
 ---
 
@@ -671,6 +730,12 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     console inside the Terminal window (see "Desktop"). A photo of the phone
     showed the status bar, the maximized Terminal with `cpus`/`temp`/`ls` in it,
     and the navigation bar with both apps.
+25. **C programs (2026-10-30).** A libc and `rog5-app.sh` (see "Apps"). Building
+    them turned up three bugs in the old `exec`:
+    - segments were loaded apart and never relocated, so stored pointers broke;
+    - `brk` handed out memory that wasn't the program's;
+    - `exit` left cpu0 with IRQs masked, which stopped the tick and with it the
+      keys and the thermal task until the next reboot.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1196,6 +1261,10 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/keys.c` | Power / volume keys: console history, fastboot and status shortcuts |
 | `arch/arm/platform/sm8350/ufs.c` | UFS host controller: LUNs, GPT, block dumps; writes only into `userdata` (OsitoFS) |
 | `arch/arm/scripts/rog5-put.ps1` | Host side of `put`: copy a file onto the phone's OsitoFS |
+| `arch/arm/scripts/rog5-app.sh` | Build `arch/arm/apps` on the Mac, copy them to the phone, run one |
+| `arch/arm/libc/` | The programs' libc: startup, syscalls, stdio/stdlib/string/time; `make check` |
+| `arch/arm/apps/` | Example programs (hello, primes, cat, guess, countdown, crash) |
+| `arch/arm/kernel/elf.c`, `process.c` | Load a static PIE contiguously and relocate it; run it on its own stack, free it after |
 | `arch/arm/platform/sm8350/smmu.c` | Checks a DMA master's stream is 1:1 through the apps SMMU |
 | `arch/arm/scripts/rog5-kload.ps1` | Host side of `kload` (used by `rog5-boot.sh --usb`) |
 | `arch/arm/include/sm8350.h` | Hardware register definitions (verified) |
