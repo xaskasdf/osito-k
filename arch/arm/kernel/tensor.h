@@ -15,17 +15,22 @@
 
 /* ── Freestanding math (x87/SSE) ─────────────────────── */
 
-float f16_to_f32(uint16_t h);       /* IEEE 754 half -> float */
-float sqrtf_bare(float x);          /* SSE sqrtss */
-float expf_bare(float x);           /* x87: fldl2e + f2xm1 + fscale */
-float sinf_bare(float x);           /* x87 fsin */
-float cosf_bare(float x);           /* x87 fcos */
-float powf_bare(float base, float exponent); /* x87: fyl2x + 2^x */
+float    f16_to_f32(uint16_t h);    /* IEEE 754 half -> float */
+uint16_t f32_to_f16(float f);       /* IEEE 754 float -> half */
+float sqrtf_bare(float x);          /* fsqrt */
+float expf_bare(float x);           /* the rest in double precision */
+float sinf_bare(float x);
+float cosf_bare(float x);
+float powf_bare(float base, float exponent);
 
 /* ── Dequantization ──────────────────────────────────── */
 
 void dequant_q4_0(const void *src, float *dst, uint64_t n);
 void dequant_q8_0(const void *src, float *dst, uint64_t n);
+void dequant_q4_1(const void *src, float *dst, uint64_t n);
+void matvec_q4_1(float *out, const void *weight,
+                 const float *input, uint32_t rows, uint32_t cols);
+void quantize_q8_0(const float *src, void *dst, uint64_t n);
 
 /* ── Quantized matrix-vector multiply ────────────────── */
 /* out[rows] = weight[rows x cols, quantized] x input[cols] */
@@ -51,7 +56,7 @@ void vec_mul(float *out, const float *a,
 void rope(float *vec, uint32_t n_heads,
           uint32_t head_dim, uint32_t pos, float theta);
 
-/* ── AVX2/FMA accelerated paths (tensor_avx2.c) ─────── */
+/* ── SIMD paths: x86's AVX2 names, NEON here (tensor_neon.c) ── */
 
 void matvec_q4_0_avx2(float *out, const void *weight,
                        const float *input, uint32_t rows, uint32_t cols);

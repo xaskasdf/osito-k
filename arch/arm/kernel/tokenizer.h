@@ -36,25 +36,54 @@ typedef struct {
     uint32_t rank;  /* Merge priority (lower = merge first) */
 } tok_merge_t;
 
+/* Tokenizer format. Picked at init time, drives encode/decode strategy.
+ *   TOK_FMT_BPE_GPT2 — Llama 3 byte-level BPE with U+0100..U+0143
+ *                      problem-byte mapping. Requires merges.
+ *   TOK_FMT_SPM      — SentencePiece (with `▁` U+2581 word marker).
+ *                      Uses scores+types for type classification; merges
+ *                      are absent. Decode is a literal piece concat
+ *                      with `▁` → ' ' substitution.
+ */
+typedef enum {
+    TOK_FMT_BPE_GPT2 = 0,
+    TOK_FMT_SPM      = 1,
+} tok_format_t;
+
+/* SPM token type codes (match SPM proto enum + GGUF tokenizer.ggml.token_type) */
+#define TOK_TYPE_NORMAL        1
+#define TOK_TYPE_UNKNOWN       2
+#define TOK_TYPE_CONTROL       3
+#define TOK_TYPE_USER_DEFINED  4
+#define TOK_TYPE_UNUSED        5
+#define TOK_TYPE_BYTE          6
+
 /* ── Tokenizer state ────────────────────────────────────────── */
 
 typedef struct {
+    /* Format selector — set by tok_init / tok_init_spm */
+    tok_format_t format;
+
     /* Vocabulary: token_id → bytes */
     tok_entry_t *vocab;         /* Array [vocab_size] */
     uint32_t     vocab_size;
 
-    /* Merge rules (sorted by rank) */
+    /* Merge rules (sorted by rank) — only populated for TOK_FMT_BPE_GPT2 */
     tok_merge_t *merges;
     uint32_t     merge_count;
 
-    /* Hash table for fast byte-sequence → token_id lookup */
+    /* Hash table for fast byte-sequence → token_id lookup (BPE only) */
     uint32_t    *hash_table;    /* Hash → vocab index, 0 = empty */
     uint32_t     hash_size;     /* Power of 2 */
 
-    /* Special token IDs */
+    /* SPM aux arrays (NULL for BPE). Both [vocab_size] when present. */
+    float    *scores;
+    uint32_t *token_types;
+
+    /* Special token IDs (UINT32_MAX = unset) */
     uint32_t bos_id;
     uint32_t eos_id;
     uint32_t pad_id;
+    uint32_t unk_id;
 
     bool ready;
 } tokenizer_t;
@@ -79,6 +108,26 @@ int tok_init(tokenizer_t *tok,
              const char **tokens, const uint32_t *token_lens, uint32_t n_tokens,
              const char **merges, const uint32_t *merge_lens, uint32_t n_merges,
              uint32_t bos_id, uint32_t eos_id);
+
+/*
+ * tok_init_spm — Initialize tokenizer with SentencePiece vocab.
+ *
+ * scores:      Per-token SPM scores (negative log-probs). Length n_tokens.
+ * token_types: Per-token type code (TOK_TYPE_*). Length n_tokens.
+ *
+ * Merges are not used for SPM. The SPM consumer in this kernel is
+ * decode-only (encoding is done host-side; agents receive token IDs
+ * over the nvme queue). Encoding is therefore not implemented for
+ * SPM and tok_encode will return -1 for SPM-format tokenizers.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int tok_init_spm(tokenizer_t *tok,
+                 const char **tokens, const uint32_t *token_lens,
+                 const float *scores, const uint32_t *token_types,
+                 uint32_t n_tokens,
+                 uint32_t bos_id, uint32_t eos_id,
+                 uint32_t unk_id, uint32_t pad_id);
 
 /*
  * tok_encode — Encode text to token IDs.

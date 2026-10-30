@@ -144,6 +144,10 @@ void    *mem_alloc_pages(uint64_t count);
 void    *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 void     mem_free_pages(void *ptr, uint64_t count);
 int      mem_reserve_range(uint64_t phys, uint64_t count);
+/* A second region for big allocations (the platform maps it first); high
+ * allocations fall back to the first region when there is none */
+void     mem_add_high(uint64_t base, uint64_t size);
+void    *mem_alloc_aligned_high(uint64_t size, uint64_t alignment);
 uint64_t mem_get_total(void);
 uint64_t mem_get_free(void);
 uint64_t mem_get_used(void);

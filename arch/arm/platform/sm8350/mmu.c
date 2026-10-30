@@ -11,6 +11,13 @@
  *   0xA0000000-0xB4DFFFFF  Normal WB     kernel, heap, kload buffers
  *   0xB4E00000-0xB4FFFFFF  Normal NC     DMA window (USB event buffer, TRBs)
  *   0xE5000000-0xE5BFFFFF  Normal NC     splash framebuffer (writes merge)
+ *   0x800000000-0x9FFFFFFFF Normal WB    the 8 GB DDR bank at 32 GB (no
+ *                                        carve-outs): the high region for big
+ *                                        allocations (models, tensor arenas)
+ *
+ * The high bank is only ever written through the cache and no device DMAs
+ * into it, so the handoff (mmu_off_and_jump) needn't clean it: a line it
+ * leaves dirty holds what the next kernel would read anyway.
  *
  * Nothing else is mapped. The firmware carve-outs below 0xA0000000 must stay
  * out: Normal memory can be read speculatively and those regions belong to
@@ -58,6 +65,9 @@
 #define FB_BASE         0xE5000000UL
 #define FB_MAPPED       0x00C00000UL            /* 12 MB >= 1080 x 2448 x 4 */
 #define BLOCK_2M        0x200000UL
+#define BLOCK_1G        0x40000000UL
+#define HIGH_BANK       0x800000000UL           /* memory node: 8 GB at 32 GB */
+#define HIGH_BANK_GB    8
 
 static uint64_t l1[512] __attribute__((aligned(4096)));
 static uint64_t l2_dram[512] __attribute__((aligned(4096)));
@@ -111,6 +121,8 @@ void platform_mmu_init(void)
     map_2m(l2_dram, L2_DRAM_BASE, RAM_CACHED_BASE, DMA_WINDOW_BASE, ATTR_NORMAL_WB);
     map_2m(l2_dram, L2_DRAM_BASE, DMA_WINDOW_BASE, RAM_END, ATTR_NORMAL_NC);
     map_2m(l2_fb, L2_FB_BASE, FB_BASE, FB_BASE + FB_MAPPED, ATTR_NORMAL_NC);
+    for (uint64_t g = 0; g < HIGH_BANK_GB; g++)
+        l1[HIGH_BANK / BLOCK_1G + g] = block_desc(HIGH_BANK + g * BLOCK_1G, ATTR_NORMAL_WB) | DESC_XN;
 
     /* The page allocator must not hand out the DMA window */
     mem_reserve_range(DMA_WINDOW_BASE, DMA_WINDOW_SIZE / 4096);
@@ -147,6 +159,24 @@ void platform_mmu_init(void)
     serial_puts(", D-cache invalidate ");
     serial_putdec((t1 - t0) * 1000 / cntfrq());
     serial_puts(" ms\n");
+
+    /* A word at the start of each gigabyte, written and read back */
+    uint64_t gb = 0;
+    while (gb < HIGH_BANK_GB) {
+        volatile uint64_t *w = (volatile uint64_t *)(uintptr_t)(HIGH_BANK + gb * BLOCK_1G);
+        uint64_t pattern = 0x05170C0DE0000000ULL | gb;
+        *w = pattern;
+        if (*w != pattern)
+            break;
+        gb++;
+    }
+    if (gb)
+        mem_add_high(HIGH_BANK, gb * BLOCK_1G);
+    if (gb < HIGH_BANK_GB) {
+        serial_puts("[MMU ] high bank: GB ");
+        serial_putdec(gb);
+        serial_puts(" doesn't read back, stopping there\n");
+    }
 }
 
 void *dma_alloc(uint32_t bytes)

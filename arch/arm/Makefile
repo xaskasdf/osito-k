@@ -58,9 +58,11 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/gui_task.c \
             kernel/pci.c kernel/net.c \
             kernel/crypto.c kernel/tls.c kernel/http.c kernel/smp.c \
-            kernel/claude.c kernel/tokenizer.c kernel/tensor.c kernel/inference.c \
+            kernel/claude.c kernel/tokenizer.c kernel/tokenizer_trie.c \
+            kernel/tensor.c kernel/tensor_neon.c kernel/tensor_arena.c \
+            kernel/inference.c kernel/dispatch.c kernel/llm.c \
             kernel/git.c kernel/zlib.c kernel/memcompress.c kernel/input_events.c \
-            kernel/stubs.c kernel/tensor_neon.c \
+            kernel/stubs.c \
             drivers/hda.c drivers/virtio_blk.c drivers/virtio_net.c \
             drivers/gpu.c drivers/gsp.c drivers/sass.c drivers/gmmu.c \
             drivers/gpu_tensor.c drivers/gpu_inference.c drivers/gpu_display.c \
@@ -113,29 +115,14 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS) -c $< -o $@
 
-# Float-using files need FP registers enabled (no -mgeneral-regs-only)
+# Float-using files need FP registers enabled (no -mgeneral-regs-only). The
+# scheduler saves no FP/SIMD state, so their code must stay on one CPU that
+# no other FP user shares (see kernel/llm.c).
 FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(CFLAGS))
-$(BUILD)/kernel/tensor.o: kernel/tensor.c
-	@echo "[CC] $< (FP)"
-	@mkdir -p $(dir $@)
-	@$(CC) $(FP_CFLAGS) -c $< -o $@
-$(BUILD)/kernel/inference.o: kernel/inference.c
-	@echo "[CC] $< (FP)"
-	@mkdir -p $(dir $@)
-	@$(CC) $(FP_CFLAGS) -c $< -o $@
-$(BUILD)/kernel/tensor_neon.o: kernel/tensor_neon.c
-	@echo "[CC] $< (NEON)"
-	@mkdir -p $(dir $@)
-	@$(CC) $(FP_CFLAGS) -c $< -o $@
-$(BUILD)/kernel/tokenizer.o: kernel/tokenizer.c
-	@echo "[CC] $< (FP)"
-	@mkdir -p $(dir $@)
-	@$(CC) $(FP_CFLAGS) -c $< -o $@
-$(BUILD)/drivers/gpu_inference.o: drivers/gpu_inference.c
-	@echo "[CC] $< (FP)"
-	@mkdir -p $(dir $@)
-	@$(CC) $(FP_CFLAGS) -c $< -o $@
-$(BUILD)/drivers/gpu_tensor.o: drivers/gpu_tensor.c
+FP_SRCS   := kernel/tensor.c kernel/tensor_neon.c kernel/inference.c \
+             kernel/tokenizer.c kernel/llm.c fs/gguf.c \
+             drivers/gpu_inference.c drivers/gpu_tensor.c
+$(patsubst %.c,$(BUILD)/%.o,$(FP_SRCS)): $(BUILD)/%.o: %.c
 	@echo "[CC] $< (FP)"
 	@mkdir -p $(dir $@)
 	@$(CC) $(FP_CFLAGS) -c $< -o $@

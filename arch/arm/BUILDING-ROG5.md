@@ -137,6 +137,7 @@ and both caches on:
 | `0xA0000000`–`0xB4DFFFFF` | Normal write-back | kernel, heap, page allocator, kload buffers |
 | `0xB4E00000`–`0xB4FFFFFF` | Normal non-cacheable | DMA window (`dma_alloc`): USB event buffer and TRBs |
 | `0xE5000000`–`0xE5BFFFFF` | Normal non-cacheable | splash framebuffer; writes merge, display sees them |
+| `0x800000000`–`0x9FFFFFFFF` | Normal write-back, 1 GB blocks | the 8 GB DDR bank at 32 GB: the high memory region (models, `put` buffers) |
 
 Everything else is unmapped. That matters for the firmware carve-outs below
 `0xA0000000`: Normal memory may be read speculatively, and those regions belong to
@@ -151,6 +152,24 @@ memory is never speculated.
 - **The page allocator** stops at `0xB5000000`, the end of DDR bank 0. The next
   bank starts at `0xC0000000`. Until 2026-10-29 it claimed 384 MB up to
   `0xC0000000`, which ran 176 MB into the hole; no allocation had gone that high.
+- **High memory (2026-10-30).** The device tree's memory node has three
+  banks:
+
+  | Bank | Range | Size | Use |
+  |------|-------|------|-----|
+  | 0 | `0x80000000`–`0xB5000000` | 848 MB | carve-outs below `0xA0000000` |
+  | 1 | `0x800000000`–`0xA00000000` | 8 GB | no carve-outs: the high region |
+  | 2 | `0xC0000000`–`0x280000000` | 7 GB | a 168 MB carve-out at `0xD8800000` and the framebuffer |
+
+  - `mmu.c` maps bank 1 with 1 GB blocks, writes and reads back a word in each
+    gigabyte, and hands it to `memory.c` as a second region with its own bitmap
+    (`mem_add_high`). `mem` shows 8400 MB.
+  - Only `mem_alloc_aligned_high` uses that region (models, `put`'s buffer).
+    `mem_alloc_pages` never does, so `kload`'s kernels stay in bank 0, where
+    `mem_init` expects to find them.
+  - The handoff doesn't clean bank 1. Nothing writes it uncached and nothing
+    DMAs into it, so a line left dirty holds what the next kernel would read
+    anyway.
 - **Effect:** `help` round trip over USB went from 315 ms to 31 ms, and kload
   uploads from 2.5 s to 0.3 s.
 
@@ -386,10 +405,11 @@ same way.
 - **Files:** the shell's `ls`, `cat`, `hexdump`, `df` and `exec` work on it.
 - **Upload:** `put <name>` takes a file from the host with `kload`'s framing
   (`"OKLD"`, size, CRC-32, bytes; `arch/arm/scripts/rog5-put.ps1 -File <path>
-  [-Name <name>]`, up to 64 MB). It replaces a file with that name, flushes the
-  device's cache, reads the file back from UFS and checks the CRC before
-  saying "stored and verified". 5 MB of random bytes took 3 s (~1.65 MB/s, the
-  USB console's pace).
+  [-Name <name>]`, up to 1 GB, received in high memory). It replaces a file
+  with that name, flushes the device's cache, reads the file back from UFS and
+  checks the CRC before saying "stored and verified". It runs at the USB
+  console's pace, ~1.67 MB/s: 5 MB of random bytes took 3 s, a 92 MB model
+  54 s.
 - **Apps:** `exec <name> [args]` runs a program stored there (see "Apps").
 
 ---
@@ -454,6 +474,74 @@ Examples, all run on the phone on 2026-10-30:
 - The context switch doesn't save FP/SIMD registers. A program may use them
   as long as no other task on its CPU does (the kernel is built with
   `-mgeneral-regs-only`, NEON inference aside).
+
+---
+
+## Local LLM
+
+The inference stack is x86's, ported, replacing an older copy that arm had
+compiled but never used:
+- `fs/gguf.c` reads the hyperparameters from the GGUF itself.
+- `kernel/tokenizer.c` + `tokenizer_trie.c` do BPE or SentencePiece, chosen
+  by `tokenizer.ggml.model`.
+- `kernel/inference.c` runs llama-style models and brandon-tiny, picking the
+  chat template from the vocabulary.
+- `kernel/tensor.c` holds the kernels.
+
+`kernel/llm.c` is the arm side:
+- It loads a model from OsitoFS into high memory and sets up the tokenizer.
+- It holds the shell commands.
+- It stubs what x86's code expects of its kernel: SMP work submission
+  (`ap_worker_count = 0`, so everything runs on one CPU), NVMe layer
+  streaming and the profiler.
+
+```
+put (host): arch/arm/scripts/rog5-put.ps1 -File smollm2-135m-q4_0.gguf -Name smollm2.gguf
+model smollm2.gguf        # load it (model: the loaded one)
+chat What is the capital of France?
+llm selftest              # NEON against the scalar code, and the math
+llm simd off              # the scalar path, for comparison
+```
+
+**SIMD.** x86 calls its AVX2 kernels by name when `tensor_has_avx2()` says
+so. Here `tensor_has_avx2()` returns `tensor_simd`, and `kernel/tensor_neon.c`
+defines those names with the same signatures, in NEON:
+- `matvec_q4_0_avx2`, `matvec_f16_avx2`, `rmsnorm_avx2`, `vec_add_avx2`,
+  `vec_mul_avx2`;
+- plus `matvec_q4_1_neon`.
+
+`llm selftest` compares each against the scalar code on random data, with
+largest relative differences of 0 to 1e-6.
+
+**What had to change from x86:**
+- **Math.** The x87 code became double-precision C: `fsqrt` for the square
+  root, then range reduction plus a short series for exp/log/sin/cos. The
+  selftest checks it against known values, including cos(1000) for RoPE.
+- **Timing.** `rdtsc` reads CNTPCT, with `TSC_PER_MS` 19200.
+- **Q4_1.** `matvec`/`embed_token` gained it. x86 lacks it too, and
+  `smollm2-135m-q4_0.gguf` has some Q4_1 tensors, which x86 zeroes ("output
+  zeroed" warning).
+- **The old NEON kernels** had the wrong Q4_0 nibble order (2j / 2j+1 instead
+  of j / j+16). They had never run: `tensor_has_avx2()` returned 0, so arm
+  inference was all scalar.
+
+**FP state.** The scheduler saves no FP/SIMD registers. The FP files (the
+Makefile's `FP_SRCS`) run only in the shell task, which is pinned. `model`
+and `chat` move it to the X1 (CPU 7, `task_pin`) while they run, and back.
+Nothing else there uses FP: GUI, touch, keys and IRQ code are built with
+`-mgeneral-regs-only`.
+
+**Measured on the phone (X1, NEON, one core):**
+
+| Model | Size | Load (UFS + parse) | Prefill | Generation |
+|-------|------|--------------------|---------|------------|
+| `brandon-tiny-10m-instruct.f16.gguf` | 21 MB | 356 ms | 18 tokens in 71 ms | 9 ms/token (~110 tok/s) |
+| `smollm2-135m-q4_0.gguf` (BPE, ChatML) | 92 MB | 1.5 s | 16 tokens in 645 ms | 41-45 ms/token (~23 tok/s) |
+
+SmolLM2's answer to "What is the capital of France?" began "The capital of
+France is Paris, a city steeped in history, culture, and romance." Models are
+on `factory.naranjositos.tech/models/` (also `tinystories-llama2-20m.Q4_K_M`,
+`llama-3.2-1b-instruct-q4_k_m`, whose K-quants run scalar).
 
 ---
 
@@ -816,6 +904,11 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
 
     The desktop takes taps and swipes. Confirmed on the phone: the navigation
     bar switches windows and the Appearance pane scrolls and takes clicks.
+27. **Local LLM and high memory (2026-10-30).** See "Local LLM" and "MMU and
+    caches". The 8 GB bank at 32 GB is usable as is: all eight probe words read
+    back, and the hypervisor maps it. x86's inference stack runs with NEON
+    kernels. SmolLM2-135M answers correctly at ~23 tok/s on the X1, once Q4_1
+    was added; before that, the zeroed tensors gave word salad.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1097,6 +1190,8 @@ Since 2026-10-29 the kernel is a **PIE linked at 0** (`-fpie`, `-pie
 | `0x80000000`–`0x9BC00000` | Reserved-memory carve-outs (hyp, smem, `cdsp_secure_heap` `0x80C00000–0x85200000`, PIL regions, modem…). Don't touch |
 | `0x80000000`–`0xB5000000` | DDR bank 0 per the DTB memory node (next bank: `0xC0000000`) |
 | `0xA8000000`–`0xB5000000` | Osito-K page allocator; its top 2 MB (`0xB4E00000`) is the uncached DMA window |
+| `0x800000000`–`0xA00000000` | DDR bank 1 (8 GB, no carve-outs): Osito-K's high memory region |
+| `0xC0000000`–`0x280000000` | DDR bank 2 (7 GB): carve-out at `0xD8800000` (168 MB), splash framebuffer at `0xE5000000`; unused |
 | `_image_end` + 64 KB | Osito-K boot stack (~`0xA0340000`; follows the actual load address) |
 | `0x0098C000`     | GENI UART (serial console) |
 | `0x0A600000`     | USB DWC3 (side port) |
@@ -1343,6 +1438,9 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/pmic_arb.c` | SPMI PMIC arbiter v5: single-byte PMIC reads and writes, `pmic list` |
 | `arch/arm/platform/sm8350/rpmh.c` | Command DB lookups and active-only RPMh votes through the apps RSC (`rpmh`) |
 | `arch/arm/platform/sm8350/touch.c` | FocalTech touchscreen: RPMh supplies, bit-banged I2C, polling task, event queue |
+| `arch/arm/kernel/llm.c` | `model` / `chat` / `llm`: GGUF from OsitoFS into high memory, tokenizer, x86 glue stubs, NEON selftest |
+| `arch/arm/kernel/tensor_neon.c` | NEON kernels under x86's AVX2 names (Q4_0, Q4_1, F16 matvec, rmsnorm, vec ops) |
+| `arch/arm/kernel/{inference,tensor,tokenizer,tokenizer_trie}.c`, `fs/gguf.c` | x86's inference stack, ported (CNTPCT timing, double-precision math, Q4_1) |
 | `arch/arm/platform/sm8350/keys.c` | Power / volume keys: console history, fastboot and status shortcuts |
 | `arch/arm/platform/sm8350/ufs.c` | UFS host controller: LUNs, GPT, block dumps; writes only into `userdata` (OsitoFS) |
 | `arch/arm/scripts/rog5-put.ps1` | Host side of `put`: copy a file onto the phone's OsitoFS |

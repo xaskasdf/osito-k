@@ -30,6 +30,14 @@ static uint64_t ram_pages;     /* total pages in RAM region */
 static uint64_t free_pages;
 static uint64_t total_memory;
 
+/* A second region for big allocations (mem_alloc_aligned_high): SM8350's
+ * 8 GB bank at 0x800000000, which the platform maps and hands over with
+ * mem_add_high. Its own bitmap, indexed from its base. mem_alloc_pages
+ * never uses it, so kload's kernels stay in the first region. */
+#define HIGH_MAX_PAGES  (8ULL * 1024 * 1024 * 1024 / PAGE_SIZE)   /* 2M pages */
+static uint8_t high_bitmap[HIGH_MAX_PAGES / 8];                    /* 256 KB */
+static uint64_t high_base, high_pages, high_free;
+
 /* ── Bitmap helpers ──────────────────────────────────────── */
 
 static void bitmap_set(uint64_t page)
@@ -187,32 +195,97 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
     return addr;
 }
 
+/* ── The high region ─────────────────────────────────────── */
+
+static int high_test(uint64_t i) { return (high_bitmap[i / 8] >> (i % 8)) & 1; }
+static void high_set(uint64_t i) { high_bitmap[i / 8] |= (uint8_t)(1 << (i % 8)); }
+static void high_clear(uint64_t i) { high_bitmap[i / 8] &= (uint8_t)~(1 << (i % 8)); }
+
+/* Hand over a mapped region (once, before any high allocation) */
+void mem_add_high(uint64_t base, uint64_t size)
+{
+    uint64_t pages = size >> PAGE_SHIFT;
+    if (pages > HIGH_MAX_PAGES)
+        pages = HIGH_MAX_PAGES;
+    memset(high_bitmap, 0xFF, pages / 8);
+    high_base = base;
+    high_pages = high_free = pages;
+    serial_puts("[MEM ] High region: ");
+    serial_putdec(pages * PAGE_SIZE >> 20);
+    serial_puts(" MB at ");
+    serial_puthex(base, 10);
+    serial_puts("\n");
+}
+
+/* Big, aligned, physically contiguous memory (models, tensor arenas): from
+ * the high region, else the first one. Not zeroed. */
+void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment)
+{
+    uint64_t pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    uint64_t step = alignment >> PAGE_SHIFT;
+    if (step == 0)
+        step = 1;
+    void *addr = (void *)0;
+    uint64_t flags = spin_lock_irqsave(&mem_lock);
+    if (pages && pages <= high_free) {
+        /* Candidates at aligned addresses; on a used page, jump past it */
+        uint64_t first = ((high_base >> PAGE_SHIFT) + step - 1) / step * step - (high_base >> PAGE_SHIFT);
+        for (uint64_t p = first; p + pages <= high_pages; ) {
+            uint64_t i = 0;
+            while (i < pages && high_test(p + i))
+                i++;
+            if (i == pages) {
+                for (i = 0; i < pages; i++)
+                    high_clear(p + i);
+                high_free -= pages;
+                addr = (void *)(high_base + (p << PAGE_SHIFT));
+                break;
+            }
+            uint64_t next = p + i + 1;
+            p = first + (next - first + step - 1) / step * step;
+        }
+    }
+    spin_unlock_irqrestore(&mem_lock, flags);
+    return addr ? addr : mem_alloc_aligned(size, alignment);
+}
+
 /* ── Free pages ─────────────────────────────────────────── */
 
 void mem_free_pages(void *addr, uint64_t count)
 {
-    uint64_t start_page = (uint64_t)addr >> PAGE_SHIFT;
+    uint64_t pa = (uint64_t)addr;
     uint64_t flags = spin_lock_irqsave(&mem_lock);
-    for (uint64_t i = 0; i < count; i++) {
-        bitmap_set(start_page + i);
-        free_pages++;
+    if (high_pages && pa >= high_base && pa < high_base + (high_pages << PAGE_SHIFT)) {
+        uint64_t first = (pa - high_base) >> PAGE_SHIFT;
+        for (uint64_t i = 0; i < count && first + i < high_pages; i++) {
+            if (!high_test(first + i)) {
+                high_set(first + i);
+                high_free++;
+            }
+        }
+    } else {
+        uint64_t start_page = pa >> PAGE_SHIFT;
+        for (uint64_t i = 0; i < count; i++) {
+            bitmap_set(start_page + i);
+            free_pages++;
+        }
     }
     spin_unlock_irqrestore(&mem_lock, flags);
 }
 
-/* ── Info ────────────────────────────────────────────────── */
+/* ── Info (both regions) ─────────────────────────────────── */
 
 uint64_t mem_get_total(void)
 {
-    return total_memory;
+    return total_memory + (high_pages << PAGE_SHIFT);
 }
 
 uint64_t mem_get_free(void)
 {
-    return free_pages * PAGE_SIZE;
+    return (free_pages + high_free) * PAGE_SIZE;
 }
 
 uint64_t mem_get_used(void)
 {
-    return (ram_pages - free_pages) * PAGE_SIZE;
+    return (ram_pages - free_pages + high_pages - high_free) * PAGE_SIZE;
 }

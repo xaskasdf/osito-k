@@ -75,6 +75,13 @@ _entry:
     /* Set up exception vectors */
     adr     x0, _vectors
     msr     VBAR_EL1, x0
+
+    /* FP/SIMD on (CPACR_EL1.FPEN = 0b11): the inference code uses it. The
+     * phone's firmware leaves it on, QEMU doesn't; smp.c copies CPACR to the
+     * other CPUs. */
+    mrs     x0, CPACR_EL1
+    orr     x0, x0, #(3 << 20)
+    msr     CPACR_EL1, x0
     isb
 
     /* Stack: provided by linker script (_stack_top). PC-relative, because

@@ -11,7 +11,7 @@
     arch/arm/platform/sm8350/kload.c.
 
 .PARAMETER File
-    The file to send (up to 64 MB).
+    The file to send (up to 1 GB).
 
 .PARAMETER Name
     Its name on the phone. Default: the file's own name.

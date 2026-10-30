@@ -11,6 +11,9 @@ extern bool hda_is_ready(void);
 extern int proc_run(const char *path, int argc, char **argv);
 extern void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
 extern void net_poll(void);
+extern void cmd_model(int argc, char **argv);   /* llm.c */
+extern void cmd_chat(int argc, char **argv);
+extern void cmd_llm(int argc, char **argv);
 
 #define MAX_ARGS 16
 
@@ -53,6 +56,9 @@ static void cmd_help(void)
     serial_puts("  resolve  DNS lookup\n");
     serial_puts("  beep     Play a tone\n");
     serial_puts("  desktop  The desktop on the panel, phablet layout [off]\n");
+    serial_puts("  model    Local LLM: the loaded one [<file.gguf>: load it]\n");
+    serial_puts("  chat     Talk to the loaded model <text>\n");
+    serial_puts("  llm      Compute path [simd on|off | selftest]\n");
     serial_puts("  reboot   Reboot system [bootloader: into fastboot]\n");
     serial_puts("  pmic     PMIC arbiter + restart reason [<sid> <hex addr> | list <sid>]\n");
     serial_puts("  rpmh     Apps RSC + AOP command DB [<resource>]\n");
@@ -412,6 +418,9 @@ void shell_run(void)
         else if (strcmp(argv[0], "resolve") == 0) cmd_resolve(argc, argv);
         else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
         else if (strcmp(argv[0], "desktop") == 0) cmd_desktop(argc, argv);
+        else if (strcmp(argv[0], "model") == 0)   cmd_model(argc, argv);
+        else if (strcmp(argv[0], "chat") == 0)    cmd_chat(argc, argv);
+        else if (strcmp(argv[0], "llm") == 0)     cmd_llm(argc, argv);
         else if (strcmp(argv[0], "reboot") == 0) {
             if (argc > 1 && strcmp(argv[1], "bootloader") == 0)
                 platform_reboot_bootloader();

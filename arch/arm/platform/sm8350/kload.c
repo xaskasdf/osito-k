@@ -23,7 +23,7 @@
 #include "usb.h"
 
 #define KLOAD_MAX       (32U << 20)
-#define PUT_MAX         (64U << 20)
+#define PUT_MAX         (1U << 30)      /* received in the high region (models) */
 
 /* fs/ositofs2.c, beyond hal.h */
 int  osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len);
@@ -84,9 +84,10 @@ static void say(const char *who, const char *what)
 }
 
 /* Print "<who>: ready", then take "OKLD" + size + CRC-32 + the bytes into
- * fresh pages. Returns them (*pages to free), or NULL with the reason
- * printed. */
-static uint8_t *receive(const char *who, uint32_t min, uint32_t max,
+ * fresh pages: in the first memory region for a kernel (it runs where it
+ * lands, and mem_init reserves up to it from that region's base), high for
+ * a file. Returns them (*pages to free), or NULL with the reason printed. */
+static uint8_t *receive(const char *who, uint32_t min, uint32_t max, int high,
                         uint32_t *size_out, uint64_t *pages_out)
 {
     static const char magic[4] = { 'O', 'K', 'L', 'D' };
@@ -114,7 +115,7 @@ static uint8_t *receive(const char *who, uint32_t min, uint32_t max,
     }
 
     uint64_t pages = (size + 4095) / 4096;
-    uint8_t *buf = mem_alloc_pages(pages);
+    uint8_t *buf = high ? mem_alloc_aligned_high(size, 4096) : mem_alloc_pages(pages);
     if (!buf) {
         say(who, "out of memory\n");
         return (void *)0;
@@ -161,7 +162,7 @@ void platform_put_cmd(int argc, char **argv)
     }
     uint32_t size;
     uint64_t pages;
-    uint8_t *buf = receive("put", 1, PUT_MAX, &size, &pages);
+    uint8_t *buf = receive("put", 1, PUT_MAX, 1, &size, &pages);
     if (!buf)
         return;
     uint32_t crc_sent = 0xFFFFFFFF;
@@ -198,7 +199,7 @@ int platform_kload(void)
 {
     uint32_t size;
     uint64_t pages;
-    uint8_t *buf = receive("kload", ARM64_MAGIC_OFF + 4, KLOAD_MAX, &size, &pages);
+    uint8_t *buf = receive("kload", ARM64_MAGIC_OFF + 4, KLOAD_MAX, 0, &size, &pages);
     if (!buf)
         return -1;
     if (buf[ARM64_MAGIC_OFF] != 'A' || buf[ARM64_MAGIC_OFF + 1] != 'R' ||
