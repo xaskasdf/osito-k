@@ -11,6 +11,8 @@ extern bool hda_is_ready(void);
 extern int proc_run(const char *path, int argc, char **argv);
 extern void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
 extern void net_poll(void);
+extern void net_hold(void);
+extern void net_release(void);
 extern void cmd_model(int argc, char **argv);   /* llm.c */
 extern void cmd_chat(int argc, char **argv);
 extern void cmd_llm(int argc, char **argv);
@@ -54,6 +56,7 @@ static void cmd_help(void)
     serial_puts("  df       Filesystem free space\n");
     serial_puts("  halt     Shutdown system\n");
     serial_puts("  resolve  DNS lookup\n");
+    serial_puts("  net      USB networking (NCM): state [up | down]\n");
     serial_puts("  beep     Play a tone\n");
     serial_puts("  desktop  The desktop on the panel, phablet layout [off]\n");
     serial_puts("  model    Local LLM: the loaded one [<file.gguf>: load it]\n");
@@ -303,7 +306,10 @@ static void cmd_resolve(int argc, char **argv)
     if (argc < 2) { serial_puts("Usage: resolve <hostname>\n"); return; }
     extern int net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
     uint8_t ip[4];
-    if (net_dns_resolve(argv[1], ip) == 0) {
+    net_hold();
+    int err = net_dns_resolve(argv[1], ip);
+    net_release();
+    if (err == 0) {
         serial_puts(argv[1]);
         serial_puts(" -> ");
         serial_putdec(ip[0]); serial_putc('.');
@@ -356,10 +362,26 @@ void shell_run(void)
                 }
                 serial_puts("PING ");
                 serial_puts(argv[1]);
-                serial_puts("...\n");
-                net_icmp_send_echo(ip, 1);
-                /* Poll for reply */
-                for (int i = 0; i < 500000; i++) net_poll();
+                serial_puts("\n");
+                /* Four echoes, a second each. The first may go to ARP:
+                 * net.c drops a packet whose next hop isn't resolved yet. */
+                extern uint32_t net_icmp_get_rx_count(void);
+                net_hold();
+                for (uint16_t seq = 1; seq <= 4; seq++) {
+                    uint32_t before = net_icmp_get_rx_count();
+                    uint64_t t0 = timer_ms(), t = 0;
+                    net_icmp_send_echo(ip, seq);
+                    while (net_icmp_get_rx_count() == before && (t = timer_ms() - t0) < 1000) {
+                        net_poll();
+                        task_yield();
+                    }
+                    serial_puts(net_icmp_get_rx_count() != before ? "  reply, " : "  timeout\n");
+                    if (net_icmp_get_rx_count() != before) {
+                        serial_putdec(t);
+                        serial_puts(" ms\n");
+                    }
+                }
+                net_release();
             }
         }
         else if (strcmp(argv[0], "cpus") == 0) {
@@ -416,6 +438,7 @@ void shell_run(void)
         else if (strcmp(argv[0], "df") == 0)      cmd_df();
         else if (strcmp(argv[0], "halt") == 0)    cmd_halt();
         else if (strcmp(argv[0], "resolve") == 0) cmd_resolve(argc, argv);
+        else if (strcmp(argv[0], "net") == 0)     platform_net_cmd(argc, argv);
         else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
         else if (strcmp(argv[0], "desktop") == 0) cmd_desktop(argc, argv);
         else if (strcmp(argv[0], "model") == 0)   cmd_model(argc, argv);

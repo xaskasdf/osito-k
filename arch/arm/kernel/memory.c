@@ -66,7 +66,7 @@ static int bitmap_test(uint64_t page)
 
 /* ── Linker symbols ─────────────────────────────────────── */
 
-extern char _stack_top[];
+extern char _start[], _stack_top[];
 
 /* ── Initialize from known RAM range ────────────────────── */
 
@@ -85,9 +85,13 @@ void mem_init(uint64_t base, uint64_t size)
         free_pages++;
     }
 
-    /* Reserve: base up through kernel image + stack */
+    /* Reserve the running kernel: image, BSS, stack. Only that: a kernel
+     * kload placed inside this range finds below itself what its
+     * predecessor left, which nothing uses any more (the DMA window is
+     * reserved apart, by mmu.c). Reserving from the base up to it shrank
+     * the free memory with every kload in a row. */
     uint64_t kernel_end = (uint64_t)_stack_top;
-    uint64_t res_start = base >> PAGE_SHIFT;
+    uint64_t res_start = (uint64_t)_start >> PAGE_SHIFT;
     uint64_t res_end = (kernel_end + PAGE_SIZE - 1) >> PAGE_SHIFT;
     for (uint64_t p = res_start; p < res_end && p < MAX_PHYS_PAGES; p++) {
         if (bitmap_test(p)) {

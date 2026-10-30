@@ -63,8 +63,10 @@ The sm8350-boot shim menu appears on-screen and auto-boots the payload at 1.5 MB
 
 With the cable in the **side** USB-C port (the bottom one is damaged on our unit),
 Osito-K presents itself as a CDC-ACM serial device: `VID_1209&PID_0001` (pid.codes
-test IDs), serial `0001`. Windows 10+ binds its inbox `usbser.sys` and creates a COM
-port (COM3 on the dev box); find it with
+test IDs), serial `0001`. After `net up` it is a composite with a network function
+instead (serial `0002`, the console then on COM4; see "USB networking"). The
+scripts find the port either way by matching `VID_1209&PID_0001`. Windows 10+ binds
+its inbox `usbser.sys` and creates a COM port (COM3 on the dev box); find it with
 `Get-CimInstance Win32_SerialPort | ? PNPDeviceID -match VID_1209`. Open it with
 PuTTY or any terminal; the baud rate doesn't matter. Everything the kernel prints
 goes there as well as to the screen, and keystrokes feed the shell. Boot messages
@@ -119,9 +121,74 @@ the host and disconnects USB. Then `mmu_off_and_jump` stops the timer, cleans an
 invalidates the whole cached range, turns the MMU and caches off, invalidates the
 I-cache and TLB, and jumps with the shim's entry state. The Image runs wherever it
 landed. That works because the kernel relocates itself, and `mem_init` reserves
-everything from the RAM base up to the running kernel's end. The old kernel's
-memory is simply abandoned. Each generation lands a little higher (e.g.
-`0xA86AB000`). A 500 KB transfer takes ~0.3 s with caches on (~2.5 s without).
+the running kernel's image, BSS and stack. The old kernel's memory is simply
+abandoned and goes back into the page allocator (see "High memory"). A 500 KB
+transfer takes ~0.3 s with caches on (~2.5 s without).
+
+---
+
+## USB networking
+
+`net up` re-enumerates the gadget as a composite, `usb_set_ncm` in
+`dwc3_acm.c`. Device class EF/02/01 carries two IADs:
+
+| Function | Interfaces | Endpoints |
+|----------|------------|-----------|
+| CDC-ACM (the console, as before) | 0, 1 | EP1 bulk, EP2 interrupt |
+| CDC-NCM | 2 (control), 3 (data, alt 1) | EP4 interrupt IN (phys 9); EP3 bulk OUT/IN (phys 6/7) |
+
+It uses serial `0002`, a device instance of its own. Windows 11 binds `usbccgp`,
+then `usbser` (COM4) and its inbox `UsbNcm` (an adapter named "naranjositos
+Osito-K", "Ethernet 4" here) with no driver to install. `net down` goes back
+to the serial port alone, on COM3. If the host hasn't configured the
+composite within 20 s, the driver goes back by itself, because the console is
+the only way in.
+
+**USB side (`dwc3_acm.c`).**
+- **Class requests to interface 2** (CDC NCM 1.0 §6.2) are answered:
+  `GET_NTB_PARAMETERS` (NTB16; IN up to 16 KB, OUT up to 16 KB, 4-byte
+  alignment), the NTB format, input size and CRC mode getters, and the packet
+  filter and format setters, acknowledged.
+- **`SET_INTERFACE`** on interface 3, alt 1, arms a 16 KB bulk OUT transfer.
+  It then sends a `CONNECTION_SPEED_CHANGE` notification (120 Mbit/s) and
+  `NETWORK_CONNECTION`, as Linux's `f_ncm` does.
+- **Memory.** The DMA area grew to 40 KB.
+- **MAC addresses.** The `iMACAddress` string, `024F4B000001`, is the host
+  adapter's MAC; the phone's own is `02:4F:4B:00:00:02`.
+- Windows also asks for string `0xEE` (the Microsoft OS descriptor) and is
+  told to stall; that's harmless.
+
+**Framing (`ncm.c`).**
+- **Receiving.** An OUT NTB is unpacked datagram by datagram (NTH16, then
+  the NDP16 chain) into a 32-frame RX queue.
+- **Sending.** Up to 8 queued TX frames go out per IN NTB. The block length
+  is never a multiple of 512, so the transfer ends with a short packet.
+- **The stack's NIC.** `net.c` now takes its NIC through `net_set_nic`, with
+  virtio-net as the default for QEMU virt. The NCM NIC polls the gadget
+  itself, on receive when its queue is empty and on send after queueing, so
+  any user polling the stack also moves the USB side.
+
+**Addressing.** When the host selects the data interface, the `net` task asks
+for an address by DHCP (`kernel/dhcp.c`, broadcast replies; `net.c` now takes
+broadcasts and anything while it has no address). Windows' Internet
+Connection Sharing answers, and routes the phone to the internet. With no
+answer within 3 tries of 2 s, the phone takes a link-local 169.254.79.x, as
+Windows does after its own DHCP gives up, and the two reach each other.
+
+**Ownership.** The stack isn't reentrant. Commands hold it for their whole
+run (`net_hold`: `ping`, `resolve`, DHCP). The `net` task polls it every 10 ms
+only when nobody holds it (`net_trypoll`), so the phone answers ARP and ping
+in the background. `spin_trylock` is new in `include/spinlock.h`.
+
+**Measured (2026-10-30).**
+- Windows enumerated the composite on the first try: COM4 plus an adapter in
+  state Up, with MAC `02-4F-4B-00-00-01`.
+- PC to phone: `ping -S 169.254.122.0 169.254.79.70` gets 4/4 replies,
+  1–7 ms.
+- Phone to PC: the new `ping` (4 echoes, 1 s each) gets 0–1 ms.
+- Without `-S`, Windows sent the ping through Tailscale, whose adapter also
+  has a 169.254 address and an equal-metric route.
+- Windows put the network in the Public category.
 
 ## MMU and caches
 
@@ -174,9 +241,12 @@ memory is never speculated.
   - **Who uses it.** Only `mem_alloc_aligned_high` allocates there: models,
     `put`'s buffer, and the inference state (KV cache, scratch).
     `mem_alloc_pages` never does, so `kload`'s kernels stay in bank 0, where
-    `mem_init` expects to find them. A `kload`ed kernel lands above what its
-    predecessor had allocated in bank 0, and `mem_init` reserves everything
-    below it, so chains of `kload`s shrink bank 0. A flashed boot starts clean.
+    `mem_init` expects to find them.
+  - **`kload` and bank 0.** A `kload`ed kernel lands wherever its predecessor
+    had free pages. `mem_init` reserves just the running image (`_start` to
+    `_stack_top`); what lies below is the predecessor's abandoned memory.
+    Until 2026-10-30 it reserved from the bank's base up, so each `kload` in a
+    row shrank bank 0: one chain was down to 7 MB free, now 205 MB.
   - **The handoff doesn't clean high memory.** Nothing writes it uncached and
     nothing DMAs into it, so a line left dirty holds what the next kernel would
     read anyway.
@@ -941,6 +1011,11 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     high memory around its three carve-outs: 15362 MB in all. Matvecs are
     split over the X1 and the A78s, which took SmolLM2 from 45 to 20 ms a token.
     The inference state moved to high memory, so bank 0 stays for the kernel.
+29. **USB networking (2026-10-30).** See "USB networking". The gadget became an
+    ACM + NCM composite on demand (`net up`), with NTB16 framing, a NIC
+    interface in `net.c`, DHCP, a link-local fallback, and a background poller.
+    Windows bound its inbox drivers on the first try, and pings cross both
+    ways in 0–7 ms. `mem_init` stopped losing bank 0 to `kload` chains.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1470,6 +1545,8 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/pmic_arb.c` | SPMI PMIC arbiter v5: single-byte PMIC reads and writes, `pmic list` |
 | `arch/arm/platform/sm8350/rpmh.c` | Command DB lookups and active-only RPMh votes through the apps RSC (`rpmh`) |
 | `arch/arm/platform/sm8350/touch.c` | FocalTech touchscreen: RPMh supplies, bit-banged I2C, polling task, event queue |
+| `arch/arm/platform/sm8350/ncm.c` | USB networking: NTB16 framing, frame queues, the stack's NIC, `net` task and command |
+| `arch/arm/kernel/dhcp.c` | DHCP client (DISCOVER/OFFER/REQUEST/ACK) |
 | `arch/arm/kernel/llm.c` | `model` / `chat` / `llm`: GGUF from OsitoFS into high memory, tokenizer, x86 glue stubs, NEON selftest |
 | `arch/arm/kernel/tensor_neon.c` | NEON kernels under x86's AVX2 names (Q4_0, Q4_1, F16 matvec, rmsnorm, vec ops) |
 | `arch/arm/kernel/{inference,tensor,tokenizer,tokenizer_trie}.c`, `fs/gguf.c` | x86's inference stack, ported (CNTPCT timing, double-precision math, Q4_1) |

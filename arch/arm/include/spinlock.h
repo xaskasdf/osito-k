@@ -36,6 +36,23 @@ static inline void spin_lock(spinlock_t *l)
         : "=&r"(tmp) : "r"(&l->locked), "r"(1u) : "memory");
 }
 
+/* One attempt, no waiting: 1 if it took the lock */
+static inline int spin_trylock(spinlock_t *l)
+{
+    if (!smp_running)
+        return 1;
+    uint32_t held, fail = 1;
+    __asm__ volatile(
+        "   ldaxr   %w0, [%2]\n"
+        "   cbnz    %w0, 1f\n"
+        "   stxr    %w1, %w3, [%2]\n"
+        "   b       2f\n"
+        "1: clrex\n"
+        "2:\n"
+        : "=&r"(held), "+&r"(fail) : "r"(&l->locked), "r"(1u) : "memory");
+    return !held && !fail;
+}
+
 /* Unconditional, so a lock taken just before smp_running changes is still
  * released */
 static inline void spin_unlock(spinlock_t *l)

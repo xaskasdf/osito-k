@@ -45,7 +45,7 @@
 #define DWC3_DCTL           0xC704
 #define DWC3_DSTS           0xC70C
 
-#define USB_DMA_PAGES       4           /* 16 KB, see dwc3_acm.c */
+#define USB_DMA_PAGES       10          /* 40 KB, see dwc3_acm.c (DMA_SIZE) */
 
 static uint32_t gcc_read(uint32_t off)
 {

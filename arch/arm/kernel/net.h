@@ -125,11 +125,30 @@ typedef struct {
 typedef void (*udp_handler_t)(const uint8_t *src_ip, uint16_t src_port,
                               const void *data, uint32_t len);
 
+/* The NIC under the stack; virtio-net unless net_set_nic is called first.
+ * recv returns 0 with a frame in buf. */
+typedef struct {
+    void (*get_mac)(uint8_t mac[6]);
+    int  (*send)(const void *frame, uint32_t len);
+    int  (*recv)(void *buf, uint32_t *len);
+} net_nic_t;
+void net_set_nic(const net_nic_t *nic);
+
 /* Initialize network stack with static IP */
 void net_init(const uint8_t ip[4]);
+/* Change the address and mask later (DHCP), read them back with the gateway */
+void net_set_ip(const uint8_t ip[4], const uint8_t mask[4]);
+void net_get_ip(uint8_t ip[4], uint8_t mask[4], uint8_t gw[4]);
+void net_get_mac(uint8_t mac[6]);
+void net_set_gateway(const uint8_t gw[4]);
 
 /* Poll for incoming packets (call in main loop) */
 void net_poll(void);
+/* The stack isn't reentrant: a user holds it for its whole run; a
+ * background poller polls only while nobody holds it */
+void net_hold(void);
+void net_release(void);
+void net_trypoll(void);
 
 /* Send UDP datagram. Returns 0 on success, -1 on failure. */
 int  net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,

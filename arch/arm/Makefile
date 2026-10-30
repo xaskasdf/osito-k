@@ -56,7 +56,7 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/memory.c kernel/paging.c kernel/heap.c kernel/sched.c \
             kernel/syscall.c kernel/elf.c kernel/process.c \
             kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/gui_task.c \
-            kernel/pci.c kernel/net.c \
+            kernel/pci.c kernel/net.c kernel/dhcp.c \
             kernel/crypto.c kernel/tls.c kernel/http.c kernel/smp.c \
             kernel/claude.c kernel/tokenizer.c kernel/tokenizer_trie.c \
             kernel/tensor.c kernel/tensor_neon.c kernel/tensor_arena.c \

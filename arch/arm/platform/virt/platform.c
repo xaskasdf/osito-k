@@ -100,6 +100,13 @@ void platform_rpmh_cmd(int argc, char **argv)
     serial_puts("rpmh: only on SM8350\n");
 }
 
+void platform_net_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    serial_puts("net: virtio-net, set up at boot (see the [NET] lines)\n");
+}
+
 int platform_touch_event(int32_t *x, int32_t *y, int *down)
 {
     (void)x;

@@ -8,12 +8,22 @@
 #include "../include/hal.h"
 #include "../include/types.h"
 #include "net.h"
+#include "../include/spinlock.h"
 #include "../drivers/virtio_net.h"
 
-/* NIC interface: redirect i211_* to virtio_net_* */
-#define i211_get_mac    virtio_net_get_mac
-#define i211_send       virtio_net_send
-#define i211_recv       virtio_net_recv
+/* The NIC: virtio-net (QEMU virt) unless the platform sets another with
+ * net_set_nic (SM8350: the USB NCM function). The code below keeps x86's
+ * i211_* names. */
+static const net_nic_t virtio_nic = { virtio_net_get_mac, virtio_net_send, virtio_net_recv };
+static const net_nic_t *nic = &virtio_nic;
+#define i211_get_mac(m)     nic->get_mac(m)
+#define i211_send(f, n)     nic->send(f, n)
+#define i211_recv(b, n)     nic->recv(b, n)
+
+void net_set_nic(const net_nic_t *n)
+{
+    nic = n;
+}
 
 /* ── Byte Order ──────────────────────────────────────────────── */
 
@@ -398,8 +408,11 @@ static void handle_ipv4(const uint8_t *pkt, uint32_t len)
     if (total > len || ihl > total)
         return;
 
-    /* Check destination is us */
-    if (!ip_eq(ip->dst, our_ip))
+    /* Check destination is us: our address, a broadcast, or anything while
+     * we have none yet (DHCP) */
+    static const uint8_t bcast_ip[4] = { 255, 255, 255, 255 };
+    static const uint8_t no_ip[4] = { 0, 0, 0, 0 };
+    if (!ip_eq(ip->dst, our_ip) && !ip_eq(ip->dst, bcast_ip) && !ip_eq(our_ip, no_ip))
         return;
 
     /* Verify header checksum */
@@ -474,6 +487,26 @@ void net_init(const uint8_t ip[4])
     fb_putdec(our_ip[3]); fb_puts("\n");
 }
 
+/* Change the address after net_init (DHCP, link-local); quiet */
+void net_set_ip(const uint8_t ip[4], const uint8_t mask[4])
+{
+    memcpy(our_ip, ip, 4);
+    memcpy(netmask, mask, 4);
+    memset(arp_table, 0, sizeof(arp_table));
+}
+
+void net_get_ip(uint8_t ip[4], uint8_t mask[4], uint8_t gw[4])
+{
+    memcpy(ip, our_ip, 4);
+    memcpy(mask, netmask, 4);
+    memcpy(gw, gateway_ip, 4);
+}
+
+void net_get_mac(uint8_t mac[6])
+{
+    memcpy(mac, our_mac, ETH_ALEN);
+}
+
 void net_set_gateway(const uint8_t gw[4])
 {
     memcpy(gateway_ip, gw, 4);
@@ -482,6 +515,32 @@ void net_set_gateway(const uint8_t gw[4])
     serial_putdec(gw[1]); serial_puts(".");
     serial_putdec(gw[2]); serial_puts(".");
     serial_putdec(gw[3]); serial_puts("\n");
+}
+
+/* ── Ownership ───────────────────────────────────────────────── */
+
+/* The stack isn't reentrant (one RX buffer, shared TCP state). A command
+ * that uses it holds it for its whole run (net_hold, sleeping while it
+ * waits); a background poller only polls when nobody does (net_trypoll). */
+static spinlock_t net_owner;
+
+void net_hold(void)
+{
+    while (!spin_trylock(&net_owner))
+        task_delay_ms(10);
+}
+
+void net_release(void)
+{
+    spin_unlock(&net_owner);
+}
+
+void net_trypoll(void)
+{
+    if (spin_trylock(&net_owner)) {
+        net_poll();
+        spin_unlock(&net_owner);
+    }
 }
 
 /* ── Poll for Incoming Packets ───────────────────────────────── */
@@ -517,12 +576,18 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
                  uint16_t src_port, const void *data, uint32_t len)
 {
     /* Resolve next-hop MAC (gateway for off-subnet destinations) */
-    const uint8_t *nexthop = arp_nexthop(dst_ip);
-    arp_entry_t *entry = arp_lookup(nexthop);
-    if (!entry) {
-        /* Send ARP request and bail — caller should retry */
-        arp_send_request(nexthop);
-        return -1;
+    /* 255.255.255.255 goes to every MAC, with no ARP (DHCP) */
+    static const uint8_t bcast_ip[4] = { 255, 255, 255, 255 };
+    const uint8_t *dst_mac = bcast_mac;
+    if (!ip_eq(dst_ip, bcast_ip)) {
+        const uint8_t *nexthop = arp_nexthop(dst_ip);
+        arp_entry_t *entry = arp_lookup(nexthop);
+        if (!entry) {
+            /* Send ARP request and bail — caller should retry */
+            arp_send_request(nexthop);
+            return -1;
+        }
+        dst_mac = entry->mac;
     }
 
     /* Build UDP header */
@@ -534,7 +599,7 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
 
     /* Build frame in tx_pkt */
     eth_hdr_t *eth = (eth_hdr_t *)tx_pkt;
-    memcpy(eth->dst, entry->mac, ETH_ALEN);
+    memcpy(eth->dst, dst_mac, ETH_ALEN);
     memcpy(eth->src, our_mac, ETH_ALEN);
     eth->ethertype = htons(ETH_TYPE_IP4);
 

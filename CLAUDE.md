@@ -96,6 +96,9 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - Its I2C SE has the FIFO disabled (GPI DMA only), so the driver bit-bangs the two pins.
   - Taps and swipes reach the desktop through `platform_touch_event`.
 - Memory: the page allocator (`mem_alloc_pages`) covers DDR bank 0, 208 MB. `mem_alloc_aligned_high` serves big allocations (models, `put` buffers, inference state) from 15 GB of high memory: the rest of the 16 GB, less the device tree's carve-outs (`high_ram[]` in `platform/sm8350/mmu.c`). Kernels from `kload` must stay in bank 0.
+- USB networking: `net up` re-enumerates the gadget as ACM + CDC-NCM (`platform/sm8350/dwc3_acm.c`, framing in `ncm.c`), and the console moves to COM4. Windows binds its inbox UsbNcm. The phone then takes DHCP (Windows ICS) or a link-local 169.254.79.x.
+  - The stack (`kernel/net.c`) isn't reentrant: hold it with `net_hold`/`net_release` around any use.
+  - The `net` task polls it only when it's free.
 - Local LLM: `kernel/llm.c` (`model <file.gguf>`, `chat <text>`, `llm selftest`) runs x86's inference stack, ported.
   - Its SIMD paths are NEON under x86's AVX2 names (`kernel/tensor_neon.c`).
   - The scheduler saves no FP/SIMD state, so FP code (the Makefile's `FP_SRCS`) must stay in one pinned task per CPU. `model`/`chat` pin the shell to the X1 (CPU 7) while they run.

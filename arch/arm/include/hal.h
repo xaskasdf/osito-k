@@ -38,6 +38,7 @@ void platform_keys_cmd(int argc, char **argv);   /* shell `keys` */
 void platform_ufs_cmd(int argc, char **argv);    /* shell `ufs` */
 void platform_put_cmd(int argc, char **argv);    /* shell `put`: a file over USB */
 void platform_touch_cmd(int argc, char **argv);  /* shell `touch` */
+void platform_net_cmd(int argc, char **argv);    /* shell `net`: USB networking */
 /* The next finger event in panel pixels (down: 1 pressed or moved, 0
  * lifted): 1, or 0 when there is none */
 int  platform_touch_event(int32_t *x, int32_t *y, int *down);
