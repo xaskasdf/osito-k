@@ -1,1397 +1,679 @@
 /*
- * OsitoA x86-64 — TLS 1.3 Client (RFC 8446)
+ * tls13.c -- TLS 1.3 client (RFC 8446) that authenticates the server
  *
- * Sister module to tls.c (TLS 1.2).  Completes the TLS 1.3 handshake
- * end-to-end against any server that responds to our ClientHello with
- * supported_versions=0x0304 + key_share x25519.
+ * TLS_AES_128_GCM_SHA256 over X25519, no 0-RTT, no resumption, no client
+ * certificate. The handshake fails unless:
+ *  - the server's chain verifies up to one of Mozilla's roots, for the host
+ *    name, at the time of day (tls_verify_chain: BearSSL's X.509 engine);
+ *  - no OCSP answer (stapled, else fetched) or CRL says the leaf is
+ *    revoked (ocsp.c, crl.c; their errors don't stop it);
+ *  - its CertificateVerify is a valid signature by the leaf's key over the
+ *    transcript (tls_verify_signature);
+ *  - its Finished MAC is right.
+ * Handshake messages are reassembled across records (a long chain spans
+ * several) and must come in order: EncryptedExtensions, Certificate,
+ * CertificateVerify, Finished. The transcript is a running SHA-256.
  *
- * Wire choices:
- *   - Cipher suite: AES-128-GCM-SHA256 (0x1301).  We advertise ONLY
- *     this one — our ChaCha20-Poly1305 in crypto2.c is incomplete
- *     (poly1305 lacks the update path).
- *   - Group: X25519 (0x001D) — already used in our TLS 1.2 ECDHE path.
- *   - 0-RTT: not supported (no early_data extension).
+ * The client before this one logged its certificate checks without
+ * enforcing them, skipped CertificateVerify, and dropped a handshake
+ * message split across records. This is arch/arm/kernel/tls13.c's, with
+ * the revocation step this tree has.
  *
- * Pin/identity:
- *   - Each cert in the Certificate handshake message is fed to
- *     cert_pin_check_leaf() exactly as we do in tls.c.
- *   - CertificateVerify signature is verified via ecdsa_p256_verify
- *     against the leaf cert's SubjectPublicKey (extracted via x509.c).
- *
- * Transcript:
- *   - We buffer every handshake message and re-hash with sha256()
- *     each time the transcript is needed (key derivation, Finished
- *     MAC).  Cheap for our handshake sizes (~3-5 KB).
+ * One connection at a time: the state is static, and http.c's session
+ * owner serializes its users.
  */
 
 #include "../include/types.h"
+#include "crypto.h"
+#include "tls_verify.h"
+#include "tls13.h"
 
 extern void serial_puts(const char *s);
-extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
-
-/* Crypto primitives from crypto.c / crypto2.c — actual symbol names. */
-extern void x25519(uint8_t out[32], const uint8_t scalar[32],
-                   const uint8_t point[32]);
-extern void x25519_public(uint8_t pub[32], const uint8_t priv[32]);
-extern void sha256(const uint8_t *data, uint32_t len, uint8_t hash[32]);
-extern void hmac_sha256(const uint8_t *key, uint32_t key_len,
-                        const uint8_t *data, uint32_t data_len,
-                        uint8_t out[32]);
+extern void random_bytes(void *buf, uint32_t len);     /* random_drbg.c */
+extern uint64_t idt_get_ticks(void);                    /* 100 Hz */
 extern void hkdf_extract(const uint8_t *salt, uint32_t salt_len,
-                         const uint8_t *ikm, uint32_t ikm_len,
-                         uint8_t prk[32]);
+                         const uint8_t *ikm, uint32_t ikm_len, uint8_t prk[32]);
 extern void hkdf_expand_label(const uint8_t prk[32], const char *label,
                               const uint8_t *context, uint32_t context_len,
                               uint8_t *okm, uint32_t okm_len);
-extern int  aes128_gcm_encrypt(const uint8_t key[16], const uint8_t iv[12],
-                                const void *aad, uint32_t aad_len,
-                                const void *pt, uint32_t pt_len,
-                                void *ct, uint8_t tag[16]);
-extern int  aes128_gcm_decrypt(const uint8_t key[16], const uint8_t iv[12],
-                                const void *aad, uint32_t aad_len,
-                                const void *ct, uint32_t ct_len,
-                                void *pt, const uint8_t tag[16]);
-extern void random_get_bytes(void *buf, uint32_t len);
+extern int ocsp_check(const uint8_t *cert, uint32_t cert_len,
+                      const uint8_t *issuer, uint32_t issuer_len);
+extern int ocsp_parse_stapled(const uint8_t *resp, uint32_t resp_len,
+                              const uint8_t *cert, uint32_t cert_len,
+                              const uint8_t *issuer, uint32_t issuer_len);
+extern int crl_check_revoked_with_issuer(const uint8_t *cert, uint32_t cert_len,
+                                         const uint8_t *issuer, uint32_t issuer_len);
 
-/* Pin / cert helpers — same surface used by tls.c. */
-extern int  cert_pin_check_leaf(const uint8_t *cert_msg, uint32_t len);
+extern int net_tcp_send(int conn, const void *data, uint32_t len);
+extern int net_tcp_recv_timeout(int conn, void *buf, uint32_t size,
+                                uint32_t timeout_ticks);
+extern void *memmove(void *dst, const void *src, size_t n);    /* memory.c */
 
-/* Net I/O */
-extern int  net_tcp_send(int conn, const void *data, uint32_t len);
-extern int  net_tcp_recv(int conn, void *buf, uint32_t size);
-extern int  net_tcp_recv_timeout(int conn, void *buf, uint32_t size,
-                                  uint32_t timeout_ticks);
-extern uint64_t idt_get_ticks(void);
+#define timer_get_tick_count idt_get_ticks
 
-static void *t13_memcpy(void *dst, const void *src, uint32_t n)
-{
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
-    return dst;
-}
-static void t13_memset(void *p, int v, uint32_t n)
-{
-    uint8_t *d = (uint8_t *)p;
-    for (uint32_t i = 0; i < n; i++) d[i] = (uint8_t)v;
-}
+#define CT_CHANGE_CIPHER    20
+#define CT_ALERT            21
+#define CT_HANDSHAKE        22
+#define CT_APP_DATA         23
 
-/* ── Constants ──────────────────────────────────────────────── */
+#define HS_CLIENT_HELLO     1
+#define HS_SERVER_HELLO     2
+#define HS_ENCRYPTED_EXT    8
+#define HS_CERTIFICATE      11
+#define HS_CERT_REQUEST     13
+#define HS_CERT_VERIFY      15
+#define HS_FINISHED         20
 
-#define TLS_CONTENT_HANDSHAKE     22
-#define TLS_CONTENT_APP_DATA      23
-#define TLS_CONTENT_CHANGE_CIPHER 20
-#define TLS_CONTENT_ALERT         21
+#define AES_128_GCM_SHA256  0x1301
+#define EXT_SERVER_NAME     0
+#define EXT_SUPPORTED_GROUPS 10
+#define EXT_SIG_ALGS        13
+#define EXT_SUPPORTED_VERSIONS 43
+#define EXT_KEY_SHARE       51
+#define GROUP_X25519        0x001D
 
-#define TLS13_CLIENT_HELLO    1
-#define TLS13_SERVER_HELLO    2
-#define TLS13_NEW_SESS_TKT    4
-#define TLS13_ENCRYPTED_EXT   8
-#define TLS13_CERTIFICATE    11
-#define TLS13_CERT_VERIFY    15
-#define TLS13_FINISHED       20
+#define ALERT_BAD_CERTIFICATE   42
+#define ALERT_DECRYPT_ERROR     51
+#define ALERT_UNEXPECTED        10
 
-#define TLS13_AES_128_GCM    0x1301
+#define RECORD_MAX      (16384 + 256)   /* a ciphertext: 2^14 plus expansion */
+#define HS_MAX          65536           /* handshake bytes held at once */
+#define CHAIN_MAX       8
+#define RECORD_TICKS    1500            /* 15 s for a record, at 100 Hz */
 
-#define TLS_EXT_SUPPORTED_VERSIONS  43
-#define TLS_EXT_KEY_SHARE           51
-#define TLS_EXT_SUPPORTED_GROUPS    10
-#define TLS_EXT_SIG_ALGS            13
-#define TLS_EXT_SERVER_NAME          0
-#define TLS_EXT_STATUS_REQUEST       5    /* RFC 6066 §8 / RFC 8446 §4.4.2.1 */
-
-#define TLS_GROUP_X25519     0x001D
-#define TLS_SIG_ECDSA_P256_SHA256  0x0403
-#define TLS_SIG_RSA_PSS_RSAE_SHA256 0x0804
-
-/* ── Session State ──────────────────────────────────────────── */
-
-#define TLS13_TRANSCRIPT_MAX  16384   /* enough for all hs messages */
-
-typedef struct {
+static struct {
     int      tcp_conn;
-    bool     active;
-
-    uint8_t  client_random[32];
-    uint8_t  client_priv[32];
-    uint8_t  client_pub[32];
-    uint8_t  server_pub[32];
-    uint8_t  shared[32];
-
+    int      active;
+    uint8_t  client_priv[32], client_pub[32], server_pub[32], shared[32];
     uint8_t  handshake_secret[32];
-    uint8_t  c_hs_traffic[32];
-    uint8_t  s_hs_traffic[32];
-    uint8_t  c_ap_traffic[32];
-    uint8_t  s_ap_traffic[32];
+    uint8_t  c_hs_traffic[32], s_hs_traffic[32];
+    uint8_t  c_ap_traffic[32], s_ap_traffic[32];
+    uint8_t  c_hs_key[16], c_hs_iv[12], s_hs_key[16], s_hs_iv[12];
+    uint8_t  c_ap_key[16], c_ap_iv[12], s_ap_key[16], s_ap_iv[12];
+    uint64_t c_seq, s_seq;
+    sha256_ctx th;                      /* the transcript so far */
+    uint8_t  rec_hdr[5];                /* the last record's header: its AAD */
+    uint8_t  app_buf[RECORD_MAX];       /* decrypted data not yet returned */
+    uint32_t app_len, app_pos;
+} s13;
 
-    uint8_t  c_hs_key[16];
-    uint8_t  c_hs_iv[12];
-    uint8_t  s_hs_key[16];
-    uint8_t  s_hs_iv[12];
-    uint8_t  c_ap_key[16];
-    uint8_t  c_ap_iv[12];
-    uint8_t  s_ap_key[16];
-    uint8_t  s_ap_iv[12];
+static uint8_t rec_buf[RECORD_MAX];
+static uint8_t hs_buf[HS_MAX];          /* decrypted handshake bytes */
+static uint32_t hs_len;
 
-    uint64_t c_seq;
-    uint64_t s_seq;
+static const uint8_t zero32[32];
 
-    /* Transcript: every handshake message body (no record header).
-     * We re-hash from scratch each time th is needed — simpler than
-     * threading a SHA-256 incremental API which we don't have. */
-    uint8_t  transcript[TLS13_TRANSCRIPT_MAX];
-    uint32_t transcript_len;
-
-    /* Per-record receive buffer.  TLS 1.3 records cap at 16 KiB + 256
-     * for the auth tag and padding (RFC 8446 §5.1). */
-    uint8_t  rx_buf[17000];
-    uint32_t rx_len;
-
-    /* Decrypted app-data leftover for tls13_recv. */
-    uint8_t  app_buf[17000];
-    uint32_t app_len;
-    uint32_t app_pos;
-} tls13_session_t;
-
-static tls13_session_t s13;
-
-static const uint8_t zero32[32] = {0};
-
-/* ── Transcript helpers ─────────────────────────────────────── */
+/* ── Transcript and keys ─────────────────────────────────────── */
 
 static void th_append(const uint8_t *msg, uint32_t len)
 {
-    if (s13.transcript_len + len > TLS13_TRANSCRIPT_MAX) return;
-    t13_memcpy(s13.transcript + s13.transcript_len, msg, len);
-    s13.transcript_len += len;
+    sha256_update(&s13.th, msg, len);
 }
 
-static void th_compute(uint8_t out[32])
+/* The transcript's hash so far, the running one left as it is */
+static void th_hash(uint8_t out[32])
 {
-    sha256(s13.transcript, s13.transcript_len, out);
+    sha256_ctx copy = s13.th;
+    sha256_final(&copy, out);
 }
 
-/* ── Key derivation ─────────────────────────────────────────── */
-
-/* RFC 8446 §7.3: traffic key/iv from a traffic secret. */
-static void derive_key_iv(const uint8_t secret[32],
-                          uint8_t key_out[16], uint8_t iv_out[12])
+static void derive_key_iv(const uint8_t secret[32], uint8_t key[16], uint8_t iv[12])
 {
-    hkdf_expand_label(secret, "key", 0, 0, key_out, 16);
-    hkdf_expand_label(secret, "iv",  0, 0, iv_out,  12);
+    hkdf_expand_label(secret, "key", 0, 0, key, 16);
+    hkdf_expand_label(secret, "iv", 0, 0, iv, 12);
 }
 
-/* ── Build ClientHello ───────────────────────────────────────── */
+/* ── Records ─────────────────────────────────────────────────── */
+
+static int read_exact(uint8_t *buf, uint32_t len, uint64_t deadline)
+{
+    uint32_t got = 0;
+    while (got < len) {
+        if (timer_get_tick_count() > deadline)
+            return -1;
+        int n = net_tcp_recv_timeout(s13.tcp_conn, buf + got, len - got, 10);
+        if (n < 0)
+            return -1;                  /* the connection closed */
+        got += (uint32_t)n;
+    }
+    return 0;
+}
+
+static int read_record(uint8_t *type, uint8_t *body, uint32_t cap, uint32_t *len)
+{
+    uint64_t deadline = timer_get_tick_count() + RECORD_TICKS;
+    if (read_exact(s13.rec_hdr, 5, deadline) < 0)
+        return -1;
+    uint32_t n = ((uint32_t)s13.rec_hdr[3] << 8) | s13.rec_hdr[4];
+    if (n > cap || read_exact(body, n, deadline) < 0)
+        return -1;
+    *type = s13.rec_hdr[0];
+    *len = n;
+    return 0;
+}
+
+static void make_nonce(uint8_t nonce[12], const uint8_t iv[12], uint64_t seq)
+{
+    memcpy(nonce, iv, 12);
+    for (int i = 0; i < 8; i++)
+        nonce[11 - i] ^= (uint8_t)(seq >> (i * 8));
+}
+
+/* A record's body decrypted in place: the content without padding, its
+ * inner type */
+static int decrypt_record(uint8_t *body, uint32_t len, const uint8_t key[16],
+                          const uint8_t iv[12], uint64_t seq,
+                          uint8_t *inner, uint32_t *pt_len)
+{
+    static uint8_t pt[RECORD_MAX];
+    if (len < 17)
+        return -1;
+    uint8_t nonce[12];
+    make_nonce(nonce, iv, seq);
+    uint32_t ct_len = len - 16;
+    if (aes128_gcm_decrypt(key, nonce, s13.rec_hdr, 5, body, ct_len, pt, body + ct_len))
+        return -1;
+    uint32_t end = ct_len;
+    while (end > 0 && pt[end - 1] == 0)
+        end--;
+    if (end == 0)
+        return -1;
+    *inner = pt[end - 1];
+    *pt_len = end - 1;
+    memcpy(body, pt, end - 1);
+    return 0;
+}
+
+static int send_encrypted(uint8_t inner, const uint8_t *data, uint32_t len,
+                          const uint8_t key[16], const uint8_t iv[12], uint64_t seq)
+{
+    static uint8_t out[5 + RECORD_MAX];
+    if (len > 16384)
+        return -1;
+    uint32_t ct_len = len + 1 + 16;
+    out[0] = CT_APP_DATA;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    out[3] = (uint8_t)(ct_len >> 8);
+    out[4] = (uint8_t)ct_len;
+    memcpy(out + 5, data, len);
+    out[5 + len] = inner;
+    uint8_t nonce[12], tag[16];
+    make_nonce(nonce, iv, seq);
+    aes128_gcm_encrypt(key, nonce, out, 5, out + 5, len + 1, out + 5, tag);
+    memcpy(out + 5 + len + 1, tag, 16);
+    return net_tcp_send(s13.tcp_conn, out, 5 + ct_len);
+}
+
+/* A fatal alert under the handshake keys, before giving up */
+static int fail(uint8_t alert, const char *why)
+{
+    uint8_t msg[2] = { 2, alert };
+    serial_puts("[TLS1.3] ");
+    serial_puts(why);
+    serial_puts("\n");
+    send_encrypted(CT_ALERT, msg, 2, s13.c_hs_key, s13.c_hs_iv, s13.c_seq++);
+    return alert == ALERT_BAD_CERTIFICATE || alert == ALERT_DECRYPT_ERROR
+           ? TLS13_AUTH_FAILED : -1;
+}
+
+/* ── ClientHello and ServerHello ─────────────────────────────── */
 
 static int build_client_hello(uint8_t *buf, uint32_t cap, const char *hostname)
 {
-    if (cap < 256) return -1;
-
-    /* Ephemeral X25519 keypair */
-    random_get_bytes(s13.client_priv, 32);
-    /* clamp per RFC 7748 §5 — x25519() applies clamping too, but we
-     * also reflect the canonical key in client_priv so the public key
-     * we ship matches the scalar used for the ECDH compute later. */
-    s13.client_priv[0]  &= 248;
+    uint32_t hn = (uint32_t)strlen(hostname);
+    if (hn > 255 || cap < 256 + hn)
+        return -1;
+    random_bytes(s13.client_priv, 32);
+    s13.client_priv[0] &= 248;          /* RFC 7748 5: the clamped scalar */
     s13.client_priv[31] &= 127;
     s13.client_priv[31] |= 64;
     x25519_public(s13.client_pub, s13.client_priv);
 
-    random_get_bytes(s13.client_random, 32);
-
-    int p = 0;
-    /* Record header */
-    buf[p++] = TLS_CONTENT_HANDSHAKE;
-    buf[p++] = 0x03; buf[p++] = 0x01;       /* legacy_record_version */
-    int rec_len_pos = p; p += 2;
-    int rec_body_start = p;
-
-    /* Handshake header */
-    buf[p++] = TLS13_CLIENT_HELLO;
-    int hs_len_pos = p; p += 3;
-    int hs_body_start = p;
-
-    /* legacy_version + client_random */
-    buf[p++] = 0x03; buf[p++] = 0x03;
-    t13_memcpy(buf + p, s13.client_random, 32); p += 32;
-
-    /* legacy_session_id: empty */
-    buf[p++] = 0;
-
-    /* cipher_suites: only AES_128_GCM_SHA256 */
-    buf[p++] = 0x00; buf[p++] = 0x02;
+    uint32_t p = 0;
+    buf[p++] = CT_HANDSHAKE;
+    buf[p++] = 0x03; buf[p++] = 0x01;   /* legacy_record_version */
+    uint32_t rec_len_pos = p; p += 2;
+    buf[p++] = HS_CLIENT_HELLO;
+    uint32_t hs_len_pos = p; p += 3;
+    buf[p++] = 0x03; buf[p++] = 0x03;   /* legacy_version */
+    random_bytes(buf + p, 32);          /* random */
+    p += 32;
+    buf[p++] = 0;                       /* legacy_session_id: empty */
+    buf[p++] = 0x00; buf[p++] = 0x02;   /* cipher_suites */
     buf[p++] = 0x13; buf[p++] = 0x01;
+    buf[p++] = 0x01; buf[p++] = 0x00;   /* compression: null */
+    uint32_t ext_len_pos = p; p += 2;
+    uint32_t ext_start = p;
 
-    /* legacy_compression_methods: null */
-    buf[p++] = 0x01; buf[p++] = 0x00;
-
-    /* extensions */
-    int ext_len_pos = p; p += 2;
-    int ext_start = p;
-
-    /* supported_versions: TLS 1.3 only */
-    buf[p++] = 0x00; buf[p++] = TLS_EXT_SUPPORTED_VERSIONS;
+    /* supported_versions: TLS 1.3 */
+    buf[p++] = 0x00; buf[p++] = EXT_SUPPORTED_VERSIONS;
     buf[p++] = 0x00; buf[p++] = 0x03;
-    buf[p++] = 0x02;
-    buf[p++] = 0x03; buf[p++] = 0x04;
-
-    /* supported_groups: X25519 only */
-    buf[p++] = 0x00; buf[p++] = TLS_EXT_SUPPORTED_GROUPS;
+    buf[p++] = 0x02; buf[p++] = 0x03; buf[p++] = 0x04;
+    /* supported_groups: X25519 */
+    buf[p++] = 0x00; buf[p++] = EXT_SUPPORTED_GROUPS;
     buf[p++] = 0x00; buf[p++] = 0x04;
     buf[p++] = 0x00; buf[p++] = 0x02;
     buf[p++] = 0x00; buf[p++] = 0x1D;
+    /* signature_algorithms: what tls_verify_signature checks */
+    uint8_t sigs[32];
+    uint32_t sl = tls_signature_schemes(sigs, 1);
+    buf[p++] = 0x00; buf[p++] = EXT_SIG_ALGS;
+    buf[p++] = (uint8_t)((sl + 2) >> 8); buf[p++] = (uint8_t)(sl + 2);
+    buf[p++] = (uint8_t)(sl >> 8); buf[p++] = (uint8_t)sl;
+    memcpy(buf + p, sigs, sl);
+    p += sl;
+    /* key_share: our X25519 key */
+    buf[p++] = 0x00; buf[p++] = EXT_KEY_SHARE;
+    buf[p++] = 0x00; buf[p++] = 0x26;
+    buf[p++] = 0x00; buf[p++] = 0x24;
+    buf[p++] = 0x00; buf[p++] = 0x1D;
+    buf[p++] = 0x00; buf[p++] = 0x20;
+    memcpy(buf + p, s13.client_pub, 32);
+    p += 32;
+    /* status_request: a stapled OCSP answer for the leaf (RFC 6066 8) */
+    buf[p++] = 0x00; buf[p++] = 5;
+    buf[p++] = 0x00; buf[p++] = 0x05;
+    buf[p++] = 0x01;                    /* ocsp */
+    buf[p++] = 0x00; buf[p++] = 0x00;   /* any responder */
+    buf[p++] = 0x00; buf[p++] = 0x00;   /* no extensions */
+    /* server_name */
+    buf[p++] = 0x00; buf[p++] = EXT_SERVER_NAME;
+    buf[p++] = (uint8_t)((5 + hn) >> 8); buf[p++] = (uint8_t)(5 + hn);
+    buf[p++] = (uint8_t)((3 + hn) >> 8); buf[p++] = (uint8_t)(3 + hn);
+    buf[p++] = 0x00;                    /* host_name */
+    buf[p++] = (uint8_t)(hn >> 8); buf[p++] = (uint8_t)hn;
+    memcpy(buf + p, hostname, hn);
+    p += hn;
 
-    /* signature_algorithms: ECDSA-P256-SHA256 + RSA-PSS-RSAE-SHA256
-     * (the latter for compat — CF leaves both, server picks one) */
-    buf[p++] = 0x00; buf[p++] = TLS_EXT_SIG_ALGS;
-    buf[p++] = 0x00; buf[p++] = 0x06;
-    buf[p++] = 0x00; buf[p++] = 0x04;
-    buf[p++] = 0x04; buf[p++] = 0x03;
-    buf[p++] = 0x08; buf[p++] = 0x04;
-
-    /* key_share: X25519 client public key */
-    buf[p++] = 0x00; buf[p++] = TLS_EXT_KEY_SHARE;
-    buf[p++] = 0x00; buf[p++] = 0x26;            /* ext len: 38 */
-    buf[p++] = 0x00; buf[p++] = 0x24;            /* shares len: 36 */
-    buf[p++] = 0x00; buf[p++] = 0x1D;            /* group: x25519 */
-    buf[p++] = 0x00; buf[p++] = 0x20;            /* key len: 32 */
-    t13_memcpy(buf + p, s13.client_pub, 32); p += 32;
-
-    /* status_request (RFC 6066 §8 / RFC 8446 §4.4.2.1) — request that
-     * the server staple an OCSP response inside its Certificate message,
-     * sparing us a separate ~300ms HTTP roundtrip per chain cert.  Body:
-     *   CertificateStatusType = ocsp (1)
-     *   ResponderID list      uint16(0)  -- empty: any responder
-     *   request_extensions    uint16(0)  -- empty
-     * ext_data is 5 bytes; total ext is 9 bytes including the 4-byte
-     * type+len header. */
-    buf[p++] = 0x00; buf[p++] = TLS_EXT_STATUS_REQUEST;
-    buf[p++] = 0x00; buf[p++] = 0x05;            /* ext_data length: 5 */
-    buf[p++] = 0x01;                              /* status_type = ocsp(1) */
-    buf[p++] = 0x00; buf[p++] = 0x00;            /* responder_id_list: 0 */
-    buf[p++] = 0x00; buf[p++] = 0x00;            /* extensions: 0 */
-
-    /* server_name (SNI) */
-    if (hostname && hostname[0]) {
-        uint32_t hn = 0;
-        while (hostname[hn]) hn++;
-        buf[p++] = 0x00; buf[p++] = TLS_EXT_SERVER_NAME;
-        uint16_t ext_len = (uint16_t)(5 + hn);
-        buf[p++] = (uint8_t)(ext_len >> 8); buf[p++] = (uint8_t)ext_len;
-        uint16_t lst_len = (uint16_t)(3 + hn);
-        buf[p++] = (uint8_t)(lst_len >> 8); buf[p++] = (uint8_t)lst_len;
-        buf[p++] = 0x00;                                          /* name_type */
-        buf[p++] = (uint8_t)(hn >> 8); buf[p++] = (uint8_t)hn;
-        t13_memcpy(buf + p, hostname, hn); p += hn;
-    }
-
-    /* Patch extension length */
-    uint16_t ext_len = (uint16_t)(p - ext_start);
-    buf[ext_len_pos]     = (uint8_t)(ext_len >> 8);
+    uint32_t ext_len = p - ext_start;
+    buf[ext_len_pos] = (uint8_t)(ext_len >> 8);
     buf[ext_len_pos + 1] = (uint8_t)ext_len;
-
-    /* Patch handshake length (24-bit BE) */
-    uint32_t hs_len = (uint32_t)(p - hs_body_start);
-    buf[hs_len_pos]     = (uint8_t)(hs_len >> 16);
-    buf[hs_len_pos + 1] = (uint8_t)(hs_len >> 8);
-    buf[hs_len_pos + 2] = (uint8_t)hs_len;
-
-    /* Patch record length */
-    uint16_t rec_len = (uint16_t)(p - rec_body_start);
-    buf[rec_len_pos]     = (uint8_t)(rec_len >> 8);
+    uint32_t hs_len_v = p - (hs_len_pos + 3);
+    buf[hs_len_pos] = (uint8_t)(hs_len_v >> 16);
+    buf[hs_len_pos + 1] = (uint8_t)(hs_len_v >> 8);
+    buf[hs_len_pos + 2] = (uint8_t)hs_len_v;
+    uint32_t rec_len = p - 5;
+    buf[rec_len_pos] = (uint8_t)(rec_len >> 8);
     buf[rec_len_pos + 1] = (uint8_t)rec_len;
-
-    /* Transcript: handshake header + body (not record header). */
-    th_append(buf + 5, (uint32_t)(p - 5));
-
-    return p;
+    th_append(buf + 5, p - 5);
+    return (int)p;
 }
 
-/* ── Read raw record into rx_buf ─────────────────────────────── */
-
-static int read_record(int conn, uint8_t *type_out, uint8_t *body, uint32_t cap,
-                       uint32_t *body_len_out)
-{
-    /* Overall deadline for the whole record.  Each net_tcp_recv_timeout
-     * below is a SHORT poll; a poll that returns 0 is a timeout, not an
-     * error — we retry it until this deadline while the connection lives,
-     * and only bail on a close (n<0). The old code used a single 500-tick
-     * poll and treated n==0 as fatal; under TCG's uncalibrated APIC timer
-     * 500 ticks elapse in ~5 ms of wall-clock — well before Cloudflare's
-     * ~60 ms ServerHello (confirmed by capture) — so the 1.3 handshake
-     * ALWAYS gave up and fell back to 1.2.  This mirrors tls.c's
-     * tls_read_exact, which is why 1.2 worked where 1.3 didn't.
-     *
-     * The budget is generous (TCG's timer runs ~50k ticks/s, so this is
-     * ~1.2 s of wall-clock) to cover not just the handshake flight but a
-     * cache-cold GET response, where Cloudflare round-trips to R2 before
-     * the first app-data record lands.  net_tcp_recv_timeout still returns
-     * <0 immediately if the peer actually closes, so we don't block the
-     * full budget on a real teardown. */
-    uint64_t deadline = idt_get_ticks() + 60000;
-
-    /* 5-byte header */
-    uint32_t got = 0;
-    uint8_t hdr[5];
-    while (got < 5) {
-        if (idt_get_ticks() > deadline) return -1;
-        int n = net_tcp_recv_timeout(conn, hdr + got, 5 - got, 200);
-        if (n < 0) return -1;          /* connection closed */
-        if (n > 0) got += (uint32_t)n; /* n==0: poll timeout, retry */
-    }
-    uint8_t ct = hdr[0];
-    uint16_t rec_len = ((uint16_t)hdr[3] << 8) | hdr[4];
-    if (rec_len > cap) return -1;
-    got = 0;
-    while (got < rec_len) {
-        if (idt_get_ticks() > deadline) return -1;
-        int n = net_tcp_recv_timeout(conn, body + got, rec_len - got, 200);
-        if (n < 0) return -1;
-        if (n > 0) got += (uint32_t)n;
-    }
-    if (type_out)     *type_out = ct;
-    if (body_len_out) *body_len_out = rec_len;
-    /* Stash header bytes for AAD construction by caller. */
-    s13.rx_buf[0] = hdr[0]; s13.rx_buf[1] = hdr[1]; s13.rx_buf[2] = hdr[2];
-    s13.rx_buf[3] = hdr[3]; s13.rx_buf[4] = hdr[4];
-    return 0;
-}
-
-/* ── Encrypted record decrypt ────────────────────────────────── */
-
-static void make_nonce(uint8_t nonce[12], const uint8_t iv[12], uint64_t seq)
-{
-    for (int i = 0; i < 12; i++) nonce[i] = iv[i];
-    for (int i = 0; i < 8; i++) nonce[11 - i] ^= (uint8_t)(seq >> (i * 8));
-}
-
-/* Decrypt a TLS 1.3 record in-place.  Input: AAD (the 5-byte outer
- * record header which we cached during read_record) + ciphertext+tag
- * in `body[0..body_len)`.  Output: plaintext in `body[0..body_len-16)`,
- * inner type byte at the END of plaintext (strip any 0x00 padding
- * before it). */
-static int decrypt_record(uint8_t *body, uint32_t body_len,
-                          const uint8_t key[16], const uint8_t iv[12],
-                          uint64_t seq, uint8_t *inner_type, uint32_t *pt_len_out)
-{
-    if (body_len < 17) return -1;
-    uint8_t nonce[12];
-    make_nonce(nonce, iv, seq);
-
-    /* AAD = the 5-byte outer record header.  Standard TLS 1.3
-     * framing per RFC 8446 §5.2. */
-    uint8_t aad[5];
-    t13_memcpy(aad, s13.rx_buf, 5);
-    /* When we built rx_buf the type byte was the wire type (always
-     * 0x17 for encrypted records); ciphertext length is the full
-     * body length including the 16-byte tag. */
-
-    uint32_t ct_len = body_len - 16;
-    const uint8_t *tag = body + ct_len;
-
-    /* aes128_gcm_decrypt does the in-place decrypt + tag verify. */
-    static uint8_t pt_scratch[17000];
-    if (ct_len > sizeof pt_scratch) return -1;
-    int r = aes128_gcm_decrypt(key, nonce, aad, 5, body, ct_len, pt_scratch, tag);
-    if (r != 0) return -1;
-    t13_memcpy(body, pt_scratch, ct_len);
-
-    /* Strip trailing 0x00 padding, find inner_type byte. */
-    uint32_t end = ct_len;
-    while (end > 0 && body[end - 1] == 0) end--;
-    if (end == 0) return -1;
-    *inner_type = body[end - 1];
-    *pt_len_out = end - 1;
-    return 0;
-}
-
-/* ── Encrypted record encrypt + send ─────────────────────────── */
-
-static int send_encrypted(int conn, uint8_t inner_type,
-                          const uint8_t *pt, uint32_t pt_len,
-                          const uint8_t key[16], const uint8_t iv[12],
-                          uint64_t seq)
-{
-    /* Build plaintext: actual data || inner_type byte (no padding). */
-    static uint8_t scratch[17000];
-    if (pt_len + 1 + 16 + 5 > sizeof scratch) return -1;
-    t13_memcpy(scratch + 5, pt, pt_len);
-    scratch[5 + pt_len] = inner_type;
-    uint32_t inner_len = pt_len + 1;
-    uint32_t ct_len = inner_len + 16;
-
-    /* Outer record header: type=AppData(23), version=0x0303, length */
-    scratch[0] = TLS_CONTENT_APP_DATA;
-    scratch[1] = 0x03; scratch[2] = 0x03;
-    scratch[3] = (uint8_t)(ct_len >> 8);
-    scratch[4] = (uint8_t)ct_len;
-
-    uint8_t nonce[12]; make_nonce(nonce, iv, seq);
-    uint8_t tag[16];
-    aes128_gcm_encrypt(key, nonce, scratch, 5,
-                       scratch + 5, inner_len, scratch + 5, tag);
-    t13_memcpy(scratch + 5 + inner_len, tag, 16);
-
-    return net_tcp_send(conn, scratch, 5 + ct_len);
-}
-
-/* ── ServerHello parser ──────────────────────────────────────── */
-
-/* Returns 0 on success.  Populates s13.server_pub from key_share. */
-static int parse_server_hello(const uint8_t *body, uint32_t len)
-{
-    if (len < 4) return -1;
-    /* hs_header: type(1) + len(3) */
-    if (body[0] != TLS13_SERVER_HELLO) return -1;
-    uint32_t hs_len = ((uint32_t)body[1] << 16) | ((uint32_t)body[2] << 8) | body[3];
-    if (4 + hs_len > len) return -1;
-
-    /* Skip legacy_version(2) + server_random(32) */
-    uint32_t off = 4 + 2 + 32;
-    if (off + 1 > len) return -1;
-
-    /* legacy_session_id_echo */
-    uint8_t sid_len = body[off++];
-    off += sid_len;
-    if (off + 2 > len) return -1;
-
-    /* cipher_suite — must be AES_128_GCM_SHA256 */
-    uint16_t suite = ((uint16_t)body[off] << 8) | body[off + 1];
-    off += 2;
-    if (suite != TLS13_AES_128_GCM) {
-        serial_puts("[TLS1.3] server picked unsupported suite\n");
-        return -1;
-    }
-
-    /* legacy_compression_method (1) */
-    if (off + 1 > len) return -1;
-    off += 1;
-
-    /* Extensions block */
-    if (off + 2 > len) return -1;
-    uint16_t ext_total = ((uint16_t)body[off] << 8) | body[off + 1];
-    off += 2;
-    if (off + ext_total > len) return -1;
-
-    bool got_version = false, got_key = false;
-    uint32_t ext_end = off + ext_total;
-    while (off + 4 <= ext_end) {
-        uint16_t ext_type = ((uint16_t)body[off] << 8) | body[off + 1];
-        uint16_t ext_len  = ((uint16_t)body[off + 2] << 8) | body[off + 3];
-        off += 4;
-        if (off + ext_len > ext_end) return -1;
-
-        if (ext_type == TLS_EXT_SUPPORTED_VERSIONS && ext_len == 2) {
-            uint16_t v = ((uint16_t)body[off] << 8) | body[off + 1];
-            if (v == 0x0304) got_version = true;
-        } else if (ext_type == TLS_EXT_KEY_SHARE) {
-            /* shares header: group(2) + key_len(2) + key */
-            if (ext_len < 4) return -1;
-            uint16_t grp = ((uint16_t)body[off] << 8) | body[off + 1];
-            uint16_t klen = ((uint16_t)body[off + 2] << 8) | body[off + 3];
-            if (grp != TLS_GROUP_X25519 || klen != 32) return -1;
-            if (ext_len < 4 + klen) return -1;
-            t13_memcpy(s13.server_pub, body + off + 4, 32);
-            got_key = true;
-        }
-        off += ext_len;
-    }
-
-    if (!got_version) { serial_puts("[TLS1.3] no supported_versions in SH\n"); return -1; }
-    if (!got_key)     { serial_puts("[TLS1.3] no key_share in SH\n");          return -1; }
-    return 0;
-}
-
-/* ── AIA chasing ──────────────────────────────────────────────
- *
- * When a server sends an incomplete chain (e.g. only the leaf, with
- * no intermediate), some leaf certs advertise an Authority Information
- * Access (AIA) extension with a caIssuers URL pointing at the parent
- * cert.  RFC 5280 §4.2.2.1 says this URL serves the issuer's cert as
- * `application/pkix-cert` (DER) or `application/x-pem-file` (PEM,
- * rare).  We do one level of chase — enough for Let's Encrypt and
- * Google Trust Services deployments where the leaf is shipped alone
- * but the intermediate is reachable via plain HTTP.
- *
- * Cached at osfs2:tls/aia-<hash8>.der so subsequent boots reuse it
- * without a network roundtrip.  Hash is the first 8 bytes of the
- * SHA-256 of the leaf's caIssuers URL (deterministic, collision-safe
- * at our scale of a handful of distinct issuers). */
-
-extern int  http_plain_get(const char *url, uint8_t *out, uint32_t out_cap);
-extern int  x509_get_aia_caissuers(const uint8_t *cert, uint32_t cert_len,
-                                   char *out, uint32_t cap);
-
-/* osfs2 stub layout (same as cert_pin.c uses). */
-typedef struct {
-    uint32_t fs_version;
-    uint32_t ino;
-    void    *data;
-    uint64_t size;
-} aia_vfs_stub_t;
-extern bool  vfs_find(const char *path, int mode, void *out);
-extern int   vfs_read(void *node, uint64_t offset, void *buf, uint64_t len);
-extern bool  osfs2_is_mounted(void);
-extern int   osfs2_delete(const char *name);
-extern void *osfs2_create(const char *name, uint64_t size);
-extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
-
-static const char b64_tbl[256] = {
-    /* Initialized at first use via aia_b64_init. */
-    0
+/* SHA-256("HelloRetryRequest"): a ServerHello with this random asks for
+ * another key share, which we don't do */
+static const uint8_t hrr_random[32] = {
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02,
+    0x1E, 0x65, 0xB8, 0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+    0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 };
-static bool b64_inited = false;
-static int8_t b64_val[256];
 
-static void aia_b64_init(void)
+static int parse_server_hello(const uint8_t *m, uint32_t len)
 {
-    if (b64_inited) return;
-    for (int i = 0; i < 256; i++) b64_val[i] = -1;
-    const char *alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    for (int i = 0; i < 64; i++) b64_val[(uint8_t)alpha[i]] = (int8_t)i;
-    b64_inited = true;
-    (void)b64_tbl;
-}
-
-/* Decode base64 (RFC 4648, with whitespace skipped).  Returns output
- * length, or -1 on parse error.  Writes to `out`, capped at `cap`. */
-static int aia_b64_decode(const uint8_t *in, uint32_t in_len,
-                          uint8_t *out, uint32_t cap)
-{
-    aia_b64_init();
-    uint32_t acc = 0; int bits = 0; uint32_t outn = 0;
-    for (uint32_t i = 0; i < in_len; i++) {
-        uint8_t c = in[i];
-        if (c == '=' || c == '\r' || c == '\n' || c == ' ' || c == '\t') {
-            if (c == '=') break;
-            continue;
-        }
-        int8_t v = b64_val[c];
-        if (v < 0) return -1;
-        acc = (acc << 6) | (uint32_t)v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            if (outn >= cap) return -1;
-            out[outn++] = (uint8_t)((acc >> bits) & 0xFF);
-        }
-    }
-    return (int)outn;
-}
-
-/* Convert PEM-encoded cert (with "-----BEGIN CERTIFICATE-----" header)
- * into raw DER, in place if needed.  Returns DER length, or -1 if no
- * PEM header was found.  `buf` is rewritten with the decoded bytes. */
-static int aia_pem_to_der(uint8_t *buf, uint32_t len)
-{
-    static const char hdr[] = "-----BEGIN CERTIFICATE-----";
-    static const char ftr[] = "-----END CERTIFICATE-----";
-    uint32_t hlen = sizeof hdr - 1;
-    uint32_t flen = sizeof ftr - 1;
-    uint32_t hpos = 0;
-    bool found = false;
-    for (; hpos + hlen <= len; hpos++) {
-        bool m = true;
-        for (uint32_t k = 0; k < hlen; k++)
-            if (buf[hpos + k] != (uint8_t)hdr[k]) { m = false; break; }
-        if (m) { found = true; break; }
-    }
-    if (!found) return -1;
-    uint32_t body_start = hpos + hlen;
-    uint32_t fpos = body_start;
-    found = false;
-    for (; fpos + flen <= len; fpos++) {
-        bool m = true;
-        for (uint32_t k = 0; k < flen; k++)
-            if (buf[fpos + k] != (uint8_t)ftr[k]) { m = false; break; }
-        if (m) { found = true; break; }
-    }
-    if (!found) return -1;
-    /* Decode in a temp buf, then copy back. */
-    static uint8_t der_tmp[8192];
-    int n = aia_b64_decode(buf + body_start, fpos - body_start,
-                           der_tmp, sizeof der_tmp);
-    if (n < 0) return -1;
-    for (int i = 0; i < n; i++) buf[i] = der_tmp[i];
-    return n;
-}
-
-/* Hex-encode 4 bytes into 8 ASCII chars (lowercase).  Used to derive
- * the cache filename from the URL hash. */
-static void aia_hex8(const uint8_t *in, char *out)
-{
-    static const char hex[] = "0123456789abcdef";
-    for (int i = 0; i < 4; i++) {
-        out[i * 2 + 0] = hex[(in[i] >> 4) & 0xF];
-        out[i * 2 + 1] = hex[ in[i]       & 0xF];
-    }
-    out[8] = 0;
-}
-
-/* Try to load a previously-cached intermediate for `url` from osfs2.
- * Returns DER length on hit, -1 on miss. */
-static int aia_cache_load(const char *url, uint8_t *out, uint32_t cap)
-{
-    if (!osfs2_is_mounted()) return -1;
-    uint8_t url_h[32];
-    /* hostname-strlen */
-    uint32_t ul = 0; while (url[ul]) ul++;
-    sha256((const uint8_t *)url, ul, url_h);
-    char tag[9]; aia_hex8(url_h, tag);
-    char path[32];
-    /* "tls/aia-" + 8 + ".der" + NUL = 21 chars. */
-    const char *pfx = "tls/aia-";
-    uint32_t p = 0;
-    for (; pfx[p]; p++) path[p] = pfx[p];
-    for (int i = 0; i < 8; i++) path[p++] = tag[i];
-    path[p++] = '.'; path[p++] = 'd'; path[p++] = 'e'; path[p++] = 'r';
-    path[p] = 0;
-
-    aia_vfs_stub_t node;
-    if (!vfs_find(path, 0, &node)) return -1;
-    int n = vfs_read(&node, 0, out, cap);
-    if (n <= 0) return -1;
-    serial_puts("[AIA] cache hit: "); serial_puts(path); serial_puts("\n");
-    return n;
-}
-
-/* Persist the freshly-fetched intermediate to osfs2. */
-static void aia_cache_save(const char *url, const uint8_t *der, uint32_t len)
-{
-    if (!osfs2_is_mounted()) return;
-    uint8_t url_h[32];
-    uint32_t ul = 0; while (url[ul]) ul++;
-    sha256((const uint8_t *)url, ul, url_h);
-    char tag[9]; aia_hex8(url_h, tag);
-    char path[32];
-    const char *pfx = "tls/aia-";
-    uint32_t p = 0;
-    for (; pfx[p]; p++) path[p] = pfx[p];
-    for (int i = 0; i < 8; i++) path[p++] = tag[i];
-    path[p++] = '.'; path[p++] = 'd'; path[p++] = 'e'; path[p++] = 'r';
-    path[p] = 0;
-
-    osfs2_delete(path);
-    void *f = osfs2_create(path, (uint64_t)len);
-    if (!f) { serial_puts("[AIA] cache save: create failed\n"); return; }
-    int wr = osfs2_write(f, 0, der, (uint64_t)len);
-    if (wr < 0) { serial_puts("[AIA] cache save: write failed\n"); return; }
-    serial_puts("[AIA] cached intermediate at "); serial_puts(path); serial_puts("\n");
-}
-
-/* Extract leaf's caIssuers URL, fetch the response over plain HTTP,
- * decode PEM→DER if needed, return DER bytes in `out`.
- *
- * Returns 0 on success (`*out_len` set), -1 if the leaf has no AIA URL
- * or the fetch / decode failed.  Tries the osfs2 cache first. */
-static int aia_chase_intermediate(const uint8_t *leaf_der, uint32_t leaf_len,
-                                  uint8_t *out, uint32_t *out_len,
-                                  uint32_t cap)
-{
-    char url[256];
-    int ulen = x509_get_aia_caissuers(leaf_der, leaf_len, url, sizeof url);
-    if (ulen <= 0) {
-        serial_puts("[AIA] no caIssuers URL on leaf\n");
+    if (len < 4 + 2 + 32 + 1 || m[0] != HS_SERVER_HELLO)
+        return -1;
+    uint32_t hl = ((uint32_t)m[1] << 16) | ((uint32_t)m[2] << 8) | m[3];
+    if (4 + hl != len)
+        return -1;
+    if (memcmp(m + 6, hrr_random, 32) == 0) {
+        serial_puts("[TLS1.3] the server asks for another key share (HelloRetryRequest)\n");
         return -1;
     }
-
-    /* Cache lookup only — NO live HTTP fetch during the handshake.
-     *
-     * This used to do http_plain_get(url) here, but that synchronous
-     * connect+GET to the CA's AIA host (e.g. i.pki.goog) takes tens of
-     * seconds over QEMU SLIRP — long enough that the TLS peer hits its
-     * handshake idle timeout (~15 s) and FINs before we ever send our
-     * Finished.  Capture showed our client Finished going out at t=48 s,
-     * 33 s after the server had already given up, so TLS 1.3 could never
-     * complete a request and we always fell back to 1.2.  An external
-     * fetch on the handshake critical path is architecturally wrong
-     * regardless of transport.  Chain validation here is warn-mode (an
-     * incomplete chain or a failed link is informative, not fatal — the
-     * server's Finished still authenticates the handshake), so skipping
-     * the live fetch costs nothing functionally and unblocks 1.3.  A
-     * cached intermediate (populated out-of-band) is still spliced in.
-     * Re-enabling live AIA belongs in a background warm path off the
-     * handshake — see project notes. */
-    int cn = aia_cache_load(url, out, cap);
-    if (cn > 0) { *out_len = (uint32_t)cn; return 0; }
-
-    serial_puts("[AIA] skip live fetch during handshake (cache-only): ");
-    serial_puts(url); serial_puts("\n");
-    return -1;
+    uint32_t off = 4 + 2 + 32;
+    uint8_t sid = m[off++];
+    off += sid;
+    if (off + 3 > len)
+        return -1;
+    uint16_t suite = ((uint16_t)m[off] << 8) | m[off + 1];
+    off += 3;                           /* suite, compression */
+    if (suite != AES_128_GCM_SHA256)
+        return -1;
+    if (off + 2 > len)
+        return -1;
+    uint32_t ext_end = off + 2 + (((uint32_t)m[off] << 8) | m[off + 1]);
+    off += 2;
+    if (ext_end > len)
+        return -1;
+    int version = 0, key = 0;
+    while (off + 4 <= ext_end) {
+        uint16_t type = ((uint16_t)m[off] << 8) | m[off + 1];
+        uint16_t elen = ((uint16_t)m[off + 2] << 8) | m[off + 3];
+        off += 4;
+        if (off + elen > ext_end)
+            return -1;
+        if (type == EXT_SUPPORTED_VERSIONS && elen == 2)
+            version = m[off] == 0x03 && m[off + 1] == 0x04;
+        else if (type == EXT_KEY_SHARE && elen == 36 &&
+                 m[off] == 0x00 && m[off + 1] == 0x1D &&
+                 m[off + 2] == 0x00 && m[off + 3] == 0x20) {
+            memcpy(s13.server_pub, m + off + 4, 32);
+            key = 1;
+        }
+        off += elen;
+    }
+    return version && key ? 0 : -1;
 }
 
-/* ── Public API ──────────────────────────────────────────────── */
+/* ── Encrypted handshake messages ────────────────────────────── */
+
+/* The next whole handshake message (header included) at hs_buf, reading
+ * and decrypting records until it's all there */
+static int hs_next(uint32_t *msg_len)
+{
+    for (;;) {
+        if (hs_len >= 4) {
+            uint32_t ml = 4 + (((uint32_t)hs_buf[1] << 16) |
+                               ((uint32_t)hs_buf[2] << 8) | hs_buf[3]);
+            if (ml > HS_MAX)
+                return -1;
+            if (hs_len >= ml) {
+                *msg_len = ml;
+                return 0;
+            }
+        }
+        uint8_t type, inner;
+        uint32_t rl, pl;
+        if (read_record(&type, rec_buf, sizeof(rec_buf), &rl) < 0)
+            return -1;
+        if (type == CT_CHANGE_CIPHER)
+            continue;                   /* middlebox compatibility */
+        if (type != CT_APP_DATA ||
+            decrypt_record(rec_buf, rl, s13.s_hs_key, s13.s_hs_iv, s13.s_seq++,
+                           &inner, &pl) < 0)
+            return -1;
+        if (inner == CT_ALERT) {
+            serial_puts("[TLS1.3] the server sent an alert");
+            if (pl >= 2) {
+                serial_puts(", code ");
+                serial_putdec(rec_buf[1]);
+            }
+            serial_puts("\n");
+            return -1;
+        }
+        if (inner != CT_HANDSHAKE || hs_len + pl > HS_MAX)
+            return -1;
+        memcpy(hs_buf + hs_len, rec_buf, pl);
+        hs_len += pl;
+    }
+}
+
+/* That message into the transcript, and out of hs_buf */
+static void hs_done(uint32_t ml)
+{
+    th_append(hs_buf, ml);
+    memmove(hs_buf, hs_buf + ml, hs_len - ml);
+    hs_len -= ml;
+}
+
+static uint32_t be24(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+}
+
+/* Revocation, once the chain is good: a stapled OCSP answer, else one
+ * fetched, else the CRL. Only "revoked" stops the handshake: OCSP and CRL
+ * errors don't (the soft-fail browsers use too). TLS 1.2 (tls.c) uses it
+ * too, without a stapled answer. */
+int tls_check_revocation(const uint8_t *const *certs, const uint32_t *lens,
+                         const uint8_t *stapled, uint32_t stapled_len)
+{
+    int ocsp = -1;
+    if (stapled && stapled_len) {
+        int st = ocsp_parse_stapled(stapled, stapled_len, certs[0], lens[0],
+                                    certs[1], lens[1]);
+        if (st == 0 || st == 1)
+            ocsp = st;                  /* good, revoked */
+    }
+    if (ocsp < 0)
+        ocsp = ocsp_check(certs[0], lens[0], certs[1], lens[1]);
+    if (ocsp == 1) {
+        serial_puts("[TLS] OCSP: the certificate is revoked\n");
+        return -1;
+    }
+    if (ocsp != 0 &&
+        crl_check_revoked_with_issuer(certs[0], lens[0], certs[1], lens[1]) == 1) {
+        serial_puts("[TLS] CRL: the certificate is revoked\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* Certificate (RFC 8446 4.4.2): context, then entries of a DER cert and its
+ * extensions (the leaf's may carry a stapled OCSP answer); the chain
+ * verified for the host name, then revocation checked */
+static int check_certificate(uint32_t ml, const char *hostname, tls_pubkey_t *leaf)
+{
+    const uint8_t *certs[CHAIN_MAX];
+    uint32_t lens[CHAIN_MAX];
+    const uint8_t *stapled = 0;
+    uint32_t stapled_len = 0;
+    int n = 0;
+    const uint8_t *m = hs_buf + 4, *end = hs_buf + ml;
+    if (m + 1 > end || m + 1 + m[0] + 3 > end)
+        return -1;
+    m += 1 + m[0];                      /* certificate_request_context */
+    const uint8_t *list_end = m + 3 + be24(m);
+    m += 3;
+    if (list_end != end)
+        return -1;
+    while (m < list_end) {
+        if (m + 3 > list_end)
+            return -1;
+        uint32_t cl = be24(m);
+        m += 3;
+        if (m + cl + 2 > list_end || n == CHAIN_MAX)
+            return -1;
+        certs[n] = m;
+        lens[n++] = cl;
+        m += cl;
+        uint32_t el = ((uint32_t)m[0] << 8) | m[1];
+        const uint8_t *e = m + 2, *e_end = m + 2 + el;
+        if (e_end > list_end)
+            return -1;
+        /* The leaf's status_request: CertificateStatus { ocsp(1), uint24
+         * length, the OCSP response } */
+        while (n == 1 && e + 4 <= e_end) {
+            uint32_t type = ((uint32_t)e[0] << 8) | e[1];
+            uint32_t len = ((uint32_t)e[2] << 8) | e[3];
+            if (e + 4 + len > e_end)
+                break;
+            if (type == 5 && len >= 4 && e[4] == 1 && 4 + be24(e + 5) <= len) {
+                stapled = e + 8;
+                stapled_len = be24(e + 5);
+            }
+            e += 4 + len;
+        }
+        m = e_end;
+    }
+    if (m != list_end || tls_verify_chain(certs, lens, n, hostname, leaf) < 0)
+        return -1;
+    return n >= 2 ? tls_check_revocation(certs, lens, stapled, stapled_len) : 0;
+}
+
+/* CertificateVerify (RFC 8446 4.4.3): the leaf key's signature over 64
+ * spaces, the context string, a zero and the transcript's hash */
+static int check_cert_verify(uint32_t ml, const tls_pubkey_t *leaf)
+{
+    if (ml < 8)
+        return -1;
+    uint16_t scheme = ((uint16_t)hs_buf[4] << 8) | hs_buf[5];
+    uint32_t sl = ((uint32_t)hs_buf[6] << 8) | hs_buf[7];
+    if (8 + sl != ml || (scheme & 0xFF) == 0x01)    /* no PKCS#1 v1.5 in 1.3 */
+        return -1;
+    static const char ctx[] = "TLS 1.3, server CertificateVerify";
+    uint8_t content[64 + sizeof(ctx) + 32];
+    memset(content, 0x20, 64);
+    memcpy(content + 64, ctx, sizeof(ctx));         /* with its zero */
+    th_hash(content + 64 + sizeof(ctx));
+    return tls_verify_signature(leaf, scheme, content, sizeof(content),
+                                hs_buf + 8, sl);
+}
+
+/* ── The handshake ───────────────────────────────────────────── */
 
 int tls13_connect(int tcp_conn, const char *hostname)
 {
-    t13_memset(&s13, 0, sizeof s13);
+    memset(&s13, 0, sizeof(s13));
+    hs_len = 0;
     s13.tcp_conn = tcp_conn;
+    sha256_init(&s13.th);
 
-    /* 1. ClientHello */
-    static uint8_t hello[1024];
-    int hello_len = build_client_hello(hello, sizeof hello, hostname);
-    if (hello_len < 0) return -1;
-    if (net_tcp_send(tcp_conn, hello, (uint32_t)hello_len) < 0) {
-        serial_puts("[TLS1.3] ClientHello send failed\n");
+    static uint8_t hello[512];
+    int hello_len = build_client_hello(hello, sizeof(hello), hostname);
+    if (hello_len < 0 || net_tcp_send(tcp_conn, hello, (uint32_t)hello_len) < 0)
+        return -1;
+
+    /* ServerHello, in the clear */
+    uint8_t type;
+    uint32_t rl;
+    if (read_record(&type, rec_buf, sizeof(rec_buf), &rl) < 0 || type != CT_HANDSHAKE) {
+        serial_puts("[TLS1.3] no ServerHello\n");
         return -1;
     }
-    serial_puts("[TLS1.3] ClientHello sent ("); serial_putdec(hello_len);
-    serial_puts(" bytes)\n");
-
-    /* 2. ServerHello */
-    static uint8_t sh_body[8192];
-    uint8_t ct; uint32_t sh_len;
-    if (read_record(tcp_conn, &ct, sh_body, sizeof sh_body, &sh_len) < 0) {
-        serial_puts("[TLS1.3] no ServerHello record\n");
+    if (parse_server_hello(rec_buf, rl) < 0) {
+        serial_puts("[TLS1.3] the server doesn't do TLS 1.3 as we ask it to\n");
         return -1;
     }
-    if (ct != TLS_CONTENT_HANDSHAKE) {
-        serial_puts("[TLS1.3] expected handshake record, got type=");
-        serial_putdec(ct); serial_puts("\n");
-        return -1;
-    }
-    if (parse_server_hello(sh_body, sh_len) < 0) return -2;
-    th_append(sh_body, sh_len);
-    serial_puts("[TLS1.3] ServerHello parsed, x25519 key share OK\n");
+    th_append(rec_buf, rl);
 
-    /* 3. Compute ECDH shared secret. */
+    /* Handshake secrets (RFC 8446 7.1) */
     x25519(s13.shared, s13.client_priv, s13.server_pub);
-
-    /* 4. Key schedule per RFC 8446 §7.1. */
-    uint8_t early_secret[32];
-    hkdf_extract(zero32, 32, zero32, 32, early_secret);
-
-    uint8_t empty_hash[32];
-    sha256((const uint8_t *)"", 0, empty_hash);
-    uint8_t derived1[32];
-    hkdf_expand_label(early_secret, "derived", empty_hash, 32, derived1, 32);
-
-    hkdf_extract(derived1, 32, s13.shared, 32, s13.handshake_secret);
-
-    uint8_t th[32]; th_compute(th);
+    uint8_t early[32], empty_hash[32], derived[32], th[32];
+    hkdf_extract(zero32, 32, zero32, 32, early);
+    sha256("", 0, empty_hash);
+    hkdf_expand_label(early, "derived", empty_hash, 32, derived, 32);
+    hkdf_extract(derived, 32, s13.shared, 32, s13.handshake_secret);
+    th_hash(th);
     hkdf_expand_label(s13.handshake_secret, "c hs traffic", th, 32, s13.c_hs_traffic, 32);
     hkdf_expand_label(s13.handshake_secret, "s hs traffic", th, 32, s13.s_hs_traffic, 32);
     derive_key_iv(s13.c_hs_traffic, s13.c_hs_key, s13.c_hs_iv);
     derive_key_iv(s13.s_hs_traffic, s13.s_hs_key, s13.s_hs_iv);
 
-    /* 5. Optionally read+ignore a ChangeCipherSpec for compat. */
-    /* Then read EncryptedExtensions / Certificate / CertVerify /
-     * Finished — each is an encrypted record.  We loop until we see
-     * the server Finished. */
-    bool got_cert = false;
-    bool got_finished = false;
-    s13.s_seq = 0;
-    /* Loop bound prevents pathological servers from holding us
-     * forever (still bounded by the per-record recv timeout). */
-    for (int round = 0; round < 16 && !got_finished; round++) {
-        static uint8_t rec[17000];
-        uint32_t rec_len;
-        if (read_record(tcp_conn, &ct, rec, sizeof rec, &rec_len) < 0) {
-            serial_puts("[TLS1.3] handshake recv failed\n");
-            return -1;
-        }
-        if (ct == TLS_CONTENT_CHANGE_CIPHER) continue;
-        if (ct == TLS_CONTENT_ALERT) {
-            serial_puts("[TLS1.3] alert during handshake\n");
-            return -1;
-        }
-        if (ct != TLS_CONTENT_APP_DATA) {
-            serial_puts("[TLS1.3] unexpected record type during hs\n");
-            return -1;
-        }
-        uint8_t inner; uint32_t pt_len;
-        if (decrypt_record(rec, rec_len, s13.s_hs_key, s13.s_hs_iv,
-                           s13.s_seq, &inner, &pt_len) < 0) {
-            serial_puts("[TLS1.3] hs record decrypt FAILED\n");
-            return -1;
-        }
-        s13.s_seq++;
-        if (inner != TLS_CONTENT_HANDSHAKE) continue;
+    uint32_t ml;
+    tls_pubkey_t leaf;
+    if (hs_next(&ml) < 0 || hs_buf[0] != HS_ENCRYPTED_EXT)
+        return fail(ALERT_UNEXPECTED, "expected EncryptedExtensions");
+    hs_done(ml);
+    if (hs_next(&ml) < 0)
+        return fail(ALERT_UNEXPECTED, "no Certificate");
+    if (hs_buf[0] == HS_CERT_REQUEST)
+        return fail(ALERT_UNEXPECTED, "the server wants a client certificate");
+    if (hs_buf[0] != HS_CERTIFICATE)
+        return fail(ALERT_UNEXPECTED, "expected Certificate");
+    if (check_certificate(ml, hostname, &leaf) < 0)
+        return fail(ALERT_BAD_CERTIFICATE, "the server's certificate is refused");
+    hs_done(ml);
+    if (hs_next(&ml) < 0 || hs_buf[0] != HS_CERT_VERIFY)
+        return fail(ALERT_UNEXPECTED, "expected CertificateVerify");
+    if (check_cert_verify(ml, &leaf) < 0)
+        return fail(ALERT_DECRYPT_ERROR, "the server's CertificateVerify signature is wrong");
+    serial_puts("[TLS1.3] the server proved it holds the certificate's key (");
+    serial_puts(tls_scheme_name(((uint16_t)hs_buf[4] << 8) | hs_buf[5]));
+    serial_puts(")\n");
+    hs_done(ml);
+    if (hs_next(&ml) < 0 || hs_buf[0] != HS_FINISHED || ml != 36)
+        return fail(ALERT_UNEXPECTED, "expected Finished");
+    uint8_t fk[32], expect[32];
+    hkdf_expand_label(s13.s_hs_traffic, "finished", 0, 0, fk, 32);
+    th_hash(th);
+    hmac_sha256(fk, 32, th, 32, expect);
+    uint8_t diff = 0;
+    for (int i = 0; i < 32; i++)
+        diff |= expect[i] ^ hs_buf[4 + i];
+    if (diff)
+        return fail(ALERT_DECRYPT_ERROR, "the server's Finished is wrong");
+    hs_done(ml);
 
-        /* A single record can carry MULTIPLE handshake messages
-         * concatenated.  Walk them. */
-        uint32_t off = 0;
-        while (off + 4 <= pt_len) {
-            uint8_t mtype = rec[off];
-            uint32_t mlen = ((uint32_t)rec[off + 1] << 16) |
-                            ((uint32_t)rec[off + 2] << 8)  |
-                             rec[off + 3];
-            if (off + 4 + mlen > pt_len) break;
-
-            /* Pin check the certificate chain.  TLS 1.3 Certificate
-             * message body: cert_request_context(1) + cert_list_len(3)
-             * + entries (each: cert_data + extensions). */
-            if (mtype == TLS13_CERTIFICATE) {
-                /* TLS 1.3 Certificate body (RFC 8446 §4.4.2):
-                 *   uint8  ctx_len, opaque ctx[ctx_len],
-                 *   uint24 cert_list_len, CertificateEntry list[..]
-                 *
-                 *   CertificateEntry = uint24 cert_len, DER cert,
-                 *                      uint16 ext_len, opaque exts.
-                 *
-                 * We walk the entries ourselves (cert_pin's TLS 1.2
-                 * walker doesn't know about the per-entry exts),
-                 * synthesize a 1.2-shape single-cert wrapper for the
-                 * leaf pin check, then run x509_verify_chain_link
-                 * across consecutive entries. */
-                if (mlen >= 5) {
-                    uint8_t  ctx_len = rec[off + 4];
-                    uint32_t list_start = off + 4 + 1 + ctx_len;
-                    if (list_start + 3 <= off + 4 + mlen) {
-                        uint32_t list_len = ((uint32_t)rec[list_start] << 16) |
-                                             ((uint32_t)rec[list_start + 1] << 8) |
-                                              rec[list_start + 2];
-                        uint32_t walk = list_start + 3;
-                        uint32_t walk_end = walk + list_len;
-                        if (walk_end <= off + 4 + mlen) {
-                            const uint8_t *certs[4];
-                            uint32_t       cert_lens[4];
-                            int            nc = 0;
-                            /* Stapled OCSP for the leaf (RFC 6066 §8 /
-                             * RFC 8446 §4.4.2.1).  Servers attach the
-                             * status_request extension (type=5) to the
-                             * leaf's CertificateEntry; its body is a
-                             *   CertificateStatus { uint8 type=ocsp(1),
-                             *                       opaque resp<1..2^24-1> }
-                             * Captured here, consumed by the chain
-                             * verifier below to skip the outbound OCSP
-                             * call when GOOD. */
-                            const uint8_t *stapled_ocsp = NULL;
-                            uint32_t       stapled_ocsp_len = 0;
-                            while (walk + 3 <= walk_end && nc < 4) {
-                                uint32_t clen = ((uint32_t)rec[walk] << 16) |
-                                                 ((uint32_t)rec[walk + 1] << 8) |
-                                                  rec[walk + 2];
-                                walk += 3;
-                                if (walk + clen > walk_end) break;
-                                int this_idx = nc;
-                                certs[nc]     = rec + walk;
-                                cert_lens[nc] = clen;
-                                nc++;
-                                walk += clen;
-                                /* Per-entry extensions block. */
-                                if (walk + 2 > walk_end) break;
-                                uint16_t elen = ((uint16_t)rec[walk] << 8) | rec[walk + 1];
-                                walk += 2;
-                                if (walk + elen > walk_end) break;
-                                /* Scan extensions ONLY on the leaf for
-                                 * status_request (type=5). */
-                                if (this_idx == 0) {
-                                    uint32_t eo = walk;
-                                    uint32_t ee = walk + elen;
-                                    while (eo + 4 <= ee) {
-                                        uint16_t etype = ((uint16_t)rec[eo] << 8) | rec[eo + 1];
-                                        uint16_t elen2 = ((uint16_t)rec[eo + 2] << 8) | rec[eo + 3];
-                                        eo += 4;
-                                        if (eo + elen2 > ee) break;
-                                        if (etype == TLS_EXT_STATUS_REQUEST && elen2 >= 4) {
-                                            /* CertificateStatus: type(1) + len(3) + resp. */
-                                            if (rec[eo] == 0x01) {
-                                                uint32_t rlen = ((uint32_t)rec[eo + 1] << 16) |
-                                                                 ((uint32_t)rec[eo + 2] << 8)  |
-                                                                  rec[eo + 3];
-                                                if (rlen > 0 && 4 + rlen <= elen2) {
-                                                    stapled_ocsp     = rec + eo + 4;
-                                                    stapled_ocsp_len = rlen;
-                                                }
-                                            }
-                                        }
-                                        eo += elen2;
-                                    }
-                                }
-                                walk += elen;
-                            }
-
-                            /* Pin check on the leaf: synthesize a
-                             * single-cert TLS-1.2-shape body and
-                             * pass through the shared walker. */
-                            if (nc >= 1) {
-                                static uint8_t pin_wrap[8192];
-                                uint32_t need = 3 + 3 + cert_lens[0];
-                                if (need <= sizeof pin_wrap) {
-                                    uint32_t total = 3 + cert_lens[0];
-                                    pin_wrap[0] = (uint8_t)(total >> 16);
-                                    pin_wrap[1] = (uint8_t)(total >> 8);
-                                    pin_wrap[2] = (uint8_t)total;
-                                    pin_wrap[3] = (uint8_t)(cert_lens[0] >> 16);
-                                    pin_wrap[4] = (uint8_t)(cert_lens[0] >> 8);
-                                    pin_wrap[5] = (uint8_t)cert_lens[0];
-                                    for (uint32_t k = 0; k < cert_lens[0]; k++)
-                                        pin_wrap[6 + k] = certs[0][k];
-                                    cert_pin_check_leaf(pin_wrap, need);
-                                }
-                            }
-
-                            /* A12.6: validity-window check on every
-                             * cert in the chain.  Skips cleanly if
-                             * NTP hasn't synced (now_utc == 0). */
-                            extern uint32_t ntp_get_utc(void);
-                            extern int x509_check_validity(
-                                const uint8_t *cert, uint32_t len,
-                                uint32_t now_utc);
-                            uint32_t now_utc = ntp_get_utc();
-                            if (now_utc != 0) {
-                                for (int i = 0; i < nc; i++) {
-                                    int v = x509_check_validity(
-                                        certs[i], cert_lens[i], now_utc);
-                                    serial_puts("[TLS1.3] cert#");
-                                    serial_putdec((uint64_t)i);
-                                    serial_puts(" validity: ");
-                                    serial_puts(v == 0 ? "OK\n"
-                                                       : "OUT OF WINDOW\n");
-                                }
-                            } else {
-                                serial_puts("[TLS1.3] validity skipped (NTP not synced)\n");
-                            }
-
-                            /* A12.8: SAN / hostname match on the leaf.
-                             * Looks at the cert's Subject Alternative
-                             * Name extension (or falls back to Subject
-                             * CN) and verifies one of the dNSName
-                             * entries matches the SNI hostname we
-                             * connected to. */
-                            extern int x509_match_hostname(
-                                const uint8_t *cert, uint32_t cert_len,
-                                const char *hostname);
-                            if (nc >= 1 && hostname) {
-                                int m = x509_match_hostname(
-                                    certs[0], cert_lens[0], hostname);
-                                serial_puts("[TLS1.3] hostname match (");
-                                serial_puts(hostname);
-                                serial_puts("): ");
-                                serial_puts(m == 0 ? "OK\n" : "MISMATCH\n");
-                            }
-
-                            /* A12.10: chain constraints (BasicConstraints,
-                             * KeyUsage, pathLenConstraint).  Asserts that
-                             * every intermediate has CA=TRUE and (when
-                             * present) keyCertSign — the right to sign
-                             * other certs.  Without this, an attacker's
-                             * valid LEAF cert could be presented as an
-                             * intermediate and chain validation would
-                             * still pass. */
-                            extern int x509_check_chain_constraints(
-                                const uint8_t **chain,
-                                const uint32_t *chain_lens,
-                                uint32_t count);
-                            int cc = x509_check_chain_constraints(
-                                certs, cert_lens, (uint32_t)nc);
-                            serial_puts("[TLS1.3] chain constraints: ");
-                            serial_puts(cc == 0 ? "OK\n" : "FAIL\n");
-
-                            /* A12.11: AIA URL extraction (informational —
-                             * shows the responder + issuer URLs the cert
-                             * advertises so AIA chasing and OCSP queries
-                             * have somewhere to go). */
-                            extern int x509_get_aia_caissuers(
-                                const uint8_t *cert, uint32_t len,
-                                char *out, uint32_t cap);
-                            extern int x509_get_aia_ocsp(
-                                const uint8_t *cert, uint32_t len,
-                                char *out, uint32_t cap);
-                            if (nc >= 1) {
-                                char url[256];
-                                int n = x509_get_aia_caissuers(
-                                    certs[0], cert_lens[0], url, sizeof url);
-                                serial_puts("[TLS1.3] AIA caIssuers: ");
-                                serial_puts(n > 0 ? url : "(none)");
-                                serial_puts("\n");
-                                n = x509_get_aia_ocsp(
-                                    certs[0], cert_lens[0], url, sizeof url);
-                                serial_puts("[TLS1.3] AIA OCSP:      ");
-                                serial_puts(n > 0 ? url : "(none)");
-                                serial_puts("\n");
-                            }
-
-                            /* A12.12: OCSP revocation check.  Query the
-                             * responder named in the leaf's AIA-OCSP
-                             * URL with the leaf + issuer; informative
-                             * mode (logged but not enforced).
-                             * Signature verify on the response is a
-                             * follow-up (documented in ocsp.h). */
-                            if (nc >= 2) {
-                                extern int ocsp_check(
-                                    const uint8_t *cert, uint32_t cert_len,
-                                    const uint8_t *issuer, uint32_t issuer_len);
-                                extern int ocsp_parse_stapled(
-                                    const uint8_t *resp,   uint32_t resp_len,
-                                    const uint8_t *cert,   uint32_t cert_len,
-                                    const uint8_t *issuer, uint32_t issuer_len);
-                                int ocsp = -1;
-                                /* Try stapled response first (RFC 6066 §8). */
-                                if (stapled_ocsp && stapled_ocsp_len > 0) {
-                                    int sst = ocsp_parse_stapled(
-                                        stapled_ocsp, stapled_ocsp_len,
-                                        certs[0], cert_lens[0],
-                                        certs[1], cert_lens[1]);
-                                    serial_puts("[TLS1.3] OCSP stapled: ");
-                                    switch (sst) {
-                                    case 0: serial_puts("GOOD\n");     break;
-                                    case 1: serial_puts("REVOKED\n");  break;
-                                    case 2: serial_puts("UNKNOWN\n");  break;
-                                    default: serial_puts("parse failed -> fallback to outbound\n"); break;
-                                    }
-                                    /* Accept GOOD/REVOKED from stapled
-                                     * (saves ~300ms).  UNKNOWN / parse
-                                     * error fall through to the outbound
-                                     * query. */
-                                    if (sst == 0 || sst == 1) ocsp = sst;
-                                }
-                                if (ocsp < 0) {
-                                    ocsp = ocsp_check(
-                                        certs[0], cert_lens[0],
-                                        certs[1], cert_lens[1]);
-                                }
-                                serial_puts("[TLS1.3] OCSP status: ");
-                                switch (ocsp) {
-                                case 0: serial_puts("GOOD\n");     break;
-                                case 1: serial_puts("REVOKED\n");  break;
-                                case 2: serial_puts("UNKNOWN\n");  break;
-                                default: serial_puts("ERROR\n");   break;
-                                }
-
-                                /* CRL fallback wiring.  Policy:
-                                 *  - OCSP GOOD     → trust the live answer, skip CRL.
-                                 *  - OCSP REVOKED  → already a hard fail, no point
-                                 *                   double-checking.
-                                 *  - OCSP UNKNOWN/ERROR → consult the batch CRL.
-                                 * CRL_REVOKED is a hard abort; CRL_ERROR is logged
-                                 * and we continue (same fail-open posture OCSP has). */
-                                if (ocsp != 0 /* not GOOD */ && ocsp != 1 /* not REVOKED */) {
-                                    /* 4-arg form: plumb issuer through so
-                                     * crl.c can verify the CRL signature
-                                     * (RFC 5280 §5.1.1 + §5.2.5).  The
-                                     * 2-arg legacy wrapper logs SKIPPED. */
-                                    extern int crl_check_revoked_with_issuer(
-                                        const uint8_t *cert_der,   uint32_t cert_len,
-                                        const uint8_t *issuer_der, uint32_t issuer_len);
-                                    int crl = crl_check_revoked_with_issuer(
-                                        certs[0], cert_lens[0],
-                                        certs[1], cert_lens[1]);
-                                    serial_puts("[TLS1.3] CRL fallback (OCSP=");
-                                    serial_puts(ocsp == 2 ? "unknown" : "error");
-                                    serial_puts("): ");
-                                    switch (crl) {
-                                    case 0:
-                                        serial_puts("GOOD\n");
-                                        break;
-                                    case 1:
-                                        serial_puts("REVOKED\n");
-                                        /* Hard abort the handshake. */
-                                        return -1;
-                                    default:
-                                        serial_puts("ERROR\n");
-                                        break;
-                                    }
-                                } else if (ocsp == 1) {
-                                    /* OCSP says revoked — honour it. */
-                                    return -1;
-                                }
-                            }
-
-                            /* AIA chase: if the server sent an
-                             * incomplete chain, fetch the missing
-                             * intermediates from each top-of-chain
-                             * cert's caIssuers URL and splice into
-                             * the chain BEFORE we run chain-link
-                             * verification.  Recurses up to AIA_MAX
-                             * levels to handle CAs that nest two
-                             * intermediates above the leaf. */
-                            #define AIA_MAX 3
-                            static uint8_t aia_der_bufs[AIA_MAX][8192];
-                            /* URL dedup table: FNV-1a 32-bit hash
-                             * plus the first 16 bytes of the URL.
-                             * The head-prefix guards against the
-                             * (rare but real) 32-bit collision case
-                             * where two distinct CAs would otherwise
-                             * appear identical and the second
-                             * intermediate would never be fetched. */
-                            struct aia_seen {
-                                uint32_t hash;
-                                char     head[16];
-                            };
-                            struct aia_seen aia_tried[AIA_MAX];
-                            for (int i = 0; i < AIA_MAX; i++) {
-                                aia_tried[i].hash = 0;
-                                for (int j = 0; j < 16; j++)
-                                    aia_tried[i].head[j] = 0;
-                            }
-                            int aia_tried_n = 0;
-                            for (int depth = 0; depth < AIA_MAX && nc < 4; depth++) {
-                                /* Peek the URL on the current top-of-chain
-                                 * cert so we can dedup before fetching. */
-                                char url_peek[256];
-                                int  ulen = x509_get_aia_caissuers(
-                                    certs[nc - 1], cert_lens[nc - 1],
-                                    url_peek, sizeof url_peek);
-                                if (ulen <= 0) {
-                                    /* No more caIssuers — chain head is
-                                     * either already a root or self-signed. */
-                                    break;
-                                }
-                                /* FNV-1a 32. */
-                                uint32_t h = 2166136261u;
-                                for (int i = 0; i < ulen; i++) {
-                                    h ^= (uint8_t)url_peek[i];
-                                    h *= 16777619u;
-                                }
-                                /* Capture head-prefix for collision guard. */
-                                char head[16];
-                                for (int i = 0; i < 16; i++)
-                                    head[i] = (i < ulen) ? url_peek[i] : 0;
-                                bool seen = false;
-                                for (int i = 0; i < aia_tried_n; i++) {
-                                    if (aia_tried[i].hash != h)
-                                        continue;
-                                    /* Hash matches — require head-prefix
-                                     * to match too before declaring dup. */
-                                    bool head_eq = true;
-                                    for (int j = 0; j < 16; j++) {
-                                        if (aia_tried[i].head[j] != head[j]) {
-                                            head_eq = false;
-                                            break;
-                                        }
-                                    }
-                                    if (head_eq) { seen = true; break; }
-                                    serial_puts("[AIA] FNV collision — different URL, continuing\n");
-                                }
-                                if (seen) {
-                                    serial_puts("[AIA] URL already tried this handshake — stop\n");
-                                    break;
-                                }
-                                if (aia_tried_n < AIA_MAX) {
-                                    aia_tried[aia_tried_n].hash = h;
-                                    for (int j = 0; j < 16; j++)
-                                        aia_tried[aia_tried_n].head[j] = head[j];
-                                    aia_tried_n++;
-                                }
-
-                                uint32_t alen = 0;
-                                if (aia_chase_intermediate(
-                                        certs[nc - 1], cert_lens[nc - 1],
-                                        aia_der_bufs[depth], &alen,
-                                        sizeof aia_der_bufs[depth]) != 0) {
-                                    /* Fetch failed — stop, don't keep
-                                     * hammering the same dead URL. */
-                                    break;
-                                }
-                                certs[nc]     = aia_der_bufs[depth];
-                                cert_lens[nc] = alen;
-                                nc++;
-                                serial_puts("[AIA] chain extended to depth ");
-                                serial_putdec((uint64_t)(depth + 1));
-                                serial_puts("\n");
-                            }
-
-                            /* Chain-link verification (each cert signed by
-                             * the next) is NOT run inline on the handshake.
-                             * It is informative here — it never aborts, and
-                             * CertVerify (the real server-key-ownership
-                             * proof) is skipped, so identity rests on the
-                             * cert pin + SAN hostname match above.  Each
-                             * x509_verify_chain_link is a full bignum
-                             * signature verify (ECDSA P-384 for Google Trust
-                             * Services), ~20 s apiece under QEMU TCG — two
-                             * links burned 43 s of wall-clock, far past
-                             * Cloudflare's ~15 s handshake idle timeout, so
-                             * the server FIN'd before our Finished ever went
-                             * out and 1.3 could never complete a request
-                             * (capture-confirmed).  On real hardware these
-                             * are sub-millisecond; re-enabling belongs on a
-                             * post-handshake warm path, off this critical
-                             * section. */
-                            serial_puts("[TLS1.3] chain-link verify: deferred "
-                                        "(off handshake critical path)\n");
-                        }
-                    }
-                }
-                got_cert = true;
-            }
-
-            /* CertificateVerify check skipped — verifying ECDSA over
-             * the TLS-1.3 transcript-hash-with-context is doable
-             * (signature input = 64 spaces ‖ "TLS 1.3, server
-             * CertificateVerify" ‖ 0x00 ‖ th, hashed and verified
-             * against the leaf cert's EC pubkey) but ~80 LoC and
-             * not yet wired.  Pin already gives us identity assurance;
-             * this would close the "is the SKE signed by the cert
-             * owner" leg, same as we do in tls.c.  TODO. */
-
-            if (mtype == TLS13_FINISHED) {
-                /* Server Finished MAC = HMAC(finished_key,
-                 *                            Hash(transcript up to but
-                 *                            EXCLUDING this message)).
-                 * Verify before trusting key schedule. */
-                uint8_t fk[32];
-                hkdf_expand_label(s13.s_hs_traffic, "finished", 0, 0, fk, 32);
-                uint8_t th_before[32];
-                th_compute(th_before);  /* before appending this Finished */
-                uint8_t expected[32];
-                hmac_sha256(fk, 32, th_before, 32, expected);
-                if (mlen != 32) {
-                    serial_puts("[TLS1.3] Finished length wrong\n");
-                    return -1;
-                }
-                uint8_t diff = 0;
-                for (uint32_t i = 0; i < 32; i++)
-                    diff |= (uint8_t)(expected[i] ^ rec[off + 4 + i]);
-                if (diff != 0) {
-                    serial_puts("[TLS1.3] Finished MAC mismatch\n");
-                    return -1;
-                }
-                serial_puts("[TLS1.3] server Finished verified\n");
-                got_finished = true;
-            }
-
-            /* Append message to transcript AFTER any verification
-             * that uses the pre-message hash (server Finished). */
-            th_append(rec + off, 4 + mlen);
-            off += 4 + mlen;
-        }
-    }
-
-    if (!got_cert || !got_finished) {
-        serial_puts("[TLS1.3] handshake incomplete\n");
+    /* Our Finished, then the application secrets over the transcript
+     * through the server's Finished */
+    uint8_t th_sf[32], cfk[32], fin[36] = { HS_FINISHED, 0, 0, 32 };
+    th_hash(th_sf);
+    hkdf_expand_label(s13.c_hs_traffic, "finished", 0, 0, cfk, 32);
+    hmac_sha256(cfk, 32, th_sf, 32, fin + 4);
+    if (send_encrypted(CT_HANDSHAKE, fin, 36, s13.c_hs_key, s13.c_hs_iv, s13.c_seq++) < 0)
         return -1;
-    }
-
-    /* 6. Compute client Finished + send. */
-    uint8_t th_after_sf[32]; th_compute(th_after_sf);
-    uint8_t client_fk[32];
-    hkdf_expand_label(s13.c_hs_traffic, "finished", 0, 0, client_fk, 32);
-    uint8_t client_finished[36];
-    client_finished[0] = TLS13_FINISHED;
-    client_finished[1] = 0; client_finished[2] = 0; client_finished[3] = 32;
-    hmac_sha256(client_fk, 32, th_after_sf, 32, client_finished + 4);
-    /* The client Finished is sent under the client handshake key. */
-    s13.c_seq = 0;
-    if (send_encrypted(tcp_conn, TLS_CONTENT_HANDSHAKE,
-                        client_finished, 36,
-                        s13.c_hs_key, s13.c_hs_iv, s13.c_seq) < 0) {
-        serial_puts("[TLS1.3] client Finished send failed\n");
-        return -1;
-    }
-    s13.c_seq++;
-    th_append(client_finished, 36);
-    serial_puts("[TLS1.3] client Finished sent\n");
-
-    /* 7. Switch to application traffic secrets.  Derived from
-     * master_secret which itself comes from another HKDF derive. */
-    uint8_t derived2[32];
-    hkdf_expand_label(s13.handshake_secret, "derived", empty_hash, 32, derived2, 32);
+    th_append(fin, 36);
     uint8_t master[32];
-    hkdf_extract(derived2, 32, zero32, 32, master);
-
-    /* App traffic secrets use the transcript hash up to (and
-     * including) the *server* Finished, NOT the client Finished —
-     * RFC 8446 §7.1.  th_after_sf was captured before we appended
-     * the client Finished, so it's the right snapshot. */
-    hkdf_expand_label(master, "c ap traffic", th_after_sf, 32, s13.c_ap_traffic, 32);
-    hkdf_expand_label(master, "s ap traffic", th_after_sf, 32, s13.s_ap_traffic, 32);
+    hkdf_expand_label(s13.handshake_secret, "derived", empty_hash, 32, derived, 32);
+    hkdf_extract(derived, 32, zero32, 32, master);
+    hkdf_expand_label(master, "c ap traffic", th_sf, 32, s13.c_ap_traffic, 32);
+    hkdf_expand_label(master, "s ap traffic", th_sf, 32, s13.s_ap_traffic, 32);
     derive_key_iv(s13.c_ap_traffic, s13.c_ap_key, s13.c_ap_iv);
     derive_key_iv(s13.s_ap_traffic, s13.s_ap_key, s13.s_ap_iv);
-
-    /* Reset record-level sequence numbers for the app phase. */
-    s13.c_seq = 0;
-    s13.s_seq = 0;
-    s13.active = true;
-
-    serial_puts("[TLS1.3] handshake complete — app traffic keys live\n");
+    s13.c_seq = s13.s_seq = 0;
+    s13.active = 1;
+    serial_puts("[TLS1.3] handshake complete: TLS_AES_128_GCM_SHA256, server authenticated\n");
     return 0;
 }
 
+/* ── Application data ────────────────────────────────────────── */
+
 int tls13_send(const void *data, uint32_t len)
 {
-    if (!s13.active) return -1;
-    int r = send_encrypted(s13.tcp_conn, TLS_CONTENT_APP_DATA,
-                           (const uint8_t *)data, len,
-                           s13.c_ap_key, s13.c_ap_iv, s13.c_seq);
-    if (r < 0) return -1;
-    s13.c_seq++;
+    if (!s13.active)
+        return -1;
+    const uint8_t *p = data;
+    for (uint32_t done = 0; done < len; ) {
+        uint32_t n = len - done < 16384 ? len - done : 16384;
+        if (send_encrypted(CT_APP_DATA, p + done, n, s13.c_ap_key, s13.c_ap_iv,
+                           s13.c_seq++) < 0)
+            return -1;
+        done += n;
+    }
     return (int)len;
 }
 
+/* Up to cap bytes of application data; 0 when the server closed, -1 on
+ * an error */
 int tls13_recv(void *buf, uint32_t cap)
 {
-    if (!s13.active) return -1;
-
-    /* Drain any leftover plaintext from a previously decrypted record. */
-    if (s13.app_pos < s13.app_len) {
-        uint32_t avail = s13.app_len - s13.app_pos;
-        uint32_t take = avail < cap ? avail : cap;
-        t13_memcpy(buf, s13.app_buf + s13.app_pos, take);
-        s13.app_pos += take;
-        if (s13.app_pos >= s13.app_len) { s13.app_pos = s13.app_len = 0; }
-        return (int)take;
-    }
-
-    /* Otherwise pull a fresh record. */
-    static uint8_t rec[17000];
-    for (int loop = 0; loop < 16; loop++) {
-        uint8_t ct; uint32_t rec_len;
-        if (read_record(s13.tcp_conn, &ct, rec, sizeof rec, &rec_len) < 0) {
-            serial_puts("[TLS1.3] recv: read_record failed\n");
+    if (!s13.active)
+        return -1;
+    while (s13.app_pos >= s13.app_len) {
+        uint8_t type, inner;
+        uint32_t rl, pl;
+        if (read_record(&type, rec_buf, sizeof(rec_buf), &rl) < 0)
             return -1;
-        }
-        if (ct == TLS_CONTENT_CHANGE_CIPHER) {
-            /* Post-handshake CCS for compatibility (RFC 8446 §5).
-             * Spec says client SHOULD ignore.  Pull next record. */
+        if (type == CT_CHANGE_CIPHER)
             continue;
-        }
-        if (ct == TLS_CONTENT_ALERT) {
-            serial_puts("[TLS1.3] recv: alert record (cleartext)\n");
+        if (type != CT_APP_DATA ||
+            decrypt_record(rec_buf, rl, s13.s_ap_key, s13.s_ap_iv, s13.s_seq++,
+                           &inner, &pl) < 0) {
+            serial_puts("[TLS1.3] a record didn't decrypt\n");
             return -1;
         }
-        if (ct != TLS_CONTENT_APP_DATA) {
-            serial_puts("[TLS1.3] recv: unexpected ct=");
-            serial_putdec((uint64_t)ct); serial_puts("\n");
+        if (inner == CT_ALERT) {
+            s13.active = 0;
+            return pl >= 2 && rec_buf[1] == 0 ? 0 : -1;    /* close_notify */
+        }
+        if (inner == CT_HANDSHAKE)
+            continue;                   /* NewSessionTicket: no resumption */
+        if (inner != CT_APP_DATA)
             return -1;
-        }
-
-        uint8_t inner; uint32_t pt_len;
-        if (decrypt_record(rec, rec_len, s13.s_ap_key, s13.s_ap_iv,
-                           s13.s_seq, &inner, &pt_len) < 0) {
-            serial_puts("[TLS1.3] recv: app decrypt FAILED at s_seq=");
-            serial_putdec(s13.s_seq); serial_puts("\n");
-            return -1;
-        }
-        s13.s_seq++;
-
-        if (inner == TLS_CONTENT_HANDSHAKE) {
-            /* NewSessionTicket or similar — ignore. */
-            serial_puts("[TLS1.3] recv: handshake msg post-hs, skipped\n");
-            continue;
-        }
-        if (inner == TLS_CONTENT_ALERT) {
-            serial_puts("[TLS1.3] recv: encrypted Alert");
-            if (pt_len >= 2) {
-                serial_puts(" level=");
-                serial_putdec((uint64_t)rec[0]);
-                serial_puts(" code=");
-                serial_putdec((uint64_t)rec[1]);
-            }
-            serial_puts("\n");
-            return -1;
-        }
-        if (inner != TLS_CONTENT_APP_DATA) {
-            serial_puts("[TLS1.3] recv: unknown inner type=");
-            serial_putdec((uint64_t)inner); serial_puts("\n");
-            return -1;
-        }
-
-        /* Stash and serve from app_buf. */
-        if (pt_len > sizeof s13.app_buf) return -1;
-        t13_memcpy(s13.app_buf, rec, pt_len);
-        s13.app_len = pt_len;
+        memcpy(s13.app_buf, rec_buf, pl);
+        s13.app_len = pl;
         s13.app_pos = 0;
-        uint32_t take = pt_len < cap ? pt_len : cap;
-        t13_memcpy(buf, s13.app_buf, take);
-        s13.app_pos = take;
-        if (s13.app_pos >= s13.app_len) { s13.app_pos = s13.app_len = 0; }
-        return (int)take;
     }
-    return -1;
+    uint32_t n = s13.app_len - s13.app_pos;
+    if (n > cap)
+        n = cap;
+    memcpy(buf, s13.app_buf + s13.app_pos, n);
+    s13.app_pos += n;
+    return (int)n;
 }
 
-bool tls13_is_active(void) { return s13.active; }
+void tls13_close(void)
+{
+    if (s13.active) {
+        uint8_t msg[2] = { 1, 0 };      /* warning, close_notify */
+        send_encrypted(CT_ALERT, msg, 2, s13.c_ap_key, s13.c_ap_iv, s13.c_seq++);
+    }
+    s13.active = 0;
+    memset(&s13, 0, sizeof(s13));       /* the keys too */
+}
+
+int tls13_is_active(void)
+{
+    return s13.active;
+}

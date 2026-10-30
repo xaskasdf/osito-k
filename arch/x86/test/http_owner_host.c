@@ -22,6 +22,7 @@ int tls13_connect(int fd, const char *host)
 int tls_connect(tls_conn_t *tls, int fd, const char *host)
 { (void)tls; (void)fd; (void)host; return fail & 16 ? -1 : 0; }
 void tls_close(tls_conn_t *tls) { (void)tls; }
+void tls13_close(void) {}
 int net_dns_resolve_async(const char *host, uint8_t *ip, void (*done)(int, void *), void *arg)
 {
     (void)host; memset(ip, 1, 4);

@@ -1,8 +1,13 @@
 /*
  * OsitoK x86-64 — TLS 1.2 Client
  *
- * Minimal TLS 1.2 with ECDHE-RSA-AES128-GCM-SHA256 (0xC02F).
- * No certificate verification (accepts any server cert).
+ * Minimal TLS 1.2 with ECDHE (X25519) and AES-128-GCM-SHA256, the server's
+ * certificate RSA (0xC02F) or ECDSA (0xC02B): the fallback for servers
+ * without TLS 1.3 (http.c). The server is authenticated: its chain must
+ * verify for the host name (tls_verify_chain) and the leaf mustn't be
+ * revoked (tls_check_revocation), its ServerKeyExchange must
+ * carry the leaf key's signature over both randoms and the key, and its
+ * Finished must match. Handshake messages are reassembled across records.
  * No session resumption. No client certs. No renegotiation.
  *
  * Flow: ClientHello → ServerHello + Cert + ServerKeyExchange +
@@ -11,7 +16,9 @@
  */
 
 #include "tls.h"
+#include "tls13.h"
 #include "crypto.h"
+#include "ecdh_p256.h"
 
 /* ── External dependencies ───────────────────────────────────── */
 
@@ -19,6 +26,7 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern uint64_t idt_get_ticks(void);
+extern void random_bytes(void *buf, uint32_t len);     /* random_drbg.c */
 
 /* TCP API */
 extern int  net_tcp_send(int conn, const void *data, uint32_t len);
@@ -86,45 +94,6 @@ static inline uint32_t get32(const uint8_t *p)
            ((uint32_t)p[2] << 8) | p[3];
 }
 
-/* ── Pseudo-random bytes (CCP TRNG → RDTSC fallback) ────────── */
-
-extern uint64_t ccp_random(void) __attribute__((weak));
-extern bool     ccp_is_ready(void) __attribute__((weak));
-
-static uint64_t prng_state;
-
-static void prng_seed(void)
-{
-    if (ccp_is_ready && ccp_is_ready()) {
-        prng_state = ccp_random();
-        return;
-    }
-#ifdef __EMSCRIPTEN__
-    /* WASM has no rdtsc; fall back to JS Date.now() via a builtin
-     * that emcc compiles to wasm SIMD-free code. */
-    extern double emscripten_get_now(void);
-    prng_state = (uint64_t)emscripten_get_now();
-#else
-    uint32_t lo, hi;
-    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
-    prng_state = ((uint64_t)hi << 32) | lo;
-#endif
-}
-
-static uint8_t prng_byte(void)
-{
-    prng_state ^= prng_state << 13;
-    prng_state ^= prng_state >> 7;
-    prng_state ^= prng_state << 17;
-    return (uint8_t)(prng_state & 0xFF);
-}
-
-static void prng_fill(uint8_t *buf, uint32_t len)
-{
-    for (uint32_t i = 0; i < len; i++)
-        buf[i] = prng_byte();
-}
-
 /* ── TLS Record Send ─────────────────────────────────────────── */
 
 /* Send a TLS record (plaintext, before encryption is active) */
@@ -166,7 +135,7 @@ static int tls_send_encrypted(tls_conn_t *tls, uint8_t content_type,
     put16(aad + 11, (uint16_t)len);
 
     /* Encrypt */
-    uint8_t ct[TLS_MAX_RECORD];
+    static uint8_t ct[TLS_MAX_RECORD];      /* off the task stack; one TLS user at a time (http.c's owner) */
     uint8_t tag[16];
     if (len > TLS_MAX_RECORD) return -1;
 
@@ -316,14 +285,15 @@ static int tls_send_client_hello(tls_conn_t *tls, const char *hostname)
     put16(msg + pos, TLS_VER_12); pos += 2;
 
     /* Client random */
-    prng_fill(tls->client_random, 32);
+    random_bytes(tls->client_random, 32);
     tmemcpy(msg + pos, tls->client_random, 32); pos += 32;
 
     /* Session ID (empty) */
     msg[pos++] = 0;
 
-    /* Cipher suites: only TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
-    put16(msg + pos, 2); pos += 2;  /* 2 bytes = 1 cipher suite */
+    /* Cipher suites: ECDHE with an ECDSA or RSA certificate, AES-128-GCM */
+    put16(msg + pos, 4); pos += 2;
+    put16(msg + pos, 0xC02B); pos += 2;
     put16(msg + pos, 0xC02F); pos += 2;
 
     /* Compression methods: null only */
@@ -345,11 +315,12 @@ static int tls_send_client_hello(tls_conn_t *tls, const char *hostname)
         tmemcpy(msg + pos, hostname, hn_len); pos += hn_len;
     }
 
-    /* Supported Groups extension (0x000A) — x25519 */
+    /* Supported Groups extension (0x000A) — x25519, then secp256r1 */
     put16(msg + pos, 0x000A); pos += 2;
-    put16(msg + pos, 4); pos += 2;  /* ext len */
-    put16(msg + pos, 2); pos += 2;  /* named curve list len */
+    put16(msg + pos, 6); pos += 2;  /* ext len */
+    put16(msg + pos, 4); pos += 2;  /* named curve list len */
     put16(msg + pos, 0x001D); pos += 2;  /* x25519 */
+    put16(msg + pos, 0x0017); pos += 2;  /* secp256r1 */
 
     /* EC Point Formats (0x000B) — uncompressed only */
     put16(msg + pos, 0x000B); pos += 2;
@@ -357,11 +328,13 @@ static int tls_send_client_hello(tls_conn_t *tls, const char *hostname)
     msg[pos++] = 1;  /* 1 format */
     msg[pos++] = 0;  /* uncompressed */
 
-    /* Signature Algorithms (0x000D) — rsa_pkcs1_sha256 */
+    /* Signature Algorithms (0x000D): what tls_verify_signature checks */
+    uint8_t sigs[32];
+    uint32_t sl = tls_signature_schemes(sigs, 0);
     put16(msg + pos, 0x000D); pos += 2;
-    put16(msg + pos, 4); pos += 2;
-    put16(msg + pos, 2); pos += 2;  /* list len */
-    put16(msg + pos, 0x0401); pos += 2;  /* rsa_pkcs1_sha256 */
+    put16(msg + pos, (uint16_t)(sl + 2)); pos += 2;
+    put16(msg + pos, (uint16_t)sl); pos += 2;
+    tmemcpy(msg + pos, sigs, sl); pos += sl;
 
     /* Patch extensions length */
     uint32_t ext_len = pos - ext_start - 2;
@@ -402,6 +375,18 @@ static int parse_server_hello(tls_conn_t *tls, const uint8_t *data, uint32_t len
 
     tmemcpy(tls->server_random, data + 2, 32);
 
+    /* A TLS 1.3 server negotiating 1.2 says so at the end of its random
+     * (RFC 8446 4.1.3). We tried 1.3 first, so this means someone made
+     * that attempt fail: a downgrade. */
+    static const uint8_t downgrade[8] = { 'D', 'O', 'W', 'N', 'G', 'R', 'D', 1 };
+    int sentinel = 1;
+    for (int i = 0; i < 8; i++)
+        sentinel &= tls->server_random[24 + i] == downgrade[i];
+    if (sentinel) {
+        serial_puts("[TLS] The server does TLS 1.3, but our 1.3 attempt failed: downgrade, refusing\n");
+        return -1;
+    }
+
     uint8_t sid_len = data[34];
     uint32_t pos = 35 + sid_len;
 
@@ -409,18 +394,47 @@ static int parse_server_hello(tls_conn_t *tls, const uint8_t *data, uint32_t len
     uint16_t cipher = get16(data + pos);
     pos += 2;
 
-    if (cipher != 0xC02F) {
+    if (cipher != 0xC02F && cipher != 0xC02B) {
         serial_puts("[TLS] Server chose unsupported cipher: 0x");
         serial_puthex(cipher, 4);
         serial_puts("\n");
         return -1;
     }
+    tls->suite = cipher;
 
     /* uint8_t compression = data[pos]; */
     /* Skip extensions */
 
-    serial_puts("[TLS] ServerHello: TLS 1.2, ECDHE-RSA-AES128-GCM-SHA256\n");
+    serial_puts(cipher == 0xC02B ? "[TLS] ServerHello: TLS 1.2, ECDHE-ECDSA-AES128-GCM-SHA256\n"
+                                 : "[TLS] ServerHello: TLS 1.2, ECDHE-RSA-AES128-GCM-SHA256\n");
     return 0;
+}
+
+/* Certificate: the chain (each a 3-byte length and the DER), verified for
+ * the host name and checked for revocation; the leaf's key kept for the
+ * ServerKeyExchange */
+static int verify_certificate(tls_conn_t *tls, const uint8_t *data, uint32_t len,
+                              const char *hostname)
+{
+    const uint8_t *certs[8];
+    uint32_t lens[8];
+    int n = 0;
+    if (len < 3 || 3 + get24(data) != len)
+        return -1;
+    for (uint32_t pos = 3; pos < len; ) {
+        if (pos + 3 > len || n == 8)
+            return -1;
+        uint32_t cl = get24(data + pos);
+        pos += 3;
+        if (pos + cl > len)
+            return -1;
+        certs[n] = data + pos;
+        lens[n++] = cl;
+        pos += cl;
+    }
+    if (tls_verify_chain(certs, lens, n, hostname, &tls->leaf) < 0)
+        return -1;
+    return n >= 2 ? tls_check_revocation(certs, lens, 0, 0) : 0;
 }
 
 /* Parse ServerKeyExchange — extract ECDHE public key */
@@ -441,24 +455,57 @@ static int parse_server_key_exchange(tls_conn_t *tls,
         return -1;
     }
 
-    if (named_curve != 0x001D) {  /* x25519 */
+    if (named_curve != 0x001D && named_curve != 0x0017) {  /* x25519, secp256r1 */
         serial_puts("[TLS] Unsupported curve: 0x");
         serial_puthex(named_curve, 4);
         serial_puts("\n");
         return -1;
     }
+    tls->group = named_curve;
 
-    if (pubkey_len != 32 || 4 + (uint32_t)pubkey_len > len) return -1;
+    if (pubkey_len != (named_curve == 0x0017 ? 65 : 32) ||
+        4 + (uint32_t)pubkey_len > len) return -1;
+
+    /* The signature: algorithm (2), length (2), the bytes; by the leaf's
+     * key, of the kind the suite names, over both randoms and the params */
+    uint32_t params = 4 + pubkey_len;
+    if (params + 4 > len) return -1;
+    uint16_t scheme = get16(data + params);
+    uint32_t sig_len = get16(data + params + 2);
+    if (params + 4 + sig_len != len) return -1;
+    int want_ec = tls->suite == 0xC02B;
+    if ((tls->leaf.type == 2) != want_ec || (scheme & 0xFF) == (want_ec ? 0x01 : 0x03)) {
+        serial_puts("[TLS] ServerKeyExchange: the signature doesn't match the suite\n");
+        return -1;
+    }
+    static uint8_t signed_data[64 + 4 + 255];
+    tmemcpy(signed_data, tls->client_random, 32);
+    tmemcpy(signed_data + 32, tls->server_random, 32);
+    tmemcpy(signed_data + 64, data, params);
+    if (tls_verify_signature(&tls->leaf, scheme, signed_data, 64 + params,
+                             data + params + 4, sig_len) < 0) {
+        serial_puts("[TLS] ServerKeyExchange: the server's signature is wrong\n");
+        return -1;
+    }
 
     /* Compute shared secret */
+    if (named_curve == 0x0017) {
+        if (ecdh_p256_keygen(tls->p256_priv, tls->p256_pub) < 0 ||
+            ecdh_p256_shared(tls->p256_priv, data + 4, 65, tls->premaster_secret) < 0)
+            return -1;
+        serial_puts("[TLS] ServerKeyExchange: signed by the certificate's key (");
+        serial_puts(tls_scheme_name(scheme));
+        serial_puts("); P-256 secret computed\n");
+        return 0;
+    }
     uint8_t server_pubkey[32];
     tmemcpy(server_pubkey, data + 4, 32);
 
     x25519(tls->premaster_secret, tls->ecdhe_privkey, server_pubkey);
 
-    serial_puts("[TLS] ServerKeyExchange: x25519 shared secret computed\n");
-
-    /* Remaining bytes are the signature — we skip verification (no CA store) */
+    serial_puts("[TLS] ServerKeyExchange: signed by the certificate's key (");
+    serial_puts(tls_scheme_name(scheme));
+    serial_puts("); x25519 secret computed\n");
     return 0;
 }
 
@@ -504,17 +551,18 @@ static void tls_derive_keys(tls_conn_t *tls)
 
 static int tls_send_client_finish(tls_conn_t *tls)
 {
-    /* 1. ClientKeyExchange: our ECDHE public key */
+    /* 1. ClientKeyExchange: our ECDHE public key, X25519 or P-256 */
     {
-        uint8_t msg[37];  /* 4 (hs header) + 1 (len) + 32 (pubkey) */
+        uint8_t msg[4 + 1 + 65];
+        uint32_t kl = tls->group == 0x0017 ? 65 : 32;
         msg[0] = TLS_HS_CLIENT_KEY_EXCH;
-        put24(msg + 1, 33);  /* length = 1 + 32 */
-        msg[4] = 32;  /* public key length */
-        tmemcpy(msg + 5, tls->ecdhe_pubkey, 32);
+        put24(msg + 1, 1 + kl);
+        msg[4] = (uint8_t)kl;
+        tmemcpy(msg + 5, kl == 65 ? tls->p256_pub : tls->ecdhe_pubkey, kl);
 
-        sha256_update(&tls->hs_hash, msg, 37);
+        sha256_update(&tls->hs_hash, msg, 5 + kl);
 
-        if (tls_send_record(tls, TLS_HANDSHAKE, msg, 37) < 0)
+        if (tls_send_record(tls, TLS_HANDSHAKE, msg, 5 + kl) < 0)
             return -1;
 
         serial_puts("[TLS] ClientKeyExchange sent\n");
@@ -569,107 +617,88 @@ static int tls_send_client_finish(tls_conn_t *tls)
 
 /* ── Server Handshake Processing ─────────────────────────────── */
 
-/* Read and process all server handshake messages until ServerHelloDone.
- * Then read ChangeCipherSpec + encrypted Finished. */
-static int tls_process_server_handshake(tls_conn_t *tls)
+/* The server's flight, reassembled: a certificate chain often spans
+ * several records, and one record can hold several messages */
+static uint8_t hs_buf[65536];
+static uint32_t hs_len;
+
+/* The next whole handshake message (header included) at hs_buf */
+static int next_message(tls_conn_t *tls, uint32_t *msg_len)
 {
-    uint8_t buf[TLS_MAX_HS_MSG];
-    uint32_t buf_len;
-    int got_hello = 0, got_cert = 0, got_ske = 0, got_done = 0;
-
-    /* Phase 1: Read plaintext handshake messages */
-    while (!got_done) {
-        int ct = tls_recv_record(tls, buf, &buf_len, sizeof(buf), 1000);
-
-        if (ct < 0) {
-            serial_puts("[TLS] Failed to receive handshake record\n");
-            return -1;
-        }
-
-        if (ct == TLS_ALERT) {
-            serial_puts("[TLS] Alert received: level=");
-            serial_putdec(buf[0]);
-            serial_puts(" desc=");
-            serial_putdec(buf[1]);
-            serial_puts("\n");
-            return -1;
-        }
-
-        if (ct != TLS_HANDSHAKE) {
-            serial_puts("[TLS] Expected handshake, got type ");
-            serial_putdec(ct);
-            serial_puts("\n");
-            return -1;
-        }
-
-        /* Process potentially multiple handshake messages in one record */
-        uint32_t offset = 0;
-        while (offset + 4 <= buf_len) {
-            uint8_t hs_type = buf[offset];
-            uint32_t hs_len = get24(buf + offset + 1);
-
-            if (offset + 4 + hs_len > buf_len) {
-                serial_puts("[TLS] Truncated handshake message\n");
+    static uint8_t rec[TLS_MAX_RECORD + 256];
+    for (;;) {
+        if (hs_len >= 4) {
+            uint32_t ml = 4 + get24(hs_buf + 1);
+            if (ml > sizeof(hs_buf))
                 return -1;
+            if (hs_len >= ml) {
+                *msg_len = ml;
+                return 0;
             }
-
-            /* Hash this handshake message */
-            sha256_update(&tls->hs_hash, buf + offset, 4 + hs_len);
-
-            switch (hs_type) {
-            case TLS_HS_SERVER_HELLO:
-                if (parse_server_hello(tls, buf + offset + 4, hs_len) < 0)
-                    return -1;
-                got_hello = 1;
-                break;
-
-            case TLS_HS_CERTIFICATE: {
-                /* Hash the leaf cert and check against the pin table.
-                 * Until A12's full ECDSA + chain validator lands, this
-                 * is our MITM defense: an attacker re-routing the
-                 * connection without the matching cert+key is rejected
-                 * by digest mismatch. SKE signature is still
-                 * unverified — separate sub-item. */
-                serial_puts("[TLS] Certificate received (");
-                serial_putdec(hs_len);
-                serial_puts(" bytes)\n");
-                extern int cert_pin_check_leaf(const uint8_t *msg, uint32_t len);
-                if (cert_pin_check_leaf(buf + offset + 4, hs_len) < 0) {
-                    serial_puts("[TLS] cert pin check failed — abort\n");
-                    return -1;
-                }
-                got_cert = 1;
-                break;
-            }
-
-            case TLS_HS_SERVER_KEY_EXCH:
-                if (parse_server_key_exchange(tls, buf + offset + 4, hs_len) < 0)
-                    return -1;
-                got_ske = 1;
-                break;
-
-            case TLS_HS_SERVER_HELLO_DONE:
-                serial_puts("[TLS] ServerHelloDone\n");
-                got_done = 1;
-                break;
-
-            default:
-                serial_puts("[TLS] Unknown handshake type: ");
-                serial_putdec(hs_type);
-                serial_puts(" (");
-                serial_putdec(hs_len);
-                serial_puts(" bytes, skipped)\n");
-                break;
-            }
-
-            offset += 4 + hs_len;
         }
+        uint32_t rl;
+        int ct = tls_recv_record(tls, rec, &rl, sizeof(rec), 1000);
+        if (ct == TLS_ALERT && rl >= 2) {
+            serial_puts("[TLS] Alert received: level=");
+            serial_putdec(rec[0]);
+            serial_puts(" desc=");
+            serial_putdec(rec[1]);
+            serial_puts("\n");
+            return -1;
+        }
+        if (ct != TLS_HANDSHAKE || hs_len + rl > sizeof(hs_buf)) {
+            serial_puts("[TLS] Failed to receive the server's handshake\n");
+            return -1;
+        }
+        tmemcpy(hs_buf + hs_len, rec, rl);
+        hs_len += rl;
     }
+}
 
-    if (!got_hello || !got_cert || !got_ske) {
-        serial_puts("[TLS] Missing required handshake messages\n");
+/* That message into the transcript, and out of hs_buf */
+static void message_done(tls_conn_t *tls, uint32_t ml)
+{
+    sha256_update(&tls->hs_hash, hs_buf, ml);
+    for (uint32_t i = ml; i < hs_len; i++)
+        hs_buf[i - ml] = hs_buf[i];
+    hs_len -= ml;
+}
+
+/* Read and process the server's handshake messages, in order, until
+ * ServerHelloDone. Then read ChangeCipherSpec + encrypted Finished. */
+static int tls_process_server_handshake(tls_conn_t *tls, const char *hostname)
+{
+    static uint8_t buf[TLS_MAX_HS_MSG];
+    uint32_t buf_len, ml;
+
+    hs_len = 0;
+    if (next_message(tls, &ml) < 0 || hs_buf[0] != TLS_HS_SERVER_HELLO ||
+        parse_server_hello(tls, hs_buf + 4, ml - 4) < 0)
+        return -1;
+    message_done(tls, ml);
+    if (next_message(tls, &ml) < 0 || hs_buf[0] != TLS_HS_CERTIFICATE) {
+        serial_puts("[TLS] Expected the server's Certificate\n");
         return -1;
     }
+    if (verify_certificate(tls, hs_buf + 4, ml - 4, hostname) < 0)
+        return -1;
+    message_done(tls, ml);
+    if (next_message(tls, &ml) < 0 || hs_buf[0] != TLS_HS_SERVER_KEY_EXCH ||
+        parse_server_key_exchange(tls, hs_buf + 4, ml - 4) < 0)
+        return -1;
+    message_done(tls, ml);
+    if (next_message(tls, &ml) < 0)
+        return -1;
+    if (hs_buf[0] == TLS_HS_CERT_REQUEST) {
+        serial_puts("[TLS] The server wants a client certificate\n");
+        return -1;
+    }
+    if (hs_buf[0] != TLS_HS_SERVER_HELLO_DONE || ml != 4 || hs_len != ml) {
+        serial_puts("[TLS] Expected ServerHelloDone\n");
+        return -1;
+    }
+    message_done(tls, ml);
+    serial_puts("[TLS] ServerHelloDone\n");
 
     /* Send our side: ClientKeyExchange + CCS + Finished */
     if (tls_send_client_finish(tls) < 0) return -1;
@@ -726,19 +755,20 @@ static int tls_process_server_handshake(tls_conn_t *tls)
                         "server finished", hs_digest, 32,
                         expected_verify, 12);
 
-        int ok = 1;
+        uint8_t diff = 0;
         for (int i = 0; i < 12; i++)
-            if (buf[4 + i] != expected_verify[i]) { ok = 0; break; }
+            diff |= buf[4 + i] ^ expected_verify[i];
 
-        if (!ok) {
-            serial_puts("[TLS] Server Finished verify_data mismatch!\n");
-            /* Continue anyway — might be a hash sync issue */
-        } else {
-            serial_puts("[TLS] Server Finished verified OK\n");
+        if (diff) {
+            /* The transcript isn't what the server saw: someone in the way */
+            serial_puts("[TLS] Server Finished verify_data mismatch\n");
+            tls->state = TLS_STATE_ERROR;
+            return -1;
         }
+        serial_puts("[TLS] Server Finished verified OK\n");
     }
 
-    serial_puts("[TLS] Handshake complete — encrypted channel ready\n");
+    serial_puts("[TLS] Handshake complete: TLS 1.2, server authenticated\n");
     return 0;
 }
 
@@ -753,9 +783,8 @@ int tls_connect(tls_conn_t *tls, int tcp_conn, const char *hostname)
     /* Initialize handshake hash */
     sha256_init(&tls->hs_hash);
 
-    /* Seed PRNG and generate ECDHE keypair */
-    prng_seed();
-    prng_fill(tls->ecdhe_privkey, 32);
+    /* The ECDHE keypair */
+    random_bytes(tls->ecdhe_privkey, 32);
     x25519_public(tls->ecdhe_pubkey, tls->ecdhe_privkey);
 
     serial_puts("[TLS] Connecting to ");
@@ -769,7 +798,7 @@ int tls_connect(tls_conn_t *tls, int tcp_conn, const char *hostname)
     }
 
     /* Process full server handshake */
-    if (tls_process_server_handshake(tls) < 0) {
+    if (!hostname || tls_process_server_handshake(tls, hostname) < 0) {
         tls->state = TLS_STATE_ERROR;
         return -1;
     }

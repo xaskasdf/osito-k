@@ -111,8 +111,8 @@
 | X-VBLK  | Virtio block driver (read/write via split virtqueue) | Done |
 | X-VNET  | Virtio network driver (RX/TX queues, MAC config) | Done |
 | X-USBMS | USB mass storage (BBB protocol, SCSI READ/INQUIRY) | Done |
-| X-TLS13 | TLS 1.3 client real (X25519 + AES-128-GCM + HKDF, Finished MAC, full handshake e2e contra CF) | Done |
-| X-PKI   | RFC 5280 chain validation: link sig verify (P-256/P-384/RSA-SHA256/RSA-SHA384) + constraints (BasicConstraints/KeyUsage/pathLen) + validity window + SAN/CN match (RFC 6125) + cert_pin (static/dynamic/operator) | Done |
+| X-TLS13 | TLS 1.3 client real (X25519 + AES-128-GCM + HKDF, Finished MAC, full handshake e2e contra CF). Since 2026-10-30 it authenticates the server: chain verified, CertificateVerify checked (ECDSA, RSA-PSS), revocation by OCSP/CRL, handshake messages reassembled across records; a failed authentication doesn't fall back to 1.2 | Done |
+| X-PKI   | RFC 5280 chain validation, enforced since 2026-10-30: BearSSL 0.6's X.509 engine (`lib/bearssl`) against Mozilla's roots (`kernel/ca_roots.c`, `tools/ca-roots/gen-bearssl-anchors.py`): link signatures, constraints, validity, host name; SHA-1/MD5 refused. Before, x509.c's checks only logged their result and cert_pin knew three pins. TLS 1.2 checks the ServerKeyExchange signature and revocation (OCSP, else CRL) too, keys come from an HMAC-DRBG over RDRAND (`kernel/random_drbg.c`) | Done |
 | X-OCSP  | OCSP client (RFC 6960): live query + responder sig verify + stapling (RFC 6066 §8) | Done |
 | X-CRL   | CRL client (RFC 5280 §5): download + parse + serial check + sig verify (informative-mode fallback when OCSP errors) | Done |
 | X-AIA   | AIA chase end-to-end: caIssuers URL extract + http_plain fetch + chain extend (recursive up to depth 3) + osfs2 cache | Done |

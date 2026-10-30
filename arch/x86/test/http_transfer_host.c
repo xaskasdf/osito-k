@@ -44,6 +44,7 @@ int tls13_connect(int fd, const char *host)
 int tls_connect(tls_conn_t *s, int fd, const char *host)
 { (void)s; (void)host; CHECK(fd == 7); calls_tls++; return 0; }
 void tls_close(tls_conn_t *s) { (void)s; calls_tls++; }
+void tls13_close(void) { calls_tls++; }
 int tls13_send(const void *data, uint32_t length)
 { calls_tls++; return http_transfer_send(data, length); }
 int tls13_recv(void *out, uint32_t capacity)

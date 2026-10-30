@@ -1,9 +1,11 @@
 /*
  * OsitoK x86-64 — TLS 1.2 Client
  *
- * Minimal TLS 1.2 implementation for HTTPS client.
- * Supports: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (0xC02F)
- * No client certificates, no session resumption.
+ * Minimal TLS 1.2 implementation for HTTPS client, for servers without
+ * TLS 1.3 (kernel/tls13.c). ECDHE (X25519 or P-256) with an RSA or ECDSA
+ * certificate and AES-128-GCM-SHA256 (0xC02F, 0xC02B). The server is
+ * authenticated (tls_verify.c): its chain, and its signature over the key
+ * exchange. No client certificates, no session resumption.
  */
 
 #ifndef OSITOK_TLS_H
@@ -11,6 +13,7 @@
 
 #include "../include/types.h"
 #include "crypto.h"
+#include "tls_verify.h"
 
 /* ── TLS Record Layer ────────────────────────────────────────── */
 
@@ -28,6 +31,7 @@
 #define TLS_HS_SERVER_HELLO     2
 #define TLS_HS_CERTIFICATE      11
 #define TLS_HS_SERVER_KEY_EXCH  12
+#define TLS_HS_CERT_REQUEST     13
 #define TLS_HS_SERVER_HELLO_DONE 14
 #define TLS_HS_CLIENT_KEY_EXCH  16
 #define TLS_HS_FINISHED         20
@@ -93,6 +97,15 @@ typedef struct {
     uint8_t   app_buf[TLS_MAX_RECORD];
     uint32_t  app_len;
     uint32_t  app_offset;
+
+    /* The suite the server chose, and its certificate's verified key */
+    uint16_t  suite;
+    tls_pubkey_t leaf;
+
+    /* The ECDHE group the server chose; P-256's key if it's that */
+    uint16_t  group;
+    uint8_t   p256_priv[32];
+    uint8_t   p256_pub[65];
 
     /* Error info */
     uint8_t   alert_level;

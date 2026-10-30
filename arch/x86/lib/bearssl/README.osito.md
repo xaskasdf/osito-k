@@ -1,4 +1,4 @@
-# BearSSL Primitives for WLAN and Win32
+# BearSSL Primitives for WLAN, Win32 and TLS certificate checks
 
 Unmodified subset of BearSSL 0.6, Copyright Thomas Pornin, MIT license.
 Source: https://bearssl.org/bearssl-0.6.tar.gz
@@ -20,3 +20,24 @@ The consumer supplies a signature-correct SHA-1 vtable adapter in
 `kernel/wpa2_crypto.c`: this avoids BearSSL 0.6's generic function-pointer casts
 without disabling Clang's function-type sanitizer. AES is called directly.
 The Win32 adapter also calls the typed hash functions directly.
+
+## TLS certificate checks (2026-10-30)
+
+The TLS clients (`kernel/tls13.c`, `kernel/tls.c`) authenticate servers
+through `kernel/tls_verify.c`, which uses more of the same archive, still
+unmodified (`TLS_CRYPTO_SRC` in the Makefile):
+- the X.509 "minimal" engine (`src/x509`): the chain up to a trust anchor,
+  with signatures, CA flags, path lengths, dates and the server name;
+- RSA PKCS#1 v1.5 verification and the RSA public operation (`src/rsa`, `src/int`, i31);
+- ECDSA verification on P-256, P-384 and P-521 (`src/ec`), which
+  `kernel/ecdh_p256.c` also uses for P-256 ECDHE;
+- `src/hash/multihash.c` and `src/codec/ccopy.c`.
+
+BearSSL 0.6 has no RSA-PSS, which TLS 1.3 requires of RSA servers, so
+`tls_verify.c` implements EMSA-PSS-VERIFY over `br_rsa_i31_public`. The
+trust anchors are Mozilla's roots, generated into `kernel/ca_roots.c` by
+`tools/ca-roots/gen-bearssl-anchors.py`. `port/string.h` declares
+`kernel/memory.c`'s `memmove`, which the X.509 engine and i31 use. The
+compile rule turns off BearSSL's `time()`, `/dev/urandom` and RDRAND code:
+the engine gets the time from `tls_verify.c`, and randomness comes from
+`kernel/random_drbg.c`. The same subset serves arch/arm.

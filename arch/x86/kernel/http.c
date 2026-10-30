@@ -112,13 +112,12 @@ uint32_t http_response_size(void) { return (uint32_t)sizeof(http_response_t); }
 
 /* Leftover body data from header parsing (set by http_request,
  * consumed by http_read_body). Only one request at a time. */
-static uint8_t leftover_buf[4096];
+static uint8_t leftover_buf[16384];    /* as big as hdr: the body read with it */
 static int     leftover_len;
 
 /* ── TLS dispatch helpers (1.2/1.3 unified) ──────────────────── */
 
-extern int tls13_send(const void *data, uint32_t len);
-extern int tls13_recv(void *buf, uint32_t cap);
+#include "tls13.h"
 
 static inline int http_tls_send(http_session_t *s, const void *data, uint32_t len)
 {
@@ -149,10 +148,11 @@ static inline int http_tls_recv(http_session_t *s, void *buf, uint32_t cap,
 
 static inline void http_tls_close(http_session_t *s)
 {
-    /* TLS 1.3 has no explicit close API in this build — just drop the
-     * TCP; the peer detects close via FIN. TLS 1.2 needs tls_close to
-     * emit close_notify before TCP teardown. */
-    if (!s->plaintext && !s->use_tls13) tls_close(&s->tls);
+    /* Both send close_notify before the TCP teardown; tls13_close also
+     * wipes the 1.3 keys */
+    if (s->plaintext) return;
+    if (s->use_tls13) tls13_close();
+    else tls_close(&s->tls);
 }
 
 /* ── HTTP Session Management ─────────────────────────────────── */
@@ -211,15 +211,21 @@ static int http_open_owned(http_session_t *s, const char *hostname,
     }
 
     /* TLS handshake — prefer 1.3 (one-RTT handshake + modern ciphers).
-     * Fall back to 1.2 if the server can't do 1.3. tls13 uses a global
-     * state struct, so we hold an outer single-conn lock in http_open
-     * by virtue of it being called serially per session. */
-    extern int  tls13_connect(int tcp_conn, const char *hostname);
-    if (tls13_connect(s->tcp_conn, hostname) == 0) {
+     * Fall back to 1.2 if the server may not speak 1.3, never after it
+     * failed authentication; both check the certificates (tls_verify.c).
+     * tls13 uses a global state struct, so we hold an outer single-conn
+     * lock in http_open by virtue of it being called serially per session. */
+    int r13 = tls13_connect(s->tcp_conn, hostname);
+    if (r13 == 0) {
         s->use_tls13 = true;
         serial_puts("[HTTP] HTTPS ready (TLS 1.3)\n");
         s->connected = true;
         return 0;
+    }
+    if (r13 == TLS13_AUTH_FAILED) {
+        serial_puts("[HTTP] the server failed authentication: not connecting\n");
+        net_tcp_close(s->tcp_conn);
+        return -1;
     }
 
     /* 1.3 failed — close and reopen TCP, then try 1.2. The TLS 1.3 path
@@ -331,7 +337,7 @@ int http_request(http_session_t *s, const char *method, const char *path,
 
     /* ── Read response headers ── */
 
-    char hdr[4096];
+    static char hdr[16384];     /* one session at a time (http_owner); Wikipedia sends ~5 KB */
     int hdr_len = 0;
     int hdr_end = -1;
 
@@ -654,6 +660,7 @@ typedef struct {
     uint8_t  *buf;
     uint32_t  size;
     uint32_t  pos;
+    int       full;     /* stopped reading: the buffer is full */
 } buf_ctx_t;
 
 static int buf_body_cb(const void *data, uint32_t len, void *ctx_)
@@ -666,15 +673,20 @@ static int buf_body_cb(const void *data, uint32_t len, void *ctx_)
         hmemcpy(b->buf + b->pos, data, copy);
         b->pos += copy;
     }
+    if (b->pos >= b->size) {
+        b->full = 1;
+        return -1;      /* no need for the rest */
+    }
     return 0;
 }
 
+/* The body's first buf_size bytes; the rest isn't read */
 int http_read_body_full(http_session_t *s, const http_response_t *resp,
                         void *buf, uint32_t buf_size)
 {
-    buf_ctx_t ctx = { .buf = (uint8_t *)buf, .size = buf_size, .pos = 0 };
+    buf_ctx_t ctx = { .buf = (uint8_t *)buf, .size = buf_size, .pos = 0, .full = 0 };
     int r = http_read_body(s, resp, buf_body_cb, &ctx);
-    if (r < 0) return -1;
+    if (r < 0 && !ctx.full) return -1;
     return (int)ctx.pos;
 }
 
