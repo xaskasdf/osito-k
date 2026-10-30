@@ -675,8 +675,8 @@ void matvec_q4_0(float *out, const void *weight,
         if (tids[i] >= 0) smp_wait(tids[i]);
 }
 
-void matvec_q8_0(float *out, const void *weight,
-                 const float *input, uint32_t rows, uint32_t cols)
+static void matvec_q8_0_scalar(float *out, const void *weight,
+                               const float *input, uint32_t rows, uint32_t cols)
 {
     const uint8_t *w = (const uint8_t *)weight;
     uint32_t blocks_per_row = cols / Q8_0_VALUES;
@@ -694,6 +694,16 @@ void matvec_q8_0(float *out, const void *weight,
         }
         out[r] = sum;
     }
+}
+
+void matvec_q8_0(float *out, const void *weight,
+                 const float *input, uint32_t rows, uint32_t cols)
+{
+    extern void matvec_q8_0_neon(float *, const void *, const float *, uint32_t, uint32_t);
+    if (tensor_has_avx2())
+        matvec_q8_0_neon(out, weight, input, rows, cols);
+    else
+        matvec_q8_0_scalar(out, weight, input, rows, cols);
 }
 
 /* ══════════════════════════════════════════════════════════

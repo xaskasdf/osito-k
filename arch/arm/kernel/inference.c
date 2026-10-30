@@ -10,6 +10,7 @@
 
 #include "inference.h"
 #include "tensor.h"
+#include "tensor_sdot.h"
 #include "../include/paging.h"
 #include "../include/tensor_arena.h"
 #include "../include/dispatch.h"
@@ -233,8 +234,8 @@ extern int wasm_wgpu_matvec(const float *w, const float *vin, float *out,
                              int rows, int cols);
 #endif
 
-static void matvec_one(float *out, gguf_tensor_t *tensor,
-                       const float *input, uint32_t rows, uint32_t cols);
+static void matvec_one(float *out, gguf_tensor_t *tensor, const float *input,
+                       const q8_input_t *q8, uint32_t rows, uint32_t cols);
 
 /* AArch64: split the rows of every matvec over llm.c's worker CPUs (the
  * A78s) and the calling one (the X1). llm_par_run runs part(ctx, i) for i
@@ -247,9 +248,28 @@ typedef struct {
     float *out;
     gguf_tensor_t *tensor;
     const float *input;
+    const q8_input_t *q8;
     uint32_t rows, cols, row_bytes;
     int parts;
 } matvec_split_t;
+
+/* With SDOT (tensor_sdot.c), a matvec on Q4_0, Q4_1 or Q8_0 weights
+ * quantizes its input once and every part uses that. One buffer serves:
+ * on AArch64 matvecs run one at a time (ap_worker_count is 0, so x86's
+ * concurrent paths stay off). */
+#define Q8_MAX_COLS 16384
+static int8_t q8_vals[Q8_MAX_COLS];
+static float  q8_scales[Q8_MAX_COLS / 32], q8_sums[Q8_MAX_COLS / 32];
+static q8_input_t q8_in = { q8_scales, q8_sums, q8_vals };
+
+static const q8_input_t *q8_input(uint32_t type, const float *input, uint32_t cols)
+{
+    if (!tensor_sdot || cols % 32 || cols > Q8_MAX_COLS ||
+        (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q8_0))
+        return 0;
+    q8_quantize(&q8_in, input, cols);
+    return &q8_in;
+}
 
 /* Bytes a row of cols takes, or 0 for a type that isn't split */
 static uint32_t row_bytes(uint32_t type, uint32_t cols)
@@ -275,22 +295,37 @@ static void matvec_part(void *ctx, int i)
         return;
     gguf_tensor_t slice = *m->tensor;
     slice.data = (uint8_t *)m->tensor->data + (uint64_t)r0 * m->row_bytes;
-    matvec_one(m->out + r0, &slice, m->input, r1 - r0, m->cols);
+    matvec_one(m->out + r0, &slice, m->input, m->q8, r1 - r0, m->cols);
 }
 
 static void matvec(float *out, gguf_tensor_t *tensor,
                    const float *input, uint32_t rows, uint32_t cols)
 {
-    matvec_split_t m = { out, tensor, input, rows, cols, row_bytes(tensor->type, cols), llm_parts };
+    const q8_input_t *q8 = q8_input(tensor->type, input, cols);
+    matvec_split_t m = { out, tensor, input, q8, rows, cols, row_bytes(tensor->type, cols), llm_parts };
     if (m.parts > 1 && rows >= 64 * (uint32_t)m.parts && m.row_bytes)
         llm_par_run(m.parts, matvec_part, &m);
     else
-        matvec_one(out, tensor, input, rows, cols);
+        matvec_one(out, tensor, input, q8, rows, cols);
 }
 
-static void matvec_one(float *out, gguf_tensor_t *tensor,
-                       const float *input, uint32_t rows, uint32_t cols)
+/* q8: the input quantized for SDOT, or 0 for the float kernels */
+static void matvec_one(float *out, gguf_tensor_t *tensor, const float *input,
+                       const q8_input_t *q8, uint32_t rows, uint32_t cols)
 {
+    if (q8) {
+        switch (tensor->type) {
+        case GGML_TYPE_Q4_0:
+            matvec_q4_0_sdot(out, tensor->data, q8, rows, cols);
+            return;
+        case GGML_TYPE_Q4_1:
+            matvec_q4_1_sdot(out, tensor->data, q8, rows, cols);
+            return;
+        case GGML_TYPE_Q8_0:
+            matvec_q8_0_sdot(out, tensor->data, q8, rows, cols);
+            return;
+        }
+    }
 #ifdef __EMSCRIPTEN__
     /* Only fires under bdebug gpu 1 + a giant shape. The break-even
      * threshold is so high (~100k elements) that brandon-tiny only

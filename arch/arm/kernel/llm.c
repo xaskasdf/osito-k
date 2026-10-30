@@ -4,7 +4,8 @@
  * The inference stack is x86's, ported: fs/gguf.c parses the GGUF,
  * tokenizer.c (BPE or SentencePiece), inference.c (llama-style models and
  * brandon-tiny, with the chat template chosen from the vocabulary) and
- * tensor.c, whose SIMD paths are NEON here (tensor_neon.c). This file
+ * tensor.c, whose SIMD paths are NEON here (tensor_neon.c), or SDOT on an
+ * 8-bit copy of the input for quantized weights (tensor_sdot.c). This file
  * loads a model from OsitoFS into the high memory region, wires the
  * tokenizer, and has the shell commands plus what the x86 code expects of
  * its kernel: SMP work submission and NVMe layer streaming are stubbed, so
@@ -32,6 +33,7 @@
 #include "inference.h"
 #include "tokenizer.h"
 #include "tensor.h"
+#include "tensor_sdot.h"
 
 #define LLM_CPU         7               /* the X1 */
 #define MAX_SEQ         512
@@ -423,6 +425,9 @@ static void selftest(void *arg)
     (void)arg;
     static uint8_t q4[ST_ROWS * ST_COLS / 32 * 18];
     static uint8_t q41[ST_ROWS * ST_COLS / 32 * 20];
+    static uint8_t q80[ST_ROWS * ST_COLS / 32 * 34];
+    static int8_t xq[ST_COLS];
+    static float xd[ST_COLS / 32], xs[ST_COLS / 32];
     static __fp16 f16[ST_ROWS * ST_COLS];
     static float x[ST_COLS], a[ST_COLS], b[ST_COLS], w[ST_COLS];
     static float ref[ST_ROWS > ST_COLS ? ST_ROWS : ST_COLS], got[ST_ROWS > ST_COLS ? ST_ROWS : ST_COLS];
@@ -439,6 +444,12 @@ static void selftest(void *arg)
     for (uint32_t blk = 0; blk < sizeof(q41) / 20; blk++) {
         __fp16 dm[2] = { (__fp16)(0.01f + 0.05f * absf(rndf())), (__fp16)(-0.4f * absf(rndf())) };
         memcpy(q41 + blk * 20, dm, 4);
+    }
+    for (uint32_t i = 0; i < sizeof(q80); i++)
+        q80[i] = (uint8_t)rnd();
+    for (uint32_t blk = 0; blk < sizeof(q80) / 34; blk++) {
+        __fp16 s = (__fp16)(0.0005f + 0.002f * absf(rndf()));
+        memcpy(q80 + blk * 34, &s, 2);
     }
     for (uint32_t i = 0; i < ST_ROWS * ST_COLS; i++)
         f16[i] = (__fp16)rndf();
@@ -473,6 +484,30 @@ static void selftest(void *arg)
     tensor_simd = 1;
     matvec_q4_1(got, q41, x, ST_ROWS, ST_COLS);
     ok &= check("matvec q4_1", rel_diff(got, ref, ST_ROWS), 1e-5f);
+
+    tensor_simd = 0;
+    matvec_q8_0(ref, q80, x, ST_ROWS, ST_COLS);
+    tensor_simd = 1;
+    matvec_q8_0(got, q80, x, ST_ROWS, ST_COLS);
+    ok &= check("matvec q8_0", rel_diff(got, ref, ST_ROWS), 1e-5f);
+
+    /* SDOT rounds the input to 8 bits: a fraction of a percent */
+    if (tensor_sdot_detect()) {
+        q8_input_t xq8 = { xd, xs, xq };
+        q8_quantize(&xq8, x, ST_COLS);
+        matvec_q8_0_sdot(got, q80, &xq8, ST_ROWS, ST_COLS);
+        ok &= check("sdot q8_0 ", rel_diff(got, ref, ST_ROWS), 2e-2f);
+        tensor_simd = 0;
+        matvec_q4_0(ref, q4, x, ST_ROWS, ST_COLS);
+        matvec_q4_0_sdot(got, q4, &xq8, ST_ROWS, ST_COLS);
+        ok &= check("sdot q4_0 ", rel_diff(got, ref, ST_ROWS), 2e-2f);
+        matvec_q4_1(ref, q41, x, ST_ROWS, ST_COLS);
+        matvec_q4_1_sdot(got, q41, &xq8, ST_ROWS, ST_COLS);
+        ok &= check("sdot q4_1 ", rel_diff(got, ref, ST_ROWS), 2e-2f);
+        tensor_simd = 1;
+    } else {
+        serial_puts("  sdot: not on this CPU\n");
+    }
 
     for (uint32_t r = 0; r < ST_ROWS; r++) {
         float s = 0;
@@ -523,7 +558,8 @@ static void selftest(void *arg)
     serial_puts(ok ? "llm selftest: all ok\n" : "llm selftest: FAILED\n");
 }
 
-/* Shell `llm`: the compute path; `llm simd on|off`, `llm selftest` */
+/* Shell `llm`: the compute path; `llm simd on|off`, `llm sdot on|off`,
+ * `llm smp on|off`, `llm selftest` */
 void cmd_llm(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "selftest") == 0) {
@@ -532,15 +568,19 @@ void cmd_llm(int argc, char **argv)
     }
     if (argc == 3 && strcmp(argv[1], "simd") == 0) {
         tensor_simd = strcmp(argv[2], "off") != 0;
-        dispatch_init();
+    } else if (argc == 3 && strcmp(argv[1], "sdot") == 0) {
+        tensor_sdot_wanted = strcmp(argv[2], "off") != 0;
     } else if (argc == 3 && strcmp(argv[1], "smp") == 0) {
         llm_use_workers = strcmp(argv[2], "off") != 0;
     } else if (argc != 1) {
-        serial_puts("usage: llm [simd on|off | smp on|off | selftest]\n");
+        serial_puts("usage: llm [simd on|off | sdot on|off | smp on|off | selftest]\n");
         return;
     }
+    dispatch_init();
     serial_puts("llm: ");
-    serial_puts(tensor_simd ? "NEON" : "scalar");
+    serial_puts(disp.path_name);
+    if (tensor_simd && tensor_sdot_wanted && !tensor_sdot)
+        serial_puts(" (no SDOT on this CPU)");
     if (smp_get_cpu_count() <= LLM_CPU)
         serial_puts(", one CPU (no X1 here)");
     else

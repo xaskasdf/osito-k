@@ -61,7 +61,7 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/crypto.c kernel/random.c kernel/tls.c kernel/http.c kernel/smp.c \
             kernel/tls13.c kernel/hkdf.c kernel/tls_verify.c kernel/ca_roots.c kernel/ecdh_p256.c \
             kernel/claude.c kernel/tokenizer.c kernel/tokenizer_trie.c \
-            kernel/tensor.c kernel/tensor_neon.c kernel/tensor_arena.c \
+            kernel/tensor.c kernel/tensor_neon.c kernel/tensor_sdot.c kernel/tensor_arena.c \
             kernel/inference.c kernel/dispatch.c kernel/llm.c \
             kernel/git.c kernel/zlib.c kernel/memcompress.c kernel/input_events.c \
             kernel/stubs.c \
@@ -149,13 +149,17 @@ $(BUILD)/%.o: %.c
 # scheduler saves no FP/SIMD state, so their code must stay on one CPU that
 # no other FP user shares (see kernel/llm.c).
 FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(CFLAGS))
-FP_SRCS   := kernel/tensor.c kernel/tensor_neon.c kernel/inference.c \
+FP_SRCS   := kernel/tensor.c kernel/tensor_neon.c kernel/tensor_sdot.c kernel/inference.c \
              kernel/tokenizer.c kernel/llm.c fs/gguf.c \
              drivers/gpu_inference.c drivers/gpu_tensor.c
 $(patsubst %.c,$(BUILD)/%.o,$(FP_SRCS)): $(BUILD)/%.o: %.c
 	@echo "[CC] $< (FP)"
 	@mkdir -p $(dir $@)
 	@$(CC) $(FP_CFLAGS) -c $< -o $@
+
+# SDOT's file alone may use the dot product instructions: it runs only where
+# tensor_sdot_detect found them (QEMU's Cortex-A72 has none)
+$(BUILD)/kernel/tensor_sdot.o: FP_CFLAGS += -march=armv8.2-a+dotprod
 
 # GUI shared library
 $(BUILD)/gui/%.o: ../../gui/%.c ../../gui/gui.h ../../gui/gui_theme.h

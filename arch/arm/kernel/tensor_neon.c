@@ -96,6 +96,36 @@ void matvec_q4_1_neon(float *out, const void *weight, const float *input,
     }
 }
 
+/* Q8_0: per 32 values an f16 scale and 32 int8 (SmolLM2's token embedding,
+ * which is also its output layer) */
+void matvec_q8_0_neon(float *out, const void *weight, const float *input,
+                      uint32_t rows, uint32_t cols)
+{
+    const uint8_t *w = (const uint8_t *)weight;
+    uint32_t blocks = cols / 32;
+
+    for (uint32_t r = 0; r < rows; r++) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (uint32_t b = 0; b < blocks; b++, w += 34) {
+            int8x16_t q0 = vld1q_s8((const int8_t *)w + 2), q1 = vld1q_s8((const int8_t *)w + 18);
+            int16x8_t l0 = vmovl_s8(vget_low_s8(q0)), l1 = vmovl_s8(vget_high_s8(q0));
+            int16x8_t h0 = vmovl_s8(vget_low_s8(q1)), h1 = vmovl_s8(vget_high_s8(q1));
+            const float *x = input + (uint64_t)b * 32;
+
+            float32x4_t d0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(l0))), vld1q_f32(x));
+            float32x4_t d1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(l0))), vld1q_f32(x + 4));
+            d0 = vfmaq_f32(d0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(l1))), vld1q_f32(x + 8));
+            d1 = vfmaq_f32(d1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(l1))), vld1q_f32(x + 12));
+            d0 = vfmaq_f32(d0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(h0))), vld1q_f32(x + 16));
+            d1 = vfmaq_f32(d1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(h0))), vld1q_f32(x + 20));
+            d0 = vfmaq_f32(d0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(h1))), vld1q_f32(x + 24));
+            d1 = vfmaq_f32(d1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(h1))), vld1q_f32(x + 28));
+            acc = vfmaq_n_f32(acc, vaddq_f32(d0, d1), half(w));
+        }
+        out[r] = vaddvq_f32(acc);
+    }
+}
+
 /* F16 weights, row-major (brandon-tiny ships every layer as f16) */
 void matvec_f16_avx2(float *out, const void *weight, const float *input,
                      uint32_t rows, uint32_t cols)

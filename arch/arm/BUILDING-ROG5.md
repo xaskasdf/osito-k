@@ -783,7 +783,8 @@ compiled but never used:
 put (host): arch/arm/scripts/rog5-put.ps1 -File smollm2-135m-q4_0.gguf -Name smollm2.gguf
 model smollm2.gguf        # load it (model: the loaded one)
 chat What is the capital of France?
-llm selftest              # NEON against the scalar code, the split, the math
+llm selftest              # NEON and SDOT against the scalar code, the split, the math
+llm sdot off              # NEON's float kernels, for comparison
 llm simd off              # the scalar path, for comparison
 llm smp off               # the X1 alone, for comparison
 ```
@@ -793,10 +794,26 @@ so. Here `tensor_has_avx2()` returns `tensor_simd`, and `kernel/tensor_neon.c`
 defines those names with the same signatures, in NEON:
 - `matvec_q4_0_avx2`, `matvec_f16_avx2`, `rmsnorm_avx2`, `vec_add_avx2`,
   `vec_mul_avx2`;
-- plus `matvec_q4_1_neon`.
+- plus `matvec_q4_1_neon` and `matvec_q8_0_neon` (SmolLM2's token embedding,
+  which is also its output layer: 49152 × 576, a fifth of the work per
+  token, and scalar until then).
 
 `llm selftest` compares each against the scalar code on random data, with
 largest relative differences of 0 to 1e-6.
+
+**SDOT.** Those kernels widen every weight to a float. For Q4_0, Q4_1 and
+Q8_0 weights, `kernel/tensor_sdot.c` does what llama.cpp does instead:
+- `inference.c`'s `matvec` quantizes the input once (per 32 values a scale
+  and 32 int8, plus their exact sum for Q4_1's minimum), and every part of
+  the split uses it;
+- a block's dot product is two `SDOT`s (16 int8 × int8 products each into
+  four int32), times the two scales.
+
+Rounding the input to 8 bits costs 0.4–0.7 % relative error in the selftest.
+Every SM8350 core has the instructions; QEMU's Cortex-A72 doesn't, so
+`dispatch_init` reads `ID_AA64ISAR0_EL1.DP` and keeps the float kernels
+without them (`llm` says which path runs). Only `tensor_sdot.c` is built with
+`+dotprod`.
 
 **What had to change from x86:**
 - **Math.** The x87 code became double-precision C: `fsqrt` for the square
@@ -831,12 +848,16 @@ Makefile's `FP_SRCS`) runs only in pinned tasks, one per CPU:
 Nothing else there uses FP: GUI, touch, keys and IRQ code are built with
 `-mgeneral-regs-only`.
 
-**Measured on the phone (NEON):**
+**Measured on the phone:**
 
 | Model | Size | Load (UFS + parse) | X1 alone: prefill, per token | X1 + 3 A78s: prefill, per token |
 |-------|------|--------------------|------------------------------|---------------------------------|
-| `brandon-tiny-10m-instruct.f16.gguf` | 21 MB | 356 ms | 71 ms (18 tok), 9 ms | 55 ms (13 tok), 6 ms (~165 tok/s) |
-| `smollm2-135m-q4_0.gguf` (BPE, ChatML) | 92 MB | 1.5 s | 681 ms (16 tok), 45 ms | 271 ms (16 tok), 20 ms (~50 tok/s) |
+| `brandon-tiny-10m-instruct.f16.gguf` (NEON) | 21 MB | 356 ms | 71 ms (18 tok), 9 ms | 55 ms (13 tok), 6 ms (~165 tok/s) |
+| `smollm2-135m-q4_0.gguf` (BPE, ChatML), NEON before Q8_0 | 92 MB | 1.5 s | 681 ms (16 tok), 45 ms | 271 ms (16 tok), 20 ms (~50 tok/s) |
+| the same, NEON + SDOT (2026-10-30) | | 274 ms | 159 ms (16 tok), 13 ms | 126 ms (16 tok), 10 ms (~100 tok/s) |
+
+With `llm sdot off` (NEON floats, Q8_0 included) SmolLM2 takes 217 ms and
+16 ms a token on the four cores.
 
 SmolLM2's answer to "What is the capital of France?" began "The capital of
 France is Paris, a city steeped in history, culture, and romance." Models are
@@ -1255,6 +1276,12 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
       day from NTP.
     - The badssl.com failures are refused, and Amazon and Microsoft verify
       over TLS 1.3 with RSA-PSS.
+34. **Window buttons, and an LLM twice as fast (2026-10-30).**
+    - The desktop's title bar buttons answer taps (close and minimize; see
+      "Desktop"), and `touch tap` drives it from the console.
+    - SmolLM2's output layer, Q8_0, had no NEON kernel and ran scalar. With
+      one, and SDOT for the quantized matvecs (see "Local LLM"), it went
+      from 20 to 10 ms a token, and its prefill from 276 to 126 ms.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1794,7 +1821,8 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/lib/bearssl/` | BearSSL 0.6, the subset used (X.509, RSA, ECDSA, SHA-2) |
 | `tools/ca-roots/gen-bearssl-anchors.py` | Generates `ca_roots.c` from Mozilla's bundle |
 | `arch/arm/kernel/llm.c` | `model` / `chat` / `llm`: GGUF from OsitoFS into high memory, tokenizer, x86 glue stubs, NEON selftest |
-| `arch/arm/kernel/tensor_neon.c` | NEON kernels under x86's AVX2 names (Q4_0, Q4_1, F16 matvec, rmsnorm, vec ops) |
+| `arch/arm/kernel/tensor_neon.c` | NEON kernels under x86's AVX2 names (Q4_0, Q4_1, Q8_0, F16 matvec, rmsnorm, vec ops) |
+| `arch/arm/kernel/tensor_sdot.c` | SDOT matvecs on Q4_0/Q4_1/Q8_0 weights against an 8-bit copy of the input; DP detection |
 | `arch/arm/kernel/{inference,tensor,tokenizer,tokenizer_trie}.c`, `fs/gguf.c` | x86's inference stack, ported (CNTPCT timing, double-precision math, Q4_1) |
 | `arch/arm/platform/sm8350/keys.c` | Power / volume keys: console history, fastboot and status shortcuts |
 | `arch/arm/platform/sm8350/ufs.c` | UFS host controller: LUNs, GPT, block dumps; writes only into `userdata` (OsitoFS v3: `mkfs`, `mount`, `migrate`) |

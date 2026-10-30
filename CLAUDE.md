@@ -114,7 +114,7 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - The stack (`kernel/net.c`) isn't reentrant: hold it with `net_hold`/`net_release` around any use.
   - The `net` task polls it only when it's free.
 - Local LLM: `kernel/llm.c` (`model <file.gguf>`, `chat <text>`, `llm selftest`) runs x86's inference stack, ported.
-  - Its SIMD paths are NEON under x86's AVX2 names (`kernel/tensor_neon.c`).
+  - Its SIMD paths are NEON under x86's AVX2 names (`kernel/tensor_neon.c`). Q4_0/Q4_1/Q8_0 matvecs use SDOT on an 8-bit copy of the input (`kernel/tensor_sdot.c`, the only file built with `+dotprod`) where `ID_AA64ISAR0_EL1` shows it; QEMU's Cortex-A72 lacks it.
   - The scheduler saves no FP/SIMD state, so FP code (the Makefile's `FP_SRCS`) must stay in one pinned task per CPU. `model`/`chat` pin the shell to the X1 (CPU 7) while they run.
   - Matvecs are split over the X1 and three worker tasks pinned to the A78s (CPUs 4–6), which spin only while `model`/`chat` runs.
 - Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.

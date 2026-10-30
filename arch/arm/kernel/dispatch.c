@@ -5,9 +5,11 @@
  * tensor wrappers (tensor.c) already choose NEON or scalar by tensor_simd,
  * so the table points at them; memcpy_fast/memset_fast stay null, which
  * means "use memcpy/memset". llm.c calls dispatch_init before a model loads.
+ * It also turns on the SDOT matvecs (tensor_sdot.c) where the CPU has them.
  */
 
 #include "../include/dispatch.h"
+#include "tensor_sdot.h"
 
 extern void serial_puts(const char *s);
 extern int tensor_simd;
@@ -29,5 +31,6 @@ void dispatch_init(void)
     disp.vec_mul     = vec_mul;
     disp.memcpy_fast = 0;
     disp.memset_fast = 0;
-    disp.path_name   = tensor_simd ? "NEON" : "scalar";
+    tensor_sdot = tensor_simd && tensor_sdot_wanted && tensor_sdot_detect();
+    disp.path_name   = tensor_sdot ? "NEON + SDOT" : tensor_simd ? "NEON" : "scalar";
 }
