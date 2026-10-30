@@ -1,8 +1,8 @@
 /*
  * OsitoFS v2 driver for AArch64 (port from x86-64)
  *
- * Full R/W driver with block reclamation.
- * Uses VirtIO-blk backend instead of NVMe.
+ * Full R/W driver with block reclamation, on VirtIO-blk (QEMU virt) or,
+ * on SM8350, the UFS userdata partition (ufs.c sets the backend).
  */
 
 #include "../include/hal.h"
@@ -12,15 +12,29 @@
 
 /* ── Declarations ────────────────────────────────────────────── */
 
-/* Block I/O: redirect to VirtIO-blk */
+/* Block I/O: VirtIO-blk unless the platform picks another device
+ * (osfs2_set_backend). Offsets are bytes from the start of that device. */
+static int (*be_read)(uint64_t off, void *buf, uint64_t len) = virtio_blk_read_bytes;
+static int (*be_write)(uint64_t off, const void *buf, uint64_t len) = virtio_blk_write_bytes;
+static int (*be_flush)(void) = virtio_blk_flush;
+
+void osfs2_set_backend(int (*read)(uint64_t off, void *buf, uint64_t len),
+                       int (*write)(uint64_t off, const void *buf, uint64_t len),
+                       int (*flush)(void))
+{
+    be_read = read;
+    be_write = write;
+    be_flush = flush;
+}
+
 static inline int nvme_read_bytes(uint64_t off, void *buf, uint64_t len) {
-    return virtio_blk_read_bytes(off, buf, len);
+    return be_read(off, buf, len);
 }
 static inline int nvme_write_bytes(uint64_t off, const void *buf, uint64_t len) {
-    return virtio_blk_write_bytes(off, buf, len);
+    return be_write(off, buf, len);
 }
 static inline int nvme_flush(void) {
-    return virtio_blk_flush();
+    return be_flush();
 }
 
 /* strcpy for freestanding */
@@ -271,9 +285,13 @@ superblock_ok:
     serial_putdec(fs_max_files);
     serial_puts("\n");
 
-    /* Read full file table */
+    /* Read full file table (a mount after a format frees the last one's) */
     {
-        file_table = (osfs2_file_t *)mem_alloc_pages(fs_filetab_size / 4096);
+        static uint32_t file_table_pages;
+        if (file_table)
+            mem_free_pages(file_table, file_table_pages);
+        file_table_pages = fs_filetab_size / 4096;
+        file_table = (osfs2_file_t *)mem_alloc_pages(file_table_pages);
         if (!file_table) {
             serial_puts("[OsitoFS] Failed to allocate file table\n");
             return -1;
@@ -287,7 +305,8 @@ superblock_ok:
     serial_puts("[OsitoFS] File table loaded\n");
 
     /* Read block CRC table (1MB at fixed offset) */
-    crc_table = (uint32_t *)mem_alloc_pages(OSFS2_CRCTAB_SIZE / 4096);
+    if (!crc_table)
+        crc_table = (uint32_t *)mem_alloc_pages(OSFS2_CRCTAB_SIZE / 4096);
     if (crc_table) {
         if (osfs2_part_read(fs_crctab_off, crc_table, OSFS2_CRCTAB_SIZE) < 0) {
             serial_puts("[OsitoFS] CRC table read failed (verification disabled)\n");
@@ -767,9 +786,65 @@ int osfs2_delete(const char *name)
     return 0;
 }
 
+/* ── Format (tools/ositofs/mkfs.c, in the kernel) ────────────── */
+
+/* An empty filesystem on the backend's first `bytes`: 1 MB blocks, 4096
+ * file slots, the expanded layout (superblock + backup, file table, CRC
+ * table, layer index: the first 4 MB). Unmounts whatever was mounted. */
+int osfs2_format(uint64_t bytes, const char *label)
+{
+    const uint32_t bs = OSFS2_DEFAULT_BLOCK_SIZE, slots = OSFS2_LEGACY_MAX_FILES;
+    uint64_t blocks = bytes >> osfs2_block_shift(bs);
+    uint32_t data_off = osfs2_layout_data_off_for_slots(slots);
+    if (blocks > OSFS2_MAX_BLOCKS)
+        blocks = OSFS2_MAX_BLOCKS;          /* what the CRC table covers */
+    if (blocks < data_off / bs + 1)
+        return -1;
+
+    uint8_t *zero = mem_alloc_pages(bs / 4096);
+    if (!zero)
+        return -1;
+    memset(zero, 0, bs);
+    mounted = false;
+    partition_offset = 0;
+
+    osfs2_super_t *sb = (osfs2_super_t *)zero;
+    sb->magic = OSFS2_MAGIC;
+    sb->version = OSFS2_VERSION;
+    sb->block_size = bs;
+    sb->total_blocks = (uint32_t)blocks;
+    sb->used_blocks = data_off / bs;        /* metadata only */
+    sb->next_data_block = data_off / bs;
+    uint64_t now = timer_get_ticks();
+    for (int i = 0; i < 16; i++)
+        sb->uuid[i] = (uint8_t)(now >> (8 * (i % 8))) ^ (uint8_t)(i * 37);
+    for (int i = 0; label[i] && i < OSFS2_LABEL_LEN - 1; i++)
+        sb->label[i] = label[i];
+    sb->layout_magic = OSFS2_LAYOUT_MAGIC;
+    sb->file_table_slots = slots;
+    sb->metadata_bytes = data_off;
+    sb->crc32 = osfs2_crc32(sb, sizeof(*sb));
+    memcpy(zero + OSFS2_SUPER_BACKUP_OFF, sb, sizeof(*sb));
+
+    int rc = osfs2_part_write(0, zero, OSFS2_SUPER_REGION_SIZE);
+    memset(zero, 0, sizeof(*sb));
+    memset(zero + OSFS2_SUPER_BACKUP_OFF, 0, sizeof(*sb));
+    /* File table, CRC table and layer index, zeroed */
+    for (uint32_t off = OSFS2_FILETAB_OFF; !rc && off < data_off; off += bs) {
+        uint32_t len = data_off - off < bs ? data_off - off : bs;
+        rc = osfs2_part_write(off, zero, len);
+    }
+    if (!rc)
+        rc = nvme_flush();
+    mem_free_pages(zero, bs / 4096);
+    return rc;
+}
+
 /* ── Accessors ───────────────────────────────────────────────── */
 
 bool osfs2_is_mounted(void)  { return mounted; }
+/* Data written with osfs2_write, out of the device's write cache */
+int osfs2_sync(void) { return mounted ? nvme_flush() : -1; }
 uint32_t osfs2_file_count(void) { return mounted ? superblock.file_count : 0; }
 const char *osfs2_label(void) { return mounted ? superblock.label : ""; }
 uint64_t osfs2_file_size(osfs2_file_t *file) { return file ? file->size : 0; }

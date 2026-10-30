@@ -35,6 +35,7 @@ void platform_start_tasks(void);
 void platform_temp_cmd(int argc, char **argv);   /* shell `temp` */
 void platform_keys_cmd(int argc, char **argv);   /* shell `keys` */
 void platform_ufs_cmd(int argc, char **argv);    /* shell `ufs` */
+void platform_put_cmd(int argc, char **argv);    /* shell `put`: a file over USB */
 
 /* ========================================================================
  * UART (platform-specific low-level)
@@ -215,11 +216,18 @@ uint64_t virtio_blk_capacity(void);
  * ======================================================================== */
 #include "../../../include/common/ositofs2_format.h"
 
+/* The device it lives on: VirtIO-blk unless a platform sets another (byte
+ * offsets from the device's start) */
+void osfs2_set_backend(int (*read)(uint64_t off, void *buf, uint64_t len),
+                       int (*write)(uint64_t off, const void *buf, uint64_t len),
+                       int (*flush)(void));
+int  osfs2_format(uint64_t bytes, const char *label);  /* empty fs, 1 MB blocks */
 int  osfs2_mount(uint64_t part_offset);
 void osfs2_list(void);
 osfs2_file_t *osfs2_find(const char *name);
 int  osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len);
 osfs2_file_t *osfs2_create(const char *name, uint64_t size);
+int  osfs2_sync(void);      /* what osfs2_write wrote, out of the device's cache */
 int  osfs2_delete(const char *name);
 
 /* ========================================================================

@@ -331,16 +331,19 @@ burn ending, it released them to the top levels.
 
 ---
 
-## Storage (UFS), read-only
+## Storage (UFS)
 
 The phone's storage is a **Samsung KLUEG8UHDC-B0E1** (256 GB, UFS 3.1) on the
 `ufshc@1d84000` controller (UFSHCI 3.0, 32 request slots, 64-bit DMA). It holds
-every partition the phone has, so `platform/sm8350/ufs.c` **never writes to it**:
-- `scsi()` sends only TEST UNIT READY, INQUIRY, READ CAPACITY(10) and READ(10).
-  It refuses any other opcode.
-- The data direction is always device-to-host, the UPIU's W flag is never set,
-  and inline crypto (ICE) stays off. `userdata` is file-based encrypted, so its
-  blocks read back as ciphertext.
+every partition the phone has, ABL and both boot slots included. So
+`platform/sm8350/ufs.c` **writes only to LUN 0's `userdata`**, which belongs to
+Osito-K since 2026-10-29 (Android's data there, encrypted, was given up):
+- `permitted()` decides every command. Reads (TEST UNIT READY, INQUIRY, READ
+  CAPACITY(10), READ(10)) may go anywhere.
+- WRITE(10) passes only if its whole LBA range lies inside `userdata`, found by
+  name in LUN 0's GPT (LBA 2 352 680–61 865 978). SYNCHRONIZE CACHE goes only
+  to LUN 0. Any other opcode is refused.
+- Until that lookup has run, nothing writes. Inline crypto (ICE) stays off.
 
 ABL boots from UFS and leaves the controller up: the power domain
 (`gcc_ufs_phy_gdsc`, GCC `0x77004`) and all ten UFS clocks are on, the link is
@@ -367,6 +370,30 @@ same way.
   Android also shows has a zero type GUID, which the UEFI spec calls unused.
 - `ufs read <lun> <lba> [offset]` hexdumps 256 bytes of a block (numbers in
   decimal or `0x` hex).
+
+**OsitoFS on `userdata`.**
+- **The device:** OsitoFS (`fs/ositofs2.c`) runs on a selectable backend
+  (`osfs2_set_backend`), VirtIO-blk on virt. On the phone it's `userdata` as a
+  byte device: commands of up to 16 blocks of 4 KB, and a write that covers a
+  block only partly reads it first.
+- **Format:** `ufs mkfs userdata` (the name typed as confirmation) formats it
+  with the in-kernel `osfs2_format`, a port of `tools/ositofs/mkfs.c`: 1 MB
+  blocks, 4096 file slots, the expanded layout. It writes only the first 4 MB:
+  232 469 data blocks, 227 GB.
+- **Mount:** boot mounts it (`ufs_mount_at_boot`, ~0.6 s), and `ufs mount`
+  does it by hand.
+- **Files:** the shell's `ls`, `cat`, `hexdump`, `df` and `exec` work on it.
+- **Upload:** `put <name>` takes a file from the host with `kload`'s framing
+  (`"OKLD"`, size, CRC-32, bytes; `arch/arm/scripts/rog5-put.ps1 -File <path>
+  [-Name <name>]`, up to 64 MB). It replaces a file with that name, flushes the
+  device's cache, reads the file back from UFS and checks the CRC before
+  saying "stored and verified". 5 MB of random bytes took 3 s (~1.65 MB/s, the
+  USB console's pace).
+- **Apps:** `exec <name>` loads a static AArch64 ELF from it and runs it (EL1,
+  Linux syscall numbers, `kernel/syscall.c`). `elf.c` now cleans the D-cache
+  and invalidates the I-cache over what it loads, since with the caches on the
+  copied code could otherwise run stale. `test/hello.S`, linked with
+  `aarch64-elf-gcc -nostdlib -static -Wl,-N`, ran from UFS on 2026-10-29.
 
 ---
 
@@ -603,6 +630,12 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     seven LUNs, and `ufs gpt 0` listed 23 partitions, `super` and `userdata`
     among them. The A55s' 300 MHz level came back the same day: it was the USB
     bug too.
+23. **Apps from UFS (2026-10-29).** `userdata` became Osito-K's: OsitoFS on it,
+    mounted at boot, writes refused anywhere else on the device. Files arrive
+    over USB with `put` and are checked against their CRC after reading them
+    back. `exec hello.elf` printed "Hello from userspace!" from a file stored on
+    UFS, the first app loaded that way. It needed I-cache maintenance in
+    `elf.c`, which predated the caches.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1126,7 +1159,8 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/thermal.c` | TSENS sensors (`temp`) and the big clusters' thermal cap |
 | `arch/arm/platform/sm8350/pmic_arb.c` | SPMI PMIC arbiter v5: single-byte PMIC reads and writes |
 | `arch/arm/platform/sm8350/keys.c` | Power / volume keys: console history, fastboot and status shortcuts |
-| `arch/arm/platform/sm8350/ufs.c` | UFS host controller, read-only: LUNs, GPT, block dumps |
+| `arch/arm/platform/sm8350/ufs.c` | UFS host controller: LUNs, GPT, block dumps; writes only into `userdata` (OsitoFS) |
+| `arch/arm/scripts/rog5-put.ps1` | Host side of `put`: copy a file onto the phone's OsitoFS |
 | `arch/arm/platform/sm8350/smmu.c` | Checks a DMA master's stream is 1:1 through the apps SMMU |
 | `arch/arm/scripts/rog5-kload.ps1` | Host side of `kload` (used by `rog5-boot.sh --usb`) |
 | `arch/arm/include/sm8350.h` | Hardware register definitions (verified) |

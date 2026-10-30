@@ -79,6 +79,13 @@ void platform_ufs_cmd(int argc, char **argv)
     serial_puts("ufs: only on SM8350\n");
 }
 
+void platform_put_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    serial_puts("put: only on SM8350 (over the USB console)\n");
+}
+
 /* No framebuffer console: QEMU shows the UART */
 void platform_screen_cmd(int argc, char **argv)
 {

@@ -87,7 +87,8 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - The A78s and the X1 share a voltage rail, so lowering one alone changes nothing.
   - `cpufreq try` runs a level under a watcher on another CPU, which restores it if the lowered CPUs stop ticking.
   - `platform/sm8350/thermal.c` reads the TSENS sensors (shell `temp`), and its task caps both big clusters together above 95 °C.
-- UFS (`platform/sm8350/ufs.c`, shell `ufs`) is read-only on purpose: it holds every partition of the phone. `scsi()` only sends TEST UNIT READY, INQUIRY, READ CAPACITY and READ(10); keep it that way unless the user asks for writes.
+- UFS (`platform/sm8350/ufs.c`, shell `ufs`) holds every partition of the phone, ABL and the boot slots included. Osito-K writes only to LUN 0's `userdata` (OsitoFS, mounted at boot): `permitted()` refuses any write outside that partition's LBA range and any opcode that isn't a read or WRITE(10)/SYNCHRONIZE CACHE. Never widen that without the user asking.
+  - Copy files on with `arch/arm/scripts/rog5-put.ps1 -File <path>` (shell `put <name>`); run static AArch64 ELFs with `exec <name>`.
 - Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
 - The kernel is a PIE linked at 0 that relocates itself in `start.S`, so it runs at any load address and stored pointers work. Linker-script symbols that C reads must be section-relative (an absolute symbol's GOT entry gets no relocation). After linking, `readelf -r kernel.elf` should show only `R_AARCH64_RELATIVE`.
 

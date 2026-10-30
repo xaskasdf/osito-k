@@ -1,5 +1,5 @@
 /*
- * ufs.c -- the SM8350's UFS host controller (ufshc@1d84000), read-only
+ * ufs.c -- the SM8350's UFS host controller (ufshc@1d84000)
  *
  * The phone's storage, every partition included: ABL boots from it and
  * leaves the controller up, link active, its request list idle. Shell `ufs`
@@ -9,11 +9,13 @@
  * the DMA window 1:1 (ABL leaves its context bank untranslated).
  *
  * `ufs luns`, `ufs gpt <lun>` and `ufs read <lun> <lba> [offset]` read the
- * device.
- * The first one takes the transfer request list over from ABL: stop it,
- * point it at ours, start it, nothing else. One slot, one command at a
- * time, polled. NOTHING WRITES TO THE DEVICE: scsi() sends only the reading
- * commands in `allowed`, always device-to-host, with inline crypto off.
+ * device. The first command takes the transfer request list over from ABL:
+ * stop it, point it at ours, start it. One slot, one command at a time,
+ * polled, inline crypto off.
+ *
+ * Osito-K writes only to LUN 0's userdata partition: OsitoFS lives there
+ * (`ufs mkfs userdata`, `ufs mount`). permitted() refuses any other write,
+ * and every command that isn't a read or a write into that range.
  *
  * Offsets: Linux drivers/clk/qcom/gcc-sm8350.c (the ufs_phy block at
  * 0x77000), include/ufs/ufshci.h and ufs.h, the phone's device tree (reg,
@@ -24,6 +26,9 @@
 #include "../../include/types.h"
 #include "mmu.h"
 #include "smmu.h"
+#include "ufs.h"
+
+bool osfs2_is_mounted(void);                /* fs/ositofs2.c */
 
 #define GCC_BASE            0x00100000UL
 #define GCC_UFS             0x77000     /* GCC_UFS_PHY_BCR */
@@ -121,11 +126,12 @@ static void put_flag(const char *name, int on)
     }
 }
 
-/* ── Reading the device ───────────────────────────────────────── */
+/* ── The device ───────────────────────────────────────────────── */
 
 /* UTP transfer request descriptor, word 0 */
 #define UTRD_CT_UFS         (1U << 28)  /* command type: UFS storage */
 #define UTRD_DD_NONE        (0U << 25)
+#define UTRD_DD_WRITE       (1U << 25)  /* host to device */
 #define UTRD_DD_READ        (2U << 25)  /* device to host */
 #define OCS_INVALID         0x0F        /* word 2, until the controller is done */
 
@@ -137,18 +143,28 @@ static void put_flag(const char *name, int on)
 #define UPIU_COMMAND        0x01
 #define UPIU_RESPONSE       0x21
 #define UPIU_FLAG_READ      0x40
+#define UPIU_FLAG_WRITE     0x20
 #define SCSI_GOOD           0x00
 #define SCSI_CHECK          0x02
 
-#define DATA_MAX            65536       /* one READ: 16 blocks of 4 KB */
+#define DATA_MAX            65536       /* one command: 16 blocks of 4 KB */
 #define CMD_TIMEOUT_MS      1000
 
-/* The only commands this file sends: none of them writes */
+/* Reading commands, sent anywhere */
 #define TEST_UNIT_READY     0x00
 #define INQUIRY             0x12
 #define READ_CAPACITY_10    0x25
 #define READ_10             0x28
 static const uint8_t allowed[] = { TEST_UNIT_READY, INQUIRY, READ_CAPACITY_10, READ_10 };
+
+/* Writing commands, only into the one partition Osito-K owns: LUN 0's
+ * userdata (Android's, given up on 2026-10-29), found by name in the GPT.
+ * Until ufs_attach() has found it, rw_blocks is 0 and nothing writes. */
+#define WRITE_10            0x2A
+#define SYNC_CACHE_10       0x35
+#define RW_LUN              0
+#define RW_PART             "userdata"
+static uint32_t rw_first, rw_blocks, rw_bsize;
 
 static volatile uint32_t *utrl;         /* 32 descriptors of 8 words, slot 0 used */
 static volatile uint8_t *ucd;
@@ -235,23 +251,40 @@ static uint64_t le64(const volatile uint8_t *p)
     return v;
 }
 
-/* One SCSI command to `lun`, reading `len` bytes into data[]. Returns the
- * SCSI status (SCSI_GOOD, or SCSI_CHECK with sense_key/asc/ascq set), or
- * -1 if the transfer itself failed. */
-static int scsi(uint8_t lun, const uint8_t cdb[16], uint32_t len)
+/* May this command go out? Reads anywhere; WRITE(10) and SYNCHRONIZE
+ * CACHE only on RW_LUN, a write only inside the userdata partition. */
+static int permitted(uint8_t lun, const uint8_t cdb[16], uint32_t len, int write)
 {
-    int ok = 0;
-    for (uint32_t i = 0; i < sizeof(allowed); i++)
-        ok |= cdb[0] == allowed[i];
-    if (!ok || len > DATA_MAX)
-        return -1;                      /* only reads, ever */
+    if (!write) {
+        if (cdb[0] == SYNC_CACHE_10)
+            return lun == RW_LUN && rw_blocks && !len;
+        for (uint32_t i = 0; i < sizeof(allowed); i++)
+            if (cdb[0] == allowed[i])
+                return 1;
+        return 0;
+    }
+    if (cdb[0] != WRITE_10 || lun != RW_LUN || !rw_blocks)
+        return 0;
+    uint64_t lba = (uint64_t)cdb[2] << 24 | cdb[3] << 16 | cdb[4] << 8 | cdb[5];
+    uint32_t count = (uint32_t)cdb[7] << 8 | cdb[8];
+    return count && len == count * rw_bsize &&
+           lba >= rw_first && lba + count <= (uint64_t)rw_first + rw_blocks;
+}
+
+/* One SCSI command to `lun`, moving `len` bytes through data[] (to the
+ * device if `write`). Returns the SCSI status (SCSI_GOOD, or SCSI_CHECK
+ * with sense_key/asc/ascq set), or -1 if refused or the transfer failed. */
+static int scsi(uint8_t lun, const uint8_t cdb[16], uint32_t len, int write)
+{
+    if (len > DATA_MAX || !permitted(lun, cdb, len, write))
+        return -1;
     if (take_over())
         return -1;
 
     for (int i = 0; i < UCD_SIZE; i++)
         ucd[i] = 0;
     ucd[0] = UPIU_COMMAND;
-    ucd[1] = len ? UPIU_FLAG_READ : 0;  /* never the W flag */
+    ucd[1] = !len ? 0 : write ? UPIU_FLAG_WRITE : UPIU_FLAG_READ;
     ucd[2] = lun;
     put_be32(&ucd[12], len);            /* expected data transfer length */
     for (int i = 0; i < 16; i++)
@@ -264,7 +297,8 @@ static int scsi(uint8_t lun, const uint8_t cdb[16], uint32_t len)
     prdt[3] = len ? len - 1 : 0;        /* byte count - 1 */
 
     uint64_t cd = (uint64_t)(uintptr_t)ucd;
-    utrl[0] = UTRD_CT_UFS | (len ? UTRD_DD_READ : UTRD_DD_NONE);   /* crypto off */
+    utrl[0] = UTRD_CT_UFS |                                         /* crypto off */
+              (!len ? UTRD_DD_NONE : write ? UTRD_DD_WRITE : UTRD_DD_READ);
     utrl[1] = 0;
     utrl[2] = OCS_INVALID;
     utrl[3] = 0;
@@ -305,7 +339,7 @@ static int read_capacity(uint8_t lun, uint32_t *blocks, uint32_t *bsize)
     uint8_t cdb[16] = { READ_CAPACITY_10 };
     /* The first command after a reset gets a UNIT ATTENTION: once more */
     for (int tries = 0; tries < 2; tries++) {
-        int st = scsi(lun, cdb, 8);
+        int st = scsi(lun, cdb, 8, 0);
         if (st == SCSI_GOOD) {
             *blocks = be32(&data[0]) + 1;
             *bsize = be32(&data[4]);
@@ -317,13 +351,19 @@ static int read_capacity(uint8_t lun, uint32_t *blocks, uint32_t *bsize)
     return -1;
 }
 
-static int read_blocks(uint8_t lun, uint32_t lba, uint32_t count, uint32_t bsize)
+/* READ(10) or WRITE(10) of `count` blocks between the device and data[] */
+static int rw_blocks_io(uint8_t lun, uint32_t lba, uint32_t count, uint32_t bsize, int write)
 {
-    uint8_t cdb[16] = { READ_10, 0,
+    uint8_t cdb[16] = { write ? WRITE_10 : READ_10, 0,
                         (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
                         (uint8_t)(lba >> 8), (uint8_t)lba,
                         0, (uint8_t)(count >> 8), (uint8_t)count };
-    return scsi(lun, cdb, count * bsize) == SCSI_GOOD ? 0 : -1;
+    return scsi(lun, cdb, count * bsize, write) == SCSI_GOOD ? 0 : -1;
+}
+
+static int read_blocks(uint8_t lun, uint32_t lba, uint32_t count, uint32_t bsize)
+{
+    return rw_blocks_io(lun, lba, count, bsize, 0);
 }
 
 static void put_mb(uint64_t bytes)
@@ -353,7 +393,7 @@ static void put_failure(const char *what)
 static void cmd_luns(void)
 {
     uint8_t inq[16] = { INQUIRY, 0, 0, 0, 36 };
-    if (scsi(0, inq, 36) == SCSI_GOOD) {
+    if (scsi(0, inq, 36, 0) == SCSI_GOOD) {
         serial_puts("device: ");
         for (int i = 8; i < 36; i++)
             serial_putc(data[i] >= 32 && data[i] < 127 ? (char)data[i] : ' ');
@@ -377,58 +417,87 @@ static void cmd_luns(void)
     }
 }
 
-/* `ufs gpt <lun>`: the partitions in its GPT (header at LBA 1) */
-static void cmd_gpt(uint8_t lun)
+/* A used GPT entry: its name (ASCII from UTF-16LE), first and last LBA */
+typedef struct {
+    char     name[37];
+    uint64_t first, last;
+} gpt_part_t;
+
+/* Calls fn for each used entry of the LUN's GPT (header at LBA 1). fn must
+ * not send commands: the entries live in data[]. Returns the number of
+ * entries, or -1 with the reason printed. */
+static int gpt_scan(uint8_t lun, uint32_t *bsize_out,
+                    void (*fn)(const gpt_part_t *p, uint32_t bsize, void *ctx), void *ctx)
 {
     uint32_t blocks, bsize;
     if (read_capacity(lun, &blocks, &bsize) || bsize > DATA_MAX || read_blocks(lun, 1, 1, bsize)) {
         put_failure("can't read that LUN");
-        return;
+        return -1;
     }
     static const char sig[] = "EFI PART";
     for (int i = 0; i < 8; i++)
         if (data[i] != (uint8_t)sig[i]) {
             serial_puts("ufs: no GPT at LBA 1\n");
-            return;
+            return -1;
         }
     uint64_t entries_lba = le64(&data[72]);
     uint32_t count = (uint32_t)le64(&data[80]) & 0xFFFFFFFF;
     uint32_t esize = (uint32_t)(le64(&data[84]) & 0xFFFFFFFF);
     if (esize < 128 || esize > bsize || entries_lba >= blocks) {
         serial_puts("ufs: odd GPT header\n");
-        return;
+        return -1;
     }
-    uint32_t per_block = bsize / esize, shown = 0;
+    uint32_t per_block = bsize / esize;
+    int used = 0;
     for (uint32_t blk = 0; blk * per_block < count; blk++) {
         if (read_blocks(lun, (uint32_t)entries_lba + blk, 1, bsize)) {
             put_failure("read failed");
-            return;
+            return -1;
         }
         for (uint32_t e = 0; e < per_block && blk * per_block + e < count; e++) {
             volatile uint8_t *p = data + e * esize;
             if (!le64(p) && !le64(p + 8))
-                continue;                       /* unused entry */
-            uint64_t first = le64(p + 32), last = le64(p + 40);
-            serial_puts("  ");
+                continue;                       /* zero type GUID: unused */
+            gpt_part_t part = { .first = le64(p + 32), .last = le64(p + 40) };
             int n = 0;
-            for (int c = 0; c < 36 && p[56 + 2 * c]; c++, n++)
-                serial_putc(p[56 + 2 * c] < 127 ? (char)p[56 + 2 * c] : '?');
-            for (; n < 20; n++)
-                serial_putc(' ');
-            serial_puts(" ");
-            serial_putdec(first);
-            serial_puts("-");
-            serial_putdec(last);
-            serial_puts("  ");
-            put_mb((last - first + 1) * bsize);
-            serial_puts("\n");
-            shown++;
+            for (; n < 36 && p[56 + 2 * n]; n++)
+                part.name[n] = p[56 + 2 * n] < 127 ? (char)p[56 + 2 * n] : '?';
+            part.name[n] = 0;
+            fn(&part, bsize, ctx);
+            used++;
         }
     }
+    if (bsize_out)
+        *bsize_out = bsize;
+    return used;
+}
+
+static void print_part(const gpt_part_t *p, uint32_t bsize, void *ctx)
+{
+    (void)ctx;
+    serial_puts("  ");
+    serial_puts(p->name);
+    for (int n = (int)strlen(p->name); n < 20; n++)
+        serial_putc(' ');
+    serial_puts(" ");
+    serial_putdec(p->first);
+    serial_puts("-");
+    serial_putdec(p->last);
+    serial_puts("  ");
+    put_mb((p->last - p->first + 1) * bsize);
+    serial_puts("\n");
+}
+
+/* `ufs gpt <lun>`: the partitions in its GPT */
+static void cmd_gpt(uint8_t lun)
+{
+    int n = gpt_scan(lun, (uint32_t *)0, print_part, (void *)0);
+    if (n < 0)
+        return;
     serial_puts("lun ");
     serial_putdec(lun);
     serial_puts(": ");
-    serial_putdec(shown);
+    serial_putdec((uint32_t)n);
     serial_puts(" partitions\n");
 }
 
@@ -458,6 +527,140 @@ static void cmd_read(uint8_t lun, uint32_t lba, uint32_t off)
         }
         serial_puts("\n");
     }
+}
+
+/* ── userdata, OsitoFS's device ───────────────────────────────── */
+
+static void find_rw_part(const gpt_part_t *p, uint32_t bsize, void *ctx)
+{
+    (void)bsize;
+    if (strcmp(p->name, RW_PART) == 0)
+        *(gpt_part_t *)ctx = *p;
+}
+
+/* Find userdata on LUN 0 and open it to writes. 0 if ready. */
+static int ufs_attach(void)
+{
+    if (rw_blocks)
+        return 0;
+    gpt_part_t part = { .last = 0 };
+    uint32_t bsize;
+    if (gpt_scan(RW_LUN, &bsize, find_rw_part, &part) < 0)
+        return -1;
+    if (!part.last || part.last < part.first || part.last >= 0xFFFFFFFFULL || bsize != 4096) {
+        serial_puts("ufs: no " RW_PART " partition on LUN 0\n");
+        return -1;
+    }
+    rw_first = (uint32_t)part.first;
+    rw_bsize = bsize;
+    rw_blocks = (uint32_t)(part.last - part.first + 1);
+    serial_puts("[UFS ] " RW_PART ": LBA ");
+    serial_putdec(rw_first);
+    serial_puts("-");
+    serial_putdec(part.last);
+    serial_puts(", ");
+    put_mb((uint64_t)rw_blocks * rw_bsize);
+    serial_puts(", writable\n");
+    return 0;
+}
+
+/* Bytes from userdata's start, through data[] in commands of up to 16
+ * blocks. A write that covers a block only partly reads it first. */
+static int part_io(uint64_t off, uint8_t *buf, uint64_t len, int write)
+{
+    uint64_t size = (uint64_t)rw_blocks * rw_bsize;
+    if (!rw_blocks || off > size || len > size - off)
+        return -1;
+    uint32_t bs = rw_bsize, max = DATA_MAX / bs;
+    while (len) {
+        uint32_t skip = (uint32_t)(off % bs);
+        uint64_t nblk = (skip + len + bs - 1) / bs;
+        if (nblk > max)
+            nblk = max;
+        uint64_t span = nblk * bs - skip;
+        if (span > len)
+            span = len;
+        uint32_t lba = rw_first + (uint32_t)(off / bs);
+        if (!write || skip || (skip + span) % bs) {
+            if (read_blocks(RW_LUN, lba, (uint32_t)nblk, bs))
+                return -1;
+        }
+        if (write) {
+            memcpy((uint8_t *)data + skip, buf, span);
+            if (rw_blocks_io(RW_LUN, lba, (uint32_t)nblk, bs, 1))
+                return -1;
+        } else {
+            memcpy(buf, (const uint8_t *)data + skip, span);
+        }
+        off += span;
+        buf += span;
+        len -= span;
+    }
+    return 0;
+}
+
+static int part_read(uint64_t off, void *buf, uint64_t len)
+{
+    return part_io(off, buf, len, 0);
+}
+
+static int part_write(uint64_t off, const void *buf, uint64_t len)
+{
+    return part_io(off, (uint8_t *)buf, len, 1);
+}
+
+static int part_flush(void)
+{
+    uint8_t cdb[16] = { SYNC_CACHE_10 };
+    return scsi(RW_LUN, cdb, 0, 0) == SCSI_GOOD ? 0 : -1;
+}
+
+/* userdata becomes OsitoFS's device */
+static int attach_fs(void)
+{
+    if (ufs_attach())
+        return -1;
+    osfs2_set_backend(part_read, part_write, part_flush);
+    return 0;
+}
+
+/* `ufs mkfs userdata`: an empty OsitoFS over it, then mounted. The name
+ * must be typed: it erases what was there. */
+static void cmd_mkfs(const char *confirm)
+{
+    if (strcmp(confirm, RW_PART) != 0) {
+        serial_puts("ufs mkfs: type the partition's name to erase it: ufs mkfs " RW_PART "\n");
+        return;
+    }
+    if (attach_fs())
+        return;
+    serial_puts("[UFS ] formatting " RW_PART " as OsitoFS (writes its first 4 MB)\n");
+    if (osfs2_format((uint64_t)rw_blocks * rw_bsize, "rog5")) {
+        put_failure("format failed");
+        return;
+    }
+    osfs2_mount(0);
+}
+
+/* `ufs mount`: mount the OsitoFS on userdata */
+static void cmd_mount(void)
+{
+    if (osfs2_is_mounted()) {
+        serial_puts("ufs: already mounted\n");
+        return;
+    }
+    if (attach_fs() == 0 && osfs2_mount(0) != 0)
+        serial_puts("ufs: no OsitoFS on " RW_PART " (ufs mkfs " RW_PART " makes one)\n");
+}
+
+/* At boot: mount the OsitoFS on userdata if it has one */
+void ufs_mount_at_boot(void)
+{
+    if (!clocked()) {
+        serial_puts("[UFS ] controller powered down: no filesystem\n");
+        return;
+    }
+    cmd_mount();
 }
 
 /* Decimal, or hex after 0x */
@@ -551,6 +754,10 @@ void platform_ufs_cmd(int argc, char **argv)
         survey();
     else if (argc == 2 && strcmp(argv[1], "luns") == 0)
         cmd_luns();
+    else if (argc == 2 && strcmp(argv[1], "mount") == 0)
+        cmd_mount();
+    else if (argc == 3 && strcmp(argv[1], "mkfs") == 0)
+        cmd_mkfs(argv[2]);
     else if (argc == 3 && strcmp(argv[1], "gpt") == 0 && !parse_num(argv[2], &lun) && lun < 8)
         cmd_gpt((uint8_t)lun);
     else if ((argc == 4 || argc == 5) && strcmp(argv[1], "read") == 0 &&
@@ -558,5 +765,6 @@ void platform_ufs_cmd(int argc, char **argv)
              (argc == 4 || !parse_num(argv[4], &off)))
         cmd_read((uint8_t)lun, lba, off);
     else
-        serial_puts("usage: ufs [luns | gpt <lun> | read <lun> <lba> [offset]]\n");
+        serial_puts("usage: ufs [luns | gpt <lun> | read <lun> <lba> [offset] | mount |\n"
+                    "            mkfs " RW_PART "]\n");
 }

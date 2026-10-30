@@ -3,6 +3,7 @@
  *
  * The `kload` shell command; the host side is arch/arm/scripts/rog5-kload.ps1
  * (rog5-boot.sh --usb). This replaces flashing boot_a for every test build.
+ * `put <name>` receives a file the same way (rog5-put.ps1) into OsitoFS.
  *
  * Protocol, after the device prints "kload: ready": the 4 bytes "OKLD", the
  * Image size and its CRC-32 (u32 little-endian each), then the Image. Bytes
@@ -22,6 +23,11 @@
 #include "usb.h"
 
 #define KLOAD_MAX       (32U << 20)
+#define PUT_MAX         (64U << 20)
+
+/* fs/ositofs2.c, beyond hal.h */
+int  osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len);
+bool osfs2_is_mounted(void);
 #define BYTE_TIMEOUT_MS 5000
 #define ARM64_MAGIC_OFF 0x38            /* "ARM\x64" in the Image header */
 
@@ -70,17 +76,28 @@ static uint32_t crc32_byte(uint32_t crc, uint8_t b)
     return crc;
 }
 
-int platform_kload(void)
+static void say(const char *who, const char *what)
+{
+    serial_puts(who);
+    serial_puts(": ");
+    serial_puts(what);
+}
+
+/* Print "<who>: ready", then take "OKLD" + size + CRC-32 + the bytes into
+ * fresh pages. Returns them (*pages to free), or NULL with the reason
+ * printed. */
+static uint8_t *receive(const char *who, uint32_t min, uint32_t max,
+                        uint32_t *size_out, uint64_t *pages_out)
 {
     static const char magic[4] = { 'O', 'K', 'L', 'D' };
     uint32_t matched = 0, size, crc_expect;
 
-    serial_puts("kload: ready\n");
+    say(who, "ready\n");
     while (matched < 4) {
         int c = read_byte();
         if (c < 0) {
-            serial_puts("kload: timeout waiting for the header\n");
-            return -1;
+            say(who, "timeout waiting for the header\n");
+            return (void *)0;
         }
         if (c == magic[matched])
             matched++;
@@ -88,30 +105,30 @@ int platform_kload(void)
             matched = (c == magic[0]);
     }
     if (read_u32(&size) || read_u32(&crc_expect)) {
-        serial_puts("kload: timeout in the header\n");
-        return -1;
+        say(who, "timeout in the header\n");
+        return (void *)0;
     }
-    if (size < ARM64_MAGIC_OFF + 4 || size > KLOAD_MAX) {
-        serial_puts("kload: bad size\n");
-        return -1;
+    if (size < min || size > max) {
+        say(who, "bad size\n");
+        return (void *)0;
     }
 
     uint64_t pages = (size + 4095) / 4096;
     uint8_t *buf = mem_alloc_pages(pages);
     if (!buf) {
-        serial_puts("kload: out of memory\n");
-        return -1;
+        say(who, "out of memory\n");
+        return (void *)0;
     }
 
     uint32_t crc = 0xFFFFFFFF;
     for (uint32_t i = 0; i < size; i++) {
         int c = read_byte();
         if (c < 0) {
-            serial_puts("kload: timeout after ");
+            say(who, "timeout after ");
             serial_putdec(i);
             serial_puts(" bytes\n");
             mem_free_pages(buf, pages);
-            return -1;
+            return (void *)0;
         }
         buf[i] = (uint8_t)c;
         crc = crc32_byte(crc, (uint8_t)c);
@@ -119,12 +136,71 @@ int platform_kload(void)
     crc = ~crc;
 
     if (crc != crc_expect) {
-        serial_puts("kload: crc mismatch, got ");
+        say(who, "crc mismatch, got ");
         serial_puthex(crc, 8);
         serial_puts("\n");
         mem_free_pages(buf, pages);
-        return -1;
+        return (void *)0;
     }
+    *size_out = size;
+    *pages_out = pages;
+    return buf;
+}
+
+/* Shell `put <name>`: a file from the host the same way (rog5-put.ps1), into
+ * the mounted OsitoFS, replacing one with that name */
+void platform_put_cmd(int argc, char **argv)
+{
+    if (argc != 2) {
+        serial_puts("usage: put <name>  (the host sends it: rog5-put.ps1)\n");
+        return;
+    }
+    if (!osfs2_is_mounted()) {
+        serial_puts("put: no filesystem mounted (ufs mount)\n");
+        return;
+    }
+    uint32_t size;
+    uint64_t pages;
+    uint8_t *buf = receive("put", 1, PUT_MAX, &size, &pages);
+    if (!buf)
+        return;
+    uint32_t crc_sent = 0xFFFFFFFF;
+    for (uint32_t i = 0; i < size; i++)
+        crc_sent = crc32_byte(crc_sent, buf[i]);
+    if (osfs2_find(argv[1]))
+        osfs2_delete(argv[1]);
+    osfs2_file_t *f = osfs2_create(argv[1], size);
+    int stored = f && osfs2_write(f, 0, buf, size) == 0 && osfs2_sync() == 0;
+
+    /* Read it back from the device into the same pages, and check it */
+    int verified = 0;
+    if (stored) {
+        for (uint32_t i = 0; i < size; i++)
+            buf[i] = 0;
+        if (osfs2_read(f, 0, buf, size) == (int)size) {
+            uint32_t crc = 0xFFFFFFFF;
+            for (uint32_t i = 0; i < size; i++)
+                crc = crc32_byte(crc, buf[i]);
+            verified = crc == crc_sent;
+        }
+    }
+    mem_free_pages(buf, pages);
+    serial_puts("put: ");
+    serial_puts(argv[1]);
+    serial_puts(", ");
+    serial_putdec(size);
+    serial_puts(!stored ? " bytes, crc ok, but storing it failed\n" :
+                !verified ? " bytes, crc ok, stored, but it reads back different\n" :
+                " bytes, crc ok, stored and verified\n");
+}
+
+int platform_kload(void)
+{
+    uint32_t size;
+    uint64_t pages;
+    uint8_t *buf = receive("kload", ARM64_MAGIC_OFF + 4, KLOAD_MAX, &size, &pages);
+    if (!buf)
+        return -1;
     if (buf[ARM64_MAGIC_OFF] != 'A' || buf[ARM64_MAGIC_OFF + 1] != 'R' ||
         buf[ARM64_MAGIC_OFF + 2] != 'M' || buf[ARM64_MAGIC_OFF + 3] != 0x64) {
         serial_puts("kload: not an ARM64 Image\n");

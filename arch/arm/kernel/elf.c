@@ -54,6 +54,19 @@ typedef struct {
     uint64_t brk_base;     /* end of loaded segments (for brk) */
 } elf_info_t;
 
+/* Code just copied into [p, p + len) runs next: with the caches on, push it
+ * out of the D-cache to the point of unification and drop stale I-cache
+ * lines (the pages may have held an older kernel's code). */
+static void code_written(void *p, uint64_t len)
+{
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uint64_t line = 4ULL << ((ctr >> 16) & 0xF);    /* DminLine, in bytes */
+    for (uint64_t a = (uint64_t)p & ~(line - 1); a < (uint64_t)p + len; a += line)
+        __asm__ volatile("dc cvau, %0" : : "r"(a) : "memory");
+    __asm__ volatile("dsb ish\n\tic iallu\n\tdsb ish\n\tisb" ::: "memory");
+}
+
 /* ── ELF loader ──────────────────────────────────────────── */
 
 int elf_load(const void *data, uint64_t size, elf_info_t *info)
@@ -129,6 +142,7 @@ int elf_load(const void *data, uint64_t size, elf_info_t *info)
         /* Copy file data */
         if (filesz > 0 && phdr->p_offset + filesz <= size)
             memcpy(seg, base + phdr->p_offset, filesz);
+        code_written(seg, memsz);
 
         /* Zero BSS (memsz > filesz) — already zeroed by alloc */
 

@@ -9,6 +9,7 @@
 #include "pmic_arb.h"
 #include "thermal.h"
 #include "keys.h"
+#include "ufs.h"
 
 /* Page allocator range. DDR bank 0 ends at 0xB5000000 (device memory node;
  * the next bank starts at 0xC0000000): the old 384 MB size ran 176 MB past
@@ -64,6 +65,7 @@ void platform_screen_cmd(int argc, char **argv) {
 
 void platform_probe_devices(void) {
     usb_probe();
+    ufs_mount_at_boot();                /* the OsitoFS on userdata */
 }
 
 void platform_reboot(void) {
