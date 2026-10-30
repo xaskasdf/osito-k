@@ -92,9 +92,9 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - The filesystem is OsitoFS v3 (`fs/ositofs3.c`, x86's driver ported, with directories), on the partition's first 32 GB. `ufs mkfs userdata` formats it in-kernel, and `ufs migrate userdata` converts a v2. Use the v3 API with paths from `fs_path` (`include/fs.h`), which resolves them against the shell's current directory. `fs/ositofs2.c` stays only for the migration and for dormant x86 ports.
   - Copy files on with `arch/arm/scripts/rog5-put.ps1 -File <path>` (shell `put <path>`) and off with `rog5-get.ps1 -Name <path>` (shell `get`); run programs with `exec <path> [args]`.
   - `arch/arm/scripts/rog5-screenshot.ps1 [-Out <file.png>]` saves the panel as a PNG on this PC (shell `screenshot` writes `screen.bmp`).
-- The shell (`kernel/shell.c`, editor in `kernel/term.c`) has pipes, `>`/`>>`/`<`, quotes, history and Tab completion, as x86's.
+- The shell (`kernel/shell.c`, editor in `kernel/term.c`) has pipes, `>`/`>>`/`<`, quotes, history and Tab completion, as x86's, plus `;`/`&&`/`||`, wildcards (`*`, `?`) and here documents (`<< WORD`).
   - A command's output is whatever the shell task prints with `serial_*`; `console_capture` sends it into the pipe or file.
-  - Report errors with `err_puts`, which skips the capture.
+  - Report errors with `err_puts`, which skips the capture and marks the command failed for `&&`/`||` (`note_puts` only skips the capture).
   - A command that reads input takes the pipe through `stdin_in` / `text_of` (apps through `read(0)`).
   - A new command goes in `dispatch()` and in `command_names[]` (for Tab).
 - Programs are C in `arch/arm/apps/` against the libc in `arch/arm/libc/`, built as static PIEs that `kernel/elf.c` relocates. `arch/arm/scripts/rog5-app.sh [--run <app> args]` builds them on the Mac, copies them to the phone, and optionally runs one. They run one at a time in the shell's task at EL1 with no memory protection; a fault in their own code ends them, anything else panics.

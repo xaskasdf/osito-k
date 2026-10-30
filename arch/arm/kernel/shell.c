@@ -20,7 +20,7 @@ extern void cmd_model(int argc, char **argv);   /* llm.c */
 extern void cmd_chat(int argc, char **argv);
 extern void cmd_llm(int argc, char **argv);
 
-#define MAX_ARGS 16
+#define MAX_ARGS 64                     /* wildcards can give many */
 
 static bool arg_quoted[MAX_ARGS];       /* parse_args: the argument had quotes */
 
@@ -74,7 +74,8 @@ static void cmd_help(void)
     serial_puts("  random   Random bytes in hex [n], and their source\n");
     serial_puts("  date     The time of day, UTC, from NTP [sync: ask again]\n");
     serial_puts("  history  Lines typed before [clear]; Up/Down recall them, Tab completes\n");
-    serial_puts("           Pipes: a | b; redirection: > file, >> file, < file; quotes\n");
+    serial_puts("           Pipes: a | b; redirection: > file, >> file, < file, << WORD; quotes\n");
+    serial_puts("           a ; b, a && b, a || b; wildcards * and ? (models/*.gguf)\n");
     serial_puts("  exec     Run a program from the filesystem <path> [args...]\n");
     serial_puts("  ping     Ping IP address\n");
     serial_puts("  cpus     List the online CPUs\n");
@@ -259,13 +260,25 @@ static void cmd_beep(int argc, char **argv)
 
 /* Errors skip a capture, as stderr would: to the console, not into the
  * file or the next stage of a pipe */
-static void err_puts(const char *s1, const char *s2, const char *s3)
+/* To the console even inside a pipe or `>`, as stderr would be */
+static void note_puts(const char *s1, const char *s2, const char *s3)
 {
     void (*fn)(char) = console_capture(NULL);
     serial_puts(s1);
     serial_puts(s2);
     serial_puts(s3);
     console_capture(fn);
+}
+
+/* For && and ||: a command failed if it reported an error here, its
+ * program exited non-zero, or there's no such command. (Messages other
+ * files print with serial_puts don't count.) */
+static int cmd_failed;
+
+static void err_puts(const char *s1, const char *s2, const char *s3)
+{
+    cmd_failed = 1;
+    note_puts(s1, s2, s3);
 }
 
 static int need_fs(const char *cmd)
@@ -422,8 +435,8 @@ static void cmd_random(int argc, char **argv)
         if (i % 32 == 31 || i + 1 == n)
             serial_puts("\n");
     }
-    err_puts(random_hw() ? "(hardware PRNG + timer jitter, HMAC-DRBG)\n"
-                         : "(timer jitter only, HMAC-DRBG: no hardware generator)\n", "", "");
+    note_puts(random_hw() ? "(hardware PRNG + timer jitter, HMAC-DRBG)\n"
+                          : "(timer jitter only, HMAC-DRBG: no hardware generator)\n", "", "");
 }
 
 /* `ls [path]`: a directory's entries, sizes first, directories marked */
@@ -998,7 +1011,7 @@ static void dispatch(int argc, char **argv)
     }
     else if (strcmp(argv[0], "exec") == 0) {
         if (argc < 2) serial_puts("Usage: exec <filename> [args...]\n");
-        else proc_run(argv[1], argc - 1, argv + 1);
+        else if (proc_run(argv[1], argc - 1, argv + 1) != 0) cmd_failed = 1;
     }
     else if (strcmp(argv[0], "ping") == 0) {
         if (argc < 2) { serial_puts("Usage: ping <ip>\n"); }
@@ -1114,9 +1127,7 @@ static void dispatch(int argc, char **argv)
     else if (strcmp(argv[0], "touch") == 0)   platform_touch_cmd(argc, argv);
     else if (strcmp(argv[0], "clear") == 0)   serial_puts("\033[2J\033[H");
     else {
-        serial_puts("Unknown: ");
-        serial_puts(argv[0]);
-        serial_puts("\n");
+        err_puts("Unknown: ", argv[0], "\n");
     }
 }
 
@@ -1125,8 +1136,10 @@ static void dispatch(int argc, char **argv)
  * As x86's shell: `a | b | c` runs the stages in turn, each one's output
  * captured (console_capture: only this task's, so other tasks' logs stay on
  * the console) and handed to the next as its input; `> file` and `>> file`
- * capture a command's output into a file, `< file` makes a file its input.
- * cat, head, tail, grep, wc and the apps' read(0) take that input.
+ * capture a command's output into a file, `< file` makes a file its input,
+ * `<< WORD` the lines typed after it (read_heredoc). cat, head, tail, grep,
+ * wc and the apps' read(0) take that input. Pipelines chain with ;, && and
+ * || (run_list), and words with * or ? expand to file names (glob_expand).
  */
 
 #define PIPE_STAGES 8
@@ -1164,20 +1177,123 @@ static void capture_too_big(const char *what, const struct capture *c)
     console_capture(fn);
 }
 
+/* ── Wildcards ──────────────────────────────────────────────────
+ *
+ * An unquoted word with * or ? in its last component becomes the names
+ * that match in that directory, sorted, the directory part kept as typed;
+ * with no match it stays as it is (as in sh). Case doesn't matter, as in
+ * OsitoFS lookups, and * doesn't match a leading dot unless typed.
+ */
+
+static char glob_pool[8192];
+static uint32_t glob_used;
+
+static bool has_wild(const char *s)
+{
+    for (; *s; s++)
+        if (*s == '*' || *s == '?')
+            return true;
+    return false;
+}
+
+static bool glob_match(const char *p, const char *s)
+{
+    const char *star = NULL, *back = NULL;
+    while (*s) {
+        if (*p == '?' || (*p != '*' && fold(*p) == fold(*s))) {
+            p++;
+            s++;
+        } else if (*p == '*') {
+            star = p++;
+            back = s;
+        } else if (star) {
+            p = star + 1;
+            s = ++back;
+        } else {
+            return false;
+        }
+    }
+    while (*p == '*')
+        p++;
+    return !*p;
+}
+
+/* word's matches into argv from n, sorted; the new count */
+static int glob_expand(char *word, char **argv, int n)
+{
+    int slash = -1;
+    for (int i = 0; word[i]; i++)
+        if (word[i] == '/')
+            slash = i;
+    const char *pat = word + slash + 1;
+    char dir[FS_PATH_MAX], abs[FS_PATH_MAX];
+    osfs3_dir_cursor_t cur;
+    if (!osfs3_is_mounted() || slash >= FS_PATH_MAX - 1 || !has_wild(pat))
+        goto literal;
+    if (slash < 0) {
+        strcpy(dir, ".");
+    } else {
+        memcpy(dir, word, slash ? (size_t)slash : 1);   /* "/x": the root */
+        dir[slash ? slash : 1] = 0;
+    }
+    for (int i = 0; dir[i]; i++)
+        if (dir[i] == '*' || dir[i] == '?')
+            goto literal;                               /* the last part only */
+    if (fs_path(dir, abs) < 0 || osfs3_dir_cursor_open_ci(abs, &cur) < 0)
+        goto literal;
+
+    static char name[OSFS3_NAME_MAX + 1];
+    bool is_dir;
+    int first = n;
+    while (osfs3_dir_cursor_next(&cur, name, sizeof(name), &is_dir, NULL, NULL) == 1) {
+        if ((name[0] == '.' && pat[0] != '.') || !glob_match(pat, name))
+            continue;
+        uint32_t len = (uint32_t)(slash + 1) + (uint32_t)strlen(name) + 1;
+        if (n == MAX_ARGS || glob_used + len > sizeof(glob_pool)) {
+            err_puts("shell: ", word, " matches too many names\n");
+            break;
+        }
+        char *s = glob_pool + glob_used;
+        memcpy(s, word, (size_t)(slash + 1));
+        strcpy(s + slash + 1, name);
+        glob_used += len;
+        int at = n++;
+        while (at > first && strcmp(argv[at - 1], s) > 0) {
+            argv[at] = argv[at - 1];
+            at--;
+        }
+        argv[at] = s;
+    }
+    if (n > first)
+        return n;
+literal:
+    if (n < MAX_ARGS)
+        argv[n++] = word;
+    return n;
+}
+
+/* `<< WORD` (shell_run reads the text before the line runs) */
+static char here_buf[65536];
+static struct {
+    uint32_t len;
+    int set;
+} here;
+
 static void run_command(char *seg)
 {
-    char *argv[MAX_ARGS];
-    int argc = parse_args(seg, argv);
+    char *words[MAX_ARGS], *argv[MAX_ARGS];
+    int nwords = parse_args(seg, words);
     const char *out = NULL, *in = NULL;
-    int append = 0, n = 0;
-    for (int i = 0; i < argc; i++) {
-        char *a = argv[i];
+    int append = 0, n = 0, here_in = 0;
+    glob_used = 0;
+    for (int i = 0; i < nwords; i++) {
+        char *a = words[i];
         if (!arg_quoted[i] && (a[0] == '>' || a[0] == '<')) {
             int is_out = a[0] == '>';
-            int twice = is_out && a[1] == '>';
+            int twice = a[1] == a[0];
             const char *target = a + 1 + twice;
             if (!*target)
-                target = i + 1 < argc ? argv[++i] : "";
+                target = i + 1 < nwords ? words[++i] : "";
             if (!*target) {
                 err_puts("shell: a redirection without a file\n", "", "");
                 return;
@@ -1185,22 +1301,38 @@ static void run_command(char *seg)
             if (is_out) {
                 out = target;
                 append = twice;
+            } else if (twice) {
+                here_in = 1;                /* target: the end word, read */
             } else {
                 in = target;
             }
+        } else if (n == MAX_ARGS) {
+            err_puts("shell: more than 64 arguments\n", "", "");
+            return;
+        } else if (!arg_quoted[i] && has_wild(a)) {
+            n = glob_expand(a, argv, n);
         } else {
             argv[n++] = a;
         }
     }
-    argc = n;
+    int argc = n;
     if ((in || out) && !need_fs("shell"))
         return;
+    if (here_in && !here.set) {
+        err_puts("shell: << without its text\n", "", "");
+        return;
+    }
 
-    /* < file: the whole file as the command's input */
+    /* < file: the whole file as the command's input; << the text typed */
     struct input saved_in = stdin_in;
     const char *in_data = NULL;
     uint64_t in_size = 0, in_pages = 0;
-    if (in) {
+    if (here_in) {
+        stdin_in.data = here_buf;
+        stdin_in.len = here.len;
+        stdin_in.pos = 0;
+        stdin_in.set = 1;
+    } else if (in) {
         if (text_of("shell", in, &in_data, &in_size, &in_pages) < 0)
             return;
         stdin_in.data = in_data;
@@ -1239,7 +1371,7 @@ done:
     stdin_in = saved_in;
 }
 
-/* A typed line: split at the '|'s outside quotes, the stages run in turn */
+/* A pipeline: split at the '|'s outside quotes, the stages run in turn */
 static void run_line(char *line)
 {
     char *seg[PIPE_STAGES];
@@ -1274,6 +1406,7 @@ static void run_line(char *line)
             stdin_in.set = 1;
         }
         if (i == n - 1) {
+            cmd_failed = 0;                 /* a pipe's status: its last stage's */
             run_command(seg[i]);
             break;
         }
@@ -1295,6 +1428,108 @@ static void run_line(char *line)
     }
     stdin_in.set = 0;
     capture_close(&prev);
+}
+
+static bool blank(const char *s)
+{
+    while (*s == ' ')
+        s++;
+    return !*s;
+}
+
+/* A typed line: pipelines split at ;, && and || outside quotes. After &&
+ * the next one runs if the last succeeded, after || if it failed, after ;
+ * regardless. A lone & is just text (nothing runs in the background). */
+static void run_list(char *line)
+{
+    char q = 0, op = ';', *start = line;
+    int failed = 0;
+    for (char *p = line;; p++) {
+        char c = *p;
+        if (q) {
+            if (c == q)
+                q = 0;
+            if (c)
+                continue;
+        } else if (c == '\'' || c == '"') {
+            q = c;
+            continue;
+        }
+        if (c && c != ';' && !((c == '&' || c == '|') && p[1] == c))
+            continue;
+        *p = 0;
+        if (!blank(start) && (op == ';' || (op == '&') == !failed)) {
+            cmd_failed = 0;
+            run_line(start);
+            failed = cmd_failed;
+        }
+        if (!c)
+            break;
+        op = c;
+        if (c != ';')
+            p++;
+        start = p + 1;
+    }
+}
+
+/* `<< WORD` in a line (outside quotes): the lines typed after it, up to one
+ * that is WORD, become the input of the command that has it. 0 if there's
+ * none, 1 once read, -1 if it can't be (Ctrl+C or Ctrl+D stop it). */
+static int read_heredoc(const char *line)
+{
+    const char *m = NULL;
+    char q = 0;
+    for (const char *p = line; *p && !m; p++) {
+        if (q) {
+            if (*p == q)
+                q = 0;
+        } else if (*p == '\'' || *p == '"') {
+            q = *p;
+        } else if (p[0] == '<' && p[1] == '<') {
+            m = p;
+        }
+    }
+    if (!m)
+        return 0;
+    char word[64];
+    int wl = 0;
+    q = 0;
+    const char *t = m + 2;
+    while (*t == ' ')
+        t++;
+    for (; *t; t++) {
+        if (!q && (*t == ' ' || *t == '|' || *t == ';' || *t == '&' || *t == '<' || *t == '>'))
+            break;
+        if (!q && (*t == '\'' || *t == '"'))
+            q = *t;
+        else if (q && *t == q)
+            q = 0;
+        else if (wl < (int)sizeof(word) - 1)
+            word[wl++] = *t;
+    }
+    word[wl] = 0;
+    if (!wl) {
+        err_puts("shell: << needs the word that ends the text\n", "", "");
+        return -1;
+    }
+    static char l[256];
+    here.len = 0;
+    for (;;) {
+        int n = term_readline("> ", l, sizeof(l));
+        if (n < 0)
+            return -1;
+        if (strcmp(l, word) == 0)
+            break;
+        if (here.len + (uint32_t)n + 1 > sizeof(here_buf)) {
+            err_puts("shell: the << text went over 64 KB\n", "", "");
+            return -1;
+        }
+        memcpy(here_buf + here.len, l, (size_t)n);
+        here.len += (uint32_t)n;
+        here_buf[here.len++] = '\n';
+    }
+    here.set = 1;
+    return 1;
 }
 
 /* ── Tab completion (term.c asks) ─────────────────────────────── */
@@ -1409,7 +1644,10 @@ void shell_run(void)
     serial_puts("\nOsitoK shell ready. Type 'help' for commands.\n\n");
 
     for (;;) {
-        if (term_readline("shell> ", buf, sizeof(buf)) > 0)
-            run_line(buf);
+        if (term_readline("shell> ", buf, sizeof(buf)) <= 0)
+            continue;
+        if (read_heredoc(buf) >= 0)
+            run_list(buf);
+        here.set = 0;
     }
 }

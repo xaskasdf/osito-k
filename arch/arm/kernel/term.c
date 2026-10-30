@@ -191,14 +191,15 @@ static void hist_navigate(int dir)
 /* ── Completion ──────────────────────────────────────────── */
 
 /* Tab: the word before the cursor, a command name if it's the first of
- * the line or of a pipe stage */
+ * the line, of a pipe stage, or after ;, && or || */
 static void term_complete(const char *prompt)
 {
     int ws = line_pos;
     while (ws > 0 && line_buf[ws - 1] != ' ')
         ws--;
     int first = 1;
-    for (int i = ws - 1; i >= 0 && line_buf[i] != '|'; i--)
+    for (int i = ws - 1; i >= 0 && line_buf[i] != '|' && line_buf[i] != ';' &&
+                         line_buf[i] != '&'; i--)
         if (line_buf[i] != ' ')
             first = 0;
     char add[TERM_LINE_MAX];
@@ -268,7 +269,7 @@ int term_readline(const char *prompt, char *buf, int bufsize)
         if (c == 3) {
             serial_puts("^C\n");
             buf[0] = '\0';
-            return 0;
+            return -2;
         }
 
         /* Ctrl+D: EOF on an empty line, else Delete */

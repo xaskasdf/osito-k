@@ -666,12 +666,28 @@ same way.
   - The capture is 256 MB of high memory, or 16 MB where there's less (virt).
 - **Redirection:** `> file` and `>> file` capture a command's output into a
   file, and `< file` makes a file its input. `> file` alone makes an empty
-  file. Quotes (`'...'`, `"..."`) keep spaces, `|`, `<` and `>` as text.
+  file. Quotes (`'...'`, `"..."`) keep spaces, `|`, `;`, `&`, `<`, `>` and
+  wildcards as text.
+- **Here documents:** `cat << EOF` (or `<<EOF`, `<< 'EOF'`) reads the lines
+  typed after it, at a `> ` prompt, up to one that is `EOF`, and makes them
+  the command's input; it works inside a pipe (`cat << EOF | grep -c a`) and
+  with `>`. Up to 64 KB; Ctrl+C or Ctrl+D drops it without running the line.
+- **Lists:** `a ; b` runs both, `a && b` runs `b` if `a` succeeded, `a || b`
+  if it failed. A command fails when it reports an error through `err_puts`,
+  doesn't exist, or (`exec`) its program exits non-zero; a pipe's status is
+  its last stage's. A lone `&` is plain text: nothing runs in the background.
+- **Wildcards:** an unquoted word with `*` or `?` in its last component
+  becomes the matching names in that directory, sorted, with the directory
+  part kept (`echo /models/*.gguf`, `cat logs/day?.txt`). Matching ignores
+  case, as OsitoFS lookups do, and `*` skips names starting with a dot. With
+  no match the word stays as typed, as in sh. A line takes up to 64 arguments.
 - **Capture:** `console_capture` (`kernel/serial.c`) sends what the *shell
   task* prints to the capture. Other tasks' output (logs, the network) stays
   on the console.
   - Errors go through `err_puts`, which skips the capture as stderr would:
-    `cat nope | wc` prints the error and counts nothing.
+    `cat nope | wc` prints the error and counts nothing. It also marks the
+    command as failed for `&&` and `||`; `note_puts` skips the capture
+    without that.
   - `dmesg` replays the log through the capture too.
 - **Input:** a pipe or `<` feeds `cat` (with no file), `head`, `tail`, `grep`
   and `wc`, and the apps' `read(0)`. `exec guess.elf < nums.txt` plays the
@@ -687,9 +703,9 @@ same way.
 - **Line editing:**
   - Left/Right, Home/End, Delete, and Ctrl+A/E/U/K/W/D.
   - Up/Down step through 32 lines of history.
-  - Tab completes command names (the first word of a line or of a pipe
-    stage) and paths, through the v3 directory cursor. Several matches are
-    listed.
+  - Tab completes command names (the first word of a line, of a pipe stage,
+    or after `;`, `&&` or `||`) and paths, through the v3 directory cursor.
+    Several matches are listed.
   - Escape sequences may arrive up to 100 ms apart.
   - The editor moves the cursor with `\b` and rewrites text, which the
     screen console follows too, since it knows no escape sequences.
@@ -1276,12 +1292,14 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
       day from NTP.
     - The badssl.com failures are refused, and Amazon and Microsoft verify
       over TLS 1.3 with RSA-PSS.
-34. **Window buttons, and an LLM twice as fast (2026-10-30).**
+34. **Window buttons, an LLM twice as fast, a fuller shell (2026-10-30).**
     - The desktop's title bar buttons answer taps (close and minimize; see
       "Desktop"), and `touch tap` drives it from the console.
     - SmolLM2's output layer, Q8_0, had no NEON kernel and ran scalar. With
       one, and SDOT for the quantized matvecs (see "Local LLM"), it went
       from 20 to 10 ms a token, and its prefill from 276 to 126 ms.
+    - The shell gained `;`, `&&`, `||`, wildcards and here documents (see
+      "Shell").
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`

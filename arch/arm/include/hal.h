@@ -287,6 +287,7 @@ void shell_run(void);
  * Terminal
  * ======================================================================== */
 void term_init(void);
+/* The line's length; -1 on Ctrl+D (an empty line), -2 on Ctrl+C */
 int  term_readline(const char *prompt, char *buf, int bufsize);
 void term_history_print(void);      /* shell `history` */
 void term_history_clear(void);
