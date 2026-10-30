@@ -15,6 +15,8 @@
 #include "../include/types.h"
 #include "../include/aarch64.h"
 #include "elf.h"
+#include "../include/fs.h"
+#include "../fs/ositofs3.h"
 
 #define HEAP_PAGES  8192                /* 32 MB */
 
@@ -48,25 +50,26 @@ static elf_info_t info;                 /* the running program's */
 /* The program in file `name`, with argc/argv as its main gets them */
 int proc_run(const char *name, int argc, char **argv)
 {
-    osfs2_file_t *f = osfs2_find(name);
+    void *f = fs_find(name);
     if (!f) {
         serial_puts(name);
         serial_puts(": not found\n");
         return -1;
     }
-    uint64_t pages = (f->size + 4095) / 4096;
+    uint64_t size = osfs3_file_size(f);
+    uint64_t pages = (size + 4095) / 4096;
     void *buf = mem_alloc_pages(pages);
     if (!buf) {
         serial_puts("exec: out of memory\n");
         return -1;
     }
-    if (osfs2_read(f, 0, buf, f->size) < 0) {
+    if (osfs3_read_file(f, 0, buf, size) < 0) {
         serial_puts("exec: read failed\n");
         mem_free_pages(buf, pages);
         return -1;
     }
     memset(&info, 0, sizeof(info));
-    int loaded = elf_load(buf, f->size, &info);
+    int loaded = elf_load(buf, size, &info);
     mem_free_pages(buf, pages);
     if (loaded < 0)
         return -1;

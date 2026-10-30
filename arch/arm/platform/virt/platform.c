@@ -71,12 +71,22 @@ void platform_keys_cmd(int argc, char **argv)
     serial_puts("keys: only on SM8350\n");
 }
 
-/* virt's disk is virtio-blk */
+/* virt's disk is virtio-blk: `ufs mkfs disk` puts an empty OsitoFS v3 on
+ * it, `ufs mount` mounts it */
 void platform_ufs_cmd(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
-    serial_puts("ufs: only on SM8350\n");
+    extern int osfs3_mount(uint64_t part_offset);
+    extern int osfs3_format(uint64_t bytes, const char *label, uint32_t inodes);
+    if (argc == 3 && strcmp(argv[1], "mkfs") == 0 && strcmp(argv[2], "disk") == 0) {
+        if (!virtio_blk_capacity() || osfs3_format(virtio_blk_capacity(), "virt", 0) ||
+            osfs3_mount(0))
+            serial_puts("ufs: no virtio-blk disk, or formatting it failed\n");
+    } else if (argc == 2 && strcmp(argv[1], "mount") == 0) {
+        if (osfs3_mount(0))
+            serial_puts("ufs: no OsitoFS v3 on the virtio-blk disk\n");
+    } else {
+        serial_puts("usage (virt): ufs [mkfs disk | mount]\n");
+    }
 }
 
 void platform_put_cmd(int argc, char **argv)

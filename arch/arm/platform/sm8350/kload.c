@@ -20,15 +20,13 @@
 
 #include "../../include/hal.h"
 #include "../../include/types.h"
+#include "../../include/fs.h"
+#include "../../fs/ositofs3.h"
 #include "mmu.h"
 #include "usb.h"
 
 #define KLOAD_MAX       (32U << 20)
 #define PUT_MAX         (1U << 30)      /* received in the high region (models) */
-
-/* fs/ositofs2.c, beyond hal.h */
-int  osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len);
-bool osfs2_is_mounted(void);
 #define BYTE_TIMEOUT_MS 5000
 #define ARM64_MAGIC_OFF 0x38            /* "ARM\x64" in the Image header */
 
@@ -75,6 +73,20 @@ static uint32_t crc32_byte(uint32_t crc, uint8_t b)
     for (int k = 0; k < 8; k++)
         crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1)));
     return crc;
+}
+
+/* The CRC-32 of a whole buffer, a table lookup per byte: the bitwise loop
+ * took over 5 s for a 92 MB model on the shell's A55 */
+static uint32_t crc32_buf(const uint8_t *p, uint64_t len)
+{
+    static uint32_t table[256];
+    if (!table[1])
+        for (uint32_t i = 0; i < 256; i++)
+            table[i] = crc32_byte(i, 0);
+    uint32_t crc = 0xFFFFFFFF;
+    for (uint64_t i = 0; i < len; i++)
+        crc = (crc >> 8) ^ table[(crc ^ p[i]) & 0xFF];
+    return ~crc;
 }
 
 static void say(const char *who, const char *what)
@@ -149,15 +161,15 @@ static uint8_t *receive(const char *who, uint32_t min, uint32_t max, int high,
     return buf;
 }
 
-/* Shell `put <name>`: a file from the host the same way (rog5-put.ps1), into
+/* Shell `put <path>`: a file from the host the same way (rog5-put.ps1), into
  * the mounted OsitoFS, replacing one with that name */
 void platform_put_cmd(int argc, char **argv)
 {
     if (argc != 2) {
-        serial_puts("usage: put <name>  (the host sends it: rog5-put.ps1)\n");
+        serial_puts("usage: put <path>  (the host sends it: rog5-put.ps1)\n");
         return;
     }
-    if (!osfs2_is_mounted()) {
+    if (!osfs3_is_mounted()) {
         serial_puts("put: no filesystem mounted (ufs mount)\n");
         return;
     }
@@ -166,25 +178,16 @@ void platform_put_cmd(int argc, char **argv)
     uint8_t *buf = receive("put", 1, PUT_MAX, 1, &size, &pages);
     if (!buf)
         return;
-    uint32_t crc_sent = 0xFFFFFFFF;
-    for (uint32_t i = 0; i < size; i++)
-        crc_sent = crc32_byte(crc_sent, buf[i]);
-    if (osfs2_find(argv[1]))
-        osfs2_delete(argv[1]);
-    osfs2_file_t *f = osfs2_create(argv[1], size);
-    int stored = f && osfs2_write(f, 0, buf, size) == 0 && osfs2_sync() == 0;
+    uint32_t crc_sent = crc32_buf(buf, size);
+    int stored = fs_write_file(argv[1], buf, size) == 0;
 
     /* Read it back from the device into the same pages, and check it */
     int verified = 0;
-    if (stored) {
-        for (uint32_t i = 0; i < size; i++)
-            buf[i] = 0;
-        if (osfs2_read(f, 0, buf, size) == (int)size) {
-            uint32_t crc = 0xFFFFFFFF;
-            for (uint32_t i = 0; i < size; i++)
-                crc = crc32_byte(crc, buf[i]);
-            verified = crc == crc_sent;
-        }
+    void *f = stored ? fs_find(argv[1]) : NULL;
+    if (f) {
+        memset(buf, 0, size);
+        verified = osfs3_read_file(f, 0, buf, size) == (int)size &&
+                   crc32_buf(buf, size) == crc_sent;
     }
     mem_free_pages(buf, pages);
     serial_puts("put: ");
@@ -197,58 +200,59 @@ void platform_put_cmd(int argc, char **argv)
 }
 
 /* Raw bytes to the host, a chunk per console lock so other CPUs' output
- * (kept off the link by console_host_hold) isn't held off for long */
-static void host_send(const void *data, uint32_t len)
+ * (kept off the link by console_host_hold) isn't held off for long. Stops
+ * when the host closes the port: the rest would only reach whoever opens
+ * it next. Returns the bytes sent. */
+static uint32_t host_send(const void *data, uint32_t len)
 {
     const uint8_t *p = data;
-    while (len) {
-        uint32_t n = len < 4096 ? len : 4096;
+    uint32_t sent = 0;
+    while (sent < len && acm_state() == ACM_PORT_OPEN) {
+        uint32_t n = len - sent < 4096 ? len - sent : 4096;
         uint64_t flags = console_lock();
         for (uint32_t i = 0; i < n; i++)
-            acm_putc((char)p[i]);
+            acm_putc((char)p[sent + i]);
         console_unlock(flags);
-        p += n;
-        len -= n;
+        sent += n;
     }
+    return sent;
 }
 
-/* Shell `get <name>`: a file from the mounted OsitoFS to the host
+/* Shell `get <path>`: a file from the mounted OsitoFS to the host
  * (rog5-get.ps1), framed as put's: "OKLD", size, CRC-32, the bytes */
 void platform_get_cmd(int argc, char **argv)
 {
     if (argc != 2) {
-        serial_puts("usage: get <name>  (the host takes it: rog5-get.ps1)\n");
+        serial_puts("usage: get <path>  (the host takes it: rog5-get.ps1)\n");
         return;
     }
-    if (!osfs2_is_mounted()) {
+    if (!osfs3_is_mounted()) {
         serial_puts("get: no filesystem mounted (ufs mount)\n");
         return;
     }
-    osfs2_file_t *f = osfs2_find(argv[1]);
+    void *f = fs_find(argv[1]);
     if (!f) {
         serial_puts("get: no such file\n");
         return;
     }
-    if (f->size == 0 || f->size > PUT_MAX) {
+    uint64_t file_size = osfs3_file_size(f);
+    if (file_size == 0 || file_size > PUT_MAX) {
         serial_puts("get: bad size\n");
         return;
     }
-    uint32_t size = (uint32_t)f->size;
+    uint32_t size = (uint32_t)file_size;
     uint64_t pages = (size + 4095) / 4096;
     uint8_t *buf = mem_alloc_aligned_high(size, 4096);
     if (!buf) {
         serial_puts("get: out of memory\n");
         return;
     }
-    if (osfs2_read(f, 0, buf, size) != (int)size) {
+    if (osfs3_read_file(f, 0, buf, size) != (int)size) {
         serial_puts("get: read failed\n");
         mem_free_pages(buf, pages);
         return;
     }
-    uint32_t crc = 0xFFFFFFFF;
-    for (uint32_t i = 0; i < size; i++)
-        crc = crc32_byte(crc, buf[i]);
-    crc = ~crc;
+    uint32_t crc = crc32_buf(buf, size);
 
     serial_puts("get: sending\n");
     uint8_t hdr[12] = { 'O', 'K', 'L', 'D' };
@@ -257,15 +261,14 @@ void platform_get_cmd(int argc, char **argv)
         hdr[8 + i] = (uint8_t)(crc >> (8 * i));
     }
     console_host_hold(1);
-    host_send(hdr, sizeof(hdr));
-    host_send(buf, size);
+    uint32_t sent = host_send(hdr, sizeof(hdr)) == sizeof(hdr) ? host_send(buf, size) : 0;
     console_host_hold(0);
     mem_free_pages(buf, pages);
     serial_puts("get: ");
     serial_puts(argv[1]);
     serial_puts(", ");
-    serial_putdec(size);
-    serial_puts(" bytes sent\n");
+    serial_putdec(sent);
+    serial_puts(sent == size ? " bytes sent\n" : " bytes sent, then the host closed the port\n");
 }
 
 int platform_kload(void)

@@ -10,6 +10,7 @@
 #include "virtio_blk.h"
 #include "../include/hal.h"
 #include "../include/types.h"
+#include "../include/aarch64.h"
 
 /* ── VirtIO MMIO register offsets ────────────────────────── */
 
@@ -212,7 +213,9 @@ static int virtio_blk_submit(uint32_t type, uint64_t sector, void *data, uint32_
     vq_desc[0].addr  = (uint64_t)&req_hdr;
     vq_desc[0].len   = sizeof(req_hdr);
     vq_desc[0].flags = VIRTQ_DESC_F_NEXT;
-    vq_desc[0].next  = 1;
+    /* No data (a flush): straight to the status byte. QEMU refuses a
+     * zero-length buffer and never completes the request. */
+    vq_desc[0].next  = data_len ? 1 : 2;
 
     /* Descriptor 1: data buffer */
     vq_desc[1].addr  = (uint64_t)data;
@@ -240,8 +243,11 @@ static int virtio_blk_submit(uint32_t type, uint64_t sector, void *data, uint32_
     /* Notify device */
     vw32(VIRTIO_MMIO_QUEUE_NOTIFY, 0);
 
-    /* Poll for completion */
-    for (uint32_t t = 0; t < 10000000; t++) {
+    /* Poll for completion, up to 5 s by the generic timer: a flush makes
+     * QEMU sync the image file, which took longer on Windows than the old
+     * fixed 10M-iteration loop allowed under TCG */
+    uint64_t deadline = read_cntpct_el0() + 5ULL * read_cntfrq_el0();
+    while (read_cntpct_el0() < deadline) {
         __asm__ volatile("dmb osh" ::: "memory");  /* load barrier for DMA visibility */
         if (vq_used->idx != vq_used_last) {
             vq_used_last++;

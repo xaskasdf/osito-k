@@ -5,6 +5,8 @@
 #include "../include/types.h"
 #include "task.h"
 #include "http.h"
+#include "../include/fs.h"
+#include "../fs/ositofs3.h"
 #include <stdbool.h>
 
 extern void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
@@ -41,9 +43,13 @@ static void cmd_help(void)
     serial_puts("  mem      Show heap stats\n");
     serial_puts("  uname    Show system info\n");
     serial_puts("  uptime   Show uptime\n");
-    serial_puts("  ls       List files\n");
-    serial_puts("  cat      Show file contents\n");
-    serial_puts("  exec     Run a program from the filesystem <name> [args...]\n");
+    serial_puts("  ls       List a directory [path]\n");
+    serial_puts("  cat      Show a file <path>\n");
+    serial_puts("  cd, pwd  Change / show the current directory (paths may be relative)\n");
+    serial_puts("  mkdir    Make directories <path>...; rmdir removes empty ones\n");
+    serial_puts("  rm       Delete files <path>...\n");
+    serial_puts("  mv       Rename or move <from> <to>\n");
+    serial_puts("  exec     Run a program from the filesystem <path> [args...]\n");
     serial_puts("  ping     Ping IP address\n");
     serial_puts("  cpus     List the online CPUs\n");
     serial_puts("  cpubench Timed task per CPU, all at once [any [n]: n unpinned]\n");
@@ -70,9 +76,10 @@ static void cmd_help(void)
     serial_puts("  keys     Power / volume keys: now and press counts\n");
     serial_puts("  screen   Screen mode [debug | normal]: diagnostics or full console\n");
     serial_puts("  ufs      UFS storage [luns | gpt <lun> | read <lun> <lba> [off] | mount |\n");
-    serial_puts("           mkfs userdata]: writes go only to userdata (OsitoFS)\n");
-    serial_puts("  put      Store a file sent over USB <name> (host: rog5-put.ps1)\n");
-    serial_puts("  get      Send a file to the host over USB <name> (host: rog5-get.ps1)\n");
+    serial_puts("           mkfs userdata | migrate userdata: v2 to v3, files kept]:\n");
+    serial_puts("           writes go only to userdata (OsitoFS v3)\n");
+    serial_puts("  put      Store a file sent over USB <path> (host: rog5-put.ps1)\n");
+    serial_puts("  get      Send a file to the host over USB <path> (host: rog5-get.ps1)\n");
     serial_puts("  screenshot The panel as a BMP file [name, default screen.bmp]\n");
     serial_puts("  touch    Touchscreen: state, wiring, supplies [on | read | off]\n");
     serial_puts("  kload    Receive a kernel over USB and run it\n");
@@ -222,35 +229,200 @@ static void cmd_beep(int argc, char **argv)
     hda_play_tone(freq, ms);
 }
 
-static void cmd_ls(void)
+/* ── Files: OsitoFS v3, paths relative to the current directory ── */
+
+static int need_fs(const char *cmd)
 {
-    osfs2_list();
+    if (osfs3_is_mounted())
+        return 1;
+    serial_puts(cmd);
+    serial_puts(": no filesystem mounted (ufs mount)\n");
+    return 0;
 }
 
-static void cmd_cat(int argc, char **argv)
+static void say_err(const char *cmd, const char *path, const char *what)
 {
-    if (argc < 2) {
-        serial_puts("Usage: cat <filename>\n");
+    serial_puts(cmd);
+    serial_puts(": ");
+    serial_puts(path);
+    serial_puts(": ");
+    serial_puts(what);
+    serial_puts("\n");
+}
+
+static void put_right(uint64_t v, int width)
+{
+    char buf[21];
+    int n = 0;
+    do {
+        buf[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    for (int i = n; i < width; i++)
+        serial_putc(' ');
+    while (n)
+        serial_putc(buf[--n]);
+}
+
+/* `ls [path]`: a directory's entries, sizes first, directories marked */
+static void cmd_ls(int argc, char **argv)
+{
+    if (!need_fs("ls"))
+        return;
+    char abs[FS_PATH_MAX];
+    const char *path = argc > 1 ? argv[1] : ".";
+    if (fs_path(path, abs) < 0) {
+        say_err("ls", path, "path too long");
         return;
     }
-    osfs2_file_t *f = osfs2_find(argv[1]);
-    if (!f) {
-        serial_puts("File not found: ");
-        serial_puts(argv[1]);
+    void *f = osfs3_find(abs);
+    if (f) {
+        put_right(osfs3_file_size(f), 10);
+        serial_puts("  ");
+        serial_puts(path);
         serial_puts("\n");
         return;
     }
-    /* Read and print up to 4KB */
-    static char cat_buf[4096];
-    uint64_t to_read = f->size;
-    if (to_read > sizeof(cat_buf) - 1) to_read = sizeof(cat_buf) - 1;
-    if (osfs2_read(f, 0, cat_buf, to_read) < 0) {
-        serial_puts("Read error\n");
+    osfs3_dir_cursor_t cur;
+    if (osfs3_dir_cursor_open_ci(abs, &cur) < 0) {
+        say_err("ls", path, "no such file or directory");
         return;
     }
-    cat_buf[to_read] = '\0';
-    serial_puts(cat_buf);
+    static char name[OSFS3_NAME_MAX + 1];
+    bool dir;
+    uint64_t size;
+    uint32_t files = 0, dirs = 0;
+    uint64_t bytes = 0;
+    while (osfs3_dir_cursor_next(&cur, name, sizeof(name), &dir, &size, NULL) == 1) {
+        if (dir) {
+            serial_puts("     <dir>  ");
+            dirs++;
+        } else {
+            put_right(size, 10);
+            serial_puts("  ");
+            files++;
+            bytes += size;
+        }
+        serial_puts(name);
+        serial_puts(dir ? "/\n" : "\n");
+    }
+    serial_putdec(files);
+    serial_puts(" files, ");
+    serial_putdec(dirs);
+    serial_puts(" directories, ");
+    serial_putdec(bytes);
+    serial_puts(" bytes\n");
+}
+
+/* `cat <file>`: the whole file, 4 KB at a time */
+static void cmd_cat(int argc, char **argv)
+{
+    if (argc < 2) {
+        serial_puts("Usage: cat <file>\n");
+        return;
+    }
+    if (!need_fs("cat"))
+        return;
+    void *f = fs_find(argv[1]);
+    if (!f) {
+        say_err("cat", argv[1], "no such file");
+        return;
+    }
+    static char cat_buf[4097];
+    uint64_t size = osfs3_file_size(f);
+    for (uint64_t off = 0; off < size; off += 4096) {
+        uint64_t n = size - off < 4096 ? size - off : 4096;
+        if (osfs3_read_file(f, off, cat_buf, n) < 0) {
+            say_err("cat", argv[1], "read error");
+            return;
+        }
+        cat_buf[n] = '\0';
+        serial_puts(cat_buf);
+    }
+    if (size && cat_buf[(size - 1) % 4096] != '\n')
+        serial_puts("\n");
+}
+
+static void cmd_pwd(void)
+{
+    serial_puts(fs_cwd());
     serial_puts("\n");
+}
+
+static void cmd_cd(int argc, char **argv)
+{
+    if (!need_fs("cd"))
+        return;
+    const char *path = argc > 1 ? argv[1] : "/";
+    if (fs_chdir(path) < 0)
+        say_err("cd", path, "not a directory");
+}
+
+/* mkdir, rmdir and rm: one path each, the v3 call's answer */
+static void cmd_path_op(int argc, char **argv)
+{
+    if (argc < 2) {
+        serial_puts("Usage: ");
+        serial_puts(argv[0]);
+        serial_puts(" <path>...\n");
+        return;
+    }
+    if (!need_fs(argv[0]))
+        return;
+    for (int i = 1; i < argc; i++) {
+        char abs[FS_PATH_MAX];
+        if (fs_path(argv[i], abs) < 0) {
+            say_err(argv[0], argv[i], "path too long");
+            continue;
+        }
+        int rc;
+        const char *why;
+        if (strcmp(argv[0], "mkdir") == 0) {
+            rc = osfs3_mkdir(abs);
+            why = "exists, or its parent doesn't";
+        } else if (strcmp(argv[0], "rmdir") == 0) {
+            rc = osfs3_rmdir(abs);
+            why = "not an empty directory";
+        } else {
+            rc = osfs3_delete(abs);
+            why = rc == -2 ? "in use" : "no such file";
+        }
+        if (rc < 0)
+            say_err(argv[0], argv[i], why);
+    }
+}
+
+/* `mv <from> <to>`: rename, or move into <to> when it's a directory */
+static void cmd_mv(int argc, char **argv)
+{
+    if (argc != 3) {
+        serial_puts("Usage: mv <from> <to>\n");
+        return;
+    }
+    if (!need_fs("mv"))
+        return;
+    char from[FS_PATH_MAX], to[FS_PATH_MAX];
+    if (fs_path(argv[1], from) < 0 || fs_path(argv[2], to) < 0) {
+        serial_puts("mv: path too long\n");
+        return;
+    }
+    uint32_t ino = osfs3_resolve_path(to);
+    if (ino && osfs3_is_dir(ino)) {
+        const char *base = from;
+        for (const char *p = from; *p; p++)
+            if (*p == '/')
+                base = p + 1;
+        uint32_t n = (uint32_t)strlen(to);
+        if (n + 1 + strlen(base) >= FS_PATH_MAX) {
+            serial_puts("mv: path too long\n");
+            return;
+        }
+        if (n > 1)
+            to[n++] = '/';
+        strcpy(to + n, base);
+    }
+    if (osfs3_rename(from, to, false) < 0)
+        say_err("mv", argv[1], "can't move it there (missing, or the target exists)");
 }
 
 static void cmd_echo(int argc, char **argv)
@@ -265,14 +437,17 @@ static void cmd_echo(int argc, char **argv)
 static void cmd_hexdump(int argc, char **argv)
 {
     if (argc < 2) { serial_puts("Usage: hexdump <file> [offset] [len]\n"); return; }
-    osfs2_file_t *f = osfs2_find(argv[1]);
+    if (!need_fs("hexdump")) return;
+    void *f = fs_find(argv[1]);
     if (!f) { serial_puts("File not found\n"); return; }
     uint64_t off = (argc >= 3) ? shell_atoi(argv[2]) : 0;
     uint64_t len = (argc >= 4) ? shell_atoi(argv[3]) : 256;
+    uint64_t size = osfs3_file_size(f);
     if (len > 512) len = 512;
     static uint8_t hbuf[512];
-    if (off + len > f->size) len = f->size - off;
-    if (osfs2_read(f, off, hbuf, len) < 0) { serial_puts("Read error\n"); return; }
+    if (off > size) off = size;
+    if (off + len > size) len = size - off;
+    if (osfs3_read_file(f, off, hbuf, len) < 0) { serial_puts("Read error\n"); return; }
     for (uint64_t i = 0; i < len; i += 16) {
         serial_puthex(off + i, 4);
         serial_puts(": ");
@@ -291,9 +466,22 @@ static void cmd_hexdump(int argc, char **argv)
 
 static void cmd_df(void)
 {
-    /* OsitoFS free space — use capacity info from VirtIO-blk */
-    serial_puts("OsitoFS: ");
-    osfs2_list();  /* Shows file count + block usage */
+    if (!need_fs("df"))
+        return;
+    uint64_t bs = osfs3_block_size(), total = osfs3_total_blocks(), free = osfs3_free_blocks();
+    serial_puts("OsitoFS v3 [");
+    serial_puts(osfs3_label());
+    serial_puts("]: ");
+    serial_putdec(osfs3_file_count());
+    serial_puts(" files, ");
+    serial_putdec((total - free) * bs >> 20);
+    serial_puts(" MB used, ");
+    serial_putdec(free * bs >> 20);
+    serial_puts(" MB free of ");
+    serial_putdec(total * bs >> 20);
+    serial_puts(" MB (");
+    serial_putdec(bs >> 10);
+    serial_puts(" KB blocks)\n");
 }
 
 static void cmd_halt(void)
@@ -348,18 +536,14 @@ static void cmd_https(int argc, char **argv)
  * pixels are 0x00RRGGBB, so B, G, R in memory, BMP's own order. */
 static void cmd_screenshot(int argc, char **argv)
 {
-    extern int  osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len);
-    extern bool osfs2_is_mounted(void);
     uint64_t base;
     uint32_t w, h, w_mm, h_mm;
     if (platform_panel(&base, &w, &h, &w_mm, &h_mm) < 0) {
         serial_puts("screenshot: no panel\n");
         return;
     }
-    if (!osfs2_is_mounted()) {
-        serial_puts("screenshot: no filesystem mounted (ufs mount)\n");
+    if (!need_fs("screenshot"))
         return;
-    }
     const char *name = argc > 1 ? argv[1] : "screen.bmp";
     uint32_t row = (w * 3 + 3) & ~3U;
     uint32_t size = 54 + row * h;
@@ -393,10 +577,7 @@ static void cmd_screenshot(int argc, char **argv)
             dst[3 * x + 2] = (uint8_t)(px >> 16);
         }
     }
-    if (osfs2_find(name))
-        osfs2_delete(name);
-    osfs2_file_t *f = osfs2_create(name, size);
-    int ok = f && osfs2_write(f, 0, bmp, size) == 0 && osfs2_sync() == 0;
+    int ok = fs_write_file(name, bmp, size) == 0;
     mem_free_pages(bmp, (size + 4095) / 4096);
     serial_puts("screenshot: ");
     serial_puts(name);
@@ -452,8 +633,13 @@ void shell_run(void)
         else if (strcmp(argv[0], "uptime") == 0)  cmd_uptime();
         else if (strcmp(argv[0], "kload") == 0)   platform_kload();
         else if (strcmp(argv[0], "dmesg") == 0)   klog_dump();
-        else if (strcmp(argv[0], "ls") == 0)      cmd_ls();
+        else if (strcmp(argv[0], "ls") == 0)      cmd_ls(argc, argv);
         else if (strcmp(argv[0], "cat") == 0)    cmd_cat(argc, argv);
+        else if (strcmp(argv[0], "pwd") == 0)    cmd_pwd();
+        else if (strcmp(argv[0], "cd") == 0)     cmd_cd(argc, argv);
+        else if (strcmp(argv[0], "mkdir") == 0 || strcmp(argv[0], "rmdir") == 0 ||
+                 strcmp(argv[0], "rm") == 0)     cmd_path_op(argc, argv);
+        else if (strcmp(argv[0], "mv") == 0)     cmd_mv(argc, argv);
         else if (strcmp(argv[0], "exec") == 0) {
             if (argc < 2) serial_puts("Usage: exec <filename> [args...]\n");
             else proc_run(argv[1], argc - 1, argv + 1);

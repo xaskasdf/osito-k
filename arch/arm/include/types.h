@@ -59,6 +59,13 @@ static inline size_t strlen(const char *s) {
     return n;
 }
 
+static inline char *strcpy(char *dst, const char *src) {
+    char *d = dst;
+    while ((*d++ = *src++))
+        ;
+    return dst;
+}
+
 static inline int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return *(unsigned char *)a - *(unsigned char *)b;

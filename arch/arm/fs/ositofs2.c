@@ -843,6 +843,8 @@ int osfs2_format(uint64_t bytes, const char *label)
 /* ── Accessors ───────────────────────────────────────────────── */
 
 bool osfs2_is_mounted(void)  { return mounted; }
+/* Forget it (`ufs migrate`: the volume is about to become v3) */
+void osfs2_unmount(void) { mounted = false; }
 /* Data written with osfs2_write, out of the device's write cache */
 int osfs2_sync(void) { return mounted ? nvme_flush() : -1; }
 uint32_t osfs2_file_count(void) { return mounted ? superblock.file_count : 0; }

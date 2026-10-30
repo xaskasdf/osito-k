@@ -8,6 +8,8 @@
 #include "../include/hal.h"
 #include "../include/types.h"
 #include "../include/aarch64.h"
+#include "../include/fs.h"
+#include "../fs/ositofs3.h"
 
 /* Linux AArch64 syscall numbers (from asm-generic/unistd.h) */
 #define SYS_close           57
@@ -87,7 +89,7 @@ int proc_is_running(void) { return process_running; }
 
 #define MAX_FDS  32
 typedef struct {
-    osfs2_file_t *file;     /* NULL = unused */
+    void         *file;     /* an OsitoFS v3 file, NULL = unused */
     uint64_t      pos;      /* current file position */
     int           flags;    /* O_RDONLY etc */
 } fd_entry_t;
@@ -100,7 +102,7 @@ static void fd_init(void)
     /* fd 0/1/2 are special (stdin/stdout/stderr) — no file pointer */
 }
 
-static int fd_alloc(osfs2_file_t *f)
+static int fd_alloc(void *f)
 {
     for (int i = 3; i < MAX_FDS; i++) {
         if (!fd_table[i].file) {
@@ -181,12 +183,12 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
         return (int64_t)i;
     }
     if (fd >= 3 && fd < MAX_FDS && fd_table[fd].file) {
-        osfs2_file_t *f = fd_table[fd].file;
-        uint64_t pos = fd_table[fd].pos;
-        if (pos >= f->size) return 0;  /* EOF */
-        uint64_t avail = f->size - pos;
+        void *f = fd_table[fd].file;
+        uint64_t pos = fd_table[fd].pos, size = osfs3_file_size(f);
+        if (pos >= size) return 0;  /* EOF */
+        uint64_t avail = size - pos;
         if (count > avail) count = avail;
-        if (osfs2_read(f, pos, (void *)buf, count) < 0) return -5;  /* -EIO */
+        if (osfs3_read_file(f, pos, (void *)buf, count) < 0) return -5;  /* -EIO */
         fd_table[fd].pos += count;
         return (int64_t)count;
     }
@@ -197,7 +199,7 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags)
 {
     (void)dirfd; (void)flags;
     const char *name = (const char *)pathname;
-    osfs2_file_t *f = osfs2_find(name);
+    void *f = fs_find(name);            /* relative to the shell's directory */
     if (!f) return -2;  /* -ENOENT */
     return fd_alloc(f);
 }
@@ -215,11 +217,11 @@ static int64_t sys_close(uint64_t fd)
 static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 {
     if (fd < 3 || fd >= MAX_FDS || !fd_table[fd].file) return -9;
-    osfs2_file_t *f = fd_table[fd].file;
+    void *f = fd_table[fd].file;
     int64_t new_pos;
     if (whence == 0) new_pos = offset;                          /* SEEK_SET */
     else if (whence == 1) new_pos = (int64_t)fd_table[fd].pos + offset;  /* SEEK_CUR */
-    else if (whence == 2) new_pos = (int64_t)f->size + offset;  /* SEEK_END */
+    else if (whence == 2) new_pos = (int64_t)osfs3_file_size(f) + offset;  /* SEEK_END */
     else return -22;  /* -EINVAL */
     if (new_pos < 0) return -22;
     fd_table[fd].pos = (uint64_t)new_pos;

@@ -11,7 +11,8 @@
     arch/arm/platform/sm8350/kload.c.
 
 .PARAMETER Name
-    The file's name on the phone.
+    The file's path on the phone, relative to the shell's current directory
+    (`cd`) unless it starts with /.
 
 .PARAMETER Out
     Where to write it. Default: the same name in the current directory.
@@ -55,9 +56,10 @@ public static class OsitoGet {
 
     // After `get <name>`: skip the text up to "OKLD", then read the size,
     // the CRC and the bytes. Returns null with the device's answer in text
-    // when it refuses, or on idleMs of silence.
-    public static byte[] Receive(SerialPort sp, int idleMs, out string text, out uint crcSent) {
-        sp.ReadTimeout = idleMs;
+    // when it refuses, after headerMs without the header (the device reads
+    // the whole file first), or after idleMs of silence in the data.
+    public static byte[] Receive(SerialPort sp, int headerMs, int idleMs, out string text, out uint crcSent) {
+        sp.ReadTimeout = headerMs;
         var pre = new MemoryStream();
         byte[] chunk = new byte[65536];
         int pos = 0, len = 0, matched = 0;
@@ -79,6 +81,7 @@ public static class OsitoGet {
         }
         text = Encoding.ASCII.GetString(pre.ToArray(), 0, (int)pre.Length - 4);
 
+        sp.ReadTimeout = idleMs;
         byte[] hdr = new byte[8];
         if (!Fill(sp, chunk, ref pos, ref len, hdr)) return null;
         uint size = BitConverter.ToUInt32(hdr, 0);
@@ -121,7 +124,7 @@ try {
     $sp.Write("get $Name`r")
     $text = ''
     $crcSent = [uint32]0
-    $data = [OsitoGet]::Receive($sp, 5000, [ref]$text, [ref]$crcSent)
+    $data = [OsitoGet]::Receive($sp, 120000, 5000, [ref]$text, [ref]$crcSent)
     $secs = ((Get-Date) - $t0).TotalSeconds
     if ($null -eq $data) {
         $answer = ($text -split "`r?`n" | Where-Object { $_ -match 'get' -and $_ -ne "get $Name" } | Select-Object -Last 1)

@@ -27,6 +27,8 @@
 #include "../include/dispatch.h"
 #include "../fs/gguf.h"
 #include "../../../include/common/ositofs2_format.h"
+#include "../include/fs.h"
+#include "../fs/ositofs3.h"
 #include "inference.h"
 #include "tokenizer.h"
 #include "tensor.h"
@@ -36,8 +38,6 @@
 #define MAX_TOKENS      200
 #define READ_CHUNK      (1U << 20)
 
-extern osfs2_file_t *osfs2_find(const char *name);
-extern int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len);
 extern int tensor_simd;
 extern tokenizer_t g_tokenizer;
 extern const char *llama_state_arch(void *s);
@@ -204,7 +204,7 @@ static void unload(void)
 static void load(void *arg)
 {
     const char *name = (const char *)arg;
-    osfs2_file_t *f = osfs2_find(name);
+    void *f = fs_find(name);
     if (!f) {
         serial_puts("model: no file ");
         serial_puts(name);
@@ -212,7 +212,7 @@ static void load(void *arg)
         return;
     }
     unload();
-    uint64_t size = f->size;
+    uint64_t size = osfs3_file_size(f);
     model_pages = (size + 4095) / 4096;
     model_data = mem_alloc_aligned_high(size, 2U << 20);
     if (!model_data) {
@@ -223,7 +223,7 @@ static void load(void *arg)
     uint64_t t0 = now_ms();
     for (uint64_t off = 0; off < size; off += READ_CHUNK) {
         uint64_t n = size - off < READ_CHUNK ? size - off : READ_CHUNK;
-        if (osfs2_read(f, off, (uint8_t *)model_data + off, n) < 0) {
+        if (osfs3_read_file(f, off, (uint8_t *)model_data + off, n) < 0) {
             serial_puts("model: read failed\n");
             unload();
             return;

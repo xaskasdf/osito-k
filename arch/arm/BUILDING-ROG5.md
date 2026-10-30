@@ -508,31 +508,66 @@ same way.
 - `ufs read <lun> <lba> [offset]` hexdumps 256 bytes of a block (numbers in
   decimal or `0x` hex).
 
-**OsitoFS on `userdata`.**
-- **The device:** OsitoFS (`fs/ositofs2.c`) runs on a selectable backend
-  (`osfs2_set_backend`), VirtIO-blk on virt. On the phone it's `userdata` as a
-  byte device: commands of up to 16 blocks of 4 KB, and a write that covers a
-  block only partly reads it first.
-- **Format:** `ufs mkfs userdata` (the name typed as confirmation) formats it
-  with the in-kernel `osfs2_format`, a port of `tools/ositofs/mkfs.c`: 1 MB
-  blocks, 4096 file slots, the expanded layout. It writes only the first 4 MB:
-  232 469 data blocks, 227 GB.
-- **Mount:** boot mounts it (`ufs_mount_at_boot`, ~0.6 s), and `ufs mount`
-  does it by hand.
-- **Files:** the shell's `ls`, `cat`, `hexdump`, `df` and `exec` work on it.
-- **Upload:** `put <name>` takes a file from the host with `kload`'s framing
+**OsitoFS v3 on `userdata`.** It has directories since 2026-10-30.
+- **The driver:** `fs/ositofs3.c` is x86's driver, ported. It caches the
+  inode table, path index and bitmaps at mount, and addresses file data
+  through up to 12 extents.
+  - The device is a selectable backend (`osfs3_set_backend`): `userdata` on
+    the phone, VirtIO-blk on virt. `userdata` is a byte device: commands of up
+    to 16 blocks of 4 KB, and a write that covers a block only partly reads it
+    first.
+  - What changed from x86:
+    - The caches (~9 MB for 16384 inodes) come from high memory.
+    - The mutation lock yields while it waits instead of masking IRQs, since
+      it's held across disk I/O and the boot CPU's tick is the system's time.
+    - The `__atomic` builtins became plain accesses with barriers (LSE again).
+    - Timestamps are the volume's creation time, since there's no wall clock.
+- **Format:** `ufs mkfs userdata` (the name typed as confirmation) runs the
+  in-kernel `osfs3_format`, a port of `tools/ositofs/mkfs3.c`: 64 KB blocks
+  and 16384 inodes.
+  - One bitmap block covers 524 288 blocks, so the volume is the partition's
+    first **32 GB**, of its 227 GB.
+  - It writes 4 MB: the superblock, the bitmaps, the inode table and the root
+    directory.
+  - x86's host tools accept what it writes: `ositofs-fsck3` found a virt
+    image formatted, edited and written on both sides clean.
+- **Migrate:** `ufs migrate userdata` turns a v2 volume into v3 and keeps the
+  files.
+  - It reads every file into high memory, formats, writes them into the root,
+    and reads each back against its CRC.
+  - On the phone: 12 files, 120 MB, in 63 s, all verified.
+  - v2 (`fs/ositofs2.c`) stays for this. The x86 ports nothing calls
+    (`git.c`, `claude.c`, the GGUF and KV-cache paths, `gsp.c`) still use its
+    API.
+- **Mount:** boot mounts v3 (`ufs_mount_at_boot`), and `ufs mount` does it by
+  hand. A v2 volume is mounted for `ufs migrate` only, with a hint.
+- **Paths:** `kernel/fs.c` keeps the shell's current directory. `fs_path`
+  makes any path absolute and resolves `.` and `..`; v3's own calls only take
+  paths from the root.
+- **Files:**
+  - `ls [path]`, `cat`, `hexdump`, `df`, `cd`, `pwd`, `mkdir`, `rmdir`, `rm`
+    and `mv` (which moves into a directory) work on it.
+  - `exec`, `model`, `put`, `get`, `screenshot` and the apps' `open` take
+    paths relative to the current directory.
+- **Upload:** `put <path>` takes a file from the host with `kload`'s framing
   (`"OKLD"`, size, CRC-32, bytes; `arch/arm/scripts/rog5-put.ps1 -File <path>
-  [-Name <name>]`, up to 1 GB, received in high memory). It replaces a file
+  [-Name <path>]`, up to 1 GB, received in high memory). It replaces a file
   with that name, flushes the device's cache, reads the file back from UFS and
   checks the CRC before saying "stored and verified". It runs at the USB
-  console's pace, ~1.67 MB/s: 5 MB of random bytes took 3 s, a 92 MB model
+  console's pace, ~1.7 MB/s: 5 MB of random bytes took 3 s, a 92 MB model
   54 s.
-- **Download:** `get <name>` sends a file back in the same framing
-  (`arch/arm/scripts/rog5-get.ps1 -Name <name> [-Out <path>]`, which checks
-  the CRC). Other tasks may print during the transfer. While it runs,
-  `console_host_hold` (`kernel/serial.c`) keeps their output on the screen
-  and in the log, but off the USB link, so it can't land inside the binary
-  data. It runs at ~2.9 MB/s: 21.6 MB in 7.3 s, over COM3 or COM4 alike.
+- **Download:** `get <path>` sends a file back in the same framing
+  (`arch/arm/scripts/rog5-get.ps1 -Name <path> [-Out <path>]`, which checks
+  the CRC).
+  - Other tasks may print during the transfer. While it runs,
+    `console_host_hold` (`kernel/serial.c`) keeps their output on the screen
+    and in the log, but off the USB link, so it can't land inside the binary
+    data.
+  - It runs at ~3 MB/s: 92 MB in 30 s, over COM3 or COM4 alike.
+  - The phone reads the whole file before the header, so the script waits up
+    to 2 min for it, then 5 s per read.
+  - If the host closes the port, the phone stops sending. Before, the rest
+    of the file reached whoever opened the port next.
 - **Screenshots:** `screenshot [name]` writes the panel as a 24-bit BMP,
   `screen.bmp` by default: 7.9 MB for 1080×2448.
   - The panel's pixels are `0x00RRGGBB`, so B, G, R in memory, which is
@@ -540,7 +575,7 @@ same way.
   - `arch/arm/scripts/rog5-screenshot.ps1 [-Out <file.png>]` runs it, fetches
     the BMP and saves a PNG, all in ~4 s. The console comes out at ~80 KB as
     a PNG, the desktop at ~150 KB.
-- **Apps:** `exec <name> [args]` runs a program stored there (see "Apps").
+- **Apps:** `exec <path> [args]` runs a program stored there (see "Apps").
 
 ---
 
@@ -1073,6 +1108,17 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     - 16 KB TLS buffers overflowed the 8 KB task stacks and froze the phone;
       stacks are now 32 KB;
     - virt's virtio-net dropped every frame.
+31. **Directories: OsitoFS v3 (2026-10-30).** See "OsitoFS v3 on `userdata`".
+    - x86's v3 driver runs on `userdata`, formatted in-kernel (32 GB, 64 KB
+      blocks).
+    - `ufs migrate userdata` carried the 12 v2 files over, all verified.
+    - The shell has a current directory, with `cd`, `mkdir`, `rmdir`, `rm`
+      and `mv`.
+    - virt's `virtio_blk_flush` had sent a zero-length buffer, which QEMU
+      refuses, so a flush never completed.
+    - Once flushes worked, QEMU synced the image file for them, which on
+      Windows outlasted the driver's fixed 10M-iteration wait. The wait is
+      now 5 s by the generic timer.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1609,7 +1655,9 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/kernel/tensor_neon.c` | NEON kernels under x86's AVX2 names (Q4_0, Q4_1, F16 matvec, rmsnorm, vec ops) |
 | `arch/arm/kernel/{inference,tensor,tokenizer,tokenizer_trie}.c`, `fs/gguf.c` | x86's inference stack, ported (CNTPCT timing, double-precision math, Q4_1) |
 | `arch/arm/platform/sm8350/keys.c` | Power / volume keys: console history, fastboot and status shortcuts |
-| `arch/arm/platform/sm8350/ufs.c` | UFS host controller: LUNs, GPT, block dumps; writes only into `userdata` (OsitoFS) |
+| `arch/arm/platform/sm8350/ufs.c` | UFS host controller: LUNs, GPT, block dumps; writes only into `userdata` (OsitoFS v3: `mkfs`, `mount`, `migrate`) |
+| `arch/arm/fs/ositofs3.c` | OsitoFS v3 (x86's driver, ported): directories, extents, in-kernel `osfs3_format` |
+| `arch/arm/kernel/fs.c` | The shell's current directory; paths made absolute for v3 |
 | `arch/arm/scripts/rog5-put.ps1` | Host side of `put`: copy a file onto the phone's OsitoFS |
 | `arch/arm/scripts/rog5-get.ps1` | Host side of `get`: copy a file from the phone's OsitoFS |
 | `arch/arm/scripts/rog5-screenshot.ps1` | `screenshot` on the phone, then the BMP fetched and saved as a PNG |

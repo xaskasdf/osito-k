@@ -14,7 +14,8 @@
     The file to send (up to 1 GB).
 
 .PARAMETER Name
-    Its name on the phone. Default: the file's own name.
+    Its path on the phone, relative to the shell's current directory (`cd`)
+    unless it starts with /. Default: the file's own name.
 
 .PARAMETER Port
     COM port. Default: the one whose PNP ID is VID_1209&PID_0001.

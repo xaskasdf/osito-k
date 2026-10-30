@@ -13,9 +13,10 @@
  * stop it, point it at ours, start it. One slot, one command at a time,
  * polled, inline crypto off.
  *
- * Osito-K writes only to LUN 0's userdata partition: OsitoFS lives there
- * (`ufs mkfs userdata`, `ufs mount`). permitted() refuses any other write,
- * and every command that isn't a read or a write into that range.
+ * Osito-K writes only to LUN 0's userdata partition: OsitoFS v3 lives there
+ * (`ufs mkfs userdata`, `ufs mount`; `ufs migrate userdata` turns a v2 into
+ * v3, files kept). permitted() refuses any other write, and every command
+ * that isn't a read or a write into that range.
  *
  * Offsets: Linux drivers/clk/qcom/gcc-sm8350.c (the ufs_phy block at
  * 0x77000), include/ufs/ufshci.h and ufs.h, the phone's device tree (reg,
@@ -27,8 +28,8 @@
 #include "mmu.h"
 #include "smmu.h"
 #include "ufs.h"
-
-bool osfs2_is_mounted(void);                /* fs/ositofs2.c */
+#include "../../include/fs.h"
+#include "../../fs/ositofs3.h"
 
 #define GCC_BASE            0x00100000UL
 #define GCC_UFS             0x77000     /* GCC_UFS_PHY_BCR */
@@ -615,16 +616,22 @@ static int part_flush(void)
     return scsi(RW_LUN, cdb, 0, 0) == SCSI_GOOD ? 0 : -1;
 }
 
-/* userdata becomes OsitoFS's device */
+static uint64_t part_size(void)
+{
+    return (uint64_t)rw_blocks * rw_bsize;
+}
+
+/* userdata becomes OsitoFS's device (v3, and v2 for `ufs migrate`) */
 static int attach_fs(void)
 {
     if (ufs_attach())
         return -1;
     osfs2_set_backend(part_read, part_write, part_flush);
+    osfs3_set_backend(part_read, part_write, part_flush, part_size);
     return 0;
 }
 
-/* `ufs mkfs userdata`: an empty OsitoFS over it, then mounted. The name
+/* `ufs mkfs userdata`: an empty OsitoFS v3 over it, then mounted. The name
  * must be typed: it erases what was there. */
 static void cmd_mkfs(const char *confirm)
 {
@@ -634,23 +641,130 @@ static void cmd_mkfs(const char *confirm)
     }
     if (attach_fs())
         return;
-    serial_puts("[UFS ] formatting " RW_PART " as OsitoFS (writes its first 4 MB)\n");
-    if (osfs2_format((uint64_t)rw_blocks * rw_bsize, "rog5")) {
+    serial_puts("[UFS ] formatting " RW_PART " as OsitoFS v3 (its first 32 GB; writes 4 MB)\n");
+    osfs2_unmount();
+    if (osfs3_format(part_size(), "rog5", 0)) {
         put_failure("format failed");
         return;
     }
-    osfs2_mount(0);
+    osfs3_mount(0);
 }
 
-/* `ufs mount`: mount the OsitoFS on userdata */
+/* `ufs mount`: mount the OsitoFS v3 on userdata, or say how to convert a v2 */
 static void cmd_mount(void)
 {
-    if (osfs2_is_mounted()) {
+    if (osfs3_is_mounted()) {
         serial_puts("ufs: already mounted\n");
         return;
     }
-    if (attach_fs() == 0 && osfs2_mount(0) != 0)
+    if (attach_fs())
+        return;
+    if (osfs3_mount(0) == 0)
+        return;
+    if (osfs2_is_mounted() || osfs2_mount(0) == 0)
+        serial_puts("ufs: " RW_PART " holds OsitoFS v2: `ufs migrate " RW_PART
+                    "` turns it into v3, files kept\n");
+    else
         serial_puts("ufs: no OsitoFS on " RW_PART " (ufs mkfs " RW_PART " makes one)\n");
+}
+
+/* `ufs migrate userdata`: the v2 volume as v3, files kept. Every file is
+ * read into high memory, the partition formatted as v3, and each written
+ * back into the root, read back and checked against its CRC. */
+static void cmd_migrate(const char *confirm)
+{
+    if (strcmp(confirm, RW_PART) != 0) {
+        serial_puts("ufs migrate: type the partition's name: ufs migrate " RW_PART "\n");
+        return;
+    }
+    if (osfs3_is_mounted()) {
+        serial_puts("ufs migrate: " RW_PART " is OsitoFS v3 already\n");
+        return;
+    }
+    if (attach_fs())
+        return;
+    if (!osfs2_is_mounted() && osfs2_mount(0) != 0) {
+        serial_puts("ufs migrate: no OsitoFS v2 on " RW_PART "\n");
+        return;
+    }
+    struct mfile {
+        char     name[OSFS2_NAME_LEN + 1];
+        uint8_t *data;
+        uint64_t size;
+        uint32_t crc;
+    };
+    uint32_t n = osfs2_file_count();
+    uint64_t list_bytes = (uint64_t)(n ? n : 1) * sizeof(struct mfile);
+    struct mfile *files = mem_alloc_aligned_high(list_bytes, 4096);
+    if (!files) {
+        serial_puts("ufs migrate: out of memory\n");
+        return;
+    }
+    memset(files, 0, list_bytes);
+    uint64_t total = 0;
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        osfs2_file_t *f = osfs2_file_at(i);
+        struct mfile *m = &files[kept];
+        if (!f)
+            break;
+        memcpy(m->name, f->name, OSFS2_NAME_LEN);
+        m->size = f->size;
+        if (m->size) {
+            m->data = mem_alloc_aligned_high(m->size, 4096);
+            if (!m->data || osfs2_read(f, 0, m->data, m->size) != (int)m->size) {
+                serial_puts("ufs migrate: can't read ");
+                serial_puts(m->name);
+                serial_puts(": nothing changed\n");
+                goto out;
+            }
+        }
+        m->crc = osfs3_crc32(m->data, m->size);
+        total += m->size;
+        kept++;
+    }
+    serial_puts("[UFS ] migrate: ");
+    serial_putdec(kept);
+    serial_puts(" files, ");
+    serial_putdec(total >> 20);
+    serial_puts(" MB read; formatting as OsitoFS v3\n");
+
+    osfs2_unmount();
+    if (osfs3_format(part_size(), "rog5", 0) || osfs3_mount(0)) {
+        put_failure("format failed; the files are lost");
+        goto out;
+    }
+    uint32_t ok = 0;
+    for (uint32_t i = 0; i < kept; i++) {
+        struct mfile *m = &files[i];
+        char path[FS_PATH_MAX];
+        path[0] = '/';
+        strcpy(path + 1, m->name);
+        int good = fs_write_file(path, m->data, m->size) == 0;
+        if (good && m->size) {
+            /* Read back over the copy itself, and check */
+            memset(m->data, 0, m->size);
+            void *f = osfs3_find(path);
+            good = f && osfs3_read_file(f, 0, m->data, m->size) == (int)m->size &&
+                   osfs3_crc32(m->data, m->size) == m->crc;
+        }
+        ok += good;
+        if (!good) {
+            serial_puts("ufs migrate: ");
+            serial_puts(m->name);
+            serial_puts(" failed\n");
+        }
+    }
+    serial_puts("[UFS ] migrate: ");
+    serial_putdec(ok);
+    serial_puts(" of ");
+    serial_putdec(kept);
+    serial_puts(" files written and verified\n");
+out:
+    for (uint32_t i = 0; i < n; i++)
+        if (files[i].data)
+            mem_free_pages(files[i].data, (files[i].size + 4095) / 4096);
+    mem_free_pages(files, (list_bytes + 4095) / 4096);
 }
 
 /* At boot: mount the OsitoFS on userdata if it has one */
@@ -758,6 +872,8 @@ void platform_ufs_cmd(int argc, char **argv)
         cmd_mount();
     else if (argc == 3 && strcmp(argv[1], "mkfs") == 0)
         cmd_mkfs(argv[2]);
+    else if (argc == 3 && strcmp(argv[1], "migrate") == 0)
+        cmd_migrate(argv[2]);
     else if (argc == 3 && strcmp(argv[1], "gpt") == 0 && !parse_num(argv[2], &lun) && lun < 8)
         cmd_gpt((uint8_t)lun);
     else if ((argc == 4 || argc == 5) && strcmp(argv[1], "read") == 0 &&
@@ -766,5 +882,5 @@ void platform_ufs_cmd(int argc, char **argv)
         cmd_read((uint8_t)lun, lba, off);
     else
         serial_puts("usage: ufs [luns | gpt <lun> | read <lun> <lba> [offset] | mount |\n"
-                    "            mkfs " RW_PART "]\n");
+                    "            mkfs " RW_PART " | migrate " RW_PART "]\n");
 }

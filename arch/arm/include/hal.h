@@ -248,6 +248,10 @@ void osfs2_set_backend(int (*read)(uint64_t off, void *buf, uint64_t len),
                        int (*flush)(void));
 int  osfs2_format(uint64_t bytes, const char *label);  /* empty fs, 1 MB blocks */
 int  osfs2_mount(uint64_t part_offset);
+void osfs2_unmount(void);
+bool osfs2_is_mounted(void);
+uint32_t osfs2_file_count(void);
+osfs2_file_t *osfs2_file_at(uint32_t index);
 void osfs2_list(void);
 osfs2_file_t *osfs2_find(const char *name);
 int  osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len);

@@ -313,8 +313,10 @@ void kernel_main(void *dtb)
     /* Steps 8-9 probe QEMU virt devices (virtio-mmio), absent on SM8350 */
     if (on_qemu_virt()) {
         /* Step 8: VirtIO-blk (MMIO transport) + OsitoFS */
-        if (virtio_blk_init(0, 0, 0, (uint64_t[]){0,0,0,0,0,0}) == 0)
-            osfs2_mount(0);  /* Mount at offset 0 (no GPT) */
+        extern int osfs3_mount(uint64_t part_offset);
+        if (virtio_blk_init(0, 0, 0, (uint64_t[]){0,0,0,0,0,0}) == 0 &&
+            osfs3_mount(0) != 0)
+            osfs2_mount(0);  /* v3, else v2; at offset 0 (no GPT) */
 
         /* Step 9: VirtIO-net + network stack */
         extern int virtio_net_init(void);

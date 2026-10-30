@@ -55,7 +55,7 @@ ASM_SRCS := boot/start.S kernel/context_switch.S kernel/mem.S
 C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/memory.c kernel/paging.c kernel/heap.c kernel/sched.c \
             kernel/syscall.c kernel/elf.c kernel/process.c \
-            kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/gui_task.c \
+            kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/fs.c kernel/gui_task.c \
             kernel/pci.c kernel/net.c kernel/dhcp.c \
             kernel/crypto.c kernel/tls.c kernel/http.c kernel/smp.c \
             kernel/claude.c kernel/tokenizer.c kernel/tokenizer_trie.c \
@@ -66,7 +66,7 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             drivers/hda.c drivers/virtio_blk.c drivers/virtio_net.c \
             drivers/gpu.c drivers/gsp.c drivers/sass.c drivers/gmmu.c \
             drivers/gpu_tensor.c drivers/gpu_inference.c drivers/gpu_display.c \
-            fs/ositofs2.c fs/gguf.c fs/gpt.c \
+            fs/ositofs2.c fs/ositofs3.c fs/gguf.c fs/gpt.c \
             $(wildcard $(PLAT_DIR)/*.c)
 GUI_SRCS := ../../gui/gui_draw.c ../../gui/gui_text.c \
             ../../gui/gui_panel.c ../../gui/gui_dock.c \
