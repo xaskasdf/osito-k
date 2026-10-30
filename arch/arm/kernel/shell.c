@@ -54,12 +54,14 @@ static void cmd_help(void)
     serial_puts("  beep     Play a tone\n");
     serial_puts("  desktop  The desktop on the panel, phablet layout [off]\n");
     serial_puts("  reboot   Reboot system [bootloader: into fastboot]\n");
-    serial_puts("  pmic     PMIC arbiter + restart reason [<sid> <hex addr>]\n");
+    serial_puts("  pmic     PMIC arbiter + restart reason [<sid> <hex addr> | list <sid>]\n");
+    serial_puts("  rpmh     Apps RSC + AOP command DB [<resource>]\n");
     serial_puts("  keys     Power / volume keys: now and press counts\n");
     serial_puts("  screen   Screen mode [debug | normal]: diagnostics or full console\n");
     serial_puts("  ufs      UFS storage [luns | gpt <lun> | read <lun> <lba> [off] | mount |\n");
     serial_puts("           mkfs userdata]: writes go only to userdata (OsitoFS)\n");
     serial_puts("  put      Store a file sent over USB <name> (host: rog5-put.ps1)\n");
+    serial_puts("  touch    Touchscreen: state, wiring, supplies [on | read | off]\n");
     serial_puts("  kload    Receive a kernel over USB and run it\n");
     serial_puts("  dmesg    Show the console log since boot\n");
     serial_puts("  clear    Clear screen\n");
@@ -417,10 +419,12 @@ void shell_run(void)
                 platform_reboot();
         }
         else if (strcmp(argv[0], "pmic") == 0)    platform_pmic_cmd(argc, argv);
+        else if (strcmp(argv[0], "rpmh") == 0)    platform_rpmh_cmd(argc, argv);
         else if (strcmp(argv[0], "keys") == 0)    platform_keys_cmd(argc, argv);
         else if (strcmp(argv[0], "screen") == 0)  platform_screen_cmd(argc, argv);
         else if (strcmp(argv[0], "ufs") == 0)     platform_ufs_cmd(argc, argv);
         else if (strcmp(argv[0], "put") == 0)     platform_put_cmd(argc, argv);
+        else if (strcmp(argv[0], "touch") == 0)   platform_touch_cmd(argc, argv);
         else if (strcmp(argv[0], "clear") == 0)   serial_puts("\033[2J\033[H");
         else {
             serial_puts("Unknown: ");

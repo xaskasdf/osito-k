@@ -8,8 +8,15 @@
  * an off-screen surface the desktop composes, laid out again from the log
  * (console_redraw). Frames are painted into a back buffer in cached RAM and
  * copied to the panel, only when something changed: console text, an
- * animation, a key, the status bar's minute. `desktop off` gives the panel
- * back to the console. The Power key brings the next window to the front.
+ * animation, a key, a finger, the status bar's minute. `desktop off` gives
+ * the panel back to the console. The Power key brings the next window to
+ * the front.
+ *
+ * Fingers (platform_touch_event, in panel pixels): a tap acts where it
+ * started, on the lift, unless the finger travelled more than 8 dp; then
+ * it is a swipe, and scrolls what is under it one wheel notch per 40 dp
+ * (the Appearance pane). Nav bar items bring their window to the front;
+ * anything else is a click in the front window.
  */
 
 #include "../include/hal.h"
@@ -33,6 +40,57 @@ static void cycle_window(void)
     int *order = gui_desktop_get_order();
     if (count > 1)
         gui_desktop_show_window(order[0]);
+}
+
+static struct {
+    int down, swipe;
+    int32_t x0, y0, notches;
+} finger;
+
+static void tap(int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+    int hit = gui_dock_hit(w, h, x, y);
+    if (hit != -1) {
+        int count = 0;
+        gui_desktop_get_windows(&count);
+        if (hit == -3 || hit == -4)
+            gui_dock_page(hit == -3 ? -1 : 1);
+        else if (hit >= 0 && hit < count)
+            gui_desktop_show_window(hit);
+        return;
+    }
+    /* A tap on the scroll thumb grabs it; let go at once, swipes scroll */
+    if (gui_desktop_click(gui_desktop_get_focus(), x, y) && gui_desktop_pointer_captured())
+        gui_desktop_pointer_update(x, y, false);
+}
+
+static void touch_input(int32_t x, int32_t y, int down, uint32_t w, uint32_t h)
+{
+    if (down && !finger.down) {
+        finger.down = 1;
+        finger.swipe = 0;
+        finger.x0 = x;
+        finger.y0 = y;
+        finger.notches = 0;
+        return;
+    }
+    if (!finger.down)
+        return;
+    int32_t dx = x - finger.x0, dy = y - finger.y0, slop = gui_px(8);
+    if (dx * dx + dy * dy > slop * slop)
+        finger.swipe = 1;
+    if (finger.swipe) {
+        int32_t notches = dy / gui_px(40);  /* finger down: content down (upward) */
+        if (notches != finger.notches)
+            gui_desktop_scroll(gui_desktop_get_focus(), finger.x0, finger.y0,
+                               notches - finger.notches);
+        finger.notches = notches;
+    }
+    if (!down) {
+        finger.down = 0;
+        if (!finger.swipe)
+            tap(finger.x0, finger.y0, w, h);
+    }
 }
 
 /* The status bar: uptime as the clock (no RTC), memory, frame rate */
@@ -98,12 +156,21 @@ void gui_task(void *arg)
     gui_surface_t screen = { back, w, h, w };
     uint64_t frames = 0, fps = 0, fps_t0 = timer_ms(), shown_min = ~0ULL;
     int first = 1;
+    int32_t tx, ty;
+    int tdown;
+    while (platform_touch_event(&tx, &ty, &tdown))
+        ;                               /* from before the desktop */
+    finger.down = 0;
     while (!stop_req) {
         uint64_t now = timer_ms();
         int dirty = fb_take_dirty() | first;
         if (next_req) {
             next_req = 0;
             cycle_window();
+            dirty = 1;
+        }
+        while (platform_touch_event(&tx, &ty, &tdown)) {
+            touch_input(tx, ty, tdown, w, h);
             dirty = 1;
         }
         if (gui_anim_tick(now))

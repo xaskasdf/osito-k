@@ -6,6 +6,8 @@
  * up a flat map (VA == PA) with the caches on:
  *
  *   0x00000000-0x3FFFFFFF  Device-nGnRE  MMIO (one 1 GB block)
+ *   0x80800000-0x809FFFFF  Device-nGnRE  holds the AOP's command DB
+ *                                        (0x80860000, rpmh.c reads it)
  *   0xA0000000-0xB4DFFFFF  Normal WB     kernel, heap, kload buffers
  *   0xB4E00000-0xB4FFFFFF  Normal NC     DMA window (USB event buffer, TRBs)
  *   0xE5000000-0xE5BFFFFF  Normal NC     splash framebuffer (writes merge)
@@ -13,7 +15,8 @@
  * Nothing else is mapped. The firmware carve-outs below 0xA0000000 must stay
  * out: Normal memory can be read speculatively and those regions belong to
  * other processors. Device memory is never speculated, so the holes in the
- * MMIO gigabyte are harmless.
+ * MMIO gigabyte are harmless, and so is mapping the command DB's block (the
+ * rest of it is SMEM and the XBL log, never touched).
  *
  * 39-bit VA (T0SZ = 25) starts at level 1 (1 GB per entry); the DDR and
  * framebuffer gigabytes use level-2 tables of 2 MB blocks. Tables are static.
@@ -50,6 +53,7 @@
 #define SCTLR_I         (1ULL << 12)
 
 #define L2_DRAM_BASE    0x80000000UL
+#define CMD_DB_BLOCK    0x80800000UL            /* the 2 MB with cmd-db */
 #define L2_FB_BASE      0xC0000000UL
 #define FB_BASE         0xE5000000UL
 #define FB_MAPPED       0x00C00000UL            /* 12 MB >= 1080 x 2448 x 4 */
@@ -103,6 +107,7 @@ void platform_mmu_init(void)
     l1[0] = block_desc(0, ATTR_DEVICE);
     l1[2] = (uint64_t)(uintptr_t)l2_dram | DESC_TABLE;
     l1[3] = (uint64_t)(uintptr_t)l2_fb | DESC_TABLE;
+    map_2m(l2_dram, L2_DRAM_BASE, CMD_DB_BLOCK, CMD_DB_BLOCK + BLOCK_2M, ATTR_DEVICE);
     map_2m(l2_dram, L2_DRAM_BASE, RAM_CACHED_BASE, DMA_WINDOW_BASE, ATTR_NORMAL_WB);
     map_2m(l2_dram, L2_DRAM_BASE, DMA_WINDOW_BASE, RAM_END, ATTR_NORMAL_NC);
     map_2m(l2_fb, L2_FB_BASE, FB_BASE, FB_BASE + FB_MAPPED, ATTR_NORMAL_NC);

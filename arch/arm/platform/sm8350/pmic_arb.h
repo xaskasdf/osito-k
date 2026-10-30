@@ -16,5 +16,6 @@
 int pmic_read(uint8_t sid, uint16_t addr, uint8_t *val);
 int pmic_write(uint8_t sid, uint16_t addr, uint8_t val);
 uint32_t pmic_arb_version(void);
+void pmic_list(uint8_t sid);    /* every peripheral it maps on that PMIC */
 
 #endif

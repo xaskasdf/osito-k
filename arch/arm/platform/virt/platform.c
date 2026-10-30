@@ -86,6 +86,28 @@ void platform_put_cmd(int argc, char **argv)
     serial_puts("put: only on SM8350 (over the USB console)\n");
 }
 
+void platform_touch_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    serial_puts("touch: only on SM8350\n");
+}
+
+void platform_rpmh_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    serial_puts("rpmh: only on SM8350\n");
+}
+
+int platform_touch_event(int32_t *x, int32_t *y, int *down)
+{
+    (void)x;
+    (void)y;
+    (void)down;
+    return 0;
+}
+
 /* No panel for the desktop: QEMU shows the UART */
 int platform_panel(uint64_t *base, uint32_t *w, uint32_t *h,
                    uint32_t *w_mm, uint32_t *h_mm)

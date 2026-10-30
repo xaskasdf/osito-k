@@ -20,6 +20,7 @@ void platform_reboot(void);
  * bootloader`). Returns only if it can't. */
 void platform_reboot_bootloader(void);
 void platform_pmic_cmd(int argc, char **argv);  /* shell `pmic` */
+void platform_rpmh_cmd(int argc, char **argv);  /* shell `rpmh` */
 /* MMU + caches (called from kernel_main after mem_init) */
 void platform_mmu_init(void);
 /* Board devices beyond the core (called from kernel_main after the heap) */
@@ -36,6 +37,10 @@ void platform_temp_cmd(int argc, char **argv);   /* shell `temp` */
 void platform_keys_cmd(int argc, char **argv);   /* shell `keys` */
 void platform_ufs_cmd(int argc, char **argv);    /* shell `ufs` */
 void platform_put_cmd(int argc, char **argv);    /* shell `put`: a file over USB */
+void platform_touch_cmd(int argc, char **argv);  /* shell `touch` */
+/* The next finger event in panel pixels (down: 1 pressed or moved, 0
+ * lifted): 1, or 0 when there is none */
+int  platform_touch_event(int32_t *x, int32_t *y, int *down);
 
 /* ========================================================================
  * UART (platform-specific low-level)

@@ -127,6 +127,38 @@ int pmic_read(uint8_t sid, uint16_t addr, uint8_t *val)
     return err;
 }
 
+/* Every peripheral of one PMIC the arbiter maps, with its type/subtype
+ * (registers 0x04/0x05), each once */
+void pmic_list(uint8_t sid)
+{
+    uint8_t seen[256] = { 0 };
+    int count = 0;
+    for (int n = 0; APID_MAP(n) < CORE_SIZE; n++) {
+        uint32_t ppid = (mmio_rd32(ARB_CORE + APID_MAP(n)) >> 8) & 0xFFF;
+        if (!ppid || (ppid >> 8) != sid || seen[ppid & 0xFF])
+            continue;
+        uint8_t periph = (uint8_t)ppid, type = 0, sub = 0;
+        seen[periph] = 1;
+        pmic_read(sid, (uint16_t)(periph << 8 | 0x04), &type);
+        pmic_read(sid, (uint16_t)(periph << 8 | 0x05), &sub);
+        uint64_t flags = spin_lock_irqsave(&arb_lock);
+        int ours = find_apid(sid, periph, 1) >= 0;
+        spin_unlock_irqrestore(&arb_lock, flags);
+        serial_puts(count % 4 ? "   " : "\n  ");
+        serial_puthex(periph << 8, 4);
+        serial_puts(ours ? "*" : " ");
+        serial_puthex(type, 2);
+        serial_puts("/");
+        serial_puthex(sub, 2);
+        count++;
+    }
+    serial_puts("\n");
+    serial_putdec((uint32_t)count);
+    serial_puts(" peripherals on sid ");
+    serial_putdec(sid);
+    serial_puts(" (address type/subtype; * = EE 0 may write it)\n");
+}
+
 int pmic_write(uint8_t sid, uint16_t addr, uint8_t val)
 {
     if (!arb_ok())

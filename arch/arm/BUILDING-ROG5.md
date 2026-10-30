@@ -133,6 +133,7 @@ and both caches on:
 | Range | Attributes | Use |
 |-------|-----------|-----|
 | `0x00000000`–`0x3FFFFFFF` | Device-nGnRE (1 GB block) | MMIO: GCC, UART, USB, SMMU, GIC… |
+| `0x80800000`–`0x809FFFFF` | Device-nGnRE | the AOP's command DB (`0x80860000`, read by `rpmh.c`) |
 | `0xA0000000`–`0xB4DFFFFF` | Normal write-back | kernel, heap, page allocator, kload buffers |
 | `0xB4E00000`–`0xB4FFFFFF` | Normal non-cacheable | DMA window (`dma_alloc`): USB event buffer and TRBs |
 | `0xE5000000`–`0xE5BFFFFF` | Normal non-cacheable | splash framebuffer; writes merge, display sees them |
@@ -472,8 +473,8 @@ panel's physical size (70 x 158 mm, `platform_panel`) the theme picks 300%,
   history.
 - **Frames** are painted into a back buffer in cached RAM and copied to the
   panel, only when something changed: console text (`fb_take_dirty`), an
-  animation, the status bar's minute, a key. The first frame takes 39 ms on an
-  A55 (20 ms once the wallpaper is cached).
+  animation, the status bar's minute, a key, a finger. The first frame takes
+  39 ms on an A55 (20 ms once the wallpaper is cached).
 - **The status bar** shows memory and, with no RTC on the phone, the uptime as
   its clock.
 - **Power** brings the window behind to the front: Terminal or System, with
@@ -482,7 +483,77 @@ panel's physical size (70 x 158 mm, `platform_panel`) the theme picks 300%,
   redrawn from the log). `screen` refuses to change modes while the desktop is
   up, and the heartbeat squares stay off it.
 
-There is no touchscreen driver yet, so the keys are the only input.
+- **Fingers** (see "Touchscreen"): a tap acts where it started, on the lift.
+  The navigation bar's items bring their window to the front; anywhere else it
+  is a click in the front window (the Appearance pane's controls). A finger
+  that travels more than 8 dp is a swipe instead, and scrolls what is under it
+  one wheel notch per 40 dp. The window title bar's buttons don't react yet:
+  taps there go to the window as clicks.
+
+---
+
+## Touchscreen
+
+From the phone's device tree: a FocalTech controller (`focaltech,fts`, an
+FT3658U: chip `0x5652`, firmware `0x36`, vendor `0x8d`) at I2C address `0x38`
+on QUP0 SE4 (`i2c@990000`), SDA/SCL on TLMM GPIO 20/21, reset on 22, interrupt on
+23 (low), an IO power switch on 131. Coordinates are panel pixels
+(1080 x 2448), up to ten fingers. `platform/sm8350/touch.c` drives it.
+
+**Power.** ABL leaves both supplies off: `pm8350c_l3` (vdd, 3.008 V) and
+`pm8350c_l8` (I/O, 1.8 V). They aren't the apps processor's to switch over SPMI:
+`pmic list 2` marks none of PM8350C's LDOs writable by EE 0. The AOP owns them
+and sets each from the votes of every subsystem, which arrive through that
+subsystem's RSC. `platform/sm8350/rpmh.c` is the apps side, after Linux's
+`rpmh-rsc.c` and `cmd-db.c`:
+- **Command DB:** the AOP leaves it in DDR at `0x80860000` (magic `0x0C0330DB`,
+  mapped as Device by `mmu.c`). It turns a resource name into its address:
+  `ldoc3` is the VRM at `0x41100`, `ldoc8` at `0x42800`.
+- **Apps RSC:** DRV 2 at `0x18220000`, TCSes from `+0xd00` (v2.3: 8 TCSes, 16
+  commands each). The device tree's `tcs-config` is ACTIVE 2, SLEEP 3, WAKE 3,
+  CONTROL 0, so TCS 0 and 1 are the AMCs, which send at once.
+- A vote is one command per AMC: MSGID write + response required, address,
+  data, then the trigger sequence of `__tcs_set_trigger`. The completion is
+  polled in IRQ_STATUS; no GIC line is enabled for it. Only active-only votes:
+  sleep and wake sets matter only when the CPU cluster power-collapses, and
+  Osito-K never does.
+- A regulator vote (`rpmh_vrm_vote`) sends voltage (mV, offset 0), mode (`0x8`;
+  7 = HPM) and enable (`0x4`), and refuses names the command DB doesn't list as
+  VRMs. Only drivers vote, with the device tree's fixed voltages: the shell's
+  `rpmh` shows the RSC and the command DB, and `rpmh <name>` looks a resource
+  up, both read-only.
+
+**The bus.** SE4's QUP firmware has its FIFO interface disabled
+(`GENI_IF_DISABLE_RO` bit 0, firmware `0x303`, I2C). The SE is set up for GPI
+DMA, which Android shares with its trusted-touch VM, so Linux drives it through
+the GSI. Until there's a GPI driver, `touch.c` bit-bangs I2C on the same two
+pins as GPIOs (their sleep state is function gpio anyway). It works open drain
+through the output enable, with the pull-ups, at about 150 kHz. A read of 63
+bytes (every point) takes 4 ms, so the task's 9 bytes of the first point take
+about 0.8 ms.
+
+**The driver.** A `touch` task, started at boot:
+1. Holds reset low, votes both supplies, raises GPIO 131, and releases reset.
+2. Waits 200 ms for the controller's firmware, then reads its IDs.
+3. Has the TLMM latch the interrupt line's falling edges (raw status in the
+   pin's INTR_CFG; not enabled, so it is routed nowhere).
+4. Every 10 ms, reads the first point when an edge was latched, and again while
+   a finger is down so the lift isn't missed. Register 2 is the point count;
+   each point is 6 bytes from register 3: event (0 down, 1 up, 2 contact) and X
+   in the first two, ID and Y in the next two.
+
+Presses, moves and lifts go into a 32-event queue the desktop drains
+(`platform_touch_event`). When the desktop falls behind, moves may be dropped,
+but presses and lifts never are.
+
+- `touch` shows the controller's state, presses and reads, the last point, the
+  pins, the QUP clocks, both supplies and SE4.
+- `touch read` reads every point once, with the raw registers 0–8.
+- `touch on` powers it up and probes it again (verbose); `touch off` drops the
+  reset and the vdd vote (`ldoc8` stays on: always-on in Android).
+
+Still open: GPI DMA for SE4 (rings, events and an SMMU stream), more than one
+finger, the window buttons.
 
 ---
 
@@ -736,6 +807,15 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     - `brk` handed out memory that wasn't the program's;
     - `exit` left cpu0 with IRQs masked, which stopped the tick and with it the
       keys and the thermal task until the next reboot.
+26. **Touchscreen (2026-10-30).** See "Touchscreen". Three surprises:
+    - the supplies were off and not writable over SPMI, which took the first
+      RPMh client;
+    - SE4's FIFO is disabled (GPI DMA only), which led to bit-banged I2C;
+    - the QUP AHB clocks are hardware-gated and read "off" while idle (Linux
+      skips their halt check).
+
+    The desktop takes taps and swipes. Confirmed on the phone: the navigation
+    bar switches windows and the Appearance pane scrolls and takes clicks.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -930,7 +1010,10 @@ A one-byte access writes `(op << 27) | (reg << 4)` to the channel's CMD (`0x00`)
 and polls STATUS (`0x08`); data is in WDATA0 (`0x10`) / RDATA0 (`0x18`). Writes
 need an APID owned by EE 0 (HLOS), as Linux requires. `pmic` in the shell prints
 the arbiter version and the restart reason, and `pmic <sid> <hex addr>` reads any
-register: `pmic 0 0105` returns `0x2f`, the PMK8350 subtype. `spmi.c` is an
+register: `pmic 0 0105` returns `0x2f`, the PMK8350 subtype. `pmic list <sid>`
+lists one PMIC's peripherals with type/subtype, marking with `*` those EE 0 may
+write. On PM8350C (SID 2) that is its GPIOs and PWM channels, not one LDO: the
+AOP owns those, and they are reached through RPMh (see "Touchscreen"). `spmi.c` is an
 earlier attempt that guessed a v7 layout with a fixed channel and data-aborted;
 nothing uses it.
 
@@ -1257,7 +1340,9 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/mmu.c` | Flat MMU map, caches on, uncached DMA window, clean-and-disable handoff |
 | `arch/arm/platform/sm8350/cpufreq.c` | EPSS CPU frequency: levels, shared-rail report, `cpufreq try`, `cpufreq l3` |
 | `arch/arm/platform/sm8350/thermal.c` | TSENS sensors (`temp`) and the big clusters' thermal cap |
-| `arch/arm/platform/sm8350/pmic_arb.c` | SPMI PMIC arbiter v5: single-byte PMIC reads and writes |
+| `arch/arm/platform/sm8350/pmic_arb.c` | SPMI PMIC arbiter v5: single-byte PMIC reads and writes, `pmic list` |
+| `arch/arm/platform/sm8350/rpmh.c` | Command DB lookups and active-only RPMh votes through the apps RSC (`rpmh`) |
+| `arch/arm/platform/sm8350/touch.c` | FocalTech touchscreen: RPMh supplies, bit-banged I2C, polling task, event queue |
 | `arch/arm/platform/sm8350/keys.c` | Power / volume keys: console history, fastboot and status shortcuts |
 | `arch/arm/platform/sm8350/ufs.c` | UFS host controller: LUNs, GPT, block dumps; writes only into `userdata` (OsitoFS) |
 | `arch/arm/scripts/rog5-put.ps1` | Host side of `put`: copy a file onto the phone's OsitoFS |

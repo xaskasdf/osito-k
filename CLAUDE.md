@@ -91,6 +91,10 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - Copy files on with `arch/arm/scripts/rog5-put.ps1 -File <path>` (shell `put <name>`); run programs with `exec <name> [args]`.
 - Programs are C in `arch/arm/apps/` against the libc in `arch/arm/libc/`, built as static PIEs that `kernel/elf.c` relocates. `arch/arm/scripts/rog5-app.sh [--run <app> args]` builds them on the Mac, copies them to the phone, and optionally runs one. They run one at a time in the shell's task at EL1 with no memory protection; a fault in their own code ends them, anything else panics.
 - `desktop` runs the shared GUI (`gui/`) on the panel in its phablet layout (`GUI_LAYOUT_PHABLET`, 300%), with the console inside its Terminal window (`kernel/gui_task.c`); `desktop off` returns to the plain console. Layout changes in `gui/` also affect x86 and wasm, so build x86 too.
+- Power rails (the PMICs' LDOs) belong to the AOP, so SPMI writes to them are refused; `pmic list <sid>` marks what EE 0 may write. Switch them through RPMh (`platform/sm8350/rpmh.c`: command DB lookup, then a vote through an apps RSC AMC), and only with the device tree's voltages.
+  - The touchscreen (`platform/sm8350/touch.c`, shell `touch`) powers up that way at boot.
+  - Its I2C SE has the FIFO disabled (GPI DMA only), so the driver bit-bangs the two pins.
+  - Taps and swipes reach the desktop through `platform_touch_event`.
 - Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
 - The kernel is a PIE linked at 0 that relocates itself in `start.S`, so it runs at any load address and stored pointers work. Linker-script symbols that C reads must be section-relative (an absolute symbol's GOT entry gets no relocation). After linking, `readelf -r kernel.elf` should show only `R_AARCH64_RELATIVE`.
 

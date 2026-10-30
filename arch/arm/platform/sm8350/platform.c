@@ -10,6 +10,7 @@
 #include "thermal.h"
 #include "keys.h"
 #include "ufs.h"
+#include "touch.h"
 
 /* Page allocator range. DDR bank 0 ends at 0xB5000000 (device memory node;
  * the next bank starts at 0xC0000000): the old 384 MB size ran 176 MB past
@@ -156,16 +157,22 @@ void platform_reboot_bootloader(void) {
     platform_reboot();
 }
 
-/* Once the scheduler exists: the thermal limit and the keys */
+/* Once the scheduler exists: the thermal limit, the keys, the touchscreen */
 void platform_start_tasks(void) {
     thermal_start();
     keys_start();
+    touch_start();
 }
 
 /* Shell `pmic`: the arbiter version and the restart reason; `pmic <sid>
- * <addr>` reads any register (hex addr, e.g. 7148). Read-only. */
+ * <addr>` reads any register (hex addr, e.g. 7148); `pmic list <sid>` the
+ * PMIC's peripherals and which EE 0 may write. Read-only. */
 void platform_pmic_cmd(int argc, char **argv) {
     uint32_t sid = PMK8350_SID, addr = SDAM_RESTART_REASON;
+    if (argc == 3 && strcmp(argv[1], "list") == 0) {
+        pmic_list((uint8_t)(argv[2][0] - '0'));
+        return;
+    }
     if (argc == 3) {
         sid = 0;
         for (const char *p = argv[1]; *p >= '0' && *p <= '9'; p++)
@@ -180,7 +187,7 @@ void platform_pmic_cmd(int argc, char **argv) {
             addr = addr * 16 + (uint32_t)d;
         }
     } else if (argc != 1) {
-        serial_puts("usage: pmic [<sid> <hex addr>]\n");
+        serial_puts("usage: pmic [<sid> <hex addr> | list <sid>]\n");
         return;
     }
     serial_puts("arbiter version ");
