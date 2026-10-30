@@ -118,12 +118,14 @@ static int task_started;
 static uint32_t presses, reads;
 static int32_t last_x = -1, last_y = -1;
 
-/* Touch events for the desktop: one producer (the task), one consumer */
+/* Touch events for the desktop: producers (the task, `touch tap`) under
+ * q_lock, one consumer */
 static struct {
     int16_t x, y;
     uint8_t down;
 } queue[QUEUE];
 static volatile uint32_t q_head, q_tail;
+static spinlock_t q_lock;
 
 static void put_pin(const char *what, int n)
 {
@@ -399,15 +401,17 @@ static void touch_on(int verbose)
 
 static void push(int32_t x, int32_t y, int down, int droppable)
 {
+    uint64_t flags = spin_lock_irqsave(&q_lock);
     uint32_t used = q_head - q_tail;
-    if (used >= QUEUE || (droppable && used >= QUEUE / 2))
-        return;
-    uint32_t i = q_head % QUEUE;
-    queue[i].x = (int16_t)x;
-    queue[i].y = (int16_t)y;
-    queue[i].down = (uint8_t)down;
-    __asm__ volatile("dmb ish" : : : "memory");
-    q_head = q_head + 1;
+    if (used < QUEUE && !(droppable && used >= QUEUE / 2)) {
+        uint32_t i = q_head % QUEUE;
+        queue[i].x = (int16_t)x;
+        queue[i].y = (int16_t)y;
+        queue[i].down = (uint8_t)down;
+        __asm__ volatile("dmb ish" : : : "memory");
+        q_head = q_head + 1;
+    }
+    spin_unlock_irqrestore(&q_lock, flags);
 }
 
 /* The desktop's side of the queue: 1 and the next event, or 0 */
@@ -543,8 +547,24 @@ void platform_touch_cmd(int argc, char **argv)
         touch_read();
         return;
     }
+    if (argc == 4 && strcmp(argv[1], "tap") == 0) {
+        /* A press and a lift at panel pixels, as a finger's: to drive the
+         * desktop from the console */
+        int32_t xy[2] = {0, 0};
+        for (int k = 0; k < 2; k++)
+            for (const char *s = argv[2 + k]; *s; s++) {
+                if (*s < '0' || *s > '9' || xy[k] > 9999) {
+                    serial_puts("touch tap: x and y are panel pixels\n");
+                    return;
+                }
+                xy[k] = xy[k] * 10 + (*s - '0');
+            }
+        push(xy[0], xy[1], 1, 0);
+        push(xy[0], xy[1], 0, 0);
+        return;
+    }
     if (argc != 1) {
-        serial_puts("usage: touch [on | read | off]\n");
+        serial_puts("usage: touch [on | read | off | tap <x> <y>]\n");
         return;
     }
     serial_puts("controller: ");

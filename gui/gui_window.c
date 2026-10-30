@@ -9,11 +9,14 @@ gui_rect_t gui_window_frame(const gui_win_desc_t *win)
 
 gui_rect_t gui_window_button_rect(const gui_win_desc_t *win, int button)
 {
+    /* Phablet windows are always maximized: close and minimize only */
+    bool phablet = gui_theme_get()->layout == GUI_LAYOUT_PHABLET;
     int right = win->x + win->w - gui_px(6);
     int width = gui_px(button == 1 ? 42 : 30);
-    int offset = button == 1 ? 0 : button == 3 ? gui_px(43) : gui_px(74);
+    int offset = button == 1 ? 0 : button == 3 || phablet ? gui_px(43) : gui_px(74);
     gui_rect_t r = { right - offset - width, win->y + gui_px(4), width, gui_px(26) };
-    if (button < 1 || button > 3 || r.x < win->x + gui_px(22)) r.w = 0;
+    if (button < 1 || button > 3 || (phablet && button == 3) || r.x < win->x + gui_px(22))
+        r.w = 0;
     return r;
 }
 

@@ -872,11 +872,13 @@ panel's physical size (70 x 158 mm, `platform_panel`) the theme picks 300%,
   up, and the heartbeat squares stay off it.
 
 - **Fingers** (see "Touchscreen"): a tap acts where it started, on the lift.
-  The navigation bar's items bring their window to the front; anywhere else it
-  is a click in the front window (the Appearance pane's controls). A finger
-  that travels more than 8 dp is a swipe instead, and scrolls what is under it
-  one wheel notch per 40 dp. The window title bar's buttons don't react yet:
-  taps there go to the window as clicks.
+  The navigation bar's items bring their window to the front. The title bar
+  has close and minimize (no maximize: every window already fills the
+  screen); both put the window away, the one behind it shows, and its nav bar
+  item or Power brings it back. Anywhere else a tap is a click in the front
+  window (the Appearance pane's controls). A finger that travels more than
+  8 dp is a swipe instead, and scrolls what is under it one wheel notch per
+  40 dp.
 
 ---
 
@@ -939,9 +941,11 @@ but presses and lifts never are.
 - `touch read` reads every point once, with the raw registers 0–8.
 - `touch on` powers it up and probes it again (verbose); `touch off` drops the
   reset and the vdd vote (`ldoc8` stays on: always-on in Android).
+- `touch tap <x> <y>` queues a press and a lift at those panel pixels, as a
+  finger would: it drives the desktop from the console.
 
 Still open: GPI DMA for SE4 (rings, events and an SMMU stream), more than one
-finger, the window buttons.
+finger.
 
 ---
 

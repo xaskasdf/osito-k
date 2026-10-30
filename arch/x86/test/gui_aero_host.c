@@ -127,6 +127,18 @@ static void check_hit_geometry(void)
             CHECK(gui_window_button_hit(&w, close.x, close.y) == 0);
         }
     }
+    /* Phablet windows are always maximized: close, and minimize beside it */
+    gui_theme_options_t phablet = { GUI_LAYOUT_PHABLET, 300, true, true };
+    gui_theme_set_physical_size(0, 0); gui_theme_configure(&phablet);
+    gui_desktop_init(1080, 2448);
+    gui_win_desc_t w = {0, gui_px(30), 1080, gui_px(600), "Window", GUI_SURFACE, false};
+    gui_rect_t close = gui_window_button_rect(&w, 1), minimize = gui_window_button_rect(&w, 2);
+    for (int button = 1; button <= 2; button++) {
+        gui_rect_t r = gui_window_button_rect(&w, button);
+        CHECK(gui_window_button_hit(&w, r.x + r.w / 2, r.y + r.h / 2) == button);
+    }
+    CHECK(gui_window_button_rect(&w, 3).w == 0);
+    CHECK(minimize.x + minimize.w < close.x && close.x - minimize.x - minimize.w <= gui_px(2));
     gui_dock_set_tasks(NULL, 0);
 }
 

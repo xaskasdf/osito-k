@@ -15,8 +15,9 @@
  * Fingers (platform_touch_event, in panel pixels): a tap acts where it
  * started, on the lift, unless the finger travelled more than 8 dp; then
  * it is a swipe, and scrolls what is under it one wheel notch per 40 dp
- * (the Appearance pane). Nav bar items bring their window to the front;
- * anything else is a click in the front window.
+ * (the Appearance pane). Nav bar items bring their window to the front, the
+ * title bar's close and minimize put it away; anything else is a click in
+ * the front window.
  */
 
 #include "../include/hal.h"
@@ -47,6 +48,36 @@ static struct {
     int32_t x0, y0, notches;
 } finger;
 
+/* The window on screen: the top one that isn't put away, or -1 */
+static int front_window(void)
+{
+    int count = 0;
+    gui_win_desc_t *wins = gui_desktop_get_windows(&count);
+    int *order = gui_desktop_get_order();
+    for (int i = count - 1; i >= 0; i--)
+        if (!wins[order[i]].hidden)
+            return order[i];
+    return -1;
+}
+
+/* Close and minimize both put the window away (its nav bar item brings it
+ * back), and the one behind it comes to the front */
+static void put_away(int idx)
+{
+    int count = 0;
+    gui_win_desc_t *wins = gui_desktop_get_windows(&count);
+    gui_anim_cancel(&wins[idx].x);
+    gui_anim_cancel(&wins[idx].y);
+    gui_anim_cancel(&wins[idx].w);
+    gui_anim_cancel(&wins[idx].h);
+    wins[idx].hidden = true;
+    int next = front_window();
+    if (next >= 0)
+        gui_desktop_raise_window(next);
+    else
+        gui_desktop_set_focus(-1);
+}
+
 static void tap(int32_t x, int32_t y, uint32_t w, uint32_t h)
 {
     int hit = gui_dock_hit(w, h, x, y);
@@ -58,6 +89,15 @@ static void tap(int32_t x, int32_t y, uint32_t w, uint32_t h)
         else if (hit >= 0 && hit < count)
             gui_desktop_show_window(hit);
         return;
+    }
+    int front = front_window();
+    if (front >= 0) {
+        int count = 0;
+        gui_win_desc_t *wins = gui_desktop_get_windows(&count);
+        if (gui_window_button_hit(&wins[front], x, y)) {
+            put_away(front);
+            return;
+        }
     }
     /* A tap on the scroll thumb grabs it; let go at once, swipes scroll */
     if (gui_desktop_click(gui_desktop_get_focus(), x, y) && gui_desktop_pointer_captured())
