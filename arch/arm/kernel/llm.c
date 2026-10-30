@@ -13,6 +13,13 @@
  * FP/SIMD registers aren't saved by the scheduler. The shell task is
  * pinned (to the boot CPU) and nothing else there uses them; `model` and
  * `chat` move it to the X1 (CPU 7) for speed while they run, and back.
+ *
+ * Matvecs are split by rows over the X1 and three workers pinned to the
+ * A78s (CPUs 4-6; inference.c's matvec calls llm_par_run). Each worker is
+ * the only FP user on its CPU. While `model` or `chat` runs they spin
+ * waiting for work, since a matvec takes a fraction of a millisecond and
+ * a sleep a tick; otherwise they sleep. The A55s are left alone: an even
+ * split would wait on them.
  */
 
 #include "../include/hal.h"
@@ -40,9 +47,90 @@ extern int llama_chat(llama_state_t *state, const char *text, uint32_t max_token
 extern void matvec_f16_avx2(float *out, const void *weight, const float *input,
                             uint32_t rows, uint32_t cols);
 
+/* --- The matvec workers */
+
+#define WORKERS 3
+static const int worker_cpu[WORKERS] = { 4, 5, 6 };    /* the A78s */
+
+static struct worker {
+    volatile uint32_t posted, done;     /* job numbers */
+    void (*volatile fn)(void *ctx, int i);
+    void *volatile ctx;
+    volatile int part;
+} workers[WORKERS];
+static volatile int spinning;           /* model / chat running */
+static int workers_started;
+int llm_parts = 1;                      /* inference.c splits matvecs this many ways */
+int llm_use_workers = 1;                /* `llm smp off`: the X1 alone */
+
+static inline void barrier(void) { __asm__ volatile("dmb ish" : : : "memory"); }
+
+static void worker_task(void *arg)
+{
+    struct worker *w = (struct worker *)arg;
+    uint32_t seen = w->posted;
+    for (;;) {
+        if (w->posted == seen) {
+            if (spinning)
+                __asm__ volatile("yield");
+            else
+                task_delay_ms(20);
+            continue;
+        }
+        barrier();
+        seen = w->posted;
+        w->fn(w->ctx, w->part);
+        barrier();
+        w->done = seen;
+    }
+}
+
+/* part(ctx, i) for i < parts: the first parts - 1 on the workers, the
+ * last here; returns when all are done */
+void llm_par_run(int parts, void (*part)(void *ctx, int i), void *ctx)
+{
+    int n = parts - 1 < WORKERS ? parts - 1 : WORKERS;
+    for (int i = 0; i < n; i++) {
+        workers[i].fn = part;
+        workers[i].ctx = ctx;
+        workers[i].part = i;
+        barrier();
+        workers[i].posted = workers[i].posted + 1;
+    }
+    for (int i = n; i < parts; i++)
+        part(ctx, i);
+    for (int i = 0; i < n; i++)
+        while (workers[i].done != workers[i].posted)
+            __asm__ volatile("yield");
+    barrier();
+}
+
+static void workers_on(void)
+{
+    /* task_create_on takes any CPU number, and a task pinned to one that
+     * isn't online never runs (QEMU virt has 1-4): only with all eight */
+    if (!workers_started) {
+        workers_started = smp_get_cpu_count() > LLM_CPU ? 1 : -1;
+        for (int i = 0; i < WORKERS && workers_started > 0; i++)
+            if (task_create_on("llm", worker_task, &workers[i], 1, worker_cpu[i]) < 0)
+                workers_started = -1;
+    }
+    if (workers_started > 0 && llm_use_workers) {
+        spinning = 1;
+        llm_parts = WORKERS + 1;
+    }
+}
+
+static void workers_off(void)
+{
+    llm_parts = 1;
+    spinning = 0;
+}
+
 /* What the x86 inference expects of its kernel. ap_worker_count = 0 keeps
- * every matvec on the calling CPU; the submit functions are never reached
- * then, and NVMe streaming (llama_init_streaming) reports no device. */
+ * x86's own SMP paths off (the split above replaces them); the submit
+ * functions are never reached then, and NVMe streaming
+ * (llama_init_streaming) reports no device. */
 int ap_worker_count;
 int smp_submit(int cpu, void (*fn)(void *, void *), void *arg, void *res)
 {
@@ -86,12 +174,15 @@ static uint64_t now_ms(void)
     return timer_ms();
 }
 
-/* Run fn on the X1, then put the calling task back where it was */
+/* Run fn on the X1 with the workers spinning, then put the calling task
+ * back where it was */
 static void on_big_core(void (*fn)(void *), void *arg)
 {
     int self = task_self();
     int was = task_pin(self, LLM_CPU);
+    workers_on();
     fn(arg);
+    workers_off();
     if (was >= -1)
         task_pin(self, was);
 }
@@ -310,6 +401,23 @@ static int check(const char *what, float err, float limit)
 #define ST_ROWS 64
 #define ST_COLS 512
 
+/* The worker split, on a q4_0 matvec: each part takes a slice of rows */
+static struct {
+    float *out;
+    const uint8_t *w;
+    const float *x;
+    int parts;
+} st_split;
+
+static void st_part(void *ctx, int i)
+{
+    (void)ctx;
+    uint32_t r0 = ST_ROWS * (uint32_t)i / (uint32_t)st_split.parts;
+    uint32_t r1 = ST_ROWS * (uint32_t)(i + 1) / (uint32_t)st_split.parts;
+    matvec_q4_0(st_split.out + r0, st_split.w + (uint64_t)r0 * (ST_COLS / 32 * 18),
+                st_split.x, r1 - r0, ST_COLS);
+}
+
 static void selftest(void *arg)
 {
     (void)arg;
@@ -347,6 +455,18 @@ static void selftest(void *arg)
     tensor_simd = 1;
     matvec_q4_0(got, q4, x, ST_ROWS, ST_COLS);
     ok &= check("matvec q4_0", rel_diff(got, ref, ST_ROWS), 1e-5f);
+
+    matvec_q4_0(ref, q4, x, ST_ROWS, ST_COLS);
+    st_split.out = got;
+    st_split.w = q4;
+    st_split.x = x;
+    st_split.parts = llm_parts;
+    memset(got, 0, sizeof(got));
+    llm_par_run(llm_parts, st_part, (void *)0);
+    serial_puts("  split over ");
+    serial_putdec((uint64_t)llm_parts);
+    serial_puts(llm_parts > 1 ? " CPUs (X1 + A78s)" : " CPU");
+    ok &= check("", rel_diff(got, ref, ST_ROWS), 0);
 
     tensor_simd = 0;
     matvec_q4_1(ref, q41, x, ST_ROWS, ST_COLS);
@@ -413,14 +533,18 @@ void cmd_llm(int argc, char **argv)
     if (argc == 3 && strcmp(argv[1], "simd") == 0) {
         tensor_simd = strcmp(argv[2], "off") != 0;
         dispatch_init();
+    } else if (argc == 3 && strcmp(argv[1], "smp") == 0) {
+        llm_use_workers = strcmp(argv[2], "off") != 0;
     } else if (argc != 1) {
-        serial_puts("usage: llm [simd on|off | selftest]\n");
+        serial_puts("usage: llm [simd on|off | smp on|off | selftest]\n");
         return;
     }
     serial_puts("llm: ");
     serial_puts(tensor_simd ? "NEON" : "scalar");
-    serial_puts(", runs on CPU ");
-    serial_putdec(LLM_CPU);
+    if (smp_get_cpu_count() <= LLM_CPU)
+        serial_puts(", one CPU (no X1 here)");
+    else
+        serial_puts(llm_use_workers ? ", the X1 + the A78s (CPUs 7, 4-6)" : ", the X1 alone");
     serial_puts(loaded ? ", model " : ", no model");
     serial_puts(loaded ? model_file : "");
     if (last_tokens && last_ms) {

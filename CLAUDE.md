@@ -95,10 +95,11 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - The touchscreen (`platform/sm8350/touch.c`, shell `touch`) powers up that way at boot.
   - Its I2C SE has the FIFO disabled (GPI DMA only), so the driver bit-bangs the two pins.
   - Taps and swipes reach the desktop through `platform_touch_event`.
-- Memory: the page allocator (`mem_alloc_pages`) covers DDR bank 0, 208 MB. `mem_alloc_aligned_high` serves big allocations (models, `put` buffers) from the 8 GB bank at `0x800000000`. Kernels from `kload` must stay in bank 0.
+- Memory: the page allocator (`mem_alloc_pages`) covers DDR bank 0, 208 MB. `mem_alloc_aligned_high` serves big allocations (models, `put` buffers, inference state) from 15 GB of high memory: the rest of the 16 GB, less the device tree's carve-outs (`high_ram[]` in `platform/sm8350/mmu.c`). Kernels from `kload` must stay in bank 0.
 - Local LLM: `kernel/llm.c` (`model <file.gguf>`, `chat <text>`, `llm selftest`) runs x86's inference stack, ported.
   - Its SIMD paths are NEON under x86's AVX2 names (`kernel/tensor_neon.c`).
   - The scheduler saves no FP/SIMD state, so FP code (the Makefile's `FP_SRCS`) must stay in one pinned task per CPU. `model`/`chat` pin the shell to the X1 (CPU 7) while they run.
+  - Matvecs are split over the X1 and three worker tasks pinned to the A78s (CPUs 4–6), which spin only while `model`/`chat` runs.
 - Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
 - The kernel is a PIE linked at 0 that relocates itself in `start.S`, so it runs at any load address and stored pointers work. Linker-script symbols that C reads must be section-relative (an absolute symbol's GOT entry gets no relocation). After linking, `readelf -r kernel.elf` should show only `R_AARCH64_RELATIVE`.
 

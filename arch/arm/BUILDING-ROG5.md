@@ -137,7 +137,7 @@ and both caches on:
 | `0xA0000000`–`0xB4DFFFFF` | Normal write-back | kernel, heap, page allocator, kload buffers |
 | `0xB4E00000`–`0xB4FFFFFF` | Normal non-cacheable | DMA window (`dma_alloc`): USB event buffer and TRBs |
 | `0xE5000000`–`0xE5BFFFFF` | Normal non-cacheable | splash framebuffer; writes merge, display sees them |
-| `0x800000000`–`0x9FFFFFFFF` | Normal write-back, 1 GB blocks | the 8 GB DDR bank at 32 GB: the high memory region (models, `put` buffers) |
+| `0x800000000`–`0x9FFFFFFFF`, `0xC0000000`–`0x27FFFFFFF` less carve-outs | Normal write-back, XN | high memory, 15 GB (models, `put` buffers, inference state) |
 
 Everything else is unmapped. That matters for the firmware carve-outs below
 `0xA0000000`: Normal memory may be read speculatively, and those regions belong to
@@ -158,18 +158,28 @@ memory is never speculated.
   | Bank | Range | Size | Use |
   |------|-------|------|-----|
   | 0 | `0x80000000`–`0xB5000000` | 848 MB | carve-outs below `0xA0000000` |
-  | 1 | `0x800000000`–`0xA00000000` | 8 GB | no carve-outs: the high region |
-  | 2 | `0xC0000000`–`0x280000000` | 7 GB | a 168 MB carve-out at `0xD8800000` and the framebuffer |
+  | 1 | `0x800000000`–`0xA00000000` | 8 GB | no carve-outs |
+  | 2 | `0xC0000000`–`0x280000000` | 7 GB | three carve-outs (below) |
 
-  - `mmu.c` maps bank 1 with 1 GB blocks, writes and reads back a word in each
-    gigabyte, and hands it to `memory.c` as a second region with its own bitmap
-    (`mem_add_high`). `mem` shows 8400 MB.
-  - Only `mem_alloc_aligned_high` uses that region (models, `put`'s buffer).
+  Bank 2's static reserved-memory regions: `removed_region`
+  `0xD8800000`–`0xE3000000` (168 MB), `splash_region` `0xE5000000`–`0xE7300000`
+  (35 MB, the framebuffer), `dfps_data_region` `0xE7400000`–`0xE7500000`.
+  - **Mapping.** `mmu.c`'s `high_ram[]` is banks 1 and 2 less those regions:
+    8 GB, then 392 + 32 + 394 MB in the framebuffer's gigabyte, then 6 GB above
+    4 GB. They're mapped Normal WB and XN, in 2 MB blocks inside that gigabyte
+    and 1 GB blocks elsewhere.
+  - **Probe and handover.** A word at each range's start and at each gigabyte
+    boundary is written and read back. Each range then goes to `memory.c` as
+    a high region (`mem_add_high`, one bitmap for all). `mem` shows 15362 MB.
+  - **Who uses it.** Only `mem_alloc_aligned_high` allocates there: models,
+    `put`'s buffer, and the inference state (KV cache, scratch).
     `mem_alloc_pages` never does, so `kload`'s kernels stay in bank 0, where
-    `mem_init` expects to find them.
-  - The handoff doesn't clean bank 1. Nothing writes it uncached and nothing
-    DMAs into it, so a line left dirty holds what the next kernel would read
-    anyway.
+    `mem_init` expects to find them. A `kload`ed kernel lands above what its
+    predecessor had allocated in bank 0, and `mem_init` reserves everything
+    below it, so chains of `kload`s shrink bank 0. A flashed boot starts clean.
+  - **The handoff doesn't clean high memory.** Nothing writes it uncached and
+    nothing DMAs into it, so a line left dirty holds what the next kernel would
+    read anyway.
 - **Effect:** `help` round trip over USB went from 315 ms to 31 ms, and kload
   uploads from 2.5 s to 0.3 s.
 
@@ -490,17 +500,20 @@ compiled but never used:
 
 `kernel/llm.c` is the arm side:
 - It loads a model from OsitoFS into high memory and sets up the tokenizer.
+  `inference.c` puts the model's state (KV cache, scratch) in high memory
+  too.
 - It holds the shell commands.
-- It stubs what x86's code expects of its kernel: SMP work submission
-  (`ap_worker_count = 0`, so everything runs on one CPU), NVMe layer
-  streaming and the profiler.
+- It splits every matvec over four CPUs (below).
+- It stubs what x86's code expects of its kernel: x86's own SMP paths
+  (`ap_worker_count = 0`), NVMe layer streaming and the profiler.
 
 ```
 put (host): arch/arm/scripts/rog5-put.ps1 -File smollm2-135m-q4_0.gguf -Name smollm2.gguf
 model smollm2.gguf        # load it (model: the loaded one)
 chat What is the capital of France?
-llm selftest              # NEON against the scalar code, and the math
+llm selftest              # NEON against the scalar code, the split, the math
 llm simd off              # the scalar path, for comparison
+llm smp off               # the X1 alone, for comparison
 ```
 
 **SIMD.** x86 calls its AVX2 kernels by name when `tensor_has_avx2()` says
@@ -525,18 +538,33 @@ largest relative differences of 0 to 1e-6.
   of j / j+16). They had never run: `tensor_has_avx2()` returned 0, so arm
   inference was all scalar.
 
-**FP state.** The scheduler saves no FP/SIMD registers. The FP files (the
-Makefile's `FP_SRCS`) run only in the shell task, which is pinned. `model`
-and `chat` move it to the X1 (CPU 7, `task_pin`) while they run, and back.
+**Cores.** `inference.c`'s `matvec` splits every matvec of 64 rows a part
+or more by rows, for any tensor type. It runs on four parts:
+- the X1 does one;
+- three `llm` tasks pinned to the A78s (CPUs 4–6) do the others
+  (`llm_par_run` in `llm.c`).
+
+While `model` or `chat` runs the workers spin waiting for work, because a
+matvec takes a fraction of a millisecond and a sleep takes a tick.
+Otherwise they sleep. The A55s are left out: an even split would wait on
+them. Attention, the norms and the small K/V matvecs still run on the X1
+alone.
+
+**FP state.** The scheduler saves no FP/SIMD registers. FP code (the
+Makefile's `FP_SRCS`) runs only in pinned tasks, one per CPU:
+- the shell, which `model` and `chat` move to the X1 (CPU 7, `task_pin`) and
+  back;
+- the three workers.
+
 Nothing else there uses FP: GUI, touch, keys and IRQ code are built with
 `-mgeneral-regs-only`.
 
-**Measured on the phone (X1, NEON, one core):**
+**Measured on the phone (NEON):**
 
-| Model | Size | Load (UFS + parse) | Prefill | Generation |
-|-------|------|--------------------|---------|------------|
-| `brandon-tiny-10m-instruct.f16.gguf` | 21 MB | 356 ms | 18 tokens in 71 ms | 9 ms/token (~110 tok/s) |
-| `smollm2-135m-q4_0.gguf` (BPE, ChatML) | 92 MB | 1.5 s | 16 tokens in 645 ms | 41-45 ms/token (~23 tok/s) |
+| Model | Size | Load (UFS + parse) | X1 alone: prefill, per token | X1 + 3 A78s: prefill, per token |
+|-------|------|--------------------|------------------------------|---------------------------------|
+| `brandon-tiny-10m-instruct.f16.gguf` | 21 MB | 356 ms | 71 ms (18 tok), 9 ms | 55 ms (13 tok), 6 ms (~165 tok/s) |
+| `smollm2-135m-q4_0.gguf` (BPE, ChatML) | 92 MB | 1.5 s | 681 ms (16 tok), 45 ms | 271 ms (16 tok), 20 ms (~50 tok/s) |
 
 SmolLM2's answer to "What is the capital of France?" began "The capital of
 France is Paris, a city steeped in history, culture, and romance." Models are
@@ -909,6 +937,10 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     back, and the hypervisor maps it. x86's inference stack runs with NEON
     kernels. SmolLM2-135M answers correctly at ~23 tok/s on the X1, once Q4_1
     was added; before that, the zeroed tensors gave word salad.
+28. **All the RAM, and four cores for the LLM (2026-10-30).** Bank 2 joined the
+    high memory around its three carve-outs: 15362 MB in all. Matvecs are
+    split over the X1 and the A78s, which took SmolLM2 from 45 to 20 ms a token.
+    The inference state moved to high memory, so bank 0 stays for the kernel.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1191,7 +1223,7 @@ Since 2026-10-29 the kernel is a **PIE linked at 0** (`-fpie`, `-pie
 | `0x80000000`–`0xB5000000` | DDR bank 0 per the DTB memory node (next bank: `0xC0000000`) |
 | `0xA8000000`–`0xB5000000` | Osito-K page allocator; its top 2 MB (`0xB4E00000`) is the uncached DMA window |
 | `0x800000000`–`0xA00000000` | DDR bank 1 (8 GB, no carve-outs): Osito-K's high memory region |
-| `0xC0000000`–`0x280000000` | DDR bank 2 (7 GB): carve-out at `0xD8800000` (168 MB), splash framebuffer at `0xE5000000`; unused |
+| `0xC0000000`–`0x280000000` | DDR bank 2 (7 GB): carve-outs `0xD8800000`–`0xE3000000`, `0xE5000000`–`0xE7300000` (splash framebuffer), `0xE7400000`–`0xE7500000`; the rest is high memory |
 | `_image_end` + 64 KB | Osito-K boot stack (~`0xA0340000`; follows the actual load address) |
 | `0x0098C000`     | GENI UART (serial console) |
 | `0x0A600000`     | USB DWC3 (side port) |

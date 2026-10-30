@@ -37,6 +37,20 @@ extern int   nvme_wait_cq(uint16_t cid);
 extern uint32_t nvme_get_lba_size(void);
 extern void  mem_free_pages(void *addr, uint64_t count);
 
+/* AArch64: the model's state (layer tables, KV cache, scratch) goes to high
+ * memory like the model itself (llm.c), leaving the 208 MB first region to
+ * the kernel, the desktop and kload. Zeroed, as mem_alloc_pages does;
+ * llama_free's mem_free_pages takes either region. */
+extern void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment);
+static void *state_pages(uint64_t count)
+{
+    void *p = mem_alloc_aligned_high(count * 4096, 4096);
+    if (p)
+        memset(p, 0, count * 4096);
+    return p;
+}
+#define mem_alloc_pages state_pages
+
 /* Tokenizer decode (tokenizer.c) — returns NULL if tokenizer not initialized */
 extern const char *tok_global_decode(uint32_t id);
 
@@ -219,8 +233,63 @@ extern int wasm_wgpu_matvec(const float *w, const float *vin, float *out,
                              int rows, int cols);
 #endif
 
+static void matvec_one(float *out, gguf_tensor_t *tensor,
+                       const float *input, uint32_t rows, uint32_t cols);
+
+/* AArch64: split the rows of every matvec over llm.c's worker CPUs (the
+ * A78s) and the calling one (the X1). llm_par_run runs part(ctx, i) for i
+ * in [0, parts), the last on the caller; llm_parts is 1 when the workers
+ * are off. */
+extern int  llm_parts;
+extern void llm_par_run(int parts, void (*part)(void *ctx, int i), void *ctx);
+
+typedef struct {
+    float *out;
+    gguf_tensor_t *tensor;
+    const float *input;
+    uint32_t rows, cols, row_bytes;
+    int parts;
+} matvec_split_t;
+
+/* Bytes a row of cols takes, or 0 for a type that isn't split */
+static uint32_t row_bytes(uint32_t type, uint32_t cols)
+{
+    switch (type) {
+    case GGML_TYPE_F32:  return cols * 4;
+    case GGML_TYPE_F16:  return cols * 2;
+    case GGML_TYPE_Q4_0: return cols / 32 * 18;
+    case GGML_TYPE_Q4_1: return cols / 32 * 20;
+    case GGML_TYPE_Q8_0: return cols / 32 * 34;
+    case GGML_TYPE_Q4_K: return cols / 256 * 144;
+    case GGML_TYPE_Q6_K: return cols / 256 * 210;
+    }
+    return 0;
+}
+
+static void matvec_part(void *ctx, int i)
+{
+    matvec_split_t *m = (matvec_split_t *)ctx;
+    uint32_t r0 = (uint32_t)((uint64_t)m->rows * i / m->parts);
+    uint32_t r1 = (uint32_t)((uint64_t)m->rows * (i + 1) / m->parts);
+    if (r1 <= r0)
+        return;
+    gguf_tensor_t slice = *m->tensor;
+    slice.data = (uint8_t *)m->tensor->data + (uint64_t)r0 * m->row_bytes;
+    matvec_one(m->out + r0, &slice, m->input, r1 - r0, m->cols);
+}
+
 static void matvec(float *out, gguf_tensor_t *tensor,
                    const float *input, uint32_t rows, uint32_t cols)
+{
+    matvec_split_t m = { out, tensor, input, rows, cols, row_bytes(tensor->type, cols), llm_parts };
+    if (m.parts > 1 && rows >= 64 * (uint32_t)m.parts && m.row_bytes)
+        llm_par_run(m.parts, matvec_part, &m);
+    else
+        matvec_one(out, tensor, input, rows, cols);
+}
+
+static void matvec_one(float *out, gguf_tensor_t *tensor,
+                       const float *input, uint32_t rows, uint32_t cols)
 {
 #ifdef __EMSCRIPTEN__
     /* Only fires under bdebug gpu 1 + a giant shape. The break-even

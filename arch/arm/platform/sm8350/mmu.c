@@ -11,18 +11,17 @@
  *   0xA0000000-0xB4DFFFFF  Normal WB     kernel, heap, kload buffers
  *   0xB4E00000-0xB4FFFFFF  Normal NC     DMA window (USB event buffer, TRBs)
  *   0xE5000000-0xE5BFFFFF  Normal NC     splash framebuffer (writes merge)
- *   0x800000000-0x9FFFFFFFF Normal WB    the 8 GB DDR bank at 32 GB (no
- *                                        carve-outs): the high region for big
- *                                        allocations (models, tensor arenas)
+ *   high_ram[] below       Normal WB, XN the rest of the 16 GB: high memory
+ *                                        for big allocations (models, put)
  *
- * The high bank is only ever written through the cache and no device DMAs
+ * High memory is only ever written through the cache and no device DMAs
  * into it, so the handoff (mmu_off_and_jump) needn't clean it: a line it
  * leaves dirty holds what the next kernel would read anyway.
  *
- * Nothing else is mapped. The firmware carve-outs below 0xA0000000 must stay
- * out: Normal memory can be read speculatively and those regions belong to
- * other processors. Device memory is never speculated, so the holes in the
- * MMIO gigabyte are harmless, and so is mapping the command DB's block (the
+ * Nothing else is mapped. The firmware carve-outs must stay out: Normal
+ * memory can be read speculatively and those regions belong to other
+ * processors. Device memory is never speculated, so the holes in the MMIO
+ * gigabyte are harmless, and so is mapping the command DB's block (the
  * rest of it is SMEM and the XBL log, never touched).
  *
  * 39-bit VA (T0SZ = 25) starts at level 1 (1 GB per entry); the DDR and
@@ -66,8 +65,21 @@
 #define FB_MAPPED       0x00C00000UL            /* 12 MB >= 1080 x 2448 x 4 */
 #define BLOCK_2M        0x200000UL
 #define BLOCK_1G        0x40000000UL
-#define HIGH_BANK       0x800000000UL           /* memory node: 8 GB at 32 GB */
-#define HIGH_BANK_GB    8
+
+/* The RAM beyond bank 0 (the device tree's memory node: 8 GB at 32 GB, 7 GB
+ * at 3 GB), less bank 2's carve-outs: removed_region 0xD8800000-0xE3000000,
+ * splash_region 0xE5000000-0xE7300000 (the framebuffer), dfps_data_region
+ * 0xE7400000-0xE7500000. 2 MB blocks in the framebuffer's gigabyte, 1 GB
+ * blocks elsewhere. The 8 GB bank first: it holds the biggest runs. */
+static const struct {
+    uint64_t base, size;
+} high_ram[] = {
+    { 0x800000000UL, 0x200000000UL },   /* bank 1, 8 GB, no carve-outs */
+    { 0x0C0000000UL, 0x018800000UL },   /* bank 2: 392 MB to removed_region */
+    { 0x0E3000000UL, 0x002000000UL },   /* 32 MB up to the splash */
+    { 0x0E7600000UL, 0x018A00000UL },   /* 394 MB from past dfps_data to 4 GB */
+    { 0x100000000UL, 0x180000000UL },   /* 6 GB above 4 GB */
+};
 
 static uint64_t l1[512] __attribute__((aligned(4096)));
 static uint64_t l2_dram[512] __attribute__((aligned(4096)));
@@ -121,8 +133,18 @@ void platform_mmu_init(void)
     map_2m(l2_dram, L2_DRAM_BASE, RAM_CACHED_BASE, DMA_WINDOW_BASE, ATTR_NORMAL_WB);
     map_2m(l2_dram, L2_DRAM_BASE, DMA_WINDOW_BASE, RAM_END, ATTR_NORMAL_NC);
     map_2m(l2_fb, L2_FB_BASE, FB_BASE, FB_BASE + FB_MAPPED, ATTR_NORMAL_NC);
-    for (uint64_t g = 0; g < HIGH_BANK_GB; g++)
-        l1[HIGH_BANK / BLOCK_1G + g] = block_desc(HIGH_BANK + g * BLOCK_1G, ATTR_NORMAL_WB) | DESC_XN;
+    for (uint32_t r = 0; r < sizeof(high_ram) / sizeof(high_ram[0]); r++) {
+        uint64_t pa = high_ram[r].base, end = pa + high_ram[r].size;
+        for (; pa < end; ) {
+            if (!(pa & (BLOCK_1G - 1)) && end - pa >= BLOCK_1G) {
+                l1[pa / BLOCK_1G] = block_desc(pa, ATTR_NORMAL_WB) | DESC_XN;
+                pa += BLOCK_1G;
+            } else {                    /* only in the framebuffer's gigabyte */
+                l2_fb[(pa - L2_FB_BASE) / BLOCK_2M] = block_desc(pa, ATTR_NORMAL_WB) | DESC_XN;
+                pa += BLOCK_2M;
+            }
+        }
+    }
 
     /* The page allocator must not hand out the DMA window */
     mem_reserve_range(DMA_WINDOW_BASE, DMA_WINDOW_SIZE / 4096);
@@ -160,22 +182,26 @@ void platform_mmu_init(void)
     serial_putdec((t1 - t0) * 1000 / cntfrq());
     serial_puts(" ms\n");
 
-    /* A word at the start of each gigabyte, written and read back */
-    uint64_t gb = 0;
-    while (gb < HIGH_BANK_GB) {
-        volatile uint64_t *w = (volatile uint64_t *)(uintptr_t)(HIGH_BANK + gb * BLOCK_1G);
-        uint64_t pattern = 0x05170C0DE0000000ULL | gb;
-        *w = pattern;
-        if (*w != pattern)
-            break;
-        gb++;
-    }
-    if (gb)
-        mem_add_high(HIGH_BANK, gb * BLOCK_1G);
-    if (gb < HIGH_BANK_GB) {
-        serial_puts("[MMU ] high bank: GB ");
-        serial_putdec(gb);
-        serial_puts(" doesn't read back, stopping there\n");
+    /* Hand each range over as far as it reads back: a word at its start and
+     * at each gigabyte boundary in it, written and read back */
+    for (uint32_t r = 0; r < sizeof(high_ram) / sizeof(high_ram[0]); r++) {
+        uint64_t base = high_ram[r].base, end = base + high_ram[r].size, good = base;
+        while (good < end) {
+            volatile uint64_t *w = (volatile uint64_t *)(uintptr_t)good;
+            uint64_t pattern = 0x05170C0DE0000000ULL | good;
+            *w = pattern;
+            if (*w != pattern)
+                break;
+            uint64_t next = (good & ~(BLOCK_1G - 1)) + BLOCK_1G;
+            good = next < end ? next : end;
+        }
+        if (good > base)
+            mem_add_high(base, good - base);
+        if (good < end) {
+            serial_puts("[MMU ] high memory at ");
+            serial_puthex(good, 10);
+            serial_puts(" doesn't read back, stopping there\n");
+        }
     }
 }
 

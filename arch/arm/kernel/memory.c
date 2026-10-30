@@ -30,13 +30,19 @@ static uint64_t ram_pages;     /* total pages in RAM region */
 static uint64_t free_pages;
 static uint64_t total_memory;
 
-/* A second region for big allocations (mem_alloc_aligned_high): SM8350's
- * 8 GB bank at 0x800000000, which the platform maps and hands over with
- * mem_add_high. Its own bitmap, indexed from its base. mem_alloc_pages
- * never uses it, so kload's kernels stay in the first region. */
-#define HIGH_MAX_PAGES  (8ULL * 1024 * 1024 * 1024 / PAGE_SIZE)   /* 2M pages */
-static uint8_t high_bitmap[HIGH_MAX_PAGES / 8];                    /* 256 KB */
-static uint64_t high_base, high_pages, high_free;
+/* High memory, for big allocations (mem_alloc_aligned_high): the RAM the
+ * platform maps beyond the first region and hands over with mem_add_high,
+ * on SM8350 the rest of its 16 GB. One bitmap for all of it, each region
+ * owning a stretch from its first_bit. mem_alloc_pages never uses it, so
+ * kload's kernels stay in the first region. */
+#define HIGH_MAX_PAGES  (16ULL * 1024 * 1024 * 1024 / PAGE_SIZE)  /* 4M pages */
+#define HIGH_REGIONS    8
+static uint8_t high_bitmap[HIGH_MAX_PAGES / 8];                    /* 512 KB */
+static struct {
+    uint64_t base, pages, first_bit;
+} high[HIGH_REGIONS];
+static int high_count;
+static uint64_t high_pages, high_free;
 
 /* ── Bitmap helpers ──────────────────────────────────────── */
 
@@ -201,15 +207,21 @@ static int high_test(uint64_t i) { return (high_bitmap[i / 8] >> (i % 8)) & 1; }
 static void high_set(uint64_t i) { high_bitmap[i / 8] |= (uint8_t)(1 << (i % 8)); }
 static void high_clear(uint64_t i) { high_bitmap[i / 8] &= (uint8_t)~(1 << (i % 8)); }
 
-/* Hand over a mapped region (once, before any high allocation) */
+/* Hand over a mapped region (all of them before any high allocation) */
 void mem_add_high(uint64_t base, uint64_t size)
 {
     uint64_t pages = size >> PAGE_SHIFT;
-    if (pages > HIGH_MAX_PAGES)
-        pages = HIGH_MAX_PAGES;
-    memset(high_bitmap, 0xFF, pages / 8);
-    high_base = base;
-    high_pages = high_free = pages;
+    if (high_count == HIGH_REGIONS || pages > HIGH_MAX_PAGES - high_pages)
+        return;
+    uint64_t first = high_pages;
+    for (uint64_t i = 0; i < pages; i++)
+        high_set(first + i);
+    high[high_count].base = base;
+    high[high_count].pages = pages;
+    high[high_count].first_bit = first;
+    high_count++;
+    high_pages += pages;
+    high_free += pages;
     serial_puts("[MEM ] High region: ");
     serial_putdec(pages * PAGE_SIZE >> 20);
     serial_puts(" MB at ");
@@ -217,8 +229,26 @@ void mem_add_high(uint64_t base, uint64_t size)
     serial_puts("\n");
 }
 
+/* A run of pages in region r at an aligned address: its first page's
+ * index within the region, or -1. Caller holds mem_lock. */
+static int64_t high_find(int r, uint64_t pages, uint64_t step)
+{
+    uint64_t base_page = high[r].base >> PAGE_SHIFT, bit = high[r].first_bit;
+    uint64_t first = (base_page + step - 1) / step * step - base_page;
+    for (uint64_t p = first; p + pages <= high[r].pages; ) {
+        uint64_t i = 0;
+        while (i < pages && high_test(bit + p + i))
+            i++;
+        if (i == pages)
+            return (int64_t)p;
+        uint64_t next = p + i + 1;              /* past the used page */
+        p = first + (next - first + step - 1) / step * step;
+    }
+    return -1;
+}
+
 /* Big, aligned, physically contiguous memory (models, tensor arenas): from
- * the high region, else the first one. Not zeroed. */
+ * the high regions, else the first one. Not zeroed. */
 void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment)
 {
     uint64_t pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
@@ -227,23 +257,14 @@ void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment)
         step = 1;
     void *addr = (void *)0;
     uint64_t flags = spin_lock_irqsave(&mem_lock);
-    if (pages && pages <= high_free) {
-        /* Candidates at aligned addresses; on a used page, jump past it */
-        uint64_t first = ((high_base >> PAGE_SHIFT) + step - 1) / step * step - (high_base >> PAGE_SHIFT);
-        for (uint64_t p = first; p + pages <= high_pages; ) {
-            uint64_t i = 0;
-            while (i < pages && high_test(p + i))
-                i++;
-            if (i == pages) {
-                for (i = 0; i < pages; i++)
-                    high_clear(p + i);
-                high_free -= pages;
-                addr = (void *)(high_base + (p << PAGE_SHIFT));
-                break;
-            }
-            uint64_t next = p + i + 1;
-            p = first + (next - first + step - 1) / step * step;
-        }
+    for (int r = 0; r < high_count && pages && pages <= high_free && !addr; r++) {
+        int64_t p = high_find(r, pages, step);
+        if (p < 0)
+            continue;
+        for (uint64_t i = 0; i < pages; i++)
+            high_clear(high[r].first_bit + (uint64_t)p + i);
+        high_free -= pages;
+        addr = (void *)(high[r].base + ((uint64_t)p << PAGE_SHIFT));
     }
     spin_unlock_irqrestore(&mem_lock, flags);
     return addr ? addr : mem_alloc_aligned(size, alignment);
@@ -255,11 +276,16 @@ void mem_free_pages(void *addr, uint64_t count)
 {
     uint64_t pa = (uint64_t)addr;
     uint64_t flags = spin_lock_irqsave(&mem_lock);
-    if (high_pages && pa >= high_base && pa < high_base + (high_pages << PAGE_SHIFT)) {
-        uint64_t first = (pa - high_base) >> PAGE_SHIFT;
-        for (uint64_t i = 0; i < count && first + i < high_pages; i++) {
-            if (!high_test(first + i)) {
-                high_set(first + i);
+    int r = 0;
+    while (r < high_count &&
+           !(pa >= high[r].base && pa < high[r].base + (high[r].pages << PAGE_SHIFT)))
+        r++;
+    if (r < high_count) {
+        uint64_t first = (pa - high[r].base) >> PAGE_SHIFT;
+        for (uint64_t i = 0; i < count && first + i < high[r].pages; i++) {
+            uint64_t bit = high[r].first_bit + first + i;
+            if (!high_test(bit)) {
+                high_set(bit);
                 high_free++;
             }
         }

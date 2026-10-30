@@ -58,7 +58,7 @@ static void cmd_help(void)
     serial_puts("  desktop  The desktop on the panel, phablet layout [off]\n");
     serial_puts("  model    Local LLM: the loaded one [<file.gguf>: load it]\n");
     serial_puts("  chat     Talk to the loaded model <text>\n");
-    serial_puts("  llm      Compute path [simd on|off | selftest]\n");
+    serial_puts("  llm      Compute path [simd on|off | smp on|off | selftest]\n");
     serial_puts("  reboot   Reboot system [bootloader: into fastboot]\n");
     serial_puts("  pmic     PMIC arbiter + restart reason [<sid> <hex addr> | list <sid>]\n");
     serial_puts("  rpmh     Apps RSC + AOP command DB [<resource>]\n");
