@@ -265,7 +265,8 @@ DOS_SRC  = dos/dos_init.c dos/dos_exec.c dos/dos_loader.c \
 GUI_SRC  = ../../gui/gui_draw.c ../../gui/gui_text.c \
            ../../gui/gui_panel.c ../../gui/gui_dock.c \
            ../../gui/gui_desktop.c ../../gui/gui_window.c \
-           ../../gui/gui_anim.c
+           ../../gui/gui_anim.c ../../gui/gui_theme.c ../../gui/gui_font.c \
+           ../../gui/gui_widgets.c
 
 # ── Object files ──────────────────────────────────────────────
 

@@ -2,7 +2,7 @@
  * OsitoK GUI — Shared graphical desktop library
  *
  * Architecture-independent rendering to pixel buffers.
- * Inspired by elementaryOS Pantheon dark mode.
+ * Dark glass desktop with scale-aware chrome and shared input geometry.
  * Used by both x86-64 and AArch64 kernels.
  */
 
@@ -32,8 +32,8 @@ typedef struct {
 /* ── Retina-quality dark palette (macOS-inspired depth) ─────── */
 
 /* Desktop background: subtle warm-cool gradient */
-#define GUI_BG_DARK         0xFF1A1A1E  /* Top: dark with cool undertone */
-#define GUI_BG_LIGHT        0xFF28262E  /* Bottom: slightly warmer, purple tint */
+#define GUI_BG_DARK         0xFF101820
+#define GUI_BG_LIGHT        0xFF243D50
 
 /* Panel / Dock: frosted glass feel */
 #define GUI_PANEL_BG        0xD8202028  /* 85% opaque, blue-tinted dark */
@@ -69,13 +69,13 @@ typedef struct {
 
 /* ── Layout constants ─────────────────────────────────────── */
 
-#define GUI_PANEL_HEIGHT    28
-#define GUI_DOCK_HEIGHT     48
-#define GUI_DOCK_ICON_SIZE  36
-#define GUI_DOCK_PADDING    8
+#define GUI_PANEL_HEIGHT    gui_panel_height()
+#define GUI_DOCK_HEIGHT     gui_px(56)
+#define GUI_DOCK_ICON_SIZE  gui_px(40)
+#define GUI_DOCK_PADDING    gui_px(8)
 #define GUI_DOCK_BUILTIN_COUNT 2
 #define GUI_DOCK_MAX_TASKS  32
-#define GUI_TITLEBAR_H      28
+#define GUI_TITLEBAR_H      gui_px(36)
 #define GUI_BORDER_W        1
 #define GUI_CORNER_RADIUS   4
 #define GUI_SHADOW_OFFSET   3
@@ -145,6 +145,10 @@ void gui_fill_circle_aa(gui_surface_t *s, int32_t cx, int32_t cy,
 void gui_box_shadow(gui_surface_t *s, int32_t x, int32_t y,
                     int32_t w, int32_t h, int32_t offset_x, int32_t offset_y,
                     int32_t blur, uint32_t color);
+/* Same shadow, excluding [x,x+w) x [y,y+h), which the caller must overwrite. */
+void gui_box_shadow_outer(gui_surface_t *s, int32_t x, int32_t y,
+                          int32_t w, int32_t h, int32_t offset_x, int32_t offset_y,
+                          int32_t blur, uint32_t color);
 
 /* Gradient titlebar (Phase 2.7) */
 void gui_gradient_h(gui_surface_t *s, int32_t x, int32_t y,
@@ -227,5 +231,7 @@ int *gui_desktop_get_order(void);
 /* Register the terminal shm pixel buffer so gui_desktop blits it at the
  * correct z-order position (inside window 0, not after all windows). */
 void gui_desktop_set_terminal_surface(uint32_t *px, uint32_t w, uint32_t h);
+
+#include "gui_theme.h"
 
 #endif /* OSITO_GUI_H */

@@ -142,7 +142,10 @@ GUI_SRCS := \
     ../../gui/gui_dock.c \
     ../../gui/gui_window.c \
     ../../gui/gui_desktop.c \
-    ../../gui/gui_anim.c
+    ../../gui/gui_anim.c \
+    ../../gui/gui_theme.c \
+    ../../gui/gui_font.c \
+    ../../gui/gui_widgets.c
 
 # ── WASM-specific HAL + drivers ───────────────────────────────────
 WASM_SRCS := \
@@ -165,7 +168,7 @@ all: $(BUILDDIR)/osito.html
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-$(BUILDDIR)/osito.html: $(ALL_SRCS) shell.html manifest.json sw.js | $(BUILDDIR)
+$(BUILDDIR)/osito.html: $(ALL_SRCS) ../../gui/gui.h ../../gui/gui_theme.h ../../gui/gui_font_data.h shell.html manifest.json sw.js | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(EMFLAGS) $(ALL_SRCS) -o $(BUILDDIR)/osito.html
 	cp manifest.json $(BUILDDIR)/
 	# Stamp the Service Worker cache name with the wasm md5 so each

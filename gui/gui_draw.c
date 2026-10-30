@@ -273,12 +273,53 @@ void gui_fill_circle_aa(gui_surface_t *s, int32_t cx, int32_t cy,
 
 /* ── Phase 2.2: Multi-layer soft shadow ────────────────────── */
 
-void gui_box_shadow(gui_surface_t *s, int32_t x, int32_t y,
-                    int32_t w, int32_t h, int32_t offset_x, int32_t offset_y,
-                    int32_t blur, uint32_t color)
+typedef struct {
+    int32_t x0, y0, x1, y1;
+} shadow_exclusion_t;
+
+static void shadow_layer(gui_surface_t *s, int32_t x, int32_t y,
+                         int32_t w, int32_t h, int32_t r, uint32_t color,
+                         const shadow_exclusion_t *exclude)
+{
+    if (!exclude) {
+        gui_rounded_rect_alpha(s, x, y, w, h, r, color);
+        return;
+    }
+    if (w <= 0 || h <= 0 || !(color >> 24)) return;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+
+    int32_t y0 = gui_max(y, 0);
+    int32_t y1 = gui_min(y + h, (int32_t)s->height);
+    for (int32_t py = y0; py < y1; py++) {
+        int32_t row = py - y, skip = 0;
+        if (row < r)
+            skip = corner_skip(r, row);
+        else if (row >= h - r)
+            skip = corner_skip(r, h - 1 - row);
+        int32_t x0 = gui_max(x + skip, 0);
+        int32_t x1 = gui_min(x + w - skip, (int32_t)s->width);
+        if (x0 >= x1) continue;
+        if (py < exclude->y0 || py >= exclude->y1) {
+            gui_fill_rect_alpha(s, x0, py, x1 - x0, 1, color);
+        } else {
+            int32_t left = gui_min(x1, exclude->x0);
+            int32_t right = gui_max(x0, exclude->x1);
+            if (x0 < left)
+                gui_fill_rect_alpha(s, x0, py, left - x0, 1, color);
+            if (right < x1)
+                gui_fill_rect_alpha(s, right, py, x1 - right, 1, color);
+        }
+    }
+}
+
+static void box_shadow(gui_surface_t *s, int32_t x, int32_t y,
+                       int32_t w, int32_t h, int32_t offset_x, int32_t offset_y,
+                       int32_t blur, uint32_t color,
+                       const shadow_exclusion_t *exclude)
 {
     if (blur <= 0) {
-        gui_rounded_rect_alpha(s, x + offset_x, y + offset_y, w, h, 4, color);
+        shadow_layer(s, x + offset_x, y + offset_y, w, h, 4, color, exclude);
         return;
     }
     /* Multi-layer soft shadow: 4 concentric rounded rects with decreasing
@@ -294,9 +335,27 @@ void gui_box_shadow(gui_surface_t *s, int32_t x, int32_t y,
         /* Alpha decreases quadratically: outermost layer is faintest */
         uint32_t a = (base_a * (uint32_t)i) / ((uint32_t)layers * 2);
         uint32_t layer_color = (a << 24) | rgb;
-        gui_rounded_rect_alpha(s, x + offset_x - expand, y + offset_y - expand,
-                               w + 2 * expand, h + 2 * expand, er, layer_color);
+        shadow_layer(s, x + offset_x - expand, y + offset_y - expand,
+                     w + 2 * expand, h + 2 * expand, er, layer_color, exclude);
     }
+}
+
+void gui_box_shadow(gui_surface_t *s, int32_t x, int32_t y,
+                    int32_t w, int32_t h, int32_t offset_x, int32_t offset_y,
+                    int32_t blur, uint32_t color)
+{
+    box_shadow(s, x, y, w, h, offset_x, offset_y, blur, color, NULL);
+}
+
+void gui_box_shadow_outer(gui_surface_t *s, int32_t x, int32_t y,
+                          int32_t w, int32_t h, int32_t offset_x, int32_t offset_y,
+                          int32_t blur, uint32_t color)
+{
+    /* The caller paints this rectangle afterwards; shadow pixels outside it
+     * retain exactly the same layers, rounding and blend order. */
+    shadow_exclusion_t exclude = { x, y, x + w, y + h };
+    box_shadow(s, x, y, w, h, offset_x, offset_y, blur, color,
+               w > 0 && h > 0 ? &exclude : NULL);
 }
 
 /* ── Phase 2.7: Horizontal gradient ───────────────────────── */

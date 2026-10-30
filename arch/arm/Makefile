@@ -69,7 +69,8 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
 GUI_SRCS := ../../gui/gui_draw.c ../../gui/gui_text.c \
             ../../gui/gui_panel.c ../../gui/gui_dock.c \
             ../../gui/gui_desktop.c ../../gui/gui_window.c \
-            ../../gui/gui_anim.c
+            ../../gui/gui_anim.c ../../gui/gui_theme.c ../../gui/gui_font.c \
+            ../../gui/gui_widgets.c
 
 # Objects
 ASM_OBJS := $(patsubst %.S,$(BUILD)/%.o,$(ASM_SRCS))
@@ -140,10 +141,12 @@ $(BUILD)/drivers/gpu_tensor.o: drivers/gpu_tensor.c
 	@$(CC) $(FP_CFLAGS) -c $< -o $@
 
 # GUI shared library
-$(BUILD)/gui/%.o: ../../gui/%.c
+$(BUILD)/gui/%.o: ../../gui/%.c ../../gui/gui.h ../../gui/gui_theme.h
 	@echo "[CC] $<"
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/gui/gui_font.o: ../../gui/gui_font_data.h
 
 clean:
 	rm -rf $(BUILD)

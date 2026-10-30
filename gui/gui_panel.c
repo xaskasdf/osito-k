@@ -55,50 +55,32 @@ static int scat_num(char *dst, int pos, uint64_t val)
 
 void gui_panel_render(gui_surface_t *s, uint32_t screen_w)
 {
-    int32_t text_y = (GUI_PANEL_HEIGHT - GUI_FONT_H) / 2;
-
-    /* Semi-transparent panel background */
-    gui_fill_rect_alpha(s, 0, 0, (int32_t)screen_w, GUI_PANEL_HEIGHT,
-                        GUI_PANEL_BG);
-
-    /* Subtle bottom border */
-    gui_hline(s, 0, GUI_PANEL_HEIGHT - 1, (int32_t)screen_w, GUI_BORDER);
-
-    /* Left: "OsitoK" branding (AA) */
-    gui_draw_text_aa(s, 12, text_y, "OsitoK", GUI_ACCENT);
-
-    /* Right: RTC clock (HH:MM:SS from CMOS RTC) */
+    int height = gui_panel_height();
+    if (!height) return;
+    gui_glass_panel(s, (gui_rect_t){0, 0, (int)screen_w, height}, 0, false);
+    int pad = gui_px(14);
+    gui_rect_t brand = { pad, 0, gui_px(80), height };
+    gui_ui_text_fit(s, brand, "OsitoK", GUI_INK, false);
     char clock[12];
-    {
-        int ci = 0;
-        if (dbg.rtc_hour < 10) clock[ci++] = '0';
-        ci = scat_num(clock, ci, dbg.rtc_hour); clock[ci++] = ':';
-        if (dbg.rtc_min < 10) clock[ci++] = '0';
-        ci = scat_num(clock, ci, dbg.rtc_min); clock[ci++] = ':';
-        if (dbg.rtc_sec < 10) clock[ci++] = '0';
-        ci = scat_num(clock, ci, dbg.rtc_sec);
-        clock[ci] = '\0';
-    }
-    int cw = gui_text_width(clock);
-    gui_draw_text_aa(s, (int32_t)screen_w - cw - 12, text_y,
-                     clock, GUI_PANEL_TEXT);
-
-    /* Center-right: debug stats (to the left of clock) */
+    int ci = 0;
+    if (dbg.rtc_hour < 10) clock[ci++] = '0';
+    ci = scat_num(clock, ci, dbg.rtc_hour); clock[ci++] = ':';
+    if (dbg.rtc_min < 10) clock[ci++] = '0';
+    ci = scat_num(clock, ci, dbg.rtc_min);
+    clock[ci] = 0;
+    int cw = gui_ui_text_width(clock);
+    gui_rect_t cr = { (int)screen_w - cw - pad, 0, cw, height };
+    gui_ui_text_fit(s, cr, clock, GUI_INK, false);
     if (dbg.fps || dbg.mem_used_mb || dbg.ticks) {
         char line[96];
-        int p = 0;
-        p = scat(line, p, "FPS:");
+        int p = scat_num(line, 0, dbg.mem_used_mb);
+        p = scat(line, p, " MB used    ");
         p = scat_num(line, p, dbg.fps);
-        p = scat(line, p, "  MEM:");
-        p = scat_num(line, p, dbg.mem_used_mb);
-        p = scat(line, p, "/");
-        p = scat_num(line, p, dbg.mem_used_mb + dbg.mem_free_mb);
-        p = scat(line, p, "MB  P:");
-        p = scat_num(line, p, dbg.procs);
-        line[p] = '\0';
-
-        int tw = gui_text_width(line);
-        int32_t x = (int32_t)screen_w - cw - 12 - tw - 20;
-        gui_draw_text_aa(s, x, text_y, line, GUI_TEXT_DIM);
+        p = scat(line, p, " fps");
+        line[p] = 0;
+        int width = gui_ui_text_width(line);
+        int left = cr.x - gui_px(24) - width;
+        if (left > brand.x + brand.w + gui_px(20))
+            gui_ui_text_fit(s, (gui_rect_t){left, 0, width, height}, line, GUI_MUTED, false);
     }
 }
