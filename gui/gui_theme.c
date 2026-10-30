@@ -7,9 +7,12 @@ static const uint16_t scales[] = { 100, 125, 150, 175, 200, 250, 300 };
 static void theme_recalculate(void)
 {
     uint32_t target = 100;
+    bool phablet = options.layout == GUI_LAYOUT_PHABLET;
+    /* A phone is ~70 mm across and ~360 dp wide; a desktop needs 640 x 420 */
+    uint32_t min_mm = phablet ? 40 : 80, min_w = phablet ? 360 : 640, min_h = phablet ? 600 : 420;
     metrics.physical_size_valid = false;
     metrics.physical_ppi = 0;
-    if (metrics.width_mm >= 80 && metrics.height_mm >= 50 &&
+    if (metrics.width_mm >= min_mm && metrics.height_mm >= 50 &&
         metrics.width_mm <= 2000 && metrics.height_mm <= 2000) {
         uint32_t x = (uint32_t)((uint64_t)metrics.width * 254 /
                                 (metrics.width_mm * 10));
@@ -34,8 +37,8 @@ static void theme_recalculate(void)
     for (unsigned i = 1; i < sizeof(scales) / sizeof(scales[0]); i++)
         if (target >= (scales[i - 1] + scales[i]) / 2u) choice = i;
     /* Keep display settings reachable, even after an excessive manual choice. */
-    while (choice && ((uint64_t)metrics.width * 100 / scales[choice] < 640 ||
-                      (uint64_t)metrics.height * 100 / scales[choice] < 420))
+    while (choice && ((uint64_t)metrics.width * 100 / scales[choice] < min_w ||
+                      (uint64_t)metrics.height * 100 / scales[choice] < min_h))
         choice--;
     metrics.scale_percent = scales[choice];
     metrics.effective_width = metrics.width * 100 / metrics.scale_percent;
@@ -55,7 +58,8 @@ void gui_theme_configure(const gui_theme_options_t *value)
 {
     if (!value) return;
     options = *value;
-    if (options.layout != GUI_LAYOUT_TASKBAR) options.layout = GUI_LAYOUT_DOCK;
+    if (options.layout != GUI_LAYOUT_TASKBAR && options.layout != GUI_LAYOUT_PHABLET)
+        options.layout = GUI_LAYOUT_DOCK;
     if (options.scale_percent && options.scale_percent < 100) options.scale_percent = 100;
     if (options.scale_percent > 300) options.scale_percent = 300;
     theme_recalculate();
@@ -91,13 +95,20 @@ bool gui_theme_from_edid(const uint8_t *edid, uint32_t bytes)
 
 int32_t gui_panel_height(void)
 {
-    return options.layout == GUI_LAYOUT_DOCK ? gui_px(30) : 0;
+    return options.layout == GUI_LAYOUT_TASKBAR ? 0 : gui_px(30);
+}
+
+/* The navigation bar's height in the phablet layout (gui_dock.c) */
+int32_t gui_nav_height(void)
+{
+    return gui_px(64);
 }
 
 gui_rect_t gui_work_area(uint32_t width, uint32_t height)
 {
     int top = gui_panel_height();
-    int bottom = gui_px(options.layout == GUI_LAYOUT_DOCK ? 76 : 54);
+    int bottom = options.layout == GUI_LAYOUT_PHABLET ? gui_nav_height() :
+                 gui_px(options.layout == GUI_LAYOUT_DOCK ? 76 : 54);
     gui_rect_t r = { 0, top, (int32_t)width, (int32_t)height - top - bottom };
     if (r.h < 1) r.h = 1;
     return r;

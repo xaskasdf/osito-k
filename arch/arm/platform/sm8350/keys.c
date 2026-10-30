@@ -16,7 +16,8 @@
  *   Vol-Up / Vol-Down   page the screen back / forward through the console
  *                       log (console_scroll); held, they repeat
  *   both, held 2 s      reboot into fastboot (platform_reboot_bootloader)
- *   Power, under 1 s    a status summary on the console
+ *   Power, under 1 s    a status summary on the console; with the desktop
+ *                       up, the next window to the front
  * Holding Power ~10 s still resets the phone: that's the PMIC's own doing.
  * Every press and release also goes, as its PS/2 key (E0 5E power, E0 2E /
  * E0 30 volume), into the GUI's input queue.
@@ -134,7 +135,10 @@ static void edge(int k, int down)
             state[k].repeat = state[k].since + REPEAT_AFTER_MS;
         }
     } else if (k == KEY_POWER && timer_ms() - state[k].since < TAP_MS) {
-        status();
+        if (desktop_active)
+            desktop_cycle_window();
+        else
+            status();
     }
 }
 

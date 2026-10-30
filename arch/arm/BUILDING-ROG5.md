@@ -397,6 +397,36 @@ same way.
 
 ---
 
+## Desktop (phablet layout)
+
+`desktop` puts the shared GUI (`gui/`, the dark glass desktop x86 runs) on the
+panel in its phablet layout: status bar on top, navigation bar below, one
+maximized window at a time (see `gui/README.md`, "Phablet layout"). At the
+panel's physical size (70 x 158 mm, `platform_panel`) the theme picks 300%,
+360 x 816 dp.
+
+`kernel/gui_task.c` runs it as a task on whichever CPU is free:
+- **The console** moves into the Terminal window. `framebuffer.c` is pointed
+  at an off-screen surface the size of the window's content (64 columns), the
+  desktop composes it, and the text is laid out again from the log
+  (`console_redraw`), so nothing is lost. The volume keys still page its
+  history.
+- **Frames** are painted into a back buffer in cached RAM and copied to the
+  panel, only when something changed: console text (`fb_take_dirty`), an
+  animation, the status bar's minute, a key. The first frame takes 39 ms on an
+  A55 (20 ms once the wallpaper is cached).
+- **The status bar** shows memory and, with no RTC on the phone, the uptime as
+  its clock.
+- **Power** brings the window behind to the front: Terminal or System, with
+  the Appearance pane.
+- **`desktop off`** gives the panel back to the console (`platform_console_to_panel`,
+  redrawn from the log). `screen` refuses to change modes while the desktop is
+  up, and the heartbeat squares stay off it.
+
+There is no touchscreen driver yet, so the keys are the only input.
+
+---
+
 ## Keys
 
 `platform/sm8350/keys.c` reads the three keys from the PMICs over SPMI
@@ -636,6 +666,11 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     back. `exec hello.elf` printed "Hello from userspace!" from a file stored on
     UFS, the first app loaded that way. It needed I-cache maintenance in
     `elf.c`, which predated the caches.
+24. **Phablet desktop (2026-10-30).** The shared GUI gained a third layout,
+    `GUI_LAYOUT_PHABLET`, and `desktop` runs it on the panel at 300% with the
+    console inside the Terminal window (see "Desktop"). A photo of the phone
+    showed the status bar, the maximized Terminal with `cpus`/`temp`/`ls` in it,
+    and the navigation bar with both apps.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1168,6 +1203,7 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/` | Platform-specific code |
 | `arch/arm/kernel/main.c` | Kernel entry (kernel_main) |
 | `arch/arm/kernel/framebuffer.c` | Splash FB console and its history view of the log |
+| `arch/arm/kernel/gui_task.c` | `desktop`: the shared GUI's phablet layout on the panel, console in its Terminal |
 | `arch/arm/kernel/serial.c` | GENI UART driver |
 | `arch/arm/kernel/timer.c` | ARM Generic Timer |
 | `arch/arm/kernel/gic.c` | GICv3 interrupt controller |

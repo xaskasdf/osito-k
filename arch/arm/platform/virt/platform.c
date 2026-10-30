@@ -86,6 +86,18 @@ void platform_put_cmd(int argc, char **argv)
     serial_puts("put: only on SM8350 (over the USB console)\n");
 }
 
+/* No panel for the desktop: QEMU shows the UART */
+int platform_panel(uint64_t *base, uint32_t *w, uint32_t *h,
+                   uint32_t *w_mm, uint32_t *h_mm)
+{
+    (void)base; (void)w; (void)h; (void)w_mm; (void)h_mm;
+    return -1;
+}
+
+void platform_console_to_panel(void)
+{
+}
+
 /* No framebuffer console: QEMU shows the UART */
 void platform_screen_cmd(int argc, char **argv)
 {

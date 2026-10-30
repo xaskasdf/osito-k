@@ -1,5 +1,5 @@
 /*
- * OsitoK GUI — Glass dock / bottom taskbar
+ * OsitoK GUI — Glass dock / bottom taskbar / phablet navigation bar
  *
  * Shared paged layout for rendering and pointer hit testing.
  */
@@ -39,8 +39,42 @@ uint32_t gui_dock_task_id(int dock_index)
 
 static int dock_page_index;
 
+/* Phablet: a full-width navigation bar, larger targets, centered */
+static gui_dock_layout_t nav_geometry(uint32_t width, uint32_t height)
+{
+    gui_dock_layout_t d = {0};
+    int items = gui_dock_item_count();
+    d.icon_size = gui_px(48); d.gap = gui_px(16);
+    int slot = d.icon_size + d.gap;
+    int available = (int)width - gui_px(32) - d.gap;
+    d.capacity = available / slot;
+    if (d.capacity < 1) d.capacity = 1;
+    d.paged = items > d.capacity;
+    if (d.paged) {
+        d.capacity = (available - gui_px(56)) / slot;
+        if (d.capacity < 1) d.capacity = 1;
+    }
+    int pages = (items + d.capacity - 1) / d.capacity;
+    if (dock_page_index >= pages) dock_page_index = pages - 1;
+    if (dock_page_index < 0) dock_page_index = 0;
+    d.first = dock_page_index * d.capacity;
+    d.count = items - d.first;
+    if (d.count > d.capacity) d.count = d.capacity;
+    int h = gui_nav_height();
+    d.bounds = (gui_rect_t){ 0, (int)height - h, (int)width, h };
+    d.start_x = ((int)width - (d.count * slot - d.gap)) / 2;
+    if (d.paged) {
+        d.previous = (gui_rect_t){ gui_px(8), d.bounds.y + (h - gui_px(40)) / 2, gui_px(28), gui_px(40) };
+        d.next = d.previous;
+        d.next.x = (int)width - gui_px(36);
+    }
+    return d;
+}
+
 gui_dock_layout_t gui_dock_geometry(uint32_t width, uint32_t height)
 {
+    if (gui_theme_get()->layout == GUI_LAYOUT_PHABLET)
+        return nav_geometry(width, height);
     gui_dock_layout_t d = {0};
     bool bar = gui_theme_get()->layout == GUI_LAYOUT_TASKBAR;
     int items = gui_dock_item_count();
@@ -111,8 +145,10 @@ void gui_dock_render(gui_surface_t *s, uint32_t screen_w, uint32_t screen_h,
 {
     gui_dock_layout_t d = gui_dock_geometry(screen_w, screen_h);
     bool bar = gui_theme_get()->layout == GUI_LAYOUT_TASKBAR;
+    bool nav = gui_theme_get()->layout == GUI_LAYOUT_PHABLET;
+    int glyph = gui_px(nav ? 28 : 22);
     gui_soft_shadow(s, d.bounds, gui_px(10), gui_px(3), 64);
-    gui_glass_panel(s, d.bounds, bar ? 0 : gui_px(9), true);
+    gui_glass_panel(s, d.bounds, bar || nav ? 0 : gui_px(9), true);
     int win_count = 0;
     gui_win_desc_t *wins = gui_desktop_get_windows(&win_count);
     for (int i = d.first; i < d.first + d.count; i++) {
@@ -125,7 +161,8 @@ void gui_dock_render(gui_surface_t *s, uint32_t screen_w, uint32_t screen_h,
         unsigned state = (focused ? GUI_CONTROL_SELECTED : 0) | (hover ? GUI_CONTROL_HOVER : 0);
         if (hover || focused) gui_control(s, r, "", state);
         if (builtin) {
-            gui_rect_t icon = { r.x + gui_px(9), r.y + gui_px(9), gui_px(22), gui_px(22) };
+            gui_rect_t icon = nav ? (gui_rect_t){ r.x + (r.w - glyph) / 2, r.y + (r.h - glyph) / 2, glyph, glyph }
+                                  : (gui_rect_t){ r.x + gui_px(9), r.y + gui_px(9), glyph, glyph };
             gui_ui_icon(s, icon, i == 0 ? GUI_ICON_TERMINAL : GUI_ICON_SETTINGS,
                          visible ? (i ? 0xFFBCDCF2 : 0xFFC2E2D1) : GUI_MUTED);
         } else {

@@ -84,7 +84,18 @@ extern volatile int screen_debug;
 void platform_screen_cmd(int argc, char **argv);    /* shell `screen` */
 /* Per-CPU status square in the heartbeat row, in debug mode */
 #define FB_CPU_MARK(cpu, color) \
-    do { if (screen_debug) fb_fill((cpu) * 70, 420, 60, 30, (color)); } while (0)
+    do { if (screen_debug && !desktop_active) fb_fill((cpu) * 70, 420, 60, 30, (color)); } while (0)
+int  fb_take_dirty(void);           /* text drawn since the last call */
+
+/* The desktop (kernel/gui_task.c, shell `desktop`): the shared GUI in its
+ * phablet layout on the panel, the console inside its Terminal window */
+extern volatile int desktop_active;
+void desktop_cycle_window(void);    /* the next window to the front (Power) */
+void desktop_close(void);           /* back to the plain console */
+/* The panel: framebuffer, pixels and millimetres; -1 if none (virt) */
+int  platform_panel(uint64_t *base, uint32_t *w, uint32_t *h,
+                    uint32_t *w_mm, uint32_t *h_mm);
+void platform_console_to_panel(void);   /* the console back on it, redrawn */
 void fb_putc(char c);
 void fb_puts(const char *s);
 void fb_puts_color(const char *s, uint32_t color);

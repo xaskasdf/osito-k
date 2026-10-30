@@ -184,11 +184,23 @@ void fb_clear(void)
     viewing = 0;
 }
 
+/* Something was drawn since fb_take_dirty: the desktop, which composes the
+ * console's surface into its Terminal window, repaints then */
+static volatile int fb_dirty;
+
+int fb_take_dirty(void)
+{
+    int d = fb_dirty;
+    fb_dirty = 0;
+    return d;
+}
+
 /* Anything outside the font draws as a space */
 static void fb_draw_char(uint32_t col, uint32_t row, char c,
                          uint32_t fg, uint32_t bg)
 {
     if (!fb_base) return;
+    fb_dirty = 1;
     if (c < 32 || c > 126) c = ' ';
     uint32_t px = col * FONT_W * scale;
     uint32_t py = text_y0 + row * FONT_H * scale;

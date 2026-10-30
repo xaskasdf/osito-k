@@ -6,6 +6,8 @@
  *   2. Top panel (Wingpanel)
  *   3. Demo windows
  *   4. Bottom dock (Plank)
+ * In the phablet layout the windows are maximized and only the front one
+ * is painted; the dock becomes a navigation bar.
  */
 
 #include "gui.h"
@@ -85,11 +87,22 @@ static struct {
 static int settings_values[3];
 static const uint16_t setting_scales[] = { 0, 100, 125, 150, 175, 200, 250, 300 };
 static const char *const setting_labels[3][8] = {
-    { "Dock and top panel", "Bottom taskbar" },
+    { "Dock and top panel", "Bottom taskbar", "Phablet (portrait)" },
     { "Automatic", "100%", "125%", "150%", "175%", "200%", "250%", "300%" },
     { "Auto (monitor)", "13.3 inch", "14 inch", "15.6 inch", "24 inch", "27 inch" }
 };
-static const int setting_counts[3] = { 2, 8, 6 };
+static const int setting_counts[3] = { 3, 8, 6 };
+/* The "Desktop layout" row, in setting_labels[0] order */
+static const gui_layout_t setting_layouts[3] = {
+    GUI_LAYOUT_DOCK, GUI_LAYOUT_TASKBAR, GUI_LAYOUT_PHABLET
+};
+
+static int layout_setting(void)
+{
+    for (int i = 0; i < 3; i++)
+        if (setting_layouts[i] == gui_theme_get()->layout) return i;
+    return 0;
+}
 
 void gui_desktop_get_cursor(int32_t *x, int32_t *y)
 {
@@ -106,6 +119,12 @@ static void desktop_cancel_window_anim(gui_win_desc_t *w)
 static void desktop_fit(gui_win_desc_t *w)
 {
     gui_rect_t area = gui_work_area(scr_w, scr_h);
+    if (gui_theme_get()->layout == GUI_LAYOUT_PHABLET) {
+        /* Every window fills the work area, title bar included */
+        w->x = area.x; w->y = area.y; w->w = area.w;
+        w->h = area.h > GUI_TITLEBAR_H + 1 ? area.h - GUI_TITLEBAR_H : 1;
+        return;
+    }
     int margin = gui_px(12);
     int max_w = area.w - margin * 2;
     int max_h = area.h - GUI_TITLEBAR_H - margin * 2;
@@ -313,7 +332,7 @@ static void desktop_setting_step(int row, int value)
         value = (value % count + count) % count;
         settings_values[row] = value;
     }
-    if (row == 0) options.layout = settings_values[0] ? GUI_LAYOUT_TASKBAR : GUI_LAYOUT_DOCK;
+    if (row == 0) options.layout = setting_layouts[settings_values[0]];
     if (row == 1) options.scale_percent = setting_scales[settings_values[1]];
     if (row == 2) {
         static const uint16_t diagonals[] = { 0, 133, 140, 156, 240, 270 };
@@ -397,7 +416,7 @@ static void desktop_settings_render(gui_surface_t *screen)
         heading.y += gui_px(26);
         gui_ui_text_fit(&clip, desktop_local_rect(heading, ox, oy), "Choose a layout and a comfortable size.", GUI_MUTED, false);
     }
-    settings_values[0] = gui_theme_get()->layout == GUI_LAYOUT_TASKBAR;
+    settings_values[0] = layout_setting();
     for (unsigned i = 0; i < sizeof(setting_scales) / sizeof(setting_scales[0]); i++)
         if (setting_scales[i] == gui_theme_get()->scale_percent) settings_values[1] = (int)i;
     if (l.scroll_max) {
@@ -627,7 +646,7 @@ void gui_desktop_init(uint32_t screen_w, uint32_t screen_h)
     settings_focus = 0; settings_hot = 0; settings_first = 0; settings_scroll = 0;
     settings_drag.active = false;
     settings_keyboard_focus = false;
-    settings_values[0] = gui_theme_get()->layout == GUI_LAYOUT_TASKBAR;
+    settings_values[0] = layout_setting();
     settings_values[1] = 0; settings_values[2] = 0;
     for (unsigned i = 0; i < sizeof(setting_scales) / sizeof(setting_scales[0]); i++)
         if (setting_scales[i] == gui_theme_get()->scale_percent) settings_values[1] = (int)i;
@@ -721,6 +740,15 @@ void gui_desktop_render_window(gui_surface_t *screen, int index)
 void gui_desktop_render_base(gui_surface_t *screen)
 {
     gui_desktop_render_background(screen);
+    if (gui_theme_get()->layout == GUI_LAYOUT_PHABLET) {
+        /* Maximized windows cover each other: only the front one shows */
+        for (int i = NUM_DEMO_WINDOWS - 1; i >= 0; i--)
+            if (!demo_windows[demo_order[i]].hidden) {
+                gui_desktop_render_window(screen, demo_order[i]);
+                break;
+            }
+        return;
+    }
     for (int i = 0; i < NUM_DEMO_WINDOWS; i++)
         gui_desktop_render_window(screen, demo_order[i]);
 }

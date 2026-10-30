@@ -41,9 +41,38 @@ void platform_init(void *dtb) {
     }
 }
 
+/* The panel ABL leaves scanning out: 6.78", 1080 x 2448 at ~395 ppi */
+#define PANEL_W_MM  70
+#define PANEL_H_MM  158
+
+int platform_panel(uint64_t *base, uint32_t *w, uint32_t *h,
+                   uint32_t *w_mm, uint32_t *h_mm) {
+    *base = SPLASH_FB_BASE;
+    *w = DISPLAY_WIDTH;
+    *h = DISPLAY_HEIGHT;
+    *w_mm = PANEL_W_MM;
+    *h_mm = PANEL_H_MM;
+    return 0;
+}
+
+/* The console back on the panel after the desktop, as the screen mode
+ * wants it, laid out again from the log */
+void platform_console_to_panel(void) {
+    uint64_t flags = console_lock();
+    fb_init_platform(SPLASH_FB_BASE, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_WIDTH, 32);
+    fb_fill(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, 0);
+    fb_set_text_top(screen_debug ? DEBUG_CONSOLE_TOP : 0);
+    console_unlock(flags);
+    console_redraw();
+}
+
 /* Shell `screen`: the mode; `screen debug` / `screen normal` switches it,
  * moving the console and laying it out again from the log */
 void platform_screen_cmd(int argc, char **argv) {
+    if (desktop_active) {
+        serial_puts("screen: the desktop has the panel (desktop off)\n");
+        return;
+    }
     if (argc == 2 && (strcmp(argv[1], "debug") == 0 || strcmp(argv[1], "normal") == 0)) {
         int debug = argv[1][0] == 'd';
         uint64_t flags = console_lock();

@@ -87,13 +87,28 @@ that space. Existing application/terminal pixel surfaces keep their own content
 rendering; this change does not alter Win32 DPI reporting or stretch client
 surfaces. Multi-monitor DPI and persistence remain future work.
 
+## Phablet layout
+
+`GUI_LAYOUT_PHABLET` is the third layout, for portrait phones and tablets, next
+to the dock and the taskbar ("Phablet (portrait)" in Appearance):
+- the top panel becomes a status bar;
+- the dock becomes a full-width navigation bar (`gui_nav_height()`) with larger,
+  centered targets;
+- every window fills the work area, and only the front one is painted.
+
+Its scale rules are a phone's: physical sizes from 40 mm across count (a phone
+is ~70 mm), and the scale cap keeps 360 x 600 logical pixels instead of
+640 x 420. The ROG Phone 5 (6.78", 1080 x 2448, ~395 ppi) lands on 300%:
+360 x 816 dp, an Android phone's width. On the phone, `desktop` runs it with the
+text console inside the Terminal window (arch/arm/kernel/gui_task.c).
+
 ## Rendering boundaries
 
 - `gui_theme.*`: palette tokens, scale, work area and rectangle operations.
 - `gui_font.c`: bounded UTF-8 decoding, measurement, clipping and ellipsis.
 - `gui_widgets.c`: glass, shadows, controls, popup geometry/input and vector icons.
 - `gui_window.c`: shared frame and title-button geometry.
-- `gui_dock.c`: shared dock/taskbar geometry, overflow and task painting.
+- `gui_dock.c`: shared dock/taskbar/navigation-bar geometry, overflow and task painting.
 - `gui_desktop.c`: background cache, native window contents and System settings.
 
 The x86 compositor draws the background, inactive native windows, client

@@ -52,7 +52,7 @@ static void cmd_help(void)
     serial_puts("  halt     Shutdown system\n");
     serial_puts("  resolve  DNS lookup\n");
     serial_puts("  beep     Play a tone\n");
-    serial_puts("  desktop  Launch graphical desktop\n");
+    serial_puts("  desktop  The desktop on the panel, phablet layout [off]\n");
     serial_puts("  reboot   Reboot system [bootloader: into fastboot]\n");
     serial_puts("  pmic     PMIC arbiter + restart reason [<sid> <hex addr>]\n");
     serial_puts("  keys     Power / volume keys: now and press counts\n");
@@ -165,10 +165,22 @@ static void cmd_uptime(void)
 /* Desktop GUI task (gui_task.c) */
 extern void gui_task(void *arg);
 
-static void cmd_desktop(void)
+/* `desktop`: the GUI on the panel, on whichever CPU is fastest and free;
+ * `desktop off`: back to the console */
+static void cmd_desktop(int argc, char **argv)
 {
-    serial_puts("[GUI ] Launching desktop...\n");
-    task_create("desktop", gui_task, (void *)0, 2);
+    if (argc == 2 && strcmp(argv[1], "off") == 0) {
+        if (desktop_active)
+            desktop_close();
+        else
+            serial_puts("desktop: not running\n");
+        return;
+    }
+    if (desktop_active) {
+        serial_puts("desktop: already running (desktop off)\n");
+        return;
+    }
+    task_create_on("desktop", gui_task, (void *)0, 2, TASK_ANY_CPU);
 }
 
 /* Simple atoi for shell args */
@@ -397,7 +409,7 @@ void shell_run(void)
         else if (strcmp(argv[0], "halt") == 0)    cmd_halt();
         else if (strcmp(argv[0], "resolve") == 0) cmd_resolve(argc, argv);
         else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
-        else if (strcmp(argv[0], "desktop") == 0) cmd_desktop();
+        else if (strcmp(argv[0], "desktop") == 0) cmd_desktop(argc, argv);
         else if (strcmp(argv[0], "reboot") == 0) {
             if (argc > 1 && strcmp(argv[1], "bootloader") == 0)
                 platform_reboot_bootloader();

@@ -89,6 +89,7 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - `platform/sm8350/thermal.c` reads the TSENS sensors (shell `temp`), and its task caps both big clusters together above 95 °C.
 - UFS (`platform/sm8350/ufs.c`, shell `ufs`) holds every partition of the phone, ABL and the boot slots included. Osito-K writes only to LUN 0's `userdata` (OsitoFS, mounted at boot): `permitted()` refuses any write outside that partition's LBA range and any opcode that isn't a read or WRITE(10)/SYNCHRONIZE CACHE. Never widen that without the user asking.
   - Copy files on with `arch/arm/scripts/rog5-put.ps1 -File <path>` (shell `put <name>`); run static AArch64 ELFs with `exec <name>`.
+- `desktop` runs the shared GUI (`gui/`) on the panel in its phablet layout (`GUI_LAYOUT_PHABLET`, 300%), with the console inside its Terminal window (`kernel/gui_task.c`); `desktop off` returns to the plain console. Layout changes in `gui/` also affect x86 and wasm, so build x86 too.
 - Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
 - The kernel is a PIE linked at 0 that relocates itself in `start.S`, so it runs at any load address and stored pointers work. Linker-script symbols that C reads must be section-relative (an absolute symbol's GOT entry gets no relocation). After linking, `readelf -r kernel.elf` should show only `R_AARCH64_RELATIVE`.
 

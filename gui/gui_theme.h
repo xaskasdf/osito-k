@@ -5,7 +5,9 @@
 #define OSITO_GUI_THEME_H
 
 typedef struct { int32_t x, y, w, h; } gui_rect_t;
-typedef enum { GUI_LAYOUT_DOCK, GUI_LAYOUT_TASKBAR } gui_layout_t;
+/* PHABLET: portrait phones and tablets. Status bar on top, a full-width
+ * navigation bar below, one maximized window at a time. */
+typedef enum { GUI_LAYOUT_DOCK, GUI_LAYOUT_TASKBAR, GUI_LAYOUT_PHABLET } gui_layout_t;
 typedef struct {
     gui_layout_t layout;
     uint16_t scale_percent;       /* 0 = automatic; 100..300 supported */
@@ -36,6 +38,7 @@ void gui_theme_set_physical_size(uint32_t width_mm, uint32_t height_mm);
 bool gui_theme_from_edid(const uint8_t *edid, uint32_t bytes);
 int32_t gui_px(int32_t dips);
 int32_t gui_panel_height(void);
+int32_t gui_nav_height(void);
 gui_rect_t gui_work_area(uint32_t width, uint32_t height);
 bool gui_rect_contains(gui_rect_t r, int32_t x, int32_t y);
 
