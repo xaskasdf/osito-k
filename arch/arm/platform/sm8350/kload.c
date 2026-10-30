@@ -3,7 +3,8 @@
  *
  * The `kload` shell command; the host side is arch/arm/scripts/rog5-kload.ps1
  * (rog5-boot.sh --usb). This replaces flashing boot_a for every test build.
- * `put <name>` receives a file the same way (rog5-put.ps1) into OsitoFS.
+ * `put <name>` receives a file the same way (rog5-put.ps1) into OsitoFS, and
+ * `get <name>` sends one back in the same framing (rog5-get.ps1).
  *
  * Protocol, after the device prints "kload: ready": the 4 bytes "OKLD", the
  * Image size and its CRC-32 (u32 little-endian each), then the Image. Bytes
@@ -193,6 +194,78 @@ void platform_put_cmd(int argc, char **argv)
     serial_puts(!stored ? " bytes, crc ok, but storing it failed\n" :
                 !verified ? " bytes, crc ok, stored, but it reads back different\n" :
                 " bytes, crc ok, stored and verified\n");
+}
+
+/* Raw bytes to the host, a chunk per console lock so other CPUs' output
+ * (kept off the link by console_host_hold) isn't held off for long */
+static void host_send(const void *data, uint32_t len)
+{
+    const uint8_t *p = data;
+    while (len) {
+        uint32_t n = len < 4096 ? len : 4096;
+        uint64_t flags = console_lock();
+        for (uint32_t i = 0; i < n; i++)
+            acm_putc((char)p[i]);
+        console_unlock(flags);
+        p += n;
+        len -= n;
+    }
+}
+
+/* Shell `get <name>`: a file from the mounted OsitoFS to the host
+ * (rog5-get.ps1), framed as put's: "OKLD", size, CRC-32, the bytes */
+void platform_get_cmd(int argc, char **argv)
+{
+    if (argc != 2) {
+        serial_puts("usage: get <name>  (the host takes it: rog5-get.ps1)\n");
+        return;
+    }
+    if (!osfs2_is_mounted()) {
+        serial_puts("get: no filesystem mounted (ufs mount)\n");
+        return;
+    }
+    osfs2_file_t *f = osfs2_find(argv[1]);
+    if (!f) {
+        serial_puts("get: no such file\n");
+        return;
+    }
+    if (f->size == 0 || f->size > PUT_MAX) {
+        serial_puts("get: bad size\n");
+        return;
+    }
+    uint32_t size = (uint32_t)f->size;
+    uint64_t pages = (size + 4095) / 4096;
+    uint8_t *buf = mem_alloc_aligned_high(size, 4096);
+    if (!buf) {
+        serial_puts("get: out of memory\n");
+        return;
+    }
+    if (osfs2_read(f, 0, buf, size) != (int)size) {
+        serial_puts("get: read failed\n");
+        mem_free_pages(buf, pages);
+        return;
+    }
+    uint32_t crc = 0xFFFFFFFF;
+    for (uint32_t i = 0; i < size; i++)
+        crc = crc32_byte(crc, buf[i]);
+    crc = ~crc;
+
+    serial_puts("get: sending\n");
+    uint8_t hdr[12] = { 'O', 'K', 'L', 'D' };
+    for (int i = 0; i < 4; i++) {
+        hdr[4 + i] = (uint8_t)(size >> (8 * i));
+        hdr[8 + i] = (uint8_t)(crc >> (8 * i));
+    }
+    console_host_hold(1);
+    host_send(hdr, sizeof(hdr));
+    host_send(buf, size);
+    console_host_hold(0);
+    mem_free_pages(buf, pages);
+    serial_puts("get: ");
+    serial_puts(argv[1]);
+    serial_puts(", ");
+    serial_putdec(size);
+    serial_puts(" bytes sent\n");
 }
 
 int platform_kload(void)

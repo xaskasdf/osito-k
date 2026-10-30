@@ -527,6 +527,19 @@ same way.
   checks the CRC before saying "stored and verified". It runs at the USB
   console's pace, ~1.67 MB/s: 5 MB of random bytes took 3 s, a 92 MB model
   54 s.
+- **Download:** `get <name>` sends a file back in the same framing
+  (`arch/arm/scripts/rog5-get.ps1 -Name <name> [-Out <path>]`, which checks
+  the CRC). Other tasks may print during the transfer. While it runs,
+  `console_host_hold` (`kernel/serial.c`) keeps their output on the screen
+  and in the log, but off the USB link, so it can't land inside the binary
+  data. It runs at ~2.9 MB/s: 21.6 MB in 7.3 s, over COM3 or COM4 alike.
+- **Screenshots:** `screenshot [name]` writes the panel as a 24-bit BMP,
+  `screen.bmp` by default: 7.9 MB for 1080×2448.
+  - The panel's pixels are `0x00RRGGBB`, so B, G, R in memory, which is
+    already BMP's order.
+  - `arch/arm/scripts/rog5-screenshot.ps1 [-Out <file.png>]` runs it, fetches
+    the BMP and saves a PNG, all in ~4 s. The console comes out at ~80 KB as
+    a PNG, the desktop at ~150 KB.
 - **Apps:** `exec <name> [args]` runs a program stored there (see "Apps").
 
 ---
@@ -1598,6 +1611,8 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/keys.c` | Power / volume keys: console history, fastboot and status shortcuts |
 | `arch/arm/platform/sm8350/ufs.c` | UFS host controller: LUNs, GPT, block dumps; writes only into `userdata` (OsitoFS) |
 | `arch/arm/scripts/rog5-put.ps1` | Host side of `put`: copy a file onto the phone's OsitoFS |
+| `arch/arm/scripts/rog5-get.ps1` | Host side of `get`: copy a file from the phone's OsitoFS |
+| `arch/arm/scripts/rog5-screenshot.ps1` | `screenshot` on the phone, then the BMP fetched and saved as a PNG |
 | `arch/arm/scripts/rog5-app.sh` | Build `arch/arm/apps` on the Mac, copy them to the phone, run one |
 | `arch/arm/libc/` | The programs' libc: startup, syscalls, stdio/stdlib/string/time; `make check` |
 | `arch/arm/apps/` | Example programs (hello, primes, cat, guess, countdown, crash) |

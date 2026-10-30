@@ -414,9 +414,10 @@ int zlib_deflate(const uint8_t *src, uint32_t src_len,
     bw_write(&bw, 1, 1); /* BFINAL */
     bw_write(&bw, 1, 2); /* BTYPE = fixed Huffman */
 
-    /* LZ77 with hash chain */
-    int16_t hash_head[HASH_SIZE];
-    int16_t hash_prev[WINDOW];
+    /* LZ77 with hash chain. Static: 72 KB is more than a task's stack, and
+     * the only caller (git) runs in the shell. */
+    static int16_t hash_head[HASH_SIZE];
+    static int16_t hash_prev[WINDOW];
     for (int i = 0; i < HASH_SIZE; i++) hash_head[i] = -1;
 
     uint32_t i = 0;

@@ -37,6 +37,7 @@ void platform_temp_cmd(int argc, char **argv);   /* shell `temp` */
 void platform_keys_cmd(int argc, char **argv);   /* shell `keys` */
 void platform_ufs_cmd(int argc, char **argv);    /* shell `ufs` */
 void platform_put_cmd(int argc, char **argv);    /* shell `put`: a file over USB */
+void platform_get_cmd(int argc, char **argv);    /* shell `get`: one back to the host */
 void platform_touch_cmd(int argc, char **argv);  /* shell `touch` */
 void platform_net_cmd(int argc, char **argv);    /* shell `net`: USB networking */
 /* The next finger event in panel pixels (down: 1 pressed or moved, 0
@@ -74,6 +75,9 @@ void console_redraw(void);  /* the log's tail, after the text area moved */
  * CPUs, IRQs off; nests on one CPU. serial_* take it themselves. */
 uint64_t console_lock(void);
 void     console_unlock(uint64_t flags);
+/* While on, console output still reaches the screen and the log but not
+ * the host: a binary transfer (`get`) owns that link */
+void     console_host_hold(int on);
 
 /* ========================================================================
  * Framebuffer

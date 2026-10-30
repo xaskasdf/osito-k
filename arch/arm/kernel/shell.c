@@ -72,6 +72,8 @@ static void cmd_help(void)
     serial_puts("  ufs      UFS storage [luns | gpt <lun> | read <lun> <lba> [off] | mount |\n");
     serial_puts("           mkfs userdata]: writes go only to userdata (OsitoFS)\n");
     serial_puts("  put      Store a file sent over USB <name> (host: rog5-put.ps1)\n");
+    serial_puts("  get      Send a file to the host over USB <name> (host: rog5-get.ps1)\n");
+    serial_puts("  screenshot The panel as a BMP file [name, default screen.bmp]\n");
     serial_puts("  touch    Touchscreen: state, wiring, supplies [on | read | off]\n");
     serial_puts("  kload    Receive a kernel over USB and run it\n");
     serial_puts("  dmesg    Show the console log since boot\n");
@@ -341,6 +343,74 @@ static void cmd_https(int argc, char **argv)
     serial_puts("\n");
 }
 
+/* `screenshot [name]`: the panel as a 24-bit BMP in OsitoFS, screen.bmp by
+ * default (rog5-screenshot.ps1 fetches it as a PNG). The panel's 32 bpp
+ * pixels are 0x00RRGGBB, so B, G, R in memory, BMP's own order. */
+static void cmd_screenshot(int argc, char **argv)
+{
+    extern int  osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len);
+    extern bool osfs2_is_mounted(void);
+    uint64_t base;
+    uint32_t w, h, w_mm, h_mm;
+    if (platform_panel(&base, &w, &h, &w_mm, &h_mm) < 0) {
+        serial_puts("screenshot: no panel\n");
+        return;
+    }
+    if (!osfs2_is_mounted()) {
+        serial_puts("screenshot: no filesystem mounted (ufs mount)\n");
+        return;
+    }
+    const char *name = argc > 1 ? argv[1] : "screen.bmp";
+    uint32_t row = (w * 3 + 3) & ~3U;
+    uint32_t size = 54 + row * h;
+    uint8_t *bmp = mem_alloc_aligned_high(size, 4096);
+    if (!bmp) {
+        serial_puts("screenshot: out of memory\n");
+        return;
+    }
+    memset(bmp, 0, 54);
+    uint32_t fields[][2] = {
+        { 2, size }, { 10, 54 },                /* file size, pixel data offset */
+        { 14, 40 }, { 18, w }, { 22, h },       /* BITMAPINFOHEADER, bottom-up */
+        { 34, row * h },
+        { 38, 2835 }, { 42, 2835 },             /* 72 dpi */
+    };
+    bmp[0] = 'B';
+    bmp[1] = 'M';
+    for (uint32_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+        for (int b = 0; b < 4; b++)
+            bmp[fields[i][0] + b] = (uint8_t)(fields[i][1] >> (8 * b));
+    bmp[26] = 1;                                /* planes */
+    bmp[28] = 24;                               /* bits per pixel */
+    const volatile uint32_t *fb = (const volatile uint32_t *)base;
+    for (uint32_t y = 0; y < h; y++) {
+        const volatile uint32_t *src = fb + (uint64_t)(h - 1 - y) * w;
+        uint8_t *dst = bmp + 54 + (uint64_t)y * row;
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t px = src[x];
+            dst[3 * x] = (uint8_t)px;
+            dst[3 * x + 1] = (uint8_t)(px >> 8);
+            dst[3 * x + 2] = (uint8_t)(px >> 16);
+        }
+    }
+    if (osfs2_find(name))
+        osfs2_delete(name);
+    osfs2_file_t *f = osfs2_create(name, size);
+    int ok = f && osfs2_write(f, 0, bmp, size) == 0 && osfs2_sync() == 0;
+    mem_free_pages(bmp, (size + 4095) / 4096);
+    serial_puts("screenshot: ");
+    serial_puts(name);
+    serial_puts(ok ? ", " : ": storing it failed\n");
+    if (!ok)
+        return;
+    serial_putdec(w);
+    serial_puts("x");
+    serial_putdec(h);
+    serial_puts(", ");
+    serial_putdec(size);
+    serial_puts(" bytes\n");
+}
+
 static void cmd_resolve(int argc, char **argv)
 {
     if (argc < 2) { serial_puts("Usage: resolve <hostname>\n"); return; }
@@ -497,6 +567,8 @@ void shell_run(void)
         else if (strcmp(argv[0], "screen") == 0)  platform_screen_cmd(argc, argv);
         else if (strcmp(argv[0], "ufs") == 0)     platform_ufs_cmd(argc, argv);
         else if (strcmp(argv[0], "put") == 0)     platform_put_cmd(argc, argv);
+        else if (strcmp(argv[0], "get") == 0)     platform_get_cmd(argc, argv);
+        else if (strcmp(argv[0], "screenshot") == 0) cmd_screenshot(argc, argv);
         else if (strcmp(argv[0], "touch") == 0)   platform_touch_cmd(argc, argv);
         else if (strcmp(argv[0], "clear") == 0)   serial_puts("\033[2J\033[H");
         else {

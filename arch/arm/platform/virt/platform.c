@@ -86,6 +86,13 @@ void platform_put_cmd(int argc, char **argv)
     serial_puts("put: only on SM8350 (over the USB console)\n");
 }
 
+void platform_get_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    serial_puts("get: only on SM8350 (over the USB console)\n");
+}
+
 void platform_touch_cmd(int argc, char **argv)
 {
     (void)argc;

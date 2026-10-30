@@ -15,11 +15,13 @@
 static char klog[KLOG_SIZE];
 static uint32_t klog_total;         /* bytes ever logged; wraps the ring */
 static int klog_muted;
+static volatile int host_held;      /* console_host_hold */
 
 static void out_raw(char c)
 {
     fb_putc(c);
-    uart_putc(c);
+    if (!host_held)
+        uart_putc(c);
 }
 
 /* Every byte also goes to the framebuffer console (a no-op until
@@ -63,6 +65,13 @@ void console_unlock(uint64_t flags)
         spin_unlock(&con_lock);
     }
     irq_restore(flags & ~CON_COUNTED);
+}
+
+void console_host_hold(int on)
+{
+    uint64_t flags = console_lock();
+    host_held = on;
+    console_unlock(flags);
 }
 
 /* Replay the log; muted so the replay doesn't log itself over the ring */
