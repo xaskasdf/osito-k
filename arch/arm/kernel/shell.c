@@ -22,15 +22,34 @@ extern void cmd_llm(int argc, char **argv);
 
 #define MAX_ARGS 16
 
+static bool arg_quoted[MAX_ARGS];       /* parse_args: the argument had quotes */
+
+/* Split at spaces; '...' and "..." keep spaces, '|', '<' and '>' as text.
+ * The quotes come out in place (the text only moves left). */
 static int parse_args(char *line, char **argv)
 {
     int argc = 0;
+    char *w = line;
     while (*line && argc < MAX_ARGS) {
         while (*line == ' ') line++;
         if (!*line) break;
-        argv[argc++] = line;
-        while (*line && *line != ' ') line++;
-        if (*line) *line++ = 0;
+        argv[argc] = w;
+        arg_quoted[argc] = false;
+        char q = 0;
+        while (*line && (q || *line != ' ')) {
+            if (!q && (*line == '\'' || *line == '"')) {
+                q = *line++;
+                arg_quoted[argc] = true;
+            } else if (q && *line == q) {
+                q = 0;
+                line++;
+            } else {
+                *w++ = *line++;
+            }
+        }
+        if (*line) line++;
+        *w++ = 0;
+        argc++;
     }
     return argc;
 }
@@ -44,11 +63,16 @@ static void cmd_help(void)
     serial_puts("  uname    Show system info\n");
     serial_puts("  uptime   Show uptime\n");
     serial_puts("  ls       List a directory [path]\n");
-    serial_puts("  cat      Show a file <path>\n");
+    serial_puts("  cat      Show files <path>... (or its input)\n");
     serial_puts("  cd, pwd  Change / show the current directory (paths may be relative)\n");
     serial_puts("  mkdir    Make directories <path>...; rmdir removes empty ones\n");
     serial_puts("  rm       Delete files <path>...\n");
-    serial_puts("  mv       Rename or move <from> <to>\n");
+    serial_puts("  mv, cp   Rename or move, copy <from> <to> (into <to> if a directory)\n");
+    serial_puts("  head     First lines [-n N] [path]; tail the last ones\n");
+    serial_puts("  grep     Lines containing a text [-i] [-v] [-c] <text> [path]\n");
+    serial_puts("  wc       Lines, words, bytes [path]\n");
+    serial_puts("  history  Lines typed before [clear]; Up/Down recall them, Tab completes\n");
+    serial_puts("           Pipes: a | b; redirection: > file, >> file, < file; quotes\n");
     serial_puts("  exec     Run a program from the filesystem <path> [args...]\n");
     serial_puts("  ping     Ping IP address\n");
     serial_puts("  cpus     List the online CPUs\n");
@@ -231,23 +255,29 @@ static void cmd_beep(int argc, char **argv)
 
 /* ── Files: OsitoFS v3, paths relative to the current directory ── */
 
+/* Errors skip a capture, as stderr would: to the console, not into the
+ * file or the next stage of a pipe */
+static void err_puts(const char *s1, const char *s2, const char *s3)
+{
+    void (*fn)(char) = console_capture(NULL);
+    serial_puts(s1);
+    serial_puts(s2);
+    serial_puts(s3);
+    console_capture(fn);
+}
+
 static int need_fs(const char *cmd)
 {
     if (osfs3_is_mounted())
         return 1;
-    serial_puts(cmd);
-    serial_puts(": no filesystem mounted (ufs mount)\n");
+    err_puts(cmd, ": no filesystem mounted (ufs mount)\n", "");
     return 0;
 }
 
 static void say_err(const char *cmd, const char *path, const char *what)
 {
-    serial_puts(cmd);
-    serial_puts(": ");
-    serial_puts(path);
-    serial_puts(": ");
-    serial_puts(what);
-    serial_puts("\n");
+    err_puts(cmd, ": ", path);
+    err_puts(": ", what, "\n");
 }
 
 static void put_right(uint64_t v, int width)
@@ -262,6 +292,100 @@ static void put_right(uint64_t v, int width)
         serial_putc(' ');
     while (n)
         serial_putc(buf[--n]);
+}
+
+/* A command's output, captured for `>` or the next stage of a pipe */
+struct capture {
+    char    *buf;
+    uint32_t len, max;
+    int      overflow;
+};
+static struct capture *cap;             /* the one console_capture fills */
+
+static void capture_char(char c)
+{
+    if (cap->len < cap->max)
+        cap->buf[cap->len++] = c;
+    else
+        cap->overflow = 1;
+}
+
+/* A command's input, from the previous stage or `<` */
+struct input {
+    const char *data;
+    uint64_t    len, pos;
+    int         set;
+};
+static struct input stdin_in;
+
+int shell_stdin_read(char *buf, int n)
+{
+    if (!stdin_in.set)
+        return -1;
+    uint64_t left = stdin_in.len - stdin_in.pos;
+    if ((uint64_t)n > left)
+        n = (int)left;
+    memcpy(buf, stdin_in.data + stdin_in.pos, (size_t)n);
+    stdin_in.pos += (uint64_t)n;
+    return n;
+}
+
+/* Bytes out: straight into a capture, else to the console (where a NUL
+ * would end a string, and means nothing anyway) */
+static void put_bytes(const char *p, uint64_t n)
+{
+    if (cap) {
+        for (uint64_t i = 0; i < n; i++)
+            capture_char(p[i]);
+        return;
+    }
+    char chunk[257];
+    uint32_t k = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (p[i])
+            chunk[k++] = p[i];
+        if (k == sizeof(chunk) - 1 || i + 1 == n) {
+            chunk[k] = 0;
+            serial_puts(chunk);
+            k = 0;
+        }
+    }
+}
+
+/* A filter's text: the file named, or else the command's input. *pages is
+ * what to free (0: nothing). 0, or -1 with the reason printed. */
+static int text_of(const char *cmd, const char *path, const char **data,
+                   uint64_t *len, uint64_t *pages)
+{
+    *pages = 0;
+    if (!path) {
+        if (!stdin_in.set) {
+            err_puts(cmd, ": no file and no input (a pipe or <)\n", "");
+            return -1;
+        }
+        *data = stdin_in.data + stdin_in.pos;
+        *len = stdin_in.len - stdin_in.pos;
+        return 0;
+    }
+    if (!need_fs(cmd))
+        return -1;
+    void *f = fs_find(path);
+    if (!f) {
+        say_err(cmd, path, "no such file");
+        return -1;
+    }
+    *len = osfs3_file_size(f);
+    uint64_t n = ((*len ? *len : 1) + 4095) / 4096;    /* an empty file too */
+    char *buf = mem_alloc_aligned_high(n * 4096, 4096);
+    if (!buf || osfs3_read_file(f, 0, buf, *len) < 0) {
+        say_err(cmd, path, buf ? "read error" : "out of memory");
+        if (buf)
+            mem_free_pages(buf, n);
+        return -1;
+    }
+    *data = buf;
+    *pages = n;
+    return 0;
 }
 
 /* `ls [path]`: a directory's entries, sizes first, directories marked */
@@ -314,33 +438,193 @@ static void cmd_ls(int argc, char **argv)
     serial_puts(" bytes\n");
 }
 
-/* `cat <file>`: the whole file, 4 KB at a time */
+/* `cat [file...]`: the files one after another, 4 KB at a time, or the
+ * command's input. On the console a missing last newline is added. */
 static void cmd_cat(int argc, char **argv)
 {
+    char last = '\n';
     if (argc < 2) {
-        serial_puts("Usage: cat <file>\n");
-        return;
-    }
-    if (!need_fs("cat"))
-        return;
-    void *f = fs_find(argv[1]);
-    if (!f) {
-        say_err("cat", argv[1], "no such file");
-        return;
-    }
-    static char cat_buf[4097];
-    uint64_t size = osfs3_file_size(f);
-    for (uint64_t off = 0; off < size; off += 4096) {
-        uint64_t n = size - off < 4096 ? size - off : 4096;
-        if (osfs3_read_file(f, off, cat_buf, n) < 0) {
-            say_err("cat", argv[1], "read error");
+        if (!stdin_in.set) {
+            serial_puts("Usage: cat <file>...  (or a pipe or < into it)\n");
             return;
         }
-        cat_buf[n] = '\0';
-        serial_puts(cat_buf);
+        uint64_t n = stdin_in.len - stdin_in.pos;
+        put_bytes(stdin_in.data + stdin_in.pos, n);
+        stdin_in.pos = stdin_in.len;
+        if (n)
+            last = stdin_in.data[stdin_in.len - 1];
+    } else if (!need_fs("cat")) {
+        return;
     }
-    if (size && cat_buf[(size - 1) % 4096] != '\n')
+    /* 1 MB at a time: a read smaller than v3's 64 KB block reads the whole
+     * block anyway, and 4 KB pieces took 28 s for 113 MB */
+    static char *cat_buf;
+    const uint64_t chunk = 1U << 20;
+    if (argc > 1 && !cat_buf && !(cat_buf = mem_alloc_aligned_high(chunk, 4096))) {
+        err_puts("cat: out of memory\n", "", "");
+        return;
+    }
+    for (int i = 1; i < argc; i++) {
+        void *f = fs_find(argv[i]);
+        if (!f) {
+            say_err("cat", argv[i], "no such file");
+            continue;
+        }
+        uint64_t size = osfs3_file_size(f);
+        for (uint64_t off = 0; off < size; off += chunk) {
+            uint64_t n = size - off < chunk ? size - off : chunk;
+            if (osfs3_read_file(f, off, cat_buf, n) < 0) {
+                say_err("cat", argv[i], "read error");
+                break;
+            }
+            put_bytes(cat_buf, n);
+            last = cat_buf[n - 1];
+        }
+    }
+    if (!cap && last != '\n')
         serial_puts("\n");
+}
+
+/* The lines of a text: each one's start and length, without its '\n' */
+static uint64_t next_line(const char *d, uint64_t len, uint64_t pos, uint64_t *line_len)
+{
+    uint64_t e = pos;
+    while (e < len && d[e] != '\n')
+        e++;
+    *line_len = e - pos;
+    return e < len ? e + 1 : e;
+}
+
+static int parse_n(int *argc, char ***argv, int def)
+{
+    if (*argc >= 3 && strcmp((*argv)[1], "-n") == 0) {
+        int n = (int)shell_atoi((*argv)[2]);
+        *argc -= 2;
+        *argv += 2;
+        return n;
+    }
+    return def;
+}
+
+/* `head [-n N] [file]`, `tail [-n N] [file]`: the first or last N lines (10) */
+static void cmd_head_tail(int argc, char **argv)
+{
+    int tail = argv[0][0] == 't';
+    const char *cmd = argv[0];
+    int want = parse_n(&argc, &argv, 10);
+    const char *d;
+    uint64_t len, pages;
+    if (text_of(cmd, argc > 1 ? argv[1] : NULL, &d, &len, &pages) < 0)
+        return;
+    uint64_t start = 0;
+    if (tail) {
+        /* Back from the end, past `want` newlines (a last one ends a line) */
+        uint64_t p = len;
+        int lines = 0;
+        if (p && d[p - 1] == '\n')
+            p--;
+        while (p > 0) {
+            if (d[p - 1] == '\n' && ++lines == want)
+                break;
+            p--;
+        }
+        start = want > 0 ? p : len;
+        put_bytes(d + start, len - start);
+    } else {
+        uint64_t p = 0, l;
+        for (int i = 0; i < want && p < len; i++)
+            p = next_line(d, len, p, &l);
+        put_bytes(d, p);
+    }
+    if (pages)
+        mem_free_pages((void *)d, pages);
+}
+
+static char fold(char c)
+{
+    return c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
+}
+
+/* `grep [-i] [-v] [-c] <text> [file]`: the lines that contain the text (-v:
+ * that don't; -i: in any case; -c: how many) */
+static void cmd_grep(int argc, char **argv)
+{
+    int icase = 0, invert = 0, count = 0, a = 1;
+    for (; a < argc && argv[a][0] == '-' && argv[a][1]; a++) {
+        for (const char *o = argv[a] + 1; *o; o++) {
+            if (*o == 'i') icase = 1;
+            else if (*o == 'v') invert = 1;
+            else if (*o == 'c') count = 1;
+        }
+    }
+    if (a >= argc) {
+        serial_puts("Usage: grep [-i] [-v] [-c] <text> [file]\n");
+        return;
+    }
+    const char *pat = argv[a];
+    uint64_t plen = strlen(pat);
+    const char *d;
+    uint64_t len, pages;
+    if (text_of("grep", a + 1 < argc ? argv[a + 1] : NULL, &d, &len, &pages) < 0)
+        return;
+    uint64_t matches = 0, pos = 0, l;
+    while (pos < len) {
+        uint64_t start = pos;
+        pos = next_line(d, len, pos, &l);
+        int hit = plen == 0;
+        for (uint64_t i = 0; !hit && i + plen <= l; i++) {
+            uint64_t k = 0;
+            while (k < plen && (icase ? fold(d[start + i + k]) == fold(pat[k])
+                                      : d[start + i + k] == pat[k]))
+                k++;
+            hit = k == plen;
+        }
+        if (hit != invert) {
+            matches++;
+            if (!count) {
+                put_bytes(d + start, l);
+                put_bytes("\n", 1);
+            }
+        }
+    }
+    if (count) {
+        serial_putdec(matches);
+        serial_puts("\n");
+    }
+    if (pages)
+        mem_free_pages((void *)d, pages);
+}
+
+/* `wc [file]`: lines, words and bytes */
+static void cmd_wc(int argc, char **argv)
+{
+    const char *d;
+    uint64_t len, pages;
+    if (text_of("wc", argc > 1 ? argv[1] : NULL, &d, &len, &pages) < 0)
+        return;
+    uint64_t lines = 0, words = 0;
+    int in_word = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        char c = d[i];
+        if (c == '\n')
+            lines++;
+        int space = c == ' ' || c == '\n' || c == '\t' || c == '\r';
+        if (!space && !in_word)
+            words++;
+        in_word = !space;
+    }
+    serial_putdec(lines);
+    serial_puts(" ");
+    serial_putdec(words);
+    serial_puts(" ");
+    serial_putdec(len);
+    if (argc > 1) {
+        serial_puts(" ");
+        serial_puts(argv[1]);
+    }
+    serial_puts("\n");
+    if (pages)
+        mem_free_pages((void *)d, pages);
 }
 
 static void cmd_pwd(void)
@@ -392,19 +676,13 @@ static void cmd_path_op(int argc, char **argv)
     }
 }
 
-/* `mv <from> <to>`: rename, or move into <to> when it's a directory */
-static void cmd_mv(int argc, char **argv)
+/* mv and cp: both paths made absolute, and <to> a directory meaning the
+ * same name inside it. 0, or -1 with the reason printed. */
+static int from_to(const char *cmd, char **argv, char from[FS_PATH_MAX], char to[FS_PATH_MAX])
 {
-    if (argc != 3) {
-        serial_puts("Usage: mv <from> <to>\n");
-        return;
-    }
-    if (!need_fs("mv"))
-        return;
-    char from[FS_PATH_MAX], to[FS_PATH_MAX];
     if (fs_path(argv[1], from) < 0 || fs_path(argv[2], to) < 0) {
-        serial_puts("mv: path too long\n");
-        return;
+        err_puts(cmd, ": path too long\n", "");
+        return -1;
     }
     uint32_t ino = osfs3_resolve_path(to);
     if (ino && osfs3_is_dir(ino)) {
@@ -414,15 +692,52 @@ static void cmd_mv(int argc, char **argv)
                 base = p + 1;
         uint32_t n = (uint32_t)strlen(to);
         if (n + 1 + strlen(base) >= FS_PATH_MAX) {
-            serial_puts("mv: path too long\n");
-            return;
+            err_puts(cmd, ": path too long\n", "");
+            return -1;
         }
         if (n > 1)
             to[n++] = '/';
         strcpy(to + n, base);
     }
+    return 0;
+}
+
+/* `mv <from> <to>`: rename, or move into <to> when it's a directory */
+static void cmd_mv(int argc, char **argv)
+{
+    if (argc != 3) {
+        serial_puts("Usage: mv <from> <to>\n");
+        return;
+    }
+    char from[FS_PATH_MAX], to[FS_PATH_MAX];
+    if (!need_fs("mv") || from_to("mv", argv, from, to) < 0)
+        return;
     if (osfs3_rename(from, to, false) < 0)
         say_err("mv", argv[1], "can't move it there (missing, or the target exists)");
+}
+
+/* `cp <from> <to>`: a copy, replacing <to>, or into <to> when it's a
+ * directory */
+static void cmd_cp(int argc, char **argv)
+{
+    if (argc != 3) {
+        serial_puts("Usage: cp <from> <to>\n");
+        return;
+    }
+    char from[FS_PATH_MAX], to[FS_PATH_MAX];
+    if (!need_fs("cp") || from_to("cp", argv, from, to) < 0)
+        return;
+    if (strcmp(from, to) == 0) {
+        say_err("cp", argv[1], "is the target itself");
+        return;
+    }
+    const char *d;
+    uint64_t len, pages;
+    if (text_of("cp", from, &d, &len, &pages) < 0)
+        return;
+    if (fs_write_file(to, d, len) < 0)
+        say_err("cp", argv[2], "can't write it");
+    mem_free_pages((void *)d, pages);
 }
 
 static void cmd_echo(int argc, char **argv)
@@ -612,155 +927,447 @@ static void cmd_resolve(int argc, char **argv)
     }
 }
 
+/* One command, its redirections already taken out */
+static void dispatch(int argc, char **argv)
+{
+    if      (strcmp(argv[0], "help") == 0)    cmd_help();
+    else if (strcmp(argv[0], "ps") == 0)      cmd_ps();
+    else if (strcmp(argv[0], "mem") == 0)     cmd_mem();
+    else if (strcmp(argv[0], "uname") == 0)   cmd_uname();
+    else if (strcmp(argv[0], "uptime") == 0)  cmd_uptime();
+    else if (strcmp(argv[0], "kload") == 0)   platform_kload();
+    else if (strcmp(argv[0], "dmesg") == 0)   klog_dump();
+    else if (strcmp(argv[0], "ls") == 0)      cmd_ls(argc, argv);
+    else if (strcmp(argv[0], "cat") == 0)    cmd_cat(argc, argv);
+    else if (strcmp(argv[0], "pwd") == 0)    cmd_pwd();
+    else if (strcmp(argv[0], "cd") == 0)     cmd_cd(argc, argv);
+    else if (strcmp(argv[0], "mkdir") == 0 || strcmp(argv[0], "rmdir") == 0 ||
+             strcmp(argv[0], "rm") == 0)     cmd_path_op(argc, argv);
+    else if (strcmp(argv[0], "mv") == 0)     cmd_mv(argc, argv);
+    else if (strcmp(argv[0], "cp") == 0)     cmd_cp(argc, argv);
+    else if (strcmp(argv[0], "head") == 0 || strcmp(argv[0], "tail") == 0)
+        cmd_head_tail(argc, argv);
+    else if (strcmp(argv[0], "grep") == 0)   cmd_grep(argc, argv);
+    else if (strcmp(argv[0], "wc") == 0)     cmd_wc(argc, argv);
+    else if (strcmp(argv[0], "history") == 0) {
+        if (argc > 1 && strcmp(argv[1], "clear") == 0)
+            term_history_clear();
+        else
+            term_history_print();
+    }
+    else if (strcmp(argv[0], "exec") == 0) {
+        if (argc < 2) serial_puts("Usage: exec <filename> [args...]\n");
+        else proc_run(argv[1], argc - 1, argv + 1);
+    }
+    else if (strcmp(argv[0], "ping") == 0) {
+        if (argc < 2) { serial_puts("Usage: ping <ip>\n"); }
+        else {
+            uint8_t ip[4] = {0};
+            /* Simple IP parser: a.b.c.d */
+            const char *p = argv[1];
+            for (int i = 0; i < 4 && *p; i++) {
+                uint32_t v = 0;
+                while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+                ip[i] = (uint8_t)v;
+                if (*p == '.') p++;
+            }
+            serial_puts("PING ");
+            serial_puts(argv[1]);
+            serial_puts("\n");
+            /* Four echoes, a second each. The first may go to ARP:
+             * net.c drops a packet whose next hop isn't resolved yet. */
+            extern uint32_t net_icmp_get_rx_count(void);
+            net_hold();
+            for (uint16_t seq = 1; seq <= 4; seq++) {
+                uint32_t before = net_icmp_get_rx_count();
+                uint64_t t0 = timer_ms(), t = 0;
+                net_icmp_send_echo(ip, seq);
+                while (net_icmp_get_rx_count() == before && (t = timer_ms() - t0) < 1000) {
+                    net_poll();
+                    task_yield();
+                }
+                serial_puts(net_icmp_get_rx_count() != before ? "  reply, " : "  timeout\n");
+                if (net_icmp_get_rx_count() != before) {
+                    serial_putdec(t);
+                    serial_puts(" ms\n");
+                }
+            }
+            net_release();
+        }
+    }
+    else if (strcmp(argv[0], "cpus") == 0) {
+        smp_print_cpus();
+    }
+    else if (strcmp(argv[0], "cpubench") == 0 && argc > 1 &&
+             strcmp(argv[1], "mix") == 0) {
+        smp_bench_mix();
+    }
+    else if (strcmp(argv[0], "cpubench") == 0) {
+        int any = argc > 1 && strcmp(argv[1], "any") == 0;
+        int count = 0;
+        for (const char *p = argc > 2 ? argv[2] : ""; *p >= '0' && *p <= '9'; p++)
+            count = count * 10 + (*p - '0');
+        smp_bench(any, count);
+    }
+    else if (strcmp(argv[0], "cpufreq") == 0) {
+        platform_cpufreq_cmd(argc, argv);
+    }
+    else if (strcmp(argv[0], "temp") == 0) {
+        platform_temp_cmd(argc, argv);
+    }
+    else if (strcmp(argv[0], "burn") == 0) {
+        int cpu = -1, secs = 0;
+        if (argc == 3 && strcmp(argv[1], "all") != 0) {
+            cpu = 0;
+            for (const char *p = argv[1]; *p >= '0' && *p <= '9'; p++)
+                cpu = cpu * 10 + (*p - '0');
+        }
+        for (const char *p = argc == 3 ? argv[2] : ""; *p >= '0' && *p <= '9'; p++)
+            secs = secs * 10 + (*p - '0');
+        if (argc != 3 || secs <= 0 || cpu >= MAX_CPUS)
+            serial_puts("usage: burn <cpu|all> <seconds>\n");
+        else
+            smp_burn(cpu, secs);
+    }
+    else if (strcmp(argv[0], "svctest") == 0) {
+        /* Inline SVC test — no ELF loading */
+        serial_puts("[TEST] Calling SVC write...\n");
+        const char *msg = "SVC write works!\n";
+        register uint64_t x0 __asm__("x0") = 1;        /* fd */
+        register uint64_t x1 __asm__("x1") = (uint64_t)msg;
+        register uint64_t x2 __asm__("x2") = 17;       /* len */
+        register uint64_t x8 __asm__("x8") = 64;       /* SYS_write */
+        __asm__ volatile("svc #0" : "+r"(x0)
+                         : "r"(x1), "r"(x2), "r"(x8)
+                         : "memory");
+        serial_puts("[TEST] SVC returned, x0=");
+        serial_putdec(x0);
+        serial_puts("\n");
+    }
+    else if (strcmp(argv[0], "echo") == 0)    cmd_echo(argc, argv);
+    else if (strcmp(argv[0], "hexdump") == 0) cmd_hexdump(argc, argv);
+    else if (strcmp(argv[0], "df") == 0)      cmd_df();
+    else if (strcmp(argv[0], "halt") == 0)    cmd_halt();
+    else if (strcmp(argv[0], "resolve") == 0) cmd_resolve(argc, argv);
+    else if (strcmp(argv[0], "net") == 0)     platform_net_cmd(argc, argv);
+    else if (strcmp(argv[0], "https") == 0)   cmd_https(argc, argv);
+    else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
+    else if (strcmp(argv[0], "desktop") == 0) cmd_desktop(argc, argv);
+    else if (strcmp(argv[0], "model") == 0)   cmd_model(argc, argv);
+    else if (strcmp(argv[0], "chat") == 0)    cmd_chat(argc, argv);
+    else if (strcmp(argv[0], "llm") == 0)     cmd_llm(argc, argv);
+    else if (strcmp(argv[0], "reboot") == 0) {
+        if (argc > 1 && strcmp(argv[1], "bootloader") == 0)
+            platform_reboot_bootloader();
+        else
+            platform_reboot();
+    }
+    else if (strcmp(argv[0], "pmic") == 0)    platform_pmic_cmd(argc, argv);
+    else if (strcmp(argv[0], "rpmh") == 0)    platform_rpmh_cmd(argc, argv);
+    else if (strcmp(argv[0], "keys") == 0)    platform_keys_cmd(argc, argv);
+    else if (strcmp(argv[0], "screen") == 0)  platform_screen_cmd(argc, argv);
+    else if (strcmp(argv[0], "ufs") == 0)     platform_ufs_cmd(argc, argv);
+    else if (strcmp(argv[0], "put") == 0)     platform_put_cmd(argc, argv);
+    else if (strcmp(argv[0], "get") == 0)     platform_get_cmd(argc, argv);
+    else if (strcmp(argv[0], "screenshot") == 0) cmd_screenshot(argc, argv);
+    else if (strcmp(argv[0], "touch") == 0)   platform_touch_cmd(argc, argv);
+    else if (strcmp(argv[0], "clear") == 0)   serial_puts("\033[2J\033[H");
+    else {
+        serial_puts("Unknown: ");
+        serial_puts(argv[0]);
+        serial_puts("\n");
+    }
+}
+
+/* ── Pipes and redirection ──────────────────────────────────────
+ *
+ * As x86's shell: `a | b | c` runs the stages in turn, each one's output
+ * captured (console_capture: only this task's, so other tasks' logs stay on
+ * the console) and handed to the next as its input; `> file` and `>> file`
+ * capture a command's output into a file, `< file` makes a file its input.
+ * cat, head, tail, grep, wc and the apps' read(0) take that input.
+ */
+
+#define PIPE_STAGES 8
+/* A command's output goes to high memory: 256 MB (the phone's models fit),
+ * or 16 MB where there's less (virt) */
+static int capture_open(struct capture *c)
+{
+    static const uint32_t sizes[] = { 256U << 20, 16U << 20 };
+    for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        c->buf = mem_alloc_aligned_high(sizes[i], 4096);
+        if (c->buf) {
+            c->max = sizes[i];
+            return 0;
+        }
+    }
+    err_puts("shell: out of memory\n", "", "");
+    return -1;
+}
+
+static void capture_close(struct capture *c)
+{
+    if (c->buf)
+        mem_free_pages(c->buf, c->max / 4096);
+    c->buf = NULL;
+}
+
+static void capture_too_big(const char *what, const struct capture *c)
+{
+    void (*fn)(char) = console_capture(NULL);
+    serial_puts("shell: ");
+    serial_puts(what);
+    serial_puts(" went over ");
+    serial_putdec(c->max >> 20);
+    serial_puts(" MB, cut short\n");
+    console_capture(fn);
+}
+
+static void run_command(char *seg)
+{
+    char *argv[MAX_ARGS];
+    int argc = parse_args(seg, argv);
+    const char *out = NULL, *in = NULL;
+    int append = 0, n = 0;
+    for (int i = 0; i < argc; i++) {
+        char *a = argv[i];
+        if (!arg_quoted[i] && (a[0] == '>' || a[0] == '<')) {
+            int is_out = a[0] == '>';
+            int twice = is_out && a[1] == '>';
+            const char *target = a + 1 + twice;
+            if (!*target)
+                target = i + 1 < argc ? argv[++i] : "";
+            if (!*target) {
+                err_puts("shell: a redirection without a file\n", "", "");
+                return;
+            }
+            if (is_out) {
+                out = target;
+                append = twice;
+            } else {
+                in = target;
+            }
+        } else {
+            argv[n++] = a;
+        }
+    }
+    argc = n;
+    if ((in || out) && !need_fs("shell"))
+        return;
+
+    /* < file: the whole file as the command's input */
+    struct input saved_in = stdin_in;
+    const char *in_data = NULL;
+    uint64_t in_size = 0, in_pages = 0;
+    if (in) {
+        if (text_of("shell", in, &in_data, &in_size, &in_pages) < 0)
+            return;
+        stdin_in.data = in_data;
+        stdin_in.len = in_size;
+        stdin_in.pos = 0;
+        stdin_in.set = 1;
+    }
+
+    /* > file: the output captured, then written */
+    struct capture c = { 0 }, *saved_cap = cap;
+    void (*saved_fn)(char) = NULL;
+    if (out) {
+        if (capture_open(&c) < 0)
+            goto done;
+        cap = &c;
+        saved_fn = console_capture(capture_char);
+    }
+    if (argc)
+        dispatch(argc, argv);
+    if (out) {
+        console_capture(saved_fn);
+        cap = saved_cap;
+        void *f = append ? fs_find(out) : NULL;
+        int rc = f ? (osfs3_write(f, osfs3_file_size(f), c.buf, c.len) < 0 ||
+                      osfs3_sync() < 0 ? -1 : 0)
+                   : fs_write_file(out, c.buf, c.len);
+        if (rc < 0)
+            say_err("shell", out, "can't write it");
+        else if (c.overflow)
+            capture_too_big(out, &c);
+        capture_close(&c);
+    }
+done:
+    if (in_pages)
+        mem_free_pages((void *)in_data, in_pages);
+    stdin_in = saved_in;
+}
+
+/* A typed line: split at the '|'s outside quotes, the stages run in turn */
+static void run_line(char *line)
+{
+    char *seg[PIPE_STAGES];
+    int n = 1;
+    char q = 0;
+    seg[0] = line;
+    for (char *p = line; *p; p++) {
+        if (q) {
+            if (*p == q)
+                q = 0;
+        } else if (*p == '\'' || *p == '"') {
+            q = *p;
+        } else if (*p == '|') {
+            if (n == PIPE_STAGES) {
+                err_puts("shell: at most 8 stages in a pipe\n", "", "");
+                return;
+            }
+            *p = 0;
+            seg[n++] = p + 1;
+        }
+    }
+    if (n == 1) {
+        run_command(line);
+        return;
+    }
+    struct capture prev = { 0 };
+    for (int i = 0; i < n; i++) {
+        if (i > 0) {
+            stdin_in.data = prev.buf;
+            stdin_in.len = prev.len;
+            stdin_in.pos = 0;
+            stdin_in.set = 1;
+        }
+        if (i == n - 1) {
+            run_command(seg[i]);
+            break;
+        }
+        struct capture c = { 0 };
+        if (capture_open(&c) < 0)
+            break;
+        struct capture *saved_cap = cap;
+        cap = &c;
+        void (*saved_fn)(char) = console_capture(capture_char);
+        run_command(seg[i]);
+        console_capture(saved_fn);
+        cap = saved_cap;
+        capture_close(&prev);
+        prev = c;
+        if (c.overflow) {
+            capture_too_big("a stage's output", &c);
+            break;
+        }
+    }
+    stdin_in.set = 0;
+    capture_close(&prev);
+}
+
+/* ── Tab completion (term.c asks) ─────────────────────────────── */
+
+static const char *const command_names[] = {
+    "beep", "burn", "cat", "cd", "chat", "clear", "cp", "cpubench", "cpufreq",
+    "cpus", "desktop", "df", "dmesg", "echo", "exec", "get", "grep", "halt",
+    "head", "help", "hexdump", "history", "https", "keys", "kload", "llm", "ls",
+    "mem", "mkdir", "model", "mv", "net", "ping", "pmic", "ps", "put", "pwd",
+    "reboot", "resolve", "rm", "rmdir", "rpmh", "screen", "screenshot", "tail",
+    "temp", "touch", "ufs", "uname", "uptime", "wc", 0
+};
+
+static struct {
+    const char *prefix;
+    int plen, count, clen, listing;
+    char common[FS_PATH_MAX];
+} cpl;
+
+/* A candidate: a directory continues with '/', anything else with ' ' */
+static void cpl_offer(const char *name, bool dir)
+{
+    int n = (int)strlen(name);
+    if (n < cpl.plen || strncmp(name, cpl.prefix, cpl.plen) != 0 || n + 2 > FS_PATH_MAX)
+        return;
+    if (cpl.listing) {
+        serial_puts(name);
+        serial_puts(dir ? "/  " : "  ");
+        return;
+    }
+    if (cpl.count++ == 0) {
+        strcpy(cpl.common, name);
+        cpl.common[n] = dir ? '/' : ' ';
+        cpl.common[n + 1] = 0;
+        cpl.clen = n + 1;
+        return;
+    }
+    int k = 0;
+    while (k < cpl.clen && k < n && cpl.common[k] == name[k])
+        k++;
+    if (k == n && k < cpl.clen && cpl.common[k] == (dir ? '/' : ' '))
+        k++;
+    cpl.clen = k;
+    cpl.common[k] = 0;
+}
+
+static void cpl_offer_all(bool commands, const char *dir)
+{
+    if (commands) {
+        for (int i = 0; command_names[i]; i++)
+            cpl_offer(command_names[i], false);
+        return;
+    }
+    osfs3_dir_cursor_t cur;
+    static char name[OSFS3_NAME_MAX + 1];
+    bool is_dir;
+    if (osfs3_dir_cursor_open_ci(dir, &cur) < 0)
+        return;
+    while (osfs3_dir_cursor_next(&cur, name, sizeof(name), &is_dir, NULL, NULL) == 1)
+        cpl_offer(name, is_dir);
+}
+
+int shell_complete(const char *word, int len, int first, char *add, int add_max)
+{
+    static char w[FS_PATH_MAX], dir[FS_PATH_MAX];
+    add[0] = 0;
+    if (len >= FS_PATH_MAX)
+        return 0;
+    memcpy(w, word, (size_t)len);
+    w[len] = 0;
+    int slash = -1;
+    for (int i = 0; i < len; i++)
+        if (w[i] == '/')
+            slash = i;
+    bool commands = first && slash < 0;
+    if (!commands) {
+        if (!osfs3_is_mounted())
+            return 0;
+        char d[FS_PATH_MAX];
+        if (slash < 0) {
+            strcpy(d, ".");
+        } else {
+            memcpy(d, w, slash ? (size_t)slash : 1);    /* "/x": the root */
+            d[slash ? slash : 1] = 0;
+        }
+        if (fs_path(d, dir) < 0)
+            return 0;
+    }
+    cpl.prefix = w + slash + 1;
+    cpl.plen = (int)strlen(cpl.prefix);
+    cpl.count = 0;
+    cpl.listing = 0;
+    cpl_offer_all(commands, dir);
+    int extra = cpl.clen - cpl.plen;
+    if (cpl.count && extra > 0 && extra < add_max) {
+        memcpy(add, cpl.common + cpl.plen, (size_t)extra);
+        add[extra] = 0;
+    } else if (cpl.count > 1) {
+        serial_puts("\n");
+        cpl.listing = 1;
+        cpl_offer_all(commands, dir);
+        serial_puts("\n");
+    }
+    return cpl.count;
+}
+
 void shell_run(void)
 {
-    char buf[256];
-    char *argv[MAX_ARGS];
+    static char buf[256];
 
     serial_puts("\nOsitoK shell ready. Type 'help' for commands.\n\n");
 
     for (;;) {
-        int len = term_readline("shell> ", buf, sizeof(buf));
-        if (len == 0) continue;
-
-        int argc = parse_args(buf, argv);
-        if (argc == 0) continue;
-
-        if      (strcmp(argv[0], "help") == 0)    cmd_help();
-        else if (strcmp(argv[0], "ps") == 0)      cmd_ps();
-        else if (strcmp(argv[0], "mem") == 0)     cmd_mem();
-        else if (strcmp(argv[0], "uname") == 0)   cmd_uname();
-        else if (strcmp(argv[0], "uptime") == 0)  cmd_uptime();
-        else if (strcmp(argv[0], "kload") == 0)   platform_kload();
-        else if (strcmp(argv[0], "dmesg") == 0)   klog_dump();
-        else if (strcmp(argv[0], "ls") == 0)      cmd_ls(argc, argv);
-        else if (strcmp(argv[0], "cat") == 0)    cmd_cat(argc, argv);
-        else if (strcmp(argv[0], "pwd") == 0)    cmd_pwd();
-        else if (strcmp(argv[0], "cd") == 0)     cmd_cd(argc, argv);
-        else if (strcmp(argv[0], "mkdir") == 0 || strcmp(argv[0], "rmdir") == 0 ||
-                 strcmp(argv[0], "rm") == 0)     cmd_path_op(argc, argv);
-        else if (strcmp(argv[0], "mv") == 0)     cmd_mv(argc, argv);
-        else if (strcmp(argv[0], "exec") == 0) {
-            if (argc < 2) serial_puts("Usage: exec <filename> [args...]\n");
-            else proc_run(argv[1], argc - 1, argv + 1);
-        }
-        else if (strcmp(argv[0], "ping") == 0) {
-            if (argc < 2) { serial_puts("Usage: ping <ip>\n"); }
-            else {
-                uint8_t ip[4] = {0};
-                /* Simple IP parser: a.b.c.d */
-                const char *p = argv[1];
-                for (int i = 0; i < 4 && *p; i++) {
-                    uint32_t v = 0;
-                    while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
-                    ip[i] = (uint8_t)v;
-                    if (*p == '.') p++;
-                }
-                serial_puts("PING ");
-                serial_puts(argv[1]);
-                serial_puts("\n");
-                /* Four echoes, a second each. The first may go to ARP:
-                 * net.c drops a packet whose next hop isn't resolved yet. */
-                extern uint32_t net_icmp_get_rx_count(void);
-                net_hold();
-                for (uint16_t seq = 1; seq <= 4; seq++) {
-                    uint32_t before = net_icmp_get_rx_count();
-                    uint64_t t0 = timer_ms(), t = 0;
-                    net_icmp_send_echo(ip, seq);
-                    while (net_icmp_get_rx_count() == before && (t = timer_ms() - t0) < 1000) {
-                        net_poll();
-                        task_yield();
-                    }
-                    serial_puts(net_icmp_get_rx_count() != before ? "  reply, " : "  timeout\n");
-                    if (net_icmp_get_rx_count() != before) {
-                        serial_putdec(t);
-                        serial_puts(" ms\n");
-                    }
-                }
-                net_release();
-            }
-        }
-        else if (strcmp(argv[0], "cpus") == 0) {
-            smp_print_cpus();
-        }
-        else if (strcmp(argv[0], "cpubench") == 0 && argc > 1 &&
-                 strcmp(argv[1], "mix") == 0) {
-            smp_bench_mix();
-        }
-        else if (strcmp(argv[0], "cpubench") == 0) {
-            int any = argc > 1 && strcmp(argv[1], "any") == 0;
-            int count = 0;
-            for (const char *p = argc > 2 ? argv[2] : ""; *p >= '0' && *p <= '9'; p++)
-                count = count * 10 + (*p - '0');
-            smp_bench(any, count);
-        }
-        else if (strcmp(argv[0], "cpufreq") == 0) {
-            platform_cpufreq_cmd(argc, argv);
-        }
-        else if (strcmp(argv[0], "temp") == 0) {
-            platform_temp_cmd(argc, argv);
-        }
-        else if (strcmp(argv[0], "burn") == 0) {
-            int cpu = -1, secs = 0;
-            if (argc == 3 && strcmp(argv[1], "all") != 0) {
-                cpu = 0;
-                for (const char *p = argv[1]; *p >= '0' && *p <= '9'; p++)
-                    cpu = cpu * 10 + (*p - '0');
-            }
-            for (const char *p = argc == 3 ? argv[2] : ""; *p >= '0' && *p <= '9'; p++)
-                secs = secs * 10 + (*p - '0');
-            if (argc != 3 || secs <= 0 || cpu >= MAX_CPUS)
-                serial_puts("usage: burn <cpu|all> <seconds>\n");
-            else
-                smp_burn(cpu, secs);
-        }
-        else if (strcmp(argv[0], "svctest") == 0) {
-            /* Inline SVC test — no ELF loading */
-            serial_puts("[TEST] Calling SVC write...\n");
-            const char *msg = "SVC write works!\n";
-            register uint64_t x0 __asm__("x0") = 1;        /* fd */
-            register uint64_t x1 __asm__("x1") = (uint64_t)msg;
-            register uint64_t x2 __asm__("x2") = 17;       /* len */
-            register uint64_t x8 __asm__("x8") = 64;       /* SYS_write */
-            __asm__ volatile("svc #0" : "+r"(x0)
-                             : "r"(x1), "r"(x2), "r"(x8)
-                             : "memory");
-            serial_puts("[TEST] SVC returned, x0=");
-            serial_putdec(x0);
-            serial_puts("\n");
-        }
-        else if (strcmp(argv[0], "echo") == 0)    cmd_echo(argc, argv);
-        else if (strcmp(argv[0], "hexdump") == 0) cmd_hexdump(argc, argv);
-        else if (strcmp(argv[0], "df") == 0)      cmd_df();
-        else if (strcmp(argv[0], "halt") == 0)    cmd_halt();
-        else if (strcmp(argv[0], "resolve") == 0) cmd_resolve(argc, argv);
-        else if (strcmp(argv[0], "net") == 0)     platform_net_cmd(argc, argv);
-        else if (strcmp(argv[0], "https") == 0)   cmd_https(argc, argv);
-        else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
-        else if (strcmp(argv[0], "desktop") == 0) cmd_desktop(argc, argv);
-        else if (strcmp(argv[0], "model") == 0)   cmd_model(argc, argv);
-        else if (strcmp(argv[0], "chat") == 0)    cmd_chat(argc, argv);
-        else if (strcmp(argv[0], "llm") == 0)     cmd_llm(argc, argv);
-        else if (strcmp(argv[0], "reboot") == 0) {
-            if (argc > 1 && strcmp(argv[1], "bootloader") == 0)
-                platform_reboot_bootloader();
-            else
-                platform_reboot();
-        }
-        else if (strcmp(argv[0], "pmic") == 0)    platform_pmic_cmd(argc, argv);
-        else if (strcmp(argv[0], "rpmh") == 0)    platform_rpmh_cmd(argc, argv);
-        else if (strcmp(argv[0], "keys") == 0)    platform_keys_cmd(argc, argv);
-        else if (strcmp(argv[0], "screen") == 0)  platform_screen_cmd(argc, argv);
-        else if (strcmp(argv[0], "ufs") == 0)     platform_ufs_cmd(argc, argv);
-        else if (strcmp(argv[0], "put") == 0)     platform_put_cmd(argc, argv);
-        else if (strcmp(argv[0], "get") == 0)     platform_get_cmd(argc, argv);
-        else if (strcmp(argv[0], "screenshot") == 0) cmd_screenshot(argc, argv);
-        else if (strcmp(argv[0], "touch") == 0)   platform_touch_cmd(argc, argv);
-        else if (strcmp(argv[0], "clear") == 0)   serial_puts("\033[2J\033[H");
-        else {
-            serial_puts("Unknown: ");
-            serial_puts(argv[0]);
-            serial_puts("\n");
-        }
+        if (term_readline("shell> ", buf, sizeof(buf)) > 0)
+            run_line(buf);
     }
 }

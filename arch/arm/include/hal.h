@@ -78,6 +78,13 @@ void     console_unlock(uint64_t flags);
 /* While on, console output still reaches the screen and the log but not
  * the host: a binary transfer (`get`) owns that link */
 void     console_host_hold(int on);
+/* What the calling task prints goes to fn, without the console's '\r's,
+ * instead of anywhere else (shell redirection and pipes); NULL ends it.
+ * Other tasks' output is unaffected. Returns the previous fn. */
+void   (*console_capture(void (*fn)(char c)))(char c);
+/* The shell's piped or redirected input (`|`, `<`): up to n bytes, 0 at its
+ * end, or -1 when the command has none */
+int      shell_stdin_read(char *buf, int n);
 
 /* ========================================================================
  * Framebuffer
@@ -269,5 +276,12 @@ void shell_run(void);
  * ======================================================================== */
 void term_init(void);
 int  term_readline(const char *prompt, char *buf, int bufsize);
+void term_history_print(void);      /* shell `history` */
+void term_history_clear(void);
+/* Tab, with the word before the cursor (the first word: a command name):
+ * how many names it could complete to, and in `add` (NUL-terminated) what
+ * they all continue it with. With several and nothing to add, the shell
+ * prints them. (kernel/shell.c) */
+int  shell_complete(const char *word, int len, int first, char *add, int add_max);
 
 #endif /* OSITO_ARM_HAL_H */

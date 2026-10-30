@@ -157,7 +157,11 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
     if (fd == 0) {
-        /* stdin: a line from the console, echoed, with backspace. A wait
+        /* stdin: the shell's pipe or `<` file if the command has one */
+        int piped = shell_stdin_read((char *)buf, count > 0x7FFFFFFF ? 0x7FFFFFFF : (int)count);
+        if (piped >= 0)
+            return piped;
+        /* Else a line from the console, echoed, with backspace. A wait
          * that can last: IRQs on meanwhile (the SVC came in with them off),
          * or the tick, and every task sleeping on it, would stop. */
         char *dst = (char *)buf;

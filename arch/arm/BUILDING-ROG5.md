@@ -563,7 +563,7 @@ same way.
     `console_host_hold` (`kernel/serial.c`) keeps their output on the screen
     and in the log, but off the USB link, so it can't land inside the binary
     data.
-  - It runs at ~3 MB/s: 92 MB in 30 s, over COM3 or COM4 alike.
+  - It runs at ~8.5 MB/s: 92 MB in 10.8 s, over COM3 or COM4 alike.
   - The phone reads the whole file before the header, so the script waits up
     to 2 min for it, then 5 s per read.
   - If the host closes the port, the phone stops sending. Before, the rest
@@ -576,6 +576,51 @@ same way.
     the BMP and saves a PNG, all in ~4 s. The console comes out at ~80 KB as
     a PNG, the desktop at ~150 KB.
 - **Apps:** `exec <path> [args]` runs a program stored there (see "Apps").
+- **Speed:** `part_io` copies to and from the UFS DMA window (uncached) 64
+  bytes a turn, with the eight loads ahead of the stores.
+  - It had used `memcpy`, a load at a time, and the in-order A55 the shell
+    runs on waited out each uncached load. Reading 92 MB from the shell took
+    20 s.
+  - Now 92 MB reads in ~2 s from the shell and in 0.26 s from the X1
+    (`model`). `cp` of 92 MB takes 2.2 s.
+
+---
+
+## Shell
+
+`kernel/shell.c` and `kernel/term.c` work like x86's shell.
+- **Pipes:** `a | b | c` (up to 8 stages) runs the stages in turn.
+  - Each stage's output is captured and becomes the next one's input.
+  - The capture is 256 MB of high memory, or 16 MB where there's less (virt).
+- **Redirection:** `> file` and `>> file` capture a command's output into a
+  file, and `< file` makes a file its input. `> file` alone makes an empty
+  file. Quotes (`'...'`, `"..."`) keep spaces, `|`, `<` and `>` as text.
+- **Capture:** `console_capture` (`kernel/serial.c`) sends what the *shell
+  task* prints to the capture. Other tasks' output (logs, the network) stays
+  on the console.
+  - Errors go through `err_puts`, which skips the capture as stderr would:
+    `cat nope | wc` prints the error and counts nothing.
+  - `dmesg` replays the log through the capture too.
+- **Input:** a pipe or `<` feeds `cat` (with no file), `head`, `tail`, `grep`
+  and `wc`, and the apps' `read(0)`. `exec guess.elf < nums.txt` plays the
+  game from a file.
+- **Commands:**
+  - `cp` (into a directory, too).
+  - `head`/`tail [-n N]`.
+  - `grep [-i] [-v] [-c]`, which matches text, not regular expressions.
+  - `wc`.
+  - `history [clear]`.
+  - `cat` takes several files.
+  - There's no file `touch`, because `touch` is the touchscreen.
+- **Line editing:**
+  - Left/Right, Home/End, Delete, and Ctrl+A/E/U/K/W/D.
+  - Up/Down step through 32 lines of history.
+  - Tab completes command names (the first word of a line or of a pipe
+    stage) and paths, through the v3 directory cursor. Several matches are
+    listed.
+  - Escape sequences may arrive up to 100 ms apart.
+  - The editor moves the cursor with `\b` and rewrites text, which the
+    screen console follows too, since it knows no escape sequences.
 
 ---
 
@@ -1119,6 +1164,13 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     - Once flushes worked, QEMU synced the image file for them, which on
       Windows outlasted the driver's fixed 10M-iteration wait. The wait is
       now 5 s by the generic timer.
+32. **A Unix-like shell, and UFS at speed (2026-10-30).** See "Shell".
+    - The shell gained pipes, redirection, filters, `cp`, history and Tab
+      completion.
+    - Timing `wc` of a model showed reads from the shell's A55 at ~4 MB/s.
+      The cause was copying out of the uncached DMA window a load at a time.
+      With overlapped loads, 92 MB reads in ~2 s, a model loads in 0.26 s
+      instead of 1.5 s, and `get` runs at 8.5 MB/s instead of 3.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1658,6 +1710,7 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/ufs.c` | UFS host controller: LUNs, GPT, block dumps; writes only into `userdata` (OsitoFS v3: `mkfs`, `mount`, `migrate`) |
 | `arch/arm/fs/ositofs3.c` | OsitoFS v3 (x86's driver, ported): directories, extents, in-kernel `osfs3_format` |
 | `arch/arm/kernel/fs.c` | The shell's current directory; paths made absolute for v3 |
+| `arch/arm/kernel/shell.c`, `term.c` | The shell: commands, pipes and redirection, Tab completion; the line editor and history |
 | `arch/arm/scripts/rog5-put.ps1` | Host side of `put`: copy a file onto the phone's OsitoFS |
 | `arch/arm/scripts/rog5-get.ps1` | Host side of `get`: copy a file from the phone's OsitoFS |
 | `arch/arm/scripts/rog5-screenshot.ps1` | `screenshot` on the phone, then the BMP fetched and saved as a PNG |

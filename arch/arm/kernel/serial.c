@@ -6,6 +6,7 @@
 
 #include "../include/hal.h"
 #include "../include/spinlock.h"
+#include "task.h"
 
 /* Kernel log: the last KLOG_SIZE bytes of console output, for `dmesg` and
  * the screen's history view (console_scroll). On SM8350 the boot messages
@@ -16,6 +17,10 @@ static char klog[KLOG_SIZE];
 static uint32_t klog_total;         /* bytes ever logged; wraps the ring */
 static int klog_muted;
 static volatile int host_held;      /* console_host_hold */
+
+/* console_capture: what one task prints goes to a function instead */
+static void (*capture_fn)(char c);
+static void *capture_task;
 
 static void out_raw(char c)
 {
@@ -29,6 +34,11 @@ static void out_raw(char c)
  * stalls, the screen still shows the text. */
 static void out(char c)
 {
+    if (capture_fn && current_task == capture_task) {
+        if (c != '\r')              /* the '\n' -> "\r\n" is the console's */
+            capture_fn(c);
+        return;
+    }
     if (!klog_muted)
         klog[klog_total++ % KLOG_SIZE] = c;
     out_raw(c);
@@ -74,6 +84,16 @@ void console_host_hold(int on)
     console_unlock(flags);
 }
 
+void (*console_capture(void (*fn)(char c)))(char c)
+{
+    uint64_t flags = console_lock();
+    void (*prev)(char c) = capture_fn;
+    capture_fn = fn;
+    capture_task = fn ? (void *)current_task : (void *)0;
+    console_unlock(flags);
+    return prev;
+}
+
 /* Replay the log; muted so the replay doesn't log itself over the ring */
 void klog_dump(void)
 {
@@ -81,8 +101,14 @@ void klog_dump(void)
     uint32_t end = klog_total;
     uint32_t start = end > KLOG_SIZE ? end - KLOG_SIZE : 0;
     klog_muted = 1;
-    for (uint32_t i = start; i < end; i++)
-        out_raw(klog[i % KLOG_SIZE]);
+    int captured = capture_fn && current_task == capture_task;
+    for (uint32_t i = start; i < end; i++) {
+        char c = klog[i % KLOG_SIZE];
+        if (!captured)
+            out_raw(c);
+        else if (c != '\r')
+            capture_fn(c);              /* `dmesg | grep ...` */
+    }
     klog_muted = 0;
     console_unlock(flags);
 }

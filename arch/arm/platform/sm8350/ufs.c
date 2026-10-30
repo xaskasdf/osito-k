@@ -567,6 +567,28 @@ static int ufs_attach(void)
 
 /* Bytes from userdata's start, through data[] in commands of up to 16
  * blocks. A write that covers a block only partly reads it first. */
+/* To or from the DMA window, which is uncached: 64 bytes a turn, the eight
+ * loads before the stores, so an in-order A55 overlaps them. memcpy's byte
+ * loads made a 92 MB read take 20 s from the shell's A55 (0.35 s from the
+ * X1, which overlaps them itself). */
+static void dma_copy(uint8_t *dst, const uint8_t *src, uint64_t n)
+{
+    if ((((uintptr_t)dst | (uintptr_t)src) & 7) == 0) {
+        const uint64_t *s = (const uint64_t *)src;
+        uint64_t *d = (uint64_t *)dst;
+        for (; n >= 64; n -= 64, s += 8, d += 8) {
+            uint64_t w0 = s[0], w1 = s[1], w2 = s[2], w3 = s[3];
+            uint64_t w4 = s[4], w5 = s[5], w6 = s[6], w7 = s[7];
+            d[0] = w0; d[1] = w1; d[2] = w2; d[3] = w3;
+            d[4] = w4; d[5] = w5; d[6] = w6; d[7] = w7;
+        }
+        dst = (uint8_t *)d;
+        src = (const uint8_t *)s;
+    }
+    while (n--)
+        *dst++ = *src++;
+}
+
 static int part_io(uint64_t off, uint8_t *buf, uint64_t len, int write)
 {
     uint64_t size = (uint64_t)rw_blocks * rw_bsize;
@@ -587,11 +609,11 @@ static int part_io(uint64_t off, uint8_t *buf, uint64_t len, int write)
                 return -1;
         }
         if (write) {
-            memcpy((uint8_t *)data + skip, buf, span);
+            dma_copy((uint8_t *)data + skip, buf, span);
             if (rw_blocks_io(RW_LUN, lba, (uint32_t)nblk, bs, 1))
                 return -1;
         } else {
-            memcpy(buf, (const uint8_t *)data + skip, span);
+            dma_copy(buf, (const uint8_t *)data + skip, span);
         }
         off += span;
         buf += span;
