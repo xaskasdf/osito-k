@@ -42,6 +42,7 @@ typedef struct {
     int         tcp_conn;
     bool        connected;
     bool        use_tls13;      /* kernel/tls13.c's one connection */
+    bool        plain;          /* http_open_plain: no TLS */
 } http_session_t;
 
 /* ── HTTP API ───────────────────────────────────────────────── */
@@ -50,6 +51,11 @@ typedef struct {
  * Performs DNS + TCP + TLS handshake.
  * Returns 0 on success, -1 on failure. */
 int http_open(http_session_t *s, const char *hostname);
+
+/* Open plain HTTP to host:port, for what carries its own signature (CRLs:
+ * revocation.c). It may run inside another session's TLS handshake: that
+ * one has sent no request yet, so the static buffers here are free. */
+int http_open_plain(http_session_t *s, const char *hostname, uint16_t port);
 
 /* Send HTTP request and receive response headers.
  * method: "GET" or "POST"

@@ -24,6 +24,13 @@ typedef struct {
 int tls_verify_chain(const uint8_t *const *certs, const uint32_t *lens, int n,
                      const char *host, tls_pubkey_t *leaf);
 
+/* Revocation (kernel/revocation.c). After tls_verify_chain, note what the
+ * check needs from the chain; once the handshake is done, before any data,
+ * check: -1 if the leaf's CRL lists it, else 0, also when its CRL can't be
+ * fetched or checked. */
+void tls_revocation_note(const uint8_t *const *certs, const uint32_t *lens, int n);
+int  tls_revocation_check(void);
+
 /* A TLS SignatureScheme (RFC 8446 4.2.3) over msg by `key`: ECDSA
  * (0x0403, 0x0503, 0x0603), RSA-PSS (0x0804-0x0806) and, for TLS 1.2,
  * RSA PKCS#1 v1.5 (0x0401, 0x0501, 0x0601). 0 if it checks out. */

@@ -4,7 +4,8 @@
  * Minimal TLS 1.2 with ECDHE (X25519) and AES-128-GCM-SHA256, the server's
  * certificate RSA (0xC02F) or ECDSA (0xC02B): the fallback for servers
  * without TLS 1.3 (http.c). The server is authenticated: its chain must
- * verify for the host name (tls_verify_chain), its ServerKeyExchange must
+ * verify for the host name (tls_verify_chain) and its CRL mustn't list the
+ * leaf (tls_revocation_check, after the handshake), its ServerKeyExchange must
  * carry the leaf key's signature over both randoms and the key, and its
  * Finished must match. Handshake messages are reassembled across records.
  * No session resumption. No client certs. No renegotiation.
@@ -431,7 +432,10 @@ static int verify_certificate(tls_conn_t *tls, const uint8_t *data, uint32_t len
         lens[n++] = cl;
         pos += cl;
     }
-    return tls_verify_chain(certs, lens, n, hostname, &tls->leaf);
+    if (tls_verify_chain(certs, lens, n, hostname, &tls->leaf) < 0)
+        return -1;
+    tls_revocation_note(certs, lens, n);
+    return 0;
 }
 
 /* Parse ServerKeyExchange — extract ECDHE public key */
@@ -764,8 +768,6 @@ static int tls_process_server_handshake(tls_conn_t *tls, const char *hostname)
         }
         serial_puts("[TLS] Server Finished verified OK\n");
     }
-
-    serial_puts("[TLS] Handshake complete: TLS 1.2, server authenticated\n");
     return 0;
 }
 
@@ -800,6 +802,13 @@ int tls_connect(tls_conn_t *tls, int tcp_conn, const char *hostname)
         return -1;
     }
 
+    /* Revocation last, before any data: the CRL may take a while */
+    if (tls_revocation_check() < 0) {
+        tls_close(tls);
+        tls->state = TLS_STATE_ERROR;
+        return -1;
+    }
+    serial_puts("[TLS] Handshake complete: TLS 1.2, server authenticated\n");
     return 0;
 }
 

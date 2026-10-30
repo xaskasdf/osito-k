@@ -19,6 +19,9 @@ extern int  ntp_is_synced(void);
 extern int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
 extern int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
                             uint16_t src_port);
+extern int  net_tcp_send(int conn, const void *data, uint32_t len);
+extern int  net_tcp_recv_timeout(int conn, void *buf, uint32_t size,
+                                 uint32_t timeout_ticks);
 extern void net_tcp_close(int conn);
 
 /* ── Helpers ─────────────────────────────────────────────────── */
@@ -155,25 +158,49 @@ int http_open(http_session_t *s, const char *hostname)
     return 0;
 }
 
+int http_open_plain(http_session_t *s, const char *hostname, uint16_t port)
+{
+    hmemset(s, 0, sizeof(*s));
+    uint8_t ip[4];
+    if (net_dns_resolve(hostname, ip) < 0) {
+        serial_puts("[HTTP] DNS failed for ");
+        serial_puts(hostname);
+        serial_puts("\n");
+        return -1;
+    }
+    s->tcp_conn = net_tcp_connect(ip, port, next_port++);
+    if (s->tcp_conn < 0) {
+        serial_puts("[HTTP] TCP connect failed\n");
+        return -1;
+    }
+    s->plain = true;
+    s->connected = true;
+    return 0;
+}
+
 void http_close(http_session_t *s)
 {
     if (!s->connected) return;
     if (s->use_tls13)
         tls13_close();
-    else
+    else if (!s->plain)
         tls_close(&s->tls);
     net_tcp_close(s->tcp_conn);
     s->connected = false;
 }
 
-/* The session's TLS, 1.3 or 1.2 */
+/* The session's TLS, 1.3 or 1.2, or the bare TCP connection */
 static int s_send(http_session_t *s, const void *data, uint32_t len)
 {
+    if (s->plain)
+        return net_tcp_send(s->tcp_conn, data, len);
     return s->use_tls13 ? tls13_send(data, len) : tls_send(&s->tls, data, len);
 }
 
 static int s_recv(http_session_t *s, void *buf, uint32_t cap, uint32_t timeout_ticks)
 {
+    if (s->plain)
+        return net_tcp_recv_timeout(s->tcp_conn, buf, cap, timeout_ticks);
     return s->use_tls13 ? tls13_recv(buf, cap) : tls_recv(&s->tls, buf, cap, timeout_ticks);
 }
 

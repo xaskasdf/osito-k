@@ -59,7 +59,7 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/fs.c kernel/gui_task.c \
             kernel/pci.c kernel/net.c kernel/dhcp.c kernel/ntp.c \
             kernel/crypto.c kernel/random.c kernel/tls.c kernel/http.c kernel/smp.c \
-            kernel/tls13.c kernel/hkdf.c kernel/tls_verify.c kernel/ca_roots.c kernel/ecdh_p256.c \
+            kernel/tls13.c kernel/hkdf.c kernel/tls_verify.c kernel/revocation.c kernel/ca_roots.c kernel/ecdh_p256.c \
             kernel/claude.c kernel/tokenizer.c kernel/tokenizer_trie.c \
             kernel/tensor.c kernel/tensor_neon.c kernel/tensor_sdot.c kernel/tensor_arena.c \
             kernel/inference.c kernel/dispatch.c kernel/llm.c \

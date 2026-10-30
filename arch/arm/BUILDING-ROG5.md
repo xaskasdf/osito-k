@@ -249,9 +249,25 @@ can go through it.
   - the apps' `getrandom` uses it too.
   - Before this, TLS's ECDHE keys came from a xorshift seeded with the
     timer counter: guessable from roughly when the phone booted.
-- **What isn't checked:**
-  - revocation (no OCSP or CRL: `revoked.badssl.com` connects);
-  - ECDHE over P-384 only (`ecc384.badssl.com`'s server).
+- **Revocation (`kernel/revocation.c`):** once the handshake is done, before
+  any data, the leaf's CRL (its CRL Distribution Points, over plain HTTP:
+  `http_open_plain`) is fetched, checked for the issuer's name and
+  signature (the issuer's key read from the chain's second certificate),
+  and searched for the leaf's serial number.
+  - After the handshake, not during it: under QEMU a 200 KB CRL took long
+    enough that badssl.com dropped the half-done handshake. Under QEMU's
+    TCG it still outlasts badssl.com's idle timeout, so the request after a
+    fetch fails there; on the phone a fetch takes about a second.
+  - Only a listed serial stops the handshake. A CRL that can't be fetched or
+    checked is logged and let through, the soft fail browsers use too.
+  - No OCSP: Let's Encrypt's and Google Trust Services' certificates name
+    only CRLs, and the other CAs publish CRLs as well.
+  - CRLs stay in high memory until their nextUpdate, a day at most, four at
+    a time; up to 32 MB each.
+  - Measured: Let's Encrypt's shards are 60–200 KB, Google's a few hundred
+    bytes, Amazon's 2.1 MB (47,616 entries; that request took 3.9 s in all).
+- **What isn't checked:** ECDHE over P-384 only (`ecc384.badssl.com`'s
+  server).
 - **Measured on the phone (2026-10-30):** each request takes 0.6–1.8 s
   (badssl.com is under a different name each time).
 
@@ -261,6 +277,7 @@ can go through it.
   | amazon.com, microsoft.com | TLS 1.3, RSA-PSS |
   | badssl.com, rsa4096.badssl.com | TLS 1.2, RSA PKCS#1, P-256 |
   | The expired, wrong-host, self-signed, untrusted-root and SHA-1-intermediate badssl.com sites | refused, each with its reason |
+  | revoked.badssl.com | refused: its Let's Encrypt CRL lists it |
 
 - **Bugs this turned up, and fixed:**
   - x86's 1.3 client logged its certificate checks but enforced none.
@@ -1300,6 +1317,9 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
       from 20 to 10 ms a token, and its prefill from 276 to 126 ms.
     - The shell gained `;`, `&&`, `||`, wildcards and here documents (see
       "Shell").
+35. **Revocation (2026-10-30).** See "Certificates". HTTPS reads the leaf's
+    CRL and refuses a revoked certificate (`revoked.badssl.com`); CRLs are
+    cached until their nextUpdate.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1831,9 +1851,10 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/touch.c` | FocalTech touchscreen: RPMh supplies, bit-banged I2C, polling task, event queue |
 | `arch/arm/platform/sm8350/ncm.c` | USB networking: NTB16 framing, frame queues, the stack's NIC, `net` task and command |
 | `arch/arm/kernel/dhcp.c` | DHCP client (DISCOVER/OFFER/REQUEST/ACK) |
-| `arch/arm/kernel/http.c` | HTTP/1.1 client: TLS 1.3, else 1.2 (`https`) |
+| `arch/arm/kernel/http.c` | HTTP/1.1 client: TLS 1.3, else 1.2 (`https`); plain HTTP for CRLs |
 | `arch/arm/kernel/tls13.c`, `tls.c` | TLS 1.3 and 1.2 clients that authenticate the server |
 | `arch/arm/kernel/tls_verify.c`, `ca_roots.c` | Certificate chain and signature checks (BearSSL), RSA-PSS; Mozilla's roots |
+| `arch/arm/kernel/revocation.c` | The leaf's CRL: fetched, its issuer and signature checked, searched; a small DER reader |
 | `arch/arm/kernel/random.c`, `platform/sm8350/rng.c` | HMAC-DRBG over the hardware PRNG (`random`) |
 | `arch/arm/kernel/ntp.c` | SNTP: the time of day (`date`) |
 | `arch/arm/lib/bearssl/` | BearSSL 0.6, the subset used (X.509, RSA, ECDSA, SHA-2) |

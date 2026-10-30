@@ -6,7 +6,9 @@
  * no resumption, no client certificate. What x86 only logged is enforced
  * here, and the handshake fails otherwise:
  *  - the server's chain verifies up to one of Mozilla's roots, for the host
- *    name, at NTP's time (tls_verify_chain: BearSSL's X.509 engine);
+ *    name, at NTP's time (tls_verify_chain: BearSSL's X.509 engine), and
+ *    the leaf's CRL doesn't list it (checked once the handshake is done:
+ *    tls_revocation_check);
  *  - its CertificateVerify is a valid signature by the leaf's key over the
  *    transcript (tls_verify_signature);
  *  - its Finished MAC is right.
@@ -410,9 +412,10 @@ static int check_certificate(uint32_t ml, const char *hostname, tls_pubkey_t *le
         m += cl;
         m += 2 + (((uint32_t)m[0] << 8) | m[1]);   /* its extensions */
     }
-    if (m != list_end)
+    if (m != list_end || tls_verify_chain(certs, lens, n, hostname, leaf) < 0)
         return -1;
-    return tls_verify_chain(certs, lens, n, hostname, leaf);
+    tls_revocation_note(certs, lens, n);
+    return 0;
 }
 
 /* CertificateVerify (RFC 8446 4.4.3): the leaf key's signature over 64
@@ -527,6 +530,11 @@ int tls13_connect(int tcp_conn, const char *hostname)
     derive_key_iv(s13.s_ap_traffic, s13.s_ap_key, s13.s_ap_iv);
     s13.c_seq = s13.s_seq = 0;
     s13.active = 1;
+    /* Revocation last, before any data: the CRL may take a while */
+    if (tls_revocation_check() < 0) {
+        tls13_close();
+        return TLS13_AUTH_FAILED;
+    }
     serial_puts("[TLS1.3] handshake complete: TLS_AES_128_GCM_SHA256, server authenticated\n");
     return 0;
 }
