@@ -243,9 +243,7 @@ struct aarch64_context {
     /* NEON state would go here if needed (32 x 16 = 512 bytes) */
 };
 
-/* Stack must be 16-byte aligned (AArch64 ABI).
- * Recommended: 8KB per task (ESP8266 uses 1536B). */
-#define TASK_STACK_SIZE     8192
+/* Stack must be 16-byte aligned (AArch64 ABI); the size is task.h's */
 #define TASK_STACK_ALIGN    16
 
 #endif /* OSITO_AARCH64_H */

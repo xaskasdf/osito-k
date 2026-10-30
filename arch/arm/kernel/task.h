@@ -5,7 +5,11 @@
 #include "../include/hal.h"
 
 #define MAX_TASKS       32      /* includes one idle task per CPU */
-#define TASK_STACK_SIZE 8192
+/* 32 KB: code ported from x86 (net, TLS, HTTP, the LLM) assumes big
+ * stacks, and nothing guards an overflow, which lands in the next task's
+ * stack. At 8 KB, `https` wrote a 16 KB TLS record buffer over its
+ * neighbours and froze the phone (2026-10-30). */
+#define TASK_STACK_SIZE 32768
 
 /* Utilization, sampled each tick: running pushes it toward UTIL_MAX,
  * sleeping toward 0, with a time constant of 2^UTIL_SHIFT ticks (80 ms).

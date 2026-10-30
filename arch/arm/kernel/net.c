@@ -88,7 +88,9 @@ static tcp_listener_t tcp_listeners[TCP_MAX_LISTENERS];
 
 /* ── Network State ───────────────────────────────────────────── */
 
-extern uint64_t timer_get_ticks(void);
+/* Timeouts here count 100 Hz scheduler ticks (x86 IDT ticks); timer_get_ticks
+ * is the 19.2 MHz counter on AArch64 */
+extern uint64_t timer_get_tick_count(void);
 
 static uint8_t our_ip[4];
 static uint8_t our_mac[ETH_ALEN];
@@ -547,9 +549,10 @@ void net_trypoll(void)
 
 void net_poll(void)
 {
-    uint32_t len = 0;
-
-    while (i211_recv(rx_pkt, &len) == 0) {
+    for (;;) {
+        uint32_t len = sizeof(rx_pkt);      /* recv clips the frame to it */
+        if (i211_recv(rx_pkt, &len) != 0)
+            break;
         if (len < ETH_HDR_LEN)
             continue;
 
@@ -828,7 +831,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         tcp_isn_counter  += 64000;
         conn->snd_una     = conn->snd_nxt;
         conn->state       = TCP_SYN_RCVD;
-        conn->last_activity = timer_get_ticks();
+        conn->last_activity = timer_get_tick_count();
 
         /* Send SYN+ACK */
         tcp_send_segment(conn, TCP_SYN | TCP_ACK, NULL, 0);
@@ -844,7 +847,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         return;
     }
 
-    conn->last_activity = timer_get_ticks();
+    conn->last_activity = timer_get_tick_count();
 
     /* RST handling — reset connection */
     if (flags & TCP_RST) {
@@ -1007,8 +1010,8 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
     if (!arp_lookup(nexthop)) {
         arp_send_request(nexthop);
         /* Poll for ARP reply (2s timeout, 200 ticks) */
-        uint64_t arp_start = timer_get_ticks();
-        while (!arp_lookup(nexthop) && (timer_get_ticks() - arp_start) < 200) {
+        uint64_t arp_start = timer_get_tick_count();
+        while (!arp_lookup(nexthop) && (timer_get_tick_count() - arp_start) < 200) {
             net_poll();
             __asm__ volatile ("wfe");
         }
@@ -1032,7 +1035,7 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
     tcp_isn_counter += 64000;  /* Simple ISN increment */
     conn->snd_una = conn->snd_nxt;
     conn->state = TCP_SYN_SENT;
-    conn->last_activity = timer_get_ticks();
+    conn->last_activity = timer_get_tick_count();
 
     serial_puts("[TCP] Connecting to ");
     serial_putdec(dst_ip[0]); serial_puts(".");
@@ -1046,8 +1049,8 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
     tcp_send_segment(conn, TCP_SYN, NULL, 0);
 
     /* Wait for SYN-ACK (5s timeout = 500 ticks at 100Hz) */
-    uint64_t start = timer_get_ticks();
-    while (conn->state == TCP_SYN_SENT && (timer_get_ticks() - start) < 500) {
+    uint64_t start = timer_get_tick_count();
+    while (conn->state == TCP_SYN_SENT && (timer_get_tick_count() - start) < 500) {
         net_poll();
         __asm__ volatile ("wfe");
     }
@@ -1130,9 +1133,9 @@ int net_tcp_recv_timeout(int conn_idx, void *buf, uint32_t buf_size,
     if (conn_idx < 0 || conn_idx >= TCP_MAX_CONNS)
         return -1;
 
-    uint64_t start = timer_get_ticks();
+    uint64_t start = timer_get_tick_count();
 
-    while ((timer_get_ticks() - start) < timeout_ticks) {
+    while ((timer_get_tick_count() - start) < timeout_ticks) {
         net_poll();
 
         int r = net_tcp_recv(conn_idx, buf, buf_size);
@@ -1167,9 +1170,9 @@ void net_tcp_close(int conn_idx)
     }
 
     /* Wait for close to complete (3s = 300 ticks) */
-    uint64_t start = timer_get_ticks();
+    uint64_t start = timer_get_tick_count();
     while (conn->state != TCP_CLOSED && conn->state != TCP_TIME_WAIT &&
-           (timer_get_ticks() - start) < 300) {
+           (timer_get_tick_count() - start) < 300) {
         net_poll();
         __asm__ volatile ("wfe");
     }
@@ -1228,9 +1231,9 @@ int net_tcp_accept(int listener_idx, uint32_t timeout_ticks)
             listener->pending_conn = -1;
     }
 
-    uint64_t start = timer_get_ticks();
+    uint64_t start = timer_get_tick_count();
 
-    while ((timer_get_ticks() - start) < timeout_ticks) {
+    while ((timer_get_tick_count() - start) < timeout_ticks) {
         net_poll();
 
         /* Check if a SYN was received and handshake is completing */
@@ -1267,6 +1270,11 @@ static uint16_t dns_query_id = 0x1234;
 void net_dns_set_server(const uint8_t ip[4])
 {
     memcpy(dns_server, ip, 4);
+}
+
+void net_dns_get_server(uint8_t ip[4])
+{
+    memcpy(ip, dns_server, 4);
 }
 
 /* DNS response handler (registered as UDP listener on port 53) */
@@ -1394,19 +1402,30 @@ int net_dns_resolve(const char *hostname, uint8_t ip_out[4])
     serial_puts(hostname);
     serial_puts("...\n");
 
-    for (int attempt = 0; attempt < 5; attempt++) {
-        if (net_udp_send(dns_server, 53, 10053, query, qlen) == 0)
-            break;
-        /* ARP not resolved yet — poll and retry */
-        net_poll();
-        __asm__ volatile ("wfe");
-    }
-
-    /* Poll for response (3s timeout = 300 ticks) */
-    uint64_t start = timer_get_ticks();
-    while (!dns_got_reply && (timer_get_ticks() - start) < 300) {
-        net_poll();
-        __asm__ volatile ("wfe");
+    /* Three tries of 2 s. A send fails while the next hop's MAC is unknown
+     * (it only sends the ARP request), so each try keeps sending for up to
+     * a second first, waiting up to 200 ms for the ARP answer each time. */
+    for (int attempt = 0; attempt < 3 && !dns_got_reply; attempt++) {
+        uint64_t t0 = timer_ms();
+        int sent = 0;
+        while (!sent && timer_ms() - t0 < 1000) {
+            sent = net_udp_send(dns_server, 53, 10053, query, qlen) == 0;
+            uint64_t t1 = timer_ms();
+            while (!sent && !arp_lookup(arp_nexthop(dns_server)) &&
+                   timer_ms() - t1 < 200) {
+                net_poll();
+                task_yield();
+            }
+        }
+        if (!sent) {
+            serial_puts("[DNS] no ARP answer from the next hop\n");
+            continue;
+        }
+        t0 = timer_ms();
+        while (!dns_got_reply && timer_ms() - t0 < 2000) {
+            net_poll();
+            task_yield();
+        }
     }
 
     if (dns_got_reply) {
@@ -1427,6 +1446,13 @@ int net_dns_resolve(const char *hostname, uint8_t ip_out[4])
 
 void net_udp_listen(uint16_t port, udp_handler_t handler)
 {
+    /* Listening again (each `resolve` does) replaces the handler */
+    for (int i = 0; i < udp_listener_count; i++) {
+        if (udp_listeners[i].port == port) {
+            udp_listeners[i].handler = handler;
+            return;
+        }
+    }
     if (udp_listener_count >= MAX_UDP_LISTENERS) {
         serial_puts("[NET] Too many UDP listeners\n");
         return;

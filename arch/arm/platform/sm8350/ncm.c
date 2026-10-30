@@ -268,8 +268,20 @@ void platform_net_cmd(int argc, char **argv)
         serial_puts("net: serial port only\n");
         return;
     }
-    if (argc != 1) {
-        serial_puts("usage: net [up | down]\n");
+    if (argc == 3 && strcmp(argv[1], "dns") == 0) {
+        uint8_t ip[4] = { 0 };
+        const char *p = argv[2];
+        for (int i = 0; i < 4 && *p; i++) {
+            uint32_t v = 0;
+            while (*p >= '0' && *p <= '9')
+                v = v * 10 + (uint32_t)(*p++ - '0');
+            ip[i] = (uint8_t)v;
+            if (*p == '.')
+                p++;
+        }
+        net_dns_set_server(ip);
+    } else if (argc != 1) {
+        serial_puts("usage: net [up | down | dns <ip>]\n");
         return;
     }
     static const char *const states[] = {
@@ -288,6 +300,10 @@ void platform_net_cmd(int argc, char **argv)
             serial_puts(" gateway ");
             put_ip(gw);
         }
+        uint8_t dns[4];
+        net_dns_get_server(dns);
+        serial_puts(" dns ");
+        put_ip(dns);
     }
     serial_puts("\n  rx ");
     serial_putdec(rx_frames);

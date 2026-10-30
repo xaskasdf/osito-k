@@ -126,7 +126,8 @@ typedef void (*udp_handler_t)(const uint8_t *src_ip, uint16_t src_port,
                               const void *data, uint32_t len);
 
 /* The NIC under the stack; virtio-net unless net_set_nic is called first.
- * recv returns 0 with a frame in buf. */
+ * recv returns 0 with a frame in buf; *len is buf's size going in and the
+ * frame's length coming out. */
 typedef struct {
     void (*get_mac)(uint8_t mac[6]);
     int  (*send)(const void *frame, uint32_t len);
@@ -206,5 +207,6 @@ int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
 
 /* Set DNS server IP (default: 10.0.2.3 for QEMU SLIRP) */
 void net_dns_set_server(const uint8_t ip[4]);
+void net_dns_get_server(uint8_t ip[4]);
 
 #endif /* OSITOK_NET_H */

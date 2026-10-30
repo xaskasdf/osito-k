@@ -190,6 +190,43 @@ in the background. `spin_trylock` is new in `include/spinlock.h`.
   has a 169.254 address and an equal-metric route.
 - Windows put the network in the Public category.
 
+### Internet and HTTPS
+
+With Internet Connection Sharing on (the PC's internet adapter shared with
+"naranjositos Osito-K"), Windows answers DHCP with 192.168.137.x, gateway and
+DNS 192.168.137.1. DHCP logs the DNS server it got, `net` shows it, and
+`net dns <ip>` replaces it. Then:
+- `ping 1.1.1.1` gets 6–8 ms, and `resolve` works.
+- `https <host> [path]` runs a GET through `http.c` and `tls.c` (x86's, ported).
+  It prints the status and the first 600 bytes of the body.
+- The TLS client is the old 1.2 one: ECDHE-RSA-AES128-GCM, with the
+  **certificate not verified**. Don't send secrets (an API key) through it
+  until x86's TLS 1.3 / X.509 stack is ported.
+- Measured (2026-10-30): example.com and `www.google.com/robots.txt` answered
+  200, three times in a row.
+
+Three bugs in the ported stack stood in the way:
+- **Timeouts.** `net.c` and `tls.c` count x86's 100 Hz ticks, but they read
+  `timer_get_ticks()`, which on AArch64 is the 19.2 MHz counter. A "5 s" TCP
+  connect lasted 26 µs. They now read `timer_get_tick_count()`, the
+  scheduler's 100 Hz count.
+- **Stacks.** Task stacks were 8 KB, but `tls.c` put 16 KB record buffers on
+  the stack. The first `https` overflowed into the neighbouring tasks' stacks,
+  and the phone froze with no console. The big TLS and HTTP buffers are now
+  static: there is one user at a time, under `net_hold`. `TASK_STACK_SIZE` is
+  now 32 KB (`kernel/task.h`), 1 MB for the 32 tasks.
+- **DNS.**
+  - A query sent before the gateway's MAC was known was only an ARP request
+    and never went out. Each of 3 tries now resends for up to a second,
+    waiting up to 200 ms for the ARP answer each time.
+  - Every `resolve` added another UDP listener, until the table was full. A
+    second listen on a port now replaces the handler.
+
+On QEMU virt, virtio-net had never received anything: `net_poll` passed
+`len = 0`, which `virtio_net_recv` reads as the buffer's size. The `net_nic_t`
+contract now says `*len` is the buffer's size going in. With that,
+`resolve` and `https` work under SLIRP too.
+
 ## MMU and caches
 
 The shim enters with the MMU and D-cache off, so every access is
@@ -1016,6 +1053,13 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
     interface in `net.c`, DHCP, a link-local fallback, and a background poller.
     Windows bound its inbox drivers on the first try, and pings cross both
     ways in 0–7 ms. `mem_init` stopped losing bank 0 to `kload` chains.
+30. **Internet and HTTPS (2026-10-30).** See "Internet and HTTPS". Through
+    Windows ICS, the phone resolves names and fetches pages over TLS 1.2
+    (`https`). On the way, three bugs had to go:
+    - x86's tick-based timeouts read the 19.2 MHz counter;
+    - 16 KB TLS buffers overflowed the 8 KB task stacks and froze the phone;
+      stacks are now 32 KB;
+    - virt's virtio-net dropped every frame.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1547,6 +1591,7 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/touch.c` | FocalTech touchscreen: RPMh supplies, bit-banged I2C, polling task, event queue |
 | `arch/arm/platform/sm8350/ncm.c` | USB networking: NTB16 framing, frame queues, the stack's NIC, `net` task and command |
 | `arch/arm/kernel/dhcp.c` | DHCP client (DISCOVER/OFFER/REQUEST/ACK) |
+| `arch/arm/kernel/http.c`, `tls.c` | x86's HTTP/1.1 and TLS 1.2 clients, ported (`https`; certificates not verified) |
 | `arch/arm/kernel/llm.c` | `model` / `chat` / `llm`: GGUF from OsitoFS into high memory, tokenizer, x86 glue stubs, NEON selftest |
 | `arch/arm/kernel/tensor_neon.c` | NEON kernels under x86's AVX2 names (Q4_0, Q4_1, F16 matvec, rmsnorm, vec ops) |
 | `arch/arm/kernel/{inference,tensor,tokenizer,tokenizer_trie}.c`, `fs/gguf.c` | x86's inference stack, ported (CNTPCT timing, double-precision math, Q4_1) |

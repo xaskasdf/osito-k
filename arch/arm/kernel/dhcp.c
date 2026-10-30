@@ -152,12 +152,19 @@ int dhcp_run(void)
         net_set_ip(reply.yiaddr, mask);
         if (option(&reply, reply_len, 3, router, 4) >= 4)
             net_set_gateway(router);
-        if (option(&reply, reply_len, 6, dns, 4) >= 4)
+        int have_dns = option(&reply, reply_len, 6, dns, 4) >= 4;
+        if (have_dns)
             net_dns_set_server(dns);
         serial_puts("[DHCP] ");
         put_ip(reply.yiaddr);
         serial_puts(" from ");
         put_ip(server);
+        if (have_dns) {
+            serial_puts(", DNS ");
+            put_ip(dns);
+        } else {
+            serial_puts(", no DNS server offered");
+        }
         serial_puts("\n");
         return 0;
     }

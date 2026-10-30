@@ -97,6 +97,9 @@ Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fas
   - Taps and swipes reach the desktop through `platform_touch_event`.
 - Memory: the page allocator (`mem_alloc_pages`) covers DDR bank 0, 208 MB. `mem_alloc_aligned_high` serves big allocations (models, `put` buffers, inference state) from 15 GB of high memory: the rest of the 16 GB, less the device tree's carve-outs (`high_ram[]` in `platform/sm8350/mmu.c`). Kernels from `kload` must stay in bank 0.
 - USB networking: `net up` re-enumerates the gadget as ACM + CDC-NCM (`platform/sm8350/dwc3_acm.c`, framing in `ncm.c`), and the console moves to COM4. Windows binds its inbox UsbNcm. The phone then takes DHCP (Windows ICS) or a link-local 169.254.79.x.
+  - Through ICS it reaches the internet: `resolve`, and `https <host> [path]` over x86's TLS 1.2 client (`kernel/tls.c`), which doesn't verify certificates. Keep secrets off it.
+  - Code ported from x86 counts timeouts in 100 Hz ticks: on arm that's `timer_get_tick_count()`. `timer_get_ticks()` is the 19.2 MHz counter.
+  - Task stacks are 32 KB (`TASK_STACK_SIZE` in `kernel/task.h`), and nothing catches an overflow, which corrupts the next task's stack. Put big buffers in static storage or the heap.
   - The stack (`kernel/net.c`) isn't reentrant: hold it with `net_hold`/`net_release` around any use.
   - The `net` task polls it only when it's free.
 - Local LLM: `kernel/llm.c` (`model <file.gguf>`, `chat <text>`, `llm selftest`) runs x86's inference stack, ported.

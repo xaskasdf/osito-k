@@ -4,6 +4,7 @@
 #include "../include/hal.h"
 #include "../include/types.h"
 #include "task.h"
+#include "http.h"
 #include <stdbool.h>
 
 extern void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
@@ -56,7 +57,8 @@ static void cmd_help(void)
     serial_puts("  df       Filesystem free space\n");
     serial_puts("  halt     Shutdown system\n");
     serial_puts("  resolve  DNS lookup\n");
-    serial_puts("  net      USB networking (NCM): state [up | down]\n");
+    serial_puts("  net      USB networking (NCM): state [up | down | dns <ip>]\n");
+    serial_puts("  https    GET <host> [path] over TLS 1.2 (no certificate checks)\n");
     serial_puts("  beep     Play a tone\n");
     serial_puts("  desktop  The desktop on the panel, phablet layout [off]\n");
     serial_puts("  model    Local LLM: the loaded one [<file.gguf>: load it]\n");
@@ -301,6 +303,44 @@ static void cmd_halt(void)
     for (;;) __asm__ volatile("wfe");
 }
 
+/* `https <host> [path]`: GET over the TLS 1.2 client (http.c, tls.c; no
+ * certificate checks), the status and the first 600 bytes of the body */
+static void cmd_https(int argc, char **argv)
+{
+    if (argc < 2) {
+        serial_puts("Usage: https <host> [path]\n");
+        return;
+    }
+    static http_session_t s;
+    static http_response_t resp;
+    static char body[601];
+    const char *path = argc > 2 ? argv[2] : "/";
+    static const char *const headers[] = { "User-Agent: Osito-K", "Connection: close", 0 };
+    net_hold();
+    if (http_open(&s, argv[1]) < 0) {
+        net_release();
+        serial_puts("https: no connection (DNS, TCP or the TLS handshake)\n");
+        return;
+    }
+    int n = -1;
+    if (http_request(&s, "GET", path, argv[1], headers, 0, 0, &resp) == 0)
+        n = http_read_body_full(&s, &resp, body, sizeof(body) - 1);
+    http_close(&s);
+    net_release();
+    if (n < 0) {
+        serial_puts("https: request failed\n");
+        return;
+    }
+    body[n] = 0;
+    serial_puts("HTTP ");
+    serial_putdec((uint64_t)resp.status_code);
+    serial_puts(", first ");
+    serial_putdec((uint64_t)n);
+    serial_puts(" bytes:\n");
+    serial_puts(body);
+    serial_puts("\n");
+}
+
 static void cmd_resolve(int argc, char **argv)
 {
     if (argc < 2) { serial_puts("Usage: resolve <hostname>\n"); return; }
@@ -439,6 +479,7 @@ void shell_run(void)
         else if (strcmp(argv[0], "halt") == 0)    cmd_halt();
         else if (strcmp(argv[0], "resolve") == 0) cmd_resolve(argc, argv);
         else if (strcmp(argv[0], "net") == 0)     platform_net_cmd(argc, argv);
+        else if (strcmp(argv[0], "https") == 0)   cmd_https(argc, argv);
         else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
         else if (strcmp(argv[0], "desktop") == 0) cmd_desktop(argc, argv);
         else if (strcmp(argv[0], "model") == 0)   cmd_model(argc, argv);

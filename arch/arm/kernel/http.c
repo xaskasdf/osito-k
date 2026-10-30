@@ -17,7 +17,6 @@ extern int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
 extern int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
                             uint16_t src_port);
 extern void net_tcp_close(int conn);
-extern uint64_t timer_get_ticks(void);
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -198,7 +197,7 @@ int http_request(http_session_t *s, const char *method, const char *path,
 
     /* ── Read response headers ── */
 
-    char hdr[4096];
+    static char hdr[4096];                  /* off the task stack (one user: net_hold) */
     int hdr_len = 0;
     int hdr_end = -1;
 
@@ -316,7 +315,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
     if (resp->chunked) {
         /* ── Chunked transfer-encoding ── */
         /* Format: <hex-size>\r\n<data>\r\n ... 0\r\n\r\n */
-        uint8_t buf[4096];
+        static uint8_t buf[4096];           /* off the task stack (one user: net_hold) */
         int bp = 0, bl = 0;  /* buffer position, buffer length */
 
         /* Seed buffer with leftover */
@@ -395,7 +394,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
         /* ── Content-Length or read until close ── */
         uint32_t remaining = resp->content_length;
         bool has_cl = (remaining > 0);
-        uint8_t buf[4096];
+        static uint8_t buf[4096];           /* off the task stack (one user: net_hold) */
 
         /* Deliver leftover first */
         if (leftover_len > 0) {
