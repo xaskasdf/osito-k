@@ -225,6 +225,12 @@ static void configure(void)
     put_ip(ip);
     serial_puts(dhcp_ok ? " (DHCP)\n" : " (link-local: no DHCP server; "
                 "share the PC's connection to it for the internet)\n");
+    /* The time of day, for certificate checks: only past a DHCP router */
+    if (dhcp_ok && !ntp_is_synced()) {
+        net_hold();
+        ntp_sync();
+        net_release();
+    }
 }
 
 static void net_task(void *arg)

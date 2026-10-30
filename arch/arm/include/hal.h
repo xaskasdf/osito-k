@@ -86,6 +86,12 @@ void   (*console_capture(void (*fn)(char c)))(char c);
  * end, or -1 when the command has none */
 int      shell_stdin_read(char *buf, int n);
 
+/* Randomness: the platform's hardware generator (0, or -1 if it has none
+ * or it failed), and kernel/random.c's DRBG over it, for keys and nonces */
+int      platform_entropy(void *buf, uint32_t len);
+void     random_bytes(void *buf, uint32_t len);
+int      random_hw(void);   /* 1 if the hardware generator feeds it */
+
 /* ========================================================================
  * Framebuffer
  * ======================================================================== */
@@ -208,6 +214,12 @@ void     timer_init_cpu(void);          /* start the tick on a secondary CPU */
 uint64_t timer_get_ticks(void);
 uint64_t timer_ms(void);
 uint64_t timer_get_tick_count(void);
+/* The time of day (kernel/ntp.c): UTC seconds, or 0 until ntp_sync (which
+ * needs the network held: net_hold) has got it */
+int      ntp_sync(void);
+uint32_t ntp_get_utc(void);
+int      ntp_is_synced(void);
+void     ntp_print(uint32_t utc);   /* "YYYY-MM-DD hh:mm:ss" */
 void     udelay(uint32_t us);
 void     mdelay(uint32_t ms);
 void     timer_tick_handler(int count);  /* count: advance the tick count (boot CPU) */

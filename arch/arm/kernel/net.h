@@ -100,7 +100,7 @@ typedef struct __attribute__((packed)) {
 #define TCP_LISTEN      8
 #define TCP_SYN_RCVD    9
 
-#define TCP_RX_BUF_SIZE 8192
+#define TCP_RX_BUF_SIZE 16384     /* a TLS record */
 #define TCP_MAX_CONNS   32
 
 typedef struct {
@@ -157,6 +157,7 @@ int  net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
 
 /* Register UDP listener on a port */
 void net_udp_listen(uint16_t port, udp_handler_t handler);
+void net_udp_unlisten(uint16_t port);
 
 /* ICMP */
 void     net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);

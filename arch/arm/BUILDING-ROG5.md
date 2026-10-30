@@ -197,13 +197,85 @@ With Internet Connection Sharing on (the PC's internet adapter shared with
 DNS 192.168.137.1. DHCP logs the DNS server it got, `net` shows it, and
 `net dns <ip>` replaces it. Then:
 - `ping 1.1.1.1` gets 6–8 ms, and `resolve` works.
-- `https <host> [path]` runs a GET through `http.c` and `tls.c` (x86's, ported).
+- The `net` task syncs the time of day by SNTP right after DHCP (`date`;
+  `date sync` asks again; see "Certificates" below).
+- `https <host> [path]` runs a GET through `http.c` over TLS 1.3, or 1.2 if
+  the server has no 1.3, with the server authenticated (see "Certificates").
   It prints the status and the first 600 bytes of the body.
-- The TLS client is the old 1.2 one: ECDHE-RSA-AES128-GCM, with the
-  **certificate not verified**. Don't send secrets (an API key) through it
-  until x86's TLS 1.3 / X.509 stack is ported.
-- Measured (2026-10-30): example.com and `www.google.com/robots.txt` answered
-  200, three times in a row.
+
+### Certificates
+
+Every HTTPS connection authenticates the server, so secrets (an API key)
+can go through it.
+
+- **TLS 1.3 (`kernel/tls13.c`):**
+  - x86's record layer and key schedule (TLS_AES_128_GCM_SHA256 over
+    X25519).
+  - Handshake messages are reassembled across records, and they must come in
+    order.
+  - The chain must verify (`tls_verify_chain`) and CertificateVerify must be
+    the leaf key's signature over the transcript (`tls_verify_signature`)
+    before the server's Finished is accepted.
+- **TLS 1.2 (`kernel/tls.c`):** `http.c` falls back to it only when the server
+  may not speak 1.3, never after a failed authentication.
+  - ECDHE over X25519 or P-256 (`kernel/ecdh_p256.c`), an RSA or ECDSA
+    certificate, AES-128-GCM.
+  - The chain must verify, and the ServerKeyExchange must carry the leaf's
+    signature over both randoms and the key.
+  - The server's Finished must match.
+  - A TLS 1.3 server's downgrade sentinel (`DOWNGRD\x01`) is refused: it
+    means someone made our 1.3 attempt fail.
+- **The checks (`kernel/tls_verify.c`):**
+  - BearSSL 0.6's X.509 engine (`lib/bearssl`, see its README) checks every
+    signature up to one of Mozilla's 118 roots (`kernel/ca_roots.c`), CA
+    flags and path lengths, the dates, and the host name.
+  - Signatures are ECDSA, RSA PKCS#1 v1.5 (1.2 only) and RSA-PSS.
+  - BearSSL 0.6 has no PSS, so `tls_verify.c` implements EMSA-PSS-VERIFY
+    over BearSSL's RSA.
+  - SHA-1 and MD5 signatures in a chain are refused.
+- **The roots:** `tools/ca-roots/gen-bearssl-anchors.py` generates
+  `kernel/ca_roots.c` from curl's extract of Mozilla's bundle
+  (https://curl.se/ca/cacert.pem, its SHA-256 published beside it). Running
+  it again on a newer bundle updates them.
+- **The time:** dates need the time of day, which only NTP gives
+  (`kernel/ntp.c`, x86's ported).
+  - `http_open` syncs if the `net` task hasn't.
+  - With no time, certificates are refused.
+- **Keys and nonces** come from `kernel/random.c`:
+  - an HMAC-DRBG over SHA-256, reseeded on every request with the SM8350's
+    hardware PRNG (`platform/sm8350/rng.c`: prng@10d3000, its clock the HWKM
+    BCM voted through RPMh) and timer jitter;
+  - `random [n]` shows some bytes and their source;
+  - the apps' `getrandom` uses it too.
+  - Before this, TLS's ECDHE keys came from a xorshift seeded with the
+    timer counter: guessable from roughly when the phone booted.
+- **What isn't checked:**
+  - revocation (no OCSP or CRL: `revoked.badssl.com` connects);
+  - ECDHE over P-384 only (`ecc384.badssl.com`'s server).
+- **Measured on the phone (2026-10-30):** each request takes 0.6–1.8 s
+  (badssl.com is under a different name each time).
+
+  | Case | Result |
+  |---|---|
+  | example.com, google.com, api.anthropic.com | TLS 1.3, ECDSA |
+  | amazon.com, microsoft.com | TLS 1.3, RSA-PSS |
+  | badssl.com, rsa4096.badssl.com | TLS 1.2, RSA PKCS#1, P-256 |
+  | The expired, wrong-host, self-signed, untrusted-root and SHA-1-intermediate badssl.com sites | refused, each with its reason |
+
+- **Bugs this turned up, and fixed:**
+  - x86's 1.3 client logged its certificate checks but enforced none.
+    CertificateVerify went unchecked, and a handshake message split
+    across records was dropped.
+  - The 1.2 client accepted a wrong server Finished ("continue anyway").
+  - `tls_recv` dropped the part of a record that didn't fit the caller's
+    buffer.
+  - TCP (`net.c`) ACKed and then dropped data that didn't fit its buffer,
+    and accepted a FIN that came after missing data. It now takes and
+    ACKs only what fits, advertises the real free space, and has a 16 KB
+    buffer (a TLS record).
+  - `http.c` got a 16 KB header buffer, since Wikipedia sends ~5 KB of
+    headers.
+  - `http_read_body_full` stops once its buffer is full.
 
 Three bugs in the ported stack stood in the way:
 - **Timeouts.** `net.c` and `tls.c` count x86's 100 Hz ticks, but they read
@@ -1171,6 +1243,14 @@ external abort) at ELR `0xA020603C` was offset `0x603C`, a config-space read in
       The cause was copying out of the uncached DMA window a load at a time.
       With overlapped loads, 92 MB reads in ~2 s, a model loads in 0.26 s
       instead of 1.5 s, and `get` runs at 8.5 MB/s instead of 3.
+33. **Authenticated HTTPS (2026-10-30).** See "Certificates".
+    - HTTPS checks the server's certificate chain against Mozilla's roots
+      (BearSSL's X.509 engine), and the server's handshake signature,
+      over TLS 1.3 or 1.2.
+    - Keys come from the hardware PRNG through an HMAC-DRBG, and the time of
+      day from NTP.
+    - The badssl.com failures are refused, and Amazon and Microsoft verify
+      over TLS 1.3 with RSA-PSS.
 
 Still open:
 - With `SCREEN_DEBUG=1`, `PLATFORM=virt` needs `-m 4G` in QEMU, because `start.S`
@@ -1702,7 +1782,13 @@ If nothing happens (stays on ROG boot logo):
 | `arch/arm/platform/sm8350/touch.c` | FocalTech touchscreen: RPMh supplies, bit-banged I2C, polling task, event queue |
 | `arch/arm/platform/sm8350/ncm.c` | USB networking: NTB16 framing, frame queues, the stack's NIC, `net` task and command |
 | `arch/arm/kernel/dhcp.c` | DHCP client (DISCOVER/OFFER/REQUEST/ACK) |
-| `arch/arm/kernel/http.c`, `tls.c` | x86's HTTP/1.1 and TLS 1.2 clients, ported (`https`; certificates not verified) |
+| `arch/arm/kernel/http.c` | HTTP/1.1 client: TLS 1.3, else 1.2 (`https`) |
+| `arch/arm/kernel/tls13.c`, `tls.c` | TLS 1.3 and 1.2 clients that authenticate the server |
+| `arch/arm/kernel/tls_verify.c`, `ca_roots.c` | Certificate chain and signature checks (BearSSL), RSA-PSS; Mozilla's roots |
+| `arch/arm/kernel/random.c`, `platform/sm8350/rng.c` | HMAC-DRBG over the hardware PRNG (`random`) |
+| `arch/arm/kernel/ntp.c` | SNTP: the time of day (`date`) |
+| `arch/arm/lib/bearssl/` | BearSSL 0.6, the subset used (X.509, RSA, ECDSA, SHA-2) |
+| `tools/ca-roots/gen-bearssl-anchors.py` | Generates `ca_roots.c` from Mozilla's bundle |
 | `arch/arm/kernel/llm.c` | `model` / `chat` / `llm`: GGUF from OsitoFS into high memory, tokenizer, x86 glue stubs, NEON selftest |
 | `arch/arm/kernel/tensor_neon.c` | NEON kernels under x86's AVX2 names (Q4_0, Q4_1, F16 matvec, rmsnorm, vec ops) |
 | `arch/arm/kernel/{inference,tensor,tokenizer,tokenizer_trie}.c`, `fs/gguf.c` | x86's inference stack, ported (CNTPCT timing, double-precision math, Q4_1) |

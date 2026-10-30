@@ -16,6 +16,7 @@ CC      := $(CROSS)gcc
 AS      := $(CROSS)gcc
 LD      := $(CROSS)ld
 OBJCOPY := $(CROSS)objcopy
+AR      := $(CROSS)ar
 
 # Directories
 BUILD   := build
@@ -56,8 +57,9 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/memory.c kernel/paging.c kernel/heap.c kernel/sched.c \
             kernel/syscall.c kernel/elf.c kernel/process.c \
             kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/fs.c kernel/gui_task.c \
-            kernel/pci.c kernel/net.c kernel/dhcp.c \
-            kernel/crypto.c kernel/tls.c kernel/http.c kernel/smp.c \
+            kernel/pci.c kernel/net.c kernel/dhcp.c kernel/ntp.c \
+            kernel/crypto.c kernel/random.c kernel/tls.c kernel/http.c kernel/smp.c \
+            kernel/tls13.c kernel/hkdf.c kernel/tls_verify.c kernel/ca_roots.c kernel/ecdh_p256.c \
             kernel/claude.c kernel/tokenizer.c kernel/tokenizer_trie.c \
             kernel/tensor.c kernel/tensor_neon.c kernel/tensor_arena.c \
             kernel/inference.c kernel/dispatch.c kernel/llm.c \
@@ -73,6 +75,22 @@ GUI_SRCS := ../../gui/gui_draw.c ../../gui/gui_text.c \
             ../../gui/gui_desktop.c ../../gui/gui_window.c \
             ../../gui/gui_anim.c ../../gui/gui_theme.c ../../gui/gui_font.c \
             ../../gui/gui_widgets.c
+
+# BearSSL 0.6 (lib/bearssl: an unmodified subset, MIT): X.509 validation
+# and signature checks for the TLS clients (kernel/tls_verify.c). Built into
+# an archive, so only what's used is linked, with its own flags: no libc
+# beyond lib/bearssl/port, and no time(), RDRAND, x86 or POWER code.
+BEARSSL_SRCS   := $(wildcard lib/bearssl/src/*/*.c) lib/bearssl/port/string.c
+BEARSSL_OBJS   := $(patsubst %.c,$(BUILD)/%.o,$(BEARSSL_SRCS))
+BEARSSL_LIB    := $(BUILD)/libbearssl.a
+BEARSSL_CFLAGS := -ffreestanding -nostdlib -fpie -march=armv8.2-a -mtune=cortex-a78 -O2 \
+                  -mgeneral-regs-only -Wall \
+                  -Ilib/bearssl/port -Ilib/bearssl/inc -Ilib/bearssl/src \
+                  -DBR_USE_UNIX_TIME=0 -DBR_USE_WIN32_TIME=0 -DBR_USE_URANDOM=0 \
+                  -DBR_USE_WIN32_RAND=0 -DBR_RDRAND=0 -DBR_AES_X86NI=0 -DBR_SSE2=0 \
+                  -DBR_POWER8=0 -DBR_LE_UNALIGNED=0 -DBR_BE_UNALIGNED=0
+# Kernel files that include bearssl.h get its string.h
+BEARSSL_USERS  := $(BUILD)/kernel/tls_verify.o $(BUILD)/kernel/ca_roots.o $(BUILD)/kernel/ecdh_p256.o
 
 # Objects
 ASM_OBJS := $(patsubst %.S,$(BUILD)/%.o,$(ASM_SRCS))
@@ -98,10 +116,22 @@ $(IMAGE): $(ELF)
 	@echo "[OBJCOPY] $@"
 	@$(OBJCOPY) -O binary $< $@
 
-$(ELF): $(OBJS) $(LDSCRIPT)
+$(ELF): $(OBJS) $(BEARSSL_LIB) $(LDSCRIPT)
 	@echo "[LD] $@"
 	@mkdir -p $(dir $@)
-	@$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	@$(LD) $(LDFLAGS) -Map=$(BUILD)/kernel.map -o $@ $(OBJS) $(BEARSSL_LIB)
+
+$(BEARSSL_LIB): $(BEARSSL_OBJS)
+	@echo "[AR] $@"
+	@rm -f $@
+	@$(AR) rcs $@ $^
+
+$(BEARSSL_OBJS): $(BUILD)/%.o: %.c
+	@echo "[CC] $< (BearSSL)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(BEARSSL_CFLAGS) -c $< -o $@
+
+$(BEARSSL_USERS): CFLAGS += -Ilib/bearssl/port
 
 # Assembly
 $(BUILD)/%.o: %.S

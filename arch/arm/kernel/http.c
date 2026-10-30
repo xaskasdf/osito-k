@@ -7,11 +7,14 @@
  */
 
 #include "http.h"
+#include "tls13.h"
 
 /* ── External dependencies ───────────────────────────────────── */
 
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
+extern int  ntp_sync(void);
+extern int  ntp_is_synced(void);
 
 extern int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
 extern int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
@@ -90,7 +93,7 @@ uint32_t http_response_size(void) { return (uint32_t)sizeof(http_response_t); }
 
 /* Leftover body data from header parsing (set by http_request,
  * consumed by http_read_body). Only one request at a time. */
-static uint8_t leftover_buf[4096];
+static uint8_t leftover_buf[16384];    /* as big as hdr: the body read with it */
 static int     leftover_len;
 
 /* ── HTTP Session Management ─────────────────────────────────── */
@@ -116,18 +119,35 @@ int http_open(http_session_t *s, const char *hostname)
     serial_putdec(ip[2]); serial_puts(".");
     serial_putdec(ip[3]); serial_puts("\n");
 
-    /* TCP connect */
+    /* The certificates' dates are checked against the time of day */
+    if (!ntp_is_synced())
+        ntp_sync();
+
+    /* TLS 1.3 first; TLS 1.2 on a new connection only if the server may
+     * not speak 1.3, never after it failed authentication. Both check the
+     * certificates (tls_verify.c). */
     s->tcp_conn = net_tcp_connect(ip, 443, next_port++);
     if (s->tcp_conn < 0) {
         serial_puts("[HTTP] TCP connect failed\n");
         return -1;
     }
-
-    /* TLS handshake */
-    if (tls_connect(&s->tls, s->tcp_conn, hostname) < 0) {
-        serial_puts("[HTTP] TLS handshake failed\n");
+    int r = tls13_connect(s->tcp_conn, hostname);
+    if (r == 0) {
+        s->use_tls13 = true;
+    } else {
         net_tcp_close(s->tcp_conn);
-        return -1;
+        if (r == TLS13_AUTH_FAILED) {
+            serial_puts("[HTTP] the server failed authentication: not connecting\n");
+            return -1;
+        }
+        serial_puts("[HTTP] no TLS 1.3: trying TLS 1.2\n");
+        s->tcp_conn = net_tcp_connect(ip, 443, next_port++);
+        if (s->tcp_conn < 0 || tls_connect(&s->tls, s->tcp_conn, hostname) < 0) {
+            serial_puts("[HTTP] TLS handshake failed\n");
+            if (s->tcp_conn >= 0)
+                net_tcp_close(s->tcp_conn);
+            return -1;
+        }
     }
 
     serial_puts("[HTTP] HTTPS ready\n");
@@ -138,9 +158,23 @@ int http_open(http_session_t *s, const char *hostname)
 void http_close(http_session_t *s)
 {
     if (!s->connected) return;
-    tls_close(&s->tls);
+    if (s->use_tls13)
+        tls13_close();
+    else
+        tls_close(&s->tls);
     net_tcp_close(s->tcp_conn);
     s->connected = false;
+}
+
+/* The session's TLS, 1.3 or 1.2 */
+static int s_send(http_session_t *s, const void *data, uint32_t len)
+{
+    return s->use_tls13 ? tls13_send(data, len) : tls_send(&s->tls, data, len);
+}
+
+static int s_recv(http_session_t *s, void *buf, uint32_t cap, uint32_t timeout_ticks)
+{
+    return s->use_tls13 ? tls13_recv(buf, cap) : tls_recv(&s->tls, buf, cap, timeout_ticks);
 }
 
 /* ── HTTP Request ────────────────────────────────────────────── */
@@ -182,11 +216,11 @@ int http_request(http_session_t *s, const char *method, const char *path,
     p = buf_puts(req, p, mx, "\r\n");
 
     /* Send headers */
-    if (tls_send(&s->tls, req, (uint32_t)p) < 0) return -1;
+    if (s_send(s, req, (uint32_t)p) < 0) return -1;
 
     /* Send body */
     if (body && body_len > 0) {
-        if (tls_send(&s->tls, body, body_len) < 0) return -1;
+        if (s_send(s, body, body_len) < 0) return -1;
     }
 
     serial_puts("[HTTP] Sent ");
@@ -197,12 +231,12 @@ int http_request(http_session_t *s, const char *method, const char *path,
 
     /* ── Read response headers ── */
 
-    static char hdr[4096];                  /* off the task stack (one user: net_hold) */
+    static char hdr[16384];                 /* off the task stack (one user: net_hold); Wikipedia sends ~5 KB of headers */
     int hdr_len = 0;
     int hdr_end = -1;
 
     while (hdr_len < (int)sizeof(hdr) - 1) {
-        int n = tls_recv(&s->tls, hdr + hdr_len,
+        int n = s_recv(s, hdr + hdr_len,
                          (uint32_t)(sizeof(hdr) - 1 - (uint32_t)hdr_len), 5000);
         if (n <= 0) {
             serial_puts("[HTTP] Timeout reading headers\n");
@@ -333,7 +367,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
 
             while (!got_line) {
                 if (bp >= bl) {
-                    int n = tls_recv(&s->tls, buf, sizeof(buf), 500);
+                    int n = s_recv(s, buf, sizeof(buf), 500);
                     if (n <= 0) goto done;
                     bp = 0;
                     bl = n;
@@ -361,7 +395,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             uint32_t remaining = chunk_size;
             while (remaining > 0) {
                 if (bp >= bl) {
-                    int n = tls_recv(&s->tls, buf, sizeof(buf), 500);
+                    int n = s_recv(s, buf, sizeof(buf), 500);
                     if (n <= 0) goto done;
                     bp = 0;
                     bl = n;
@@ -381,7 +415,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             /* Consume trailing \r\n */
             for (int skip = 0; skip < 2; ) {
                 if (bp >= bl) {
-                    int n = tls_recv(&s->tls, buf, sizeof(buf), 500);
+                    int n = s_recv(s, buf, sizeof(buf), 500);
                     if (n <= 0) goto done;
                     bp = 0;
                     bl = n;
@@ -413,7 +447,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             uint32_t want = sizeof(buf);
             if (has_cl && remaining < want) want = remaining;
 
-            int n = tls_recv(&s->tls, buf, want, 500);
+            int n = s_recv(s, buf, want, 500);
             if (n <= 0) break;
 
             if (callback) {
@@ -435,6 +469,7 @@ typedef struct {
     uint8_t  *buf;
     uint32_t  size;
     uint32_t  pos;
+    int       full;     /* stopped reading: the buffer is full */
 } buf_ctx_t;
 
 static int buf_body_cb(const void *data, uint32_t len, void *ctx_)
@@ -447,14 +482,19 @@ static int buf_body_cb(const void *data, uint32_t len, void *ctx_)
         hmemcpy(b->buf + b->pos, data, copy);
         b->pos += copy;
     }
+    if (b->pos >= b->size) {
+        b->full = 1;
+        return -1;      /* no need for the rest (Wikipedia's 400 KB page) */
+    }
     return 0;
 }
 
+/* The body's first buf_size bytes; the rest isn't read */
 int http_read_body_full(http_session_t *s, const http_response_t *resp,
                         void *buf, uint32_t buf_size)
 {
-    buf_ctx_t ctx = { .buf = (uint8_t *)buf, .size = buf_size, .pos = 0 };
+    buf_ctx_t ctx = { .buf = (uint8_t *)buf, .size = buf_size, .pos = 0, .full = 0 };
     int r = http_read_body(s, resp, buf_body_cb, &ctx);
-    if (r < 0) return -1;
+    if (r < 0 && !ctx.full) return -1;
     return (int)ctx.pos;
 }

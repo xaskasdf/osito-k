@@ -727,7 +727,7 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
     tcp->ack      = htonl(conn->rcv_nxt);
     tcp->data_off = (uint8_t)((tcp_hdr_len / 4) << 4);
     tcp->flags    = flags;
-    tcp->window   = htons(TCP_RX_BUF_SIZE);
+    tcp->window   = htons(TCP_RX_BUF_SIZE - conn->rx_len);    /* what fits now */
     tcp->checksum = 0;
     tcp->urgent   = 0;
 
@@ -891,7 +891,9 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         if (flags & TCP_ACK)
             conn->snd_una = ack;
 
-        /* Receive data */
+        /* Receive data: only what fits is taken and ACKed, and the peer
+         * sends the rest again (it used to be ACKed and dropped, which
+         * cut TLS records short) */
         if (data_len > 0 && seq == conn->rcv_nxt) {
             uint32_t space = TCP_RX_BUF_SIZE - conn->rx_len;
             uint32_t copy = data_len < space ? data_len : space;
@@ -899,13 +901,13 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 memcpy(conn->rx_buf + conn->rx_len, data, copy);
                 conn->rx_len += copy;
             }
-            conn->rcv_nxt += data_len;
+            conn->rcv_nxt += copy;
             /* ACK the data */
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
         }
 
-        /* FIN from remote */
-        if (flags & TCP_FIN) {
+        /* FIN from remote, once everything before it is in */
+        if ((flags & TCP_FIN) && seq + data_len == conn->rcv_nxt) {
             conn->rcv_nxt = seq + data_len + 1;
             conn->state = TCP_CLOSE_WAIT;
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
@@ -927,8 +929,10 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 memcpy(conn->rx_buf + conn->rx_len, data, copy);
                 conn->rx_len += copy;
             }
-            conn->rcv_nxt += data_len;
+            conn->rcv_nxt += copy;
         }
+        if ((flags & TCP_FIN) && seq + data_len != conn->rcv_nxt)
+            flags &= (uint8_t)~TCP_FIN;     /* data before it is missing */
 
         if ((flags & TCP_FIN) && (flags & TCP_ACK)) {
             /* Simultaneous FIN+ACK — go to TIME_WAIT */
@@ -953,10 +957,10 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 memcpy(conn->rx_buf + conn->rx_len, data, copy);
                 conn->rx_len += copy;
             }
-            conn->rcv_nxt += data_len;
+            conn->rcv_nxt += copy;
         }
 
-        if (flags & TCP_FIN) {
+        if ((flags & TCP_FIN) && seq + data_len == conn->rcv_nxt) {
             conn->rcv_nxt = seq + data_len + 1;
             conn->state = TCP_TIME_WAIT;
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
@@ -1469,4 +1473,15 @@ void net_udp_listen(uint16_t port, udp_handler_t handler)
     fb_puts(" Listening UDP :");
     fb_putdec(port);
     fb_puts("\n");
+}
+
+/* Stop listening (a client's one-off source port, as NTP's) */
+void net_udp_unlisten(uint16_t port)
+{
+    for (int i = 0; i < udp_listener_count; i++) {
+        if (udp_listeners[i].port == port) {
+            udp_listeners[i] = udp_listeners[--udp_listener_count];
+            return;
+        }
+    }
 }

@@ -235,13 +235,9 @@ static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 static int64_t sys_getrandom(uint64_t buf, uint64_t len, uint64_t flags)
 {
     (void)flags;
-    uint8_t *dst = (uint8_t *)buf;
-    uint64_t state;
-    __asm__ volatile("mrs %0, CNTPCT_EL0" : "=r"(state));
-    for (uint64_t i = 0; i < len; i++) {
-        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
-        dst[i] = (uint8_t)state;
-    }
+    if (len > 256)
+        len = 256;                      /* Linux's cap for one call */
+    random_bytes((void *)buf, (uint32_t)len);
     return (int64_t)len;
 }
 

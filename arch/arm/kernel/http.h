@@ -38,9 +38,10 @@ typedef int (*http_body_cb)(const void *data, uint32_t len, void *ctx);
 /* ── HTTP Session ───────────────────────────────────────────── */
 
 typedef struct {
-    tls_conn_t  tls;
+    tls_conn_t  tls;            /* TLS 1.2, when the server has no 1.3 */
     int         tcp_conn;
     bool        connected;
+    bool        use_tls13;      /* kernel/tls13.c's one connection */
 } http_session_t;
 
 /* ── HTTP API ───────────────────────────────────────────────── */

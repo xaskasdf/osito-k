@@ -71,6 +71,8 @@ static void cmd_help(void)
     serial_puts("  head     First lines [-n N] [path]; tail the last ones\n");
     serial_puts("  grep     Lines containing a text [-i] [-v] [-c] <text> [path]\n");
     serial_puts("  wc       Lines, words, bytes [path]\n");
+    serial_puts("  random   Random bytes in hex [n], and their source\n");
+    serial_puts("  date     The time of day, UTC, from NTP [sync: ask again]\n");
     serial_puts("  history  Lines typed before [clear]; Up/Down recall them, Tab completes\n");
     serial_puts("           Pipes: a | b; redirection: > file, >> file, < file; quotes\n");
     serial_puts("  exec     Run a program from the filesystem <path> [args...]\n");
@@ -88,7 +90,7 @@ static void cmd_help(void)
     serial_puts("  halt     Shutdown system\n");
     serial_puts("  resolve  DNS lookup\n");
     serial_puts("  net      USB networking (NCM): state [up | down | dns <ip>]\n");
-    serial_puts("  https    GET <host> [path] over TLS 1.2 (no certificate checks)\n");
+    serial_puts("  https    GET <host> [path] over TLS 1.3 (else 1.2), certificate verified\n");
     serial_puts("  beep     Play a tone\n");
     serial_puts("  desktop  The desktop on the panel, phablet layout [off]\n");
     serial_puts("  model    Local LLM: the loaded one [<file.gguf>: load it]\n");
@@ -386,6 +388,42 @@ static int text_of(const char *cmd, const char *path, const char **data,
     *data = buf;
     *pages = n;
     return 0;
+}
+
+/* `date [sync]`: the time of day (UTC), from NTP */
+static void cmd_date(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "sync") == 0) {
+        net_hold();
+        ntp_sync();
+        net_release();
+    }
+    uint32_t t = ntp_get_utc();
+    if (!t) {
+        err_puts("date: unknown (no NTP yet: `net up`, or `date sync`)\n", "", "");
+        return;
+    }
+    ntp_print(t);
+    serial_puts(" UTC\n");
+}
+
+/* `random [n]`: n random bytes in hex (32), and where they come from */
+static void cmd_random(int argc, char **argv)
+{
+    uint32_t n = argc > 1 ? shell_atoi(argv[1]) : 32;
+    if (n == 0 || n > 4096)
+        n = 32;
+    static uint8_t buf[4096];
+    random_bytes(buf, n);
+    static const char hex[] = "0123456789abcdef";
+    for (uint32_t i = 0; i < n; i++) {
+        char two[3] = { hex[buf[i] >> 4], hex[buf[i] & 15], 0 };
+        serial_puts(two);
+        if (i % 32 == 31 || i + 1 == n)
+            serial_puts("\n");
+    }
+    err_puts(random_hw() ? "(hardware PRNG + timer jitter, HMAC-DRBG)\n"
+                         : "(timer jitter only, HMAC-DRBG: no hardware generator)\n", "", "");
 }
 
 /* `ls [path]`: a directory's entries, sizes first, directories marked */
@@ -808,8 +846,9 @@ static void cmd_halt(void)
     for (;;) __asm__ volatile("wfe");
 }
 
-/* `https <host> [path]`: GET over the TLS 1.2 client (http.c, tls.c; no
- * certificate checks), the status and the first 600 bytes of the body */
+/* `https <host> [path]`: GET over TLS 1.3, else 1.2 (http.c, tls13.c,
+ * tls.c), the server's certificate verified (tls_verify.c); the status and
+ * the first 600 bytes of the body */
 static void cmd_https(int argc, char **argv)
 {
     if (argc < 2) {
@@ -949,6 +988,8 @@ static void dispatch(int argc, char **argv)
         cmd_head_tail(argc, argv);
     else if (strcmp(argv[0], "grep") == 0)   cmd_grep(argc, argv);
     else if (strcmp(argv[0], "wc") == 0)     cmd_wc(argc, argv);
+    else if (strcmp(argv[0], "random") == 0) cmd_random(argc, argv);
+    else if (strcmp(argv[0], "date") == 0)   cmd_date(argc, argv);
     else if (strcmp(argv[0], "history") == 0) {
         if (argc > 1 && strcmp(argv[1], "clear") == 0)
             term_history_clear();
@@ -1260,9 +1301,10 @@ static void run_line(char *line)
 
 static const char *const command_names[] = {
     "beep", "burn", "cat", "cd", "chat", "clear", "cp", "cpubench", "cpufreq",
-    "cpus", "desktop", "df", "dmesg", "echo", "exec", "get", "grep", "halt",
+    "cpus", "date", "desktop", "df", "dmesg", "echo", "exec", "get", "grep", "halt",
     "head", "help", "hexdump", "history", "https", "keys", "kload", "llm", "ls",
     "mem", "mkdir", "model", "mv", "net", "ping", "pmic", "ps", "put", "pwd",
+    "random",
     "reboot", "resolve", "rm", "rmdir", "rpmh", "screen", "screenshot", "tail",
     "temp", "touch", "ufs", "uname", "uptime", "wc", 0
 };
