@@ -4,6 +4,8 @@
 #include "kernel32_shim.h"
 #include "pe.h"
 #include "win32_abi.h"
+#include "dllloader.h"
+#include "ntprocess.h"
 
 extern void serial_puts(const char *s);
 
@@ -222,11 +224,17 @@ static BOOL version_read_at(HANDLE file, DWORD offset, PVOID buffer,
 static HANDLE version_open_file(PCWSTR filename, DWORD *file_size)
 {
     DWORD high = 0;
+    /* Selection has already resolved WOW64 and the CWD. Open that physical
+     * file, restoring the thread setting before parsing any resources. */
+    BOOL previous = nt_thread_fs_redirection(1);
     HANDLE file = CreateFileW(filename, GENERIC_READ,
                               FILE_SHARE_READ | FILE_SHARE_WRITE |
                                   FILE_SHARE_DELETE,
                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
                               NULL);
+    DWORD error = GetLastError();
+    nt_thread_fs_redirection(previous);
+    SetLastError(error);
     if (file == INVALID_HANDLE_VALUE)
         return file;
 
@@ -274,7 +282,7 @@ static BOOL version_rva_to_file(const IMAGE_SECTION_HEADER *sections,
 static BOOL version_read_resource_entry(HANDLE file, DWORD resource_base,
                                         DWORD resource_size,
                                         DWORD directory_offset,
-                                        DWORD desired_id, BOOL first,
+                                        DWORD desired_id, const char *desired_name, BOOL first,
                                         VERSION_RESOURCE_ENTRY *result)
 {
     VERSION_RESOURCE_DIRECTORY directory;
@@ -299,7 +307,19 @@ static BOOL version_read_resource_entry(HANDLE file, DWORD resource_base,
                              i * sizeof(VERSION_RESOURCE_ENTRY);
         if (!version_read_at(file, entry_offset, &entry, sizeof(entry)))
             return FALSE;
-        if (first || (!(entry.Name & 0x80000000U) &&
+        BOOL named = FALSE;
+        if (desired_name && (entry.Name & 0x80000000U)) {
+            DWORD name_offset = entry.Name & 0x7FFFFFFFU;
+            WORD chars;
+            if (version_range_valid(name_offset, sizeof(chars), resource_size) &&
+                version_read_at(file, resource_base + name_offset, &chars, sizeof(chars)) &&
+                chars == 3 && version_range_valid(name_offset + 2, 6, resource_size)) {
+                WCHAR name[4] = {0};
+                named = version_read_at(file, resource_base + name_offset + 2, name, 6) &&
+                        version_wstr_eq_ascii(name, desired_name);
+            }
+        }
+        if (first || named || (!desired_name && !(entry.Name & 0x80000000U) &&
                       (entry.Name & 0xFFFFU) == desired_id)) {
             *result = entry;
             return TRUE;
@@ -308,7 +328,7 @@ static BOOL version_read_resource_entry(HANDLE file, DWORD resource_base,
     return FALSE;
 }
 
-static BOOL version_locate_resource(HANDLE file, DWORD file_size,
+static BOOL version_locate_resource(HANDLE file, DWORD file_size, const char *named_type,
                                     VERSION_RESOURCE_LOCATION *location)
 {
     IMAGE_DOS_HEADER dos;
@@ -402,16 +422,16 @@ static BOOL version_locate_resource(HANDLE file, DWORD file_size,
     VERSION_RESOURCE_ENTRY name_entry;
     VERSION_RESOURCE_ENTRY language_entry;
     if (!version_read_resource_entry(file, resource_base, resource_size, 0,
-                                     VERSION_RESOURCE_TYPE, FALSE,
+                                     VERSION_RESOURCE_TYPE, named_type, FALSE,
                                      &type_entry) ||
         !(type_entry.OffsetToData & 0x80000000U) ||
         !version_read_resource_entry(
             file, resource_base, resource_size,
-            type_entry.OffsetToData & 0x7FFFFFFFU, 0, TRUE, &name_entry) ||
+            type_entry.OffsetToData & 0x7FFFFFFFU, 0, NULL, TRUE, &name_entry) ||
         !(name_entry.OffsetToData & 0x80000000U) ||
         !version_read_resource_entry(
             file, resource_base, resource_size,
-            name_entry.OffsetToData & 0x7FFFFFFFU, 0, TRUE,
+            name_entry.OffsetToData & 0x7FFFFFFFU, 0, NULL, TRUE,
             &language_entry) ||
         (language_entry.OffsetToData & 0x80000000U)) {
         SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
@@ -451,24 +471,7 @@ DWORD WINAPI shim_GetFileVersionInfoSizeW(PCWSTR filename, DWORD *handle)
         return (DWORD)sizeof(kernel_version);
     }
 
-    DWORD file_size = 0;
-    HANDLE file = version_open_file(filename, &file_size);
-    if (file == INVALID_HANDLE_VALUE)
-        return 0;
-
-    VERSION_RESOURCE_LOCATION location;
-    BOOL found = version_locate_resource(file, file_size, &location);
-    DWORD error = GetLastError();
-    CloseHandle(file);
-    if (!found) {
-        SetLastError(error);
-        serial_puts("[VERSION] PE has no usable RT_VERSION resource\n");
-        return 0;
-    }
-
-    SetLastError(0);
-    serial_puts("[VERSION] PE RT_VERSION resource found\n");
-    return location.size;
+    return shim_GetFileVersionInfoSizeExW(3, filename, handle);
 }
 
 DWORD WINAPI shim_GetFileVersionInfoSizeA(PCSTR filename, DWORD *handle)
@@ -494,35 +497,7 @@ BOOL WINAPI shim_GetFileVersionInfoW(PCWSTR filename, DWORD handle,
         return FALSE;
     }
     if (!version_is_kernel_module(filename)) {
-        DWORD file_size = 0;
-        HANDLE file = version_open_file(filename, &file_size);
-        if (file == INVALID_HANDLE_VALUE)
-            return FALSE;
-
-        VERSION_RESOURCE_LOCATION location;
-        BOOL found = version_locate_resource(file, file_size, &location);
-        DWORD error = GetLastError();
-        if (!found) {
-            CloseHandle(file);
-            SetLastError(error);
-            return FALSE;
-        }
-        if (!data || length < location.size) {
-            CloseHandle(file);
-            SetLastError(ERROR_INSUFFICIENT_BUFFER);
-            return FALSE;
-        }
-
-        BOOL read = version_read_at(file, location.file_offset, data,
-                                    location.size);
-        error = GetLastError();
-        CloseHandle(file);
-        if (!read) {
-            SetLastError(error);
-            return FALSE;
-        }
-        SetLastError(0);
-        return TRUE;
+        return shim_GetFileVersionInfoExW(3, filename, handle, length, data);
     }
     if (!data || length < sizeof(kernel_version)) {
         SetLastError(ERROR_INSUFFICIENT_BUFFER);
@@ -660,7 +635,7 @@ static BOOL version_find_child(const VERSION_NODE *parent,
 }
 
 static BOOL version_query_native(PCVOID block, PCWSTR sub_block,
-                                 PVOID *buffer, UINT *length)
+                                 PVOID *buffer, UINT *length, BOOL *text)
 {
     const BYTE *root_start = (const BYTE *)block;
     WORD root_length = version_read_u16(root_start);
@@ -690,6 +665,7 @@ static BOOL version_query_native(PCVOID block, PCWSTR sub_block,
 
     *buffer = (PVOID)current.value;
     *length = (UINT)current.value_length;
+    if (text) *text = current.type == 1;
     return TRUE;
 }
 
@@ -715,7 +691,7 @@ static BOOL version_query_value(PCVOID block, PCWSTR sub_block,
             SetLastError(0);
             return TRUE;
         }
-    } else if (version_query_native(block, sub_block, buffer, length)) {
+    } else if (version_query_native(block, sub_block, buffer, length, NULL)) {
         SetLastError(0);
         return TRUE;
     }
@@ -759,7 +735,32 @@ BOOL WINAPI shim_VerQueryValueA(PCVOID block, PCSTR sub_block,
 
     PVOID value = NULL;
     UINT value_length = 0;
-    BOOL result = version_query_value(block, wide, &value, &value_length);
+    BOOL text = FALSE;
+    BOOL result;
+    if (version_read_u32(block) == VS_FFI_SIGNATURE)
+        result = version_query_value(block, wide, &value, &value_length);
+    else {
+        result = version_query_native(block, wide, &value, &value_length, &text);
+        SetLastError(result ? 0 : ERROR_RESOURCE_DATA_NOT_FOUND);
+    }
+    if (result && text && value_length) {
+        DWORD root = version_read_u16(block);
+        DWORD aligned_root = (root + 3) & ~3U;
+        SIZE_T offset = (const BYTE *)value - (const BYTE *)block;
+        /* Ex buffers reserve a second resource-sized area for ANSI queries.
+         * Only use it when the loader's trailer proves that layout. */
+        if (offset > root || value_length > (root - offset) / sizeof(WCHAR) ||
+            version_read_u32((const BYTE *)block + aligned_root) != 0x58324546U) {
+            result = FALSE;
+            SetLastError(ERROR_INVALID_PARAMETER);
+        } else {
+            PSTR ansi = (PSTR)block + aligned_root + 4 + offset;
+            int converted = WideCharToMultiByte(0, 0, value, (int)value_length,
+                                                 ansi, (int)(root - offset), NULL, NULL);
+            if (!converted) result = FALSE;
+            else { value = ansi; value_length = (UINT)converted; }
+        }
+    }
     DWORD error = GetLastError();
     LocalFree(wide);
     if (result) {
@@ -770,7 +771,208 @@ BOOL WINAPI shim_VerQueryValueA(PCVOID block, PCSTR sub_block,
     return result;
 }
 
+extern DWORD WINAPI GetUserDefaultLCID(void);
+extern int WINAPI GetLocaleInfoW(DWORD locale, DWORD type, PWSTR data, int chars);
+
+/* Read resources as data, without executing or registering the queried image. */
+static BYTE *version_file_resource(PCWSTR filename, const char *type, DWORD *size)
+{
+    DWORD file_size = 0;
+    HANDLE file = version_open_file(filename, &file_size);
+    if (file == INVALID_HANDLE_VALUE) return NULL;
+    VERSION_RESOURCE_LOCATION location;
+    BYTE *data = NULL;
+    if (version_locate_resource(file, file_size, type, &location)) {
+        data = LocalAlloc(0, location.size);
+        if (!data) SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        else if (!version_read_at(file, location.file_offset, data, location.size)) {
+            LocalFree(data); data = NULL;
+        } else *size = location.size;
+    } else if (GetLastError() == ERROR_RESOURCE_DATA_NOT_FOUND) SetLastError(1813);
+    DWORD error = GetLastError();
+    CloseHandle(file); SetLastError(error);
+    return data;
+}
+
+static BOOL version_mui_header(const BYTE *data, DWORD size, unsigned kind)
+{
+    return data && size >= 136 && version_read_u32(data) == 0xFECDFECDU &&
+           version_read_u32(data + 4) >= 136 && version_read_u32(data + 4) <= size &&
+           version_read_u32(data + 8) == 0x10000 &&
+           (version_read_u32(data + 16) & 3) == kind;
+}
+
+static BOOL version_mui_language(const BYTE *data, DWORD size, unsigned field,
+                                  WCHAR language[85])
+{
+    DWORD offset = version_read_u32(data + field), bytes = version_read_u32(data + field + 4);
+    if (offset < 136 || bytes < 4 || bytes > 170 || (bytes & 1) ||
+        !version_range_valid(offset, bytes, size)) return FALSE;
+    unsigned count = bytes / 2;
+    for (unsigned i = 0; i < count; i++) {
+        WCHAR ch = version_read_u16(data + offset + i * 2);
+        language[i] = ch;
+        if (!ch) return i > 0 && i == count - 1;
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+              (ch >= '0' && ch <= '9') || ch == '-')) return FALSE;
+    }
+    return FALSE;
+}
+
+static BYTE *version_mui_resource(PCWSTR filename, PCWSTR language,
+                                   const BYTE *neutral, DWORD *size)
+{
+    SIZE_T length = 0, prefix = 0, lang = 0;
+    while (filename[length]) {
+        if (length >= 32760) return NULL;
+        if (filename[length] == '/' || filename[length] == '\\') prefix = length + 1;
+        length++;
+    }
+    while (language[lang]) { if (lang >= 84) return NULL; lang++; }
+    PWSTR path = LocalAlloc(0, (length + lang + 7) * sizeof(WCHAR));
+    if (!path) return NULL;
+    SIZE_T n = 0;
+    for (SIZE_T i = 0; i < prefix; i++) path[n++] = filename[i];
+    for (SIZE_T i = 0; i < lang; i++) path[n++] = language[i];
+    path[n++] = '/';
+    for (SIZE_T i = prefix; i < length; i++) path[n++] = filename[i];
+    path[n++] = '.'; path[n++] = 'm'; path[n++] = 'u'; path[n++] = 'i'; path[n] = 0;
+    DWORD config_size = 0;
+    BYTE *config = version_file_resource(path, "MUI", &config_size), *result = NULL;
+    WCHAR declared[85];
+    BOOL match = version_mui_header(config, config_size, 2) &&
+                 version_mui_language(config, config_size, 116, declared);
+    if (match) {
+        for (unsigned i = 44; i < 60; i++) if (neutral[i] != config[i]) match = FALSE;
+        for (SIZE_T i = 0; i <= lang; i++)
+            if (version_ascii_lower(declared[i]) != version_ascii_lower(language[i])) { match = FALSE; break; }
+    }
+    if (match) result = version_file_resource(path, NULL, size);
+    if (config) LocalFree(config);
+    LocalFree(path);
+    return result;
+}
+
+static BYTE *version_selected_resource(DWORD flags, PCWSTR filename, DWORD *size)
+{
+    if (!filename || !*filename) { SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND); return NULL; }
+    char requested[260], physical[260];
+    WCHAR resolved[261];
+    if (!WideCharToMultiByte(65001, 0, filename, -1, requested,
+                             sizeof(requested), NULL, NULL)) return NULL;
+    if (!dll_resolve_data_path(requested, physical)) return NULL;
+    /* A leading separator keeps the resolved volume-relative path independent
+     * of the current directory, including for its sibling MUI resources. */
+    resolved[0] = '\\';
+    if (!MultiByteToWideChar(65001, 0, physical, -1, resolved + 1, 260)) return NULL;
+    filename = resolved;
+    DWORD neutral_size = 0;
+    BYTE *neutral = version_file_resource(filename, NULL, &neutral_size);
+    DWORD error = GetLastError();
+    if (flags & 1) {
+        DWORD config_size = 0;
+        BYTE *config = version_file_resource(filename, "MUI", &config_size);
+        if (version_mui_header(config, config_size, 1)) {
+            WCHAR language[85], fallback[85];
+            BYTE *localized = NULL;
+            DWORD localized_size = 0;
+            if (GetLocaleInfoW(GetUserDefaultLCID(), 0x5c, language, 85) > 1)
+                localized = version_mui_resource(filename, language, config, &localized_size);
+            if (!localized && version_mui_language(config, config_size, 124, fallback))
+                localized = version_mui_resource(filename, fallback, config, &localized_size);
+            if (localized) {
+                /* NEUTRAL selects the main file's fixed information, while
+                 * LOCALIZED alone selects the complete language resource. */
+                if ((flags & 2) && neutral && neutral_size >= 92 && localized_size >= 92 &&
+                    version_read_u32(neutral + 40) == VS_FFI_SIGNATURE &&
+                    version_read_u32(localized + 40) == VS_FFI_SIGNATURE)
+                    version_copy(localized + 40, neutral + 40, 52);
+                if (neutral) LocalFree(neutral);
+                neutral = localized; neutral_size = localized_size;
+            }
+        }
+        if (config) LocalFree(config);
+    }
+    if (!neutral) { SetLastError(error); return NULL; }
+    DWORD root = neutral_size >= 6 ? version_read_u16(neutral) : 0;
+    if (root < 6 || root > neutral_size) {
+        LocalFree(neutral); SetLastError(13); return NULL;
+    }
+    *size = root;
+    SetLastError(0);
+    return neutral;
+}
+
+DWORD WINAPI shim_GetFileVersionInfoSizeExW(DWORD flags, PCWSTR filename, DWORD *handle)
+{
+    if (handle) *handle = 0;
+    DWORD size = 0;
+    BYTE *data = version_selected_resource(flags, filename, &size);
+    if (!data) return 0;
+    LocalFree(data);
+    SetLastError(0);
+    return ((size + 3) & ~3U) * 2 + 4;
+}
+
+BOOL WINAPI shim_GetFileVersionInfoExW(DWORD flags, PCWSTR filename, DWORD handle,
+                                       DWORD length, PVOID output)
+{
+    (void)handle;
+    if (length < 72) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+    DWORD size = 0;
+    BYTE *data = version_selected_resource(flags, filename, &size);
+    if (!data) return FALSE;
+    if (length < 92) {
+        LocalFree(data); SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE;
+    }
+    if (!output || size < 6) {
+        LocalFree(data); SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
+    }
+    DWORD copied = ((length - 4) / 2) & ~3U;
+    if (copied > size) copied = size;
+    version_copy(output, data, copied);
+    if (copied < version_read_u16(data)) *(WORD *)output = (WORD)copied;
+    BYTE *trailer = (BYTE *)output + ((copied + 3) & ~3U);
+    trailer[0] = 'F'; trailer[1] = 'E'; trailer[2] = '2'; trailer[3] = 'X';
+    if ((flags & 3) == 3) {
+        /* Native combined-mode retrieval overlays the fixed record after
+         * truncation, even when it overlaps the ANSI conversion trailer. */
+        if (length < 96 || size < 92) {
+            LocalFree(data); SetLastError(13); return FALSE;
+        }
+        version_copy((BYTE *)output + 40, data + 40, 52);
+    }
+    LocalFree(data);
+    SetLastError(0);
+    return TRUE;
+}
+
+DWORD WINAPI shim_GetFileVersionInfoSizeExA(DWORD flags, PCSTR filename, DWORD *handle)
+{
+    if (handle) *handle = 0;
+    if (!filename) { SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND); return 0; }
+    PWSTR wide = version_ansi_to_wide(filename);
+    if (!wide) return 0;
+    DWORD result = shim_GetFileVersionInfoSizeExW(flags, wide, handle), error = GetLastError();
+    LocalFree(wide); SetLastError(error); return result;
+}
+
+BOOL WINAPI shim_GetFileVersionInfoExA(DWORD flags, PCSTR filename, DWORD handle,
+                                       DWORD length, PVOID data)
+{
+    if (length < 72) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+    if (!filename) { SetLastError(ERROR_RESOURCE_DATA_NOT_FOUND); return FALSE; }
+    PWSTR wide = version_ansi_to_wide(filename);
+    if (!wide) return FALSE;
+    BOOL result = shim_GetFileVersionInfoExW(flags, wide, handle, length, data);
+    DWORD error = GetLastError(); LocalFree(wide); SetLastError(error); return result;
+}
+
 static const WIN32_EXPORT version_exports[] = {
+    { "GetFileVersionInfoSizeExA", (PVOID)shim_GetFileVersionInfoSizeExA, 3, CC_STDCALL },
+    { "GetFileVersionInfoSizeExW", (PVOID)shim_GetFileVersionInfoSizeExW, 3, CC_STDCALL },
+    { "GetFileVersionInfoExA", (PVOID)shim_GetFileVersionInfoExA, 5, CC_STDCALL },
+    { "GetFileVersionInfoExW", (PVOID)shim_GetFileVersionInfoExW, 5, CC_STDCALL },
     { "GetFileVersionInfoSizeA", (PVOID)shim_GetFileVersionInfoSizeA,
       2, CC_STDCALL },
     { "GetFileVersionInfoSizeW", (PVOID)shim_GetFileVersionInfoSizeW,

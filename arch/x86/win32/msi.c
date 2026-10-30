@@ -42,6 +42,7 @@ struct msi_db {
     char     *strbuf;     /* concatenated null-terminated strings */
     uint32_t *str_start;  /* offset of string id within strbuf */
     uint32_t  nstrings;
+    uint32_t  codepage;
     int       strref;     /* string-reference width: 2 or 3 */
     msi_table_t tables[MSI_MAX_TABLES];
     int       ntables;
@@ -54,6 +55,11 @@ typedef struct {
     uint32_t     size;
     uint32_t     nrows;
 } msi_loaded_t;
+
+struct msi_table_view {
+    msi_db_t *db;
+    msi_loaded_t loaded;
+};
 
 /* ── small string helpers ────────────────────────────────────── */
 
@@ -133,12 +139,17 @@ static int build_strings(msi_db_t *db)
     uint32_t dsz = 0, psz = 0;
     uint8_t *sdata = ole2_read_index(db->ole, si, &dsz);
     uint8_t *pool  = ole2_read_index(db->ole, pi, &psz);
-    if (!pool) { if (sdata) kfree(sdata); return -1; }
+    if (!pool || psz < 4 || psz % 4) {
+        if (sdata) kfree(sdata);
+        if (pool) kfree(pool);
+        return -1;
+    }
 
     uint32_t nent = psz / 4;       /* 4-byte entries (refcount, length) */
     uint32_t codepage = (nent >= 1)
         ? ((uint32_t)rd16(pool) | ((uint32_t)rd16(pool + 2) << 16)) : 0;
     db->strref = (codepage & 0x80000000u) ? 3 : 2;
+    db->codepage = codepage & 0x7fffffffU;
 
     /* Pass 1: count strings (id 0 = "") and total byte length.            */
     /* Follows the Wine/libmsi overflow rule: a size==0,refs!=0 entry is a  */
@@ -148,18 +159,21 @@ static int build_strings(msi_db_t *db)
         uint16_t len  = rd16(pool + i * 4);       /* word0 = length */
         uint16_t refs = rd16(pool + i * 4 + 2);   /* word1 = refcount */
         uint32_t L = len;
-        if (len == 0 && refs != 0 && i + 1 < nent) {
+        if (len == 0 && refs != 0) {
+            if (i + 1 >= nent) goto invalid_pool;
             /* overflow marker: 32-bit length = next.len | (refs << 16) */
             L = (uint32_t)rd16(pool + (i + 1) * 4) | ((uint32_t)refs << 16);
             i++;
         }
+        if (totlen > dsz || L > dsz - totlen || (L && !sdata)) goto invalid_pool;
         totlen += L;
         nstr++; i++;
     }
 
+    if ((uint64_t)totlen + nstr + 1 > UINT32_MAX) goto invalid_pool;
     db->nstrings  = nstr;
     db->str_start = (uint32_t *)kmalloc((uint64_t)nstr * 4);
-    db->strbuf    = (char *)kmalloc(totlen + nstr + 1);
+    db->strbuf    = (char *)kmalloc((uint64_t)totlen + nstr + 1);
     if (!db->str_start || !db->strbuf) {
         if (sdata) kfree(sdata); kfree(pool); return -1;
     }
@@ -188,6 +202,10 @@ static int build_strings(msi_db_t *db)
     serial_puts(" strings, strref="); serial_putdec(db->strref);
     serial_puts("\n");
     return 0;
+invalid_pool:
+    if (sdata) kfree(sdata);
+    kfree(pool);
+    return -1;
 }
 
 /* ── table metadata from _Columns ────────────────────────────── */
@@ -207,6 +225,7 @@ static msi_table_t *get_or_add_table(msi_db_t *db, const char *name)
 
 static uint8_t width_for_type(msi_db_t *db, uint16_t type)
 {
+    if ((type & 0x0fffU) == 0x0900U) return 2; /* Binary markers are not string IDs. */
     if (type & MSITYPE_STRING) return (uint8_t)db->strref;
     uint8_t w = (uint8_t)(type & 0xff);
     if (w != 2 && w != 4) w = 2;
@@ -223,6 +242,7 @@ static int build_columns(msi_db_t *db)
 
     int sr = db->strref;
     uint32_t roww = (uint32_t)sr + 2 + (uint32_t)sr + 2;
+    if (size % roww) { kfree(col); return -1; }
     uint32_t nrows = roww ? size / roww : 0;
 
     /* column-major bases */
@@ -240,14 +260,18 @@ static int build_columns(msi_db_t *db)
 
         const char *tname = msi_string(db, tid);
         const char *cname = msi_string(db, nid);
-        if (num == 0) continue;                       /* null column index */
+        if (!tid || tid >= db->nstrings || !nid || nid >= db->nstrings ||
+            !*tname || !*cname || mstrlen(tname) >= MSI_NAME || mstrlen(cname) >= MSI_NAME) {
+            kfree(col); return -1;
+        }
+        if (num == 0 || typ == 0) { kfree(col); return -1; }
         uint16_t type   = (uint16_t)(typ - 0x8000);   /* int unbias (2-byte) */
         int      colnum = (int)(num - 0x8000);        /* Number is a biased int */
         int pos = colnum - 1;
-        if (pos < 0 || pos >= MSI_MAX_COLS) continue;
+        if (pos < 0 || pos >= MSI_MAX_COLS) { kfree(col); return -1; }
 
         msi_table_t *t = get_or_add_table(db, tname);
-        if (!t) continue;
+        if (!t || t->cols[pos].width) { kfree(col); return -1; }
         int j = 0; for (const char *p = cname; *p && j < MSI_NAME - 1; p++) t->cols[pos].name[j++] = *p;
         t->cols[pos].name[j] = 0;
         t->cols[pos].type  = type;
@@ -259,8 +283,11 @@ static int build_columns(msi_db_t *db)
     serial_puts(" tables\n");
 
     /* bind each table to its data stream */
-    for (int i = 0; i < db->ntables; i++)
+    for (int i = 0; i < db->ntables; i++) {
+        for (int c = 0; c < db->tables[i].ncols; c++)
+            if (!db->tables[i].cols[c].width) { kfree(col); return -1; }
         db->tables[i].ole_index = find_stream(db->ole, db->tables[i].name);
+    }
 
     kfree(col);
     return 0;
@@ -306,12 +333,20 @@ static int load_table(msi_db_t *db, const char *name, msi_loaded_t *lt)
 {
     memset(lt, 0, sizeof(*lt));
     msi_table_t *t = tbl(db, name);
-    if (!t || t->ole_index < 0) return -1;
+    if (!t) return -1;
     lt->meta = t;
+    if (t->ole_index < 0) return 0; /* A declared table may have no rows. */
+    uint32_t declared_size = 0;
+    if (!ole2_enum(db->ole, t->ole_index, NULL, 0, &declared_size, NULL)) return -1;
+    if (!declared_size) return 0;
     lt->data = ole2_read_index(db->ole, t->ole_index, &lt->size);
     if (!lt->data) return -1;
     uint32_t roww = 0;
     for (int i = 0; i < t->ncols; i++) roww += t->cols[i].width;
+    if (!roww || lt->size % roww) {
+        kfree(lt->data); lt->data = NULL;
+        return -1;
+    }
     lt->nrows = roww ? lt->size / roww : 0;
     return 0;
 }
@@ -335,6 +370,7 @@ static int col_off(msi_loaded_t *lt, const char *cname,
 static uint32_t raw_cell(msi_loaded_t *lt, uint32_t row, const char *cname, uint8_t *wout)
 {
     uint32_t base; uint8_t w;
+    if (row >= lt->nrows) { if (wout) *wout = 0; return 0; }
     if (!col_off(lt, cname, &base, &w)) { if (wout) *wout = 0; return 0; }
     const uint8_t *p = lt->data + base + row * w;
     uint32_t v = 0;
@@ -356,6 +392,106 @@ static int32_t cell_i(msi_loaded_t *lt, uint32_t row, const char *cname)
     if (raw == 0) return 0;                       /* null */
     if (w == 2) return (int32_t)(raw - 0x8000u);
     return (int32_t)(raw - 0x80000000u);
+}
+
+uint32_t msi_codepage(msi_db_t *db) { return db ? db->codepage : 0; }
+uint32_t msi_table_count(msi_db_t *db) { return db ? (uint32_t)db->ntables : 0; }
+const char *msi_table_name(msi_db_t *db, uint32_t index)
+{
+    return db && index < (uint32_t)db->ntables ? db->tables[index].name : NULL;
+}
+msi_table_view_t *msi_table_open(msi_db_t *db, const char *name)
+{
+    if (!db || !name) return NULL;
+    msi_table_view_t *view = kmalloc(sizeof(*view));
+    if (!view) return NULL;
+    view->db = db;
+    if (load_table(db, name, &view->loaded)) { kfree(view); return NULL; }
+    return view;
+}
+void msi_table_close(msi_table_view_t *view)
+{
+    if (view) { free_table(&view->loaded); kfree(view); }
+}
+uint32_t msi_table_rows(msi_table_view_t *view) { return view ? view->loaded.nrows : 0; }
+uint32_t msi_table_columns(msi_table_view_t *view)
+{
+    return view ? (uint32_t)view->loaded.meta->ncols : 0;
+}
+const char *msi_table_column_name(msi_table_view_t *view, uint32_t column)
+{
+    return column < msi_table_columns(view) ? view->loaded.meta->cols[column].name : NULL;
+}
+uint16_t msi_table_column_type(msi_table_view_t *view, uint32_t column)
+{
+    return column < msi_table_columns(view) ? view->loaded.meta->cols[column].type : 0;
+}
+int msi_table_column(msi_table_view_t *view, const char *name)
+{
+    if (name) for (uint32_t i = 0; i < msi_table_columns(view); i++)
+        if (meq(msi_table_column_name(view, i), name)) return (int)i;
+    return -1;
+}
+int msi_table_value(msi_table_view_t *view, uint32_t row, uint32_t column, msi_value_t *out)
+{
+    if (!out || row >= msi_table_rows(view) || column >= msi_table_columns(view)) return 0;
+    *out = (msi_value_t){0};
+    msi_col_t *col = &view->loaded.meta->cols[column];
+    uint32_t raw = raw_cell(&view->loaded, row, col->name, NULL);
+    if (!raw) return 1;
+    if ((col->type & 0x0fffU) == 0x0900U) out->kind = MSI_VALUE_STREAM;
+    else if (col->type & MSITYPE_STRING) {
+        if (raw >= view->db->nstrings) return 0;
+        out->kind = MSI_VALUE_STRING;
+        out->string = msi_string(view->db, raw);
+    } else {
+        out->kind = MSI_VALUE_INTEGER;
+        out->integer = cell_i(&view->loaded, row, col->name);
+    }
+    return 1;
+}
+uint8_t *msi_table_read_binary(msi_table_view_t *view, uint32_t row, uint32_t column, uint32_t *size)
+{
+    if (size) *size = 0;
+    msi_value_t value;
+    if (!msi_table_value(view, row, column, &value) || value.kind != MSI_VALUE_STREAM) return NULL;
+    char name[256];
+    uint32_t used = mstrlen(view->loaded.meta->name);
+    memcpy(name, view->loaded.meta->name, used);
+    for (uint32_t c = 0; c < msi_table_columns(view); c++) {
+        if (!(msi_table_column_type(view, c) & 0x2000U)) continue;
+        if (!msi_table_value(view, row, c, &value) || value.kind == MSI_VALUE_NULL) return NULL;
+        char number[16];
+        const char *key;
+        if (value.kind == MSI_VALUE_INTEGER) {
+            unsigned n = sizeof(number); number[--n] = 0;
+            uint32_t magnitude = value.integer < 0 ? 0U - (uint32_t)value.integer : (uint32_t)value.integer;
+            do { number[--n] = (char)('0' + magnitude % 10); magnitude /= 10; } while (magnitude);
+            if (value.integer < 0) number[--n] = '-';
+            key = number + n;
+        } else if (value.kind == MSI_VALUE_STRING) key = value.string;
+        else return NULL;
+        uint32_t length = mstrlen(key);
+        if (length >= sizeof(name) - used - 1U) return NULL;
+        name[used++] = '.';
+        memcpy(name + used, key, length); used += length;
+    }
+    name[used] = 0;
+    int index = find_stream(view->db->ole, name);
+    uint32_t length = 0;
+    if (index < 0 || !ole2_enum(view->db->ole, index, NULL, 0, &length, NULL)) return NULL;
+    /* Preserve success for a present, empty binary stream. */
+    return length ? ole2_read_index(view->db->ole, index, size) : kmalloc(1);
+}
+
+uint8_t *msi_read_stream(msi_db_t *db, const char *name, uint32_t *size)
+{
+    if (size) *size = 0;
+    if (!db || !name) return NULL;
+    int index = find_stream(db->ole, name);
+    uint32_t length = 0;
+    if (index < 0 || !ole2_enum(db->ole, index, NULL, 0, &length, NULL)) return NULL;
+    return length ? ole2_read_index(db->ole, index, size) : kmalloc(1);
 }
 
 /* ── Directory tree resolution ───────────────────────────────── */
@@ -543,9 +679,13 @@ int msi_install(msi_db_t *db, const char *pkg_name)
     installer_manifest_begin(pkg_name);
 
     int written = 0;
+    int failed = (tbl(db, "Directory") && !has_dir) || (tbl(db, "Component") && !has_comp) ||
+                 (tbl(db, "File") && !has_file) || (tbl(db, "Media") && !has_media) ||
+                 (tbl(db, "Registry") && !has_reg) ||
+                 (has_file && file.nrows && (!has_comp || !has_dir));
     cab_cache_t cc; memset(&cc, 0, sizeof cc);
 
-    if (has_file && has_comp && has_dir) {
+    if (!failed && has_file && has_comp && has_dir) {
         for (uint32_t r = 0; r < file.nrows; r++) {
             const char *fkey  = cell_s(db, &file, r, "File");
             const char *comp_ = cell_s(db, &file, r, "Component_");
@@ -554,6 +694,7 @@ int msi_install(msi_db_t *db, const char *pkg_name)
 
             /* component → directory key → resolved path */
             int cr = find_row_str(db, &comp, "Component", comp_);
+            if (cr < 0) { failed = 1; break; }
             const char *dirkey = (cr >= 0) ? cell_s(db, &comp, (uint32_t)cr, "Directory_") : "";
             char dirpath[512];
             resolve_dir(db, &dir, dirkey, dirpath, sizeof dirpath);
@@ -578,16 +719,24 @@ int msi_install(msi_db_t *db, const char *pkg_name)
 
             if (!bytes) {
                 serial_puts("[MSI] missing payload for "); serial_puts(fkey); serial_puts("\n");
-                continue;
+                failed = 1;
+                break;
             }
 
+            int32_t expected_size = cell_i(&file, r, "FileSize");
+            if (expected_size < 0 || bsz != (uint32_t)expected_size) {
+                kfree(bytes);
+                failed = 1;
+                break;
+            }
             serial_puts("[MSI] install "); serial_puts(target);
             serial_puts(" ("); serial_putdec(bsz); serial_puts(" bytes)\n");
             if (installer_write_file(target, bytes, bsz) == 0) {
                 installer_manifest_add(target);
                 written++;
-            }
+            } else failed = 1;
             kfree(bytes);
+            if (failed) break;
         }
     } else {
         serial_puts("[MSI] no File/Component/Directory tables — nothing to extract\n");
@@ -596,7 +745,7 @@ int msi_install(msi_db_t *db, const char *pkg_name)
     if (cc.cab)     cab_close(cc.cab);
     if (cc.cab_buf) kfree(cc.cab_buf);
 
-    if (has_reg) {
+    if (!failed && has_reg) {
         for (uint32_t r = 0; r < reg.nrows; r++) {
             int32_t root    = cell_i(&reg, r, "Root");
             const char *key = cell_s(db, &reg, r, "Key");
@@ -609,7 +758,7 @@ int msi_install(msi_db_t *db, const char *pkg_name)
         advapi32_registry_flush();
     }
 
-    installer_manifest_commit();
+    if (!failed) installer_manifest_commit();
 
     if (has_dir)   free_table(&dir);
     if (has_comp)  free_table(&comp);
@@ -617,7 +766,8 @@ int msi_install(msi_db_t *db, const char *pkg_name)
     if (has_media) free_table(&media);
     if (has_reg)   free_table(&reg);
 
-    serial_puts("[MSI] install complete: "); serial_putdec((uint64_t)written);
+    serial_puts(failed ? "[MSI] install failed after: " : "[MSI] install complete: ");
+    serial_putdec((uint64_t)written);
     serial_puts(" files\n");
-    return written;
+    return failed ? -1 : written;
 }

@@ -259,5 +259,7 @@ void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
 void hda_play_buffer(const int16_t *samples, uint32_t num_frames);
 void hda_stop(void);
 bool hda_is_ready(void);
+/* Irreversible kexec only: peers/interrupts stopped and PCI DMA disabled. */
+bool hda_kexec_quiesce(void);
 
 #endif /* OSITOK_HDA_H */

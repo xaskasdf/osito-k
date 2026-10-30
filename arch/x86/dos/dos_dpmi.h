@@ -77,6 +77,8 @@ enum {
 #define DOS_RM_SERVICE_INT            0xF8
 #define DPMI_SAVE_STATE_OFF           0x0110
 #define DPMI_RAW_SWITCH_OFF           0x0118
+/* Distinct real far pointers may alias the same two-byte ROM instruction. */
+#define DPMI_RAW_ALIAS_COUNT ((0xFFFFu - DPMI_RAW_SWITCH_OFF - 2u) / 16u + 1u)
 #define DPMI_EXCEPTION_RETURN_OFF     0x0120
 #define DPMI_RM_RETURN_OFF            0x0128
 #define DPMI_CALLBACK_RETURN_OFF      0x0140
@@ -93,6 +95,8 @@ enum {
 #define DPMI_CALLBACK_BASE_OFF        0x0200
 #define DPMI_CALLBACK_STUB_SIZE       4
 #define DPMI_PM_REFLECT_BASE_OFF      0x1000
+#define DPMI_CALLBACK_ADDRESS_COUNT \
+    ((DPMI_PM_REFLECT_BASE_OFF - DPMI_CALLBACK_BASE_OFF) / DPMI_CALLBACK_STUB_SIZE)
 #define DPMI_PM_HW_REFLECT_BASE_OFF   0x1400
 #define DPMI_PM_REFLECT_STUB_SIZE     4
 #define DPMI_RM_INT_BASE_OFF          0x1800
@@ -101,7 +105,12 @@ enum {
 #define DOS_RM_SERVICE_STUB_SIZE      4
 #define DPMI_PM_EXCEPTION_BASE_OFF    0x2000
 #define DPMI_PM_EXCEPTION_STUB_SIZE   4
-#define DPMI_RM_STACK_TOP             0xFFFE
+#define DOS_IRQ13_HANDLER_OFF        0x2090u
+/* Low-memory host data follows the ROM service/exception stubs. */
+#define DPMI_RM_STACK_BASE_OFF        0x2200u
+#define DPMI_RM_STACK_SIZE            0x200u
+#define DPMI_RM_STACK_COUNT \
+    ((0x10000u - DPMI_RM_STACK_BASE_OFF) / DPMI_RM_STACK_SIZE)
 
 /* Resident host stacks are excluded from the extended-memory allocator. */
 #define DPMI_EXT_BASE                 0x100000
@@ -195,7 +204,11 @@ typedef struct dpmi_state {
     bool active;
     bool is_32bit;
     bool virtual_interrupts_enabled;
+    bool coprocessor_requested;
+    uint8_t coprocessor_control;
     uint16_t owner_psp;
+    uint64_t client_id;
+    uint16_t raw_real_segment;
 
     dpmi_descriptor_t ldt[DPMI_MAX_DESCRIPTORS];
     uint8_t descriptor_state[DPMI_MAX_DESCRIPTORS];
@@ -208,14 +221,17 @@ typedef struct dpmi_state {
     uint16_t sel_psp;
     uint16_t sel_env;
     uint16_t sel_host_code;
+    uint16_t sel_interrupt_return;
     uint16_t sel_exception_stack;
+    uint32_t locked_stack_base;
+    bool locked_stack_allocated;
+    uint32_t real_stack_base;
 
     uint16_t saved_cs, saved_ip;
     uint16_t saved_ss, saved_sp;
     uint16_t saved_ds, saved_es;
 
     dpmi_mem_block_t mem_blocks[DPMI_MAX_MEM_BLOCKS];
-    uint8_t ext_page_bitmap[DPMI_EXT_BITMAP_SIZE];
     uint32_t next_handle;
 
     dpmi_callback_t callbacks[DPMI_MAX_CALLBACKS];
@@ -225,6 +241,7 @@ typedef struct dpmi_state {
     dpmi_stack_t callback_real_stacks[DPMI_MAX_CALLBACKS];
     dpmi_paging_t callback_real_paging[DPMI_MAX_CALLBACKS];
     uint8_t callback_depth;
+    dpmi_host_wait_t *callback_wait;
     uint8_t control_depth;
     dpmi_stack_t suspended_stack;
     dpmi_stack_t real_mode_stack;
@@ -243,6 +260,31 @@ typedef struct dpmi_state {
     dpmi_host_wait_t *host_wait;
     uint8_t exception_depth;
 } dpmi_state_t;
+
+/* A host call owns these cursors, not the storage slot holding its client. */
+typedef struct {
+    uint64_t client_id;
+    dpmi_stack_t suspended_stack, real_stack;
+    dpmi_paging_t suspended_paging, real_paging;
+    dpmi_host_wait_t *host_wait, *callback_wait;
+    uint8_t exception_depth, callback_depth, control_depth, interrupt_depth;
+    bool virtual_if;
+} dpmi_host_activation_t;
+
+dpmi_host_activation_t dpmi_host_activation_save(const dpmi_state_t *client);
+void dpmi_host_activation_restore(dos_vm_t *vm, const dpmi_host_activation_t *saved);
+bool dpmi_host_resume_client(dos_vm_t *vm, uint64_t client_id);
+
+/* A host activation borrows a client without changing the primary client. */
+typedef struct dpmi_client_scope {
+    struct dpmi_client_scope *previous;
+    uint64_t caller_id;
+    bool displaced;
+    dpmi_stack_t suspended_stack;
+    dpmi_paging_t suspended_paging;
+    uint16_t psp;
+    bool protected_caller;
+} dpmi_client_scope_t;
 
 static inline uint32_t dpmi_desc_get_base(const dpmi_descriptor_t *d)
 {
@@ -293,11 +335,14 @@ static inline uint16_t dpmi_index_to_sel(uint16_t index)
 }
 
 void dpmi_init(dos_vm_t *vm);
+void dpmi_init_client(dos_vm_t *vm);
+struct cpu8086_state;
+void dpmi_apply_coprocessor(struct cpu8086_state *cpu);
+void dpmi_release_host_resources(dos_vm_t *vm);
 void dos_int2f_dispatch(dos_vm_t *vm);
 void dos_int31_dpmi(dos_vm_t *vm);
 int dpmi_selftest(void);
 void dpmi_enter_protected_mode(dos_vm_t *vm);
-bool dpmi_raw_mode_switch(dos_vm_t *vm, uint8_t private_frame_bytes);
 typedef enum {
     DPMI_SERVICE_INVALID,
     DPMI_SERVICE_COMPLETE,
@@ -305,8 +350,11 @@ typedef enum {
      * Keep its CPU state and abandon the pending operation. */
     DPMI_SERVICE_INTERRUPTED
 } dpmi_service_result_t;
+dpmi_service_result_t dpmi_raw_mode_switch(dos_vm_t *vm, uint8_t private_frame_bytes);
+const dpmi_state_t *dpmi_raw_real_owner(const dos_vm_t *vm);
 dpmi_service_result_t dpmi_save_restore_state(dos_vm_t *vm);
 bool dpmi_has_real_timer_handler(const dos_vm_t *vm);
+bool dpmi_primary_hardware_interrupt(dos_vm_t *vm, uint8_t vector);
 bool dpmi_owns_real_interrupt(const dos_vm_t *vm, uint8_t vector);
 bool dpmi_reflect_dos_interrupt(dos_vm_t *vm, uint8_t vector);
 bool dpmi_reflect_timer(dos_vm_t *vm);
@@ -319,12 +367,18 @@ bool dpmi_dispatch_default_exception(dos_vm_t *vm, uint8_t vector,
 bool dpmi_dispatch_default_real_exception(dos_vm_t *vm, uint8_t vector,
                                           uint8_t private_frame_bytes);
 uint16_t dpmi_get_host_code_selector(dos_vm_t *vm);
+uint16_t dpmi_get_interrupt_return_selector(dos_vm_t *vm);
+bool dpmi_native_interrupt_return_selector(const dos_vm_t *vm, uint16_t selector);
 uint16_t dpmi_get_exception_stack_selector(dos_vm_t *vm);
 bool dpmi_stack_span(dos_vm_t *vm, uint16_t selector, uint32_t offset,
                      uint32_t size, uint32_t *linear);
 /* Host frames: complete paged admission before payload/cursor changes.
  * Fields are in memory order, using the client's 16/32-bit ABI width. */
 bool dpmi_read_stack_frame(dos_vm_t *vm, void *data, uint32_t size);
+/* Fixed host-service input records, at most 64 bytes. Faults follow the
+ * service retry/cancellation contract; no payload is read before admission. */
+bool dpmi_read_service_record(dos_vm_t *vm, uint16_t selector, uint32_t offset,
+                               void *data, uint32_t size);
 /* Returns only after the matching validated exception return. An edited
  * CS:EIP or process termination abandons the suspended host operation. */
 bool dpmi_service_exception(dos_vm_t *vm, uint8_t vector, uint32_t error,
@@ -359,6 +413,9 @@ uint32_t dpmi_ext_total_pages(const dos_vm_t *vm);
 uint32_t dpmi_ext_free_page_count(const dos_vm_t *vm);
 uint32_t dpmi_ext_largest_free_page_count(const dos_vm_t *vm);
 uint32_t dpmi_ext_alloc_pages(dos_vm_t *vm, uint32_t count, bool high);
+bool dpmi_ext_reserve_pages(dos_vm_t *vm, uint32_t base, uint32_t count);
+bool dpmi_ext_resize_pages(dos_vm_t *vm, uint32_t base, uint32_t old_count,
+                            uint32_t new_count);
 bool dpmi_ext_free_pages(dos_vm_t *vm, uint32_t base, uint32_t count);
 
 #endif /* DOS_DPMI_H */

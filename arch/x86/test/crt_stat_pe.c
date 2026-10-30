@@ -130,11 +130,18 @@ void mainCRTStartup(void)
     OPEN_HANDLE open_handle = (OPEN_HANDLE)GetProcAddress(module, "_open_osfhandle");
     CLOSE_FD close_fd = (CLOSE_FD)GetProcAddress(module, "_close");
     FSTAT_QUERY fstat_query = (FSTAT_QUERY)GetProcAddress(module, "_fstat64");
+    const char *fd_names[6] = {"_fstat32", "_fstat32i64", "_fstat64i32", "_fstat64", "_fstat", "_fstati64"};
+    const unsigned fd_layouts[6] = {0, 1, 2, 3, sizeof(void *) == 4 ? 0 : 2, sizeof(void *) == 4 ? 1 : 3};
+    FSTAT_QUERY fd_queries[6];
     CHMOD chmod_file = (CHMOD)GetProcAddress(module, "_chmod");
     const char *names[8] = {"_stat32", "_stat32i64", "_stat64i32", "_stat64",
                             "_wstat32", "_wstat32i64", "_wstat64i32", "_wstat64"};
     STAT_QUERY query[8];
     BOOL exports = module && open_handle && close_fd && fstat_query && chmod_file;
+    for (unsigned i = 0; i < 6; ++i) {
+        fd_queries[i] = (FSTAT_QUERY)GetProcAddress(module, fd_names[i]);
+        if ((ucrt && i < 4) || (!ucrt && i >= 3)) exports = exports && fd_queries[i];
+    }
     for (unsigned i = 0; i < 8; i++) {
         query[i] = (STAT_QUERY)GetProcAddress(module, names[i]);
         if (ucrt || (i % 4) == 3) exports = exports && query[i];
@@ -166,6 +173,14 @@ void mainCRTStartup(void)
         int rc = fstat_query(fd, &result.value);
         check(rc == 0, "fstat64 query");
         if (!rc) inspect(&result, 3, creation, access, write, "fstat64 timestamps");
+        for (unsigned i = 0; i < 6; ++i) {
+            unsigned layout = fd_layouts[i];
+            if (!fd_queries[i] || (phase == 2 && layout < 2)) continue;
+            prepare(&result);
+            rc = fd_queries[i](fd, &result.value);
+            check(rc == 0, fd_names[i]);
+            if (!rc) inspect(&result, layout, creation, access, write, fd_names[i]);
+        }
         for (unsigned i = 0; i < 8; i++) {
             unsigned layout = i % 4;
             if (!query[i] || (phase == 2 && layout < 2)) continue;

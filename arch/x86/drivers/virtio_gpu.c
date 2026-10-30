@@ -7,6 +7,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/display_source.h"
 #include "../include/paging.h"
 #include "../include/drivers/virtio_gpu.h"
 #include "../kernel/smp.h"
@@ -781,7 +782,7 @@ static void virtio_gpu_free_backing(uint64_t fb_phys, uint64_t fb_size)
 
 /* ── Public Interface ─────────────────────────────────────────── */
 
-void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
+static void virtio_gpu_init_impl(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
                      uint32_t fb_width, uint32_t fb_height)
 {
     serial_puts("[VIRTIO-GPU] Initializing at ");
@@ -1056,6 +1057,15 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
     serial_puts("[VIRTIO-GPU] ============================\n");
 }
 
+void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
+                     uint32_t fb_width, uint32_t fb_height)
+{
+    display_source_change_t change={0};
+    if (!display_source_begin(&change,NULL)) return;
+    virtio_gpu_init_impl(ecam,bus,dev,func,fb_width,fb_height);
+    (void)display_source_end(&change);
+}
+
 /* ── Getters for userspace ────────────────────────────────────── */
 uint32_t *virtio_gpu_get_fb(void)   { return gpu.framebuffer; }
 uint32_t  virtio_gpu_get_width(void) { return gpu.width; }
@@ -1072,7 +1082,7 @@ bool virtio_gpu_get_native_mode(uint32_t *width, uint32_t *height)
     return true;
 }
 
-int virtio_gpu_resize(uint32_t width, uint32_t height)
+static int virtio_gpu_resize_impl(uint32_t width, uint32_t height)
 {
     uint64_t new_size;
     if (!virtio_gpu_valid_mode(width, height, &new_size))
@@ -1156,6 +1166,15 @@ int virtio_gpu_resize(uint32_t width, uint32_t height)
     serial_putdec(height);
     serial_puts("\n");
     return 0;
+}
+
+int virtio_gpu_resize(uint32_t width, uint32_t height)
+{
+    display_source_change_t change={0};
+    if (!display_source_begin(&change,NULL)) return -16;
+    int result=virtio_gpu_resize_impl(width,height);
+    (void)display_source_end(&change);
+    return result;
 }
 
 /* ── Flush (call after drawing to framebuffer) ────────────────── */

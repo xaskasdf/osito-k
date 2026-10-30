@@ -319,6 +319,7 @@ typedef struct {
     uint32_t  pos;
     uint32_t  bits;
     int       nbits;
+    bool      overflow;
 } bitwriter_t;
 
 static void bw_init(bitwriter_t *bw, uint8_t *dst, uint32_t max)
@@ -328,6 +329,7 @@ static void bw_init(bitwriter_t *bw, uint8_t *dst, uint32_t max)
     bw->pos = 0;
     bw->bits = 0;
     bw->nbits = 0;
+    bw->overflow = false;
 }
 
 static void bw_write(bitwriter_t *bw, uint32_t val, int n)
@@ -337,6 +339,8 @@ static void bw_write(bitwriter_t *bw, uint32_t val, int n)
     while (bw->nbits >= 8) {
         if (bw->pos < bw->max)
             bw->data[bw->pos++] = (uint8_t)(bw->bits & 0xFF);
+        else
+            bw->overflow = true;
         bw->bits >>= 8;
         bw->nbits -= 8;
     }
@@ -353,6 +357,7 @@ static void bw_write_rev(bitwriter_t *bw, uint32_t code, int n)
 
 static void bw_flush(bitwriter_t *bw)
 {
+    if (bw->nbits > 0 && bw->pos >= bw->max) bw->overflow = true;
     if (bw->nbits > 0 && bw->pos < bw->max) {
         bw->data[bw->pos++] = (uint8_t)(bw->bits & 0xFF);
         bw->bits = 0;
@@ -439,6 +444,7 @@ static uint32_t lz77_hash(const uint8_t *p)
 int zlib_deflate(const uint8_t *src, uint32_t src_len,
                  uint8_t *dst, uint32_t *dst_len)
 {
+    if (!dst_len || !dst || (!src && src_len)) return -1;
     uint32_t max = *dst_len;
     if (max < 8) return -1;
 
@@ -519,6 +525,7 @@ int zlib_deflate(const uint8_t *src, uint32_t src_len,
 
     emit_eob(&bw);
     bw_flush(&bw);
+    if (bw.overflow) return -1;
 
     /* Adler-32 trailer (big-endian) */
     uint32_t adler = zlib_adler32(src, src_len);

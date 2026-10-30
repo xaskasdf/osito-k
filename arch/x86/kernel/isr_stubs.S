@@ -12,6 +12,8 @@
  * All others get a dummy 0 pushed.
  */
 
+#include "../dos/dos_native_fp.h"
+
 .code64
 .text
 
@@ -26,6 +28,40 @@ isr_common:
     push %rax
     push %rcx
     push %rdx
+    /* Optional-instruction fixups also belong to APs. Only these exact
+     * kernel sites may bypass normal dispatch; never EOI a CPU exception.
+     * Three saved GPRs precede vector/error/RIP/CS in this frame. */
+    testb  $3, 48(%rsp)
+    jnz    .Lisr_probe_done
+    cmpq   $0, 32(%rsp)
+    jne    .Lisr_probe_done
+    cmpq   $13, 24(%rsp)
+    jne    .Lisr_probe_ud
+    leaq   x86_read_msr_fault(%rip), %rax
+    cmpq   %rax, 40(%rsp)
+    jne    .Lisr_probe_idle
+    leaq   x86_read_msr_fixup(%rip), %rax
+    jmp    .Lisr_probe_fixup
+.Lisr_probe_ud:
+    cmpq   $6, 24(%rsp)
+    jne    .Lisr_probe_done
+.Lisr_probe_idle:
+    leaq   x86_monitor_fault(%rip), %rax
+    cmpq   %rax, 40(%rsp)
+    je     .Lisr_probe_idle_fixup
+    leaq   x86_mwait_fault(%rip), %rax
+    cmpq   %rax, 40(%rsp)
+    jne    .Lisr_probe_done
+.Lisr_probe_idle_fixup:
+    leaq   x86_mwait_fixup(%rip), %rax
+.Lisr_probe_fixup:
+    movq   %rax, 40(%rsp)
+    pop    %rdx
+    pop    %rcx
+    pop    %rax
+    add    $16, %rsp
+    jmp    x86_compat_iret
+.Lisr_probe_done:
     cmpl   $0, isr_tsc_aux_enabled(%rip)
     je     .Lisr_read_apic_id
     rdtscp
@@ -67,6 +103,30 @@ isr_common:
     push %r14
     push %r15
 
+    /* A requested diagnostic NMI must not touch scheduler/FPU ownership,
+     * even when it interrupted another ISR with IF=0. IST5 is independent. */
+    cmpq $2, 120(%rsp)
+    jne .Lisr_not_lockup_nmi
+    cmpl $1, lockup_nmi_pending(%rip)
+    jne .Lisr_not_lockup_nmi
+    cld
+    mov %rsp, %rsi
+    lea lockup_nmi_frame(%rip), %rdi
+    mov $22, %ecx                   /* x86_interrupt_frame_t: 176 bytes */
+    rep movsq
+    mov %cr2, %rax
+    mov %rax, lockup_nmi_cr2(%rip)
+    mov %cr3, %rax
+    mov %rax, lockup_nmi_cr3(%rip)
+    mov %cr0, %rax
+    mov %rax, lockup_nmi_cr0(%rip)
+    mov %cr4, %rax
+    mov %rax, lockup_nmi_cr4(%rip)
+    addl $1, lockup_nmi_captured(%rip)
+    movl $0, lockup_nmi_pending(%rip)
+    jmp .Lisr_restore_gprs
+.Lisr_not_lockup_nmi:
+
     /* Fault gates use IST3. Keep a per-entry cursor below the live frame so
      * nested faults cannot overwrite it. R12/R13 are safe scratch registers
      * here: their interrupted values are already in the GPR save area and the
@@ -97,6 +157,24 @@ isr_common:
     /* C requires DF clear. IRETQ restores the interrupted RFLAGS. */
     cld
 
+    mov %rsp, %rbp
+    xor %r14, %r14
+    cmpq $0, g_native_dos_vm(%rip)
+    je .Lisr_process_fp
+    /* Native DOS inhibits task switching. Each interrupt, including an IRQ
+     * inside a host service, owns its image instead of overwriting the outer
+     * interrupt's process slot. Never dereference the VM under its guest CR3. */
+    sub $DOS_NATIVE_FP_FRAME_BYTES, %rsp
+    and $~0x3F, %rsp
+    mov %rsp, %r14
+    mov %rsp, %rdi
+    call dos_native_fp_save
+    mov %rbp, %rdi
+    mov %r14, %rsi
+    call dos_native_isr_dispatch
+    jmp .Lisr_handler_done
+
+.Lisr_process_fp:
     /* Pass frame pointer as argument (RSP points to saved regs) */
     mov %rsp, %rdi
 
@@ -142,6 +220,7 @@ isr_common:
     /* Call C handler */
     call isr_handler
 
+.Lisr_handler_done:
     /* The task may have slept in a PE32 SEH callback. The scheduler restores
      * its private IST3 cursor before this call chain resumes, so returning the
      * cursor to the entry value is now safe. */
@@ -150,6 +229,14 @@ isr_common:
     movq %r12, (%r13)
 .Lisr_fault_cursor_restored:
 
+    test %r14, %r14
+    jz .Lisr_process_fp_restore
+    mov %r14, %rdi
+    call dos_native_fp_restore
+    mov %rbp, %rsp
+    jmp .Lisr_fp_restored
+
+.Lisr_process_fp_restore:
     /* Restore rsp to the GPR area and load FPU state from whichever
      * process is live *now* (the scheduler may have rewritten
      * `fpu_state_ptr` while we were in C). */
@@ -175,6 +262,7 @@ isr_common:
 .Lskip_fxrstor:
     pop    %rcx
 
+.Lisr_fp_restored:
     /* ── Scheduler: check for context switch (X-SCHED) ────────── */
     /* APs returned before isr_handler, so only the BSP reaches this point. */
     xor %rax, %rax
@@ -197,6 +285,7 @@ isr_common:
     mov %rax, %rsp
 .Lno_switch:
 
+.Lisr_restore_gprs:
     /* Restore all GPRs */
     pop %r15
     pop %r14
@@ -293,6 +382,12 @@ ISR_NOERR 41
 
 /* Vector 42: RTL8111 NIC MSI interrupt. */
 ISR_NOERR 42
+
+/* Intel native graphics MSI. */
+ISR_NOERR 43
+
+/* PS/2 auxiliary port: slave PIC IRQ12, vector 0x7C. */
+ISR_NOERR 124
 
 /* ── Vector 0xFE: SMP work IPI (lightweight, no fxsave) ─────── */
 /* APs receive this to wake from HLT. Only does APIC EOI — no GPR

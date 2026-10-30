@@ -30,6 +30,9 @@ PVOID   WINAPI shim_CoTaskMemAlloc(SIZE_T size);
 void    WINAPI shim_CoTaskMemFree(PVOID ptr);
 HRESULT WINAPI shim_OleInitialize(PVOID reserved);
 void    WINAPI shim_OleUninitialize(void);
+HRESULT WINAPI shim_DoDragDrop(PVOID data_object, PVOID drop_source,
+                               DWORD allowed_effects, DWORD *effect);
+void    WINAPI shim_ReleaseStgMedium(PVOID medium);
 HRESULT WINAPI shim_RegisterDragDrop(HANDLE hwnd, PVOID drop_target);
 HRESULT WINAPI shim_RevokeDragDrop(HANDLE hwnd);
 HRESULT WINAPI shim_CoCreateGuid(PVOID guid);
@@ -43,6 +46,8 @@ PWSTR   WINAPI shim_SysAllocStringByteLen(PCSTR source, UINT length);
 void    WINAPI shim_VariantInit(PVOID variant);
 HRESULT WINAPI shim_VariantClear(PVOID variant);
 HRESULT WINAPI shim_VariantCopy(PVOID destination, PCVOID source);
+HRESULT WINAPI shim_VariantChangeType(PVOID destination, PCVOID source,
+                                      USHORT flags, USHORT type);
 
 PVOID ole32_shim_init(void);
 PVOID ole32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);

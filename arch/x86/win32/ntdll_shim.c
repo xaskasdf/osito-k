@@ -4,13 +4,14 @@
  * Provides Rtl* utility functions and an export lookup table
  * so PE imports from "ntdll.dll" resolve to our implementations.
  *
- * The Nt* functions here are kernel-side handlers called directly
- * (in OsitoK's identity-mapped model, user/kernel share address space).
- * When we add proper ring separation, these become SYSCALL wrappers.
+ * The Nt* functions here are kernel-side handlers. PE64 NTDLL entries enter
+ * through the native service gateway; internal kernel calls remain direct.
+ * The gateway is not a privilege boundary while PE code executes at CPL0.
  */
 
 #include "ntdll_shim.h"
 #include "ntsyscall.h"
+#include "ntprocess.h"
 #include "handle.h"
 #include "filelock.h"
 #include "advapi32_shim.h"
@@ -19,6 +20,7 @@
 #include "compat32.h"
 #include "unwind64.h"
 #include "win32_abi.h"
+#include "nt64_service.h"
 
 extern void *kmalloc(uint64_t size);
 extern void kfree(void *ptr);
@@ -38,6 +40,7 @@ extern int win32_user_range_executable(const void *pointer, SIZE_T size,
 extern NTSTATUS ntsync_set_event_for_process(HANDLE event, ULONG owner_pid,
                                               LONG *previous_state);
 extern BOOL win32_process_cr3(DWORD process_id, uint64_t *out_cr3);
+extern uint32_t win32_process_peb32_address(DWORD process_id);
 extern int paging_copy_between_cr3(uint64_t destination_cr3,
                                    uint64_t destination_address,
                                    uint64_t source_cr3,
@@ -128,6 +131,19 @@ BOOL NTAPI RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION section)
     return section ? TryEnterCriticalSection(section) : FALSE;
 }
 
+static BOOL NTAPI RtlIsCriticalSectionLockedByThread(
+    PRTL_CRITICAL_SECTION section)
+{
+    if (!section) return FALSE;
+    if (g_compat32_mode) {
+        const RTL_CRITICAL_SECTION32 *cs = (const void *)section;
+        return cs->RecursionCount > 0 &&
+               cs->OwningThread == GetCurrentThreadId();
+    }
+    return section->RecursionCount > 0 &&
+           (ULONG_PTR)section->OwningThread == GetCurrentThreadId();
+}
+
 NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION section)
 {
     if (!section) return STATUS_INVALID_PARAMETER;
@@ -204,11 +220,29 @@ ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status)
 {
     switch (status) {
     case STATUS_SUCCESS:                return 0;      /* ERROR_SUCCESS */
+    case STATUS_UNSUCCESSFUL:           return 31;     /* ERROR_GEN_FAILURE */
     case STATUS_INVALID_PARAMETER:      return 87;     /* ERROR_INVALID_PARAMETER */
+    case STATUS_INVALID_CID:            return 87;
+    case STATUS_INVALID_PARAMETER_MIX:  return 87;
+    case STATUS_PRIVILEGE_NOT_HELD:     return 1314;
+    case STATUS_NO_TOKEN:               return 1008;
+    case STATUS_BAD_IMPERSONATION_LEVEL:return 1346;
+    case STATUS_CANT_OPEN_ANONYMOUS:    return 1347;
+    case STATUS_BAD_TOKEN_TYPE:         return 1349;
+    case STATUS_INVALID_IMAGE_FORMAT:   return 193;    /* ERROR_BAD_EXE_FORMAT */
+    case STATUS_PROCEDURE_NOT_FOUND:    return 127;    /* ERROR_PROC_NOT_FOUND */
+    case STATUS_DLL_NOT_FOUND:          return 126;    /* ERROR_MOD_NOT_FOUND */
+    case STATUS_DLL_INIT_FAILED:        return 1114;   /* ERROR_DLL_INIT_FAILED */
     case STATUS_NO_MEMORY:              return 8;      /* ERROR_NOT_ENOUGH_MEMORY */
     case STATUS_INVALID_HANDLE:         return 6;      /* ERROR_INVALID_HANDLE */
+    case STATUS_OBJECT_TYPE_MISMATCH:   return 6;      /* ERROR_INVALID_HANDLE */
     case STATUS_HANDLE_NOT_CLOSABLE:    return 6;      /* ERROR_INVALID_HANDLE */
     case STATUS_ACCESS_DENIED:          return 5;      /* ERROR_ACCESS_DENIED */
+    case STATUS_MUTANT_NOT_OWNED:       return 288;    /* ERROR_NOT_OWNER */
+    case STATUS_SEMAPHORE_LIMIT_EXCEEDED:return 298;    /* ERROR_TOO_MANY_POSTS */
+    case STATUS_PROCESS_IS_TERMINATING: return 5;      /* ERROR_ACCESS_DENIED */
+    case STATUS_CONFLICTING_ADDRESSES:  return 487;    /* ERROR_INVALID_ADDRESS */
+    case STATUS_UNABLE_TO_FREE_VM:      return 487;    /* ERROR_INVALID_ADDRESS */
     case STATUS_INVALID_DEVICE_REQUEST: return 1;      /* ERROR_INVALID_FUNCTION */
     case STATUS_OBJECT_NAME_NOT_FOUND:  return 2;      /* ERROR_FILE_NOT_FOUND */
     case STATUS_OBJECT_PATH_NOT_FOUND:  return 3;      /* ERROR_PATH_NOT_FOUND */
@@ -231,6 +265,127 @@ ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status)
 }
 
 /* ── Export table ────────────────────────────────────────────── */
+
+static NTSTATUS ntdll_open_client(PHANDLE output, ACCESS_MASK access,
+    POBJECT_ATTRIBUTES attributes, PCLIENT_ID client,
+    NTSTATUS (*open_client)(ULONG_PTR, ULONG_PTR, ACCESS_MASK, BOOL, PHANDLE))
+{
+    BOOL compat32 = g_compat32_mode;
+    SIZE_T pointer_size = compat32 ? 4 : sizeof(HANDLE);
+    if (!win32_user_range_writable(output, pointer_size, compat32))
+        return STATUS_ACCESS_VIOLATION;
+    ULONG attr_flags = 0;
+    ULONG_PTR name = 0, pid = 0, tid = 0;
+    if (compat32) {
+        if (attributes) {
+            if (!win32_user_range_readable(attributes, 24, TRUE))
+                return STATUS_ACCESS_VIOLATION;
+            if (*(ULONG *)attributes != 24) return STATUS_INVALID_PARAMETER;
+        }
+        if (client && !win32_user_range_readable(client, 8, TRUE))
+            return STATUS_ACCESS_VIOLATION;
+    } else if (((ULONG_PTR)attributes & 3U) || ((ULONG_PTR)client & 3U)) {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    /* WOW64's marshaller initializes the output even on a native failure. */
+    if (compat32) *(ULONG *)output = 0;
+    if (!win32_user_range_readable(attributes, compat32 ? 24 :
+                                   sizeof(*attributes), compat32))
+        return STATUS_ACCESS_VIOLATION;
+    if (compat32) {
+        const ULONG *a = (const ULONG *)attributes;
+        name = a[2];
+        attr_flags = a[3];
+    } else {
+        name = (ULONG_PTR)attributes->ObjectName;
+        attr_flags = attributes->Attributes;
+    }
+    if (name || !client) return STATUS_INVALID_PARAMETER_MIX;
+    if (!win32_user_range_readable(client, 2 * pointer_size, compat32))
+        return STATUS_ACCESS_VIOLATION;
+    if (compat32) {
+        pid = ((ULONG *)client)[0];
+        tid = ((ULONG *)client)[1];
+    } else {
+        pid = (ULONG_PTR)client->UniqueProcess;
+        tid = (ULONG_PTR)client->UniqueThread;
+    }
+    HANDLE handle = NULL;
+    NTSTATUS status = open_client(pid, tid, access,
+                                  (attr_flags & OBJ_INHERIT) != 0, &handle);
+    if (NT_SUCCESS(status)) {
+        if (compat32) *(ULONG *)output = (ULONG)(ULONG_PTR)handle;
+        else *output = handle;
+    }
+    return status;
+}
+
+NTSTATUS NTAPI NtOpenThread(PHANDLE output, ACCESS_MASK access,
+                            POBJECT_ATTRIBUTES attributes, PCLIENT_ID client)
+{
+    return ntdll_open_client(output, access, attributes, client, nt_thread_open);
+}
+
+NTSTATUS NTAPI NtOpenProcess(PHANDLE output, ACCESS_MASK access,
+                             POBJECT_ATTRIBUTES attributes, PCLIENT_ID client)
+{
+    return ntdll_open_client(output, access, attributes, client,
+                            nt_process_open_client);
+}
+
+static NTSTATUS ntdll_open_token(HANDLE source, ACCESS_MASK access, ULONG attributes,
+                                 BOOL thread, BOOL open_as_self, PHANDLE output)
+{
+    BOOL compat32 = g_compat32_mode;
+    if (!win32_user_range_writable(output, compat32 ? 4 : sizeof(HANDLE), compat32))
+        return STATUS_ACCESS_VIOLATION;
+    if (compat32) *(ULONG *)output = 0;
+    HANDLE handle = NULL;
+    NTSTATUS status = advapi32_open_token(source, access, attributes, thread,
+                                          open_as_self, &handle);
+    if (NT_SUCCESS(status)) {
+        if (compat32) *(ULONG *)output = (ULONG)(ULONG_PTR)handle;
+        else *output = handle;
+    }
+    return status;
+}
+
+NTSTATUS NTAPI NtOpenProcessTokenEx(HANDLE process, ACCESS_MASK access,
+                                    ULONG attributes, PHANDLE output)
+{
+    return ntdll_open_token(process, access, attributes, FALSE, FALSE, output);
+}
+
+NTSTATUS NTAPI NtOpenProcessToken(HANDLE process, ACCESS_MASK access, PHANDLE output)
+{
+    return NtOpenProcessTokenEx(process, access, 0, output);
+}
+
+NTSTATUS NTAPI NtOpenThreadTokenEx(HANDLE thread, ACCESS_MASK access, BYTE open_as_self,
+                                   ULONG attributes, PHANDLE output)
+{
+    return ntdll_open_token(thread, access, attributes, TRUE, open_as_self, output);
+}
+
+NTSTATUS NTAPI NtOpenThreadToken(HANDLE thread, ACCESS_MASK access, BYTE open_as_self,
+                                 PHANDLE output)
+{
+    return NtOpenThreadTokenEx(thread, access, open_as_self, 0, output);
+}
+
+NTSTATUS NTAPI NtSetInformationThread(HANDLE thread, ULONG info_class,
+                                      PCVOID information, ULONG length)
+{
+    if (info_class != 5) return STATUS_INVALID_INFO_CLASS; /* ThreadImpersonationToken */
+    BOOL compat32 = g_compat32_mode;
+    SIZE_T bytes = compat32 ? 4 : sizeof(HANDLE);
+    if (compat32 ? length < bytes : length != bytes) return STATUS_INFO_LENGTH_MISMATCH;
+    if (!compat32 && ((ULONG_PTR)information & 3U)) return STATUS_DATATYPE_MISALIGNMENT;
+    if (!win32_user_range_readable(information, bytes, compat32)) return STATUS_ACCESS_VIOLATION;
+    HANDLE token = compat32 ? (HANDLE)(ULONG_PTR)*(const ULONG *)information
+                            : *(const HANDLE *)information;
+    return nt_thread_assign_token_handle(thread, token);
+}
 
 static int nt_registry_prefix(const char *path, const char *prefix,
                               const char **subkey)
@@ -441,13 +596,51 @@ NTSTATUS NTAPI NtCreateFile(PHANDLE fh, ACCESS_MASK access, POBJECT_ATTRIBUTES o
                       ULONG attrs, ULONG share, ULONG disp, ULONG opts,
                       PVOID ea, ULONG ea_len)
 {
+    BOOL compat = g_compat32_mode != 0;
+    HANDLE native_handle = NULL;
+    IO_STATUS_BLOCK native_iosb = {0};
+    OBJECT_ATTRIBUTES native_oa;
+    UNICODE_STRING native_name;
+    if (compat) {
+        if (!win32_user_range_writable(fh, 4, TRUE) ||
+            !win32_user_range_writable(iosb, 8, TRUE) ||
+            !win32_user_range_readable(oa, 24, TRUE))
+            return STATUS_ACCESS_VIOLATION;
+        const ULONG *fields = (const ULONG *)oa;
+        *(ULONG *)fh = 0;
+        if (fields[0] != 24) return STATUS_INVALID_PARAMETER;
+        const BYTE *name = (const BYTE *)(ULONG_PTR)fields[2];
+        if (!win32_user_range_readable(name, 8, TRUE))
+            return STATUS_ACCESS_VIOLATION;
+        native_name.Length = *(const USHORT *)name;
+        native_name.MaximumLength = *(const USHORT *)(name + 2);
+        native_name.Buffer = (PWSTR)(ULONG_PTR)*(const ULONG *)(name + 4);
+        if ((native_name.Length & 1U) ||
+            native_name.Length > native_name.MaximumLength)
+            return STATUS_OBJECT_NAME_INVALID;
+        if (!win32_user_range_readable(native_name.Buffer, native_name.Length, TRUE))
+            return STATUS_ACCESS_VIOLATION;
+        native_oa.Length = sizeof(native_oa);
+        native_oa.RootDirectory = (HANDLE)(ULONG_PTR)fields[1];
+        native_oa.ObjectName = &native_name;
+        native_oa.Attributes = fields[3];
+        native_oa.SecurityDescriptor = (PVOID)(ULONG_PTR)fields[4];
+        native_oa.SecurityQualityOfService = (PVOID)(ULONG_PTR)fields[5];
+    }
     ULONG_PTR args[11] = {
-        (ULONG_PTR)fh, (ULONG_PTR)access, (ULONG_PTR)oa,
-        (ULONG_PTR)iosb, (ULONG_PTR)alloc_size, (ULONG_PTR)attrs,
+        (ULONG_PTR)(compat ? &native_handle : fh), (ULONG_PTR)access,
+        (ULONG_PTR)(compat ? &native_oa : oa),
+        (ULONG_PTR)(compat ? &native_iosb : iosb), (ULONG_PTR)alloc_size, (ULONG_PTR)attrs,
         (ULONG_PTR)share, (ULONG_PTR)disp, (ULONG_PTR)opts,
         (ULONG_PTR)ea, (ULONG_PTR)ea_len
     };
-    return sys_NtCreateFile(args);
+    NTSTATUS status = sys_NtCreateFile(args);
+    if (compat) {
+        *(ULONG *)fh = (ULONG)(ULONG_PTR)native_handle;
+        ((ULONG *)iosb)[0] = (ULONG)native_iosb.Status;
+        ((ULONG *)iosb)[1] = (ULONG)native_iosb.Information;
+    }
+    return status;
 }
 
 NTSTATUS NTAPI NtReadFile(HANDLE fh, HANDLE event, PVOID apc_routine,
@@ -967,6 +1160,7 @@ done:
 NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE proc, PVOID *base, ULONG_PTR zbits,
                                   SIZE_T *size, ULONG type, ULONG prot)
 {
+    if (!base || !size) return STATUS_INVALID_PARAMETER;
 
     if (g_compat32_mode) {
         /* base and size point to 4-byte DWORDs in 32-bit memory */
@@ -998,6 +1192,7 @@ NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE proc, PVOID *base, ULONG_PTR zbits
 
 NTSTATUS NTAPI NtFreeVirtualMemory(HANDLE proc, PVOID *base, SIZE_T *size, ULONG type)
 {
+    if (!base || !size) return STATUS_INVALID_PARAMETER;
 
     if (g_compat32_mode) {
         uint32_t *base32 = (uint32_t *)base;
@@ -1095,6 +1290,7 @@ NTSTATUS NTAPI NtDuplicateObject(HANDLE src_proc, HANDLE src_handle,
 NTSTATUS NTAPI NtProtectVirtualMemory(HANDLE proc, PVOID *base, SIZE_T *size,
                                  ULONG new_prot, ULONG *old_prot)
 {
+    if (!base || !size || !old_prot) return STATUS_INVALID_PARAMETER;
 
     if (g_compat32_mode) {
         uint32_t *base32 = (uint32_t *)base;
@@ -1308,10 +1504,42 @@ NTSTATUS NTAPI NtQueryInformationProcess(HANDLE process,
                                           PVOID info, ULONG info_len,
                                           ULONG *return_len)
 {
-    if (!info) return STATUS_INVALID_PARAMETER;
+    if (!info && info_class != ProcessHandleTable &&
+        info_class != ProcessWow64Information) return STATUS_INVALID_PARAMETER;
 
     if (ntdll_is_current_process_handle(process))
         process = NT_CURRENT_PROCESS;
+
+    if (g_compat32_mode && info_class == ProcessBasicInformation) {
+        typedef struct {
+            NTSTATUS status;
+            uint32_t peb, affinity;
+            LONG priority;
+            uint32_t pid, parent;
+        } BASIC32;
+        _Static_assert(sizeof(BASIC32) == 24, "PE32 process basic layout");
+        if (return_len && !win32_user_range_writable(return_len, 4, TRUE))
+            return STATUS_ACCESS_VIOLATION;
+        if (return_len) *return_len = sizeof(BASIC32);
+        if (info_len < sizeof(BASIC32)) return STATUS_INFO_LENGTH_MISMATCH;
+        if (!win32_user_range_writable(info, sizeof(BASIC32), TRUE))
+            return STATUS_ACCESS_VIOLATION;
+        PROCESS_BASIC_INFORMATION native = {0};
+        ULONG_PTR args[5] = {
+            (ULONG_PTR)process, (ULONG_PTR)info_class, (ULONG_PTR)&native,
+            sizeof(native), 0
+        };
+        NTSTATUS status = sys_NtQueryInformationProcess(args);
+        if (!NT_SUCCESS(status)) return status;
+        BASIC32 *out = info;
+        out->status = native.ExitStatus;
+        out->peb = win32_process_peb32_address((DWORD)native.UniqueProcessId);
+        out->affinity = (uint32_t)native.AffinityMask;
+        out->priority = native.BasePriority;
+        out->pid = (uint32_t)native.UniqueProcessId;
+        out->parent = (uint32_t)native.InheritedFromUniqueProcessId;
+        return STATUS_SUCCESS;
+    }
 
     ULONG_PTR args[5] = {
         (ULONG_PTR)process, (ULONG_PTR)info_class, (ULONG_PTR)info,
@@ -1371,7 +1599,6 @@ static NTSTATUS ntdll_read_process_memory(HANDLE process, ULONGLONG address,
                                            PVOID buffer, ULONGLONG size,
                                            ULONGLONG *bytes_read)
 {
-    extern BOOL nt_process_id(HANDLE handle, DWORD *process_id);
     extern BOOL win32_process_cr3(DWORD process_id, uint64_t *out_cr3);
     extern int paging_copy_between_cr3(uint64_t, uint64_t, uint64_t,
                                         uint64_t, uint64_t, uint64_t *);
@@ -1379,9 +1606,10 @@ static NTSTATUS ntdll_read_process_memory(HANDLE process, ULONGLONG address,
     if (bytes_read) *bytes_read = 0;
     uint64_t source_cr3 = 0;
     if (!ntdll_is_current_process_handle(process)) {
-        DWORD process_id = 0;
-        if (!nt_process_id(process, &process_id) ||
-            !win32_process_cr3(process_id, &source_cr3))
+        ULONG process_id = 0;
+        NTSTATUS status = nt_process_resolve_vm_pid(process, 0x0010U, &process_id);
+        if (!NT_SUCCESS(status)) return status;
+        if (!win32_process_cr3(process_id, &source_cr3))
             return STATUS_INVALID_HANDLE;
     } else {
         __asm__ volatile ("mov %%cr3, %0" : "=r"(source_cr3));
@@ -1408,7 +1636,6 @@ static NTSTATUS ntdll_write_process_memory(HANDLE process, ULONGLONG address,
                                             PCVOID buffer, ULONGLONG size,
                                             ULONGLONG *bytes_written)
 {
-    extern BOOL nt_process_id(HANDLE handle, DWORD *process_id);
     extern BOOL win32_process_cr3(DWORD process_id, uint64_t *out_cr3);
     extern int paging_copy_between_cr3(uint64_t, uint64_t, uint64_t,
                                         uint64_t, uint64_t, uint64_t *);
@@ -1416,9 +1643,10 @@ static NTSTATUS ntdll_write_process_memory(HANDLE process, ULONGLONG address,
     if (bytes_written) *bytes_written = 0;
     uint64_t destination_cr3 = 0;
     if (!ntdll_is_current_process_handle(process)) {
-        DWORD process_id = 0;
-        if (!nt_process_id(process, &process_id) ||
-            !win32_process_cr3(process_id, &destination_cr3))
+        ULONG process_id = 0;
+        NTSTATUS status = nt_process_resolve_vm_pid(process, 0x0020U, &process_id);
+        if (!NT_SUCCESS(status)) return status;
+        if (!win32_process_cr3(process_id, &destination_cr3))
             return STATUS_INVALID_HANDLE;
     } else {
         __asm__ volatile ("mov %%cr3, %0" : "=r"(destination_cr3));
@@ -1526,6 +1754,7 @@ extern NTSTATUS sys_NtCreateEvent(ULONG_PTR *args);
 extern NTSTATUS sys_NtSetEvent(ULONG_PTR *args);
 extern NTSTATUS sys_NtResetEvent(ULONG_PTR *args);
 extern NTSTATUS sys_NtPulseEvent(ULONG_PTR *args);
+extern NTSTATUS sys_NtReleaseSemaphore(ULONG_PTR *args);
 extern NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args);
 
 NTSTATUS NTAPI NtCreateEvent(PHANDLE EventHandle, ACCESS_MASK DesiredAccess,
@@ -1569,6 +1798,16 @@ NTSTATUS NTAPI NtPulseEvent(HANDLE EventHandle, LONG *PreviousState)
         (ULONG_PTR)EventHandle, (ULONG_PTR)PreviousState
     };
     return sys_NtPulseEvent(args);
+}
+
+NTSTATUS NTAPI NtReleaseSemaphore(HANDLE SemaphoreHandle, LONG ReleaseCount,
+                                  LONG *PreviousCount)
+{
+    ULONG_PTR args[3] = {
+        (ULONG_PTR)SemaphoreHandle, (ULONG_PTR)ReleaseCount,
+        (ULONG_PTR)PreviousCount
+    };
+    return sys_NtReleaseSemaphore(args);
 }
 
 NTSTATUS NTAPI NtWaitForSingleObject(HANDLE Handle, BOOL Alertable,
@@ -1807,6 +2046,24 @@ static BOOL NTAPI RtlDeleteFunctionTable_ntdll(PVOID function_table)
 {
     return win32_unwind64_delete_function_table(
         (PRUNTIME_FUNCTION)function_table);
+}
+
+static NTSTATUS NTAPI RtlAddGrowableFunctionTable_ntdll(PVOID *dynamic_table,
+    PRUNTIME_FUNCTION table, DWORD count, DWORD maximum_count,
+    ULONG_PTR range_base, ULONG_PTR range_end)
+{
+    return win32_unwind64_add_growable_table(dynamic_table, table, count,
+                                             maximum_count, range_base, range_end);
+}
+
+static void NTAPI RtlGrowFunctionTable_ntdll(PVOID dynamic_table, DWORD count)
+{
+    win32_unwind64_grow_function_table(dynamic_table, count);
+}
+
+static void NTAPI RtlDeleteGrowableFunctionTable_ntdll(PVOID dynamic_table)
+{
+    win32_unwind64_delete_growable_table(dynamic_table);
 }
 
 /*
@@ -2125,21 +2382,35 @@ static NTSTATUS NTAPI LdrGetProcedureAddress(PVOID BaseAddress,
                                                PVOID *FunctionAddress)
 {
     if (!FunctionAddress) return STATUS_INVALID_PARAMETER;
-    *FunctionAddress = NULL;
+    BOOL compat = g_compat32_mode ? TRUE : FALSE;
+    SIZE_T pointer_bytes = compat ? 4 : sizeof(PVOID);
+    if (!win32_user_range_writable(FunctionAddress, pointer_bytes, compat))
+        return STATUS_ACCESS_VIOLATION;
+    if (compat) *(uint32_t *)(void *)FunctionAddress = 0;
+    else *FunctionAddress = NULL;
     if (!BaseAddress) return STATUS_DLL_NOT_FOUND;
 
     PCSTR lookup;
     char *name = NULL;
     if (FunctionName) {
-        if ((!FunctionName->Buffer && FunctionName->Length) ||
-            FunctionName->MaximumLength < FunctionName->Length)
+        typedef struct { USHORT length, maximum; uint32_t buffer; } STRING32;
+        if (!win32_user_range_readable(FunctionName,
+                compat ? sizeof(STRING32) : sizeof(*FunctionName), compat))
+            return STATUS_ACCESS_VIOLATION;
+        const STRING32 *in32 = (const void *)FunctionName;
+        USHORT length = compat ? in32->length : FunctionName->Length;
+        USHORT maximum = compat ? in32->maximum : FunctionName->MaximumLength;
+        const char *buffer = compat ? (const char *)(ULONG_PTR)in32->buffer
+                                   : FunctionName->Buffer;
+        if ((!buffer && length) || maximum < length)
             return STATUS_INVALID_PARAMETER;
+        if (length && !win32_user_range_readable(buffer, length, compat))
+            return STATUS_ACCESS_VIOLATION;
 
-        name = (char *)kmalloc((SIZE_T)FunctionName->Length + 1);
+        name = (char *)kmalloc((SIZE_T)length + 1);
         if (!name) return STATUS_NO_MEMORY;
-        for (USHORT i = 0; i < FunctionName->Length; i++)
-            name[i] = FunctionName->Buffer[i];
-        name[FunctionName->Length] = 0;
+        for (USHORT i = 0; i < length; i++) name[i] = buffer[i];
+        name[length] = 0;
         lookup = name;
     } else {
         if (!Ordinal || Ordinal > 0xFFFF) return STATUS_INVALID_PARAMETER;
@@ -2150,7 +2421,8 @@ static NTSTATUS NTAPI LdrGetProcedureAddress(PVOID BaseAddress,
     if (name) kfree(name);
     if (!address) return STATUS_PROCEDURE_NOT_FOUND;
 
-    *FunctionAddress = address;
+    if (compat) *(uint32_t *)(void *)FunctionAddress = (uint32_t)(ULONG_PTR)address;
+    else *FunctionAddress = address;
     return STATUS_SUCCESS;
 }
 
@@ -2242,6 +2514,13 @@ static NTSTATUS NTAPI LdrUnlockLoaderLock(ULONG flags, ULONG_PTR cookie)
 
 /* ── Export resolution table ────────────────────────────────── */
 
+static BYTE NTAPI RtlIsThreadWithinLoaderCallout(void)
+{ return dll_within_loader_callout() ? TRUE : FALSE; }
+static BYTE NTAPI RtlDllShutdownInProgress(void)
+{ return dll_shutdown_in_progress() ? TRUE : FALSE; }
+static void NTAPI LdrShutdownProcess(void)
+{ dll_shutdown_process(); }
+
 static const SHIM_EXPORT ntdll_exports[] = {
     /* NT API */
     { "NtCreateFile",              (PVOID)NtCreateFile,              11, CC_STDCALL },
@@ -2251,6 +2530,13 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "NtUnlockFile",              (PVOID)NtUnlockFile,                5, CC_STDCALL },
     { "NtClose",                   (PVOID)NtClose,                    1, CC_STDCALL },
     { "NtQueryObject",             (PVOID)NtQueryObject,              5, CC_STDCALL },
+    { "NtOpenThread",              (PVOID)NtOpenThread,               4, CC_STDCALL },
+    { "NtOpenProcess",             (PVOID)NtOpenProcess,              4, CC_STDCALL },
+    { "NtOpenProcessToken",        (PVOID)NtOpenProcessToken,         3, CC_STDCALL },
+    { "NtOpenProcessTokenEx",      (PVOID)NtOpenProcessTokenEx,       4, CC_STDCALL },
+    { "NtOpenThreadToken",         (PVOID)NtOpenThreadToken,          4, CC_STDCALL },
+    { "NtOpenThreadTokenEx",       (PVOID)NtOpenThreadTokenEx,        5, CC_STDCALL },
+    { "NtSetInformationThread",    (PVOID)NtSetInformationThread,     4, CC_STDCALL },
     { "NtAllocateVirtualMemory",   (PVOID)NtAllocateVirtualMemory,    6, CC_STDCALL },
     { "NtFreeVirtualMemory",       (PVOID)NtFreeVirtualMemory,        4, CC_STDCALL },
     { "NtTerminateProcess",        (PVOID)NtTerminateProcess,         2, CC_STDCALL },
@@ -2288,6 +2574,7 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "NtSetEvent",                (PVOID)NtSetEvent,                 2, CC_STDCALL },
     { "NtResetEvent",              (PVOID)NtResetEvent,               2, CC_STDCALL },
     { "NtPulseEvent",              (PVOID)NtPulseEvent,               2, CC_STDCALL },
+    { "NtReleaseSemaphore",        (PVOID)NtReleaseSemaphore,         3, CC_STDCALL },
     { "NtWaitForSingleObject",     (PVOID)NtWaitForSingleObject,      3, CC_STDCALL },
     /* Zw aliases (identical in user mode) */
     { "ZwCreateFile",              (PVOID)NtCreateFile,              11, CC_STDCALL },
@@ -2297,6 +2584,13 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "ZwUnlockFile",              (PVOID)NtUnlockFile,                5, CC_STDCALL },
     { "ZwClose",                   (PVOID)NtClose,                    1, CC_STDCALL },
     { "ZwQueryObject",             (PVOID)NtQueryObject,              5, CC_STDCALL },
+    { "ZwOpenThread",              (PVOID)NtOpenThread,               4, CC_STDCALL },
+    { "ZwOpenProcess",             (PVOID)NtOpenProcess,              4, CC_STDCALL },
+    { "ZwOpenProcessToken",        (PVOID)NtOpenProcessToken,         3, CC_STDCALL },
+    { "ZwOpenProcessTokenEx",      (PVOID)NtOpenProcessTokenEx,       4, CC_STDCALL },
+    { "ZwOpenThreadToken",         (PVOID)NtOpenThreadToken,          4, CC_STDCALL },
+    { "ZwOpenThreadTokenEx",       (PVOID)NtOpenThreadTokenEx,        5, CC_STDCALL },
+    { "ZwSetInformationThread",    (PVOID)NtSetInformationThread,     4, CC_STDCALL },
     { "ZwQueryInformationFile",    (PVOID)NtQueryInformationFile,     5, CC_STDCALL },
     { "ZwSetInformationFile",      (PVOID)NtSetInformationFile,       5, CC_STDCALL },
     { "ZwDuplicateObject",         (PVOID)NtDuplicateObject,          7, CC_STDCALL },
@@ -2305,6 +2599,7 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "ZwSetEvent",                (PVOID)NtSetEvent,                 2, CC_STDCALL },
     { "ZwResetEvent",              (PVOID)NtResetEvent,               2, CC_STDCALL },
     { "ZwPulseEvent",              (PVOID)NtPulseEvent,               2, CC_STDCALL },
+    { "ZwReleaseSemaphore",        (PVOID)NtReleaseSemaphore,         3, CC_STDCALL },
     { "ZwWaitForSingleObject",     (PVOID)NtWaitForSingleObject,      3, CC_STDCALL },
     /* Rtl utilities */
     { "RtlInitUnicodeString",      (PVOID)RtlInitUnicodeString,       2, CC_STDCALL },
@@ -2315,6 +2610,7 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "RtlInitializeCriticalSectionEx", (PVOID)RtlInitializeCriticalSectionEx, 3, CC_STDCALL },
     { "RtlEnterCriticalSection",  (PVOID)RtlEnterCriticalSection,    1, CC_STDCALL },
     { "RtlTryEnterCriticalSection", (PVOID)RtlTryEnterCriticalSection, 1, CC_STDCALL },
+    { "RtlIsCriticalSectionLockedByThread", (PVOID)RtlIsCriticalSectionLockedByThread, 1, CC_STDCALL },
     { "RtlLeaveCriticalSection",  (PVOID)RtlLeaveCriticalSection,    1, CC_STDCALL },
     { "RtlDeleteCriticalSection", (PVOID)RtlDeleteCriticalSection,   1, CC_STDCALL },
     { "RtlAcquirePebLock",        (PVOID)RtlAcquirePebLock,          0, CC_STDCALL },
@@ -2336,10 +2632,16 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "RtlLookupFunctionEntry",    (PVOID)RtlLookupFunctionEntry_stub, 3, CC_STDCALL },
     { "RtlAddFunctionTable",       (PVOID)RtlAddFunctionTable_ntdll,  3, CC_STDCALL },
     { "RtlDeleteFunctionTable",    (PVOID)RtlDeleteFunctionTable_ntdll, 1, CC_STDCALL },
+    { "RtlAddGrowableFunctionTable", (PVOID)RtlAddGrowableFunctionTable_ntdll, 6, CC_STDCALL },
+    { "RtlGrowFunctionTable", (PVOID)RtlGrowFunctionTable_ntdll, 2, CC_STDCALL },
+    { "RtlDeleteGrowableFunctionTable", (PVOID)RtlDeleteGrowableFunctionTable_ntdll, 1, CC_STDCALL },
     { "__C_specific_handler",      (PVOID)win32_unwind64_c_specific_handler, 4, CC_STDCALL },
     { "NtRaiseException",          (PVOID)NtRaiseException,           3, CC_STDCALL },
     { "ZwRaiseException",          (PVOID)NtRaiseException,           3, CC_STDCALL },
     /* Loader */
+    { "RtlIsThreadWithinLoaderCallout", (PVOID)RtlIsThreadWithinLoaderCallout, 0, CC_STDCALL },
+    { "RtlDllShutdownInProgress", (PVOID)RtlDllShutdownInProgress, 0, CC_STDCALL },
+    { "LdrShutdownProcess", (PVOID)LdrShutdownProcess, 0, CC_STDCALL },
     { "LdrLoadDll",                (PVOID)LdrLoadDll,                 4, CC_STDCALL },
     { "LdrGetProcedureAddress",    (PVOID)LdrGetProcedureAddress,     4, CC_STDCALL },
     { "LdrLockLoaderLock",         (PVOID)LdrLockLoaderLock,          3, CC_STDCALL },
@@ -2354,6 +2656,62 @@ const WIN32_EXPORT *ntdll_abi_table(int *count) {
 
 #define NTDLL_EXPORT_COUNT \
     (sizeof(ntdll_exports) / sizeof(ntdll_exports[0]) - 1)
+
+static BOOL nt64_service_export(const SHIM_EXPORT *entry)
+{
+    const char *name = entry->name;
+    return name && ((name[0] == 'N' && name[1] == 't') ||
+                    (name[0] == 'Z' && name[1] == 'w')) &&
+           entry->func && entry->cc == CC_STDCALL && entry->argc <= 16;
+}
+
+ULONG nt64_service_number(PVOID target)
+{
+    /* Aliases use the first descriptor for the same implementation. No
+     * service ID or kernel address is derived from mutable guest memory. */
+    for (ULONG i = 0; i < NTDLL_EXPORT_COUNT; i++) {
+        if (ntdll_exports[i].func == target &&
+            nt64_service_export(&ntdll_exports[i]))
+            return NT64_SERVICE_BASE + i;
+    }
+    return 0;
+}
+
+_Static_assert(NTDLL_EXPORT_COUNT < NT64_SERVICE_LIMIT - NT64_SERVICE_BASE,
+               "NT service namespace exhausted");
+_Static_assert(sizeof(NT64_SERVICE_FRAME) == 112 &&
+               __builtin_offsetof(NT64_SERVICE_FRAME, rip) == 96,
+               "NT64 gateway frame layout changed");
+
+NTSTATUS nt64_service_dispatch(ULONG number, const NT64_SERVICE_FRAME *frame)
+{
+    extern ULONG_PTR win32_current_image_base(void);
+    ULONG_PTR image = win32_current_image_base();
+    ULONG index = number - NT64_SERVICE_BASE;
+    if (index >= NTDLL_EXPORT_COUNT ||
+        !nt64_service_export(&ntdll_exports[index]) ||
+        g_compat32_mode || !image ||
+        !win32_user_range_readable((const void *)image, 4096, FALSE) ||
+        dll_current_process_bitness() != 64)
+        return (NTSTATUS)0xC000001C; /* STATUS_INVALID_SYSTEM_SERVICE */
+
+    const SHIM_EXPORT *entry = &ntdll_exports[index];
+    ULONG_PTR args[16] = {frame->r10, frame->rdx, frame->r8, frame->r9};
+    if (entry->argc > 4) {
+        /* SYSCALL leaves the guest RSP at the return address. The next four
+         * slots are shadow space, then the fifth and subsequent arguments. */
+        ULONG_PTR stack = (ULONG_PTR)(frame + 1);
+        if (stack > UINT64_MAX - 5 * sizeof(ULONG_PTR))
+            return STATUS_ACCESS_VIOLATION;
+        const ULONG_PTR *extra =
+            (const ULONG_PTR *)(stack + 5 * sizeof(ULONG_PTR));
+        SIZE_T bytes = (entry->argc - 4) * sizeof(ULONG_PTR);
+        if (!win32_user_range_readable(extra, bytes, FALSE))
+            return STATUS_ACCESS_VIOLATION;
+        for (ULONG i = 4; i < entry->argc; i++) args[i] = extra[i - 4];
+    }
+    return nt64_service_invoke(entry->func, args);
+}
 
 /* ── Resolve by name ────────────────────────────────────────── */
 

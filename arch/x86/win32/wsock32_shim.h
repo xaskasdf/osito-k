@@ -68,6 +68,7 @@ PVOID ws2_32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);
 void  wsock_service_pending_io(void);
 BOOL  wsock_cancel_io(SOCKET socket, PVOID overlapped,
                       BOOL current_thread_only);
+void  wsock_cancel_thread_sends(DWORD owner_pid, DWORD owner_tid);
 DWORD wsock_release_process(DWORD process_id);
 int   wsock_selftest(void);
 

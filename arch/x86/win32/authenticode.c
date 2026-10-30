@@ -1,4 +1,4 @@
-/* Authenticode verification for PE files and WINTRUST_ACTION_GENERIC_VERIFY_V2. */
+/* Authenticode verification for PE/CAB and WINTRUST_ACTION_GENERIC_VERIFY_V2. */
 
 #include "authenticode.h"
 #include "kernel32_shim.h"
@@ -10,6 +10,10 @@
 #include "../kernel/x509.h"
 
 extern void sha384(const uint8_t *data, uint64_t len, uint8_t hash[48]);
+extern int rsa_pkcs1_v15_sha1_verify(
+    const uint8_t *sig, uint32_t sig_len, const uint8_t *modulus,
+    uint32_t modulus_len, const uint8_t *exponent, uint32_t exponent_len,
+    const uint8_t hash[20]);
 extern int rsa_pkcs1_v15_sha256_verify(
     const uint8_t *sig, uint32_t sig_len, const uint8_t *modulus,
     uint32_t modulus_len, const uint8_t *exponent, uint32_t exponent_len,
@@ -27,7 +31,7 @@ extern void serial_putdec(uint64_t value);
 #define AUTH_FILE_BEGIN                0U
 #define AUTH_WIN_CERT_TYPE_PKCS_SIGNED 0x0002U
 #define AUTH_MAX_CERTS                 16U
-#define AUTH_MAX_CHAIN                 12U
+#define AUTH_MAX_CHAIN                 AUTHENTICODE_CHAIN_MAX
 #define AUTH_MAX_PKCS7                 (2U * 1024U * 1024U)
 #define AUTH_HASH_BUFFER               4096U
 
@@ -73,6 +77,7 @@ typedef struct {
     DWORD file_digest_len;
     const BYTE *content;
     DWORD content_len;
+    auth_der_t subject;
     auth_cert_t certs[AUTH_MAX_CERTS];
     DWORD cert_count;
     auth_signer_t signer;
@@ -113,6 +118,8 @@ static const BYTE oid_sha384[] =
     { 0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x02 };
 static const BYTE oid_rsa_encryption[] =
     { 0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x01 };
+static const BYTE oid_sha1_rsa[] =
+    { 0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x05 };
 static const BYTE oid_sha256_rsa[] =
     { 0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0B };
 static const BYTE oid_sha384_rsa[] =
@@ -129,6 +136,10 @@ static const BYTE oid_signing_time[] =
     { 0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x09,0x05 };
 static const BYTE oid_counter_signature[] =
     { 0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x09,0x06 };
+static const BYTE oid_rfc3161_timestamp[] =
+    { 0x2B,0x06,0x01,0x04,0x01,0x82,0x37,0x03,0x03,0x01 };
+static const BYTE oid_tst_info[] =
+    { 0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x09,0x10,0x01,0x04 };
 
 static int auth_bytes_equal(const BYTE *left, const BYTE *right, DWORD length)
 {
@@ -377,6 +388,32 @@ static int auth_pe_info(HANDLE file, DWORD file_size, auth_pe_info_t *info)
     return 0;
 }
 
+/* The supported signed CAB layout has a 20-byte CFHEADER reserve and no
+ * folder/data reserves. Validate all offsets before reading the raw CMS. */
+static int auth_cab_info(HANDLE file, DWORD file_size, auth_pe_info_t *info)
+{
+    BYTE header[60];
+    if (file_size < 36U || auth_read_at(file, 0, header, 36U) ||
+        auth_read_u32(header) != 0x4643534dU) return -1;
+    if (!(header[30] & 4U)) return 1;
+    if (file_size < sizeof(header) ||
+        auth_read_at(file, 36U, header + 36U, sizeof(header) - 36U) ||
+        auth_read_u32(header + 36U) != 20U ||
+        auth_read_u32(header + 40U) != 0x00100000U) return -1;
+    DWORD offset = auth_read_u32(header + 44U);
+    DWORD size = auth_read_u32(header + 48U);
+    if (!offset && !size) return 1;
+    DWORD files = auth_read_u32(header + 16U);
+    DWORD folders = (DWORD)header[26] | ((DWORD)header[27] << 8);
+    if (offset < 60U || offset > file_size || !size ||
+        size != file_size - offset || auth_read_u32(header + 8U) != offset ||
+        files < 60U || files > offset || folders > (files - 60U) / 8U)
+        return -1;
+    *info = (auth_pe_info_t){ .file_size = file_size,
+        .certificate_offset = offset, .certificate_size = size };
+    return 0;
+}
+
 static int auth_hash_file_range(HANDLE file, auth_hash_ctx_t *ctx,
                                 DWORD offset, DWORD length)
 {
@@ -413,6 +450,76 @@ static int auth_pe_digest(HANDLE file, const auth_pe_info_t *info,
 
     auth_hash_final(&ctx, digest);
     return 0;
+}
+
+/* The SPC_LINK moniker carries serialized attributes. Its enhanced hash
+ * binds the CAB length; it does not replace the hash of the cabinet data.
+ * The latter also covers iCabinet, as measured with Windows' CAB SIP. */
+static int auth_parse_enhanced_hash(const auth_cms_t *cms, auth_der_t *digest)
+{
+    static const BYTE link_oid[] = {0x2b,0x06,0x01,0x04,0x01,0x82,0x37,0x02,0x01,0x1c};
+    static const BYTE cab_oid[] = {0x2b,0x06,0x01,0x04,0x01,0x82,0x37,0x02,0x01,0x19};
+    static const BYTE enhanced_oid[] = {0x2b,0x06,0x01,0x04,0x01,0x82,0x37,0x02,0x05,0x01};
+    static const BYTE class_id[] = {0xa6,0xb5,0x86,0xd5,0xb4,0xa1,0x24,0x66,
+                                  0xae,0x05,0xa2,0x17,0xda,0x8e,0x60,0xd6};
+    const BYTE *p = cms->subject.value, *end = p + cms->subject.value_len;
+    auth_der_t oid, link, id, serialized, attributes;
+    *digest = (auth_der_t){0};
+    if (auth_der_expect(&p, end, 0x06, &oid)) return -1;
+    if (auth_der_oid_equal(&oid, cab_oid, sizeof(cab_oid))) return 1;
+    if (!auth_der_oid_equal(&oid, link_oid, sizeof(link_oid)) ||
+        auth_der_read(&p, end, &link) || p != end) return -1;
+    /* URL and file links do not carry an enhanced hash. */
+    if (link.tag == 0x80 || link.tag == 0xa2) return 1;
+    if (link.tag != 0xa1) return -1;
+    p = link.value; end = p + link.value_len;
+    if (auth_der_expect(&p, end, 0x04, &id) || id.value_len != sizeof(class_id) ||
+        !auth_bytes_equal(id.value, class_id, sizeof(class_id)) ||
+        auth_der_expect(&p, end, 0x04, &serialized) || p != end) return -1;
+    p = serialized.value; end = p + serialized.value_len;
+    if (auth_der_expect(&p, end, 0x31, &attributes) || p != end) return -1;
+    p = attributes.value; end = p + attributes.value_len;
+    while (p < end) {
+        auth_der_t attribute, values;
+        if (auth_der_expect(&p, end, 0x30, &attribute)) return -1;
+        const BYTE *ap = attribute.value, *ae = ap + attribute.value_len;
+        if (auth_der_expect(&ap, ae, 0x06, &oid) ||
+            auth_der_expect(&ap, ae, 0x31, &values) || ap != ae) return -1;
+        if (!auth_der_oid_equal(&oid, enhanced_oid, sizeof(enhanced_oid))) continue;
+        if (digest->tlv) return -1;
+        ap = values.value; ae = ap + values.value_len;
+        if (auth_der_expect(&ap, ae, 0x04, digest) || ap != ae ||
+            digest->value_len != cms->file_digest_len) return -1;
+    }
+    return digest->tlv ? 0 : 1;
+}
+
+static authenticode_result_t auth_cab_verify_digest(
+    HANDLE file, const auth_pe_info_t *info, const auth_cms_t *cms)
+{
+    auth_hash_ctx_t ctx;
+    BYTE digest[48];
+    if (auth_hash_init(&ctx, cms->file_digest_algorithm))
+        return AUTHENTICODE_VERIFY_UNSUPPORTED;
+    if (auth_hash_file_range(file, &ctx, 0U, 4U) ||
+        auth_hash_file_range(file, &ctx, 8U, 28U) ||
+        auth_hash_file_range(file, &ctx, 38U, 2U) ||
+        auth_hash_file_range(file, &ctx, 60U, info->certificate_offset - 60U))
+        return AUTHENTICODE_VERIFY_IO_ERROR;
+    auth_hash_final(&ctx, digest);
+    if (!auth_bytes_equal(digest, cms->file_digest, cms->file_digest_len))
+        return AUTHENTICODE_VERIFY_BAD_DIGEST;
+    auth_der_t enhanced;
+    int status = auth_parse_enhanced_hash(cms, &enhanced);
+    if (status < 0) return AUTHENTICODE_VERIFY_UNSUPPORTED;
+    if (!status) {
+        BYTE size[4];
+        for (DWORD i = 0; i < 4; i++) size[i] = (BYTE)(info->certificate_offset >> (i * 8));
+        if (auth_hash_memory(cms->file_digest_algorithm, size, sizeof(size), digest) ||
+            !auth_bytes_equal(digest, enhanced.value, enhanced.value_len))
+            return AUTHENTICODE_VERIFY_BAD_DIGEST;
+    }
+    return AUTHENTICODE_VERIFY_OK;
 }
 
 static int auth_parse_signer(const auth_der_t *sequence, auth_signer_t *signer)
@@ -456,8 +563,9 @@ static int auth_parse_spc_content(const auth_der_t *content,
     auth_der_t algorithm;
     auth_der_t digest;
     if (auth_der_expect(&p, end, 0x30, &data_type) ||
-        auth_der_expect(&p, end, 0x30, &digest_info))
+        auth_der_expect(&p, end, 0x30, &digest_info) || p != end)
         return -1;
+    cms->subject = data_type;
 
     p = digest_info.value;
     end = p + digest_info.value_len;
@@ -492,7 +600,8 @@ static int auth_parse_certificates(const auth_der_t *wrapper, auth_cms_t *cms)
     return cms->cert_count ? 0 : -1;
 }
 
-static int auth_parse_cms(const BYTE *der, DWORD der_len, auth_cms_t *cms)
+static int auth_parse_cms(const BYTE *der, DWORD der_len, int timestamp,
+                           auth_cms_t *cms)
 {
     *cms = (auth_cms_t){0};
     const BYTE *p = der;
@@ -531,8 +640,9 @@ static int auth_parse_cms(const BYTE *der, DWORD der_len, auth_cms_t *cms)
     auth_der_t encapsulated_type;
     auth_der_t encapsulated_value;
     if (auth_der_expect(&ep, eend, 0x06, &encapsulated_type) ||
-        !auth_der_oid_equal(&encapsulated_type, oid_spc_indirect_data,
-                            sizeof(oid_spc_indirect_data)) ||
+        !auth_der_oid_equal(&encapsulated_type,
+                            timestamp ? oid_tst_info : oid_spc_indirect_data,
+                            timestamp ? sizeof(oid_tst_info) : sizeof(oid_spc_indirect_data)) ||
         auth_der_expect(&ep, eend, 0xA0, &explicit_content) || ep != eend)
         return -1;
 
@@ -542,7 +652,7 @@ static int auth_parse_cms(const BYTE *der, DWORD der_len, auth_cms_t *cms)
         return -1;
 
     auth_der_t spc_content;
-    if (encapsulated_value.tag == 0x30) {
+    if (!timestamp && encapsulated_value.tag == 0x30) {
         spc_content = encapsulated_value;
         /* Legacy Authenticode signs the SEQUENCE contents, not its TLV. */
         cms->content = spc_content.value;
@@ -557,7 +667,7 @@ static int auth_parse_cms(const BYTE *der, DWORD der_len, auth_cms_t *cms)
     } else {
         return -1;
     }
-    if (auth_parse_spc_content(&spc_content, cms)) return -1;
+    if (!timestamp && auth_parse_spc_content(&spc_content, cms)) return -1;
 
     auth_der_t certificates;
     if (p >= end || *p != 0xA0 ||
@@ -576,7 +686,8 @@ static int auth_parse_cms(const BYTE *der, DWORD der_len, auth_cms_t *cms)
     const BYTE *sp = signer_infos.value;
     const BYTE *send = sp + signer_infos.value_len;
     if (auth_der_expect(&sp, send, 0x30, &signer_sequence) ||
-        auth_parse_signer(&signer_sequence, &cms->signer))
+        auth_parse_signer(&signer_sequence, &cms->signer) ||
+        (timestamp && sp != send))
         return -1;
     return 0;
 }
@@ -680,6 +791,7 @@ static int auth_signature_algorithm(const auth_der_t *identifier,
     if (auth_der_expect(&p, end, 0x06, &oid)) return -1;
     if (auth_der_oid_equal(&oid, oid_rsa_encryption,
                            sizeof(oid_rsa_encryption)) ||
+        auth_der_oid_equal(&oid, oid_sha1_rsa, sizeof(oid_sha1_rsa)) ||
         auth_der_oid_equal(&oid, oid_sha256_rsa, sizeof(oid_sha256_rsa)) ||
         auth_der_oid_equal(&oid, oid_sha384_rsa, sizeof(oid_sha384_rsa))) {
         *is_rsa = 1;
@@ -714,6 +826,10 @@ static int auth_verify_crypto_signature(const auth_signer_t *signer,
                                     &modulus, &modulus_len, &exponent,
                                     &exponent_len))
             return -1;
+        if (signer->digest_algorithm == AUTH_HASH_SHA1)
+            return rsa_pkcs1_v15_sha1_verify(
+                signer->signature, signer->signature_len, modulus,
+                modulus_len, exponent, exponent_len, digest);
         if (signer->digest_algorithm == AUTH_HASH_SHA256)
             return rsa_pkcs1_v15_sha256_verify(
                 signer->signature, signer->signature_len, modulus,
@@ -787,8 +903,9 @@ static int auth_verify_signer(const auth_signer_t *signer,
                                     oid_content_type,
                                     sizeof(oid_content_type),
                                     &content_type) != 0 ||
-                !auth_der_oid_equal(&content_type, oid_spc_indirect_data,
-                                    sizeof(oid_spc_indirect_data)))
+                !auth_der_oid_equal(&content_type,
+                    require_content_type == 2 ? oid_tst_info : oid_spc_indirect_data,
+                    require_content_type == 2 ? sizeof(oid_tst_info) : sizeof(oid_spc_indirect_data)))
                 return -1;
         }
         if (auth_hash_signed_attributes(signer->digest_algorithm,
@@ -811,8 +928,10 @@ static int auth_chain_revocation_ok(const BYTE *const *chain,
                                     DWORD chain_count, int trusted,
                                     uint32_t validation_time,
                                     DWORD revocation_checks,
-                                    DWORD provider_flags)
+                                    DWORD provider_flags, DWORD software_policy,
+                                    DWORD *errors)
 {
+    if ((provider_flags & 0x10U) || (software_policy & 0x200U)) return 1;
     int check_end =
         (provider_flags & AUTH_WTD_REVOCATION_CHECK_END_CERT) != 0;
     int check_chain = revocation_checks == AUTH_WTD_REVOKE_WHOLECHAIN ||
@@ -832,6 +951,14 @@ static int auth_chain_revocation_ok(const BYTE *const *chain,
             chain[i], chain_lens[i], chain[issuer], chain_lens[issuer],
             validation_time, allow_network, &attempted);
         if (status != CERTMGR_REVOCATION_GOOD) {
+            /* Software Publishing policy may permit an offline signer, but
+             * never converts an authenticated revocation into success. */
+            if (status == CERTMGR_REVOCATION_UNAVAILABLE &&
+                (software_policy & 0x1400U)) {
+                if (errors) errors[i] |= 0x01000040U;
+                serial_puts("[AUTH] offline revocation allowed by Software Publishing policy\n");
+                continue;
+            }
             serial_puts(status == CERTMGR_REVOCATION_REVOKED
                             ? "[AUTH] certificate revoked\n"
                             : "[AUTH] revocation status unavailable\n");
@@ -845,7 +972,9 @@ static int auth_chain_trusted(const auth_cert_t *leaf,
                               const auth_cert_t *certificates,
                               DWORD certificate_count, int leaf_index,
                               const char *usage_oid, uint32_t validation_time,
-                              DWORD revocation_checks, DWORD provider_flags)
+                              DWORD revocation_checks, DWORD provider_flags,
+                              DWORD software_policy,
+                              authenticode_chain_t *report)
 {
     const BYTE *chain[AUTH_MAX_CHAIN];
     DWORD chain_lens[AUTH_MAX_CHAIN];
@@ -878,7 +1007,7 @@ static int auth_chain_trusted(const auth_cert_t *leaf,
                     chain[count - 1], chain_lens[count - 1],
                     certificates[i].der, certificates[i].der_len) != 1)
                 continue;
-            if (x509_verify_chain_link(chain[count - 1],
+            if (x509_verify_chain_link_legacy(chain[count - 1],
                                        chain_lens[count - 1],
                                        certificates[i].der,
                                        certificates[i].der_len) == 0) {
@@ -904,7 +1033,7 @@ static int auth_chain_trusted(const auth_cert_t *leaf,
         if (certmgr_issuer_iter_begin(&roots, chain[count - 1],
                                       chain_lens[count - 1]) == 0) {
             while (certmgr_issuer_iter_next(&roots, &root, &root_len)) {
-                if (x509_verify_chain_link(chain[count - 1],
+                if (x509_verify_chain_link_legacy(chain[count - 1],
                                            chain_lens[count - 1], root,
                                            root_len) != 0)
                     continue;
@@ -947,20 +1076,260 @@ static int auth_chain_trusted(const auth_cert_t *leaf,
         serial_puts("[AUTH] certificate chain constraints rejected\n");
         return 0;
     }
-    return auth_chain_revocation_ok(
+    if (!auth_chain_revocation_ok(
         chain, chain_lens, count, trusted, validation_time,
-        revocation_checks, provider_flags);
+        revocation_checks, provider_flags, software_policy,
+        report ? report->errors : NULL)) return 0;
+    if (report) {
+        report->count = count;
+        report->validation_time = validation_time;
+        for (DWORD i = 0; i < count; i++) {
+            report->certificates[i] = chain[i];
+            report->lengths[i] = chain_lens[i];
+        }
+    }
+    return 1;
+}
+
+/* ESSCertID/ESSCertIDv2 binds a time-stamp to the exact TSA certificate,
+ * including its validity and usages, rather than only its public key. */
+static int auth_timestamp_certid(const auth_cms_t *timestamp, int signer_index)
+{
+    static const BYTE cert_v1_oid[] = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x09,0x10,0x02,0x0c};
+    static const BYTE cert_v2_oid[] = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x09,0x10,0x02,0x2f};
+    auth_der_t value, certificates, entry, hash;
+    int version2 = 1;
+    int status = auth_find_attribute(&timestamp->signer.signed_attributes,
+        cert_v2_oid, sizeof(cert_v2_oid), &value);
+    if (status > 0) {
+        version2 = 0;
+        status = auth_find_attribute(&timestamp->signer.signed_attributes,
+            cert_v1_oid, sizeof(cert_v1_oid), &value);
+    }
+    if (status || value.tag != 0x30) return -1;
+    const BYTE *p = value.value, *end = p + value.value_len;
+    if (auth_der_expect(&p, end, 0x30, &certificates)) return -1;
+    if (p < end) {
+        auth_der_t policies;
+        if (auth_der_expect(&p, end, 0x30, &policies) || p != end) return -1;
+    }
+    p = certificates.value; end = p + certificates.value_len;
+    if (auth_der_expect(&p, end, 0x30, &entry)) return -1;
+    /* Remaining entries identify chain certificates, not additional signers. */
+    while (p < end) {
+        auth_der_t other;
+        if (auth_der_expect(&p, end, 0x30, &other)) return -1;
+    }
+    p = entry.value; end = p + entry.value_len;
+    auth_hash_algorithm_t algorithm = version2 ? AUTH_HASH_SHA256 : AUTH_HASH_SHA1;
+    if (version2 && p < end && *p == 0x30) {
+        auth_der_t alg;
+        if (auth_der_expect(&p, end, 0x30, &alg)) return -1;
+        algorithm = auth_algorithm_identifier(&alg);
+    }
+    const auth_cert_t *cert = &timestamp->certs[signer_index];
+    BYTE digest[48];
+    if (auth_der_expect(&p, end, 0x04, &hash) ||
+        hash.value_len != auth_hash_length(algorithm) ||
+        auth_hash_memory(algorithm, cert->der, cert->der_len, digest) ||
+        !auth_bytes_equal(hash.value, digest, hash.value_len)) return -1;
+    if (p < end) {
+        auth_der_t issuer_serial, names, name, issuer, serial;
+        if (auth_der_expect(&p, end, 0x30, &issuer_serial) || p != end) return -1;
+        p = issuer_serial.value; end = p + issuer_serial.value_len;
+        if (auth_der_expect(&p, end, 0x30, &names) ||
+            auth_der_expect(&p, end, 0x02, &serial) || p != end) return -1;
+        const BYTE *cert_serial, *cert_issuer;
+        DWORD serial_len, issuer_len;
+        if (x509_get_serial_number(cert->der, cert->der_len, &cert_serial, &serial_len) ||
+            x509_get_issuer_name_der(cert->der, cert->der_len, &cert_issuer, &issuer_len))
+            return -1;
+        const BYTE *serial_value = serial.value;
+        DWORD serial_size = serial.value_len;
+        auth_strip_integer_zero(&serial_value, &serial_size);
+        if (serial_len != serial_size || !auth_bytes_equal(cert_serial, serial_value, serial_size))
+            return -1;
+        p = names.value; end = p + names.value_len;
+        int matched = 0;
+        while (p < end) {
+            if (auth_der_read(&p, end, &name)) return -1;
+            if (name.tag != 0xa4) continue;
+            const BYTE *np = name.value, *ne = np + name.value_len;
+            if (auth_der_expect(&np, ne, 0x30, &issuer) || np != ne) return -1;
+            if (issuer.tlv_len == issuer_len && auth_bytes_equal(issuer.tlv, cert_issuer, issuer_len))
+                matched = 1;
+        }
+        if (!matched) return -1;
+    }
+    return 0;
+}
+
+static int auth_parse_rfc3161_time(const auth_cms_t *timestamp,
+                                   const auth_signer_t *primary,
+                                   uint32_t *signing_time)
+{
+    const BYTE *p = timestamp->content, *end = p + timestamp->content_len;
+    auth_der_t info, version, policy, imprint, serial, time;
+    if (auth_der_expect(&p, end, 0x30, &info) || p != end) return -1;
+    p = info.value; end = p + info.value_len;
+    if (auth_der_expect(&p, end, 0x02, &version) ||
+        version.value_len != 1 || version.value[0] != 1 ||
+        auth_der_expect(&p, end, 0x06, &policy) || !policy.value_len ||
+        auth_der_expect(&p, end, 0x30, &imprint) ||
+        auth_der_expect(&p, end, 0x02, &serial) || !serial.value_len ||
+        (serial.value[0] & 0x80U) ||
+        auth_der_expect(&p, end, 0x18, &time)) return -1;
+    const BYTE *ip = imprint.value, *ie = ip + imprint.value_len;
+    auth_der_t algorithm, hash;
+    if (auth_der_expect(&ip, ie, 0x30, &algorithm) ||
+        auth_der_expect(&ip, ie, 0x04, &hash) || ip != ie) return -1;
+    auth_hash_algorithm_t kind = auth_algorithm_identifier(&algorithm);
+    BYTE digest[48];
+    if (hash.value_len != auth_hash_length(kind) ||
+        auth_hash_memory(kind, primary->signature, primary->signature_len, digest) ||
+        !auth_bytes_equal(hash.value, digest, hash.value_len)) return -1;
+    /* RFC 3161 permits decimal fractions; certificate validity uses seconds.
+     * Keep X.509 certificate-time parsing strict and normalize only this TST. */
+    if (time.value_len < 15U || time.value[time.value_len - 1U] != 'Z') return -1;
+    if (time.value_len != 15U) {
+        if (time.value_len < 17U || time.value[14] != '.' ||
+            time.value[time.value_len - 2U] == '0') return -1;
+        for (DWORD i = 15U; i + 1U < time.value_len; i++)
+            if (time.value[i] < '0' || time.value[i] > '9') return -1;
+    }
+    BYTE seconds[17] = {0x18,15};
+    auth_copy(seconds + 2, time.value, 14U); seconds[16] = 'Z';
+    if (x509_parse_time_der(seconds, sizeof(seconds), signing_time, NULL) ||
+        !*signing_time) return -1;
+    if (p < end && *p == 0x30) {
+        auth_der_t accuracy;
+        if (auth_der_expect(&p, end, 0x30, &accuracy)) return -1;
+        const BYTE *ap = accuracy.value, *ae = ap + accuracy.value_len;
+        BYTE tags[] = {0x02,0x80,0x81};
+        for (DWORD i = 0; i < sizeof(tags); i++) if (ap < ae && *ap == tags[i]) {
+            auth_der_t part;
+            if (auth_der_read(&ap, ae, &part) || !part.value_len ||
+                part.value_len > 4U || (part.value[0] & 0x80U)) return -1;
+            DWORD value = 0;
+            for (DWORD n = 0; n < part.value_len; n++) value = (value << 8) | part.value[n];
+            if (i && (!value || value > 999U)) return -1;
+        }
+        if (ap != ae) return -1;
+    }
+    if (p < end && *p == 0x01) {
+        auth_der_t ordering;
+        if (auth_der_expect(&p, end, 0x01, &ordering) || ordering.value_len != 1U ||
+            ordering.value[0] != 0xffU) return -1;
+    }
+    if (p < end && *p == 0x02) {
+        auth_der_t nonce;
+        if (auth_der_expect(&p, end, 0x02, &nonce) || !nonce.value_len ||
+            (nonce.value[0] & 0x80U)) return -1;
+    }
+    if (p < end && *p == 0xa0) {
+        auth_der_t tsa, name;
+        if (auth_der_expect(&p, end, 0xa0, &tsa)) return -1;
+        const BYTE *np = tsa.value, *ne = np + tsa.value_len;
+        if (auth_der_read(&np, ne, &name) || np != ne) return -1;
+    }
+    /* TST extensions are not implemented; never ignore a critical extension. */
+    return p == end ? 0 : -1;
+}
+
+/* Require a dedicated time-stamping EKU, not anyExtendedKeyUsage. Windows
+ * accepts Microsoft's CAB TSA certificate with a noncritical EKU, although
+ * RFC 3161 asks issuers to mark this extension critical. */
+static int auth_timestamp_usage(const auth_cert_t *cert)
+{
+    static const BYTE eku_oid[] = {0x55,0x1d,0x25};
+    static const BYTE usage_oid[] = {0x2b,0x06,0x01,0x05,0x05,0x07,0x03,0x08};
+    const BYTE *p = cert->der, *end = p + cert->der_len;
+    auth_der_t outer, tbs, value;
+    if (auth_der_expect(&p, end, 0x30, &outer) || p != end) return -1;
+    p = outer.value; end = p + outer.value_len;
+    if (auth_der_expect(&p, end, 0x30, &tbs)) return -1;
+    p = tbs.value; end = p + tbs.value_len;
+    if (p < end && *p == 0xa0 && auth_der_expect(&p, end, 0xa0, &value)) return -1;
+    for (unsigned i = 0; i < 6; i++) if (auth_der_read(&p, end, &value)) return -1;
+    while (p < end && (*p == 0x81 || *p == 0x82))
+        if (auth_der_read(&p, end, &value)) return -1;
+    if (auth_der_expect(&p, end, 0xa3, &value) || p != end) return -1;
+    p = value.value; end = p + value.value_len;
+    auth_der_t extensions;
+    if (auth_der_expect(&p, end, 0x30, &extensions) || p != end) return -1;
+    p = extensions.value; end = p + extensions.value_len;
+    int found = 0;
+    while (p < end) {
+        auth_der_t extension, oid, critical, octets;
+        if (auth_der_expect(&p, end, 0x30, &extension)) return -1;
+        const BYTE *ep = extension.value, *ee = ep + extension.value_len;
+        if (auth_der_expect(&ep, ee, 0x06, &oid)) return -1;
+        if (!auth_der_oid_equal(&oid, eku_oid, sizeof(eku_oid))) continue;
+        if (found++) return -1;
+        if (ep < ee && *ep == 0x01 &&
+            (auth_der_expect(&ep, ee, 0x01, &critical) ||
+             critical.value_len != 1U || critical.value[0] != 0xffU)) return -1;
+        if (auth_der_expect(&ep, ee, 0x04, &octets) || ep != ee) return -1;
+        ep = octets.value; ee = ep + octets.value_len;
+        if (auth_der_expect(&ep, ee, 0x30, &value) || ep != ee) return -1;
+        ep = value.value; ee = ep + value.value_len;
+        if (auth_der_expect(&ep, ee, 0x06, &oid) || ep != ee ||
+            !auth_der_oid_equal(&oid, usage_oid, sizeof(usage_oid))) return -1;
+    }
+    return found == 1 ? 0 : -1;
+}
+
+static int auth_rfc3161_timestamp(const auth_cms_t *cms,
+                                   const auth_der_t *token,
+                                   DWORD revocation_checks, DWORD provider_flags,
+                                   DWORD software_policy, uint32_t *signing_time,
+                                   authenticode_chain_t *report)
+{
+    auth_cms_t timestamp;
+    int index = -1;
+    if (token->tag != 0x30 || auth_parse_cms(token->tlv, token->tlv_len, 1, &timestamp) ||
+        !timestamp.signer.signed_attributes.tlv ||
+        auth_parse_rfc3161_time(&timestamp, &cms->signer, signing_time) ||
+        auth_verify_signer(&timestamp.signer, timestamp.certs, timestamp.cert_count,
+            timestamp.content, timestamp.content_len, 2, &index) ||
+        auth_timestamp_certid(&timestamp, index) ||
+        auth_timestamp_usage(&timestamp.certs[index])) {
+        serial_puts("[AUTH] RFC3161 token or signature invalid\n");
+        return -1;
+    }
+    uint32_t now = ntp_get_utc();
+    if (now && *signing_time > now) return -1;
+    if (software_policy & 0x20000U) {
+        revocation_checks = 0;
+        provider_flags &= ~0xe0U;
+    }
+    if (!auth_chain_trusted(&timestamp.certs[index], timestamp.certs,
+        timestamp.cert_count, index, "1.3.6.1.5.5.7.3.8", *signing_time,
+        revocation_checks, provider_flags, software_policy, report)) {
+        serial_puts("[AUTH] RFC3161 timestamp chain rejected\n");
+        return -1;
+    }
+    serial_puts("[AUTH] trusted RFC3161 timestamp at ");
+    serial_putdec(*signing_time); serial_puts("\n");
+    return 0;
 }
 
 static int auth_counter_signature(const auth_cms_t *cms,
                                   DWORD revocation_checks,
                                   DWORD provider_flags,
-                                  uint32_t *signing_time)
+                                  DWORD software_policy,
+                                  uint32_t *signing_time,
+                                  authenticode_chain_t *report)
 {
     *signing_time = 0;
     if (!cms->signer.unsigned_attributes.tlv) return 1;
 
     auth_der_t counter_value;
+    int rfc = auth_find_attribute(&cms->signer.unsigned_attributes,
+        oid_rfc3161_timestamp, sizeof(oid_rfc3161_timestamp), &counter_value);
+    if (rfc < 0) return -1;
+    if (!rfc) return auth_rfc3161_timestamp(cms, &counter_value,
+        revocation_checks, provider_flags, software_policy, signing_time, report);
     int found = auth_find_attribute(
         &cms->signer.unsigned_attributes, oid_counter_signature,
         sizeof(oid_counter_signature), &counter_value);
@@ -990,10 +1359,14 @@ static int auth_counter_signature(const auth_cms_t *cms,
     }
 
     static const char timestamp_usage[] = "1.3.6.1.5.5.7.3.8";
+    if (software_policy & 0x20000U) {
+        revocation_checks = 0;
+        provider_flags &= ~0xe0U;
+    }
     if (!auth_chain_trusted(&cms->certs[counter_cert_index], cms->certs,
                             cms->cert_count, counter_cert_index,
                             timestamp_usage, *signing_time,
-                            revocation_checks, provider_flags)) {
+                            revocation_checks, provider_flags, software_policy, report)) {
         serial_puts("[AUTH] timestamp chain rejected\n");
         return -1;
     }
@@ -1004,28 +1377,35 @@ static int auth_counter_signature(const auth_cms_t *cms,
 }
 
 static authenticode_result_t auth_verify_pkcs7(
-    HANDLE file, const auth_pe_info_t *pe, const BYTE *der, DWORD der_len,
-    DWORD revocation_checks, DWORD provider_flags)
+    HANDLE file, const auth_pe_info_t *pe, int is_cab, const BYTE *der, DWORD der_len,
+    DWORD revocation_checks, DWORD provider_flags, DWORD software_policy,
+    authenticode_chain_sink_t sink, PVOID sink_context)
 {
     auth_cms_t cms;
-    if (auth_parse_cms(der, der_len, &cms)) {
+    if (auth_parse_cms(der, der_len, 0, &cms)) {
         serial_puts("[AUTH] malformed PKCS#7 SignedData\n");
         return AUTHENTICODE_VERIFY_UNSUPPORTED;
     }
 
     BYTE file_digest[48];
     if (cms.file_digest_algorithm == AUTH_HASH_SHA384) {
-        serial_puts("[AUTH] SHA-384 PE digest streaming is unsupported\n");
+        serial_puts("[AUTH] SHA-384 file digest streaming is unsupported\n");
         return AUTHENTICODE_VERIFY_UNSUPPORTED;
     }
-    if (auth_pe_digest(file, pe, cms.file_digest_algorithm, file_digest))
-        return AUTHENTICODE_VERIFY_IO_ERROR;
-    if (!auth_bytes_equal(file_digest, cms.file_digest,
-                          cms.file_digest_len)) {
-        serial_puts("[AUTH] PE digest mismatch\n");
-        return AUTHENTICODE_VERIFY_BAD_DIGEST;
+    if (is_cab) {
+        authenticode_result_t result = auth_cab_verify_digest(file, pe, &cms);
+        if (result != AUTHENTICODE_VERIFY_OK) return result;
+        serial_puts("[AUTH] CAB digest verified\n");
+    } else {
+        if (auth_pe_digest(file, pe, cms.file_digest_algorithm, file_digest))
+            return AUTHENTICODE_VERIFY_IO_ERROR;
+        if (!auth_bytes_equal(file_digest, cms.file_digest,
+                              cms.file_digest_len)) {
+            serial_puts("[AUTH] PE digest mismatch\n");
+            return AUTHENTICODE_VERIFY_BAD_DIGEST;
+        }
+        serial_puts("[AUTH] PE digest verified\n");
     }
-    serial_puts("[AUTH] PE digest verified\n");
 
     int signer_index = -1;
     if (auth_verify_signer(&cms.signer, cms.certs, cms.cert_count,
@@ -1036,26 +1416,60 @@ static authenticode_result_t auth_verify_pkcs7(
     }
     serial_puts("[AUTH] CMS signer signature verified\n");
 
+    authenticode_report_t report = {0};
     uint32_t timestamp = 0;
     int timestamp_status = auth_counter_signature(
-        &cms, revocation_checks, provider_flags, &timestamp);
-    uint32_t validation_time = timestamp_status == 0 ? timestamp
-                                                     : ntp_get_utc();
+        &cms, revocation_checks, provider_flags, software_policy,
+        &timestamp, &report.timestamp);
+    if (timestamp_status < 0) return AUTHENTICODE_VERIFY_BAD_SIGNATURE;
+    uint32_t validation_time = timestamp_status == 0 && !(provider_flags & 0x800U)
+        ? timestamp : ntp_get_utc();
+    if (!validation_time) return AUTHENTICODE_VERIFY_UNTRUSTED;
+    /* The individual/commercial statement chooses the corresponding offline
+     * policy bits. An absent statement is the individual signing policy. */
+    static const BYTE statement_oid[] = {0x2b,0x06,0x01,0x04,0x01,0x82,0x37,0x02,0x01,0x0b};
+    static const BYTE commercial_oid[] = {0x2b,0x06,0x01,0x04,0x01,0x82,0x37,0x02,0x01,0x16};
+    auth_der_t statement;
+    int commercial = 0;
+    int statement_status = auth_find_attribute(&cms.signer.signed_attributes,
+        statement_oid, sizeof(statement_oid), &statement);
+    if (statement_status < 0) return AUTHENTICODE_VERIFY_UNSUPPORTED;
+    if (!statement_status) {
+        if (statement.tag != 0x30) return AUTHENTICODE_VERIFY_UNSUPPORTED;
+        const BYTE *cursor = statement.value, *end = cursor + statement.value_len;
+        while (cursor < end) {
+            auth_der_t usage;
+            if (auth_der_expect(&cursor, end, 0x06, &usage))
+                return AUTHENTICODE_VERIFY_UNSUPPORTED;
+            if (auth_der_oid_equal(&usage, commercial_oid, sizeof(commercial_oid)))
+                commercial = 1;
+        }
+    }
+    DWORD signer_policy = software_policy;
+    if (commercial) {
+        signer_policy &= ~0x1400U;
+        signer_policy |= (software_policy & 0x2800U) >> 1;
+    }
     static const char code_signing_usage[] = "1.3.6.1.5.5.7.3.3";
     if (!auth_chain_trusted(&cms.certs[signer_index], cms.certs,
                             cms.cert_count, signer_index,
                             code_signing_usage, validation_time,
-                            revocation_checks, provider_flags))
+                            revocation_checks, provider_flags, signer_policy,
+                            &report.signer))
         return AUTHENTICODE_VERIFY_UNTRUSTED;
 
     serial_puts("[AUTH] Authenticode chain trusted\n");
+    if (sink && !sink(&report, sink_context)) return AUTHENTICODE_VERIFY_IO_ERROR;
     return AUTHENTICODE_VERIFY_OK;
 }
 
-authenticode_result_t authenticode_verify_file(PCWSTR path,
+authenticode_result_t authenticode_verify_file_report(PCWSTR path,
                                                 HANDLE supplied_file,
                                                 DWORD revocation_checks,
-                                                DWORD provider_flags)
+                                                DWORD provider_flags,
+                                                DWORD software_policy,
+                                                authenticode_chain_sink_t sink,
+                                                PVOID sink_context)
 {
     HANDLE file = supplied_file;
     int close_file = 0;
@@ -1079,7 +1493,12 @@ authenticode_result_t authenticode_verify_file(PCWSTR path,
     }
 
     auth_pe_info_t pe;
-    int pe_status = auth_pe_info(file, file_size, &pe);
+    BYTE magic[4];
+    int is_cab = file_size >= sizeof(magic) &&
+        !auth_read_at(file, 0, magic, sizeof(magic)) &&
+        auth_read_u32(magic) == 0x4643534dU;
+    int pe_status = is_cab ? auth_cab_info(file, file_size, &pe)
+                           : auth_pe_info(file, file_size, &pe);
     if (pe_status != 0) {
         if (close_file) CloseHandle(file);
         return pe_status > 0 ? AUTHENTICODE_VERIFY_NO_SIGNATURE
@@ -1101,6 +1520,13 @@ authenticode_result_t authenticode_verify_file(PCWSTR path,
     }
 
     authenticode_result_t result = AUTHENTICODE_VERIFY_NO_SIGNATURE;
+    if (is_cab) {
+        result = auth_verify_pkcs7(file, &pe, 1, certificates, pe.certificate_size,
+            revocation_checks, provider_flags, software_policy, sink, sink_context);
+        HeapFree(GetProcessHeap(), 0, certificates);
+        if (close_file) CloseHandle(file);
+        return result;
+    }
     DWORD offset = 0;
     while (offset + 8U <= pe.certificate_size) {
         DWORD certificate_length = auth_read_u32(certificates + offset);
@@ -1111,9 +1537,9 @@ authenticode_result_t authenticode_verify_file(PCWSTR path,
             break;
         if (certificate_type == AUTH_WIN_CERT_TYPE_PKCS_SIGNED) {
             result = auth_verify_pkcs7(
-                file, &pe, certificates + offset + 8U,
+                file, &pe, 0, certificates + offset + 8U,
                 certificate_length - 8U, revocation_checks,
-                provider_flags);
+                provider_flags, software_policy, sink, sink_context);
             if (result == AUTHENTICODE_VERIFY_OK) break;
         }
         DWORD aligned = (certificate_length + 7U) & ~7U;
@@ -1125,4 +1551,12 @@ authenticode_result_t authenticode_verify_file(PCWSTR path,
     HeapFree(GetProcessHeap(), 0, certificates);
     if (close_file) CloseHandle(file);
     return result;
+}
+
+authenticode_result_t authenticode_verify_file(PCWSTR path, HANDLE file,
+                                                DWORD revocation_checks,
+                                                DWORD provider_flags)
+{
+    return authenticode_verify_file_report(path, file, revocation_checks,
+                                           provider_flags, 0, NULL, NULL);
 }

@@ -1,0 +1,18 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+ExitProcess@4
+GetStdHandle@4
+WriteFile@20
+LoadLibraryA@4
+GetProcAddress@8
+GetCommandLineA@0
+GetModuleFileNameA@12
+GetTickCount@0
+GetLastError@0
+Sleep@4
+CreateIoCompletionPort@16
+GetQueuedCompletionStatus@20
+WaitForSingleObject@8
+CloseHandle@4
+CreateProcessA@40
+GetExitCodeProcess@8

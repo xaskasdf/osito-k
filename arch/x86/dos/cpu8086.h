@@ -170,6 +170,20 @@ static inline uint32_t cpu8086_flags_image(const cpu8086_state_t *cpu)
     return flags;
 }
 
+static inline uint32_t cpu8086_exception_flags(uint32_t flags, uint8_t vector)
+{
+    /* Fault-class vectors implemented by this CPU. #DB uses the event's RF:
+     * traps/instruction breakpoints do not set it, and native GD faults
+     * already carry hardware RF. Sticky DR6 is not a new exception cause. */
+    switch (vector) {
+    case 0: case 5: case 6: case 7: case 10: case 11: case 12:
+    case 13: case 14: case 16: case 17: case 19:
+        return flags | FLAG_RF;
+    default:
+        return flags;
+    }
+}
+
 static inline void cpu8086_restore_virtual_flags(cpu8086_state_t *cpu)
 {
     if (cpu->protected_mode && !cpu->guest_idt && cpu->vm->dpmi.active && cpu->vm->emulate_cpu) {
@@ -184,6 +198,20 @@ static inline void cpu8086_restore_virtual_flags(cpu8086_state_t *cpu)
 static inline uint32_t dos_linear(uint16_t seg, uint16_t off)
 {
     return ((uint32_t)seg << 4) + off;
+}
+
+static inline bool dos_a20_enabled(const dos_vm_t *vm)
+{
+    const cpu8086_state_t *cpu = vm->cpu;
+    /* DPMI guarantees A20 in protected mode, without losing the real-mode
+     * latch across raw switches, callbacks or simulated real interrupts. */
+    return !vm->a20_masked || (cpu && cpu->protected_mode &&
+           vm->dpmi.active && !cpu->guest_idt && !(cpu->eflags & FLAG_VM));
+}
+
+static inline uint32_t dos_a20_address(const dos_vm_t *vm, uint32_t address)
+{
+    return dos_a20_enabled(vm) ? address : address & ~0x100000u;
 }
 
 /* Forward declaration for protected-mode translation */
@@ -216,7 +244,9 @@ static inline uint32_t dos_vbe_memory_address(const dos_vm_t *vm,
     return DOS_VBE_FB_BASE + (uint32_t)framebuffer_offset;
 }
 
-static inline uint8_t dos_mem_read8(dos_vm_t *vm, uint32_t addr)
+/* Chipset access with A20 already enabled, e.g. BIOS extended-memory moves.
+ * CPU accesses must use dos_mem_* so the mask precedes EMS/VBE translation. */
+static inline uint8_t dos_phys_read8(dos_vm_t *vm, uint32_t addr)
 {
     if (vm->io && vm->vga_mode == 0x13u && !vm->vbe_active &&
         addr - DOS_VGA_APERTURE_BASE < DOS_VGA_APERTURE_SIZE)
@@ -233,6 +263,11 @@ static inline uint8_t dos_mem_read8(dos_vm_t *vm, uint32_t addr)
     return vm->mem[addr];
 }
 
+static inline uint8_t dos_mem_read8(dos_vm_t *vm, uint32_t addr)
+{
+    return dos_phys_read8(vm, dos_a20_address(vm, addr));
+}
+
 static inline uint16_t dos_mem_read16(dos_vm_t *vm, uint32_t addr)
 {
     return dos_mem_read8(vm, addr) | ((uint16_t)dos_mem_read8(vm, addr + 1) << 8);
@@ -244,9 +279,16 @@ static inline uint32_t dos_mem_read32(dos_vm_t *vm, uint32_t addr)
 }
 
 /* Write with VGA dirty tracking */
+void dos_phys_write8(dos_vm_t *vm, uint32_t addr, uint8_t val);
 void dos_mem_write8(dos_vm_t *vm, uint32_t addr, uint8_t val);
 void dos_mem_write16(dos_vm_t *vm, uint32_t addr, uint16_t val);
 void dos_mem_write32(dos_vm_t *vm, uint32_t addr, uint32_t val);
+/* Preflight a CPU physical span, not a paged linear range. An optional direct
+ * pointer is returned only for contiguous RAM without VGA register effects. */
+bool dos_mem_guest_span(dos_vm_t *vm, uint32_t addr, uint32_t size,
+                         uint8_t **direct);
+bool dos_phys_guest_span(dos_vm_t *vm, uint32_t addr, uint32_t size,
+                          uint8_t **direct);
 void dos_native_map_video(dos_vm_t *vm);
 void dos_native_ems_map_frame(dos_vm_t *vm, unsigned frame,
                               uint32_t backing);
@@ -401,6 +443,10 @@ bool cpu8086_enter_dpmi_interrupt(cpu8086_state_t *cpu, uint16_t selector,
                                    uint32_t fault_eip);
 bool dos_int_has_pm_translator(uint8_t int_num);
 bool dos_rm_private_interrupt(const dos_vm_t *vm, uint8_t vector);
+bool dos_pm_interrupt_return_source(const dos_vm_t *vm, uint8_t vector);
+/* 0: ordinary IRET; 1: restored locked caller; -1: invalid host continuation. */
+int dos_pm_interrupt_return_iret(dos_vm_t *vm, uint16_t cs, uint32_t ip,
+                                 uint16_t ss, uint32_t esp, uint32_t flags);
 bool dos_rm_host_vector(dos_vm_t *vm, uint8_t vector,
                           uint16_t segment, uint16_t offset);
 void cpu8086_rm_service(dos_vm_t *vm, uint8_t service);
@@ -413,7 +459,10 @@ bool cpu_deliver_exception(dos_vm_t *vm, uint8_t vector,
                            uint32_t return_eip, uint32_t error_code,
                            bool has_error_code);
 bool dpmi_exception_return(dos_vm_t *vm);
+void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num);
 void dos_int21_dispatch(dos_vm_t *vm);
+void dos_terminate_resident(dos_vm_t *vm, uint16_t psp,
+                             uint16_t paragraphs, uint8_t code);
 void dos_api_init(dos_vm_t *vm);
 void dos_api_close_all(dos_vm_t *vm);
 bool dos_exec_activate_loaded_child(dos_vm_t *vm);
@@ -421,6 +470,14 @@ bool dos_exec_complete_termination(dos_vm_t *vm);
 void dos_exec_cleanup(dos_vm_t *vm);
 bool dos_exec_begin_dpmi_client(dos_vm_t *vm);
 void dos_exec_abort_dpmi_client(dos_vm_t *vm);
+const dpmi_state_t *dos_exec_suspended_dpmi(const dos_vm_t *vm,
+                                           const dpmi_state_t *previous);
+const dpmi_state_t *dos_exec_primary_dpmi(const dos_vm_t *vm);
+const dpmi_state_t *dos_exec_find_dpmi(const dos_vm_t *vm, uint64_t client_id);
+bool dos_exec_select_dpmi(dos_vm_t *vm, const dpmi_state_t *client);
+bool dos_exec_enter_dpmi(dos_vm_t *vm, const dpmi_state_t *client,
+                          dpmi_client_scope_t *scope);
+void dos_exec_leave_dpmi(dos_vm_t *vm, dpmi_client_scope_t *scope);
 int dos_exec_dpmi_selftest(void);
 int dos_mem_free_owner(dos_vm_t *vm, uint16_t owner);
 void dos_native_cleanup(dos_vm_t *vm);
@@ -446,8 +503,11 @@ int dos_run_options_selftest(void);
 int dos_mem_selftest(void);
 int dpmi_selftest(void);
 int dos_bios_memory_selftest(void);
+int dos_a20_selftest(void);
+int dos_a20_buffer_selftest(dos_vm_t *vm);
 int dos_bios_contract_selftest(void);
 int dos_interrupt_selftest(void);
+int dos_cpu_rf_selftest(void);
 int dos_dpmi_stack_selftest(void);
 int dos_vcpi_selftest(void);
 

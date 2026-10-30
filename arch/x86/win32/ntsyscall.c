@@ -17,16 +17,22 @@
 
 #include "ntsyscall.h"
 #include "handle.h"
+#include "ntjob.h"
+#include "ntprocess.h"
 #include "filelock.h"
 #include "pe.h"
+#include "compat32.h"
 #include "dllloader.h"
 #include "ddraw_shim.h"
 #include "dinput8_shim.h"
 #include "dsound_shim.h"
 #include "gdi32_shim.h"
 #include "kernel32_shim.h"
+#include "wow64.h"
 #include "msvcrt_shim.h"
 #include "winmm_shim.h"
+#include "cabinet_shim.h"
+#include "msi_shim.h"
 #include "wintime.h"
 #include "../include/fd.h"
 #include "../include/paging.h"
@@ -158,6 +164,7 @@ typedef struct {
     ULONG    owner_pid;
     BOOL     owns_phys;
     PVOID    section;
+    NT_VM_DRIVER_VIEW *driver_view;
 } vm_track_entry_t;
 
 typedef struct {
@@ -188,6 +195,7 @@ static NTSTATUS section_flush_mapping(PVOID section, uint64_t view_phys,
 static int vm_map_private_backing(ULONG owner_pid, uint64_t cr3, uint64_t va,
                                   SIZE_T size, ULONG protect,
                                   uint64_t *out_phys);
+static BOOL vm_driver_revoke_locked(NT_VM_DRIVER_VIEW *view);
 
 static ULONG nt_current_owner_pid(void)
 {
@@ -199,6 +207,115 @@ static uint64_t nt_current_cr3(void)
 {
     uint64_t cr3 = proc_current_cr3();
     return cr3 ? cr3 : paging_get_kernel_cr3();
+}
+
+typedef struct {
+    ULONG owner_pid;
+    uint64_t cr3;
+    BOOL compat32;
+} NT_VM_TARGET;
+
+#if defined(WIN32_LATENCY_TRACE) && WIN32_LATENCY_TRACE && !defined(TEST_HARNESS)
+typedef struct {
+    uint64_t operation;
+    uint64_t calls;
+    uint64_t total_cycles;
+    uint64_t max_cycles;
+    uint32_t reports;
+} NT_MEMORY_LATENCY;
+static NT_MEMORY_LATENCY nt_memory_latency[8];
+
+static uint64_t nt_memory_latency_cycles(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("lfence; rdtsc; lfence"
+                      : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void nt_memory_latency_record(const char *kind, uint64_t operation,
+    uint64_t started, uint64_t elapsed, ULONG owner, uint64_t amount,
+    uint64_t entry_flags)
+{
+    extern uint64_t idt_get_tsc_freq(void);
+    uint64_t hz = idt_get_tsc_freq();
+    uint64_t flags;
+    NT_MEMORY_LATENCY sample = {0};
+    BOOL report = FALSE;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    for (unsigned i = 0; i < sizeof(nt_memory_latency) /
+                                    sizeof(nt_memory_latency[0]); i++) {
+        NT_MEMORY_LATENCY *state = &nt_memory_latency[i];
+        if (state->operation && state->operation != operation) continue;
+        state->operation = operation;
+        state->calls++;
+        state->total_cycles += elapsed;
+        if (elapsed > state->max_cycles) state->max_cycles = elapsed;
+        /* At most 128 records per operation. The periodic total also exposes
+         * time spent in many small operations that never cross 20 ms. */
+        if (state->reports < 128 &&
+            (state->calls == 1 || !(state->calls & 1023) ||
+             (hz && elapsed >= hz / 50))) {
+            state->reports++;
+            sample = *state;
+            report = TRUE;
+        }
+        break;
+    }
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+    if (!report) return;
+    serial_puts("[NT-MEM-LATENCY] kind="); serial_puts(kind);
+    serial_puts(" op=0x"); serial_puthex(operation, 16);
+    serial_puts(" owner="); serial_putdec(owner);
+    serial_puts(" start="); serial_putdec(started);
+    serial_puts(" cycles="); serial_putdec(elapsed);
+    serial_puts(" hz="); serial_putdec(hz);
+    serial_puts(" calls="); serial_putdec(sample.calls);
+    serial_puts(" total="); serial_putdec(sample.total_cycles);
+    serial_puts(" max="); serial_putdec(sample.max_cycles);
+    serial_puts(" amount="); serial_putdec(amount);
+    serial_puts(" entry_if="); serial_putdec((entry_flags >> 9) & 1);
+    serial_puts("\n");
+}
+#endif
+
+/* Win32 execution/teardown is BSP-owned. Keep resolution and the non-yielding
+ * VM operation in one interrupt-disabled interval, without switching CR3 or
+ * pretending that the caller owns the target's mappings. */
+static NTSTATUS nt_vm_dispatch(ULONG_PTR *args, ACCESS_MASK access,
+    NTSTATUS (*operation)(ULONG_PTR *, const NT_VM_TARGET *), BOOL force32)
+{
+    extern BOOL win32_process_cr3(DWORD pid, uint64_t *cr3);
+    extern uint32_t win32_process_peb32_address(DWORD pid);
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#if defined(WIN32_LATENCY_TRACE) && WIN32_LATENCY_TRACE && !defined(TEST_HARNESS)
+    uint64_t latency_start = nt_memory_latency_cycles();
+#endif
+    HANDLE handle = (HANDLE)args[0];
+    NT_VM_TARGET target = {nt_current_owner_pid(), nt_current_cr3(), force32};
+    NTSTATUS status = STATUS_SUCCESS;
+    if (handle != NT_CURRENT_PROCESS && (ULONG_PTR)handle != UINT32_MAX) {
+        status = nt_process_resolve_vm_pid(handle, access, &target.owner_pid);
+        if (NT_SUCCESS(status)) {
+            if (!win32_process_cr3(target.owner_pid, &target.cr3))
+                status = STATUS_PROCESS_IS_TERMINATING;
+            else if (win32_process_peb32_address(target.owner_pid))
+                target.compat32 = TRUE;
+        }
+    }
+    if (NT_SUCCESS(status)) status = operation(args, &target);
+#if defined(WIN32_LATENCY_TRACE) && WIN32_LATENCY_TRACE && !defined(TEST_HARNESS)
+    uint64_t latency_elapsed = nt_memory_latency_cycles() - latency_start;
+    uint64_t latency_entries = (uint64_t)vm_track_count;
+#endif
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+#if defined(WIN32_LATENCY_TRACE) && WIN32_LATENCY_TRACE && !defined(TEST_HARNESS)
+    nt_memory_latency_record("vm", (uint64_t)(ULONG_PTR)operation,
+        latency_start, latency_elapsed, target.owner_pid, latency_entries,
+        flags);
+#endif
+    return status;
 }
 
 static uint64_t nt_identity_reservation_conflict_end(uint64_t base,
@@ -449,12 +566,11 @@ BOOL nt_vm_process_dep_enabled(ULONG owner_pid)
     return enabled;
 }
 
-static int vm_track_add(uint64_t va, uint64_t phys, SIZE_T size, ULONG protect,
+static int vm_track_add(ULONG owner_pid, uint64_t cr3,
+                        uint64_t va, uint64_t phys, SIZE_T size, ULONG protect,
                         BOOL owns_phys, PVOID section,
                         uint64_t section_offset)
 {
-    ULONG owner_pid = nt_current_owner_pid();
-    uint64_t cr3 = nt_current_cr3();
     uint64_t allocation_base = va;
     ULONG allocation_protect = protect;
     if (phys != 0 || section != NULL) {
@@ -477,11 +593,17 @@ static int vm_track_add(uint64_t va, uint64_t phys, SIZE_T size, ULONG protect,
             vm_track[i].owner_pid == owner_pid &&
             vm_track_entry_committed(&vm_track[i]) ==
                 (phys != 0 || section != NULL)) {
+            if (vm_track[i].driver_view)
+                return 0;
+            if (owns_phys && !section && phys && size > vm_track[i].size &&
+                !nt_job_charge_commit(owner_pid, size - vm_track[i].size))
+                return 0;
             if (size > vm_track[i].size)
                 vm_track[i].size = size;
             vm_track[i].protect = protect;
             vm_track[i].owns_phys = owns_phys;
             vm_track[i].section = section;
+            vm_track[i].driver_view = NULL;
             vm_track[i].section_offset = section_offset;
             vm_track[i].cr3 = cr3;
             vm_track[i].allocation_base = allocation_base;
@@ -490,6 +612,8 @@ static int vm_track_add(uint64_t va, uint64_t phys, SIZE_T size, ULONG protect,
         }
     }
     if (vm_track_count < VM_TRACK_MAX) {
+        if (owns_phys && !section && phys && !nt_job_charge_commit(owner_pid, size))
+            return 0;
         vm_track[vm_track_count].va   = va;
         vm_track[vm_track_count].phys = phys;
         vm_track[vm_track_count].section_offset = section_offset;
@@ -501,6 +625,7 @@ static int vm_track_add(uint64_t va, uint64_t phys, SIZE_T size, ULONG protect,
         vm_track[vm_track_count].owner_pid = owner_pid;
         vm_track[vm_track_count].owns_phys = owns_phys;
         vm_track[vm_track_count].section = section;
+        vm_track[vm_track_count].driver_view = NULL;
         vm_track_count++;
         return 1;
     } else {
@@ -622,6 +747,8 @@ static void vm_track_unmap_range(const vm_track_entry_t *entry,
                                  uint64_t start, uint64_t end)
 {
     static uint32_t missing_phys_logs;
+    if (entry->owns_phys && !entry->section)
+        nt_job_return_commit(entry->owner_pid, end - start);
 
     for (uint64_t va = start; va < end; va += 4096) {
         uint64_t phys = entry->owns_phys && !entry->section
@@ -762,7 +889,8 @@ static int vm_commit_range_locked(ULONG owner_pid, uint64_t cr3, uint64_t va,
         uint64_t phys = 0;
         if (!vm_map_private_backing(owner_pid, cr3, cursor, gap_size,
                                     protect, &phys) ||
-            !vm_track_add(cursor, phys, gap_size, protect, TRUE, NULL, 0)) {
+            !vm_track_add(owner_pid, cr3, cursor, phys, gap_size,
+                           protect, TRUE, NULL, 0)) {
             if (phys) {
                 SIZE_T pages = gap_size / 4096;
                 for (SIZE_T page = 0; page < pages; page++)
@@ -801,7 +929,7 @@ static int vm_decommit_range_locked(ULONG owner_pid, uint64_t va, SIZE_T size)
             !vm_track_entry_committed(entry) || entry_end < entry->va ||
             va >= entry_end || entry->va >= end)
             continue;
-        if (entry->section)
+        if (entry->section || entry->driver_view)
             return -1;
         if (entry->va < va && entry_end > end)
             extra_entries++;
@@ -847,6 +975,9 @@ static int vm_decommit_range_locked(ULONG owner_pid, uint64_t va, SIZE_T size)
 void nt_vm_release_process(ULONG owner_pid)
 {
     if (!owner_pid) return;
+    /* Close new device admission even for direct/root cleanup callers.
+     * begin_main_cpu_accounting reopens the root object on the next launch. */
+    nt_process_begin_vm_teardown(owner_pid);
 
     /* Timer callbacks can re-enter process code. Stop their dispatcher before
      * transferring or removing any process-owned mappings. */
@@ -863,6 +994,8 @@ void nt_vm_release_process(ULONG owner_pid)
     dinput8_release_process(owner_pid);
     dsound_release_process(owner_pid);
     gdi32_release_process(owner_pid);
+    cabinet_release_process(owner_pid);
+    msi_release_process(owner_pid);
     msvcrt_release_process(owner_pid);
 
     uint64_t released_pages = 0;
@@ -871,11 +1004,14 @@ void nt_vm_release_process(ULONG owner_pid)
     for (;;) {
         vm_track_entry_t entry = {0};
         BOOL found = FALSE;
+        BOOL driver_safe = FALSE;
         uint64_t vm_irq_flags = vm_track_lock_irqsave();
         for (int i = 0; i < vm_track_count; i++) {
             if (vm_track[i].owner_pid != owner_pid)
                 continue;
             entry = vm_track[i];
+            if (entry.driver_view)
+                driver_safe = vm_driver_revoke_locked(entry.driver_view);
             vm_track[i] = vm_track[--vm_track_count];
             found = TRUE;
             break;
@@ -885,6 +1021,15 @@ void nt_vm_release_process(ULONG owner_pid)
             break;
 
         released_entries++;
+        if (entry.driver_view) {
+            NT_VM_DRIVER_VIEW *view = entry.driver_view;
+            NT_VM_DRIVER_RETIRED retired = view->retired;
+            PVOID context = view->context;
+            if (driver_safe) released_pages += entry.size / 4096;
+            /* The callback receives VM's reference and may destroy view. */
+            retired(view, driver_safe, context);
+            continue;
+        }
         if (!vm_track_entry_committed(&entry)) continue;
 
         SIZE_T pages = (entry.size + 4095) / 4096;
@@ -1002,9 +1147,8 @@ void nt_vm_get_address_space(SIZE_T *total, SIZE_T *available)
     if (available) *available = available_bytes;
 }
 
-static int vm_track_contains(uint64_t va, SIZE_T size)
+static int vm_track_contains(ULONG owner_pid, uint64_t va, SIZE_T size)
 {
-    ULONG owner_pid = nt_current_owner_pid();
     uint64_t end = va + size;
     if (end < va) return 0;
 
@@ -1027,9 +1171,8 @@ static int vm_track_contains(uint64_t va, SIZE_T size)
     return 1;
 }
 
-static int vm_track_overlaps(uint64_t va, SIZE_T size)
+static int vm_track_overlaps(ULONG owner_pid, uint64_t va, SIZE_T size)
 {
-    ULONG owner_pid = nt_current_owner_pid();
     uint64_t end = va + size;
     if (end < va) return 1;
 
@@ -1068,14 +1211,16 @@ ULONGLONG nt_vm_range_conflict_end(ULONGLONG va, ULONGLONG size)
 
 /* Return the end of the first owner-local VMA or PE image intersecting the
  * candidate range. Must hold vm_track_lock. */
-static uint64_t vm_range_conflict_end_locked(uint64_t va, SIZE_T size,
+static uint64_t vm_range_conflict_end_locked(ULONG owner_pid, uint64_t cr3,
+                                             uint64_t va, SIZE_T size,
                                              int compat32)
 {
-    ULONG owner_pid = nt_current_owner_pid();
     uint64_t end = va + size;
     uint64_t conflict_end = 0;
     if (end < va)
         return UINT64_MAX;
+    if (compat32 && compat32_runtime_range_conflicts(va, size))
+        conflict_end = end;
 
     for (int i = 0; i < vm_track_count; i++) {
         uint64_t entry_end = vm_track[i].va + vm_track[i].size;
@@ -1085,9 +1230,10 @@ static uint64_t vm_range_conflict_end_locked(uint64_t va, SIZE_T size,
             conflict_end = entry_end;
     }
 
-    extern uint64_t syscall_vma_range_conflict_end(uint64_t base,
-                                                    uint64_t size);
-    uint64_t mmap_end = syscall_vma_range_conflict_end(va, size);
+    extern uint64_t syscall_vma_range_conflict_end_in_cr3(uint64_t cr3,
+                                                          uint64_t base,
+                                                          uint64_t size);
+    uint64_t mmap_end = syscall_vma_range_conflict_end_in_cr3(cr3, va, size);
     if (mmap_end == UINT64_MAX)
         return UINT64_MAX;
     if (mmap_end > conflict_end)
@@ -1096,21 +1242,21 @@ static uint64_t vm_range_conflict_end_locked(uint64_t va, SIZE_T size,
     uint64_t image_base = 0;
     uint64_t image_size = 0;
     uint64_t next_image = 0;
-    if (pe_va_query_range(va, &image_base, &image_size, &next_image)) {
+    if (pe_va_query_range_for_owner(owner_pid, va, &image_base,
+                                     &image_size, &next_image)) {
         uint64_t image_end = image_base +
                              ((image_size + 0xFFFULL) & ~0xFFFULL);
         if (image_end > conflict_end)
             conflict_end = image_end;
     } else if (next_image && next_image < end &&
-               pe_va_query_range(next_image, &image_base, &image_size,
-                                 &next_image)) {
+               pe_va_query_range_for_owner(owner_pid, next_image, &image_base,
+                                             &image_size, &next_image)) {
         uint64_t image_end = image_base +
                              ((image_size + 0xFFFULL) & ~0xFFFULL);
         if (image_end > conflict_end)
             conflict_end = image_end;
     }
 
-    uint64_t cr3 = nt_current_cr3();
     /* A shell-hosted PE32 main process runs on kernel_cr3, where ordinary low
      * RAM PTEs are inherited identity aliases rather than user allocations.
      * Ignore those aliases, but preserve the small set of low ranges that the
@@ -1149,11 +1295,11 @@ static BOOL vm_address_allowed(uint64_t va, SIZE_T size, BOOL requested,
 
 /* Choose a 64 KB allocation-granularity address. Automatic allocations skip
  * occupied ranges instead of reporting false OOM at the first collision. */
-static uint64_t vm_choose_address_locked(SIZE_T size, uint64_t requested_va,
+static uint64_t vm_choose_address_locked(ULONG owner_pid, uint64_t cr3,
+                                         SIZE_T size, uint64_t requested_va,
                                          int compat32)
 {
-    uint64_t *auto_next = vm_auto_next_locked(nt_current_owner_pid(),
-                                               compat32);
+    uint64_t *auto_next = vm_auto_next_locked(owner_pid, compat32);
     if (!auto_next)
         return 0;
 
@@ -1164,7 +1310,8 @@ static uint64_t vm_choose_address_locked(SIZE_T size, uint64_t requested_va,
         if (!vm_address_allowed(va, size, requested_va != 0, compat32))
             return 0;
 
-        uint64_t conflict_end = vm_range_conflict_end_locked(va, size,
+        uint64_t conflict_end = vm_range_conflict_end_locked(owner_pid, cr3,
+                                                              va, size,
                                                               compat32);
         if (!conflict_end)
             return va;
@@ -1175,9 +1322,140 @@ static uint64_t vm_choose_address_locked(SIZE_T size, uint64_t requested_va,
     }
 }
 
+/* Revoke only our exact 4 KiB PTEs. No callbacks or PMM frees under this lock.
+ * Once quarantined, never walk that CR3 again: teardown can destroy/reuse it. */
+static BOOL vm_driver_revoke_locked(NT_VM_DRIVER_VIEW *view)
+{
+    if (view->state != NT_VM_DRIVER_LIVE)
+        return FALSE;
+    if (smp_current_cpu() != 0) {
+        view->state = NT_VM_DRIVER_QUARANTINED;
+        return FALSE;
+    }
+    BOOL safe = TRUE;
+    for (SIZE_T off = 0; off < view->mapped_bytes; off += 4096) {
+        uint64_t va = view->address + off;
+        uint64_t *pte = nt_get_pte_in(view->cr3, va);
+        if (pte && (*pte & PTE_ADDR_MASK) == view->physical + off) {
+            if (nt_unmap_page_in(view->cr3, va) != 0)
+                safe = FALSE;
+        } else if ((!pte || !*pte) &&
+                   paging_query_mapping_in_cr3(view->cr3, va, NULL, NULL) != 0) {
+            /* Even an already-cleared entry must lose its local stale TLB. */
+            __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+        } else {
+            safe = FALSE;
+        }
+    }
+    view->state = safe ? NT_VM_DRIVER_RETIRED_STATE : NT_VM_DRIVER_QUARANTINED;
+    return safe;
+}
+
+/* Admission is already serialized against NT process exit by the BSP caller.
+ * Keep a tracker entry even after a failed rollback if backing safety cannot
+ * be proved. Its reference is then returned only by process teardown. */
+static NTSTATUS vm_map_driver_view_locked(const NT_VM_TARGET *target,
+    NT_VM_DRIVER_VIEW *view, uint64_t physical, SIZE_T bytes, BOOL writable,
+    NT_VM_DRIVER_RETIRED retired, PVOID context)
+{
+    if (!view || view->self || view->state || !retired || !physical ||
+        (physical & 4095) || !bytes || (bytes & 4095) ||
+        bytes > 256ULL * 1024 * 1024 || physical > PTE_ADDR_MASK ||
+        bytes - 4096 > PTE_ADDR_MASK - physical ||
+        !target->owner_pid || !target->cr3)
+        return STATUS_INVALID_PARAMETER;
+    if (vm_track_count == VM_TRACK_MAX)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    uint64_t va = vm_choose_address_locked(target->owner_pid, target->cr3,
+                                            bytes, 0, target->compat32);
+    if (!va) return STATUS_NO_MEMORY;
+    *view = (NT_VM_DRIVER_VIEW){
+        .self = view, .retired = retired, .context = context,
+        .address = va, .physical = physical, .cr3 = target->cr3,
+        .bytes = bytes, .owner_pid = target->owner_pid,
+        .state = NT_VM_DRIVER_LIVE
+    };
+    ULONG protect = writable ? PAGE_READWRITE : PAGE_READONLY;
+    vm_track[vm_track_count++] = (vm_track_entry_t){
+        .va = va, .phys = physical, .cr3 = target->cr3,
+        .allocation_base = va, .size = bytes,
+        .allocation_protect = protect, .protect = protect,
+        .owner_pid = target->owner_pid, .driver_view = view
+    };
+    vm_advance_auto_next_locked(target->owner_pid, target->compat32, va, bytes);
+    /* Always WB and NX, including legacy PE processes with DEP disabled. */
+    uint64_t flags = PTE_PRESENT | PTE_NX | (writable ? PTE_WRITABLE : 0);
+    for (SIZE_T off = 0; off < bytes; off += 4096) {
+        if (nt_map_page_in(target->cr3, va + off, physical + off, flags) != 0) {
+            if (vm_driver_revoke_locked(view)) --vm_track_count;
+            return STATUS_NO_MEMORY;
+        }
+        view->mapped_bytes += 4096;
+    }
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS nt_vm_map_driver_view(NT_VM_DRIVER_VIEW *view, uint64_t physical,
+                               SIZE_T bytes, BOOL compat32, BOOL writable,
+                               NT_VM_DRIVER_RETIRED retired, PVOID context)
+{
+    if (smp_current_cpu() != 0) return STATUS_NOT_SUPPORTED;
+    vm_global_init_once();
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    NT_VM_TARGET target = {0, nt_current_cr3(), compat32};
+    NTSTATUS status = nt_process_resolve_vm_pid(NT_CURRENT_PROCESS, 0,
+                                                &target.owner_pid);
+    BOOL returned_reference = FALSE;
+    if (NT_SUCCESS(status)) {
+        uint64_t vm_flags = vm_track_lock_irqsave();
+        status = vm_map_driver_view_locked(&target, view, physical, bytes,
+                                            writable, retired, context);
+        returned_reference = view && view->self == view &&
+                             view->state == NT_VM_DRIVER_RETIRED_STATE &&
+                             status == STATUS_NO_MEMORY;
+        vm_track_unlock_irqrestore(vm_flags);
+    }
+    if (flags & (1ULL << 9)) __asm__ volatile("sti" ::: "memory");
+    if (returned_reference) retired(view, TRUE, context);
+    return status;
+}
+
+NTSTATUS nt_vm_map_coherent_driver_view(NT_VM_DRIVER_VIEW *view,uint64_t physical,
+    SIZE_T bytes,BOOL compat32,NT_VM_DRIVER_RETIRED retired,PVOID context)
+{
+    return nt_vm_map_driver_view(view,physical,bytes,compat32,FALSE,retired,context);
+}
+
+NTSTATUS nt_vm_unmap_driver_view(NT_VM_DRIVER_VIEW *view)
+{
+    if (smp_current_cpu() != 0) return STATUS_NOT_SUPPORTED;
+    NT_VM_DRIVER_RETIRED retired = NULL;
+    PVOID context = NULL;
+    NTSTATUS status = STATUS_INVALID_PARAMETER;
+    uint64_t flags = vm_track_lock_irqsave();
+    if (view && view->self == view) {
+        for (int i = 0; i < vm_track_count; i++) {
+            if (vm_track[i].driver_view != view) continue;
+            status = STATUS_UNSUCCESSFUL;
+            if (vm_driver_revoke_locked(view)) {
+                vm_track[i] = vm_track[--vm_track_count];
+                retired = view->retired;
+                context = view->context;
+                status = STATUS_SUCCESS;
+            }
+            break;
+        }
+    }
+    vm_track_unlock_irqrestore(flags);
+    if (retired) retired(view, TRUE, context);
+    return status;
+}
+
 /* Forward declaration (defined below with other nt_* helpers) */
 static inline void nt_memset(void *s, int c, SIZE_T n);
 static uint64_t nt_prot_to_page_flags(ULONG protect, BOOL dep_enabled);
+static BOOL nt_valid_page_protection(ULONG protect);
 
 /* Allocate zeroed physical backing and install it atomically in one address
  * space. The final PTE flags reflect the requested protection. */
@@ -1220,12 +1498,11 @@ static int vm_map_private_backing(ULONG owner_pid, uint64_t cr3, uint64_t va,
 }
 
 /* Allocate VA range and map physical pages into it */
-static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect,
+static PVOID win32_va_alloc(ULONG owner_pid, uint64_t cr3,
+                            SIZE_T size, uint64_t *out_phys, ULONG protect,
                             uint64_t requested_va, int reserve_only,
                             int compat32)
 {
-    ULONG owner_pid = nt_current_owner_pid();
-    uint64_t cr3 = nt_current_cr3();
     uint64_t pages = size / 4096;
     if (pages == 0) return NULL;
 
@@ -1233,7 +1510,8 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect,
      * free-range index. Monotonic allocation prevents stale aliases without
      * coupling the allocator to any particular executable. */
     uint64_t *auto_next = vm_auto_next_locked(owner_pid, compat32);
-    uint64_t va = vm_choose_address_locked(size, requested_va, compat32);
+    uint64_t va = vm_choose_address_locked(owner_pid, cr3, size,
+                                            requested_va, compat32);
     if (!auto_next || !va) {
         static uint32_t auto_reject_logs;
         static uint32_t fixed_reject_logs;
@@ -1357,6 +1635,8 @@ static FILE_OBJECT *nt_file_object_allocate(ULONG flags)
         used++;
     }
     spin_unlock(&g_file_pool_lock);
+    if (object && (flags & FILE_OBJ_DISK_FILE))
+        nt_file_cache_open(object);
     if (!object) {
         static uint32_t exhaustion_logs;
         uint32_t index = __atomic_fetch_add(&exhaustion_logs, 1,
@@ -1376,6 +1656,7 @@ static void nt_file_object_release(FILE_OBJECT *object)
 {
     if (!object) return;
     nt_file_locks_release_object(object);
+    nt_file_cache_close(object);
     spin_lock(&g_file_pool_lock);
     object->flags = 0;
     object->osfs_file = NULL;
@@ -1544,12 +1825,20 @@ static NTSTATUS nt_pipe_read(PFILE_OBJECT end, PVOID buffer, ULONG length,
 {
     WIN32_PIPE_OBJECT *obj = (WIN32_PIPE_OBJECT *)end->osfs_file;
     pipe_buf_t *pipe = obj ? nt_pipe_read_buffer(obj, end) : NULL;
+    PVOID request = nt_thread_sync_io_begin();
+    NTSTATUS status;
+    ULONG transferred = 0;
     for (;;) {
+        if (nt_thread_sync_io_cancelled(request)) {
+            status = STATUS_CANCELLED;
+            break;
+        }
         spin_lock(&g_win32_pipe_lock);
         if (!obj || !obj->in_use || !pipe || !pipe->in_use ||
             !(end->flags & FILE_OBJ_PIPE_READ)) {
             spin_unlock(&g_win32_pipe_lock);
-            return STATUS_INVALID_HANDLE;
+            status = STATUS_INVALID_HANDLE;
+            break;
         }
         if (pipe->count) {
             ULONG count = length < pipe->count ? length : pipe->count;
@@ -1560,23 +1849,24 @@ static NTSTATUS nt_pipe_read(PFILE_OBJECT end, PVOID buffer, ULONG length,
             }
             pipe->count -= count;
             spin_unlock(&g_win32_pipe_lock);
-            if (iosb) {
-                iosb->Status = STATUS_SUCCESS;
-                iosb->Information = count;
-            }
-            return STATUS_SUCCESS;
+            transferred = count;
+            status = STATUS_SUCCESS;
+            break;
         }
         BOOL eof = pipe->write_refs == 0;
         spin_unlock(&g_win32_pipe_lock);
         if (eof) {
-            if (iosb) {
-                iosb->Status = STATUS_END_OF_FILE;
-                iosb->Information = 0;
-            }
-            return STATUS_END_OF_FILE;
+            status = STATUS_END_OF_FILE;
+            break;
         }
         sched_yield();
     }
+    nt_thread_sync_io_end(request);
+    if (iosb) {
+        iosb->Status = status;
+        iosb->Information = transferred;
+    }
+    return status;
 }
 
 NTSTATUS nt_pipe_try_read(HANDLE handle, PVOID buffer, ULONG length,
@@ -1661,13 +1951,20 @@ static NTSTATUS nt_pipe_write(PFILE_OBJECT end, PCVOID buffer, ULONG length,
 {
     WIN32_PIPE_OBJECT *obj = (WIN32_PIPE_OBJECT *)end->osfs_file;
     pipe_buf_t *pipe = obj ? nt_pipe_write_buffer(obj, end) : NULL;
+    PVOID request = nt_thread_sync_io_begin();
+    NTSTATUS status = STATUS_SUCCESS;
     ULONG written = 0;
     while (written < length) {
+        if (nt_thread_sync_io_cancelled(request)) {
+            status = STATUS_CANCELLED;
+            break;
+        }
         spin_lock(&g_win32_pipe_lock);
         if (!obj || !obj->in_use || !pipe || !pipe->in_use ||
             !(end->flags & FILE_OBJ_PIPE_WRITE) || pipe->read_refs == 0) {
             spin_unlock(&g_win32_pipe_lock);
-            return STATUS_INVALID_HANDLE;
+            status = STATUS_INVALID_HANDLE;
+            break;
         }
         ULONG space = PIPE_BUF_SIZE - pipe->count;
         if (space) {
@@ -1687,11 +1984,12 @@ static NTSTATUS nt_pipe_write(PFILE_OBJECT end, PCVOID buffer, ULONG length,
         if (!space)
             sched_yield();
     }
+    nt_thread_sync_io_end(request);
     if (iosb) {
-        iosb->Status = STATUS_SUCCESS;
-        iosb->Information = written;
+        iosb->Status = status;
+        iosb->Information = NT_SUCCESS(status) ? written : 0;
     }
-    return STATUS_SUCCESS;
+    return status;
 }
 
 NTSTATUS nt_pipe_peek(HANDLE handle, PVOID buffer, ULONG length,
@@ -1813,7 +2111,7 @@ static NTSTATUS nt_resolve_object_path(POBJECT_ATTRIBUTES attributes,
         if (raw[0] && pos == (int)sizeof(joined) - 1)
             return STATUS_OBJECT_PATH_NOT_FOUND;
         joined[pos] = 0;
-        return win32_normalize_path(joined, path)
+        return (win32_normalize_path(joined, path) && win32_redirect_path(path))
             ? STATUS_SUCCESS : STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
@@ -1831,7 +2129,7 @@ static NTSTATUS nt_resolve_object_path(POBJECT_ATTRIBUTES attributes,
         absolute[pos++] = resolved[i++];
     if (resolved[i]) return STATUS_OBJECT_PATH_NOT_FOUND;
     absolute[pos] = 0;
-    return win32_normalize_path(absolute, path)
+    return (win32_normalize_path(absolute, path) && win32_redirect_path(path))
         ? STATUS_SUCCESS : STATUS_OBJECT_PATH_NOT_FOUND;
 }
 
@@ -2017,6 +2315,27 @@ static NTSTATUS nt_file_resolve_offset_locked(FILE_OBJECT *file,
 
 NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
 {
+    return nt_create_file_resolved(args, NULL);
+}
+
+/* A missing final component differs from a missing containing directory. */
+static NTSTATUS nt_missing_path_status(const char *path)
+{
+    char parent[260];
+    unsigned length = 0, separator = 0;
+    while (path[length] && length < sizeof(parent) - 1) {
+        parent[length] = path[length];
+        if (path[length] == '\\' || path[length] == '/') separator = length + 1;
+        length++;
+    }
+    if (!separator) return STATUS_OBJECT_NAME_NOT_FOUND;
+    parent[separator - 1] = 0;
+    return win32_directory_exists_normalized(parent)
+        ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_OBJECT_PATH_NOT_FOUND;
+}
+
+NTSTATUS nt_create_file_resolved(ULONG_PTR *args, const char *physical_path)
+{
     PHANDLE             FileHandle       = (PHANDLE)args[0];
     ACCESS_MASK         DesiredAccess    = (ACCESS_MASK)args[1];
     POBJECT_ATTRIBUTES  ObjectAttributes = (POBJECT_ATTRIBUTES)args[2];
@@ -2050,7 +2369,18 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
     }
 
     char path_buf[260];
-    NTSTATUS path_status = nt_resolve_object_path(ObjectAttributes, path_buf);
+    NTSTATUS path_status = STATUS_SUCCESS;
+    if (physical_path) {
+        unsigned length = 0;
+        while (physical_path[length] && length < sizeof(path_buf) - 1) {
+            path_buf[length] = physical_path[length];
+            length++;
+        }
+        path_buf[length] = 0;
+        if (physical_path[length]) path_status = STATUS_OBJECT_PATH_NOT_FOUND;
+    } else {
+        path_status = nt_resolve_object_path(ObjectAttributes, path_buf);
+    }
     if (!NT_SUCCESS(path_status)) {
         return nt_complete_io(IoStatusBlock, path_status, 0);
     }
@@ -2123,19 +2453,20 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
         if (!existed) {
             if (CreateDisposition == FILE_OPEN ||
                 CreateDisposition == FILE_OVERWRITE) {
+                NTSTATUS missing_status = nt_missing_path_status(path);
                 if (IoStatusBlock) {
-                    IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+                    IoStatusBlock->Status = missing_status;
                     IoStatusBlock->Information = 0;
                 }
-                nt_log_create_failure(path, STATUS_OBJECT_NAME_NOT_FOUND,
+                nt_log_create_failure(path, missing_status,
                                       CreateDisposition, CreateOptions,
                                       ObjectAttributes->RootDirectory);
                 if (trace_create)
                     nt_trace_file_create(create_trace_id, "dir-missing", path,
                                           DesiredAccess, CreateDisposition,
                                           CreateOptions,
-                                          STATUS_OBJECT_NAME_NOT_FOUND, false);
-                return STATUS_OBJECT_NAME_NOT_FOUND;
+                                          missing_status, false);
+                return missing_status;
             }
             DWORD error = win32_directory_create_normalized(path);
             if (trace_detail) {
@@ -2256,7 +2587,7 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
                                   path, DesiredAccess, CreateDisposition,
                                   CreateOptions,
                                   osfs_file ? STATUS_SUCCESS
-                                            : STATUS_OBJECT_NAME_NOT_FOUND,
+                                            : nt_missing_path_status(path),
                                   false);
     } else if (osfs_file && (CreateDisposition == FILE_OVERWRITE ||
                              CreateDisposition == FILE_OVERWRITE_IF ||
@@ -2271,19 +2602,20 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
     }
 
     if (!osfs_file) {
-        nt_log_create_failure(path, STATUS_OBJECT_NAME_NOT_FOUND,
+        NTSTATUS missing_status = nt_missing_path_status(path);
+        nt_log_create_failure(path, missing_status,
                               CreateDisposition, CreateOptions,
                               ObjectAttributes->RootDirectory);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = missing_status;
             IoStatusBlock->Information = 0;
         }
         if (trace_create)
             nt_trace_file_create(create_trace_id, "file-missing", path,
                                   DesiredAccess, CreateDisposition,
-                                  CreateOptions, STATUS_OBJECT_NAME_NOT_FOUND,
+                                  CreateOptions, missing_status,
                                   existed_before);
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+        return missing_status;
     }
 
     /* Create file object. The pool is reused: a free slot has flags==0 (an
@@ -2436,7 +2768,12 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
      * from any CR3) and then copying to the user VA (accessible under
      * the current Win32 CR3), we guarantee correct data delivery.
      */
-    void *sys_buf = kmalloc(to_read);
+    uint32_t capacity = nt_file_read_capacity(fobj, offset, to_read, file_size);
+    void *sys_buf = kmalloc(capacity);
+    if (!sys_buf && capacity > to_read) {
+        capacity = to_read;
+        sys_buf = kmalloc(capacity);
+    }
     if (!sys_buf) {
         nt_file_io_guard_end(&io_guard);
         nt_file_io_unlock(fobj);
@@ -2444,7 +2781,8 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
                               STATUS_INSUFFICIENT_RESOURCES, 0);
     }
 
-    int result = osfs2_read(fobj->osfs_file, offset, sys_buf, to_read);
+    int result = nt_file_cached_read(fobj, offset, sys_buf, to_read, capacity,
+                                      file_size);
     if (result == (int)to_read) {
         volatile uint8_t *dst = (volatile uint8_t *)Buffer;
         const uint8_t *src = (const uint8_t *)sys_buf;
@@ -2494,9 +2832,13 @@ NTSTATUS sys_NtWriteFile(ULONG_PTR *args)
     PLARGE_INTEGER      ByteOffset    = (PLARGE_INTEGER)args[7];
     /* PULONG           Key           = (PULONG)args[8]; */
 
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
     FILE_OBJECT *fobj = NULL;
-    NTSTATUS status = handle_lookup(&g_handle_table, FileHandle,
-                                    OBJ_TYPE_FILE, (PVOID *)&fobj);
+    ACCESS_MASK access = 0;
+    NTSTATUS status = handle_lookup_access_for_process(
+        &g_handle_table, FileHandle, owner_pid, OBJ_TYPE_FILE,
+        (PVOID *)&fobj, &access);
     if (!NT_SUCCESS(status))
         return nt_complete_io(IoStatusBlock, status, 0);
 
@@ -2526,6 +2868,13 @@ NTSTATUS sys_NtWriteFile(ULONG_PTR *args)
         return nt_complete_io(IoStatusBlock,
                               STATUS_INVALID_DEVICE_REQUEST, 0);
 
+    access = nt_map_file_access(access);
+    if (!(access & (FILE_WRITE_DATA | FILE_APPEND_DATA)))
+        return nt_complete_io(IoStatusBlock, STATUS_ACCESS_DENIED, 0);
+    bool append = !(access & FILE_WRITE_DATA) ||
+                  (ByteOffset && ByteOffset->HighPart == -1 &&
+                   ByteOffset->LowPart == FILE_WRITE_TO_END_OF_FILE);
+
     nt_file_io_lock(fobj);
     uint64_t file_size = osfs2_file_size(fobj->osfs_file);
     if (file_size > 0x7FFFFFFFFFFFFFFFULL) {
@@ -2536,8 +2885,13 @@ NTSTATUS sys_NtWriteFile(ULONG_PTR *args)
 
     uint64_t offset = 0;
     bool advance_position = false;
-    status = nt_file_resolve_offset_locked(fobj, ByteOffset, true,
-                                           &offset, &advance_position);
+    if (append) {
+        offset = file_size;
+        advance_position = nt_file_is_synchronous(fobj);
+    } else {
+        status = nt_file_resolve_offset_locked(fobj, ByteOffset, true,
+                                               &offset, &advance_position);
+    }
     if (!NT_SUCCESS(status) ||
         offset > 0x7FFFFFFFFFFFFFFFULL - (uint64_t)Length) {
         nt_file_io_unlock(fobj);
@@ -2547,8 +2901,6 @@ NTSTATUS sys_NtWriteFile(ULONG_PTR *args)
                               0);
     }
 
-    ULONG owner_pid = win32_current_process_id();
-    if (!owner_pid) owner_pid = 1;
     NT_FILE_IO_GUARD io_guard;
     status = nt_file_io_guard_begin(fobj, owner_pid, offset, Length,
                                     TRUE, &io_guard);
@@ -2574,9 +2926,33 @@ NTSTATUS sys_NtWriteFile(ULONG_PTR *args)
         io_flags |= OSFS_IO_PRESERVE_MTIME;
     if (fobj->suppress_change_time)
         io_flags |= OSFS_IO_PRESERVE_CTIME;
-    int result = osfs2_write_ex(fobj->osfs_file, offset, sys_buf, Length,
-                                io_flags);
+    int result;
+    for (;;) {
+        result = append
+            ? osfs2_append_ex(fobj->osfs_file, offset, sys_buf, Length, io_flags)
+            : osfs2_write_ex(fobj->osfs_file, offset, sys_buf, Length, io_flags);
+        if (!append || result != OSFS_APPEND_RETRY) break;
+
+        /* Another open extended/truncated the file after the range check.
+         * Protect the new EOF range before retrying the atomic append. */
+        nt_file_io_guard_end(&io_guard);
+        file_size = osfs2_file_size(fobj->osfs_file);
+        if (file_size > 0x7FFFFFFFFFFFFFFFULL - (uint64_t)Length) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        fobj->size = (LONGLONG)file_size;
+        offset = file_size;
+        status = nt_file_io_guard_begin(fobj, owner_pid, offset, Length,
+                                        TRUE, &io_guard);
+        if (!NT_SUCCESS(status)) break;
+    }
     kfree(sys_buf);
+    if (!NT_SUCCESS(status)) {
+        nt_file_io_guard_end(&io_guard);
+        nt_file_io_unlock(fobj);
+        return nt_complete_io(IoStatusBlock, status, 0);
+    }
     if (result < 0) {
         nt_file_io_guard_end(&io_guard);
         nt_file_io_unlock(fobj);
@@ -2673,6 +3049,8 @@ static NTSTATUS nt_close_handle_for_process_internal(HANDLE Handle,
                closed.type == OBJ_TYPE_MUTANT ||
                closed.type == OBJ_TYPE_SEMAPHORE) {
         extern void ntsync_release_object(OBJECT_TYPE_ID type, PVOID object);
+        if (closed.type == OBJ_TYPE_EVENT)
+            k32_iocp_release_event(closed.object);
         ntsync_release_object(closed.type, closed.object);
     } else if (closed.type == OBJ_TYPE_THREAD) {
         extern void nt_process_release_thread_object(PVOID object);
@@ -2702,21 +3080,26 @@ NTSTATUS sys_NtClose(ULONG_PTR *args)
 
 /* ── NtAllocateVirtualMemory ────────────────────────────────── */
 
-static NTSTATUS nt_allocate_virtual_memory(ULONG_PTR *args, int compat32)
+static NTSTATUS nt_allocate_virtual_memory(ULONG_PTR *args,
+                                             const NT_VM_TARGET *target)
 {
-    /* HANDLE   ProcessHandle = (HANDLE)args[0]; */
     PVOID   *BaseAddress   = (PVOID *)args[1];
     /* ULONG_PTR ZeroBits   = args[2]; */
     SIZE_T  *RegionSize    = (SIZE_T *)args[3];
     ULONG    AllocationType = (ULONG)args[4];
     ULONG    Protect        = (ULONG)args[5];
 
-    if (!BaseAddress || !RegionSize)
+    if (!BaseAddress || !RegionSize || !nt_valid_page_protection(Protect))
         return STATUS_INVALID_PARAMETER;
+
+    ULONG owner_pid = target->owner_pid;
+    uint64_t cr3 = target->cr3;
+    BOOL compat32 = target->compat32;
 
     SIZE_T requested_size = *RegionSize;
     uint64_t requested_address = (uint64_t)(ULONG_PTR)*BaseAddress;
-    uint64_t requested_va = requested_address & ~0xFFFULL;
+    uint64_t alignment = (AllocationType & MEM_RESERVE) ? 0xFFFFULL : 0xFFFULL;
+    uint64_t requested_va = requested_address & ~alignment;
     SIZE_T page_offset = requested_address - requested_va;
     if (!requested_size || requested_size > UINT64_MAX - page_offset ||
         requested_size + page_offset > UINT64_MAX - 0xFFFULL)
@@ -2740,7 +3123,7 @@ static NTSTATUS nt_allocate_virtual_memory(ULONG_PTR *args, int compat32)
      * such as Chromium's PartitionAlloc. */
     if (AllocationType & MEM_RESET) {
         if (AllocationType != MEM_RESET || !requested_va ||
-            !vm_track_contains(requested_va, size)) {
+            !vm_track_contains(owner_pid, requested_va, size)) {
             vm_track_unlock_irqrestore(vm_irq_flags);
             return STATUS_CONFLICTING_ADDRESSES;
         }
@@ -2763,13 +3146,9 @@ static NTSTATUS nt_allocate_virtual_memory(ULONG_PTR *args, int compat32)
     if (want_commit && !want_reserve && requested_address == 0)
         want_reserve = TRUE;
 
-    ULONG owner_pid = nt_current_owner_pid();
-    uint64_t cr3 = nt_current_cr3();
-
     if (want_reserve) {
         if (requested_va &&
-            (vm_track_overlaps(requested_va, size) ||
-             pe_va_range_conflicts(requested_va, size))) {
+            vm_track_overlaps(owner_pid, requested_va, size)) {
             vm_track_unlock_irqrestore(vm_irq_flags);
             return STATUS_CONFLICTING_ADDRESSES;
         }
@@ -2781,17 +3160,17 @@ static NTSTATUS nt_allocate_virtual_memory(ULONG_PTR *args, int compat32)
             return STATUS_NO_MEMORY;
         }
 
-        addr = win32_va_alloc(size, &phys, Protect, requested_va,
+        addr = win32_va_alloc(owner_pid, cr3, size, &phys, Protect, requested_va,
                               !want_commit, compat32);
         if (!addr) {
             vm_track_unlock_irqrestore(vm_irq_flags);
             return requested_va ? STATUS_CONFLICTING_ADDRESSES
                                 : STATUS_NO_MEMORY;
         }
-        if (!vm_track_add((uint64_t)addr, 0, size, Protect,
+        if (!vm_track_add(owner_pid, cr3, (uint64_t)addr, 0, size, Protect,
                           FALSE, NULL, 0) ||
             (want_commit &&
-             !vm_track_add((uint64_t)addr, phys, size, Protect,
+             !vm_track_add(owner_pid, cr3, (uint64_t)addr, phys, size, Protect,
                            TRUE, NULL, 0))) {
             vm_track_count = initial_count;
             if (phys) {
@@ -2802,8 +3181,11 @@ static NTSTATUS nt_allocate_virtual_memory(ULONG_PTR *args, int compat32)
             vm_track_unlock_irqrestore(vm_irq_flags);
             return STATUS_NO_MEMORY;
         }
-        vm_advance_auto_next_locked(owner_pid, compat32,
-                                    (uint64_t)addr, size);
+        /* Fixed placement must not skip free space below an unrelated high
+         * reservation. The automatic search already skips every live VMA. */
+        if (!requested_va)
+            vm_advance_auto_next_locked(owner_pid, compat32,
+                                        (uint64_t)addr, size);
     } else {
         if (!requested_va ||
             vm_track_find_reservation_locked(owner_pid, requested_va, size) < 0) {
@@ -2833,7 +3215,8 @@ static NTSTATUS nt_allocate_virtual_memory(ULONG_PTR *args, int compat32)
 
 NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
 {
-    return nt_allocate_virtual_memory(args, g_compat32_mode);
+    return nt_vm_dispatch(args, 0x0008U, nt_allocate_virtual_memory,
+                            g_compat32_mode);
 }
 
 NTSTATUS nt_vm_allocate_compat32(PVOID *base_address, SIZE_T *region_size,
@@ -2850,7 +3233,7 @@ NTSTATUS nt_vm_allocate_compat32(PVOID *base_address, SIZE_T *region_size,
         allocation_type,
         protect,
     };
-    return nt_allocate_virtual_memory(args, TRUE);
+    return nt_vm_dispatch(args, 0x0008U, nt_allocate_virtual_memory, TRUE);
 }
 
 /* ── NtFreeVirtualMemory ────────────────────────────────────── */
@@ -2883,7 +3266,8 @@ static NTSTATUS vm_release_reservation_locked(ULONG owner_pid, uint64_t va,
             !vm_track_entry_committed(entry) || entry_end < entry->va ||
             va >= entry_end || entry->va >= end)
             continue;
-        if (entry->section || entry->va < va || entry_end > end)
+        if (entry->section || entry->driver_view ||
+            entry->va < va || entry_end > end)
             return STATUS_UNABLE_TO_FREE_VM;
         had_committed_backing = TRUE;
     }
@@ -2910,9 +3294,9 @@ static NTSTATUS vm_release_reservation_locked(ULONG owner_pid, uint64_t va,
     return STATUS_SUCCESS;
 }
 
-NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
+static NTSTATUS nt_free_virtual_memory(ULONG_PTR *args,
+                                         const NT_VM_TARGET *target)
 {
-    /* HANDLE ProcessHandle = (HANDLE)args[0]; */
     PVOID  *BaseAddress    = (PVOID *)args[1];
     SIZE_T *RegionSize     = (SIZE_T *)args[2];
     ULONG   FreeType       = (ULONG)args[3];
@@ -2942,7 +3326,7 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
             return STATUS_INVALID_PARAMETER;
         }
         size = (size + 0xFFFULL) & ~0xFFFULL;
-        int result = vm_decommit_range_locked(nt_current_owner_pid(), va, size);
+        int result = vm_decommit_range_locked(target->owner_pid, va, size);
         if (result <= 0) {
             vm_track_unlock_irqrestore(vm_irq_flags);
             return STATUS_UNABLE_TO_FREE_VM;
@@ -2961,7 +3345,7 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
         return STATUS_INVALID_PARAMETER;
     }
 
-    ULONG owner_pid = nt_current_owner_pid();
+    ULONG owner_pid = target->owner_pid;
     uint64_t va = (uint64_t)(ULONG_PTR)*BaseAddress;
     SIZE_T tracked = 0;
     NTSTATUS release_status = vm_release_reservation_locked(owner_pid, va,
@@ -2976,6 +3360,11 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
     *BaseAddress = NULL;
     *RegionSize = 0;
     return STATUS_SUCCESS;
+}
+
+NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
+{
+    return nt_vm_dispatch(args, 0x0008U, nt_free_virtual_memory, g_compat32_mode);
 }
 
 NTSTATUS nt_vm_release_allocation_for_process(ULONG owner_pid,
@@ -3137,7 +3526,7 @@ NTSTATUS sys_NtQueryInformationFile(ULONG_PTR *args)
         if ((fobj->flags & (FILE_OBJ_DISK_FILE | FILE_OBJ_DIRECTORY)) &&
             fobj->osfs_file) {
             osfs_file_times_t times;
-            uint16_t mode;
+            uint8_t dos_attributes;
             nt_file_io_lock(fobj);
             if (osfs2_file_get_times(fobj->osfs_file, &times) == 0) {
                 info->CreationTime.QuadPart =
@@ -3149,10 +3538,10 @@ NTSTATUS sys_NtQueryInformationFile(ULONG_PTR *args)
                 info->ChangeTime.QuadPart =
                     nt_filetime_from_unix_seconds(times.changed);
             }
-            if (osfs2_get_mode(fobj->osfs_file, &mode) == 0 &&
-                !(mode & 0222U)) {
-                info->FileAttributes &= ~FILE_ATTRIBUTE_NORMAL;
-                info->FileAttributes |= FILE_ATTRIBUTE_READONLY;
+            if (osfs2_file_get_dos_attributes(fobj->osfs_file, &dos_attributes) == 0) {
+                info->FileAttributes = dos_attributes |
+                    ((fobj->flags & FILE_OBJ_DIRECTORY) ? FILE_ATTRIBUTE_DIRECTORY : 0);
+                if (!info->FileAttributes) info->FileAttributes = FILE_ATTRIBUTE_NORMAL;
             }
             nt_file_io_unlock(fobj);
         }
@@ -3268,18 +3657,8 @@ NTSTATUS sys_NtSetInformationFile(ULONG_PTR *args)
 
         nt_file_io_lock(fobj);
         if (requested.FileAttributes) {
-            uint16_t mode;
-            if (osfs2_get_mode(fobj->osfs_file, &mode) < 0) {
-                nt_file_io_unlock(fobj);
-                return nt_complete_io(IoStatusBlock,
-                                      STATUS_UNSUCCESSFUL, 0);
-            }
-            mode &= 07777U;
-            if (requested.FileAttributes & FILE_ATTRIBUTE_READONLY)
-                mode &= (uint16_t)~0222U;
-            else
-                mode |= 0222U;
-            if (osfs2_set_mode(fobj->osfs_file, mode) < 0) {
+            if (osfs2_file_set_dos_attributes(fobj->osfs_file,
+                    requested.FileAttributes & OSFS_DOS_ATTR_MASK) < 0) {
                 nt_file_io_unlock(fobj);
                 return nt_complete_io(IoStatusBlock,
                                       STATUS_UNSUCCESSFUL, 0);
@@ -3312,10 +3691,11 @@ NTSTATUS sys_NtSetInformationFile(ULONG_PTR *args)
             return nt_complete_io(IoStatusBlock,
                                   STATUS_INFO_LENGTH_MISMATCH, 0);
         FILE_POSITION_INFORMATION *info = (FILE_POSITION_INFORMATION *)FileInformation;
-        if (!nt_file_is_synchronous(fobj) ||
-            info->CurrentByteOffset.QuadPart < 0)
+        if (info->CurrentByteOffset.QuadPart < 0)
             return nt_complete_io(IoStatusBlock,
                                   STATUS_INVALID_PARAMETER, 0);
+        /* Explicit seeks also set an async handle's cursor for SetEndOfFile;
+         * overlapped I/O still neither consumes nor advances that cursor. */
         nt_file_io_lock(fobj);
         fobj->position = info->CurrentByteOffset.QuadPart;
         nt_file_io_unlock(fobj);
@@ -3619,6 +3999,38 @@ cleanup:
     nt_file_test_close(&first);
 }
 
+static void nt_file_append_backend_selftest(int *checks, int *failures)
+{
+    void *file = osfs2_find("nt_file_contract.tmp");
+    bool ready = file && osfs2_truncate_ex(file, 0, 0) == 0;
+    nt_file_test_expect(ready, "append backend fixture", checks, failures);
+    if (!ready) return;
+
+    nt_file_test_expect(osfs2_append_ex(file, 0, "A", 1, 0) == 0 &&
+                        osfs2_file_size(file) == 1,
+                        "append backend matches EOF", checks, failures);
+    uint64_t revision = osfs2_file_revision(file);
+    char value = 0;
+    nt_file_test_expect(
+        osfs2_append_ex(file, 0, "B", 1, 0) == OSFS_APPEND_RETRY &&
+        osfs2_file_revision(file) == revision &&
+        osfs2_file_size(file) == 1 &&
+        osfs2_read(file, 0, &value, 1) == 1 && value == 'A',
+        "stale append leaves contents and revision unchanged", checks, failures);
+    nt_file_test_expect(osfs2_truncate_ex(file, 0, 0) == 0 &&
+                        osfs2_append_ex(file, 1, "B", 1, 0) == OSFS_APPEND_RETRY &&
+                        osfs2_file_size(file) == 0,
+                        "append detects concurrent truncation", checks, failures);
+    nt_file_test_expect(osfs2_append_ex(file, 0, "C", 1, 0) == 0 &&
+                        osfs2_read(file, 0, &value, 1) == 1 && value == 'C',
+                        "append retries at new EOF", checks, failures);
+    revision = osfs2_file_revision(file);
+    nt_file_test_expect(osfs2_append_ex(file, 9, NULL, 0, 0) == 0 &&
+                        osfs2_file_size(file) == 1 &&
+                        osfs2_file_revision(file) == revision,
+                        "zero-length append does not extend", checks, failures);
+}
+
 int nt_file_selftest(void)
 {
     const ULONG sync_options = FILE_NON_DIRECTORY_FILE |
@@ -3913,6 +4325,34 @@ int nt_file_selftest(void)
                             position.CurrentByteOffset.QuadPart == 0,
                             "asynchronous I/O does not advance position",
                             &checks, &failures);
+        status = nt_file_test_set_position(handle, 37, &iosb);
+        nt_file_test_expect(NT_SUCCESS(status) &&
+                            iosb.Status == STATUS_SUCCESS &&
+                            iosb.Information == 0,
+                            "asynchronous handle accepts explicit seek",
+                            &checks, &failures);
+        value = 0;
+        status = nt_file_test_read(handle, &value, 1, &explicit_offset,
+                                   &iosb);
+        if (NT_SUCCESS(status))
+            status = nt_file_test_query(handle, FilePositionInformation,
+                                        &position, sizeof(position), &iosb);
+        nt_file_test_expect(NT_SUCCESS(status) && value == 'Q' &&
+                            position.CurrentByteOffset.QuadPart == 37,
+                            "asynchronous read ignores and preserves cursor",
+                            &checks, &failures);
+        status = nt_file_test_set_position(handle, -1, &iosb);
+        nt_file_test_expect(status == STATUS_INVALID_PARAMETER &&
+                            iosb.Status == STATUS_INVALID_PARAMETER &&
+                            iosb.Information == 0,
+                            "negative asynchronous seek is rejected",
+                            &checks, &failures);
+        status = nt_file_test_query(handle, FilePositionInformation,
+                                    &position, sizeof(position), &iosb);
+        nt_file_test_expect(NT_SUCCESS(status) &&
+                            position.CurrentByteOffset.QuadPart == 37,
+                            "rejected asynchronous seek preserves cursor",
+                            &checks, &failures);
         status = nt_file_test_read(handle, &value, 1, NULL, &iosb);
         nt_file_test_expect(status == STATUS_INVALID_PARAMETER,
                             "asynchronous NULL offset is rejected", &checks,
@@ -3941,6 +4381,8 @@ int nt_file_selftest(void)
     nt_file_test_expect(status == STATUS_INVALID_PARAMETER && !handle,
                         "synchronous open requires SYNCHRONIZE", &checks,
                         &failures);
+
+    nt_file_append_backend_selftest(&checks, &failures);
 
 cleanup:
     nt_file_test_close(&handle);
@@ -4289,7 +4731,7 @@ static int vm_protect_tracked_range_locked(ULONG owner_pid, uint64_t cr3,
                                            ULONG *old_protect)
 {
     uint64_t end = base + size;
-    if (end < base || !vm_track_contains(base, size))
+    if (end < base || !vm_track_contains(owner_pid, base, size))
         return 0;
 
     vm_track_entry_t *first = vm_track_find_committed_locked(owner_pid, base);
@@ -4305,6 +4747,8 @@ static int vm_protect_tracked_range_locked(ULONG owner_pid, uint64_t cr3,
             !vm_track_entry_committed(entry) || entry_end < entry->va ||
             base >= entry_end || entry->va >= end)
             continue;
+        if (entry->driver_view)
+            return -1;
         if (entry->va < base)
             extra_entries++;
         if (entry_end > end)
@@ -4316,11 +4760,17 @@ static int vm_protect_tracked_range_locked(ULONG owner_pid, uint64_t cr3,
     uint64_t pages = size / 4096;
     for (uint64_t page = 0; page < pages; page++) {
         uint64_t page_va = base + page * 4096;
-        vm_track_entry_t *entry = vm_track_find_committed_locked(owner_pid,
-                                                                  page_va);
         uint64_t *pte = nt_get_pte_in(cr3, page_va);
-        if (!entry || ((!pte || !(*pte & PTE_ADDR_MASK)) && !entry->section))
-            return -1;
+        /* vm_track_contains already proved committed coverage while this
+         * lock is held. Only a missing backing page needs a VMA lookup to
+         * distinguish a demand-paged section from inconsistent private
+         * memory. Avoid scanning the whole table for every resident page. */
+        if (!pte || !(*pte & PTE_ADDR_MASK)) {
+            vm_track_entry_t *entry =
+                vm_track_find_committed_locked(owner_pid, page_va);
+            if (!entry || !entry->section)
+                return -1;
+        }
     }
 
     uint64_t flags = nt_prot_to_page_flags(
@@ -4379,9 +4829,9 @@ static int vm_protect_tracked_range_locked(ULONG owner_pid, uint64_t cr3,
     return 1;
 }
 
-NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args)
+static NTSTATUS nt_protect_virtual_memory(ULONG_PTR *args,
+                                            const NT_VM_TARGET *target)
 {
-    /* HANDLE ProcessHandle = (HANDLE)args[0]; */
     PVOID  *BaseAddress    = (PVOID *)args[1];
     SIZE_T *RegionSize     = (SIZE_T *)args[2];
     ULONG   NewProtect     = (ULONG)args[3];
@@ -4401,8 +4851,8 @@ NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args)
         return STATUS_INVALID_PARAMETER;
     uint64_t pages = size / 4096;
 
-    ULONG owner_pid = nt_current_owner_pid();
-    uint64_t cr3 = nt_current_cr3();
+    ULONG owner_pid = target->owner_pid;
+    uint64_t cr3 = target->cr3;
     uint64_t vm_irq_flags = vm_track_lock_irqsave();
 
     uint64_t protect_end = base + size;
@@ -4426,8 +4876,8 @@ NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args)
         uint64_t image_size = 0;
         uint64_t next_image = 0;
         uint64_t range_end = base + size;
-        BOOL image_range = pe_va_query_range(base, &image_base, &image_size,
-                                             &next_image) &&
+        BOOL image_range = pe_va_query_range_for_owner(owner_pid, base,
+                                             &image_base, &image_size, &next_image) &&
                            range_end >= base &&
                            range_end <= image_base +
                                         ((image_size + 0xFFFULL) & ~0xFFFULL);
@@ -4469,6 +4919,11 @@ NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args)
     return STATUS_SUCCESS;
 }
 
+NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args)
+{
+    return nt_vm_dispatch(args, 0x0008U, nt_protect_virtual_memory, g_compat32_mode);
+}
+
 /* ── NtQueryVirtualMemory ───────────────────────────────────── */
 
 /* MEMORY_BASIC_INFORMATION for NtQueryVirtualMemory */
@@ -4493,9 +4948,9 @@ typedef enum _MEMORY_INFORMATION_CLASS {
     MemoryBasicInformation = 0,
 } MEMORY_INFORMATION_CLASS;
 
-NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
+static NTSTATUS nt_query_virtual_memory(ULONG_PTR *args,
+                                          const NT_VM_TARGET *target)
 {
-    /* HANDLE ProcessHandle          = (HANDLE)args[0]; */
     PVOID  BaseAddress               = (PVOID)args[1];
     MEMORY_INFORMATION_CLASS InfoClass = (MEMORY_INFORMATION_CLASS)args[2];
     PVOID  MemoryInformation         = (PVOID)args[3];
@@ -4516,6 +4971,8 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
 
     MEMORY_BASIC_INFORMATION *mbi = (MEMORY_BASIC_INFORMATION *)MemoryInformation;
     uint64_t addr = (uint64_t)BaseAddress;
+    if (addr >= (target->compat32 ? WIN32_VA_LIMIT : WIN64_FIXED_VA_LIMIT))
+        return STATUS_INVALID_PARAMETER;
     uint64_t page_base = addr & ~0xFFFULL;
     static uint32_t allocator_query_logs;
     int trace_query = 0;
@@ -4533,8 +4990,8 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
     mbi->Padding0          = 0;
     mbi->Padding1          = 0;
 
-    ULONG owner_pid = nt_current_owner_pid();
-    uint64_t cr3 = nt_current_cr3();
+    ULONG owner_pid = target->owner_pid;
+    uint64_t cr3 = target->cr3;
     vm_track_entry_t committed = {0};
     vm_track_entry_t reservation = {0};
     int have_committed = 0;
@@ -4549,8 +5006,9 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
     int have_identity = cr3 == paging_get_kernel_cr3() &&
         nt_identity_reservation_query(page_base, &identity_base,
                                       &identity_size, &next_identity);
-    int have_image = pe_va_query_range(page_base, &image_base, &image_size,
-                                       &next_image);
+    int have_image = pe_va_query_range_for_owner(owner_pid, page_base,
+                                                  &image_base, &image_size,
+                                                  &next_image);
 
     uint64_t vm_irq_flags = vm_track_lock_irqsave();
     for (int i = 0; i < vm_track_count; i++) {
@@ -4592,6 +5050,7 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
                     !vm_track_entry_committed(&vm_track[i]) ||
                     vm_track[i].protect != committed.protect ||
                     vm_track[i].section != committed.section ||
+                    vm_track[i].driver_view != committed.driver_view ||
                     vm_track[i].allocation_base != committed.allocation_base ||
                     entry_end < vm_track[i].va)
                     continue;
@@ -4610,7 +5069,8 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
         mbi->RegionSize = region_end - page_base;
         mbi->State = MEM_COMMIT;
         mbi->Protect = committed.protect;
-        mbi->Type = committed.section ? MEM_MAPPED : MEM_PRIVATE;
+        mbi->Type = (committed.section || committed.driver_view)
+                  ? MEM_MAPPED : MEM_PRIVATE;
 
     } else if (have_reservation) {
         uint64_t region_end = reservation.va + reservation.size;
@@ -4728,7 +5188,7 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
     /* Preserve compatibility for mapped kernel/section pages that predate
      * vm_track. They remain page-sized until their owners gain VMA records. */
     uint64_t *pte = nt_get_pte_in(cr3, page_base);
-    BOOL inherited_win32_identity = g_compat32_mode &&
+    BOOL inherited_win32_identity = target->compat32 &&
         cr3 == paging_get_kernel_cr3() &&
         page_base >= WIN32_VA_BASE && page_base < WIN32_VA_LIMIT;
     if (!inherited_win32_identity && pte && (*pte & PTE_PRESENT)) {
@@ -4747,7 +5207,7 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
         return STATUS_SUCCESS;
     }
 
-    uint64_t region_end = g_compat32_mode
+    uint64_t region_end = target->compat32
                           ? WIN32_VA_LIMIT : WIN64_FIXED_VA_LIMIT;
     if (next_mapping > page_base && next_mapping < region_end)
         region_end = next_mapping;
@@ -4763,6 +5223,11 @@ NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
     mbi->Type = 0;
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args)
+{
+    return nt_vm_dispatch(args, 0x0400U, nt_query_virtual_memory, g_compat32_mode);
 }
 
 /* ── NtYieldExecution ───────────────────────────────────────── */
@@ -4817,6 +5282,236 @@ static NTSTATUS vm_test_query(PVOID base, MEMORY_BASIC_INFORMATION *info)
         (ULONG_PTR)&returned
     };
     return sys_NtQueryVirtualMemory(args);
+}
+
+typedef struct {
+    unsigned calls, safe, unsafe, bad;
+} vm_driver_test_context_t;
+
+static void vm_driver_test_retired(NT_VM_DRIVER_VIEW *view, BOOL safe,
+                                    PVOID opaque)
+{
+    vm_driver_test_context_t *context = opaque;
+    context->calls++;
+    /* Re-enter the VM tracker: a callback under its lock would deadlock. */
+    uint32_t entries;
+    nt_vm_get_stats(&entries, NULL, NULL);
+    if (view->self != view) context->bad++;
+    if (safe) {
+        context->safe++;
+        if (view->state != NT_VM_DRIVER_RETIRED_STATE) context->bad++;
+        for (SIZE_T off = 0; off < view->mapped_bytes; off += 4096)
+            if (paging_translate_in_cr3(view->cr3, view->address + off)
+                != UINT64_MAX) context->bad++;
+    } else {
+        context->unsafe++;
+        if (view->state != NT_VM_DRIVER_QUARANTINED) context->bad++;
+    }
+}
+
+static void nt_vm_driver_view_selftest(int *checks, int *failures)
+{
+    int initial_checks = *checks, initial_failures = *failures;
+    NT_VM_DRIVER_VIEW a = {0}, b = {0};
+    vm_driver_test_context_t ca = {0}, cb = {0};
+    /* A fault in the current root may quarantine its fixture past return. */
+    static NT_VM_DRIVER_VIEW current;
+    static vm_driver_test_context_t cc;
+    static BOOL running;
+    NT_VM_TARGET ta = {0x7ffef001U, 0, TRUE};
+    NT_VM_TARGET tb = {0x7ffef002U, 0, FALSE};
+    void *backing = NULL;
+    uint32_t entries_before, entries_after;
+    uint64_t private_before, private_after, mapped_before, mapped_after;
+    nt_vm_get_stats(&entries_before, &private_before, &mapped_before);
+    if (smp_current_cpu() != 0) {
+        vm_test_expect(FALSE, "driver VM test requires BSP", checks, failures);
+        return;
+    }
+    if (running || current.state == NT_VM_DRIVER_QUARANTINED ||
+        current.state == NT_VM_DRIVER_LIVE) {
+        vm_test_expect(FALSE, "driver VM fixture is still retained", checks, failures);
+        return;
+    }
+    running = TRUE;
+    current = (NT_VM_DRIVER_VIEW){0};
+    cc = (vm_driver_test_context_t){0};
+    ta.cr3 = paging_create_process_cr3();
+    tb.cr3 = paging_create_process_cr3();
+    backing = mem_alloc_pages(4);
+    vm_test_expect(ta.cr3 && tb.cr3 && backing,
+        "driver views allocate isolated CR3 roots and retained PMM", checks, failures);
+    if (!ta.cr3 || !tb.cr3 || !backing) goto cleanup;
+    nt_memset(PHYS_TO_VIRT(backing), 0, 4 * 4096);
+    uint64_t physical = (uint64_t)(uintptr_t)backing;
+    uint64_t invalid_flags = vm_track_lock_irqsave();
+    NT_VM_DRIVER_VIEW invalid = {0};
+    NTSTATUS invalid_zero = vm_map_driver_view_locked(&ta, &invalid, 0, 4096,
+        TRUE, vm_driver_test_retired, &ca);
+    NTSTATUS invalid_alignment = vm_map_driver_view_locked(&ta, &invalid, physical + 1,
+        4096, TRUE, vm_driver_test_retired, &ca);
+    NTSTATUS invalid_size = vm_map_driver_view_locked(&ta, &invalid, physical,
+        4097, TRUE, vm_driver_test_retired, &ca);
+    NTSTATUS invalid_overflow = vm_map_driver_view_locked(&ta, &invalid, PTE_ADDR_MASK,
+        8192, TRUE, vm_driver_test_retired, &ca);
+    vm_track_unlock_irqrestore(invalid_flags);
+    vm_test_expect(invalid_zero == STATUS_INVALID_PARAMETER &&
+        invalid_alignment == STATUS_INVALID_PARAMETER &&
+        invalid_size == STATUS_INVALID_PARAMETER &&
+        invalid_overflow == STATUS_INVALID_PARAMETER && !invalid.self && !ca.calls,
+        "invalid physical ranges never transfer driver ownership", checks, failures);
+    ULONG live_pid = 0;
+    NTSTATUS admission = nt_process_resolve_vm_pid(NT_CURRENT_PROCESS, 0, &live_pid);
+    NTSTATUS status = nt_vm_map_driver_view(&current, physical, 8192, FALSE,
+                                             TRUE, vm_driver_test_retired, &cc);
+    vm_test_expect(NT_SUCCESS(admission) ? NT_SUCCESS(status) : status == admission,
+        "public driver view observes current NT process admission", checks, failures);
+    if (NT_SUCCESS(status)) {
+        volatile BYTE *address = (volatile BYTE *)(uintptr_t)current.address;
+        address[0] = 0x35;
+        address[8191] = 0x96;
+        BYTE *cpu = PHYS_TO_VIRT(backing);
+        vm_test_expect(cpu[0] == 0x35 && cpu[8191] == 0x96 &&
+            current.owner_pid == live_pid,
+            "CPU VA aliases the retained physical backing", checks, failures);
+        vm_test_expect(nt_vm_user_range_accessible(current.address, 8192, TRUE),
+            "driver CPU view is an owned writable user range", checks, failures);
+        extern NTSTATUS sys_NtUnmapViewOfSection(ULONG_PTR *);
+        ULONG_PTR unmap_args[2] = {(ULONG_PTR)NT_CURRENT_PROCESS, current.address};
+        vm_test_expect(!NT_SUCCESS(sys_NtUnmapViewOfSection(unmap_args)) && !cc.calls,
+            "section unmap cannot consume a driver view", checks, failures);
+        vm_test_expect(NT_SUCCESS(nt_vm_unmap_driver_view(&current)) &&
+            cc.calls == 1 && cc.safe == 1 && !cc.bad,
+            "public unmap notifies after PTE removal outside VM lock", checks, failures);
+    } else {
+        vm_test_expect(!current.self && !cc.calls,
+            "closed NT process admits no driver reference", checks, failures);
+    }
+
+    uint64_t flags = vm_track_lock_irqsave();
+    status = vm_map_driver_view_locked(&ta, &a, physical, 8192, TRUE,
+                                        vm_driver_test_retired, &ca);
+    NTSTATUS other = vm_map_driver_view_locked(&tb, &b, physical + 8192,
+                                               8192, FALSE, vm_driver_test_retired, &cb);
+    vm_track_unlock_irqrestore(flags);
+    vm_test_expect(NT_SUCCESS(status) && NT_SUCCESS(other),
+        "driver views map both 32-bit and 64-bit VA arenas", checks, failures);
+    if (!NT_SUCCESS(status) || !NT_SUCCESS(other)) goto cleanup;
+    vm_test_expect(a.address >= WIN32_VA_BASE && a.address + a.bytes <= WIN32_VA_LIMIT &&
+        b.address >= vm_safe_auto_base && b.address + b.bytes <= WIN64_VA_LIMIT,
+        "driver view addresses fit the requesting ABI", checks, failures);
+    uint64_t pflags = 0, psize = 0;
+    vm_test_expect(paging_query_mapping_in_cr3(ta.cr3, a.address, &pflags, &psize) == 0 &&
+        psize == 4096 && (pflags & (PTE_NX | PTE_WRITABLE)) == (PTE_NX | PTE_WRITABLE) &&
+        !(pflags & 0x198ULL), /* global/PAT/PCD/PWT all clear */
+        "driver writable view uses non-global WB NX pages", checks, failures);
+    vm_test_expect(paging_query_mapping_in_cr3(tb.cr3, b.address, &pflags, &psize) == 0 &&
+        psize == 4096 && (pflags & PTE_NX) && !(pflags & PTE_WRITABLE),
+        "driver readonly view is hardware readonly and NX", checks, failures);
+    vm_test_expect(paging_translate_in_cr3(ta.cr3, a.address + 4096) == physical + 4096 &&
+        paging_translate_in_cr3(tb.cr3, a.address) == UINT64_MAX &&
+        paging_translate_in_cr3(ta.cr3, b.address) == UINT64_MAX,
+        "driver view translates only in its process root", checks, failures);
+    MEMORY_BASIC_INFORMATION info = {0};
+    SIZE_T returned = 0;
+    ULONG_PTR query[6] = {0, a.address, MemoryBasicInformation,
+                          (ULONG_PTR)&info, sizeof(info), (ULONG_PTR)&returned};
+    status = nt_query_virtual_memory(query, &ta);
+    vm_test_expect(NT_SUCCESS(status) && info.Type == MEM_MAPPED && info.State == MEM_COMMIT &&
+        info.RegionSize == 8192 && info.Protect == PAGE_READWRITE &&
+        (uint64_t)(uintptr_t)info.AllocationBase == a.address,
+        "query reports driver view as committed mapped memory", checks, failures);
+    query[1]=b.address;
+    vm_test_expect(NT_SUCCESS(nt_query_virtual_memory(query,&tb)) &&
+        info.Protect==PAGE_READONLY && info.AllocationProtect==PAGE_READONLY,
+        "read-only driver view keeps read-only VMA protection",checks,failures);
+    PVOID readonly_base=(PVOID)(uintptr_t)b.address;
+    SIZE_T readonly_size=b.bytes;
+    ULONG readonly_old=0;
+    ULONG_PTR readonly_protect[5]={0,(ULONG_PTR)&readonly_base,(ULONG_PTR)&readonly_size,
+        PAGE_READWRITE,(ULONG_PTR)&readonly_old};
+    vm_test_expect(!NT_SUCCESS(nt_protect_virtual_memory(readonly_protect,&tb)) &&
+        paging_query_mapping_in_cr3(tb.cr3,b.address,&pflags,&psize)==0 &&
+        (pflags&PTE_NX) && !(pflags&(PTE_WRITABLE|0x198ULL)),
+        "VirtualProtect cannot grant writes to a coherent read-only page",checks,failures);
+    nt_vm_get_stats(&entries_after, &private_after, &mapped_after);
+    vm_test_expect(private_after == private_before && mapped_after == mapped_before + 4,
+        "borrowed driver pages do not become VM-owned private pages", checks, failures);
+    PVOID base = (PVOID)(uintptr_t)a.address;
+    SIZE_T size = 0;
+    ULONG_PTR free_args[4] = {0, (ULONG_PTR)&base, (ULONG_PTR)&size, MEM_RELEASE};
+    vm_test_expect(!NT_SUCCESS(nt_free_virtual_memory(free_args, &ta)) && !ca.calls,
+        "VirtualFree cannot release driver backing", checks, failures);
+    size = 4096; free_args[3] = MEM_DECOMMIT;
+    vm_test_expect(!NT_SUCCESS(nt_free_virtual_memory(free_args, &ta)) && !ca.calls,
+        "VirtualFree cannot decommit a driver page", checks, failures);
+    ULONG old_protect = 0;
+    ULONG_PTR protect_args[5] = {0, (ULONG_PTR)&base, (ULONG_PTR)&size,
+                                 PAGE_EXECUTE_READWRITE, (ULONG_PTR)&old_protect};
+    vm_test_expect(!NT_SUCCESS(nt_protect_virtual_memory(protect_args, &ta)) &&
+        paging_query_mapping_in_cr3(ta.cr3, a.address, &pflags, &psize) == 0 && (pflags & PTE_NX),
+        "VirtualProtect cannot split or make driver pages executable", checks, failures);
+    ULONG_PTR commit_args[6] = {0, (ULONG_PTR)&base, 0, (ULONG_PTR)&size,
+                                MEM_COMMIT, PAGE_READWRITE};
+    vm_test_expect(!NT_SUCCESS(nt_allocate_virtual_memory(commit_args, &ta)),
+        "private commit cannot replace a driver page", checks, failures);
+    NT_VM_DRIVER_VIEW copy = a;
+    vm_test_expect(!NT_SUCCESS(nt_vm_unmap_driver_view(&copy)) && !ca.calls,
+        "a copied view cannot consume the VM reference", checks, failures);
+    flags = vm_track_lock_irqsave();
+    status = vm_map_driver_view_locked(&ta, &a, physical, 8192, TRUE,
+                                        vm_driver_test_retired, &ca);
+    vm_track_unlock_irqrestore(flags);
+    vm_test_expect(!NT_SUCCESS(status) && !ca.calls,
+        "an admitted view cannot be overwritten", checks, failures);
+    vm_test_expect(NT_SUCCESS(nt_vm_unmap_driver_view(&a)) && ca.calls == 1 &&
+        ca.safe == 1 && !ca.bad,
+        "explicit retirement returns exactly one reference", checks, failures);
+    vm_test_expect(!NT_SUCCESS(nt_vm_unmap_driver_view(&a)) && ca.calls == 1,
+        "repeated retirement cannot return the reference twice", checks, failures);
+    a = (NT_VM_DRIVER_VIEW){0};
+    flags = vm_track_lock_irqsave();
+    status = vm_map_driver_view_locked(&ta, &a, physical, 8192, TRUE,
+                                        vm_driver_test_retired, &ca);
+    vm_track_unlock_irqrestore(flags);
+    vm_test_expect(NT_SUCCESS(status), "remap with a newly offered VM reference", checks, failures);
+    nt_vm_release_process(ta.owner_pid);
+    vm_test_expect(ca.calls == 2 && ca.safe == 2 && !ca.bad,
+        "process exit revokes driver views before returning backing", checks, failures);
+    /* Deliberately substitute one page only in our isolated test root. */
+    vm_test_expect(nt_map_page_in(tb.cr3, b.address, physical, PTE_PRESENT | PTE_NX) == 0,
+        "inject foreign PTE into isolated driver view", checks, failures);
+    vm_test_expect(!NT_SUCCESS(nt_vm_unmap_driver_view(&b)) && !cb.calls &&
+        b.state == NT_VM_DRIVER_QUARANTINED &&
+        paging_translate_in_cr3(tb.cr3, b.address) == physical &&
+        paging_translate_in_cr3(tb.cr3, b.address + 4096) == UINT64_MAX,
+        "inconsistent view retains backing and preserves foreign PTE", checks, failures);
+    vm_test_expect(!NT_SUCCESS(nt_vm_unmap_driver_view(&b)) && !cb.calls,
+        "quarantined view is not retried", checks, failures);
+    nt_vm_release_process(tb.owner_pid);
+    vm_test_expect(cb.calls == 1 && cb.unsafe == 1 && !cb.safe && !cb.bad,
+        "exit transfers quarantine without claiming backing is safe", checks, failures);
+cleanup:
+    if (current.self && current.state == NT_VM_DRIVER_LIVE)
+        (void)nt_vm_unmap_driver_view(&current);
+    nt_vm_release_process(ta.owner_pid);
+    nt_vm_release_process(tb.owner_pid);
+    /* The test controls every alias and destroys both private roots before
+     * reclaiming its deliberately quarantined fixture. Production callers
+     * cannot substitute this proof with a process ID or a stale CR3 value. */
+    if (ta.cr3) paging_free_process_cr3(ta.cr3);
+    if (tb.cr3) paging_free_process_cr3(tb.cr3);
+    if (backing && (!current.self || current.state == NT_VM_DRIVER_RETIRED_STATE))
+        mem_free_pages(backing, 4);
+    nt_vm_get_stats(&entries_after, &private_after, &mapped_after);
+    vm_test_expect(entries_after == entries_before && private_after == private_before &&
+        mapped_after == mapped_before, "driver VM test returns tracker to baseline", checks, failures);
+    serial_puts("[DRIVERVM] checks=");
+    serial_putdec((uint64_t)(*checks - initial_checks));
+    serial_puts(" failures=");
+    serial_putdec((uint64_t)(*failures - initial_failures));
+    serial_puts("\n");
+    running = FALSE;
 }
 
 int nt_vm_selftest(void)
@@ -4888,6 +5583,7 @@ int nt_vm_selftest(void)
             identity_end <= WIN32_VA_LIMIT) {
             uint64_t vm_irq_flags = vm_track_lock_irqsave();
             uint64_t conflict_end = vm_range_conflict_end_locked(
+                nt_current_owner_pid(), nt_current_cr3(),
                 identity_base, 4096, TRUE);
             vm_track_unlock_irqrestore(vm_irq_flags);
             vm_test_expect(conflict_end >= identity_end,
@@ -5167,6 +5863,7 @@ cleanup:
     }
     if (stack_allocation)
         (void)nt_vm_free_stack(stack_allocation);
+    nt_vm_driver_view_selftest(&checks, &failures);
     serial_puts("[VMTEST] checks=");
     serial_putdec((uint64_t)checks);
     serial_puts(" failures=");
@@ -5258,6 +5955,10 @@ NTSTATUS sys_NtDelayExecution(ULONG_PTR *args)
         ? (uint64_t)(-(interval + 1)) + 1
         : (uint64_t)interval;
 
+    /* A prior wake may have deferred exit while the caller held a host lock.
+     * Consume it before starting another potentially unbounded sleep. */
+    nt_win32_exit_checkpoint();
+
     if (!delay) {
         sched_yield();
         nt_win32_exit_checkpoint();
@@ -5333,9 +6034,10 @@ NTSTATUS sys_NtQueryPerformanceCounter(ULONG_PTR *args)
 #define SEC_IMAGE       0x1000000
 #define SEC_RESERVE     0x4000000
 
-/* Large data mappings are committed virtually and materialized on demand.
- * Pagefile sections start zeroed; file-backed sections page in their data.
- * Image sections retain contiguous backing for loader compatibility. */
+/* Large data mappings materialize on demand. Small read-only files keep an
+ * eager snapshot in the revision-keyed control-area cache: repeatedly mapping
+ * a font must not reread it, and a later disk write must not fault a live view.
+ * Small writable/pagefile and image sections retain contiguous backing. */
 #define SECTION_SPARSE_MIN_SIZE (1024ULL * 1024ULL)
 #define SECTION_FAULT_BATCH_PAGES 32
 #define SECTION_CONTROL_CACHE_ENTRIES 32
@@ -5708,6 +6410,25 @@ int nt_section_cache_flush_unused(void)
     while (section_control_evict_one(TRUE))
         evicted++;
     return evicted;
+}
+
+/* A cache-only reference must not prevent deleting an otherwise closed file.
+ * Active sections keep their retain and the filesystem still rejects them. */
+void nt_section_cache_drop_file(PVOID file)
+{
+    if (!file)
+        return;
+    for (int i = 0; i < SECTION_CONTROL_CACHE_ENTRIES; i++) {
+        SECTION_CONTROL_CLEANUP cleanup = {0};
+        uint64_t irq_flags = section_lock_irqsave();
+        SECTION_CONTROL_AREA *control = &section_control_cache[i];
+        if (control->in_use && control->file == file && !control->object_refs) {
+            section_control_collect_locked(control, &cleanup);
+            section_control_evictions++;
+        }
+        section_unlock_irqrestore(irq_flags);
+        section_control_cleanup_finish(&cleanup);
+    }
 }
 
 static inline void *section_backing_file(SECTION_OBJECT *sec)
@@ -6501,8 +7222,10 @@ NTSTATUS sys_NtCreateSection(ULONG_PTR *args)
     if (backing_file && osfs2_file_retain(backing_file) < 0)
         return STATUS_INVALID_PARAMETER;
 
-    BOOL sparse = size >= SECTION_SPARSE_MIN_SIZE &&
-                  !(AllocationAttributes & SEC_IMAGE);
+    BOOL sparse = !(AllocationAttributes & SEC_IMAGE) &&
+                  (size >= SECTION_SPARSE_MIN_SIZE ||
+                   (backing_file &&
+                    section_control_read_only_protect(SectionPageProtection)));
 
     if (FileHandle) {
         if (!file_object || !file_object->osfs_file ||
@@ -6516,7 +7239,7 @@ NTSTATUS sys_NtCreateSection(ULONG_PTR *args)
             file_object->size = (LONGLONG)logical_size;
     }
 
-    /* Small mappings and image sections retain contiguous backing. */
+    /* Small writable/pagefile mappings and images keep contiguous backing. */
     uint64_t pages = size / 4096;
     void *mem_phys = NULL;
     void *mem = NULL;
@@ -6532,13 +7255,25 @@ NTSTATUS sys_NtCreateSection(ULONG_PTR *args)
         nt_memset(mem, 0, size);
     }
 
-    /* Eager mappings load their file now. Sparse mappings page it in from the
-     * fault path and therefore do no I/O during NtCreateSection. */
+    /* Contiguous mappings load their file now. Small shared snapshots load
+     * after the control-area lookup below; large sparse mappings page in
+     * from the fault path. */
     if (FileHandle && !sparse && file_object->size > 0) {
         uint64_t to_read = (uint64_t)file_object->size;
         if (to_read > size) to_read = size;
-        if (osfs2_read(file_object->osfs_file, 0, mem, to_read) !=
-            (int)to_read) {
+#if defined(WIN32_LATENCY_TRACE) && WIN32_LATENCY_TRACE && !defined(TEST_HARNESS)
+        uint64_t read_flags;
+        __asm__ volatile ("pushfq; popq %0" : "=r"(read_flags));
+        uint64_t read_start = nt_memory_latency_cycles();
+#endif
+        int bytes_read = osfs2_read(file_object->osfs_file, 0, mem, to_read);
+#if defined(WIN32_LATENCY_TRACE) && WIN32_LATENCY_TRACE && !defined(TEST_HARNESS)
+        uint64_t read_elapsed = nt_memory_latency_cycles() - read_start;
+        nt_memory_latency_record("section-read",
+            (uint64_t)(ULONG_PTR)sys_NtCreateSection, read_start,
+            read_elapsed, nt_current_owner_pid(), to_read, read_flags);
+#endif
+        if (bytes_read != (int)to_read) {
             mem_free_pages(mem_phys, pages);
             osfs2_file_release(backing_file);
             nt_log("NtCreateSection: file read failed");
@@ -6579,6 +7314,25 @@ NTSTATUS sys_NtCreateSection(ULONG_PTR *args)
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     sec->file_size = logical_size;
+
+    /* Small file mappings previously captured all bytes at creation. Keep
+     * that behavior even when their pages are shared by a control area:
+     * SQLite may change a file after creating a read-only view, before its
+     * first access. Deferring this read would reject the changed revision
+     * from the page-fault handler instead of preserving the existing view. */
+    if (sparse && size < SECTION_SPARSE_MIN_SIZE && section_backing_file(sec)) {
+        uint64_t phys_pages[SECTION_FAULT_BATCH_PAGES];
+        for (uint32_t first = 0; first < pages;) {
+            uint32_t count = (uint32_t)(pages - first);
+            if (count > SECTION_FAULT_BATCH_PAGES)
+                count = SECTION_FAULT_BATCH_PAGES;
+            if (section_sparse_pages_get(sec, first, count, phys_pages) != count) {
+                section_free(sec);
+                return STATUS_UNSUCCESSFUL;
+            }
+            first += count;
+        }
+    }
 
 #if !defined(OK_QUIET) || !OK_QUIET
     static uint32_t demand_trace_count;
@@ -6724,7 +7478,7 @@ NTSTATUS sys_NtMapViewOfSection(ULONG_PTR *args)
     vm_global_init_once();
     uint64_t irq_flags = vm_track_lock_irqsave();
     uint64_t requested_va = (uint64_t)(ULONG_PTR)*BaseAddress & ~0xFFFULL;
-    uint64_t va = vm_choose_address_locked(map_size, requested_va,
+    uint64_t va = vm_choose_address_locked(owner_pid, cr3, map_size, requested_va,
                                            g_compat32_mode);
     if (!va) {
         vm_track_unlock_irqrestore(irq_flags);
@@ -6747,12 +7501,50 @@ NTSTATUS sys_NtMapViewOfSection(ULONG_PTR *args)
 
     uint64_t mapped_pages = 0;
     uint64_t pages = map_size / 4096;
-    if (!sec->sparse) {
+    BOOL map_now = !sec->sparse ||
+                   (sec->size < SECTION_SPARSE_MIN_SIZE && section_backing_file(sec));
+    if (!map_now && g_compat32_mode && cr3 == paging_get_kernel_cr3()) {
+        /* The shell-hosted PE32 address chooser ignores low RAM identity
+         * aliases. Remove them so sparse views fault into their section,
+         * rather than reading unrelated physical RAM. Split a huge alias
+         * through the existing mapper before clearing its individual PTE. */
+        for (uint64_t page = 0; page < pages; page++) {
+            uint64_t page_va = va + page * 4096;
+            uint64_t page_size = 0;
+            if (paging_query_mapping_in_cr3(cr3, page_va, NULL,
+                                            &page_size) != 0)
+                continue;
+            if ((page_size > 4096 &&
+                 nt_map_page_in(cr3, page_va, page_va,
+                                  PTE_PRESENT | PTE_WRITABLE) != 0) ||
+                nt_unmap_page_in(cr3, page_va) != 0) {
+                vm_track_unlock_irqrestore(irq_flags);
+                section_view_release(sec);
+                return STATUS_NO_MEMORY;
+            }
+        }
+    }
+    if (map_now) {
+        uint64_t cached_pages[SECTION_FAULT_BATCH_PAGES];
         for (; mapped_pages < pages; mapped_pages++) {
             uint64_t page_va = va + mapped_pages * 4096;
-            if (nt_map_page_in(cr3, page_va,
-                               sec->backing_phys + offset +
-                                   mapped_pages * 4096,
+            uint64_t phys = sec->backing_phys + offset + mapped_pages * 4096;
+            if (sec->sparse) {
+                uint32_t batch_offset = mapped_pages % SECTION_FAULT_BATCH_PAGES;
+                if (!batch_offset) {
+                    uint32_t count = (uint32_t)(pages - mapped_pages);
+                    if (count > SECTION_FAULT_BATCH_PAGES)
+                        count = SECTION_FAULT_BATCH_PAGES;
+                    /* Creation preloaded all small-file pages. With the view
+                     * reference held, this only looks up resident cache pages. */
+                    if (section_sparse_pages_get(sec,
+                            (uint32_t)(offset / 4096 + mapped_pages), count,
+                            cached_pages) != count)
+                        break;
+                }
+                phys = cached_pages[batch_offset];
+            }
+            if (nt_map_page_in(cr3, page_va, phys,
                                PTE_PRESENT | PTE_WRITABLE) != 0)
                 break;
             if (pte_flags != (PTE_PRESENT | PTE_WRITABLE) &&
@@ -6763,8 +7555,8 @@ NTSTATUS sys_NtMapViewOfSection(ULONG_PTR *args)
         }
     }
 
-    if ((!sec->sparse && mapped_pages != pages) ||
-        !vm_track_add(va,
+    if ((map_now && mapped_pages != pages) ||
+        !vm_track_add(owner_pid, cr3, va,
                       sec->sparse ? 0 : sec->backing_phys + offset,
                       map_size, protect, FALSE, sec, offset)) {
         while (mapped_pages)
@@ -6773,7 +7565,8 @@ NTSTATUS sys_NtMapViewOfSection(ULONG_PTR *args)
         section_view_release(sec);
         return STATUS_NO_MEMORY;
     }
-    vm_advance_auto_next_locked(owner_pid, g_compat32_mode, va, map_size);
+    if (!requested_va)
+        vm_advance_auto_next_locked(owner_pid, g_compat32_mode, va, map_size);
     vm_track_unlock_irqrestore(irq_flags);
 
     *BaseAddress = (PVOID)(ULONG_PTR)va;

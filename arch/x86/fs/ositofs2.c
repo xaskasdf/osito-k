@@ -1869,17 +1869,33 @@ static int osfs2_write_impl(osfs2_file_t *file, uint64_t offset,
                             (uint32_t)slot, &after);
 }
 
-int osfs2_write_ex(void *opaque, uint64_t offset, const void *buf,
-                   uint64_t len, uint32_t io_flags)
+static int osfs2_write_checked(void *opaque, uint64_t offset, const void *buf,
+                                uint64_t len, uint32_t io_flags, bool append)
 {
     if (io_flags & ~OSFS_IO_FLAG_MASK) return -1;
     osfs2_file_t *file = (osfs2_file_t *)opaque;
 #ifndef __EMSCRIPTEN__
     if (osfs3_is_mounted())
-        return osfs3_write_ex(file, offset, buf, len, io_flags);
+        return append ? osfs3_append_ex(file, offset, buf, len, io_flags)
+                      : osfs3_write_ex(file, offset, buf, len, io_flags);
 #endif
     osfs2_spin_lock(&mutation_lock);
     int slot = osfs2_file_slot(file);
+    if (append) {
+        if (!mounted || slot < 0 || !(file->flags & OSFS2_FLAG_VALID) ||
+            (!buf && len) || offset > UINT64_MAX - len) {
+            osfs2_spin_unlock(&mutation_lock);
+            return -1;
+        }
+        if (!len) {
+            osfs2_spin_unlock(&mutation_lock);
+            return 0;
+        }
+        if (file->size != offset) {
+            osfs2_spin_unlock(&mutation_lock);
+            return OSFS_APPEND_RETRY;
+        }
+    }
     if (slot >= 0)
         __atomic_add_fetch(&file_revisions[slot], 1, __ATOMIC_ACQ_REL);
     int result = osfs2_write_impl(file, offset, buf, len, io_flags);
@@ -1887,6 +1903,18 @@ int osfs2_write_ex(void *opaque, uint64_t offset, const void *buf,
         __atomic_add_fetch(&file_revisions[slot], 1, __ATOMIC_RELEASE);
     osfs2_spin_unlock(&mutation_lock);
     return result;
+}
+
+int osfs2_write_ex(void *file, uint64_t offset, const void *buf,
+                   uint64_t len, uint32_t io_flags)
+{
+    return osfs2_write_checked(file, offset, buf, len, io_flags, false);
+}
+
+int osfs2_append_ex(void *file, uint64_t expected_size, const void *buf,
+                    uint64_t len, uint32_t io_flags)
+{
+    return osfs2_write_checked(file, expected_size, buf, len, io_flags, true);
 }
 
 int osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf,
@@ -2156,6 +2184,14 @@ bool osfs2_is_mounted(void)
     if (osfs3_is_mounted()) return true;
 #endif
     return mounted;
+}
+
+uint64_t osfs2_partition_start(void)
+{
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return osfs3_partition_start();
+#endif
+    return mounted ? partition_offset : UINT64_MAX;
 }
 
 uint32_t osfs2_file_count(void)

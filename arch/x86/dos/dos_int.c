@@ -11,7 +11,10 @@
  */
 
 #include "cpu8086.h"
+#include "dos_xms.h"
 #include "dos_hostmem.h"
+#include "dos_native_fp.h"
+#include "dos_fpu.h"
 #include "dos_audio.h"
 #include "dos_io.h"
 #include "dos_mouse.h"
@@ -44,6 +47,7 @@ bool dos_int_has_pm_translator(uint8_t int_num)
 {
     switch (int_num) {
     case 0x10:
+    case 0x11:
     case 0x15:
     case 0x16:
     case 0x1A:
@@ -72,6 +76,13 @@ static bool dos_dpmi_pm_exception_return_source(const dos_vm_t *vm)
 {
     return dos_dpmi_pm_stub_source(vm, DPMI_EXCEPTION_RETURN_OFF) ||
            dos_dpmi_pm_stub_source(vm, DPMI_EXCEPTION_EXT_RETURN_OFF);
+}
+
+bool dos_pm_interrupt_return_source(const dos_vm_t *vm, uint8_t vector)
+{
+    return vector == DPMI_EXCEPTION_RETURN_INT &&
+           dos_dpmi_pm_stub_source(vm, DPMI_INTERRUPT_RETURN_OFF) &&
+           vm->dpmi.interrupt_depth != 0;
 }
 
 static bool dos_dpmi_pm_reflect_source(const dos_vm_t *vm,
@@ -147,9 +158,7 @@ static bool dos_dpmi_rm_callback_source(const dos_vm_t *vm)
 {
     const cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
     uint32_t first_return = DPMI_CALLBACK_BASE_OFF + 2u;
-    uint32_t last_return = first_return +
-                           (DPMI_MAX_CALLBACKS - 1u) *
-                           DPMI_CALLBACK_STUB_SIZE;
+    uint32_t last_return = DPMI_PM_REFLECT_BASE_OFF - DPMI_CALLBACK_STUB_SIZE + 2u;
     if (!cpu || cpu->protected_mode || cpu->cs != DPMI_ENTRY_SEG ||
         dpmi_desc_get_base(&cpu->cs_cache.descriptor) != (DPMI_ENTRY_SEG << 4) ||
         cpu->eip < first_return || cpu->eip > last_return)
@@ -168,7 +177,8 @@ static bool dos_rm_service_source(const dos_vm_t *vm, uint8_t *service)
     if (relative >= 256u * DOS_RM_SERVICE_STUB_SIZE ||
         relative % DOS_RM_SERVICE_STUB_SIZE) return false;
     uint8_t number = (uint8_t)(relative / DOS_RM_SERVICE_STUB_SIZE);
-    if (number != 9U && !dos_int_has_pm_translator(number)) return false;
+    if (number != 9U && number != 0x27 &&
+        !dos_int_has_pm_translator(number)) return false;
     *service = number;
     return true;
 }
@@ -176,11 +186,12 @@ static bool dos_rm_service_source(const dos_vm_t *vm, uint8_t *service)
 bool dos_rm_private_interrupt(const dos_vm_t *vm, uint8_t vector)
 {
     uint8_t service;
-    if (vector == DOS_RM_SERVICE_INT) return dos_rm_service_source(vm, &service);
+    if (vector == DOS_RM_SERVICE_INT)
+        return dos_rm_service_source(vm, &service) || dos_xms_entry_source(vm);
     if (vector == DPMI_ENTRY_INT) return dos_dpmi_rm_stub_source(vm, DPMI_ENTRY_OFF);
     if (vector == DPMI_CALLBACK_ENTRY_INT) return dos_dpmi_rm_callback_source(vm);
     if (vector == DPMI_RAW_SWITCH_INT)
-        return dos_dpmi_rm_stub_source(vm, DPMI_RAW_SWITCH_OFF) ||
+        return dpmi_raw_real_owner(vm) != NULL ||
                dos_dpmi_rm_stub_source(vm, DPMI_SAVE_STATE_OFF);
     return false;
 }
@@ -189,7 +200,8 @@ bool dos_rm_host_vector(dos_vm_t *vm, uint8_t vector,
                           uint16_t segment, uint16_t offset)
 {
     if (segment != (DOS_ROM_BASE >> 4)) return false;
-    if (vector == 8 || (vector != 9 && !dos_int_has_pm_translator(vector))) return false;
+    if (vector == 8 || (vector != 9 && vector != 0x27 &&
+                        !dos_int_has_pm_translator(vector))) return false;
     if (offset != DOS_RM_SERVICE_BASE_OFF + vector * DOS_RM_SERVICE_STUB_SIZE) return false;
     uint32_t address = DOS_ROM_BASE + offset;
     return dos_mem_read8(vm, address) == 0xCD &&
@@ -219,6 +231,84 @@ static void dos_int15_e801(cpu8086_state_t *cpu, uint32_t total_bytes)
     cpu->flags &= ~FLAG_CF;
 }
 
+/* BIOS 87h uses 24-bit physical addresses, not the caller's page mappings.
+ * Check the backing of mapped EMS/VBE windows before committing any words. */
+static bool dos_bios_move_span(dos_vm_t *vm, uint32_t address, uint32_t size)
+{
+    if (!vm || !vm->mem || (uint64_t)address + size > 0x1000000u) return false;
+    while (size) {
+        uint32_t part = DOS_PAGE_SIZE - (address & (DOS_PAGE_SIZE - 1u));
+        if (part > size) part = size;
+        uint32_t physical = dos_vbe_memory_address(vm, address);
+        uint32_t frame_offset = physical - DOS_EMS_PAGE_FRAME_BASE;
+        if (frame_offset < DOS_EMS_FRAME_PAGES * DOS_EMS_PAGE_SIZE) {
+            uint32_t backing = vm->ems_frame_bases[frame_offset / DOS_EMS_PAGE_SIZE];
+            if (backing) {
+                uint64_t mapped = (uint64_t)backing + (frame_offset & (DOS_EMS_PAGE_SIZE - 1u));
+                if (mapped > UINT32_MAX) return false;
+                physical = (uint32_t)mapped;
+            }
+        }
+        if (physical > vm->total_mem_size || part > vm->total_mem_size - physical)
+            return false;
+        address += part;
+        size -= part;
+    }
+    return true;
+}
+
+static bool dos_bios_move_descriptor(const dpmi_descriptor_t *descriptor,
+                                      uint32_t bytes)
+{
+    /* IBM's AT block-move ABI requires a CPL0 read/write data descriptor
+     * with its reserved word clear, independent of the caller's DPMI ABI. */
+    return descriptor->access == (DESC_PRESENT | DESC_SEGMENT | DESC_WRITABLE | DESC_ACCESSED) &&
+           !descriptor->flags_lim && !descriptor->base_hi &&
+           (!bytes || bytes - 1u <= descriptor->limit_lo);
+}
+
+static void dos_bios_move_block(dos_vm_t *vm)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+    uint8_t table[48];
+    uint32_t bytes = (uint32_t)cpu->cx * 2u;
+    if (bytes > 0x10000u) goto invalid;
+    if (cpu->protected_mode) {
+        uint32_t offset = vm->dpmi.is_32bit ? cpu->esi : cpu->si;
+        if (!vm->dpmi.active || (!vm->dpmi.is_32bit && offset > 0x10000u - sizeof(table)))
+            goto invalid;
+        if (!dpmi_read_service_record(vm, cpu->es, offset, table, sizeof(table)))
+            return;
+    } else {
+        uint32_t address = dos_linear(cpu->es, cpu->si);
+        if (cpu->si > 0x10000u - sizeof(table) ||
+            !dos_bios_move_span(vm, address, sizeof(table))) goto invalid;
+        for (unsigned i = 0; i < sizeof(table); i++) table[i] = dos_phys_read8(vm, address + i);
+    }
+    dpmi_descriptor_t source, target;
+    for (unsigned i = 0; i < sizeof(source); i++) {
+        ((uint8_t *)&source)[i] = table[16u + i];
+        ((uint8_t *)&target)[i] = table[24u + i];
+    }
+    uint32_t from = dpmi_desc_get_base(&source), to = dpmi_desc_get_base(&target);
+    if (!dos_bios_move_descriptor(&source, bytes) || !dos_bios_move_descriptor(&target, bytes) ||
+        !dos_bios_move_span(vm, from, bytes) || !dos_bios_move_span(vm, to, bytes)) goto invalid;
+    /* Snapshot descriptors before copying: the destination can alias the
+     * table. Match the AT's forward MOVSW, including overlapping operands. */
+    for (uint32_t offset = 0; offset < bytes; offset += 2u) {
+        uint16_t word = dos_phys_read8(vm, from + offset) |
+                        ((uint16_t)dos_phys_read8(vm, from + offset + 1u) << 8);
+        dos_phys_write8(vm, to + offset, (uint8_t)word);
+        dos_phys_write8(vm, to + offset + 1u, (uint8_t)(word >> 8));
+    }
+    cpu->ah = 0;
+    cpu->eflags = (cpu->eflags & ~(FLAG_CF | FLAG_ZF)) | FLAG_ZF;
+    return;
+invalid:
+    cpu->ah = 2; /* BIOS exception/error result, without modifying the payload. */
+    cpu->eflags = (cpu->eflags & ~(FLAG_CF | FLAG_ZF)) | FLAG_CF;
+}
+
 /* ── INT dispatch ───────────────────────────────────────────────── */
 
 void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
@@ -238,6 +328,10 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
         dos_int10_video(vm);
         break;
 
+    case 0x11:
+        vm->cpu->ax = dos_mem_read16(vm, 0x410);
+        break;
+
     case 0x16:
         dos_int16_keyboard(vm);
         break;
@@ -246,14 +340,28 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
         /* BIOS services — extended memory, system config */
         cpu8086_state_t *c15 = vm->cpu;
         switch (c15->ah) {
-        case 0x87: /* Move block (extended memory copy) */
-            c15->flags &= ~FLAG_CF;  /* success */
+        case 0x24:
+            if (!vm->io || c15->al > 3u) {
+                c15->ah = 0x86;
+                c15->flags |= FLAG_CF;
+                break;
+            }
+            switch (c15->al) {
+            case 0: (void)dos_io_set_a20(vm, false); break;
+            case 1: (void)dos_io_set_a20(vm, true); break;
+            case 2: c15->al = dos_a20_enabled(vm); break;
+            case 3: c15->bx = 3; break;
+            }
             c15->ah = 0;
+            c15->flags &= ~FLAG_CF;
+            break;
+        case 0x87: /* Move block (extended memory copy) */
+            dos_bios_move_block(vm);
             break;
         case 0x88: { /* Get extended memory size (KB above 1MB) */
             uint32_t system_memory = vm->system_mem_size
                                    ? vm->system_mem_size : vm->total_mem_size;
-            c15->ax = (system_memory > 0x100000) ?
+            c15->ax = (!dos_xms_bios_hooked(vm) && system_memory > 0x100000) ?
                       (uint16_t)((system_memory - 0x100000) / 1024) : 0;
             c15->flags &= ~FLAG_CF;
             break;
@@ -311,6 +419,11 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
         dos_int21_dispatch(vm);
         break;
 
+    case 0x27:
+        dos_terminate_resident(vm, vm->cpu->cs,
+            (uint16_t)(((uint32_t)vm->cpu->dx + 15u) >> 4), 0);
+        break;
+
     case 0x2F:
         dos_int2f_dispatch(vm);
         break;
@@ -336,6 +449,10 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
         break;
 
     case DOS_RM_SERVICE_INT: {
+        if (dos_xms_entry_source(vm)) {
+            dos_xms_dispatch(vm);
+            break;
+        }
         uint8_t service;
         if (!dos_rm_service_source(vm, &service))
             goto generic_interrupt;
@@ -413,9 +530,9 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
             break;
         }
         if (!dos_dpmi_pm_stub_source(vm, DPMI_RAW_SWITCH_OFF) &&
-            !dos_dpmi_rm_stub_source(vm, DPMI_RAW_SWITCH_OFF))
+            !dpmi_raw_real_owner(vm))
             goto generic_interrupt;
-        if (!dpmi_raw_mode_switch(vm, vm->software_int_frame_bytes)) {
+        if (dpmi_raw_mode_switch(vm, vm->software_int_frame_bytes) == DPMI_SERVICE_INVALID) {
             vm->cpu->running = false;
             vm->cpu->exit_code = -1;
         }
@@ -467,6 +584,156 @@ generic_interrupt: {
     }
 }
 
+static int dos_bios_move_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    enum { MEMORY_BYTES = 0x180000, MEMORY_PAGES = MEMORY_BYTES / DOS_PAGE_SIZE };
+    uint8_t *memory = dos_host_alloc_pages(MEMORY_PAGES);
+    uint8_t *expected = dos_host_alloc_pages(MEMORY_PAGES);
+    if (!memory || !expected) {
+        if (memory) dos_host_free_pages(memory, MEMORY_PAGES);
+        if (expected) dos_host_free_pages(expected, MEMORY_PAGES);
+        return 1;
+    }
+    unsigned checks = 0;
+    int failures = 0;
+    for (unsigned scenario = 0; scenario < 40; scenario++)
+    for (unsigned flags = 0; flags < 4; flags++) {
+        vm->mem = memory;
+        vm->total_mem_size = MEMORY_BYTES;
+        vm->vbe_active = false;
+        vm->dpmi.active = false;
+        for (unsigned i = 0; i < DOS_EMS_FRAME_PAGES; i++) vm->ems_frame_bases[i] = 0;
+        *cpu = (cpu8086_state_t){0};
+        cpu8086_init(cpu, vm);
+        cpu->eax = 0xa5a5874bu; cpu->ebx = 0xb6b61234u;
+        cpu->ecx = 0xc7c7001fu; cpu->edx = 0xd8d85678u;
+        cpu->esi = 0xe9e91300u; cpu->edi = 0xfafa9abcu;
+        cpu->ebp = 0xababdef0u; cpu->esp = 0xbcbc8000u;
+        cpu->es = 0x100; cpu->ss = 0x2000; cpu->ds = 0x3000;
+        cpu->eflags = FLAGS_FIXED | FLAG_IF | FLAG_DF | FLAG_RF | FLAG_OF |
+                      (flags & 1u ? FLAG_CF : 0) | (flags & 2u ? FLAG_ZF : 0);
+        cpu->cr2 = 0x76543210;
+        uint32_t table = 0x2300, from = 0x110001, to = 0x120003;
+        dpmi_descriptor_t source = { .limit_lo = 0xffff, .access = 0x93 };
+        dpmi_descriptor_t target = source;
+        bool valid = true, paged = scenario >= 38;
+        switch (scenario) {
+        case 1: cpu->cx = 0; break;
+        case 2: cpu->cx = 1; break;
+        case 3: cpu->cx = 0x8000; break;
+        case 4: cpu->cx = 0x7fff; break;
+        case 5: cpu->cx = 0x8001; valid = false; break;
+        case 6: source.limit_lo = 61; target.limit_lo = 61; break;
+        case 7: source.limit_lo = 60; valid = false; break;
+        case 8: target.limit_lo = 60; valid = false; break;
+        case 9: source.access = 0x13; valid = false; break;
+        case 10: target.access = 0x91; valid = false; break;
+        case 11: source.access = 0x9b; valid = false; break;
+        case 12: source.access = 0xf3; valid = false; break;
+        case 13: source.flags_lim = 0x80; valid = false; break;
+        case 14: target.flags_lim = 0x40; valid = false; break;
+        case 15: from = 0x01110001; valid = false; break;
+        case 16: to = 0x01120003; valid = false; break;
+        case 17: from = 0xfffff0; valid = false; break;
+        case 18: to = MEMORY_BYTES - 1u; valid = false; break;
+        case 19: from = MEMORY_BYTES - 62u; break;
+        case 20: from = MEMORY_BYTES - 61u; valid = false; break;
+        case 21: to = MEMORY_BYTES - 62u; break;
+        case 22: to = from + 1u; break;
+        case 23: to = from - 1u; break;
+        case 24: to = from; break;
+        case 25: to = table; break;
+        case 26: case 28: from = DOS_EMS_PAGE_FRAME_BASE + DOS_EMS_PAGE_SIZE - 8u; break;
+        case 27: case 29: to = DOS_EMS_PAGE_FRAME_BASE + DOS_EMS_PAGE_SIZE - 8u; break;
+        case 30:
+            vm->vbe_active = true; vm->vbe_linear = false; vm->vbe_bank = 0xffff;
+            from = DOS_VBE_WINDOW_BASE; valid = false; break;
+        case 31: cpu->si = 0xfff0; valid = false; break;
+        case 32: vm->total_mem_size = table + 47u; valid = false; break;
+        case 33: cpu->cx = 0; source.access = 0; valid = false; break;
+        case 34: cpu->cx = 0; from = 0xf00000; to = 0xe00000; break;
+        case 35: cpu->es = 0xffff; cpu->si = 0x40; table = 0x100030; break;
+        }
+        if (scenario >= 26 && scenario <= 29) {
+            vm->ems_frame_bases[0] = 0x100000;
+            vm->ems_frame_bases[1] = scenario >= 28 ? MEMORY_BYTES : 0x104000;
+            if (scenario >= 28) valid = false;
+        }
+        for (unsigned i = 0; i < MEMORY_BYTES; i++) memory[i] = (uint8_t)(i * 37u + (i >> 9));
+        dpmi_desc_set_base(&source, from);
+        dpmi_desc_set_base(&target, to);
+        uint8_t record[48] = {0};
+        for (unsigned i = 0; i < sizeof(source); i++) {
+            record[16u + i] = ((uint8_t *)&source)[i];
+            record[24u + i] = ((uint8_t *)&target)[i];
+        }
+        if (scenario >= 36) {
+            vm->dpmi.active = true;
+            vm->dpmi.is_32bit = (scenario & 1u) != 0;
+            vm->dpmi.descriptor_state[1] = DPMI_DESC_MUTABLE;
+            dpmi_descriptor_t *descriptor = &vm->dpmi.ldt[1];
+            *descriptor = (dpmi_descriptor_t){ .limit_lo = 0xffff, .access = 0xf3 };
+            cpu->protected_mode = true; cpu->pm_cs_loaded = true; cpu->cpl = 3;
+            cpu->cr0 |= 1u; cpu->es = dpmi_index_to_sel(1);
+            cpu->esi = vm->dpmi.is_32bit ? 0xff0 : 0xaaaa0ff0;
+            if (paged) {
+                cpu->cr0 |= DOS_CR0_PG; cpu->cr3 = 0x30000;
+                for (unsigned i = 0; i < 0x2000; i++) memory[0x30000 + i] = 0;
+                dpmi_desc_set_base(descriptor, 0x400000);
+                dos_mem_write32(vm, 0x30004, 0x31007);
+                dos_mem_write32(vm, 0x31000, 0x24007);
+                dos_mem_write32(vm, 0x31004, 0x26007);
+            } else dpmi_desc_set_base(descriptor, 0x24000);
+            for (unsigned i = 0; i < sizeof(record); i++)
+                memory[paged && i >= 16u ? 0x26000 + i - 16u : 0x24ff0 + i] = record[i];
+        } else {
+            for (unsigned i = 0; i < sizeof(record); i++) memory[table + i] = record[i];
+        }
+        for (unsigned i = 0; i < MEMORY_BYTES; i++) expected[i] = memory[i];
+        /* Reference model has its own memory image and the same board's
+         * mapped windows; descriptor addresses come from the test case. */
+        if (valid) {
+            vm->mem = expected;
+            if (paged) {
+                dos_mem_write32(vm, 0x30004, 0x31027);
+                dos_mem_write32(vm, 0x31000, 0x24027);
+                dos_mem_write32(vm, 0x31004, 0x26027);
+            }
+            for (uint32_t offset = 0; offset < (uint32_t)cpu->cx * 2u; offset += 2u) {
+                uint8_t lo = dos_mem_read8(vm, from + offset);
+                uint8_t hi = dos_mem_read8(vm, from + offset + 1u);
+                dos_mem_write8(vm, to + offset, lo);
+                dos_mem_write8(vm, to + offset + 1u, hi);
+            }
+            vm->mem = memory;
+        }
+        cpu8086_state_t result = *cpu;
+        result.ah = valid ? 0 : 2;
+        result.eflags = (result.eflags & ~(FLAG_CF | FLAG_ZF)) | (valid ? FLAG_ZF : FLAG_CF);
+        dos_int_dispatch(vm, 0x15);
+        bool ok = true;
+        for (unsigned i = 0; i < sizeof(result); i++)
+            if (((uint8_t *)cpu)[i] != ((uint8_t *)&result)[i]) { ok = false; break; }
+        for (unsigned i = 0; i < MEMORY_BYTES; i++)
+            if (memory[i] != expected[i]) { ok = false; break; }
+        if (!ok) {
+            if (failures < 8) {
+                serial_puts("[DOS-BIOS-MOVE] case="); serial_putdec(scenario);
+                serial_puts(" flags="); serial_putdec(flags);
+                serial_puts(" AX="); serial_puthex(cpu->ax, 4); serial_puts("\n");
+            }
+            failures++;
+        }
+        checks++;
+    }
+    vm->mem = NULL; vm->total_mem_size = 0; vm->vbe_active = false; vm->dpmi.active = false;
+    dos_host_free_pages(expected, MEMORY_PAGES);
+    dos_host_free_pages(memory, MEMORY_PAGES);
+    serial_puts("[DOS-BIOS-MOVE] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
 int dos_bios_memory_selftest(void)
 {
     dos_vm_t vm = {0};
@@ -505,6 +772,8 @@ int dos_bios_memory_selftest(void)
     dos_int_dispatch(&vm, 0x15);
     if (!(cpu.flags & FLAG_CF)) failures++;
 
+    failures += dos_bios_move_selftest(&vm, &cpu);
+    failures += dos_a20_selftest();
     return failures;
 }
 
@@ -567,6 +836,7 @@ static bool dpmi_deliver_exception_frame(dos_vm_t *vm, uint8_t vector,
     bool extended = real || vm->dpmi.exception_extended[vector];
     uint32_t old_flags = real ? real->cpu.eflags | FLAG_VM | FLAGS_FIXED
                               : cpu8086_flags_image(cpu);
+    old_flags = cpu8086_exception_flags(old_flags, vector);
     uint16_t old_ss = cpu->ss;
     uint32_t old_esp = cpu->esp;
     uint16_t old_cs = cpu->cs;
@@ -584,7 +854,7 @@ static bool dpmi_deliver_exception_frame(dos_vm_t *vm, uint8_t vector,
         const uint32_t extra[] = {
             DPMI_EXCEPTION_EXT_RETURN_OFF | (width == 2u ? (uint32_t)host_sel << 16 : 0),
             width == 4u ? host_sel : 0,
-            vector == 1u ? (old_flags & FLAG_TF ? 0x8000u : 0u) : error_code,
+            error_code,
             return_eip, old_cs | (host ? DPMI_EXCEPTION_HOST << 16 : 0),
             old_flags, old_esp, old_ss, cpu->es, cpu->ds, cpu->fs, cpu->gs,
             vector == 14u ? cpu->cr2 : 0,
@@ -625,7 +895,7 @@ static bool dpmi_deliver_exception_frame(dos_vm_t *vm, uint8_t vector,
     cpu->rep_compare.active = false;
     cpu->cs = handler_sel;
     cpu->eip = handler_off;
-    cpu->flags = (cpu->flags | FLAG_IF) & ~FLAG_TF;
+    cpu->eflags = (cpu->eflags | FLAG_IF) & ~(FLAG_TF | FLAG_RF);
     cpu8086_sync_cs(cpu);
     return true;
 }
@@ -869,7 +1139,7 @@ invalid:
     return false;
 }
 
-static bool dpmi_deliver_real_exception(dos_vm_t *vm, uint8_t vector,
+static bool dpmi_deliver_real_exception_current(dos_vm_t *vm, uint8_t vector,
                                         uint32_t return_eip, uint32_t error_code,
                                         bool service)
 {
@@ -879,6 +1149,7 @@ static bool dpmi_deliver_real_exception(dos_vm_t *vm, uint8_t vector,
         return !service && handled;
     }
 
+    dpmi_host_activation_t activation = dpmi_host_activation_save(&vm->dpmi);
     dpmi_real_exception_t real = { .cpu = *cpu,
         .real_stack = vm->dpmi.real_mode_stack, .real_paging = vm->dpmi.real_mode_paging,
         .protected_stack = vm->dpmi.suspended_stack,
@@ -893,9 +1164,10 @@ static bool dpmi_deliver_real_exception(dos_vm_t *vm, uint8_t vector,
      * although the suspended caller is real mode. Report that PTE image. */
     if (service && vector == 14u) real.pte = dpmi_exception_pte(vm, cpu->cr2);
     bool delivered = dpmi_deliver_exception_frame(vm, vector, return_eip, error_code, &real);
+    bool returned = false;
     if (delivered) {
         vm->native_dispatch_depth++;
-        (void)cpu8086_run_until_signal(vm, &wait.returned);
+        returned = cpu8086_run_until_signal(vm, &wait.returned);
         vm->native_dispatch_depth--;
     } else {
         *cpu = real.cpu;
@@ -905,28 +1177,29 @@ static bool dpmi_deliver_real_exception(dos_vm_t *vm, uint8_t vector,
             cpu->exit_code = -1;
         }
     }
-    vm->dpmi.host_wait = wait.previous;
-    /* A failed/killed handler must not leave a pointer to this C activation.
-     * Normal and nested returns have already popped their private contexts. */
-    if (wait.depth < DPMI_MAX_EXCEPTION_DEPTH &&
-        vm->dpmi.exception_context[wait.depth].real == &real) {
-        for (unsigned i = wait.depth; i < vm->dpmi.exception_depth; i++) {
-            vm->dpmi.exception_context[i] = (dpmi_exception_context_t){0};
-            vm->dpmi.exception_software_entries[i] = (dpmi_software_entry_t){0};
-            vm->dpmi.exception_esp_high[i] = 0;
-        }
-        vm->dpmi.exception_depth = wait.depth;
-        vm->dpmi.virtual_interrupts_enabled = vm->dpmi.exception_virtual_interrupts[wait.depth];
-        vm->dpmi.real_mode_stack = real.real_stack;
-        vm->dpmi.real_mode_paging = real.real_paging;
-        vm->dpmi.suspended_stack = real.protected_stack;
-    }
+    dpmi_state_t *owner = (dpmi_state_t *)dos_exec_find_dpmi(vm, activation.client_id);
+    if (owner) owner->host_wait = wait.previous;
+    if (!returned) dpmi_host_activation_restore(vm, &activation);
     cpu = vm->cpu;
     if (service)
-        return delivered && wait.returned && cpu->running && !wait.redirected &&
+        return delivered && returned && cpu->running && !wait.redirected &&
                vm->current_psp == wait.psp && !cpu->protected_mode &&
                cpu->cs == real.cpu.cs && cpu->eip == return_eip;
     return delivered && (wait.returned || !cpu->running);
+}
+
+static bool dpmi_deliver_real_exception(dos_vm_t *vm, uint8_t vector,
+                                        uint32_t return_eip, uint32_t error_code,
+                                        bool service)
+{
+    const dpmi_state_t *primary = dos_exec_primary_dpmi(vm);
+    if (!primary) return false;
+    dpmi_client_scope_t scope;
+    if (!dos_exec_enter_dpmi(vm, primary, &scope)) return false;
+    bool delivered = dpmi_deliver_real_exception_current(vm, vector, return_eip,
+                                                          error_code, service);
+    dos_exec_leave_dpmi(vm, &scope);
+    return delivered;
 }
 
 bool dpmi_real_service_exception(dos_vm_t *vm, uint8_t vector, uint32_t error,
@@ -953,20 +1226,23 @@ static bool dpmi_host_exception(dos_vm_t *vm, uint8_t vector, uint32_t error,
         cpu->eflags = vm->software_int_return_flags | FLAGS_FIXED | FLAG_IF;
         vm->software_int_frame_bytes = 0;
     }
+    dpmi_host_activation_t activation = dpmi_host_activation_save(&vm->dpmi);
     dpmi_host_wait_t wait = { .previous = vm->dpmi.host_wait,
         .psp = vm->current_psp, .depth = vm->dpmi.exception_depth, .delivering = true };
     if (vector == 14u) cpu->cr2 = linear;
     vm->dpmi.host_wait = &wait;
     if (!cpu_deliver_exception(vm, vector, eip, error, true) || !cpu->running ||
         vm->dpmi.exception_depth != wait.depth + 1u) {
-        vm->dpmi.host_wait = wait.previous;
+        dpmi_host_activation_restore(vm, &activation);
         return false;
     }
     wait.delivering = false;
     vm->native_dispatch_depth++;
     bool returned = cpu8086_run_until_signal(vm, &wait.returned);
     vm->native_dispatch_depth--;
-    vm->dpmi.host_wait = wait.previous;
+    dpmi_state_t *owner = (dpmi_state_t *)dos_exec_find_dpmi(vm, activation.client_id);
+    if (owner) owner->host_wait = wait.previous;
+    if (!returned) dpmi_host_activation_restore(vm, &activation);
     cpu = vm->cpu;
     return returned && cpu->running && vm->current_psp == wait.psp &&
            cpu->protected_mode && (allow_redirect ||
@@ -984,6 +1260,7 @@ bool dos_native_prepare_return(dos_vm_t *vm)
     cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
     if (!cpu || !cpu->running) return false;
     for (;;) {
+        dpmi_apply_coprocessor(cpu);
         cpu_system_segment_t loaded[6];
         cpu_event_fault_t fault = {0};
         if (cpu8086_probe_native_segments(cpu, loaded, &fault)) {
@@ -1034,7 +1311,7 @@ static bool dpmi_deliver_locked_interrupt(dos_vm_t *vm, uint16_t selector,
     dpmi_stack_t stack;
     dpmi_stack_t caller = { cpu->ss, cpu->esp };
     uint32_t flags = cpu8086_flags_image(cpu);
-    uint16_t host = dpmi_get_host_code_selector(vm);
+    uint16_t host = dpmi_get_interrupt_return_selector(vm);
     const uint32_t fields[] = { DPMI_INTERRUPT_RETURN_OFF, host, flags };
     if (!host || dpmi->interrupt_depth >= DPMI_MAX_INTERRUPT_DEPTH ||
         !dpmi_locked_stack_top(vm, dpmi->is_32bit ? 12u : 6u, &stack) ||
@@ -1052,33 +1329,20 @@ static bool dpmi_deliver_locked_interrupt(dos_vm_t *vm, uint16_t selector,
     frame->virtual_if = dpmi->virtual_interrupts_enabled;
     cpu->cs = selector;
     cpu->eip = offset;
-    cpu->flags = (cpu->flags | FLAG_IF) & ~FLAG_TF;
+    cpu->eflags = (cpu->eflags | FLAG_IF) & ~(FLAG_TF | FLAG_RF);
     if (hardware) dpmi->virtual_interrupts_enabled = false;
     cpu8086_sync_cs(cpu);
     return true;
 }
 
-static bool dpmi_interrupt_return(dos_vm_t *vm, bool discard_private_frame)
+static bool dpmi_interrupt_finish(dos_vm_t *vm, uint16_t ss,
+                                   uint32_t after, uint32_t flags)
 {
     cpu8086_state_t *cpu = vm->cpu;
     dpmi_state_t *dpmi = &vm->dpmi;
-    if (!cpu->protected_mode || !dpmi->interrupt_depth ||
-        !dos_dpmi_pm_stub_source(vm, DPMI_INTERRUPT_RETURN_OFF)) return false;
+    if (!cpu->protected_mode || !dpmi->interrupt_depth) return false;
     dpmi_interrupt_frame_t *frame = &dpmi->interrupt_frames[dpmi->interrupt_depth - 1u];
-    uint32_t after = cpu->esp;
-    uint32_t flags = cpu->eflags;
-    if (discard_private_frame) {
-        unsigned width = dpmi->is_32bit ? 4u : 2u;
-        uint8_t bytes[12];
-        if (!dpmi_read_stack_frame(vm, bytes, 3u * width))
-            return false;
-        flags = 0;
-        for (unsigned b = 0; b < width; b++)
-            flags |= (uint32_t)bytes[2u * width + b] << (8u * b);
-        after = cpu_stack_addr32(cpu) ? after + 3u * width
-              : (after & 0xFFFF0000u) | (uint16_t)(after + 3u * width);
-    }
-    if (cpu->ss != frame->handler.ss || after != frame->handler.esp) {
+    if (ss != frame->handler.ss || after != frame->handler.esp) {
         serial_puts("[DPMI] Unbalanced locked interrupt return\n");
         return false;
     }
@@ -1096,7 +1360,44 @@ static bool dpmi_interrupt_return(dos_vm_t *vm, bool discard_private_frame)
                                     ? (flags & FLAG_IF) != 0 : frame->virtual_if;
     dpmi->interrupt_depth--;
     cpu8086_sync_cs(cpu);
+    dos_io_irq_trace(vm, DOS_IRQ_TRACE_RETURN, 0xFF, flags);
     return true;
+}
+
+int dos_pm_interrupt_return_iret(dos_vm_t *vm, uint16_t cs, uint32_t ip,
+                                 uint16_t ss, uint32_t esp, uint32_t flags)
+{
+    if (!vm || !vm->cpu || !vm->dpmi.active || cpu8086_uses_guest_idt(vm->cpu) ||
+        ip != DPMI_INTERRUPT_RETURN_OFF)
+        return 0;
+    bool native_alias = cs == vm->dpmi.sel_interrupt_return &&
+                        dpmi_native_interrupt_return_selector(vm, cs);
+    uint16_t index = dpmi_sel_to_index(cs);
+    bool software_stub = !vm->native_active && cs == vm->dpmi.sel_host_code &&
+                         (cs & 4u) && index && index < DPMI_MAX_DESCRIPTORS &&
+                         vm->dpmi.descriptor_state[index] == DPMI_DESC_HOST;
+    if (!native_alias && !software_stub) return 0;
+    /* Retire the locked frame before STI's shadow expires. Executing the
+     * private INT as a second instruction would admit IRQs in between. */
+    return dpmi_interrupt_finish(vm, ss, esp, flags) ? 1 : -1;
+}
+
+static bool dpmi_interrupt_return(dos_vm_t *vm, bool discard_private_frame)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+    if (!dos_pm_interrupt_return_source(vm, DPMI_EXCEPTION_RETURN_INT)) return false;
+    uint32_t after = cpu->esp, flags = cpu->eflags;
+    if (discard_private_frame) {
+        unsigned width = vm->dpmi.is_32bit ? 4u : 2u;
+        uint8_t bytes[12];
+        if (!dpmi_read_stack_frame(vm, bytes, 3u * width)) return false;
+        flags = 0;
+        for (unsigned b = 0; b < width; b++)
+            flags |= (uint32_t)bytes[2u * width + b] << (8u * b);
+        after = cpu_stack_addr32(cpu) ? after + 3u * width
+              : (after & 0xFFFF0000u) | (uint16_t)(after + 3u * width);
+    }
+    return dpmi_interrupt_finish(vm, cpu->ss, after, flags);
 }
 
 static bool dpmi_enter_software_interrupt(dos_vm_t *vm,
@@ -1104,7 +1405,9 @@ static bool dpmi_enter_software_interrupt(dos_vm_t *vm,
                                           uint32_t fault_eip, bool completed_int)
 {
     cpu8086_state_t *cpu = vm->cpu;
-    uint32_t flags = cpu8086_flags_image(cpu);
+    /* A repaired native entry still belongs to the INT which consumed RF.
+     * Exception-return RF must not leak into that INT's new return frame. */
+    uint32_t flags = cpu8086_flags_image(cpu) & ~FLAG_RF;
     if (!vm->emulate_cpu) flags |= FLAG_IF;
     unsigned depth = vm->dpmi.exception_depth;
     if (!cpu8086_enter_dpmi_interrupt(cpu, entry->handler_sel, entry->handler_off,
@@ -1114,14 +1417,14 @@ static bool dpmi_enter_software_interrupt(dos_vm_t *vm,
             vm->dpmi.exception_software_entries[depth] = *entry;
         return true; /* A selected vector's fault must not fall through to DOS. */
     }
-    cpu->flags = (cpu->flags | FLAG_IF) & ~FLAG_TF;
+    cpu->eflags = (cpu->eflags | FLAG_IF) & ~(FLAG_TF | FLAG_RF);
     if (entry->vector <= 7u) vm->dpmi.virtual_interrupts_enabled = false;
     return true;
 }
 
 static bool dpmi_deliver_software_interrupt(dos_vm_t *vm, uint8_t int_num,
                                             uint32_t return_eip, uint32_t fault_eip,
-                                            bool completed_int)
+                                            bool completed_int, bool use_translator_stub)
 {
     cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
     if (!cpu || !cpu->protected_mode || cpu8086_uses_guest_idt(cpu) || !vm->dpmi.active ||
@@ -1132,8 +1435,9 @@ static bool dpmi_deliver_software_interrupt(dos_vm_t *vm, uint8_t int_num,
     uint32_t handler_off = vm->dpmi.pm_vectors[int_num].off;
     if (!handler_sel) {
         /* Keep built-in API translators on their direct fast path. Their
-         * chainable 0204h address still enters through the default stub. */
-        if (dos_int_has_pm_translator(int_num))
+         * chainable 0204h address still enters through the default stub.
+         * A DPL0 gate intercepted via #GP needs that stub as its entry. */
+        if (!use_translator_stub && dos_int_has_pm_translator(int_num))
             return false;
         handler_sel = dpmi_get_host_code_selector(vm);
         handler_off = DPMI_PM_REFLECT_BASE_OFF +
@@ -1154,7 +1458,7 @@ static bool dpmi_deliver_software_interrupt(dos_vm_t *vm, uint8_t int_num,
 bool cpu_deliver_pm_software_interrupt(dos_vm_t *vm, uint8_t int_num,
                                        uint32_t return_eip, uint32_t fault_eip)
 {
-    return dpmi_deliver_software_interrupt(vm, int_num, return_eip, fault_eip, false);
+    return dpmi_deliver_software_interrupt(vm, int_num, return_eip, fault_eip, false, false);
 }
 
 bool cpu_deliver_hw_interrupt(dos_vm_t *vm, uint8_t int_num)
@@ -1169,6 +1473,11 @@ bool cpu_deliver_hw_interrupt(dos_vm_t *vm, uint8_t int_num)
     }
     /* Without DPMI, protected interrupts already take the guest IDT path. */
     if (!vm->dpmi.virtual_interrupts_enabled) return false;
+    if (dos_exec_primary_dpmi(vm) != &vm->dpmi) {
+        bool delivered = dpmi_primary_hardware_interrupt(vm, int_num);
+        if (delivered) cpu->rep_compare.active = false;
+        return delivered;
+    }
     cpu->halted = false;
     cpu->flags |= FLAG_IF;
 
@@ -1202,6 +1511,8 @@ bool cpu_deliver_exception(dos_vm_t *vm, uint8_t vector,
             .return_eip = return_eip, .raised = true, .has_error = has_error_code };
         return false;
     }
+    vm->cpu_event_serial++;
+    if (vector == 1u) cpu->dr[7] &= ~(1u << 13);
     if (cpu8086_uses_guest_idt(cpu) || (!cpu->protected_mode && !vm->dpmi.active))
         return cpu8086_deliver_guest_interrupt(vm, vector, CPU_EVENT_EXCEPTION,
                                                 return_eip, return_eip, error_code, has_error_code);
@@ -1256,7 +1567,8 @@ _Static_assert(sizeof(dos_native_regs_t) == 25 * 8, "DOS INT stub frame size");
  * Set up by dos_transfer_to_native() before jumping to 32-bit code.
  * The native dispatch reads/writes this to provide DOS services.
  */
-static dos_vm_t *g_native_dos_vm = 0;
+/* isr_common reads this token, but only host-CR3 C code dereferences it. */
+dos_vm_t *g_native_dos_vm = 0;
 static cpu8086_state_t g_native_cpu;
 static cpu8086_state_t *g_native_interpreter_cpu;
 
@@ -1278,6 +1590,40 @@ int dos_native_session_active(void)
      * map. A non-NULL published pointer is the session-active token and is
      * cleared synchronously during teardown. */
     return g_native_dos_vm != 0;
+}
+
+static bool dos_native_interrupt_fp(dos_vm_t *owner, void *image, bool capture)
+{
+    if (!owner || owner != g_native_dos_vm || !image) return false;
+    extern uint64_t paging_get_kernel_cr3(void);
+    uint64_t saved_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kernel_cr3 = paging_get_kernel_cr3();
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(kernel_cr3) : "memory");
+    bool owned = owner->native_active && owner->native_cr3 == saved_cr3 && owner->native_fp;
+    if (owned) {
+        if (capture) {
+            dos_fpu_capture_native(owner, image);
+        } else {
+            memcpy(image, owner->native_fp->image, DOS_NATIVE_FP_BYTES);
+            dos_native_fp_return(owner, image);
+        }
+    }
+    if (kernel_cr3 && saved_cr3 != kernel_cr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
+    return owned;
+}
+
+void dos_native_isr_dispatch(x86_interrupt_frame_t *frame, void *fp_image)
+{
+    dos_vm_t *owner = g_native_dos_vm;
+    bool guest = (frame->cs & 3u) == 3u && dos_native_interrupt_fp(owner, fp_image, true);
+    extern void isr_handler(x86_interrupt_frame_t *frame);
+    isr_handler(frame);
+    /* Host-nested interrupts preserve their own FP state, not the client's.
+     * An emulated data operation may have changed the client image in C. */
+    if (guest) (void)dos_native_interrupt_fp(owner, fp_image, false);
 }
 
 void dos_native_cleanup_active(void)
@@ -1322,8 +1668,12 @@ static bool dos_native_selector_base(dos_vm_t *vm, uint16_t selector,
 
 static bool dos_native_fetch_code_byte(dos_vm_t *vm,
                                        const dpmi_descriptor_t *code,
-                                       uint32_t offset, uint8_t *value)
+                                       uint32_t rip, uint32_t cursor, uint8_t *value)
 {
+    /* Prefixes, opcode and immediates share one non-wrapping fetch budget. */
+    if (cursor >= 15u || cursor > UINT32_MAX - rip)
+        return false;
+    uint32_t offset = rip + cursor;
     if (!vm || !code || !value || offset > dpmi_desc_get_limit(code))
         return false;
     uint64_t linear = (uint64_t)dpmi_desc_get_base(code) + offset;
@@ -1392,11 +1742,58 @@ static bool dos_native_step_data(dos_vm_t *vm, x86_interrupt_frame_t *frame,
                                   const dpmi_descriptor_t *code)
 {
     cpu8086_state_t *cpu = dos_native_import_frame(vm, frame, code);
+    if (frame->vector == 13) cpu->eflags &= ~FLAG_RF;
     unsigned exception_depth = vm->dpmi.exception_depth;
     if (!cpu8086_run_one(vm)) return false;
     if (vm->dpmi.exception_depth != exception_depth) dos_native_sync_ldt(vm);
     dos_native_export_frame(cpu, frame);
     return true;
+}
+
+static int dos_native_interrupt_return_fault(dos_vm_t *vm,
+                                              x86_interrupt_frame_t *frame,
+                                              const dpmi_descriptor_t *code)
+{
+    if (frame->vector != 11 || !vm->dpmi.interrupt_depth ||
+        frame->error_code != (vm->dpmi.sel_interrupt_return & ~3u) ||
+        !dpmi_native_interrupt_return_selector(vm, (uint16_t)frame->error_code) ||
+        (frame->rflags & FLAG_NT)) return 0;
+    bool prefix66 = false, iret = false;
+    for (unsigned cursor = 0; cursor < 15u; cursor++) {
+        uint8_t opcode;
+        if (!dos_native_fetch_code_byte(vm, code, (uint32_t)frame->rip, cursor, &opcode))
+            return 0;
+        if (opcode == 0x66) { prefix66 = true; continue; }
+        if (opcode == 0x26 || opcode == 0x2E || opcode == 0x36 ||
+            opcode == 0x3E || opcode == 0x64 || opcode == 0x65 ||
+            opcode == 0x67 || opcode == 0xF2 || opcode == 0xF3) continue;
+        iret = opcode == 0xCF;
+        break;
+    }
+    if (!iret) return 0;
+
+    cpu8086_state_t *cpu = dos_native_import_frame(vm, frame, code);
+    unsigned width = ((code->flags_lim & DESC_32BIT) != 0) ^ prefix66 ? 4u : 2u;
+    uint8_t bytes[12];
+    if (!dpmi_read_stack_frame(vm, bytes, width * 3u)) return 0;
+    uint32_t ip = 0, cs = 0;
+    for (unsigned b = 0; b < width; b++) {
+        ip |= (uint32_t)bytes[b] << (b * 8u);
+        cs |= (uint32_t)bytes[width + b] << (b * 8u);
+    }
+    if (ip != DPMI_INTERRUPT_RETURN_OFF || (uint16_t)cs != vm->dpmi.sel_interrupt_return)
+        return 0;
+
+    /* #NP is a host interception, not a guest fault. Execute the still-live
+     * IRET frame and retire tracing only after restoring the locked caller. */
+    cpu->eflags &= ~FLAG_RF;
+    vm->native_dispatch_depth++;
+    bool stepped = cpu8086_run_one(vm);
+    vm->native_dispatch_depth--;
+    if (!stepped) return -1;
+    dos_native_sync_ldt(vm);
+    dos_native_export_frame(cpu, frame);
+    return 1;
 }
 
 bool dos_native_handle_exception(x86_interrupt_frame_t *frame)
@@ -1431,6 +1828,12 @@ bool dos_native_handle_exception(x86_interrupt_frame_t *frame)
         !(code.access & DESC_CODE))
         goto done;
 
+    int interrupt_return = dos_native_interrupt_return_fault(vm, frame, &code);
+    if (interrupt_return) {
+        handled = interrupt_return > 0;
+        goto done;
+    }
+
     if (frame->vector == 14 && vm->vga_mode == 0x13u && !vm->vbe_active) {
         if ((frame->error_code == 5u || frame->error_code == 7u) &&
             fault_address - DOS_VGA_APERTURE_BASE < DOS_VGA_APERTURE_SIZE)
@@ -1446,7 +1849,7 @@ bool dos_native_handle_exception(x86_interrupt_frame_t *frame)
         for (unsigned cursor = 0; cursor < 15u; cursor++) {
             uint8_t opcode;
             if (cursor > UINT32_MAX - return_eip ||
-                !dos_native_fetch_code_byte(vm, &code, return_eip + cursor,
+                !dos_native_fetch_code_byte(vm, &code, return_eip, cursor,
                                             &opcode))
                 break;
             if (opcode == 0x26 || opcode == 0x2E || opcode == 0x36 ||
@@ -1509,7 +1912,7 @@ int dos_native_handle_privileged_fault(x86_interrupt_frame_t *frame)
     bool operand_override = false;
     uint8_t opcode = 0;
     while (cursor < 15U) {
-        if (!dos_native_fetch_code_byte(vm, &code, rip + cursor, &opcode))
+        if (!dos_native_fetch_code_byte(vm, &code, rip, cursor, &opcode))
             goto done;
         if (opcode == 0x66U) {
             operand_override = true;
@@ -1531,7 +1934,7 @@ int dos_native_handle_privileged_fault(x86_interrupt_frame_t *frame)
     bool default32 = (code.flags_lim & DESC_32BIT) != 0;
     if (opcode == 0xCDU && vm->dpmi.active) {
         uint8_t int_num;
-        if (!dos_native_fetch_code_byte(vm, &code, rip + cursor, &int_num))
+        if (!dos_native_fetch_code_byte(vm, &code, rip, cursor, &int_num))
             goto done;
         uint16_t fault_selector = (uint16_t)frame->error_code;
         if (!(fault_selector & 0x02u) ||
@@ -1543,7 +1946,7 @@ int dos_native_handle_privileged_fault(x86_interrupt_frame_t *frame)
 
         uint32_t return_eip = rip + cursor + 1u;
         if (!default32) return_eip = (uint16_t)return_eip;
-        if (!cpu_deliver_pm_software_interrupt(vm, int_num, return_eip, rip))
+        if (!dpmi_deliver_software_interrupt(vm, int_num, return_eip, rip, false, true))
             goto done;
 
         if (!cpu->running) goto done;
@@ -1562,12 +1965,7 @@ int dos_native_handle_privileged_fault(x86_interrupt_frame_t *frame)
     }
 
     if ((opcode == 0xFAU || opcode == 0xFBU) && vm->dpmi.active) {
-        vm->dpmi.virtual_interrupts_enabled = opcode == 0xFBU;
-        frame->rflags = (frame->rflags | FLAGS_FIXED | FLAG_IF) &
-                        ~(uint64_t)FLAG_IOPL_MASK;
-        frame->rip = default32 ? (uint32_t)(rip + cursor)
-                               : (uint16_t)(rip + cursor);
-        handled = 1;
+        handled = dos_native_step_data(vm, frame, &code);
         goto done;
     }
 
@@ -1600,7 +1998,7 @@ int dos_native_handle_privileged_fault(x86_interrupt_frame_t *frame)
     uint16_t port = (uint16_t)frame->rdx;
     if (immediate) {
         uint8_t immediate_port;
-        if (!dos_native_fetch_code_byte(vm, &code, rip + cursor,
+        if (!dos_native_fetch_code_byte(vm, &code, rip, cursor,
                                         &immediate_port))
             goto done;
         port = immediate_port;
@@ -1627,6 +2025,14 @@ int dos_native_handle_privileged_fault(x86_interrupt_frame_t *frame)
 
     frame->rip = default32 ? (uint32_t)(rip + cursor)
                            : (uint16_t)(rip + cursor);
+    frame->rflags &= ~FLAG_RF;
+    if (frame->rflags & FLAG_TF) {
+        cpu8086_state_t *cpu = dos_native_import_frame(vm, frame, &code);
+        cpu->dr[6] |= 1u << 14;
+        if (!cpu_deliver_exception(vm, 1, cpu->eip, 0x8000u, false)) goto done;
+        dos_native_sync_ldt(vm);
+        dos_native_export_frame(cpu, frame);
+    }
     handled = 1;
 
 done:
@@ -1666,7 +2072,7 @@ bool dos_native_handle_memory_fault(x86_interrupt_frame_t *frame,
     unsigned cursor;
     for (cursor = 0; cursor < 15u; cursor++) {
         if (!dos_native_fetch_code_byte(vm, &code,
-                                        (uint32_t)frame->rip + cursor,
+                                        (uint32_t)frame->rip, cursor,
                                         &opcode))
             goto done;
         if (opcode != 0x26 && opcode != 0x2E && opcode != 0x36 &&
@@ -1677,14 +2083,14 @@ bool dos_native_handle_memory_fault(x86_interrupt_frame_t *frame,
     }
     if (cursor == 15u) goto done;
 
-    /* These integer memory operations have matching 16/32-bit interpreter
-     * semantics and preserve segment registers. Do not pretend that x87,
-     * vector memory operations or control transfers are supported here. */
+    /* Integer and x87 data accesses use the checked interpreter. The ISR
+     * bridge imports/exports x87 state around mediation; vector memory
+     * operations and control transfers still require their own contracts. */
     bool supported = (opcode <= 0x3Bu && (opcode & 7u) <= 3u) ||
         (opcode >= 0x80 && opcode <= 0x8B) ||
         (opcode >= 0xA0 && opcode <= 0xA7) ||
         (opcode >= 0xAA && opcode <= 0xAF) ||
-        opcode == 0xC6 || opcode == 0xC7;
+        opcode == 0xC6 || opcode == 0xC7 || (opcode >= 0xD8 && opcode <= 0xDF);
     if (!supported) {
         serial_puts("[DOS/VGA] unsupported native memory opcode ");
         serial_puthex(opcode, 2);
@@ -1881,7 +2287,8 @@ void dos_native_dump_rip(uint16_t cs, uint32_t rip, uint16_t ss_hint,
         __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
 }
 
-void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
+void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs,
+                             void *fp_image)
 {
 #ifdef COMPAT_TRACE
     /* Panorama probe: mirrors the [int2e] probe for DOS native INT path.
@@ -1917,8 +2324,17 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
     }
 
     dos_vm_t *vm = g_native_dos_vm;
+    /* Keep the register file outside IST2: raw switches and EXEC can abandon
+     * this frame. Each native entry still has its own temporary image. */
+    if (fp_image && vm->native_fp) {
+        dos_fpu_capture_native(vm, fp_image);
+    }
     cpu8086_state_t *cpu = &g_native_cpu;
     vm->cpu = cpu;
+
+    /* A native entry has retired the previously mediated instruction. */
+    cpu->irq_shadow = 0;
+    cpu->rep_compare.active = false;
 
     /* Copy native registers → emulated CPU state for DOS handlers */
     cpu->eax = (uint32_t)regs->rax;
@@ -1968,7 +2384,7 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
                                   host_exception_return || host_interrupt_return ||
                                   host_callback_return;
     if (int_num <= 0xFFu && !host_private_interrupt &&
-        dpmi_deliver_software_interrupt(vm, (uint8_t)int_num, cpu->eip, cpu->eip, true)) {
+        dpmi_deliver_software_interrupt(vm, (uint8_t)int_num, cpu->eip, cpu->eip, true, false)) {
         rewrite_iret = true;
         software_redirected = true;
         if (cpu->running) dos_native_sync_ldt(vm);
@@ -2003,7 +2419,7 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
             cpu->exit_code = -1;
         }
     } else if (host_raw_switch) {
-        if (!dpmi_raw_mode_switch(vm, 0) || cpu->protected_mode ||
+        if (dpmi_raw_mode_switch(vm, 0) != DPMI_SERVICE_COMPLETE || cpu->protected_mode ||
             !g_native_interpreter_cpu) {
             serial_puts("[DOS-NT] PM->RM switch failed\n");
             cpu->running = false;
@@ -2019,7 +2435,15 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
          * be confused with software INT services. Preserve the processor's
          * return RIP in the DPMI frame; the client handler may adjust it. */
         rewrite_iret = true;
-        (void)cpu_deliver_exception(vm, 1, cpu->eip, 0, false);
+        uint64_t dr6;
+        __asm__ volatile ("mov %%dr6, %0" : "=r"(dr6));
+        cpu->dr[6] = (uint32_t)dr6;
+        /* BS is sticky; consume it so a later ICEBP is not reported as TF.
+         * POPF can clear TF in the very instruction that caused this #DB. */
+        uint64_t consumed = dr6 & ~(1ull << 14);
+        __asm__ volatile ("mov %0, %%dr6" :: "r"(consumed) : "memory");
+        (void)cpu_deliver_exception(vm, 1, cpu->eip,
+                                      (dr6 & (1u << 14)) ? 0x8000u : 0u, false);
         if (cpu->running)
             dos_native_sync_ldt(vm);
     } else if (host_interrupt_return) {
@@ -2158,6 +2582,11 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
         serial_puts("[DOS32] No shell recovery context; halting\n");
         __asm__ volatile ("cli");
         for (;;) __asm__ volatile ("hlt");
+    }
+
+    if (fp_image && vm->native_fp) {
+        memcpy(fp_image, vm->native_fp->image, DOS_NATIVE_FP_BYTES);
+        dos_native_fp_return(vm, fp_image);
     }
 
     /* Restore DOS CR3 before returning to ring-3 DOS code. */
@@ -2419,7 +2848,8 @@ static int dos_dpmi_extended_exception_selftest(dos_vm_t *vm, cpu8086_state_t *c
         uint32_t address = 0x20000u + top - (scenario == 22u ? 0u : DPMI_EXCEPTION_EXT_FRAME_SIZE);
         for (unsigned i = 0; i < DPMI_EXCEPTION_EXT_FRAME_SIZE; i++)
             vm->mem[address + i] = 0xA5;
-        bool delivered = dpmi_deliver_exception(vm, vector, original.eip, 0x123);
+        bool delivered = dpmi_deliver_exception(vm, vector, original.eip,
+                                                  scenario == 17u ? 0x8000u : 0x123u);
         EXT_CHECK(delivered == (scenario != 22u));
         if (!delivered) {
             EXT_CHECK(cpu->ss == original.ss && cpu->esp == original.esp &&
@@ -2442,7 +2872,8 @@ static int dos_dpmi_extended_exception_selftest(dos_vm_t *vm, cpu8086_state_t *c
         EXT_CHECK(dos_mem_read32(vm, address + 0x28u) == (scenario == 17u ? 0x8000u : 0x123u) &&
                   dos_mem_read32(vm, address + 0x2Cu) == original.eip &&
                   dos_mem_read32(vm, address + 0x30u) == (code | (host ? 0x10000u : 0u)));
-        EXT_CHECK(dos_mem_read32(vm, address + 0x34u) == original.eflags &&
+        uint32_t exception_flags = original.eflags | (vector == 1u ? 0u : FLAG_RF);
+        EXT_CHECK(dos_mem_read32(vm, address + 0x34u) == exception_flags &&
                   dos_mem_read32(vm, address + 0x38u) == original.esp &&
                   dos_mem_read32(vm, address + 0x3Cu) == stack);
         EXT_CHECK(dos_mem_read32(vm, address + 0x40u) == data &&
@@ -2544,8 +2975,9 @@ static int dos_dpmi_extended_exception_selftest(dos_vm_t *vm, cpu8086_state_t *c
         }
         EXT_CHECK(returned == valid);
         if (valid) {
+            uint32_t expected_flags = old_return && !use32 ? (uint16_t)exception_flags : exception_flags;
             EXT_CHECK(cpu->ss == stack && cpu->esp == expected_esp && cpu->cs == code &&
-                      cpu->eip == expected_eip && cpu->eflags == original.eflags);
+                      cpu->eip == expected_eip && cpu->eflags == expected_flags);
             EXT_CHECK(cpu->es == expected_es && cpu->ds == data && cpu->fs == expected_fs && !cpu->gs);
             EXT_CHECK(!vm->dpmi.exception_depth && !vm->dpmi.exception_context[0].extended &&
                       !vm->dpmi.exception_esp_high[0] && vm->dpmi.callback_depth == 1);
@@ -2656,9 +3088,10 @@ static int dos_dpmi_real_exception_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         REAL_CHECK(cpu->protected_mode && !cpu->ds && !cpu->es && !cpu->fs && !cpu->gs &&
                    !(cpu->eflags & FLAG_VM) && cpu->ss == stack && cpu->cs == code &&
                    cpu_stack_offset(cpu) == 0x9000u - DPMI_EXCEPTION_EXT_FRAME_SIZE);
+        uint32_t exception_flags = real.cpu.eflags | (vector == 3u ? 0u : FLAG_RF);
         REAL_CHECK(dos_mem_read32(vm, address + 0x2Cu) == real.cpu.eip &&
                    dos_mem_read32(vm, address + 0x30u) == (real.cpu.cs | (host_fault ? 0x10000u : 0u)) &&
-                   dos_mem_read32(vm, address + 0x34u) == (real.cpu.eflags | FLAG_VM) &&
+                   dos_mem_read32(vm, address + 0x34u) == (exception_flags | FLAG_VM) &&
                    dos_mem_read32(vm, address + 0x38u) == real.cpu.esp);
         REAL_CHECK(dos_mem_read32(vm, address + 0x3Cu) == real.cpu.ss &&
                    dos_mem_read32(vm, address + 0x40u) == real.cpu.es &&
@@ -2752,7 +3185,7 @@ static int dos_dpmi_real_exception_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
                 REAL_CHECK(!cpu->protected_mode && cpu->cs == real.cpu.cs && cpu->eip == wanted_eip &&
                            cpu->ss == real.cpu.ss && cpu->esp == wanted_esp && cpu->eax == 0x24681357);
                 REAL_CHECK(cpu->cr0 == real.cpu.cr0 && cpu->cr3 == real.cpu.cr3 &&
-                           cpu->eflags == real.cpu.eflags && cpu->ds == (scenario == 1u ? 0x6600 : real.cpu.ds) &&
+                           cpu->eflags == exception_flags && cpu->ds == (scenario == 1u ? 0x6600 : real.cpu.ds) &&
                            dpmi_desc_get_limit(&cpu->ds_cache.descriptor) == 0x1FFFF);
             }
             REAL_CHECK(vm->dpmi.real_mode_stack.ss == real.real_stack.ss &&
@@ -2831,7 +3264,7 @@ static int dos_dpmi_locked_stack_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         cpu->eip = DPMI_EXCEPTION_RETURN_OFF + 2u;
         if (!dpmi_exception_return_native(vm) || cpu->ss != repair_sel ||
             cpu->esp != 0x800 || cpu->eip != 0x1234 || cpu->cs != code_sel ||
-            cpu->eflags != (FLAGS_FIXED | FLAG_IF | FLAG_DF) ||
+            cpu->eflags != (FLAGS_FIXED | FLAG_IF | FLAG_DF | (use32 ? FLAG_RF : 0)) ||
             vm->dpmi.exception_depth) ok = false;
         if (!ok) failures++;
         checks++;
@@ -3009,6 +3442,9 @@ static int dos_dpmi_paged_frame_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         cpu->cr0 = DOS_CR0_PG | DOS_CR0_WP | 1u;
         cpu->cr3 = 0x10000;
         cpu8086_state_t before = *cpu;
+        uint32_t exception_flags = before.eflags | FLAG_RF;
+        uint32_t returned_flags = irq ? before.eflags :
+            use32 || extended ? exception_flags : (uint16_t)exception_flags;
         bool allowed = policy == 0 || policy == 11 || policy == 12;
         bool delivered = irq ? dpmi_deliver_locked_interrupt(vm, code_sel, 0x2000, 0x1234, true)
                              : dpmi_deliver_exception(vm, 13, 0x1234, 0x123);
@@ -3022,7 +3458,7 @@ static int dos_dpmi_paged_frame_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
                 cpu_stack_addr32(cpu) != (stack32 != 0)) ok = false;
             const uint32_t fields[] = { irq ? DPMI_INTERRUPT_RETURN_OFF : DPMI_EXCEPTION_RETURN_OFF,
                 host, irq ? before.eflags : 0x123, 0x1234, code_sel,
-                before.eflags, original_sp, stack_sel };
+                exception_flags, original_sp, stack_sel };
             uint8_t expected[DPMI_EXCEPTION_EXT_FRAME_SIZE] = {0};
             for (unsigned i = 0; i < (irq ? 3u : 8u) * width; i++)
                 expected[i] = fields[i / width] >> (8u * (i % width));
@@ -3030,7 +3466,7 @@ static int dos_dpmi_paged_frame_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
                 const uint32_t extra[] = {
                     DPMI_EXCEPTION_EXT_RETURN_OFF | (use32 ? 0u : (uint32_t)host << 16),
                     use32 ? host : 0, 0x123, 0x1234, code_sel,
-                    before.eflags, original_sp, stack_sel, 0, 0, 0, 0, 0, 0
+                    exception_flags, original_sp, stack_sel, 0, 0, 0, 0, 0, 0
                 };
                 for (unsigned i = 0; i < 56; i++)
                     expected[32u + i] = extra[i / 4u] >> (8u * (i % 4u));
@@ -3094,7 +3530,7 @@ static int dos_dpmi_paged_frame_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
                     dos_mem_read32(vm, pte1) != 0x40005 || dos_mem_read32(vm, pte2) != 0x60004)
                     ok = false;
             } else if (cpu->ss != stack_sel || cpu->esp != original_sp ||
-                       cpu->cs != code_sel || cpu->eip != 0x1234 || cpu->eflags != before.eflags ||
+                       cpu->cs != code_sel || cpu->eip != 0x1234 || cpu->eflags != returned_flags ||
                        vm->dpmi.exception_depth != 1 || vm->dpmi.interrupt_depth ||
                        !vm->dpmi.virtual_interrupts_enabled ||
                        dos_mem_read32(vm, pte2) != 0x60025 ||
@@ -3387,7 +3823,7 @@ static int dos_dpmi_software_frame_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         for (unsigned i = 0; i < 16; i++) vm->mem[0x48FF0 + i] = 0xA5;
         unsigned width = use32 ? 4u : 2u;
         uint32_t original_sp = cpu->esp;
-        bool ok = completed ? dpmi_deliver_software_interrupt(vm, 0x60, 0x1005, 0x1005, true)
+        bool ok = completed ? dpmi_deliver_software_interrupt(vm, 0x60, 0x1005, 0x1005, true, false)
                             : cpu8086_run_one(vm);
         ok &= vm->dpmi.exception_depth == 1 && cpu->eip == 0x3000 && cpu->ebx == 0 &&
               vm->dpmi.exception_software_entries[0].active == (completed != 0);
@@ -3665,11 +4101,15 @@ static int dos_dpmi_default_exception_selftest(dos_vm_t *vm,
             (void)dos_test_run_one(vm);
             if (!vm->dpmi.exception_depth) break;
         }
+        /* Real-mode reflection changes only the low FLAGS word. The USE32
+         * exception frame retains its fault RF until the protected return. */
+        uint32_t returned_flags = flags |
+            (use32 && (vector == 0 || vector == 5 || vector == 7) ? FLAG_RF : 0);
         if (fatal ? (cpu->running || cpu->exit_code != -1 || vm->mem[0x7100])
                   : (!cpu->running || vm->dpmi.exception_depth ||
                      cpu->eip != 0x2000 || cpu->cs != code_sel ||
                      cpu->esp != old_sp || cpu->ss != stack_sel ||
-                     cpu->eflags != flags || vm->mem[0x7100] != 1))
+                     cpu->eflags != returned_flags || vm->mem[0x7100] != 1))
             ok = false;
         if (cpu->eax != 0xA1A11234u || cpu->ebx != 0xB2B22345u ||
             cpu->ecx != 0xC3C33456u || cpu->edx != 0xD4D44567u ||
@@ -4750,7 +5190,8 @@ static int dos_group5_instruction_selftest(dos_vm_t *vm,
             if (cpu->eip != 0x3000u || cpu->cs != old_cs) ok = false;
             if (mode) {
                 if (vm->dpmi.exception_depth != 1 || fields[2] || fields[3] != 0x1000u ||
-                    fields[4] != old_cs || (fields[5] & ~FLAG_IOPL_MASK) != flags ||
+                    fields[4] != old_cs || (fields[5] & ~FLAG_IOPL_MASK) !=
+                        (flags | (mode == 2 ? FLAG_RF : 0)) ||
                     fields[6] != (mode == 2 ? old_esp : (uint16_t)old_esp) ||
                     fields[7] != old_ss || vm->dpmi.exception_esp_high[0] != (old_esp & 0xFFFF0000u))
                     ok = false;
@@ -7216,6 +7657,8 @@ static int dos_string_memory_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
                 uint32_t right = left ^ ((repeat == 2 ? done - 1u != stop : done - 1u == stop) ? 1u : 0);
                 expected.eflags = dos_string_compare_flags(width, original.eflags, left, right);
             }
+            expected.eflags = (expected.eflags & ~FLAG_RF) |
+                              (done < target ? FLAG_RF : 0);
             if (!dos_test_general_registers(cpu, &expected) || cpu->esp != original.esp ||
                 cpu->eflags != expected.eflags || cpu->eip != (done < target ? 0x1000u : next) ||
                 cpu->rep_compare.active != (compare && done < target) ||
@@ -7336,7 +7779,7 @@ static int dos_string_paging_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
                 ok = false;
             uint32_t frame = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
             uint32_t saved_flags = mode == 2 ? dos_mem_read32(vm, frame + 20u) : dos_mem_read16(vm, frame + 10u);
-            if (saved_flags != (mode == 2 ? original.eflags : (uint16_t)original.eflags)) ok = false;
+            if (saved_flags != (mode == 2 ? original.eflags | FLAG_RF : (uint16_t)original.eflags)) ok = false;
             faults++;
         } else if (!dos_test_general_registers(cpu, &expected) || cpu->esp != original.esp ||
                    cpu->eflags != expected.eflags || cpu->eip != next ||
@@ -8196,7 +8639,7 @@ static int dos_checked_stack_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
             uint32_t frame = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
             uint32_t saved_flags = mode == 2 ? dos_mem_read32(vm, frame + 20u)
                                                : dos_mem_read16(vm, frame + 10u);
-            if (saved_flags != (mode == 2 ? original.eflags : (uint16_t)original.eflags)) ok = false;
+            if (saved_flags != (mode == 2 ? original.eflags | FLAG_RF : (uint16_t)original.eflags)) ok = false;
             faults++;
         } else if (!dos_stack_test_result(vm, &expected, next, external, width)) ok = false;
         for (unsigned i = 0; i < 8192; i++)
@@ -9463,6 +9906,7 @@ static int dos_native_segments_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
             vm->timer_irq_pending = true;
         }
         bool admitted = gate ? dos_native_admit_gate_return(vm) : dos_native_prepare_return(vm);
+        uint32_t returned_flags = before.eflags | (mode == 2 ? FLAG_RF : 0);
         bool ok = !vm->step_limit_reached && !vm->dpmi.host_wait &&
             vm->native_dispatch_depth == (gate ? 0u : dispatch_depth);
         if (gate && !stop) {
@@ -9479,7 +9923,7 @@ static int dos_native_segments_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
             ok &= admitted && cpu->running && !cpu->halted &&
                 !vm->dpmi.exception_depth && cpu->cs == before.cs &&
                 cpu->ss == before.ss && cpu->esp == before.esp && cpu->eip == before.eip &&
-                cpu->eflags == before.eflags && dos_test_general_registers(cpu, &before);
+                cpu->eflags == returned_flags && dos_test_general_registers(cpu, &before);
             if (ok) recoveries++;
         }
         if (!ok) {
@@ -9491,7 +9935,7 @@ static int dos_native_segments_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
             serial_puts(" admitted="); serial_putdec(admitted);
             serial_puts(" depth="); serial_putdec(vm->native_dispatch_depth);
             serial_puts(" flags="); serial_puthex(cpu->eflags, 8);
-            serial_puts(" expected="); serial_puthex(before.eflags, 8);
+            serial_puts(" expected="); serial_puthex(returned_flags, 8);
             serial_puts(" esp="); serial_puthex(cpu->esp, 8);
             serial_puts(" ip="); serial_puthex(cpu->eip, 8);
             serial_puts(" gpr="); serial_putdec(dos_test_general_registers(cpu, &before));
@@ -12070,7 +12514,7 @@ static int dos_iret_flags_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         if (!mode || !cpl) mask |= FLAG_IOPL_MASK;
         if (mode && !cpl) mask |= FLAG_VIF | FLAG_VIP;
         if (width == 2) mask &= 0xFFFFu;
-        expected.eflags = ((expected.eflags & ~mask) | (incoming & mask)) | FLAGS_FIXED;
+        expected.eflags = ((expected.eflags & ~(mask | FLAG_RF)) | (incoming & mask)) | FLAGS_FIXED;
         expected.cs = selector;
         expected.esp += width * 3u;
         bool ok = cpu8086_run_one(vm) && dos_segment_test_result(vm, &expected, 0x1800, 0) &&
@@ -12342,7 +12786,7 @@ static int dos_iret_v86_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         const uint32_t back[] = { 0x2468, 0x1357, FLAG_CF | FLAG_DF };
         dos_iret_test_frame(vm, ((uint32_t)cpu->ss << 4) + cpu->sp, width, back, 3);
         uint32_t expected_flags = FLAGS_FIXED | FLAG_VM | FLAG_IOPL_MASK | FLAG_VIF | FLAG_VIP |
-            FLAG_CF | FLAG_DF | (width == 2 ? FLAG_RF | FLAG_AC | FLAG_ID : 0);
+            FLAG_CF | FLAG_DF | (width == 2 ? FLAG_AC | FLAG_ID : 0);
         if (!cpu8086_run_one(vm) || cpu->cs != 0x1357 || cpu->eip != 0x2468 ||
             cpu->esp != 0xCAFE9000u + 3u * width || cpu->eflags != expected_flags ||
             cpu->protected_mode || cpu8086_cpl(cpu) != 3 || cpu->cpl != 3) ok = false;
@@ -12957,8 +13401,13 @@ static int dos_task_debug_cache_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
     int failures = 0;
     for (unsigned wide = 0; wide < 2; wide++)
     for (unsigned source = 0; source < 6; source++)
-    for (unsigned scenario = 0; scenario < 6; scenario++) {
+    for (unsigned scenario = 0; scenario < 8; scenario++) {
         cpu8086_state_t next = dos_task_test_prepare(vm, cpu, wide, wide, true, true, 3, 3);
+        if (scenario >= 6) {
+            cpu->eflags |= FLAG_TF;
+            if (scenario == 6) next.eflags |= FLAG_TF;
+            dos_task_test_image(vm, 0x5000, wide, &next);
+        }
         if (scenario == 0) dos_mem_write16(vm, 0x5064, 1); /* No trap field in a 16-bit TSS. */
         if (scenario == 1) {
             /* The loaded TR survives editing both the live base and type. */
@@ -13010,6 +13459,16 @@ static int dos_task_debug_cache_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         if (trap && (dos_mem_read32(vm, 0x77FF4 - pushed) != next.eip || dos_mem_read32(vm, 0x77FF8 - pushed) != next.cs ||
             dos_mem_read32(vm, 0x77FFC - pushed) != flags)) ok = false;
         if (scenario == 5 && (cpu->es_cache.valid || cpu->ds_cache.valid || cpu->fs_cache.valid || cpu->gs_cache.valid)) ok = false;
+        if (scenario >= 6 && ok) {
+            uint32_t ip = cpu->eip, sp = cpu->esp;
+            vm->mem[dpmi_desc_get_base(&cpu->cs_cache.descriptor) + ip] = 0x90;
+            ok &= cpu8086_run_one(vm);
+            if (scenario == 6) ok &= cpu->cs == 43 && cpu->eip == 0x4010 &&
+                cpu->esp == sp - 12u && (cpu->dr[6] & 0x4000u) &&
+                dos_mem_read32(vm, dpmi_desc_get_base(&cpu->ss_cache.descriptor) +
+                                     cpu_stack_offset(cpu)) == ip + 1u;
+            else ok &= cpu->cs == next.cs && cpu->eip == ip + 1u && cpu->esp == sp;
+        }
         if (!ok || cpu->delivery_fault) {
             if (failures < 8) { serial_puts("[DOS-TASK-DEBUG-CACHE] case="); serial_putdec(checks);
                 serial_puts(" IP="); serial_puthex(cpu->eip, 8); serial_puts("\n"); }
@@ -13217,7 +13676,7 @@ static int dos_idt_gate_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
             cpu->eflags != live_flags || cpu->op_size_32 != !wide || cpu->delivery_fault ||
             !dos_test_general_registers(cpu, &before) || dos_idt_test_read(vm, at, width) != 0x1002 ||
             dos_idt_test_read(vm, at + width, width) != before.cs ||
-            dos_idt_test_read(vm, at + 2u * width, width) != (before.eflags & field_mask) ||
+            dos_idt_test_read(vm, at + 2u * width, width) != (before.eflags & ~FLAG_RF & field_mask) ||
             (inward && (dos_idt_test_read(vm, at + 3u * width, width) != (before.esp & field_mask) ||
                          dos_idt_test_read(vm, at + 4u * width, width) != before.ss))) ok = false;
         code.access |= DESC_ACCESSED;
@@ -13851,6 +14310,1628 @@ static uint32_t dos_flags_test_pop(uint32_t old, uint32_t value, unsigned width,
     return result & ~FLAG_RF;
 }
 
+/* Compare the architectural state at the boundary, before handler execution. */
+static bool dos_trace_test_frame(dos_vm_t *vm, const cpu8086_state_t *retired,
+                                   unsigned vector, bool stepped)
+{
+    const cpu8086_state_t *cpu = vm->cpu;
+    bool v86 = (retired->cr0 & 1u) && (retired->eflags & FLAG_VM);
+    bool real = !retired->protected_mode && !v86;
+    unsigned width = real ? 2u : 4u, count = v86 ? 9u : 3u;
+    unsigned cpl = v86 ? 0u : cpu8086_cpl(retired);
+    uint32_t sp = (v86 ? 0x9000u : retired->esp) - width * count;
+    if (real || (!v86 && !cpu_stack_addr32(retired)))
+        sp = (retired->esp & 0xFFFF0000u) | (uint16_t)sp;
+    uint32_t base = v86 ? 0x50000u : dpmi_desc_get_base(&retired->ss_cache.descriptor);
+    uint32_t at = base + (real || (!v86 && !cpu_stack_addr32(retired)) ? (uint16_t)sp : sp);
+    bool ok = cpu->running && !cpu->delivery_fault && !vm->dpmi.exception_depth &&
+        cpu->eip == 0x4000u + vector * 16u && cpu->cs == (real ? 0u : 40u | cpl) &&
+        cpu->ss == (v86 ? 48u : retired->ss) && cpu->esp == sp &&
+        !(cpu->eflags & FLAG_TF) && !cpu->irq_shadow && !cpu->rep_compare.active &&
+        dos_test_general_registers(cpu, retired);
+    const uint32_t fields[] = { retired->eip, retired->cs, retired->eflags,
+        retired->esp, retired->ss, retired->es, retired->ds, retired->fs, retired->gs };
+    for (unsigned i = 0; i < count; i++)
+        ok &= dos_idt_test_read(vm, at + i * width, width) ==
+            (fields[i] & (real ? 0xFFFFu : UINT32_MAX));
+    if (vector == 1) ok &= !(cpu->dr[7] & 0x2000u);
+    if (stepped) ok &= (cpu->dr[6] & 0x4000u) != 0;
+    else ok &= cpu->dr[6] == retired->dr[6];
+    return ok;
+}
+
+static int dos_trace_retirement_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    unsigned checks = 0, faults = 0, iterations = 0;
+    int failures = 0;
+    for (unsigned mode = 0; mode < 4; mode++)
+    for (unsigned stack32 = 0; stack32 < ((mode == 1 || mode == 2) ? 2u : 1u); stack32++)
+    for (unsigned scenario = 0; scenario < 15; scenario++) {
+        bool ok = dos_flags_test_prepare(vm, cpu, mode, stack32, 3);
+        if (!mode) for (unsigned v = 0; v < 32; v++)
+            dos_mem_write32(vm, v * 4u, 0x4000u + v * 16u);
+        cpu->eflags = FLAGS_FIXED | FLAG_IOPL_MASK | FLAG_TF | FLAG_CF |
+                     (mode == 3 ? FLAG_VM : 0);
+        cpu->dr[7] |= 0x2000u;
+        uint32_t p = 0x1000;
+        unsigned vector = 1;
+        if (scenario == 0) vm->mem[p++] = 0x90;
+        if (scenario == 1 || scenario == 2) {
+            if (!cpu->op_size_32) vm->mem[p++] = 0x66;
+            vm->mem[p++] = 0x9D;
+            uint32_t flags = scenario == 1 ? cpu->eflags : cpu->eflags & ~FLAG_TF;
+            dos_mem_write32(vm, 0x29000, flags);
+            if (scenario == 1) cpu->eflags &= ~FLAG_TF;
+        }
+        if (scenario == 3) {
+            vm->mem[p++] = 0x8E; vm->mem[p++] = 0xD0;
+            cpu->ax = cpu->ss;
+        }
+        if (scenario == 4) {
+            vm->mem[p++] = 0x17;
+            dos_mem_write32(vm, 0x29000, cpu->ss);
+        }
+        if (scenario == 5 || scenario == 6) vm->mem[p++] = scenario == 5 ? 0xFB : 0xFA;
+        if (scenario == 7 || scenario == 8) {
+            vm->mem[p++] = 0xCE;
+            if (scenario == 8) { cpu->eflags |= FLAG_OF; vector = 4; }
+        }
+        if (scenario == 9) { vm->mem[p++] = 0xCC; vector = 3; }
+        if (scenario == 10) vm->mem[p++] = 0xF1;
+        if (scenario == 11) { vm->mem[p++] = 0x0F; vm->mem[p++] = 0x0B; vector = 6; }
+        if (scenario == 12) { vm->mem[p++] = 0xF0; vm->mem[p++] = 0x90; vector = 6; }
+        if (scenario == 13 || scenario == 14) {
+            vm->mem[p++] = 0xCF;
+            const uint32_t frame[] = { 0x1080, cpu->cs,
+                scenario == 13 ? cpu->eflags & ~FLAG_TF : cpu->eflags };
+            dos_iret_test_frame(vm, 0x29000, cpu->op_size_32 ? 4u : 2u, frame, 3);
+        }
+        vm->mem[p] = 0x90;
+        cpu8086_state_t expected = *cpu;
+        expected.eip = vector == 6 ? 0x1000u : p;
+        if (scenario == 1 || scenario == 2) {
+            expected.eflags = dos_mem_read32(vm, 0x29000);
+            expected.esp += 4;
+        }
+        if (scenario == 4) expected.esp += cpu->op_size_32 ? 4u : 2u;
+        if (scenario == 5) expected.eflags |= FLAG_IF;
+        if (scenario == 13 || scenario == 14) {
+            expected.eip = 0x1080;
+            expected.esp += 3u * (cpu->op_size_32 ? 4u : 2u);
+            if (scenario == 13) expected.eflags &= ~FLAG_TF;
+        }
+        ok &= cpu8086_run_one(vm);
+        if (scenario == 1 || scenario == 3 || scenario == 4) {
+            ok &= cpu->eip == p && cpu->esp == expected.esp &&
+                  cpu->dr[6] == expected.dr[6] && (cpu->eflags & FLAG_TF);
+            ok &= cpu8086_run_one(vm);
+            expected.eip++;
+        }
+        if (vector == 6) { if (mode) expected.eflags |= FLAG_RF; faults++; }
+        ok &= dos_trace_test_frame(vm, &expected, vector, vector == 1 && scenario != 10);
+        if (!ok) {
+            serial_puts("[DOS-TRACE-RETIRE] case="); serial_putdec(checks);
+            serial_puts(" ip="); serial_puthex(cpu->eip, 8);
+            serial_puts(" sp="); serial_puthex(cpu->esp, 8); serial_puts("\n");
+            failures++;
+        }
+        checks++;
+    }
+
+    const uint8_t strings[] = { 0xA4, 0xA6, 0x6C, 0x6E };
+    const unsigned counts[] = { 0, 1, 3, 257 };
+    for (unsigned mode = 0; mode < 4; mode++)
+    for (unsigned adr32 = 0; adr32 < 2; adr32++)
+    for (unsigned backwards = 0; backwards < 2; backwards++)
+    for (unsigned op = 0; op < sizeof(strings); op++)
+    for (unsigned n = 0; n < sizeof(counts) / sizeof(counts[0]); n++) {
+        bool ok = dos_flags_test_prepare(vm, cpu, mode, mode == 2, 3);
+        if (!mode) dos_mem_write32(vm, 4, 0x4010);
+        if (!mode || mode == 3) {
+            cpu8086_load_real_segment(cpu, 3, 0);
+            cpu8086_load_real_segment(cpu, 0, 0);
+        }
+        cpu->eflags = FLAGS_FIXED | FLAG_IOPL_MASK | FLAG_TF | FLAG_CF |
+                      (backwards ? FLAG_DF : 0) | (mode == 3 ? FLAG_VM : 0);
+        cpu->edx = op == 2 ? 0x21 : 0x80;
+        cpu->esi = (adr32 ? 0u : 0xABCD0000u) | 0x6000u;
+        cpu->edi = (adr32 ? 0u : 0xBCDE0000u) | 0x6800u;
+        cpu->ecx = (adr32 ? 0u : 0xCDEF0000u) | counts[n];
+        uint32_t base = mode == 1 || mode == 2 ? 0x20000u : 0;
+        for (unsigned i = 0x5E00; i < 0x6A00; i++) vm->mem[base + i] = 0xA5;
+        uint32_t end = 0x1000;
+        if (adr32 != cpu->addr_size_32) vm->mem[end++] = 0x67;
+        vm->mem[end++] = 0xF3; vm->mem[end++] = strings[op];
+        unsigned steps = counts[n] ? counts[n] : 1;
+        for (unsigned i = 0; i < steps && ok; i++) {
+            cpu8086_state_t expected = *cpu;
+            expected.eflags &= ~FLAG_RF;
+            if (counts[n]) {
+                if (adr32) expected.ecx--; else expected.cx--;
+                int delta = backwards ? -1 : 1;
+                if (op != 2) { if (adr32) expected.esi += delta; else expected.si += delta; }
+                if (op != 3) { if (adr32) expected.edi += delta; else expected.di += delta; }
+                if (op == 1) expected.eflags = (expected.eflags &
+                    ~(FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF)) | FLAG_ZF | FLAG_PF;
+            }
+            expected.eip = i + 1u < steps ? 0x1000u : end;
+            if (mode && i + 1u < steps) expected.eflags |= FLAG_RF;
+            ok &= cpu8086_run_one(vm) && dos_trace_test_frame(vm, &expected, 1, true);
+            uint32_t handler = dpmi_desc_get_base(&cpu->cs_cache.descriptor) + cpu->eip;
+            vm->mem[handler] = 0xCF;
+            /* Returning to TF=1 must not itself produce another debug trap. */
+            ok &= cpu8086_run_one(vm) && cpu->cs == expected.cs &&
+                  cpu->eip == expected.eip && cpu->esp == expected.esp &&
+                  cpu->eflags == expected.eflags && dos_test_general_registers(cpu, &expected);
+            iterations++;
+            /* The diagnostic budget is per case, not a limit on REP counts. */
+            vm->step_count = 0;
+        }
+        if (!ok) {
+            serial_puts("[DOS-TRACE-REP] case="); serial_putdec(checks);
+            serial_puts(" ip="); serial_puthex(cpu->eip, 8); serial_puts("\n");
+            failures++;
+        }
+        checks++;
+    }
+    unsigned pages = (sizeof(jit_state_t) + 4095u) / 4096u;
+    jit_state_t *jit = dos_host_alloc_pages(pages);
+    if (jit) {
+        jit_init(jit);
+        for (unsigned mode = 0; mode < 4; mode++) {
+            bool ok = dos_flags_test_prepare(vm, cpu, mode, mode == 2, 3);
+            if (!mode) dos_mem_write32(vm, 4, 0x4010);
+            cpu->eflags = FLAGS_FIXED | FLAG_IOPL_MASK | (mode == 3 ? FLAG_VM : 0);
+            vm->step_limit = 0;
+            vm->jit = jit;
+            vm->mem[0x1000] = 0x90; vm->mem[0x1001] = 0xEB; vm->mem[0x1002] = 0x0D;
+            cpu8086_state_t before = *cpu;
+            jit->hit_count[0x1000] = JIT_HOT_THRESHOLD;
+            uint64_t translated = jit->jit_instructions;
+            ok &= cpu8086_run_until(vm, cpu->protected_mode, cpu->cs, 0x1010) &&
+                  jit->jit_instructions == translated + 2u;
+            translated = jit->jit_instructions;
+            *cpu = before;
+            cpu->eflags |= FLAG_TF;
+            cpu8086_state_t retired = *cpu;
+            retired.eip++;
+            ok &= cpu8086_run_until(vm, mode != 0, mode == 3 ? 40u : mode ? 43u : 0u, 0x4010) &&
+                  jit->jit_instructions == translated && dos_trace_test_frame(vm, &retired, 1, true);
+            if (!ok) {
+                serial_puts("[DOS-TRACE-JIT] mode="); serial_putdec(mode); serial_puts("\n");
+                failures++;
+            }
+            vm->jit = NULL;
+            checks++;
+        }
+        jit_destroy(jit);
+        dos_host_free_pages(jit, pages);
+    } else failures++;
+    dos_init_ivt(vm);
+    serial_puts("[DOS-TRACE] checks="); serial_putdec(checks);
+    serial_puts(" faults="); serial_putdec(faults);
+    serial_puts(" iterations="); serial_putdec(iterations);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static int dos_rf_instruction_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    unsigned checks = 0;
+    int failures = 0;
+    for (unsigned mode = 0; mode < 4; mode++)
+    for (unsigned initial_rf = 0; initial_rf < 2; initial_rf++)
+    for (unsigned scenario = 0; scenario < 15; scenario++) {
+        bool ok = dos_flags_test_prepare(vm, cpu, mode, mode == 2, 3);
+        if (!mode) for (unsigned v = 0; v <= 0x40; v++)
+            dos_mem_write32(vm, v * 4u, 0x4000u + v * 16u);
+        cpu->eflags = FLAGS_FIXED | FLAG_IOPL_MASK | FLAG_IF | FLAG_CF |
+            (initial_rf ? FLAG_RF : 0) | (mode == 3 ? FLAG_VM : 0) |
+            (scenario == 9 ? FLAG_OF : 0) | (scenario == 11 ? FLAG_TF : 0);
+        cpu8086_state_t expected = *cpu;
+        expected.eflags &= ~FLAG_RF;
+        unsigned width = scenario == 4 || scenario == 6 ? 2u : 4u;
+        uint32_t p = 0x1000;
+        unsigned vector = 0;
+        if (scenario >= 3 && scenario <= 7 && (width == 4) != cpu->op_size_32)
+            vm->mem[p++] = 0x66;
+        switch (scenario) {
+        case 1: vm->mem[p++] = 0x89; vm->mem[p++] = 0xC0; break;
+        case 2: vm->mem[p++] = 0xEB; vm->mem[p++] = 0; break;
+        case 3: vm->mem[p++] = 0x9C; expected.esp -= width; break;
+        case 4: case 5:
+            vm->mem[p++] = 0x9D;
+            dos_mem_write32(vm, 0x29000, expected.eflags | FLAG_RF);
+            expected.esp += width;
+            break;
+        case 6: case 7: {
+            vm->mem[p++] = 0xCF;
+            if (width == 4 && !initial_rf) expected.eflags |= FLAG_RF;
+            const uint32_t frame[] = { 0x1080, cpu->cs, expected.eflags | (width == 2 ? FLAG_RF : 0) };
+            dos_iret_test_frame(vm, 0x29000, width, frame, 3);
+            expected.esp += width * 3u;
+            break;
+        }
+        case 8: vm->mem[p++] = 0xCC; vector = 3; break;
+        case 9: vm->mem[p++] = 0xCE; vector = 4; break;
+        case 10: vm->mem[p++] = 0xF1; vector = 1; break;
+        case 11: vm->mem[p++] = 0x90; vector = 1; break;
+        case 12: vm->mem[p++] = 0x0F; vm->mem[p++] = 0x0B; vector = 6; break;
+        case 13:
+            vm->mem[p++] = 0x9B;
+            cpu->cr0 |= (1u << 1) | (1u << 3); /* CR0.MP and CR0.TS. */
+            vector = 7;
+            break;
+        case 14: vm->mem[p++] = 0xCD; vm->mem[p++] = 0x40; vector = 0x40; break;
+        default: vm->mem[p++] = 0x90; break;
+        }
+        expected.eip = scenario == 6 || scenario == 7 ? 0x1080u :
+                       scenario == 12 || scenario == 13 ? 0x1000u : p;
+        if ((scenario == 12 || scenario == 13) && mode) expected.eflags |= FLAG_RF;
+        ok &= cpu8086_run_one(vm);
+        if (vector) ok &= dos_trace_test_frame(vm, &expected, vector, scenario == 11);
+        else ok &= cpu->cs == expected.cs && cpu->eip == expected.eip &&
+            cpu->esp == expected.esp && cpu->eflags == expected.eflags &&
+            dos_test_general_registers(cpu, &expected);
+        if (scenario == 3) ok &= dos_mem_read32(vm, 0x28FFC) == (expected.eflags & ~FLAG_VM);
+        if (scenario == 7 && ok) {
+            /* An IRQ immediately after IRETD saves the newly loaded RF. */
+            ok &= cpu_deliver_hw_interrupt(vm, 0x40) && dos_trace_test_frame(vm, &expected, 0x40, false);
+            vm->mem[dpmi_desc_get_base(&cpu->cs_cache.descriptor) + cpu->eip] = 0xCF;
+            ok &= cpu8086_run_one(vm) && cpu->eip == expected.eip;
+            vm->mem[0x1080] = 0x90;
+            ok &= cpu8086_run_one(vm) && cpu->eip == 0x1081 && !(cpu->eflags & FLAG_RF);
+        }
+        if (!ok || !cpu->running || cpu->delivery_fault) {
+            if (failures < 8) { serial_puts("[DOS-RF-INSTRUCTION] case="); serial_putdec(checks);
+                serial_puts(" flags="); serial_puthex(cpu->eflags, 8); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    for (unsigned wide = 0; wide < 2; wide++)
+    for (unsigned incoming = 0; incoming < 2; incoming++)
+    for (unsigned source = 0; source < 4; source++) {
+        cpu8086_state_t next = dos_task_test_prepare(vm, cpu, wide, wide, true, true, 3, 3);
+        cpu->eflags |= FLAG_RF;
+        next.eflags |= wide && incoming ? FLAG_RF : 0;
+        dos_task_test_image(vm, 0x5000, wide, &next);
+        uint32_t return_eip = 0x1000;
+        if (source < 2) return_eip = dos_far_test_code(vm, source ? 2 : 0, 4, false, 64, 0, 0, false);
+        else if (source == 2) dos_idt_test_gate(vm, 0x40, 64, 0, 0xE5);
+        else {
+            cpu->eflags |= FLAG_NT;
+            dos_mem_write16(vm, 0x4000, 64);
+            vm->mem[0x2045] |= 2u;
+            vm->mem[0x1000] = 0xCF;
+            return_eip++;
+        }
+        cpu8086_state_t before = *cpu;
+        uint32_t saved = before.eflags & ~(source == 2 ? 0 : FLAG_RF);
+        if (source == 3) saved &= ~FLAG_NT;
+        uint32_t flags = next.eflags | (source == 0 || source == 2 ? FLAG_NT : 0);
+        bool ok = source == 2 ? cpu_deliver_hw_interrupt(vm, 0x40) : cpu8086_run_one(vm);
+        ok &= cpu->tr == 64 && cpu->cs == next.cs && cpu->eip == next.eip &&
+              cpu->eflags == flags && dos_task_test_saved(vm, 0x4000, wide, &before, return_eip, saved);
+        vm->mem[0x61800] = 0x90;
+        ok &= cpu8086_run_one(vm) && cpu->eip == 0x1801 && cpu->eflags == (flags & ~FLAG_RF);
+        if (!ok || !cpu->running || cpu->delivery_fault) {
+            if (failures < 8) { serial_puts("[DOS-RF-TASK] case="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    serial_puts("[DOS-RF-INSTRUCTION] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static int dos_rf_string_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    const uint8_t operations[] = { 0xA4, 0xA6, 0xAA, 0xAC, 0xAE, 0x6C, 0x6E };
+    const unsigned counts[] = { 0, 1, 257 };
+    unsigned checks = 0, interrupts = 0;
+    int failures = 0;
+    for (unsigned mode = 0; mode < 4; mode++)
+    for (unsigned adr32 = 0; adr32 < 2; adr32++)
+    for (unsigned width = 1; width <= 4; width *= 2)
+    for (unsigned initial_rf = 0; initial_rf < 2; initial_rf++)
+    for (unsigned op = 0; op < sizeof(operations); op++)
+    for (unsigned n = 0; n < sizeof(counts) / sizeof(counts[0]); n++) {
+        bool ok = dos_flags_test_prepare(vm, cpu, mode, mode == 2, 3);
+        if (!mode) dos_mem_write32(vm, 0x40u * 4u, 0x4400);
+        if (!mode || mode == 3) {
+            cpu8086_load_real_segment(cpu, 3, 0);
+            cpu8086_load_real_segment(cpu, 0, 0);
+        }
+        cpu->eflags = FLAGS_FIXED | FLAG_IOPL_MASK | FLAG_IF | FLAG_CF |
+            (initial_rf ? FLAG_RF : 0) | (mode == 3 ? FLAG_VM : 0);
+        cpu->eax = 0xA5A5A5A5;
+        cpu->edx = op == 5 ? 0x21 : 0x80;
+        cpu->esi = (adr32 ? 0 : 0xABCD0000u) | 0x6000u;
+        cpu->edi = (adr32 ? 0 : 0xBCDE0000u) | 0x6800u;
+        cpu->ecx = (adr32 ? 0 : 0xCDEF0000u) | counts[n];
+        uint32_t base = mode == 1 || mode == 2 ? 0x20000u : 0;
+        for (unsigned i = 0x6000; i < 0x6C10; i++) vm->mem[base + i] = 0xA5;
+        uint32_t end = 0x1000;
+        if (width > 1 && (width == 4) != cpu->op_size_32) vm->mem[end++] = 0x66;
+        if (adr32 != cpu->addr_size_32) vm->mem[end++] = 0x67;
+        vm->mem[end++] = 0xF3; vm->mem[end++] = operations[op] | (width != 1);
+        unsigned remaining = counts[n];
+        do {
+            unsigned done = remaining > 256u ? 256u : remaining;
+            remaining -= done;
+            ok &= cpu8086_run_one(vm) && cpu->eip == (remaining ? 0x1000u : end) &&
+                (adr32 ? cpu->ecx : cpu->cx) == remaining &&
+                !!(cpu->eflags & FLAG_RF) == (remaining != 0);
+            cpu8086_state_t saved = *cpu;
+            saved.eflags = (saved.eflags & ~FLAG_RF) | (remaining ? FLAG_RF : 0);
+            ok &= cpu_deliver_hw_interrupt(vm, 0x40) && dos_trace_test_frame(vm, &saved, 0x40, false);
+            vm->mem[dpmi_desc_get_base(&cpu->cs_cache.descriptor) + cpu->eip] = 0xCF;
+            ok &= cpu8086_run_one(vm) && cpu->cs == saved.cs && cpu->eip == saved.eip &&
+                cpu->esp == saved.esp && cpu->eflags == (saved.eflags & (mode ? UINT32_MAX : ~FLAG_RF));
+            interrupts++;
+        } while (remaining && ok);
+        if (!ok || !cpu->running || cpu->delivery_fault) {
+            if (failures < 8) { serial_puts("[DOS-RF-REP] case="); serial_putdec(checks);
+                serial_puts(" flags="); serial_puthex(cpu->eflags, 8); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    serial_puts("[DOS-RF-REP] checks="); serial_putdec(checks);
+    serial_puts(" interrupts="); serial_putdec(interrupts);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static int dos_rf_jit_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    unsigned pages = (sizeof(jit_state_t) + 4095u) / 4096u, checks = 0;
+    jit_state_t *jit = dos_host_alloc_pages(pages);
+    if (!jit) return 1;
+    jit_init(jit);
+    int failures = 0;
+    for (unsigned mode = 0; mode < 4; mode++) {
+        bool ok = dos_flags_test_prepare(vm, cpu, mode, mode == 2, 3);
+        vm->jit = jit;
+        vm->step_limit = 0;
+        vm->mem[0x1000] = 0x90; vm->mem[0x1001] = 0xEB; vm->mem[0x1002] = 0x0D;
+        jit->hit_count[0x1000] = JIT_HOT_THRESHOLD;
+        cpu8086_state_t before = *cpu;
+        uint64_t translated = jit->jit_instructions;
+        ok &= cpu8086_run_until(vm, cpu->protected_mode, cpu->cs, 0x1010) &&
+            jit->jit_instructions == translated + 2u;
+        *cpu = before;
+        uint32_t p = 0x1080;
+        if (!cpu->op_size_32) vm->mem[p++] = 0x66;
+        vm->mem[p] = 0xCF;
+        const uint32_t frame[] = { 0x1000, cpu->cs, cpu->eflags | FLAG_RF };
+        dos_iret_test_frame(vm, 0x29000, 4, frame, 3);
+        cpu->eip = 0x1080;
+        ok &= cpu8086_run_one(vm) && cpu->eip == 0x1000 && (cpu->eflags & FLAG_RF);
+        translated = jit->jit_instructions;
+        ok &= cpu8086_run_until(vm, cpu->protected_mode, cpu->cs, 0x1010) &&
+            jit->jit_instructions == translated + 2u && !(cpu->eflags & FLAG_RF);
+        *cpu = before;
+        cpu->eflags |= FLAG_RF;
+        jit_block_t *block = jit_get_block(jit, cpu->cs, cpu->eip);
+        translated = jit->jit_instructions;
+        ok &= block && jit_exec_block(vm, block) && cpu->eip == 0x1010 &&
+            jit->jit_instructions == translated + 2u && !(cpu->eflags & FLAG_RF);
+        *cpu = before;
+        cpu->eflags |= FLAG_RF;
+        vm->mem[0x1000] = 0xF4;
+        translated = jit->jit_instructions;
+        ok &= block && !jit_exec_block(vm, block) && cpu->eip == before.eip &&
+            (cpu->eflags & FLAG_RF) && jit->jit_instructions == translated;
+        if (!ok) { serial_puts("[DOS-RF-JIT] mode="); serial_putdec(mode); serial_puts("\n"); failures++; }
+        vm->jit = NULL;
+        checks++;
+    }
+    jit_destroy(jit);
+    dos_host_free_pages(jit, pages);
+    serial_puts("[DOS-RF-JIT] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static int dos_rf_boundary_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    unsigned checks = 0;
+    int failures = 0;
+    for (unsigned mode = 0; mode < 4; mode++)
+    for (unsigned initial_rf = 0; initial_rf < 2; initial_rf++)
+    for (unsigned scenario = 0; scenario < 3; scenario++) {
+        bool ok = dos_flags_test_prepare(vm, cpu, mode, mode == 2, 3);
+        cpu->eflags = FLAGS_FIXED | FLAG_IOPL_MASK | FLAG_CF |
+            (initial_rf ? FLAG_RF : 0) | (mode == 3 ? FLAG_VM : 0);
+        uint32_t flags = cpu->eflags;
+        unsigned vector = scenario == 1 ? 7u : 13u;
+        if (scenario == 0) {
+            vm->mem[0x1000] = 0xB8;
+            dpmi_desc_set_limit(&cpu->cs_cache.descriptor, 0x1000);
+        } else if (scenario == 1) {
+            vm->mem[0x1000] = 0x9B;
+            cpu->cr0 |= (1u << 1) | (1u << 3);
+        } else {
+            vm->mem[0x1000] = 0xA0;
+            dos_mem_write32(vm, 0x1001, 0x6000);
+            dpmi_desc_set_limit(&cpu->ds_cache.descriptor, 0x5FFF);
+            flags &= ~FLAG_RF;
+        }
+        cpu8086_state_t before = *cpu;
+        cpu_event_fault_t fault = {0};
+        cpu->delivery_fault = &fault;
+        ok &= cpu8086_run_one(vm);
+        cpu->delivery_fault = NULL;
+        ok &= fault.raised && fault.vector == vector && fault.return_eip == before.eip &&
+            cpu->running && cpu->eflags == flags && cpu->esp == before.esp &&
+            cpu->cs == before.cs && dos_test_general_registers(cpu, &before);
+        if (!ok) { serial_puts("[DOS-RF-BOUNDARY] case="); serial_putdec(checks); serial_puts("\n"); failures++; }
+        checks++;
+    }
+    for (unsigned mode = 0; mode < 4; mode++)
+    for (unsigned initial_rf = 0; initial_rf < 2; initial_rf++)
+    for (unsigned scan = 0; scan < 2; scan++)
+    for (unsigned equal = 0; equal < 2; equal++)
+    for (unsigned yielded = 0; yielded < 2; yielded++) {
+        bool ok = dos_flags_test_prepare(vm, cpu, mode, mode == 2, 3);
+        if (!mode) dos_mem_write32(vm, 0x40u * 4u, 0x4400);
+        if (!mode || mode == 3) {
+            cpu8086_load_real_segment(cpu, 3, 0);
+            cpu8086_load_real_segment(cpu, 0, 0);
+        }
+        cpu->eflags = FLAGS_FIXED | FLAG_IOPL_MASK | FLAG_IF |
+            (initial_rf ? FLAG_RF : 0) | (mode == 3 ? FLAG_VM : 0);
+        cpu->eax = 0xA5;
+        cpu->esi = 0x6000; cpu->edi = 0x6800;
+        cpu->ecx = yielded ? 258u : 257u;
+        vm->mem[0x1000] = equal ? 0xF3 : 0xF2;
+        vm->mem[0x1001] = scan ? 0xAE : 0xA6;
+        uint32_t base = mode == 1 || mode == 2 ? 0x20000u : 0;
+        for (unsigned i = 0; i < 258; i++) {
+            vm->mem[base + 0x6000 + i] = 0xA5;
+            vm->mem[base + 0x6800 + i] = equal ? 0xA5 : 0x5A;
+        }
+        if (yielded) ok &= cpu8086_run_one(vm) && cpu->eip == 0x1000 &&
+            cpu->ecx == 2 && (cpu->eflags & FLAG_RF);
+        vm->mem[base + cpu->edi] = equal ? 0x5A : 0xA5;
+        ok &= cpu8086_run_one(vm) && cpu->eip == 0x1002 &&
+            cpu->ecx == (yielded ? 1u : 256u) && !(cpu->eflags & FLAG_RF);
+        /* Count alone does not distinguish an unfinished REP from a
+         * comparison which retired early because its condition changed. */
+        cpu8086_state_t retired = *cpu;
+        retired.eflags &= ~FLAG_RF;
+        ok &= cpu_deliver_hw_interrupt(vm, 0x40) && dos_trace_test_frame(vm, &retired, 0x40, false);
+        if (!ok || !cpu->running || cpu->delivery_fault) {
+            serial_puts("[DOS-RF-BOUNDARY] case="); serial_putdec(checks); serial_puts("\n"); failures++;
+        }
+        checks++;
+    }
+    dos_init_ivt(vm);
+    serial_puts("[DOS-RF-BOUNDARY] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static int dos_rf_dpmi_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    static const struct { uint8_t vector; bool fault; } events[] = {
+        {0, true}, {1, false}, {3, false}, {4, false}, {5, true},
+        {6, true}, {7, true}, {10, true}, {11, true}, {12, true},
+        {13, true}, {14, true}, {16, true}, {17, true}, {19, true}
+    };
+    unsigned checks = 0;
+    int failures = 0;
+    for (unsigned real_mode = 0; real_mode < 2; real_mode++)
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned frame_kind = real_mode ? 2u : 0u; frame_kind < 3; frame_kind++)
+    for (unsigned initial_rf = 0; initial_rf < 2; initial_rf++)
+    for (unsigned edited_rf = 0; edited_rf < 3; edited_rf++)
+    for (unsigned event = 0; event < sizeof(events) / sizeof(events[0]); event++) {
+        dos_step_test_prepare(vm, cpu, mode, 0);
+        vm->dpmi.callback_depth = 1;
+        vm->dpmi.virtual_interrupts_enabled = true;
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        cpu->esp = stack32 ? 0x9000u : 0xABCD9000u;
+        cpu->eflags = FLAGS_FIXED | FLAG_IF | FLAG_IOPL_MASK | FLAG_DF |
+                      (initial_rf ? FLAG_RF : 0);
+        cpu8086_sync_cs(cpu);
+        cpu8086_sync_data(cpu);
+        uint8_t vector = events[event].vector;
+        uint16_t handler = cpu->cs;
+        vm->dpmi.exception_vectors[vector].sel = handler;
+        vm->dpmi.exception_vectors[vector].off = 0x6000;
+        vm->dpmi.exception_extended[vector] = frame_kind != 0;
+        vm->dpmi.real_exception_vectors[vector].sel = handler;
+        vm->dpmi.real_exception_vectors[vector].off = 0x6000;
+        dpmi_real_exception_t real = {0};
+        if (real_mode) {
+            vm->dpmi.suspended_stack = (dpmi_stack_t){cpu->ss, cpu->esp};
+            cpu->protected_mode = false;
+            cpu->cr0 = 0x10;
+            for (unsigned s = 0; s < 6; s++) cpu8086_load_real_segment(cpu, s, 0x1000);
+            cpu->esp = 0xBEEF8000;
+            real.cpu = *cpu;
+            real.protected_stack = vm->dpmi.suspended_stack;
+        }
+        cpu8086_state_t original = *cpu;
+        unsigned width = mode == 2 ? 4u : 2u;
+        bool extended_return = frame_kind == 2;
+        unsigned flag_width = extended_return ? 4u : width;
+        uint32_t saved_flags = original.eflags | (events[event].fault ? FLAG_RF : 0) |
+                               (real_mode ? FLAG_VM : 0);
+        bool ok = dpmi_deliver_exception_frame(vm, vector, original.eip,
+                     vector == 1 ? 0x8000u : 0u, real_mode ? &real : NULL);
+        uint32_t base = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+        ok &= cpu->running && vm->dpmi.exception_depth == 1 && cpu->cs == handler &&
+              cpu->eip == 0x6000 && !(cpu->eflags & (FLAG_RF | FLAG_TF | FLAG_VM)) &&
+              !vm->dpmi.virtual_interrupts_enabled;
+        if (!real_mode) ok &= (width == 4 ? dos_mem_read32(vm, base + 5u * width)
+                                         : dos_mem_read16(vm, base + 5u * width)) ==
+                              (width == 4 ? saved_flags : (uint16_t)saved_flags);
+        if (frame_kind) ok &= dos_mem_read32(vm, base + 0x34u) == saved_flags;
+        uint32_t returned_flags = saved_flags;
+        if (edited_rf) returned_flags = (returned_flags & ~FLAG_RF) |
+                                         (edited_rf == 1 ? FLAG_RF : 0);
+        uint32_t flags_address = base + (extended_return ? 0x34u : 5u * width);
+        if (flag_width == 4) dos_mem_write32(vm, flags_address, returned_flags);
+        else { returned_flags &= 0xFFFFu; dos_mem_write16(vm, flags_address, returned_flags); }
+        if (frame_kind && !real_mode) {
+            /* Give the unselected frame the opposite RF value. */
+            uint32_t ignored = base + (extended_return ? 5u * width : 0x34u);
+            if (!extended_return || width == 4)
+                dos_mem_write32(vm, ignored, returned_flags ^ FLAG_RF);
+        }
+        if (extended_return) cpu_stack_adjust(cpu, 32u);
+        vm->mem[0x6000] = 0xCB;
+        ok &= cpu8086_run_one(vm) && cpu->cs == vm->dpmi.sel_host_code &&
+              cpu->eip == (extended_return ? DPMI_EXCEPTION_EXT_RETURN_OFF : DPMI_EXCEPTION_RETURN_OFF);
+        ok &= cpu8086_run_one(vm) && cpu->running && !vm->dpmi.exception_depth &&
+              cpu->cs == original.cs && cpu->eip == original.eip &&
+              cpu->ss == original.ss && cpu->esp == original.esp &&
+              cpu->eflags == (returned_flags & ~(real_mode ? FLAG_VM : 0));
+        vm->mem[real_mode ? 0x11000 : 0x1000] = 0x90;
+        ok &= cpu8086_run_one(vm) && cpu->eip == original.eip + 1u &&
+              !(cpu->eflags & FLAG_RF) && !vm->dpmi.exception_depth;
+        if (!ok) {
+            if (failures < 16) { serial_puts("[DOS-RF-DPMI] case="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+        vm->dpmi.exception_context[0].real = NULL;
+    }
+    dos_init_ivt(vm);
+    serial_puts("[DOS-RF-DPMI] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static int dos_rf_dpmi_interrupt_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    unsigned checks = 0;
+    int failures = 0;
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned hardware = 0; hardware < 2; hardware++)
+    for (unsigned initial_rf = 0; initial_rf < 2; initial_rf++)
+    for (unsigned edited_rf = 0; edited_rf < 3; edited_rf++)
+    for (unsigned nested = 0; nested < 2; nested++) {
+        dos_step_test_prepare(vm, cpu, mode, 0);
+        vm->dpmi.callback_depth = nested;
+        vm->dpmi.virtual_interrupts_enabled = true;
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        cpu->esp = stack32 ? 0x9000u : 0xABCD9000u;
+        cpu->eflags = FLAGS_FIXED | FLAG_IF | FLAG_IOPL_MASK | FLAG_DF |
+                      (initial_rf ? FLAG_RF : 0);
+        cpu8086_sync_cs(cpu);
+        cpu8086_sync_data(cpu);
+        cpu8086_state_t original = *cpu;
+        unsigned width = mode == 2 ? 4u : 2u;
+        bool ok = dpmi_deliver_locked_interrupt(vm, original.cs, 0x6000,
+                                                  original.eip, hardware);
+        uint32_t base = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+        uint32_t saved = width == 4 ? dos_mem_read32(vm, base + 2u * width)
+                                   : dos_mem_read16(vm, base + 2u * width);
+        ok &= cpu->running && vm->dpmi.interrupt_depth == 1 &&
+              cpu->cs == original.cs && cpu->eip == 0x6000 &&
+              !(cpu->eflags & (FLAG_RF | FLAG_TF)) &&
+              vm->dpmi.virtual_interrupts_enabled == !hardware &&
+              saved == (width == 4 ? original.eflags : (uint16_t)original.eflags);
+        uint32_t returned_flags = original.eflags;
+        if (edited_rf) returned_flags = (returned_flags & ~FLAG_RF) |
+                                         (edited_rf == 1 ? FLAG_RF : 0);
+        if (width == 4) dos_mem_write32(vm, base + 2u * width, returned_flags);
+        else { returned_flags &= 0xFFFFu; dos_mem_write16(vm, base + 2u * width, returned_flags); }
+        vm->mem[0x6000] = 0xCF;
+        ok &= cpu8086_run_one(vm) && cpu->running && !vm->dpmi.interrupt_depth &&
+              cpu->cs == original.cs && cpu->eip == original.eip &&
+              cpu->ss == original.ss && cpu->esp == original.esp &&
+              cpu->eflags == returned_flags && dos_test_general_registers(cpu, &original);
+        vm->mem[0x1000] = 0x90;
+        ok &= cpu8086_run_one(vm) && cpu->eip == 0x1001 &&
+              cpu->eflags == (returned_flags & ~FLAG_RF);
+        if (!ok) {
+            if (failures < 16) { serial_puts("[DOS-RF-DPMI-IRQ] case="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    /* Model an IRQ becoming pending after each STI/IRET, without relying
+     * on wall-clock speed or serial backpressure to expose frame growth. */
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned returned_if = 0; returned_if < 2; returned_if++)
+    for (unsigned nested = 0; nested < 2; nested++) {
+        dos_step_test_prepare(vm, cpu, mode, 0);
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        cpu->esp = stack32 ? 0x9000u : 0xABCD9000u;
+        cpu->eflags = FLAGS_FIXED | FLAG_IF | FLAG_IOPL_MASK | FLAG_DF;
+        cpu8086_sync_cs(cpu); cpu8086_sync_data(cpu);
+        cpu8086_state_t original = *cpu;
+        bool ok = true;
+        if (nested)
+            ok = dpmi_deliver_locked_interrupt(vm, original.cs, 0x5000, original.eip, false);
+        cpu8086_state_t caller = *cpu;
+        vm->dpmi.pm_vectors[8].sel = original.cs;
+        vm->dpmi.pm_vectors[8].off = 0x6000;
+        vm->mem[0x6000] = 0xFB;
+        vm->mem[0x6001] = 0xCF;
+        unsigned width = mode == 2 ? 4u : 2u;
+        uint32_t flags = FLAGS_FIXED | FLAG_IOPL_MASK | FLAG_DF |
+                         (returned_if ? FLAG_IF : 0) | (width == 4 ? FLAG_RF : 0);
+        for (unsigned irq = 0; ok && irq < DPMI_MAX_INTERRUPT_DEPTH + 2u; irq++) {
+            vm->dpmi.virtual_interrupts_enabled = true;
+            ok &= cpu_deliver_hw_interrupt(vm, 8) && vm->dpmi.interrupt_depth == nested + 1u;
+            uint32_t base = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+            if (width == 4) dos_mem_write32(vm, base + 2u * width, flags);
+            else dos_mem_write16(vm, base + 2u * width, flags);
+            ok &= cpu8086_run_one(vm) && cpu->eip == 0x6001 && cpu->irq_shadow == 1 &&
+                  vm->dpmi.virtual_interrupts_enabled;
+            ok &= cpu8086_run_one(vm) && !cpu->irq_shadow &&
+                  vm->dpmi.interrupt_depth == nested &&
+                  cpu->cs == caller.cs && cpu->eip == caller.eip &&
+                  cpu->ss == caller.ss && cpu->esp == caller.esp &&
+                  cpu->eflags == (flags | FLAG_IF) &&
+                  vm->dpmi.virtual_interrupts_enabled == (returned_if != 0) &&
+                  dos_test_general_registers(cpu, &caller);
+            if (!returned_if) ok &= !cpu_deliver_hw_interrupt(vm, 8);
+        }
+        if (ok && nested) {
+            vm->mem[0x5000] = 0xCF;
+            ok &= cpu8086_run_one(vm) && !vm->dpmi.interrupt_depth &&
+                  cpu->cs == original.cs && cpu->eip == original.eip &&
+                  cpu->ss == original.ss && cpu->esp == original.esp;
+        }
+        if (!ok) { serial_puts("[DOS-RF-DPMI-IRQ] pending case="); serial_putdec(checks); serial_puts("\n"); failures++; }
+        checks++;
+    }
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned scenario = 0; scenario < 9; scenario++) {
+        dos_step_test_prepare(vm, cpu, mode, 0);
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        cpu8086_sync_cs(cpu); cpu8086_sync_data(cpu);
+        bool ok = dpmi_deliver_locked_interrupt(vm, cpu->cs, 0x6000, cpu->eip, true);
+        uint16_t cs = vm->dpmi.sel_host_code;
+        uint32_t ip = DPMI_INTERRUPT_RETURN_OFF;
+        uint16_t ss = vm->dpmi.interrupt_frames[0].handler.ss;
+        uint32_t esp = vm->dpmi.interrupt_frames[0].handler.esp;
+        if (scenario == 0) esp++;
+        if (scenario == 1) ss = 0;
+        if (scenario == 2) vm->dpmi.interrupt_frames[0].cs = 0;
+        if (scenario == 3) vm->dpmi.interrupt_frames[0].caller.ss = 0;
+        if (scenario == 4) vm->dpmi.interrupt_depth = 0;
+        if (scenario == 5) vm->dpmi.descriptor_state[cs >> 3] = DPMI_DESC_MUTABLE;
+        if (scenario == 6) ip++;
+        if (scenario == 7) cs &= ~3u;
+        if (scenario == 8) cpu->guest_idt = true;
+        cpu8086_state_t before = *cpu;
+        unsigned depth = vm->dpmi.interrupt_depth;
+        bool virtual_if = vm->dpmi.virtual_interrupts_enabled;
+        int result = dos_pm_interrupt_return_iret(vm, cs, ip, ss, esp,
+                                                   FLAGS_FIXED | FLAG_IF | FLAG_IOPL_MASK);
+        ok &= result == (scenario < 5 ? -1 : 0) &&
+              vm->dpmi.interrupt_depth == depth &&
+              vm->dpmi.virtual_interrupts_enabled == virtual_if;
+        const uint8_t *after = (const uint8_t *)cpu, *saved = (const uint8_t *)&before;
+        for (unsigned byte = 0; byte < sizeof(before); byte++)
+            if (after[byte] != saved[byte]) ok = false;
+        if (!ok) { serial_puts("[DOS-RF-DPMI-IRQ] reject case="); serial_putdec(checks); serial_puts("\n"); failures++; }
+        checks++;
+    }
+    /* Matching the private vector alone must not preserve a guest INT's RF. */
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned host_cs = 0; host_cs < 2; host_cs++) {
+        dos_step_test_prepare(vm, cpu, mode, 0);
+        vm->dpmi.virtual_interrupts_enabled = true;
+        uint16_t handler = cpu->cs;
+        vm->dpmi.pm_vectors[DPMI_EXCEPTION_RETURN_INT].sel = handler;
+        vm->dpmi.pm_vectors[DPMI_EXCEPTION_RETURN_INT].off = 0x6000;
+        if (host_cs) cpu->cs = dpmi_get_host_code_selector(vm);
+        cpu->eip = 0x7000;
+        cpu->eflags = FLAGS_FIXED | FLAG_IF | FLAG_IOPL_MASK | FLAG_RF;
+        cpu8086_sync_cs(cpu);
+        cpu8086_sync_data(cpu);
+        uint32_t code = dos_addr(vm, cpu->cs, cpu->eip);
+        vm->mem[code] = 0xCD; vm->mem[code + 1u] = DPMI_EXCEPTION_RETURN_INT;
+        bool ok = cpu8086_run_one(vm) && cpu->cs == handler && cpu->eip == 0x6000 &&
+                  !(cpu->eflags & FLAG_RF) && !vm->dpmi.interrupt_depth;
+        unsigned width = mode == 2 ? 4u : 2u;
+        uint32_t base = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+        ok &= (width == 4 ? dos_mem_read32(vm, base + 2u * width)
+                         : dos_mem_read16(vm, base + 2u * width)) ==
+              (FLAGS_FIXED | FLAG_IF | FLAG_IOPL_MASK);
+        if (!ok) { serial_puts("[DOS-RF-DPMI-IRQ] source case="); serial_putdec(checks); serial_puts("\n"); failures++; }
+        checks++;
+    }
+    serial_puts("[DOS-RF-DPMI-IRQ] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static int dos_native_test_privileged_frame(dos_vm_t *vm, x86_interrupt_frame_t *frame)
+{
+    /* Publish the fixture only while interrupts are disabled. Never replace
+     * an active native session or leave its shared CPU image modified. */
+    uint64_t host_flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(host_flags) :: "memory");
+    int handled = -1;
+    if (!g_native_dos_vm) {
+        cpu8086_state_t *cpu = vm->cpu;
+        cpu8086_state_t saved_native = g_native_cpu;
+        cpu8086_state_t *saved_interpreter = g_native_interpreter_cpu;
+        dos_set_native_vm(vm);
+        handled = dos_native_handle_privileged_fault(frame);
+        dos_set_native_vm(NULL);
+        g_native_cpu = saved_native;
+        g_native_interpreter_cpu = saved_interpreter;
+        vm->cpu = cpu;
+    }
+    __asm__ volatile ("pushq %0; popfq" :: "r"(host_flags) : "memory", "cc");
+    return handled;
+}
+
+static int dos_rf_native_io_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    unsigned checks = 0;
+    int failures = 0;
+    if (!dos_audio_init(vm)) return 1;
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned input = 0; input < 2; input++)
+    for (unsigned immediate = 0; immediate < 2; immediate++)
+    for (unsigned width = 1; width <= 4; width *= 2)
+    for (unsigned trace = 0; trace < 2; trace++)
+    for (unsigned initial_rf = 0; initial_rf < 2; initial_rf++) {
+        dos_port_test_prepare(vm, cpu, mode);
+        vm->emulate_cpu = false;
+        vm->dpmi.callback_depth = 1;
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        cpu8086_sync_cs(cpu);
+        cpu8086_sync_data(cpu);
+        dos_io_write8(vm, 0x83, 0x25);
+        dos_io_write8(vm, 0x3C4, 2);
+        dos_io_write8(vm, 0x3C5, 0x24);
+        dos_io_write8(vm, 0x3C6, 0x5A);
+        unsigned p = 0x1000;
+        if ((width == 4) != (mode == 2)) { vm->mem[p++] = 0x66; vm->mem[p++] = 0x66; }
+        vm->mem[p++] = 0x67; vm->mem[p++] = 0xF3;
+        vm->mem[p++] = (immediate ? 0xE4 : 0xEC) | (input ? 0 : 2) | (width != 1);
+        if (immediate) vm->mem[p++] = 0x80;
+        x86_interrupt_frame_t frame = { .vector = 13, .rip = 0x1000, .cs = cpu->cs,
+            .ss = cpu->ss, .rsp = stack32 ? 0x9000u : 0xABCD9000u,
+            .rax = 0x6B553702, .rdx = 0xABCD03C4, .rcx = 0x56781234,
+            .rflags = FLAGS_FIXED | FLAG_IF | FLAG_DF | FLAG_CF |
+                      (trace ? FLAG_TF : 0) | (initial_rf ? FLAG_RF : 0) };
+        uint32_t mask = width == 1 ? 0xFFu : width == 2 ? 0xFFFFu : UINT32_MAX;
+        uint32_t expected_ax = input ? (frame.rax & ~mask) |
+                              ((immediate ? 0x25FFFFFFu : 0x035A2402u) & mask) : frame.rax;
+        uint32_t expected_flags = frame.rflags & ~FLAG_RF;
+        int handled = dos_native_test_privileged_frame(vm, &frame);
+        bool ok = handled == 1 && frame.rax == expected_ax &&
+                  frame.rdx == 0xABCD03C4 && frame.rcx == 0x56781234 &&
+                  frame.rflags == (expected_flags & ~(trace ? FLAG_TF : 0));
+        if (trace) {
+            unsigned field_width = mode == 2 ? 4u : 2u;
+            uint32_t frame_base = stack32 ? frame.rsp : (uint16_t)frame.rsp;
+            uint32_t saved = field_width == 4 ? dos_mem_read32(vm, frame_base + 5u * field_width)
+                                            : dos_mem_read16(vm, frame_base + 5u * field_width);
+            ok &= frame.rip == 0x6010 && vm->dpmi.exception_depth == 1 && saved == expected_flags;
+        } else ok &= frame.rip == p && !vm->dpmi.exception_depth;
+        ok &= dos_io_read8(vm, 0x83) == (!input && immediate && width == 4 ? 0x6B : 0x25) &&
+              dos_io_read8(vm, 0x3C5) == (!input && !immediate && width >= 2 ? 0x37 : 0x24) &&
+              dos_io_read8(vm, 0x3C6) == (!input && !immediate && width == 4 ? 0x55 : 0x5A);
+        if (!ok) {
+            if (failures < 16) { serial_puts("[DOS-RF-NATIVE-IO] case="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned initial_rf = 0; initial_rf < 2; initial_rf++)
+    for (unsigned scenario = 0; scenario < 6; scenario++) {
+        dos_step_test_prepare(vm, cpu, mode, 0);
+        cpu8086_sync_cs(cpu);
+        cpu8086_sync_data(cpu);
+        vm->mem[0x1000] = 0xE6; vm->mem[0x1001] = 0x83;
+        dos_io_write8(vm, 0x83, 0x25);
+        x86_interrupt_frame_t frame = { .vector = 13, .rip = 0x1000, .cs = cpu->cs,
+            .ss = cpu->ss, .rsp = 0x9000, .rax = 0x37,
+            .rflags = FLAGS_FIXED | FLAG_IF | FLAG_TF | (initial_rf ? FLAG_RF : 0) };
+        if (scenario == 0) frame.error_code = 1;
+        if (scenario == 1) dpmi_desc_set_limit(&vm->dpmi.ldt[1], 0x1000);
+        if (scenario == 2) vm->mem[0x1000] = 0xF0;
+        if (scenario == 3) for (unsigned b = 0; b < 15; b++) vm->mem[0x1000 + b] = 0x66;
+        if (scenario == 4) vm->mem[0x1000] = 0x90;
+        if (scenario == 5) vm->dpmi.ldt[1].access &= ~DESC_PRESENT;
+        x86_interrupt_frame_t before = frame;
+        bool ok = dos_native_test_privileged_frame(vm, &frame) == 0 &&
+                  !memcmp(&frame, &before, sizeof(frame)) && dos_io_read8(vm, 0x83) == 0x25;
+        if (!ok) {
+            if (failures < 16) { serial_puts("[DOS-RF-NATIVE-IO] case="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    dos_audio_shutdown(vm);
+    vm->emulate_cpu = true;
+    serial_puts("[DOS-RF-NATIVE-IO] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static bool dos_native_test_exception_frame(dos_vm_t *vm, x86_interrupt_frame_t *frame)
+{
+    uint64_t host_flags, cr3;
+    __asm__ volatile ("pushfq; popq %0; cli; mov %%cr3, %1"
+                      : "=r"(host_flags), "=r"(cr3) :: "memory");
+    bool handled = false;
+    if (!g_native_dos_vm) {
+        cpu8086_state_t *cpu = vm->cpu;
+        cpu8086_state_t saved_native = g_native_cpu;
+        cpu8086_state_t *saved_interpreter = g_native_interpreter_cpu;
+        uint64_t saved_cr3 = vm->native_cr3;
+        bool active = vm->native_active;
+        vm->native_active = true;
+        vm->native_cr3 = cr3;
+        dos_set_native_vm(vm);
+        handled = dos_native_handle_exception(frame);
+        *cpu = g_native_cpu;
+        dos_set_native_vm(NULL);
+        g_native_cpu = saved_native;
+        g_native_interpreter_cpu = saved_interpreter;
+        vm->cpu = cpu;
+        vm->native_cr3 = saved_cr3;
+        vm->native_active = active;
+    }
+    __asm__ volatile ("pushq %0; popfq" :: "r"(host_flags) : "memory", "cc");
+    return handled;
+}
+
+static int dos_native_irq_return_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    unsigned checks = 0;
+    int failures = 0;
+    uint64_t ldt[DPMI_MAX_DESCRIPTORS], gdt[64];
+    void *saved_ldt = vm->native_ldt, *saved_gdt = vm->native_gdt;
+    bool active = vm->native_active;
+    vm->native_ldt = ldt; vm->native_gdt = gdt;
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned initial_rf = 0; initial_rf < 2; initial_rf++)
+    for (unsigned returned_rf = 0; returned_rf < 2; returned_rf++)
+    for (unsigned old_tf = 0; old_tf < 2; old_tf++)
+    for (unsigned returned_tf = 0; returned_tf < 2; returned_tf++)
+    for (unsigned nested = 0; nested < 2; nested++)
+    for (unsigned hardware = 0; hardware < 2; hardware++) {
+        dos_step_test_prepare(vm, cpu, mode, 0);
+        vm->emulate_cpu = false; vm->native_active = true;
+        vm->dpmi.virtual_interrupts_enabled = true;
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        cpu->esp = stack32 ? 0x9000u : 0xABCD9000u;
+        cpu->eflags = FLAGS_FIXED | FLAG_IF | FLAG_CF | FLAG_DF | (initial_rf ? FLAG_RF : 0);
+        cpu8086_sync_cs(cpu); cpu8086_sync_data(cpu);
+        cpu8086_state_t original = *cpu;
+        bool ok = true;
+        if (nested) {
+            ok &= dpmi_deliver_locked_interrupt(vm, original.cs, 0x5000, original.eip, true);
+            vm->dpmi.virtual_interrupts_enabled = true;
+        }
+        cpu8086_state_t caller = *cpu;
+        ok &= dpmi_deliver_locked_interrupt(vm, caller.cs, 0x6000, caller.eip, hardware);
+        unsigned width = mode == 2 ? 4u : 2u;
+        uint32_t base = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+        uint32_t flags = FLAGS_FIXED | FLAG_IF | FLAG_PF | FLAG_SF |
+                         (returned_rf && width == 4 ? FLAG_RF : 0) |
+                         (returned_tf ? FLAG_TF : 0);
+        if (width == 4) dos_mem_write32(vm, base + 2u * width, flags);
+        else dos_mem_write16(vm, base + 2u * width, flags);
+        uint16_t alias = vm->dpmi.sel_interrupt_return;
+        ok &= alias && alias != vm->dpmi.sel_host_code &&
+              (vm->dpmi.ldt[alias >> 3].access & DESC_PRESENT) &&
+              !(ldt[alias >> 3] & (1ULL << 47)) &&
+              (ldt[vm->dpmi.sel_host_code >> 3] & (1ULL << 47)) &&
+              !(cpu->eflags & (FLAG_TF | FLAG_RF));
+        /* A selector refresh must not turn the private alias executable. */
+        ldt[alias >> 3] |= 1ULL << 47;
+        ok &= !dos_native_refresh_guest_selector(vm, alias & ~3u) &&
+              !(ldt[alias >> 3] & (1ULL << 47));
+        vm->dpmi.exception_vectors[1].sel = original.cs;
+        vm->dpmi.exception_vectors[1].off = 0x6800;
+        vm->dpmi.exception_extended[1] = true;
+        vm->mem[0x6000] = 0xCF;
+        x86_interrupt_frame_t frame = {0};
+        dos_native_export_frame(cpu, &frame);
+        frame.vector = 11; frame.error_code = alias & ~3u;
+        frame.rflags |= FLAG_RF | (old_tf ? FLAG_TF : 0);
+        ok &= dos_native_test_exception_frame(vm, &frame) && cpu->running &&
+              vm->dpmi.interrupt_depth == nested && !vm->native_dispatch_depth;
+        if (old_tf) {
+            uint32_t at = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+            ok &= vm->dpmi.exception_depth == 1 && cpu->eip == 0x6800 &&
+                  dos_mem_read32(vm, at + 0x28u) == 0x8000u &&
+                  dos_mem_read32(vm, at + 0x2Cu) == caller.eip &&
+                  dos_mem_read32(vm, at + 0x30u) == caller.cs &&
+                  dos_mem_read32(vm, at + 0x34u) == flags &&
+                  dos_mem_read32(vm, at + 0x38u) == caller.esp &&
+                  dos_mem_read32(vm, at + 0x3Cu) == caller.ss &&
+                  (cpu->dr[6] & 0x4000u);
+        } else {
+            ok &= !vm->dpmi.exception_depth && cpu->cs == caller.cs &&
+                  cpu->eip == caller.eip && cpu->ss == caller.ss && cpu->esp == caller.esp &&
+                  cpu->eflags == flags && frame.rflags == flags &&
+                  vm->dpmi.virtual_interrupts_enabled && dos_test_general_registers(cpu, &caller);
+            vm->mem[caller.eip] = 0x90;
+            ok &= cpu8086_run_one(vm);
+            if (returned_tf) {
+                uint32_t at = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+                ok &= vm->dpmi.exception_depth == 1 && cpu->eip == 0x6800 &&
+                      dos_mem_read32(vm, at + 0x2Cu) == caller.eip + 1u &&
+                      dos_mem_read32(vm, at + 0x34u) == (flags & ~FLAG_RF);
+            } else {
+                ok &= !vm->dpmi.exception_depth && cpu->eip == caller.eip + 1u &&
+                      cpu->eflags == (flags & ~FLAG_RF);
+                if (nested) {
+                    cpu->eip = 0x6000;
+                    dos_native_export_frame(cpu, &frame);
+                    frame.vector = 11; frame.error_code = alias & ~3u; frame.rflags |= FLAG_RF;
+                    ok &= dos_native_test_exception_frame(vm, &frame) &&
+                          !vm->dpmi.interrupt_depth && cpu->cs == original.cs &&
+                          cpu->eip == original.eip && cpu->ss == original.ss && cpu->esp == original.esp &&
+                          cpu->eflags == (original.eflags & (width == 4 ? UINT32_MAX : 0xFFFFu));
+                }
+            }
+        }
+        if (!ok) {
+            if (failures < 16) { serial_puts("[DOS-NATIVE-IRQ] case="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned scenario = 0; scenario < 10; scenario++) {
+        dos_step_test_prepare(vm, cpu, mode, 0);
+        vm->emulate_cpu = false; vm->native_active = true;
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        cpu8086_sync_cs(cpu); cpu8086_sync_data(cpu);
+        uint16_t client = cpu->cs;
+        bool ok = dpmi_deliver_locked_interrupt(vm, client, 0x6000, 0x1000, true);
+        unsigned width = mode == 2 ? 4u : 2u;
+        uint32_t base = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+        uint16_t alias = vm->dpmi.sel_interrupt_return;
+        vm->mem[0x6000] = 0xCF;
+        x86_interrupt_frame_t frame = {0};
+        dos_native_export_frame(cpu, &frame);
+        frame.vector = 11; frame.error_code = alias & ~3u; frame.rflags |= FLAG_RF;
+        if (scenario == 0) dos_mem_write16(vm, base, DPMI_INTERRUPT_RETURN_OFF + 1u);
+        if (scenario == 1) frame.error_code |= 2u;
+        if (scenario == 2) vm->mem[0x6000] = 0xCB;
+        if (scenario == 3) { vm->mem[0x6000] = 0xF0; vm->mem[0x6001] = 0xCF; }
+        if (scenario == 4) {
+            for (unsigned i = 0; i < 15; i++) vm->mem[0x6000 + i] = 0x2E;
+            vm->mem[0x600F] = 0xCF;
+        }
+        if (scenario == 5) {
+            vm->mem[0x6000] = 0x2E; vm->mem[0x6001] = 0xCF;
+            dpmi_desc_set_limit(&vm->dpmi.ldt[client >> 3], 0x6000);
+        }
+        if (scenario == 6) vm->dpmi.interrupt_frames[0].handler.esp += width;
+        if (scenario == 7) vm->dpmi.interrupt_frames[0].cs = 0;
+        if (scenario == 8) vm->dpmi.interrupt_depth = 0;
+        if (scenario == 9) vm->dpmi.descriptor_state[alias >> 3] = DPMI_DESC_MUTABLE;
+        unsigned vector = scenario == 6 || scenario == 7 ? 13u : 11u;
+        vm->dpmi.exception_vectors[vector].sel = client;
+        vm->dpmi.exception_vectors[vector].off = 0x5000;
+        vm->dpmi.exception_extended[vector] = true;
+        uint32_t old_sp = cpu->esp;
+        uint16_t old_ss = cpu->ss;
+        ok &= dos_native_test_exception_frame(vm, &frame) && cpu->eip == 0x5000 &&
+              vm->dpmi.exception_depth == 1 && vm->dpmi.interrupt_depth == (scenario != 8);
+        uint32_t at = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+        ok &= dos_mem_read32(vm, at + 0x28u) == (vector == 13 ? 0u : (alias & ~3u) | (scenario == 1 ? 2u : 0u)) &&
+              dos_mem_read32(vm, at + 0x2Cu) == 0x6000 &&
+              dos_mem_read32(vm, at + 0x30u) == client &&
+              dos_mem_read32(vm, at + 0x38u) == old_sp &&
+              dos_mem_read32(vm, at + 0x3Cu) == old_ss;
+        if (!ok) {
+            if (failures < 16) { serial_puts("[DOS-NATIVE-IRQ] reject="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    vm->native_ldt = saved_ldt; vm->native_gdt = saved_gdt;
+    vm->native_active = active; vm->emulate_cpu = true;
+    serial_puts("[DOS-NATIVE-IRQ] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static int dos_native_decode_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    unsigned checks = 0;
+    int failures = 0;
+    if (!dos_audio_init(vm)) return 1;
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned input = 0; input < 2; input++)
+    for (unsigned immediate = 0; immediate < 2; immediate++)
+    for (unsigned width = 1; width <= 4; width *= 2)
+    for (unsigned length = 15; length <= 16; length++)
+    for (unsigned bound = 0; bound < 3; bound++)
+    for (unsigned rf = 0; rf < 2; rf++) {
+        dos_port_test_prepare(vm, cpu, mode);
+        vm->emulate_cpu = false;
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        unsigned prefixes = length - 1u - immediate;
+        for (unsigned b = 0; b < prefixes; b++) vm->mem[0x1000 + b] = 0x2E;
+        if ((width == 4) != (mode == 2)) vm->mem[0x1000] = 0x66;
+        vm->mem[0x1000 + prefixes] = (immediate ? 0xE4 : 0xEC) |
+                                      (input ? 0 : 2) | (width != 1);
+        if (immediate) vm->mem[0x1000 + length - 1u] = 0x80;
+        if (bound) dpmi_desc_set_limit(&vm->dpmi.ldt[1], 0x1000 + length - bound);
+        cpu8086_sync_cs(cpu);
+        cpu8086_sync_data(cpu);
+        dos_io_write8(vm, 0x83, 0x25);
+        dos_io_write8(vm, 0x3C4, 2);
+        dos_io_write8(vm, 0x3C5, 0x24);
+        dos_io_write8(vm, 0x3C6, 0x5A);
+        x86_interrupt_frame_t frame = { .vector = 13, .rip = 0x1000, .cs = cpu->cs,
+            .ss = cpu->ss, .rsp = stack32 ? 0x9000u : 0xABCD9000u,
+            .rax = 0x6B553702, .rdx = 0xABCD03C4, .rcx = 0x56781234,
+            .rflags = FLAGS_FIXED | FLAG_IF | FLAG_DF | FLAG_CF | (rf ? FLAG_RF : 0) };
+        bool accepted = length == 15 && bound != 2;
+        x86_interrupt_frame_t expected = frame;
+        if (accepted) {
+            uint32_t mask = width == 1 ? 0xFFu : width == 2 ? 0xFFFFu : UINT32_MAX;
+            if (input) expected.rax = (frame.rax & ~mask) |
+                                      ((immediate ? 0x25FFFFFFu : 0x035A2402u) & mask);
+            expected.rip += length;
+            expected.rflags &= ~FLAG_RF;
+        }
+        bool written = accepted && !input;
+        bool ok = dos_native_test_privileged_frame(vm, &frame) == (int)accepted &&
+            !memcmp(&frame, &expected, sizeof(frame)) && !vm->dpmi.exception_depth &&
+            dos_io_read8(vm, 0x83) == (written && immediate && width == 4 ? 0x6B : 0x25) &&
+            dos_io_read8(vm, 0x3C5) == (written && !immediate && width >= 2 ? 0x37 : 0x24) &&
+            dos_io_read8(vm, 0x3C6) == (written && !immediate && width == 4 ? 0x55 : 0x5A);
+        if (!ok) {
+            if (failures < 16) { serial_puts("[DOS-NATIVE-DECODE] case="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    for (unsigned mode = 1; mode <= 2; mode++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned length = 15; length <= 16; length++)
+    for (unsigned bound = 0; bound < 3; bound++)
+    for (unsigned rf = 0; rf < 2; rf++) {
+        dos_step_test_prepare(vm, cpu, mode, 0);
+        vm->emulate_cpu = false;
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        vm->dpmi.pm_vectors[0x60].sel = cpu->cs;
+        vm->dpmi.pm_vectors[0x60].off = 0x6000;
+        for (unsigned b = 0; b < length - 2u; b++) vm->mem[0x1000 + b] = 0x2E;
+        vm->mem[0x1000 + length - 2u] = 0xCD;
+        vm->mem[0x1000 + length - 1u] = 0x60;
+        /* Keep the handler in a separate descriptor when limiting the caller. */
+        dos_test_descriptor(&vm->dpmi, 0x27, true, mode == 2);
+        vm->dpmi.pm_vectors[0x60].sel = 0x27;
+        if (bound) dpmi_desc_set_limit(&vm->dpmi.ldt[1], 0x1000 + length - bound);
+        cpu8086_sync_cs(cpu);
+        cpu8086_sync_data(cpu);
+        x86_interrupt_frame_t frame = { .vector = 13, .error_code = (0x60u << 3) | 2u,
+            .rip = 0x1000, .cs = cpu->cs, .ss = cpu->ss,
+            .rsp = stack32 ? 0x9000u : 0xABCD9000u, .rax = 0x6B553702,
+            .rdx = 0xABCD03C4, .rcx = 0x56781234,
+            .rflags = FLAGS_FIXED | FLAG_IF | FLAG_CF | (rf ? FLAG_RF : 0) };
+        x86_interrupt_frame_t before = frame;
+        bool accepted = length == 15 && bound != 2;
+        int handled = dos_native_test_privileged_frame(vm, &frame);
+        bool ok = handled == (int)accepted && !vm->dpmi.exception_depth;
+        if (!accepted) ok &= !memcmp(&frame, &before, sizeof(frame));
+        else {
+            unsigned width = mode == 2 ? 4u : 2u;
+            uint32_t base = stack32 ? frame.rsp : (uint16_t)frame.rsp;
+            uint32_t saved_ip = width == 4 ? dos_mem_read32(vm, base) : dos_mem_read16(vm, base);
+            uint32_t saved_flags = width == 4 ? dos_mem_read32(vm, base + 2u * width)
+                                            : dos_mem_read16(vm, base + 2u * width);
+            ok &= frame.cs == 0x27 && frame.rip == 0x6000 && frame.ss == before.ss &&
+                  frame.rsp == before.rsp - 3u * width && frame.rax == before.rax &&
+                  frame.rcx == before.rcx && frame.rdx == before.rdx &&
+                  frame.rflags == (before.rflags & ~FLAG_RF) &&
+                  saved_ip == 0x100F && saved_flags == (before.rflags & ~FLAG_RF);
+        }
+        if (!ok) {
+            if (failures < 16) { serial_puts("[DOS-NATIVE-DECODE] case="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    static const struct {
+        uint32_t rip, cursor, limit, base;
+        bool accepted;
+    } fetches[] = {
+        { 0x1000, 14, 0x100E, 0, true }, { 0x1000, 14, 0x100D, 0, false },
+        { 0x1000, 15, 0x100F, 0, false }, { 0x1000, 16, 0x1010, 0, false },
+        { UINT32_MAX, 1, 0xFFFF, 0, false }, { UINT32_MAX - 13u, 14, 0xFFFF, 0, false },
+        { 0, 0, 0, 0, true }, { 16, 0, 0xFFFF, UINT32_MAX - 15u, false }
+    };
+    for (unsigned i = 0; i < sizeof(fetches) / sizeof(fetches[0]); i++) {
+        dpmi_descriptor_t code = {0};
+        uint32_t base = i == 6 ? vm->total_mem_size - 1u : fetches[i].base;
+        dpmi_desc_set_base(&code, base);
+        dpmi_desc_set_limit(&code, fetches[i].limit);
+        vm->mem[0] = vm->mem[0x100E] = vm->mem[0x100F] = vm->mem[0x1010] = 0x71;
+        vm->mem[vm->total_mem_size - 1u] = 0x71;
+        uint8_t value = 0xA5;
+        bool fetched = dos_native_fetch_code_byte(vm, &code, fetches[i].rip, fetches[i].cursor, &value);
+        bool ok = fetched == fetches[i].accepted && value == (fetched ? 0x71 : 0xA5);
+        if (!ok) {
+            if (failures < 16) { serial_puts("[DOS-NATIVE-DECODE] case="); serial_putdec(checks); serial_puts("\n"); }
+            failures++;
+        }
+        checks++;
+    }
+    dos_audio_shutdown(vm);
+    vm->emulate_cpu = true;
+    serial_puts("[DOS-NATIVE-DECODE] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static int dos_rf_software_entry_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    bool emulate = vm->emulate_cpu;
+    unsigned dispatch_depth = vm->native_dispatch_depth, checks = 0;
+    int failures = 0;
+    const uint16_t cs = dpmi_index_to_sel(1), ss = dpmi_index_to_sel(2);
+    const uint16_t target = dpmi_index_to_sel(3);
+    for (unsigned use32 = 0; use32 < 2; use32++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned completed = 0; completed < 2; completed++)
+    for (unsigned frame_kind = 0; frame_kind < 3; frame_kind++)
+    for (unsigned rf = 0; rf < 2; rf++)
+    for (unsigned tf = 0; tf < 2; tf++)
+    for (unsigned policy = 0; policy < 4; policy++) {
+        dos_step_test_prepare(vm, cpu, use32 ? 2u : 1u, 128);
+        dos_test_descriptor(&vm->dpmi, cs, true, use32);
+        dos_test_descriptor(&vm->dpmi, ss, false, stack32);
+        dos_test_descriptor(&vm->dpmi, target, true, use32);
+        vm->emulate_cpu = !completed;
+        vm->native_dispatch_depth = dispatch_depth + 1u;
+        vm->dpmi.active = true;
+        vm->dpmi.is_32bit = use32;
+        vm->dpmi.virtual_interrupts_enabled = stack32;
+        vm->dpmi.pm_vectors[0x60].sel = target;
+        vm->dpmi.pm_vectors[0x60].off = 0x1800;
+        for (unsigned v = 0; v < 3; v++) {
+            unsigned vector = v == 0 ? 12u : v == 1 ? 6u : 1u;
+            vm->dpmi.exception_vectors[vector].sel = cs;
+            vm->dpmi.exception_vectors[vector].off = 0x3000u + v * 0x100u;
+            vm->dpmi.exception_extended[vector] = v == 2 || frame_kind;
+            vm->mem[0x3000u + v * 0x100u] = 0xCB;
+        }
+        cpu->protected_mode = cpu->pm_cs_loaded = true;
+        cpu->cs = cs;
+        cpu->ss = cpu->ds = cpu->es = ss;
+        cpu->eip = completed ? 0x1005 : 0x1000;
+        cpu->esp = stack32 ? 0x9000 : 0xBEEF9000;
+        cpu->eflags = FLAGS_FIXED | FLAG_IF | FLAG_DF | FLAG_CF |
+                      (!completed ? FLAG_RF : 0);
+        dpmi_desc_set_limit(&vm->dpmi.ldt[2], 0x8FFE);
+        cpu8086_sync_cs(cpu);
+        cpu8086_sync_data(cpu);
+        const uint8_t instruction[] = { 0x66, 0x67, 0x3E, 0xCD, 0x60 };
+        memcpy(vm->mem + 0x1000, instruction, sizeof(instruction));
+        vm->mem[0x1800] = 0x43; /* Count only actual software-handler execution. */
+        vm->mem[0x1801] = 0xCF;
+        vm->mem[0x1005] = vm->mem[0x1080] = 0x90;
+        uint32_t original_sp = cpu->esp;
+        unsigned width = use32 ? 4u : 2u;
+        unsigned flag_width = frame_kind == 2 ? 4u : width;
+        uint32_t returned_flags = 0;
+        bool ok = completed ? dpmi_deliver_software_interrupt(vm, 0x60, 0x1005, 0x1005, true, false)
+                            : cpu8086_run_one(vm);
+        for (unsigned attempt = 0; attempt < (policy == 1 ? 2u : 1u); attempt++) {
+            ok &= cpu->running && cpu->eip == 0x3000 && !cpu->ebx &&
+                  vm->dpmi.exception_depth == 1 &&
+                  vm->dpmi.exception_software_entries[0].active == (completed != 0);
+            uint32_t frame = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+            if (use32) ok &= (dos_mem_read32(vm, frame + 5u * width) & FLAG_RF) != 0;
+            if (frame_kind) ok &= (dos_mem_read32(vm, frame + 0x34u) & FLAG_RF) != 0;
+            if (policy == 2) {
+                ok &= dpmi_deliver_exception(vm, 6, 0x3000, 0) && vm->dpmi.exception_depth == 2;
+                if (frame_kind == 2) cpu_stack_adjust(cpu, 32u);
+                ok &= cpu8086_run_one(vm) && cpu8086_run_one(vm) &&
+                      cpu->eip == 0x3000 && vm->dpmi.exception_depth == 1 &&
+                      vm->dpmi.exception_software_entries[0].active == (completed != 0);
+            }
+            uint32_t flags_address = frame + (frame_kind == 2 ? 0x34u : 5u * width);
+            returned_flags = (flag_width == 4 ? dos_mem_read32(vm, flags_address)
+                                             : dos_mem_read16(vm, flags_address));
+            returned_flags = (returned_flags & ~(FLAG_RF | FLAG_TF)) |
+                             (rf && flag_width == 4 ? FLAG_RF : 0) | (tf ? FLAG_TF : 0);
+            if (flag_width == 4) dos_mem_write32(vm, flags_address, returned_flags);
+            else dos_mem_write16(vm, flags_address, returned_flags);
+            if (frame_kind && (frame_kind == 1 || use32))
+                dos_mem_write32(vm, frame + (frame_kind == 2 ? 5u * width : 0x34u),
+                                 returned_flags ^ FLAG_RF);
+            bool retry_fault = policy == 1 && !attempt;
+            if (!retry_fault) dpmi_desc_set_limit(&vm->dpmi.ldt[2], 0xFFFF);
+            if (policy == 3) {
+                uint32_t ip_address = frame + (frame_kind == 2 ? 0x2Cu : 3u * width);
+                if (flag_width == 4) dos_mem_write32(vm, ip_address, 0x1080);
+                else dos_mem_write16(vm, ip_address, 0x1080);
+            }
+            if (frame_kind == 2) cpu_stack_adjust(cpu, 32u);
+            ok &= cpu8086_run_one(vm) && cpu8086_run_one(vm);
+            if (!completed && policy != 3) ok &= cpu8086_run_one(vm);
+        }
+        uint32_t next_ip = policy == 3 ? 0x1080u : 0x1005u;
+        if (policy != 3) {
+            ok &= cpu->cs == target && cpu->eip == 0x1800 && !cpu->ebx &&
+                  cpu->ss == ss && cpu->esp == original_sp - 3u * width &&
+                  !(cpu->eflags & (FLAG_RF | FLAG_TF));
+            uint32_t frame = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+            uint32_t flags = width == 4 ? dos_mem_read32(vm, frame + 2u * width)
+                                       : dos_mem_read16(vm, frame + 2u * width);
+            ok &= flags == ((returned_flags & ~FLAG_RF) & (use32 ? UINT32_MAX : 0xFFFFu));
+            ok &= cpu8086_run_one(vm) && cpu8086_run_one(vm) && cpu->ebx == 1;
+        }
+        ok &= cpu->running && cpu->cs == cs && cpu->eip == next_ip &&
+              cpu->ss == ss && cpu->esp == original_sp && !vm->dpmi.exception_depth &&
+              !vm->dpmi.exception_software_entries[0].active &&
+              !vm->dpmi.exception_software_entries[1].active &&
+              (cpu->eflags & (FLAG_RF | FLAG_TF)) ==
+                  (returned_flags & (FLAG_TF | (policy == 3 ? FLAG_RF : 0)));
+        ok &= cpu8086_run_one(vm);
+        if (tf) {
+            uint32_t frame = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+            ok &= cpu->eip == 0x3200 && vm->dpmi.exception_depth == 1 &&
+                  dos_mem_read32(vm, frame + 0x28u) == 0x8000 &&
+                  dos_mem_read32(vm, frame + 0x2Cu) == next_ip + 1u &&
+                  (dos_mem_read32(vm, frame + 0x34u) & (FLAG_RF | FLAG_TF)) == FLAG_TF;
+        } else ok &= cpu->eip == next_ip + 1u && !(cpu->eflags & FLAG_RF);
+        if (!ok) {
+            if (failures < 16) {
+                serial_puts("[DOS-RF-SOFTWARE] case="); serial_putdec(checks);
+                serial_puts(" flags="); serial_puthex(cpu->eflags, 8);
+                serial_puts(" ip="); serial_puthex(cpu->eip, 8); serial_puts("\n");
+            }
+            failures++;
+        }
+        checks++;
+    }
+    dpmi_init(vm);
+    vm->emulate_cpu = emulate;
+    vm->native_dispatch_depth = dispatch_depth;
+    serial_puts("[DOS-RF-SOFTWARE] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+static bool dos_native_test_service_frame(dos_vm_t *vm, dos_native_regs_t *frame)
+{
+    uint64_t host_flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(host_flags) :: "memory");
+    bool handled = false;
+    if (!g_native_dos_vm) {
+        cpu8086_state_t *cpu = vm->cpu;
+        cpu8086_state_t saved_native = g_native_cpu;
+        cpu8086_state_t *saved_interpreter = g_native_interpreter_cpu;
+        dos_set_native_vm(vm);
+        dos_int_native_dispatch(frame->int_num, frame, NULL);
+        *cpu = g_native_cpu;
+        dos_set_native_vm(NULL);
+        g_native_cpu = saved_native;
+        g_native_interpreter_cpu = saved_interpreter;
+        vm->cpu = cpu;
+        handled = true;
+    }
+    __asm__ volatile ("pushq %0; popfq" :: "r"(host_flags) : "memory", "cc");
+    return handled;
+}
+
+static int dos_rf_native_service_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
+{
+    bool emulate = vm->emulate_cpu;
+    bool timer_pending = vm->timer_irq_pending;
+    uint8_t pic_mask = dos_io_read8(vm, 0x21);
+    unsigned dispatch_depth = vm->native_dispatch_depth, checks = 0;
+    int failures = 0;
+    for (unsigned use32 = 0; use32 < 2; use32++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned segment = 0; segment < 6; segment++)
+    for (unsigned frame_kind = 0; frame_kind < 3; frame_kind++)
+    for (unsigned rf = 0; rf < 2; rf++)
+    for (unsigned tf = 0; tf < 2; tf++)
+    for (unsigned policy = 0; policy < 3; policy++) {
+        dos_step_test_prepare(vm, cpu, use32 ? 2u : 1u, 256);
+        vm->emulate_cpu = false;
+        vm->native_dispatch_depth = 0;
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        dos_test_descriptor(&vm->dpmi, dpmi_index_to_sel(7), true, use32);
+        const uint16_t candidate = dpmi_index_to_sel(6);
+        dos_test_descriptor(&vm->dpmi, candidate, segment == 1,
+                            segment == 2 ? stack32 : use32);
+        *dos_segment_test_sreg(cpu, segment) = candidate;
+        cpu->eip = 0x1002;
+        cpu->esp = stack32 ? 0x9000 : 0xBEEF9000;
+        cpu->eax = 0xA5A50000; cpu->ecx = 1;
+        cpu->ebx = 0x12345678; cpu->edx = 0x87654321;
+        cpu->esi = 0xCAFEBABE; cpu->edi = 0xBEAD1234; cpu->ebp = 0xABCDE123;
+        cpu->eflags = FLAGS_FIXED | FLAG_IF | FLAG_DF | FLAG_CF;
+        cpu8086_sync_cs(cpu); cpu8086_sync_data(cpu);
+        vm->dpmi.virtual_interrupts_enabled = stack32;
+        unsigned vector = segment == 2 ? 12u : 11u;
+        vm->dpmi.exception_vectors[vector].sel = dpmi_index_to_sel(7);
+        vm->dpmi.exception_vectors[vector].off = 0x3000;
+        vm->dpmi.exception_extended[vector] = frame_kind != 0;
+        vm->dpmi.exception_vectors[3].sel = dpmi_index_to_sel(7);
+        vm->dpmi.exception_vectors[3].off = 0x3800;
+        vm->dpmi.exception_vectors[1].sel = dpmi_index_to_sel(7);
+        vm->dpmi.exception_vectors[1].off = 0x3900;
+        vm->dpmi.exception_extended[1] = true;
+        (void)dpmi_get_exception_stack_selector(vm);
+        unsigned allocated = 0;
+        for (unsigned i = 0; i < DPMI_MAX_DESCRIPTORS; i++)
+            allocated += vm->dpmi.descriptor_state[i] == DPMI_DESC_MUTABLE;
+        uint16_t rights = vm->dpmi.ldt[6].access | ((vm->dpmi.ldt[6].flags_lim & 0xF0u) << 8);
+        vm->dpmi.ldt[6].access &= ~DESC_PRESENT;
+        dos_mem_write32(vm, 0x8000, 0); dos_mem_write32(vm, 0x8004, 0);
+        vm->mem[0x1002] = vm->mem[0x1080] = 0x90;
+        unsigned width = use32 ? 4u : 2u;
+        unsigned flag_width = frame_kind == 2 ? 4u : width;
+        uint32_t expected_flags = FLAGS_FIXED | FLAG_IF | FLAG_DF | FLAG_CF | FLAG_ZF |
+                                 (rf && flag_width == 4 ? FLAG_RF : 0) | (tf ? FLAG_TF : 0);
+        uint32_t p = 0x3000;
+#define NS_BYTE(value) (vm->mem[p++] = (uint8_t)(value))
+#define NS_WORD(value) do { dos_mem_write16(vm, p, (value)); p += 2; } while (0)
+#define NS_DWORD(value) do { dos_mem_write32(vm, p, (value)); p += 4; } while (0)
+#define NS_OP32() do { if (!use32) NS_BYTE(0x66); } while (0)
+#define NS_ADDR32() do { if (!use32) NS_BYTE(0x67); } while (0)
+        NS_OP32(); NS_BYTE(0x60); /* PUSHAD preserves the completed allocation result. */
+        NS_OP32(); NS_BYTE(0x1E); /* Save DS before selecting writable test data. */
+        NS_OP32(); NS_BYTE(0x89); NS_BYTE(0xE5);
+        if (use32) NS_BYTE(0x66);
+        NS_BYTE(0xB8); NS_WORD(dpmi_index_to_sel(2)); NS_BYTE(0x8E); NS_BYTE(0xD8);
+        NS_OP32(); NS_ADDR32(); NS_BYTE(0xFF); NS_BYTE(0x05); NS_DWORD(0x8000);
+        unsigned fields[] = { 3u * width, 5u * width, 0x30u, 0x34u };
+        for (unsigned i = 0; i < (frame_kind ? 4u : 2u); i++) {
+            bool wide = i >= 2 || use32;
+            NS_BYTE(0x36); if (wide != use32) NS_BYTE(0x66);
+            NS_ADDR32(); NS_BYTE(0x8B); NS_BYTE(0x45); NS_BYTE(36u + fields[i]);
+            if (wide != use32) NS_BYTE(0x66);
+            NS_ADDR32(); NS_BYTE(0xA3); NS_DWORD(0x8010 + i * 4u);
+        }
+        if (policy == 1) NS_BYTE(0xCC);
+        const uint8_t opcodes[] = { 0xB8, 0xBB, 0xB9 };
+        const uint16_t operands[] = { 9, candidate, rights };
+        for (unsigned i = 0; i < 3; i++) {
+            if (use32) NS_BYTE(0x66);
+            NS_BYTE(opcodes[i]); NS_WORD(operands[i]);
+        }
+        NS_BYTE(0xCD); NS_BYTE(0x31);
+        unsigned flag_offsets[] = { frame_kind == 2 ? 0x34u : 5u * width,
+                                    frame_kind == 2 ? 5u * width : 0x34u };
+        for (unsigned i = 0; i < (frame_kind ? 2u : 1u); i++) {
+            unsigned size = i ? (frame_kind == 2 ? width : 4u) : flag_width;
+            NS_BYTE(0x36); if ((size == 4) != use32) NS_BYTE(0x66);
+            NS_ADDR32(); NS_BYTE(0xC7); NS_BYTE(0x45); NS_BYTE(36u + flag_offsets[i]);
+            uint32_t flags = expected_flags ^ (i ? FLAG_RF | FLAG_TF | FLAG_ZF : 0);
+            if (size == 4) NS_DWORD(flags); else NS_WORD(flags);
+        }
+        if (policy == 2) {
+            NS_BYTE(0x36); if ((flag_width == 4) != use32) NS_BYTE(0x66);
+            NS_ADDR32(); NS_BYTE(0xC7); NS_BYTE(0x45);
+            NS_BYTE(36u + (frame_kind == 2 ? 0x2Cu : 3u * width));
+            if (flag_width == 4) NS_DWORD(0x1080); else NS_WORD(0x1080);
+            if (frame_kind == 2) {
+                NS_BYTE(0x36); NS_OP32(); NS_ADDR32(); NS_BYTE(0x81); NS_BYTE(0x4D);
+                NS_BYTE(36u + 0x30u); NS_DWORD(DPMI_EXCEPTION_REDIRECT << 16);
+            }
+        }
+        NS_OP32(); NS_BYTE(0x1F); NS_OP32(); NS_BYTE(0x61);
+        if (frame_kind == 2) { NS_BYTE(0x83); NS_BYTE(0xC4); NS_BYTE(32); }
+        NS_BYTE(0xCB);
+        bool ok = p < 0x3800;
+        p = 0x3800;
+        NS_OP32(); NS_ADDR32(); NS_BYTE(0xFF); NS_BYTE(0x05); NS_DWORD(0x8004);
+        NS_BYTE(0xCB);
+#undef NS_ADDR32
+#undef NS_OP32
+#undef NS_DWORD
+#undef NS_WORD
+#undef NS_BYTE
+        dos_native_regs_t frame = { .int_num = 0x31,
+            .rax = cpu->eax, .rbx = cpu->ebx, .rcx = cpu->ecx, .rdx = cpu->edx,
+            .rsi = cpu->esi, .rdi = cpu->edi, .rbp = cpu->ebp,
+            .ds = cpu->ds, .es = cpu->es, .fs = cpu->fs, .gs = cpu->gs,
+            .iret_rip = cpu->eip, .iret_cs = cpu->cs, .iret_ss = cpu->ss,
+            .iret_rsp = cpu->esp, .iret_rflags = cpu->eflags };
+        dos_native_regs_t expected = frame;
+        ok &= dos_native_test_service_frame(vm, &frame);
+        unsigned remaining = 0;
+        for (unsigned i = 0; i < DPMI_MAX_DESCRIPTORS; i++)
+            remaining += vm->dpmi.descriptor_state[i] == DPMI_DESC_MUTABLE;
+        expected.rax = frame.rax;
+        expected.iret_rip = policy == 2 ? 0x1080 : 0x1002;
+        expected.iret_rflags = expected_flags;
+        ok &= remaining == allocated + 1 && (frame.rax >> 16) == 0xA5A5 &&
+              (frame.rax & 7u) == 7u && (uint16_t)frame.rax / 8u < DPMI_MAX_DESCRIPTORS &&
+              vm->dpmi.descriptor_state[(uint16_t)frame.rax / 8u] == DPMI_DESC_MUTABLE &&
+              !memcmp(&frame, &expected, sizeof(frame)) && cpu->eflags == expected_flags &&
+              dos_mem_read32(vm, 0x8000) == 1 && dos_mem_read32(vm, 0x8004) == (policy == 1) &&
+              dos_mem_read16(vm, 0x8010) == 0x1002 && !(dos_mem_read16(vm, 0x8014) & FLAG_CF) &&
+              (!use32 || (dos_mem_read32(vm, 0x8014) & FLAG_RF)) &&
+              (!frame_kind || ((dos_mem_read32(vm, 0x8018) >> 16) == DPMI_EXCEPTION_HOST &&
+                               (dos_mem_read32(vm, 0x801C) & FLAG_RF))) &&
+              cpu->running && !cpu->halted && !vm->dpmi.exception_depth &&
+              !vm->dpmi.host_wait && !vm->native_dispatch_depth &&
+              !vm->interpreter_stop_signal && !vm->software_int_frame_bytes &&
+              vm->dpmi.virtual_interrupts_enabled == (stack32 != 0);
+        ok &= cpu8086_run_one(vm);
+        if (tf) {
+            uint32_t address = dos_addr(vm, cpu->ss, cpu_stack_offset(cpu));
+            ok &= cpu->eip == 0x3900 && vm->dpmi.exception_depth == 1 &&
+                  dos_mem_read32(vm, address + 0x28u) == 0x8000 &&
+                  dos_mem_read32(vm, address + 0x2Cu) == expected.iret_rip + 1u &&
+                  dos_mem_read32(vm, address + 0x34u) == (expected_flags & ~FLAG_RF);
+        } else ok &= cpu->eip == expected.iret_rip + 1u && !(cpu->eflags & FLAG_RF);
+        if (!ok) {
+            if (failures < 16) {
+                serial_puts("[DOS-RF-NATIVE-SERVICE] case="); serial_putdec(checks);
+                serial_puts(" flags="); serial_puthex(frame.iret_rflags, 8);
+                serial_puts(" expected="); serial_puthex(expected_flags, 8);
+                serial_puts(" ip="); serial_puthex(frame.iret_rip, 8);
+                serial_puts(" allocations="); serial_putdec(remaining - allocated);
+                serial_puts("\n");
+            }
+            failures++;
+        }
+        checks++;
+    }
+    /* A native INT is a completed instruction boundary, not a continuation
+     * of the previously mediated STI or REP iteration. */
+    for (unsigned use32 = 0; use32 < 2; use32++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned enabled = 0; enabled < 2; enabled++)
+    for (unsigned masked = 0; masked < 2; masked++)
+    for (unsigned stale = 0; stale < 2; stale++) {
+        dos_step_test_prepare(vm, cpu, use32 ? 2u : 1u, 256);
+        vm->emulate_cpu = false;
+        vm->native_dispatch_depth = 0;
+        vm->dpmi.virtual_interrupts_enabled = enabled != 0;
+        dos_test_descriptor(&vm->dpmi, cpu->ss, false, stack32);
+        dos_test_descriptor(&vm->dpmi, dpmi_index_to_sel(7), true, use32);
+        cpu->eip = 0x1002;
+        cpu->esp = stack32 ? 0x9000u : 0xBEEF9000u;
+        cpu->eax = 0xA5A50902u;
+        cpu->ebx = 0x12345678u; cpu->ecx = 0x87654321u;
+        cpu->edx = 0xCAFEBABEu; cpu->esi = 0xBEAD1234u;
+        cpu->edi = 0xABCDEF12u; cpu->ebp = 0xFEDCBA98u;
+        cpu->eflags = FLAGS_FIXED | FLAG_IF | FLAG_DF | FLAG_CF | FLAG_ZF;
+        cpu8086_sync_cs(cpu); cpu8086_sync_data(cpu);
+        cpu->irq_shadow = stale;
+        cpu->rep_compare.active = stale != 0;
+        vm->mem[0x1002] = 0xF4; /* The completed service must not run its caller. */
+        vm->mem[0x7000] = 0xCF;
+        vm->dpmi.pm_vectors[8].sel = dpmi_index_to_sel(7);
+        vm->dpmi.pm_vectors[8].off = 0x7000;
+        dos_io_write8(vm, 0x20, 0x20);
+        dos_io_write8(vm, 0x21, masked ? 0xFF : 0xFE);
+        vm->timer_irq_pending = true;
+        dos_native_regs_t frame = { .int_num = 0x31,
+            .rax = cpu->eax, .rbx = cpu->ebx, .rcx = cpu->ecx, .rdx = cpu->edx,
+            .rsi = cpu->esi, .rdi = cpu->edi, .rbp = cpu->ebp,
+            .ds = cpu->ds, .es = cpu->es, .fs = cpu->fs, .gs = cpu->gs,
+            .iret_rip = cpu->eip, .iret_cs = cpu->cs, .iret_ss = cpu->ss,
+            .iret_rsp = cpu->esp, .iret_rflags = cpu->eflags };
+        dos_native_regs_t expected = frame;
+        expected.rax = 0xA5A50900u | enabled;
+        expected.iret_rflags &= ~FLAG_CF;
+        bool ok = dos_native_test_service_frame(vm, &frame) &&
+                  !cpu->irq_shadow && !cpu->rep_compare.active;
+        bool delivered = enabled && !masked;
+        if (delivered) {
+            const dpmi_interrupt_frame_t *irq = &vm->dpmi.interrupt_frames[0];
+            bool admitted = vm->dpmi.interrupt_depth == 1 && !vm->timer_irq_pending &&
+                !vm->dpmi.virtual_interrupts_enabled &&
+                cpu->cs == dpmi_index_to_sel(7) && cpu->eip == 0x7000 &&
+                irq->cs == expected.iret_cs && irq->eip == expected.iret_rip &&
+                irq->caller.ss == expected.iret_ss && irq->caller.esp == expected.iret_rsp;
+            ok &= admitted;
+            frame.iret_cs = expected.iret_cs; frame.iret_rip = expected.iret_rip;
+            frame.iret_ss = expected.iret_ss; frame.iret_rsp = expected.iret_rsp;
+            frame.iret_rflags = expected.iret_rflags;
+            if (admitted)
+                ok &= dos_test_run_until(vm, true, (uint16_t)expected.iret_cs,
+                                         (uint32_t)expected.iret_rip);
+        } else {
+            ok &= vm->timer_irq_pending && !vm->dpmi.interrupt_depth;
+        }
+        ok &= !memcmp(&frame, &expected, sizeof(frame)) && cpu->running && !cpu->halted &&
+              cpu->cs == expected.iret_cs && cpu->eip == expected.iret_rip &&
+              cpu->ss == expected.iret_ss && cpu->esp == expected.iret_rsp &&
+              cpu->eflags == expected.iret_rflags &&
+              vm->dpmi.virtual_interrupts_enabled == (enabled != 0) &&
+              !vm->dpmi.interrupt_depth && !vm->dpmi.exception_depth &&
+              !vm->dpmi.host_wait && !vm->native_dispatch_depth && !vm->step_limit_reached;
+        if (!ok) {
+            serial_puts("[DOS-RF-NATIVE-SERVICE] boundary case="); serial_putdec(checks);
+            serial_puts(" shadow="); serial_putdec(cpu->irq_shadow);
+            serial_puts(" rep="); serial_putdec(cpu->rep_compare.active);
+            serial_puts(" pending="); serial_putdec(vm->timer_irq_pending);
+            serial_puts(" ip="); serial_puthex(cpu->eip, 8);
+            serial_puts("\n");
+            failures++;
+        }
+        checks++;
+    }
+    dpmi_init(vm);
+    vm->emulate_cpu = emulate;
+    vm->native_dispatch_depth = dispatch_depth;
+    vm->timer_irq_pending = timer_pending;
+    dos_io_write8(vm, 0x20, 0x20);
+    dos_io_write8(vm, 0x21, pic_mask);
+    serial_puts("[DOS-RF-NATIVE-SERVICE] checks="); serial_putdec(checks);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+    return failures;
+}
+
+int dos_cpu_rf_selftest(void)
+{
+    unsigned pages = (2u * 1024u * 1024u) / 4096u;
+    uint8_t *memory = dos_host_alloc_pages(pages);
+    if (!memory) return 1;
+    memset(memory, 0, pages * 4096u);
+    dos_vm_t vm = { .mem = memory, .total_mem_size = pages * 4096u };
+    cpu8086_state_t cpu;
+    vm.cpu = &cpu;
+    dos_init_ivt(&vm);
+    int failures = 1;
+    if (dos_io_init(&vm)) {
+        failures = dos_rf_instruction_selftest(&vm, &cpu);
+        failures += dos_rf_string_selftest(&vm, &cpu);
+        failures += dos_rf_jit_selftest(&vm, &cpu);
+        failures += dos_rf_boundary_selftest(&vm, &cpu);
+        failures += dos_rf_dpmi_selftest(&vm, &cpu);
+        failures += dos_rf_dpmi_interrupt_selftest(&vm, &cpu);
+        failures += dos_rf_native_io_selftest(&vm, &cpu);
+        failures += dos_native_decode_selftest(&vm, &cpu);
+        failures += dos_native_irq_return_selftest(&vm, &cpu);
+        failures += dos_rf_software_entry_selftest(&vm, &cpu);
+        failures += dos_rf_native_service_selftest(&vm, &cpu);
+        dos_io_shutdown(&vm);
+    }
+    dos_host_free_pages(memory, pages);
+    return failures;
+}
+
 static int dos_flags_stack_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
 {
     const uint32_t patterns[] = { 0, UINT32_MAX, 0xAAAAAAAA, 0x55555555 };
@@ -13865,6 +15946,7 @@ static int dos_flags_stack_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
     for (unsigned pop = 0; pop < 2; pop++) {
         bool ok = dos_flags_test_prepare(vm, cpu, mode, stack32, cpl);
         uint32_t old = ((~patterns[pattern] & 0x003C4FD5u) | FLAGS_FIXED | FLAG_RF | (iopl << 12));
+        if (!mode) dos_mem_write32(vm, 4, 0x4010);
         if (mode == 3) old |= FLAG_VM;
         cpu->eflags = old;
         /* An installed guest IDT must not borrow a suspended host's IF. */
@@ -13883,17 +15965,23 @@ static int dos_flags_stack_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
             faults++;
         } else {
             uint32_t expected = pop ? dos_flags_test_pop(old, patterns[pattern], width,
-                                                        mode == 3 ? 3u : cpl) : old;
-            ok &= cpu->eip == p && cpu->cs == before.cs && cpu->ss == before.ss &&
+                                                        mode == 3 ? 3u : cpl) : old & ~FLAG_RF;
+            if (old & FLAG_TF) {
+                cpu8086_state_t retired = before;
+                retired.eip = p;
+                retired.esp += pop ? width : -width;
+                retired.eflags = expected;
+                ok &= dos_trace_test_frame(vm, &retired, 1, true);
+            } else ok &= cpu->eip == p && cpu->cs == before.cs && cpu->ss == before.ss &&
                   cpu->esp == before.esp + (pop ? width : -width) &&
-                  (cpu->eflags & ~FLAG_RF) == (expected & ~FLAG_RF) &&
-                  (!pop || !(cpu->eflags & FLAG_RF)) && !cpu->irq_shadow &&
+                  cpu->eflags == expected && !cpu->irq_shadow &&
                   dos_test_general_registers(cpu, &before);
             if (!pop) ok &= dos_idt_test_read(vm, 0x29000u - width, width) ==
                 ((old & ~(FLAG_RF | FLAG_VM)) & (width == 4 ? UINT32_MAX : 0xFFFFu));
         }
-        ok &= dos_mem_read32(vm, 0x29000) == patterns[pattern] &&
-              vm->dpmi.virtual_interrupts_enabled == host_if && cpu->cr2 == before.cr2;
+        if (!pop || !(old & FLAG_TF) || failed)
+            ok &= dos_mem_read32(vm, 0x29000) == patterns[pattern];
+        ok &= vm->dpmi.virtual_interrupts_enabled == host_if && cpu->cr2 == before.cr2;
         if (!ok) {
             if (failures < 8) { serial_puts("[DOS-FLAGS-STACK] case="); serial_putdec(checks);
                 serial_puts(" flags="); serial_puthex(cpu->eflags, 8);
@@ -14095,7 +16183,7 @@ static int dos_flags_paging_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         if (!failed || vector == 14) {
             ok &= cpu->eip == p && cpu->cs == before.cs && cpu->ss == before.ss &&
                   cpu->esp == resumed_sp + (pop ? width : -width) &&
-                  (cpu->eflags & ~FLAG_RF) == (expected_flags & ~FLAG_RF) &&
+                  cpu->eflags == expected_flags &&
                   dos_test_general_registers(cpu, &before);
             if (!pop) for (unsigned i = 0; i < width; i++)
                 bytes[4095u + i] = (before.eflags & ~(FLAG_RF | FLAG_VM)) >> (i * 8u);
@@ -14370,7 +16458,7 @@ static int dos_real_idt_fault_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         if (fatal) {
             stopped++;
             ok = !cpu->running && cpu->exit_code == -1 && cpu->esp == before.esp &&
-                 cpu->cs == before.cs && cpu->eflags == before.eflags && !cpu->delivery_fault;
+                 cpu->cs == before.cs && cpu->eflags == (before.eflags & ~FLAG_RF) && !cpu->delivery_fault;
             for (unsigned i = 1; i <= 6; i++) {
                 uint32_t offset = (before.esp - i) & mask;
                 if (offset < 0x20000 && vm->mem[0x20000 + offset] != 0xA5) ok = false;
@@ -14743,6 +16831,18 @@ static int dos_string_io_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
     unsigned checks = 0;
     int failures = 0;
     if (!dos_io_init(vm)) return 1;
+    failures += dos_rf_instruction_selftest(vm, cpu);
+    failures += dos_rf_string_selftest(vm, cpu);
+    failures += dos_rf_jit_selftest(vm, cpu);
+    failures += dos_rf_boundary_selftest(vm, cpu);
+    failures += dos_rf_dpmi_selftest(vm, cpu);
+    failures += dos_rf_dpmi_interrupt_selftest(vm, cpu);
+    failures += dos_rf_native_io_selftest(vm, cpu);
+    failures += dos_native_decode_selftest(vm, cpu);
+    failures += dos_native_irq_return_selftest(vm, cpu);
+    failures += dos_rf_software_entry_selftest(vm, cpu);
+    failures += dos_rf_native_service_selftest(vm, cpu);
+    failures += dos_trace_retirement_selftest(vm, cpu);
     failures += dos_flags_stack_selftest(vm, cpu);
     failures += dos_flags_interrupt_selftest(vm, cpu);
     failures += dos_flags_lock_selftest(vm, cpu);
@@ -14809,13 +16909,13 @@ static int dos_string_io_selftest(dos_vm_t *vm, cpu8086_state_t *cpu)
         uint32_t advanced = (adr32 ? 0 : 0x56780000u) |
                              (0x4800u + done * delta);
         if (cpu->eip != (done < count ? 0x1000u : p) ||
-            cpu->ecx != expected_count || cpu->eflags != flags ||
+            cpu->ecx != expected_count || cpu->eflags != (flags | (done < count ? FLAG_RF : 0)) ||
             cpu->eax != 0xA1B2C3D4u || cpu->edx != 0xBAD003C9u ||
             (input ? cpu->edi : cpu->esi) != advanced ||
             (input ? cpu->esi : cpu->edi) != ((adr32 ? 0 : 0x56780000u) | 0x4800u))
             ok = false;
         if (done < count && ok) {
-            if (!dos_test_run_one(vm) || cpu->eip != p ||
+            if (!dos_test_run_one(vm) || cpu->eip != p || cpu->eflags != flags ||
                 cpu->ecx != (adr32 ? 0 : 0x12340000u) ||
                 (input ? cpu->edi : cpu->esi) !=
                     ((adr32 ? 0 : 0x56780000u) | (0x4800u + count * delta))) ok = false;
@@ -15009,6 +17109,7 @@ int dos_interrupt_selftest(void)
     for (uint64_t i = 0; i < pages * 4096u; i++) memory[i] = 0;
     dos_init_ivt(&vm);
     cpu8086_init(&cpu, &vm);
+    cpu.cr0 |= 4u; /* Explicitly request software emulation, not an absent FPU. */
     vm.timer_irq_pending = false;
     vm.start_ticks = idt_get_ticks();
     vm.last_timer_tick = vm.start_ticks;

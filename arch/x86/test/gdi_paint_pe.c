@@ -92,6 +92,24 @@ static void formats(void)
           "24bpp resources released");
 }
 
+static void screen_dc_contract(void)
+{
+    HANDLE user32 = GetModuleHandleA("user32.dll");
+    HANDLE (CALL *get_dc)(HANDLE) = GetProcAddress(user32, "GetDC");
+    HANDLE (CALL *get_desktop)(void) = GetProcAddress(user32, "GetDesktopWindow");
+    HANDLE (CALL *window_from_dc)(HANDLE) = GetProcAddress(user32, "WindowFromDC");
+    int (CALL *release_dc)(HANDLE, HANDLE) = GetProcAddress(user32, "ReleaseDC");
+    check(get_dc && get_desktop && window_from_dc && release_dc, "screen DC exports");
+    if (!get_dc || !get_desktop || !window_from_dc || !release_dc) return;
+    HANDLE dc = get_dc(0);
+    check(dc && window_from_dc(dc) == get_desktop(), "screen DC belongs to desktop");
+    check(release_dc(0, dc), "screen DC released");
+    dc = get_dc(get_desktop());
+    check(dc && window_from_dc(dc) == get_desktop(), "desktop GetDC owner");
+    check(release_dc(get_desktop(), dc), "desktop DC released");
+    check(!get_dc((HANDLE)(UPTR)0xDEADC0DE), "invalid HWND is not a screen DC");
+}
+
 void mainCRTStartup(void)
 {
     HANDLE dc = CreateCompatibleDC(0);
@@ -195,6 +213,7 @@ void mainCRTStartup(void)
     SelectObject(dc, old_bitmap);
     check(DeleteObject(bitmap) && DeleteDC(dc), "DC and DIB released");
     formats();
+    screen_dc_contract();
     report(failures ? "[GDI-PAINT] FAIL\n" : "[GDI-PAINT] PASS\n");
     ExitProcess(failures ? 3 : 0);
 }

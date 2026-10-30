@@ -14,6 +14,8 @@
 #define OSFS_IO_FLAG_MASK        (OSFS_IO_PRESERVE_MTIME | \
                                   OSFS_IO_PRESERVE_CTIME)
 
+#define OSFS_APPEND_RETRY        (-2)
+
 #define OSFS_DOS_ATTR_READ_ONLY  0x01U
 #define OSFS_DOS_ATTR_HIDDEN     0x02U
 #define OSFS_DOS_ATTR_SYSTEM     0x04U
@@ -40,6 +42,10 @@ int osfs2_file_set_dos_attributes(void *file, uint8_t attributes);
 
 int osfs2_write_ex(void *file, uint64_t offset, const void *buf,
                    uint64_t len, uint32_t io_flags);
+/* Compare EOF and write under the filesystem mutation lock. A changed EOF
+ * returns OSFS_APPEND_RETRY without writing, so callers can recheck locks. */
+int osfs2_append_ex(void *file, uint64_t expected_size, const void *buf,
+                    uint64_t len, uint32_t io_flags);
 int osfs2_truncate_ex(void *file, uint64_t size, uint32_t io_flags);
 
 #endif /* OSITOFS_METADATA_H */

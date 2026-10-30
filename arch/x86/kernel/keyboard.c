@@ -3,11 +3,12 @@
  *
  * X-OS8: Scancode set 1 → ASCII translation, ring buffer, IRQ 1.
  * Uses the 8042 PS/2 controller (standard in QEMU q35).
- * IRQ 1 → IDT vector 33 (32 + IRQ number).
+ * IRQ 1 uses PIC vector 0x71; the shared receive path also drains AUX.
  */
 
 #include "../include/types.h"
 #include "../include/input_events.h"
+#include "../drivers/ps2.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -15,6 +16,8 @@ extern void serial_puts(const char *s);
 
 /* xHCI USB polling (weak: works without xHCI driver) */
 extern void xhci_poll(void) __attribute__((weak));
+extern void win32_post_keyboard_scan(uint16_t scan, int key_up)
+    __attribute__((weak));
 
 /* Compositor state (weak: absent if compositor not compiled) */
 extern bool compositor_is_running(void) __attribute__((weak));
@@ -23,14 +26,7 @@ extern bool compositor_is_running(void) __attribute__((weak));
  * The weak declaration preserves the early-boot polling fallback. */
 extern int sched_sleep_ticks(uint64_t ticks) __attribute__((weak));
 extern bool sched_is_enabled(void) __attribute__((weak));
-
-/* ── PS/2 ports ──────────────────────────────────────────────── */
-
-#define KB_DATA_PORT    0x60
-#define KB_STATUS_PORT  0x64
-#define KB_CMD_PORT     0x64
-
-#define KB_STATUS_OBF   0x01  /* Output buffer full (data ready) */
+extern bool terminal_control_key(unsigned char key) __attribute__((weak));
 
 /* ── Ring buffer ─────────────────────────────────────────────── */
 
@@ -90,6 +86,7 @@ static const char sc_shifted[128] = {
 
 void kb_push(char c)
 {
+    if (terminal_control_key && terminal_control_key((unsigned char)c)) return;
     uint32_t next = (kb_head + 1) % KB_BUF_SIZE;
     if (next != kb_tail) {  /* Not full */
         kb_buf[kb_head] = c;
@@ -211,27 +208,100 @@ static void kb_process_scancode(uint8_t sc, bool emit)
     if (c) kb_push(c);
 }
 
-/* ── IRQ 1 handler (called from IDT vector 33) ──────────────── */
+/* Set-1 is a transport encoding, not the HID usage namespace consumed by
+ * the compositor and native applications. Keep prefix state independent of
+ * the console injector, which may run on another input path. */
+static bool kb_hw_extended;
+static uint8_t kb_hw_pause;
+
+static const uint8_t set1_hid[128] = {
+    [0x01]=0x29, [0x02]=0x1E, [0x03]=0x1F, [0x04]=0x20, [0x05]=0x21,
+    [0x06]=0x22, [0x07]=0x23, [0x08]=0x24, [0x09]=0x25, [0x0A]=0x26,
+    [0x0B]=0x27, [0x0C]=0x2D, [0x0D]=0x2E, [0x0E]=0x2A, [0x0F]=0x2B,
+    [0x10]=0x14, [0x11]=0x1A, [0x12]=0x08, [0x13]=0x15, [0x14]=0x17,
+    [0x15]=0x1C, [0x16]=0x18, [0x17]=0x0C, [0x18]=0x12, [0x19]=0x13,
+    [0x1A]=0x2F, [0x1B]=0x30, [0x1C]=0x28, [0x1D]=0xE0, [0x1E]=0x04,
+    [0x1F]=0x16, [0x20]=0x07, [0x21]=0x09, [0x22]=0x0A, [0x23]=0x0B,
+    [0x24]=0x0D, [0x25]=0x0E, [0x26]=0x0F, [0x27]=0x33, [0x28]=0x34,
+    [0x29]=0x35, [0x2A]=0xE1, [0x2B]=0x31, [0x2C]=0x1D, [0x2D]=0x1B,
+    [0x2E]=0x06, [0x2F]=0x19, [0x30]=0x05, [0x31]=0x11, [0x32]=0x10,
+    [0x33]=0x36, [0x34]=0x37, [0x35]=0x38, [0x36]=0xE5, [0x37]=0x55,
+    [0x38]=0xE2, [0x39]=0x2C, [0x3A]=0x39, [0x3B]=0x3A, [0x3C]=0x3B,
+    [0x3D]=0x3C, [0x3E]=0x3D, [0x3F]=0x3E, [0x40]=0x3F, [0x41]=0x40,
+    [0x42]=0x41, [0x43]=0x42, [0x44]=0x43, [0x45]=0x53, [0x46]=0x47,
+    [0x47]=0x5F, [0x48]=0x60, [0x49]=0x61, [0x4A]=0x56, [0x4B]=0x5C,
+    [0x4C]=0x5D, [0x4D]=0x5E, [0x4E]=0x57, [0x4F]=0x59, [0x50]=0x5A,
+    [0x51]=0x5B, [0x52]=0x62, [0x53]=0x63, [0x54]=0x46, [0x56]=0x64,
+    [0x57]=0x44, [0x58]=0x45,
+};
+
+static const uint8_t set1_e0_hid[128] = {
+    [0x1C]=0x58, [0x1D]=0xE4, [0x35]=0x54, [0x37]=0x46, [0x38]=0xE6,
+    [0x46]=0x48, [0x47]=0x4A, [0x48]=0x52, [0x49]=0x4B, [0x4B]=0x50,
+    [0x4D]=0x4F, [0x4F]=0x4D, [0x50]=0x51, [0x51]=0x4E, [0x52]=0x49,
+    [0x53]=0x4C, [0x5B]=0xE3, [0x5C]=0xE7, [0x5D]=0x65,
+};
+
+static uint8_t kb_decode_hw(uint8_t sc, bool *extended, bool *pulse)
+{
+    static const uint8_t pause[] = {0xE1,0x1D,0x45,0xE1,0x9D,0xC5};
+    *extended = false;
+    *pulse = false;
+    if (kb_hw_pause) {
+        if (sc == pause[kb_hw_pause]) {
+            if (++kb_hw_pause < sizeof(pause)) return 0;
+            kb_hw_pause = 0;
+            *pulse = true; /* Pause has no separate break sequence. */
+            return 0x48;
+        }
+        kb_hw_pause = 0; /* A truncated sequence must not eat the next key. */
+    }
+    if (sc == 0xE1) {
+        kb_hw_extended = false;
+        kb_hw_pause = 1;
+        return 0;
+    }
+    if (sc == 0xE0) {
+        kb_hw_extended = true;
+        return 0;
+    }
+    *extended = kb_hw_extended;
+    kb_hw_extended = false;
+    /* E0 fake Shift bytes around PrintScreen/navigation are deliberately
+     * unmapped. ACK/RESEND/error bytes have no entry in either table. */
+    return (*extended ? set1_e0_hid : set1_hid)[sc & 0x7F];
+}
+
+/* Physical keyboard bytes, after the i8042 source/status check. */
+
+void kb_handle_hw_byte(uint8_t sc)
+{
+    bool captured = input_keyboard_post_set1(&sc, 1);
+    bool extended, pulse;
+    uint8_t usage = kb_decode_hw(sc, &extended, &pulse);
+    if (!usage) return;
+
+    bool emit = !captured &&
+        !(compositor_is_running && compositor_is_running());
+    if (usage != 0x48) {
+        if (extended) kb_process_scancode(0xE0, emit);
+        kb_process_scancode(sc, emit);
+    }
+    if (captured) return; /* DOS retains the untouched set-1 byte stream. */
+    input_post_key(usage, pulse || !(sc & 0x80), extended);
+    if (pulse) input_post_key(usage, false, false);
+    /* Submit decoded transitions atomically; a second keyboard must not
+     * inherit this transport's E0/E1 prefix state. DOS owns captured bytes. */
+    if (win32_post_keyboard_scan) {
+        uint16_t scan = pulse ? 0xE145 : (extended ? 0xE000 : 0) | (sc & 0x7F);
+        win32_post_keyboard_scan(scan, pulse ? 0 : (sc & 0x80) != 0);
+        if (pulse) win32_post_keyboard_scan(scan, 1);
+    }
+}
 
 void keyboard_irq(void)
 {
-    uint8_t sc = inb(KB_DATA_PORT);
-    if (input_keyboard_post_set1(&sc, 1)) {
-        kb_process_scancode(sc, false);
-        return;
-    }
-    /* Post to input event system for USB games / compositor key_ring.
-     * Only from hardware IRQ — kb_inject_scancode must NOT re-post
-     * or we get an infinite loop. Skip 0xE0 prefix byte. */
-    if (sc != 0xE0) {
-        extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
-        input_post_key(sc & 0x7F, !(sc & 0x80), false);
-    }
-    /* When compositor is running it owns all input routing — it converts
-     * events and pushes to kb_buf for the terminal when appropriate.
-     * Without compositor (bare shell), process directly. */
-    if (!(compositor_is_running && compositor_is_running()))
-        kb_process_scancode(sc, true);
+    ps2_irq();
 }
 
 /* ── Inject scancode from compositor (no I/O port read) ──────── */
@@ -243,8 +313,8 @@ void kb_inject_scancode(uint8_t sc)
 
 /* ── Public API ──────────────────────────────────────────────── */
 
-/* Read one character (blocking) */
-char kb_getchar(void)
+/* Only prompt readers opt into cancellation; normal input remains blocking. */
+int kb_getchar_interruptible(bool (*cancel)(void *), void *context)
 {
     bool restore_interrupts = false;
     if (kb_head == kb_tail && sched_is_enabled && sched_is_enabled()) {
@@ -266,6 +336,7 @@ char kb_getchar(void)
          * When compositor runs, it calls xhci_poll() every frame and
          * pushes chars via kb_push(); shell just waits to be woken. */
         if (!(compositor_is_running && compositor_is_running())) {
+            ps2_poll();
             if (xhci_poll) xhci_poll();
         }
         if (kb_head != kb_tail) break;
@@ -275,10 +346,17 @@ char kb_getchar(void)
             extern int serial_getc(void);
             int sc = serial_getc();
             if (sc >= 0) {
+                if (terminal_control_key && terminal_control_key((unsigned char)sc))
+                    continue;
                 if (restore_interrupts)
                     __asm__ volatile ("cli" ::: "memory");
-                return (char)sc;
+                return (unsigned char)sc;
             }
+        }
+        if (cancel && cancel(context)) {
+            if (restore_interrupts)
+                __asm__ volatile ("cli" ::: "memory");
+            return -1;
         }
         /* COM1 RX interrupts are disabled, so wake periodically to poll. A
          * single 10 ms tick keeps console input responsive without issuing
@@ -296,10 +374,16 @@ char kb_getchar(void)
     }
 
     char c = kb_buf[kb_tail];
+    kb_buf[kb_tail] = 0;
     kb_tail = (kb_tail + 1) % KB_BUF_SIZE;
     if (restore_interrupts)
         __asm__ volatile ("cli" ::: "memory");
-    return c;
+    return (unsigned char)c;
+}
+
+char kb_getchar(void)
+{
+    return (char)kb_getchar_interruptible(NULL, NULL);
 }
 
 /* Read one character (non-blocking, returns 0 if empty) */
@@ -307,6 +391,7 @@ char kb_trygetchar(void)
 {
     if (kb_head == kb_tail) return 0;
     char c = kb_buf[kb_tail];
+    kb_buf[kb_tail] = 0;
     kb_tail = (kb_tail + 1) % KB_BUF_SIZE;
     return c;
 }
@@ -351,14 +436,10 @@ void kb_init(void)
     kb_alt = false;
     kb_caps = false;
 
-    /* Flush any pending data */
-    while (inb(KB_STATUS_PORT) & KB_STATUS_OBF)
-        inb(KB_DATA_PORT);
-
-    /* Enable keyboard IRQ (unmask IRQ 1 in PIC) */
-    uint8_t mask = inb(0x21);
-    mask &= ~(1 << 1);  /* Clear bit 1 = unmask IRQ 1 */
-    outb(0x21, mask);
+    kb_extended = false;
+    kb_hw_extended = false;
+    kb_hw_pause = 0;
+    ps2_init();
 
     serial_puts("[KB] PS/2 keyboard ready (IRQ 1 → vector 0x71)\n");
 }

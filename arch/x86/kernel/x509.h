@@ -59,6 +59,11 @@ int x509_extract_ec_pubkey_from_msg(const uint8_t *cert_msg, uint32_t msg_len,
 int x509_verify_chain_link(const uint8_t *child_cert,  uint32_t child_len,
                            const uint8_t *issuer_cert, uint32_t issuer_len);
 
+/* Authenticode compatibility: additionally permits RSA/SHA-1 certificate
+ * signatures. TLS continues to use x509_verify_chain_link(). */
+int x509_verify_chain_link_legacy(const uint8_t *child_cert, uint32_t child_len,
+                                  const uint8_t *issuer_cert, uint32_t issuer_len);
+
 /* Verify an arbitrary ASN.1 signed object using an X.509 signer's SPKI.
  * `signature_algorithm` is the complete AlgorithmIdentifier TLV and `tbs`
  * includes the complete signed TLV. */

@@ -18,9 +18,27 @@ extern int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
                             uint16_t src_port);
 extern void net_tcp_close(int conn);
 extern int  net_tcp_state(int conn);
+extern int  net_tcp_send(int conn, const void *data, uint32_t len);
+extern int  net_tcp_recv_timeout(int conn, void *data, uint32_t len,
+                                  uint32_t timeout_ticks);
 extern uint64_t idt_get_ticks(void);
 
 #define TCP_STATE_ESTABLISHED 2
+
+/* TLS 1.3 and HTTP leftovers are shared. Serialize complete sessions, including
+ * async opens, now that background firmware fetches can overlap shell clients. */
+static http_session_t *http_owner;
+static bool http_claim(http_session_t *s)
+{
+    http_session_t *expected = NULL;
+    return s && __atomic_compare_exchange_n(&http_owner, &expected, s, false,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+static void http_release(http_session_t *s)
+{
+    __atomic_compare_exchange_n(&http_owner, &s, NULL, false,
+                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -104,6 +122,16 @@ extern int tls13_recv(void *buf, uint32_t cap);
 
 static inline int http_tls_send(http_session_t *s, const void *data, uint32_t len)
 {
+    if (s->plaintext) {
+        uint32_t sent = 0;
+        while (sent < len) {
+            int count = net_tcp_send(s->tcp_conn, (const uint8_t *)data + sent,
+                                      len - sent);
+            if (count <= 0 || (uint32_t)count > len - sent) return -1;
+            sent += (uint32_t)count;
+        }
+        return (int)sent;
+    }
     return s->use_tls13 ? tls13_send(data, len) : tls_send(&s->tls, data, len);
 }
 
@@ -113,6 +141,8 @@ static inline int http_tls_send(http_session_t *s, const void *data, uint32_t le
 static inline int http_tls_recv(http_session_t *s, void *buf, uint32_t cap,
                                 uint32_t timeout_ticks)
 {
+    if (s->plaintext)
+        return net_tcp_recv_timeout(s->tcp_conn, buf, cap, timeout_ticks);
     if (s->use_tls13) return tls13_recv(buf, cap);
     return tls_recv(&s->tls, buf, cap, timeout_ticks);
 }
@@ -122,14 +152,34 @@ static inline void http_tls_close(http_session_t *s)
     /* TLS 1.3 has no explicit close API in this build — just drop the
      * TCP; the peer detects close via FIN. TLS 1.2 needs tls_close to
      * emit close_notify before TCP teardown. */
-    if (!s->use_tls13) tls_close(&s->tls);
+    if (!s->plaintext && !s->use_tls13) tls_close(&s->tls);
 }
 
 /* ── HTTP Session Management ─────────────────────────────────── */
 
-int http_open(http_session_t *s, const char *hostname)
+static bool http_numeric_host(const char *host, uint8_t ip[4])
+{
+    uint8_t parsed[4];
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned value = 0, digits = 0;
+        while (*host >= '0' && *host <= '9') {
+            value = value * 10 + (unsigned)(*host++ - '0');
+            if (++digits > 3 || value > 255) return false;
+        }
+        if (!digits || (i < 3 ? *host != '.' : *host != 0)) return false;
+        parsed[i] = (uint8_t)value;
+        if (i < 3) host++;
+    }
+    hmemcpy(ip, parsed, 4);
+    return true;
+}
+
+static int http_open_owned(http_session_t *s, const char *hostname,
+                            uint16_t port, bool use_tls)
 {
     hmemset(s, 0, sizeof(*s));
+    s->tcp_conn = -1;
+    s->plaintext = !use_tls;
 
     /* DNS resolve */
     uint8_t ip[4];
@@ -137,7 +187,7 @@ int http_open(http_session_t *s, const char *hostname)
     serial_puts(hostname);
     serial_puts("...\n");
 
-    if (net_dns_resolve(hostname, ip) < 0) {
+    if (!http_numeric_host(hostname, ip) && net_dns_resolve(hostname, ip) < 0) {
         serial_puts("[HTTP] DNS failed\n");
         return -1;
     }
@@ -149,10 +199,15 @@ int http_open(http_session_t *s, const char *hostname)
     serial_putdec(ip[3]); serial_puts("\n");
 
     /* TCP connect */
-    s->tcp_conn = net_tcp_connect(ip, 443, next_port++);
+    s->tcp_conn = net_tcp_connect(ip, port, next_port++);
     if (s->tcp_conn < 0) {
         serial_puts("[HTTP] TCP connect failed\n");
         return -1;
+    }
+
+    if (!use_tls) {
+        s->connected = true;
+        return 0;
     }
 
     /* TLS handshake — prefer 1.3 (one-RTT handshake + modern ciphers).
@@ -171,7 +226,7 @@ int http_open(http_session_t *s, const char *hostname)
      * may have left the connection mid-handshake; safest is a fresh TCP. */
     serial_puts("[HTTP] TLS 1.3 failed, falling back to 1.2\n");
     net_tcp_close(s->tcp_conn);
-    s->tcp_conn = net_tcp_connect(ip, 443, next_port++);
+    s->tcp_conn = net_tcp_connect(ip, port, next_port++);
     if (s->tcp_conn < 0) {
         serial_puts("[HTTP] TCP reconnect failed\n");
         return -1;
@@ -187,12 +242,39 @@ int http_open(http_session_t *s, const char *hostname)
     return 0;
 }
 
+int http_open(http_session_t *s, const char *hostname)
+{
+    return http_open_port(s, hostname, 443, true);
+}
+
+int http_open_port(http_session_t *s, const char *hostname, uint16_t port,
+                    bool use_tls)
+{
+    if (!hostname || !*hostname || !port) return -1;
+    if (!http_claim(s)) return -1;
+    int rc = http_open_owned(s, hostname, port, use_tls);
+    if (rc) http_release(s);
+    return rc;
+}
+
 void http_close(http_session_t *s)
 {
-    if (!s->connected) return;
-    http_tls_close(s);
-    net_tcp_close(s->tcp_conn);
+    if (__atomic_load_n(&http_owner, __ATOMIC_ACQUIRE) != s) return;
+    if (s->connected) {
+        http_tls_close(s);
+        net_tcp_close(s->tcp_conn);
+        s->connected = false;
+    }
+    http_release(s);
+}
+
+void http_abort(http_session_t *s)
+{
+    if (!s || __atomic_load_n(&http_owner, __ATOMIC_ACQUIRE) != s) return;
+    if (s->tcp_conn >= 0) net_tcp_close(s->tcp_conn);
+    s->tcp_conn = -1;
     s->connected = false;
+    http_release(s);
 }
 
 /* ── HTTP Request ────────────────────────────────────────────── */
@@ -324,8 +406,15 @@ int http_request(http_session_t *s, const char *method, const char *path,
     const char *cl = http_get_header(resp, "Content-Length");
     if (cl) {
         uint32_t v = 0;
-        for (int j = 0; cl[j] >= '0' && cl[j] <= '9'; j++)
-            v = v * 10 + (uint32_t)(cl[j] - '0');
+        int j = 0;
+        if (cl[0] < '0' || cl[0] > '9') return -1;
+        for (; cl[j] >= '0' && cl[j] <= '9'; j++) {
+            uint32_t digit = (uint32_t)(cl[j] - '0');
+            if (v > (0x7fffffffU - digit) / 10U) return -1;
+            v = v * 10 + digit;
+        }
+        while (cl[j] == ' ' || cl[j] == '\t') j++;
+        if (cl[j]) return -1;
         resp->content_length = v;
     }
 
@@ -407,10 +496,10 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
                     if (n < 0) {
                         if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
                             && ++idle < MAX_IDLE_RETRIES) continue;
-                        goto done;
+                        return -1;
                     }
                     if (n == 0) {
-                        if (++idle >= MAX_IDLE_RETRIES) goto done;
+                        if (++idle >= MAX_IDLE_RETRIES) return -1;
                         continue;
                     }
                     idle = 0;
@@ -423,16 +512,27 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
                     got_line = true;
                 } else if (lp < (int)sizeof(line) - 1 && c != '\r') {
                     line[lp++] = c;
+                } else if (c != '\r') {
+                    return -1;
                 }
             }
 
             /* Parse hex chunk size */
             uint32_t chunk_size = 0;
+            int digits = 0;
             for (int i = 0; line[i]; i++) {
                 int d = hex_digit(line[i]);
-                if (d < 0) break;
+                if (d < 0) {
+                    if (line[i] != ';') return -1;
+                    break;
+                }
+                if (chunk_size > (0x7fffffffU - (uint32_t)d) / 16U)
+                    return -1;
                 chunk_size = (chunk_size << 4) | (uint32_t)d;
+                digits++;
             }
+            if (!digits || chunk_size > 0x7fffffffU - (uint32_t)total)
+                return -1;
 
             if (chunk_size == 0) break;  /* final chunk */
 
@@ -444,10 +544,10 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
                     if (n < 0) {
                         if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
                             && ++idle < MAX_IDLE_RETRIES) continue;
-                        goto done;
+                        return -1;
                     }
                     if (n == 0) {
-                        if (++idle >= MAX_IDLE_RETRIES) goto done;
+                        if (++idle >= MAX_IDLE_RETRIES) return -1;
                         continue;
                     }
                     idle = 0;
@@ -473,24 +573,24 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
                     if (n < 0) {
                         if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
                             && ++idle < MAX_IDLE_RETRIES) continue;
-                        goto done;
+                        return -1;
                     }
                     if (n == 0) {
-                        if (++idle >= MAX_IDLE_RETRIES) goto done;
+                        if (++idle >= MAX_IDLE_RETRIES) return -1;
                         continue;
                     }
                     idle = 0;
                     bp = 0;
                     bl = n;
                 }
-                bp++;
+                if (buf[bp++] != (skip ? '\n' : '\r')) return -1;
                 skip++;
             }
         }
     } else {
         /* ── Content-Length or read until close ── */
         uint32_t remaining = resp->content_length;
-        bool has_cl = (remaining > 0);
+        bool has_cl = http_get_header(resp, "Content-Length") != NULL;
         uint8_t buf[4096];
 
         /* Deliver leftover first */
@@ -526,10 +626,13 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
                  * trying — the server may be mid-response.  For read-
                  * until-close (no CL), a long idle stretch is the
                  * normal terminator, so still cap retries. */
-                if (++idle >= MAX_IDLE_RETRIES) break;
+                if (net_tcp_state(s->tcp_conn) != TCP_STATE_ESTABLISHED) break;
+                if (++idle >= MAX_IDLE_RETRIES) return -1;
                 continue;
             }
             idle = 0;
+
+            if ((uint32_t)n > 0x7fffffffU - (uint32_t)total) return -1;
 
             if (callback) {
                 if (callback(buf, (uint32_t)n, ctx) < 0)
@@ -538,9 +641,10 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             total += n;
             if (has_cl) remaining -= (uint32_t)n;
         }
+        if (has_cl && remaining) return -1;
+        if (!has_cl && idle >= MAX_IDLE_RETRIES) return -1;
     }
 
-done:
     return total;
 }
 
@@ -615,6 +719,7 @@ static void http_async_tls_done(http_async_ctx_t *ac, int result)
     if (result < 0) {
         serial_puts("[HTTP-ASYNC] TLS failed\n");
         net_tcp_close(s->tcp_conn);
+        http_release(s);
         if (cb) cb(-1, ctx);
         return;
     }
@@ -634,6 +739,7 @@ static void http_async_tcp_done(int result, void *arg)
         serial_puts("[HTTP-ASYNC] TCP connect failed\n");
         http_open_cb_t cb = ac->done_cb;
         void *ctx = ac->done_ctx;
+        http_release(ac->session);
         ac->session = NULL;
         if (cb) cb(-1, ctx);
         return;
@@ -657,6 +763,7 @@ static void http_async_dns_done(int result, void *arg)
         serial_puts("[HTTP-ASYNC] DNS failed\n");
         http_open_cb_t cb = ac->done_cb;
         void *ctx = ac->done_ctx;
+        http_release(ac->session);
         ac->session = NULL;
         if (cb) cb(-1, ctx);
         return;
@@ -674,6 +781,7 @@ static void http_async_dns_done(int result, void *arg)
         serial_puts("[HTTP-ASYNC] TCP connect queue failed\n");
         http_open_cb_t cb = ac->done_cb;
         void *ctx = ac->done_ctx;
+        http_release(ac->session);
         ac->session = NULL;
         if (cb) cb(-1, ctx);
     }
@@ -682,10 +790,11 @@ static void http_async_dns_done(int result, void *arg)
 int http_open_async(http_session_t *s, const char *hostname,
                     http_open_cb_t cb, void *ctx)
 {
+    if (!http_claim(s)) return -1;
     hmemset(s, 0, sizeof(*s));
 
     http_async_ctx_t *ac = http_async_alloc();
-    if (!ac) return -1;
+    if (!ac) { http_release(s); return -1; }
 
     ac->session  = s;
     ac->hostname = hostname;
@@ -700,6 +809,7 @@ int http_open_async(http_session_t *s, const char *hostname,
     if (net_dns_resolve_async(hostname, ac->resolved_ip,
                               http_async_dns_done, ac) < 0) {
         ac->session = NULL;
+        http_release(s);
         return -1;
     }
 

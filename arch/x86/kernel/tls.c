@@ -786,22 +786,32 @@ int tls_send(tls_conn_t *tls, const void *data, uint32_t len)
 int tls_recv(tls_conn_t *tls, void *buf, uint32_t buf_size,
              uint32_t timeout_ticks)
 {
+    if (!buf_size) return 0;
+    if (!buf) return -1;
     if (tls->state != TLS_STATE_ESTABLISHED) return -1;
 
-    uint8_t rec_buf[TLS_MAX_RECORD];
-    uint32_t rec_len;
+    if (tls->app_offset < tls->app_len) {
+        uint32_t remaining = tls->app_len - tls->app_offset;
+        uint32_t copy = remaining < buf_size ? remaining : buf_size;
+        tmemcpy(buf,tls->app_buf+tls->app_offset,copy);
+        tls->app_offset += copy;
+        return (int)copy;
+    }
+    tls->app_offset = tls->app_len = 0;
+    uint32_t rec_len = 0;
 
-    int ct = tls_recv_record(tls, rec_buf, &rec_len, sizeof(rec_buf),
+    int ct = tls_recv_record(tls, tls->app_buf, &rec_len, sizeof(tls->app_buf),
                               timeout_ticks);
 
     if (ct < 0) return -1;
     if (ct == TLS_ALERT) {
+        if (rec_len < 2) { tls->state = TLS_STATE_ERROR; return -1; }
         serial_puts("[TLS] Alert: ");
-        serial_putdec(rec_buf[0]);
+        serial_putdec(tls->app_buf[0]);
         serial_puts("/");
-        serial_putdec(rec_buf[1]);
+        serial_putdec(tls->app_buf[1]);
         serial_puts("\n");
-        if (rec_buf[0] == TLS_ALERT_FATAL || rec_buf[1] == 0) {
+        if (tls->app_buf[0] == TLS_ALERT_FATAL || tls->app_buf[1] == 0) {
             tls->state = TLS_STATE_CLOSED;
             return -1;
         }
@@ -815,7 +825,9 @@ int tls_recv(tls_conn_t *tls, void *buf, uint32_t buf_size,
     }
 
     uint32_t copy = rec_len < buf_size ? rec_len : buf_size;
-    tmemcpy(buf, rec_buf, copy);
+    tmemcpy(buf, tls->app_buf, copy);
+    tls->app_len = rec_len;
+    tls->app_offset = copy;
     return (int)copy;
 }
 
@@ -827,6 +839,7 @@ void tls_close(tls_conn_t *tls)
         tls_send_encrypted(tls, TLS_ALERT, alert, 2);
     }
     tls->state = TLS_STATE_CLOSED;
+    tls->app_len = tls->app_offset = 0;
 }
 
 /* Helper for shell.c which doesn't include tls.h */

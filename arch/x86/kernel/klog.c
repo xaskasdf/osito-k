@@ -50,23 +50,13 @@ void klog_puts(const char *s)
  * Returns bytes copied into buf. */
 uint32_t klog_read(char *buf, uint32_t max_len)
 {
-    if (!klog_initialized || max_len == 0) return 0;
+    if (!klog_initialized || !buf || max_len == 0) return 0;
 
     uint32_t available = (klog_total < KLOG_SIZE) ? (uint32_t)klog_total : KLOG_SIZE;
     uint32_t to_copy = (available < max_len) ? available : max_len;
 
-    /* Calculate start position in ring */
-    uint32_t start;
-    if (klog_total <= KLOG_SIZE) {
-        start = 0;
-        to_copy = klog_total < max_len ? (uint32_t)klog_total : max_len;
-    } else {
-        start = klog_head;  /* Oldest data is at current head */
-        /* Skip to show only the last max_len bytes */
-        if (available > max_len) {
-            start = (start + available - max_len) % KLOG_SIZE;
-        }
-    }
+    /* The newest suffix ends at head, even before the ring fills. */
+    uint32_t start = (klog_head + KLOG_SIZE - to_copy) % KLOG_SIZE;
 
     /* Copy from ring to linear buffer */
     for (uint32_t i = 0; i < to_copy; i++) {

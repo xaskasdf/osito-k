@@ -10,6 +10,7 @@
 #include "paging.h"
 #include "winmm_shim.h"
 #include "win32_abi.h"
+#include "../include/compositor_surface.h"
 
 extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
 
@@ -30,10 +31,11 @@ extern NTSTATUS nt_vm_release_allocation_for_process(ULONG owner_pid,
                                                        PVOID allocation_base);
 
 /* Compositor integration — user32 provides the per-window shm info */
-extern void    *user32_get_window_shm_pixels(void *hwnd)      __attribute__((weak));
 extern uint32_t user32_get_window_compositor_id(void *hwnd)    __attribute__((weak));
-extern BOOL user32_get_window_surface(HANDLE hwnd, void **pixels, int *width,
-                                      int *height, int *pitch)
+extern BOOL user32_acquire_window_dc_surface(HANDLE hwnd, BOOL whole,
+                                             compositor_surface_ref_t *surface)
+    __attribute__((weak));
+extern void compositor_release_surface(compositor_surface_ref_t *surface)
     __attribute__((weak));
 extern void user32_mark_window_dirty(HANDLE hwnd) __attribute__((weak));
 extern BOOL user32_configure_directdraw_window(HANDLE hwnd, BOOL exclusive,
@@ -1121,23 +1123,30 @@ enum {
     DDRAW_TARGET_FRAMEBUFFER
 };
 
-static int ddraw_get_present_target(DDRAW_PROCESS_STATE *state,
+static void ddraw_release_present_surface(compositor_surface_ref_t *surface)
+{
+    if (surface->handle && compositor_release_surface)
+        compositor_release_surface(surface);
+}
+
+static int ddraw_get_present_target(HANDLE window,
                                     uint32_t requested_width,
                                     uint32_t requested_height,
                                     uint32_t **pixels, uint32_t *width,
-                                    uint32_t *height, uint32_t *pitch)
+                                    uint32_t *height, uint32_t *pitch,
+                                    compositor_surface_ref_t *surface)
 {
-    void *window_pixels = NULL;
-    int window_width = 0, window_height = 0, window_pitch = 0;
-    if (state && state->hwnd && user32_get_window_surface &&
-        user32_get_window_surface(state->hwnd, &window_pixels, &window_width,
-                                  &window_height, &window_pitch) &&
-        window_pixels && window_width > 0 && window_height > 0 &&
-        window_pitch >= window_width * 4) {
-        *pixels = (uint32_t *)window_pixels;
-        *width = (uint32_t)window_width;
-        *height = (uint32_t)window_height;
-        *pitch = (uint32_t)window_pitch / 4;
+    if (window) {
+        /* A missing/empty window must not redirect a present to the desktop. */
+        if (!user32_acquire_window_dc_surface || !compositor_release_surface ||
+            !user32_acquire_window_dc_surface(window, FALSE, surface) ||
+            !surface->pixels || !surface->width || !surface->height ||
+            surface->pitch < surface->width)
+            return DDRAW_TARGET_NONE;
+        *pixels = surface->pixels;
+        *width = surface->width;
+        *height = surface->height;
+        *pitch = surface->pitch;
         return DDRAW_TARGET_WINDOW;
     }
 
@@ -1174,10 +1183,13 @@ void ddraw_present_pixels(const void *pixels, uint32_t sw, uint32_t sh,
     if (!pixels || !sw || !sh) return;
     DWORD owner_pid = win32_current_process_id();
     DDRAW_PROCESS_STATE *state = ddraw_current_state(FALSE);
+    HANDLE window = state ? state->hwnd : NULL;
+    compositor_surface_ref_t surface
+        __attribute__((cleanup(ddraw_release_present_surface))) = {0};
     uint32_t *dst32 = NULL;
     uint32_t fbw = 0, fbh = 0, pitch = 0;
-    int target = ddraw_get_present_target(state, sw, sh, &dst32, &fbw, &fbh,
-                                          &pitch);
+    int target = ddraw_get_present_target(window, sw, sh, &dst32, &fbw, &fbh,
+                                          &pitch, &surface);
     if (target == DDRAW_TARGET_NONE || !dst32 || !fbw || !fbh || !pitch)
         return;
 
@@ -1248,8 +1260,8 @@ void ddraw_present_pixels(const void *pixels, uint32_t sw, uint32_t sh,
     }
 
     if (target == DDRAW_TARGET_WINDOW) {
-        if (state && state->hwnd && user32_mark_window_dirty)
-            user32_mark_window_dirty(state->hwnd);
+        if (user32_mark_window_dirty)
+            user32_mark_window_dirty(window);
     } else if (target == DDRAW_TARGET_DISPLAY) {
         if (display_flip) display_flip();
     } else if (fb_flush_all) {

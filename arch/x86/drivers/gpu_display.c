@@ -16,6 +16,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/display_source.h"
 #include "gpu.h"
 #include "gpu_display.h"
 
@@ -700,7 +701,7 @@ static void disp_submit_pushbufs(void)
 
 /* ── Public API: gpu_display_init ────────────────────────────── */
 
-int gpu_display_init(uint32_t *gop_fb, uint32_t width,
+static int gpu_display_init_impl(uint32_t *gop_fb, uint32_t width,
                      uint32_t height, uint32_t pitch)
 {
     gpu_probe_t *p = gpu_get_probe();
@@ -775,6 +776,15 @@ int gpu_display_init(uint32_t *gop_fb, uint32_t width,
     fb_puts(" GPU Display: Phase A done\n");
 
     return 0;
+}
+
+int gpu_display_init(uint32_t *gop_fb, uint32_t width, uint32_t height, uint32_t pitch)
+{
+    display_source_change_t change={0};
+    if (!display_source_begin(&change,NULL)) return -16;
+    int result=gpu_display_init_impl(gop_fb,width,height,pitch);
+    (void)display_source_end(&change);
+    return result;
 }
 
 /* ── Public API: gpu_display_flip ────────────────────────────── */
@@ -1138,7 +1148,7 @@ int gpu_display_detect_monitor(edid_mode_t *mode)
  *
  * Requires: gpu_display_init() already called (Phase A complete).
  */
-int gpu_display_set_mode(const edid_mode_t *mode, uint64_t fb_addr, uint32_t fb_pitch)
+static int gpu_display_set_mode_impl(const edid_mode_t *mode, uint64_t fb_addr, uint32_t fb_pitch)
 {
     if (!disp.ready || !mode) return -1;
 
@@ -1302,4 +1312,13 @@ int gpu_display_set_mode(const edid_mode_t *mode, uint64_t fb_addr, uint32_t fb_
 
     serial_puts("[DISP] Modeset timeout!\n");
     return -1;
+}
+
+int gpu_display_set_mode(const edid_mode_t *mode, uint64_t fb_addr, uint32_t fb_pitch)
+{
+    display_source_change_t change={0};
+    if (!display_source_begin(&change,NULL)) return -16;
+    int result=gpu_display_set_mode_impl(mode,fb_addr,fb_pitch);
+    (void)display_source_end(&change);
+    return result;
 }

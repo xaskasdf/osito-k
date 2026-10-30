@@ -41,6 +41,7 @@ extern int   strncmp(const char *a, const char *b, uint64_t n);
 
 /* winexec engine */
 extern int winexec_run(const uint8_t *file_data, uint64_t file_size);
+extern int winexec_run_ex(const uint8_t *file_data, uint64_t file_size, BOOL administrator);
 
 /* INT 0x2E assembly stub (int2e_stub.S) */
 extern void int2e_stub(void);
@@ -196,6 +197,16 @@ char win32_command_line[WIN32_COMMAND_LINE_CAP] = "program.exe";
 
 int win32_exec_args(const char *filename, int argc, const char **argv)
 {
+    /* This is a native shell option, not an argument or API accepted by the PE.
+     * A fresh default token is still created on every ordinary launch. */
+    BOOL administrator = filename && !strcmp(filename, "--admin");
+    if (administrator) {
+        if (argc < 2 || !argv || !argv[1] || !argv[1][0]) {
+            serial_puts("Usage: winexec --admin <file.exe> [arguments]\n");
+            return -1;
+        }
+        filename = argv[1]; argv++; argc--;
+    }
     if (!win32_initialized) {
         serial_puts("[WIN32] Not initialized — call win32_init() first\n");
         return -1;
@@ -291,7 +302,7 @@ int win32_exec_args(const char *filename, int argc, const char **argv)
     }
 
     /* Hand off to the PE execution engine */
-    result = winexec_run(buf, size);
+    result = winexec_run_ex(buf, size, administrator);
 
     /* Free the file buffer (PE image was copied by pe_load) */
     mem_free_pages(buf, pages);

@@ -88,6 +88,12 @@ typedef struct {
     uint8_t   rx_buf[TLS_MAX_RECORD + 256];
     uint32_t  rx_len;
 
+    /* Authenticated application bytes not yet consumed by tls_recv's caller.
+     * TCP record reassembly and application reads have independent boundaries. */
+    uint8_t   app_buf[TLS_MAX_RECORD];
+    uint32_t  app_len;
+    uint32_t  app_offset;
+
     /* Error info */
     uint8_t   alert_level;
     uint8_t   alert_desc;

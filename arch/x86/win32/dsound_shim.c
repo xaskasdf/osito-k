@@ -133,8 +133,8 @@ extern uint64_t proc_current_cr3(void);
 #define DSOUND_DEVICES_PER_PROCESS  8U
 #define DSOUND_BUFFERS_PER_PROCESS  32U
 #define DSOUND_MIX_FRAMES           AUDIO_OUTPUT_BLOCK_FRAMES
-#define DSOUND_DS_VTBL_SLOTS        11U
-#define DSOUND_DSB_VTBL_SLOTS       21U
+#define DSOUND_DS_VTBL_SLOTS        12U
+#define DSOUND_DSB_VTBL_SLOTS       24U
 #define DSOUND_DSL_VTBL_SLOTS       18U
 #define DSOUND_DS3DB_VTBL_SLOTS     21U
 
@@ -231,6 +231,7 @@ typedef struct {
 typedef struct {
     bool in_use;
     bool initialized;
+    bool version8;
     ULONG refs;
     uint32_t live_buffers;
     DWORD cooperative_level;
@@ -305,6 +306,7 @@ typedef struct {
     HRESULT (WINAPI *GetSpeakerConfig)(PVOID, DWORD *);
     HRESULT (WINAPI *SetSpeakerConfig)(PVOID, DWORD);
     HRESULT (WINAPI *Initialize)(PVOID, LPCGUID);
+    HRESULT (WINAPI *VerifyCertification)(PVOID, DWORD *);
 } IDIRECTSOUND_VTBL;
 
 typedef struct {
@@ -330,6 +332,9 @@ typedef struct {
     HRESULT (WINAPI *Stop)(PVOID);
     HRESULT (WINAPI *Unlock)(PVOID, PVOID, DWORD, PVOID, DWORD);
     HRESULT (WINAPI *Restore)(PVOID);
+    HRESULT (WINAPI *SetFX)(PVOID, DWORD, PVOID, DWORD *);
+    HRESULT (WINAPI *AcquireResources)(PVOID, DWORD, DWORD, DWORD *);
+    HRESULT (WINAPI *GetObjectInPath)(PVOID, LPCGUID, DWORD, LPCGUID, PVOID);
 } IDIRECTSOUNDBUFFER_VTBL;
 
 typedef struct {
@@ -392,6 +397,7 @@ static HRESULT WINAPI ds_Compact(PVOID self);
 static HRESULT WINAPI ds_GetSpeakerConfig(PVOID self, DWORD *configuration);
 static HRESULT WINAPI ds_SetSpeakerConfig(PVOID self, DWORD configuration);
 static HRESULT WINAPI ds_Initialize(PVOID self, LPCGUID device);
+static HRESULT WINAPI ds_VerifyCertification(PVOID self, DWORD *certified);
 
 static HRESULT WINAPI dsb_QueryInterface(PVOID self, LPCGUID iid,
                                          PVOID output);
@@ -422,6 +428,13 @@ static HRESULT WINAPI dsb_Stop(PVOID self);
 static HRESULT WINAPI dsb_Unlock(PVOID self, PVOID pointer1, DWORD bytes1,
                                  PVOID pointer2, DWORD bytes2);
 static HRESULT WINAPI dsb_Restore(PVOID self);
+static HRESULT WINAPI dsb_SetFX(PVOID self, DWORD count, PVOID effects,
+                                DWORD *results);
+static HRESULT WINAPI dsb_AcquireResources(PVOID self, DWORD flags, DWORD count,
+                                           DWORD *results);
+static HRESULT WINAPI dsb_GetObjectInPath(PVOID self, LPCGUID object,
+                                          DWORD index, LPCGUID iid,
+                                          PVOID output);
 
 static HRESULT WINAPI dsl_GetAllParameters(PVOID self,
                                             DS3DLISTENER_DS *listener);
@@ -509,6 +522,7 @@ static IDIRECTSOUND_VTBL ds_vtbl64 = {
     ds_QueryInterface, ds_AddRef, ds_Release, ds_CreateSoundBuffer,
     ds_GetCaps, ds_DuplicateSoundBuffer, ds_SetCooperativeLevel, ds_Compact,
     ds_GetSpeakerConfig, ds_SetSpeakerConfig, ds_Initialize,
+    ds_VerifyCertification,
 };
 
 static IDIRECTSOUNDBUFFER_VTBL dsb_vtbl64 = {
@@ -517,6 +531,7 @@ static IDIRECTSOUNDBUFFER_VTBL dsb_vtbl64 = {
     dsb_GetFrequency, dsb_GetStatus, dsb_Initialize, dsb_Lock, dsb_Play,
     dsb_SetCurrentPosition, dsb_SetFormat, dsb_SetVolume, dsb_SetPan,
     dsb_SetFrequency, dsb_Stop, dsb_Unlock, dsb_Restore,
+    dsb_SetFX, dsb_AcquireResources, dsb_GetObjectInPath,
 };
 
 static IDIRECTSOUND3DLISTENER_VTBL dsl_vtbl64 = {
@@ -552,6 +567,14 @@ static const GUID iid_idirectsoundbuffer = {
     0x279AFA85, 0x4981, 0x11CE,
     { 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 }
 };
+static const GUID iid_idirectsound8 = {
+    0xC50A7E93, 0xF395, 0x4834,
+    { 0x9E, 0xF6, 0x7F, 0xA9, 0x9D, 0xE5, 0x09, 0x66 }
+};
+static const GUID iid_idirectsoundbuffer8 = {
+    0x6825A449, 0x7524, 0x4D82,
+    { 0x92, 0x0F, 0x50, 0xE3, 0x6A, 0xB3, 0xAB, 0x1E }
+};
 static const GUID iid_idirectsound3dlistener = {
     0x279AFA84, 0x4981, 0x11CE,
     { 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 }
@@ -564,6 +587,10 @@ static const GUID clsid_directsound = {
     0x47D4D946, 0x62E8, 0x11CF,
     { 0x93, 0xBC, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 }
 };
+static const GUID clsid_directsound8 = {
+    0x3901CC3F, 0x84B5, 0x4FA4,
+    { 0xBA, 0x35, 0xAA, 0x81, 0x72, 0xB8, 0xA0, 0x9B }
+};
 static const GUID dsdevid_default_playback = {
     0xDEF00000, 0x9C6D, 0x47ED,
     { 0xAA, 0xF1, 0x4D, 0xDA, 0x8F, 0x2B, 0x5C, 0x03 }
@@ -571,6 +598,12 @@ static const GUID dsdevid_default_playback = {
 static const GUID dsdevid_default_voice_playback = {
     0xDEF00002, 0x9C6D, 0x47ED,
     { 0xAA, 0xF1, 0x4D, 0xDA, 0x8F, 0x2B, 0x5C, 0x03 }
+};
+/* Stable identifier of the single logical PCM output, shared by enumeration,
+ * GetDeviceID and DirectSoundCreate. It is available only when audio is ready. */
+static const GUID dsound_pcm_output = {
+    0xA4E6CD52, 0x7C4B, 0x4FD6,
+    { 0x9C, 0xF1, 0x6B, 0x51, 0x88, 0xA3, 0xB5, 0x1E }
 };
 
 static DSOUND_PROCESS dsound_processes[DSOUND_PROCESS_SLOTS];
@@ -646,7 +679,8 @@ static bool dsound_guid_equal(LPCGUID left, LPCGUID right)
 static bool dsound_playback_device_supported(LPCGUID device)
 {
     return !device || dsound_guid_equal(device, &dsdevid_default_playback) ||
-           dsound_guid_equal(device, &dsdevid_default_voice_playback);
+           dsound_guid_equal(device, &dsdevid_default_voice_playback) ||
+           dsound_guid_equal(device, &dsound_pcm_output);
 }
 
 static HRESULT dsound_validate_cooperative_level(DWORD level)
@@ -1334,15 +1368,16 @@ static bool dsound_build_proxy_page(BYTE **page_out)
         (uint64_t)(ULONG_PTR)ds_GetSpeakerConfig,
         (uint64_t)(ULONG_PTR)ds_SetSpeakerConfig,
         (uint64_t)(ULONG_PTR)ds_Initialize,
+        (uint64_t)(ULONG_PTR)ds_VerifyCertification,
     };
     static const char *const ds_names[DSOUND_DS_VTBL_SLOTS] = {
         "DS_QueryInterface", "DS_AddRef", "DS_Release",
         "DS_CreateSoundBuffer", "DS_GetCaps", "DS_DuplicateSoundBuffer",
         "DS_SetCooperativeLevel", "DS_Compact", "DS_GetSpeakerConfig",
-        "DS_SetSpeakerConfig", "DS_Initialize",
+        "DS_SetSpeakerConfig", "DS_Initialize", "DS_VerifyCertification",
     };
     static const uint8_t ds_args[DSOUND_DS_VTBL_SLOTS] = {
-        3, 1, 1, 4, 2, 3, 3, 1, 2, 2, 2,
+        3, 1, 1, 4, 2, 3, 3, 1, 2, 2, 2, 2,
     };
 
     const uint64_t dsb_targets[DSOUND_DSB_VTBL_SLOTS] = {
@@ -1367,6 +1402,9 @@ static bool dsound_build_proxy_page(BYTE **page_out)
         (uint64_t)(ULONG_PTR)dsb_Stop,
         (uint64_t)(ULONG_PTR)dsb_Unlock,
         (uint64_t)(ULONG_PTR)dsb_Restore,
+        (uint64_t)(ULONG_PTR)dsb_SetFX,
+        (uint64_t)(ULONG_PTR)dsb_AcquireResources,
+        (uint64_t)(ULONG_PTR)dsb_GetObjectInPath,
     };
     static const char *const dsb_names[DSOUND_DSB_VTBL_SLOTS] = {
         "DSB_QueryInterface", "DSB_AddRef", "DSB_Release", "DSB_GetCaps",
@@ -1375,10 +1413,12 @@ static bool dsound_build_proxy_page(BYTE **page_out)
         "DSB_Initialize", "DSB_Lock", "DSB_Play",
         "DSB_SetCurrentPosition", "DSB_SetFormat", "DSB_SetVolume",
         "DSB_SetPan", "DSB_SetFrequency", "DSB_Stop", "DSB_Unlock",
-        "DSB_Restore",
+        "DSB_Restore", "DSB_SetFX", "DSB_AcquireResources",
+        "DSB_GetObjectInPath",
     };
     static const uint8_t dsb_args[DSOUND_DSB_VTBL_SLOTS] = {
         3, 1, 1, 2, 3, 4, 2, 2, 2, 2, 3, 8, 4, 2, 2, 2, 2, 2, 1, 5, 1,
+        4, 4, 5,
     };
 
     const uint64_t dsl_targets[DSOUND_DSL_VTBL_SLOTS] = {
@@ -1772,12 +1812,18 @@ static HRESULT WINAPI ds_QueryInterface(PVOID self, LPCGUID iid, PVOID output)
     if (!iid || !dsound_guest_readable(iid, sizeof(*iid), compat32,
                                        "IDirectSound::QueryInterface IID") ||
         (!dsound_guid_equal(iid, &iid_iunknown) &&
-                 !dsound_guid_equal(iid, &iid_idirectsound)))
+         !dsound_guid_equal(iid, &iid_idirectsound) &&
+         !dsound_guid_equal(iid, &iid_idirectsound8)))
         return DSERR_NOINTERFACE;
 
     uint64_t irq_flags = dsound_lock_irqsave();
     DSOUND_DEVICE *device = dsound_device_from_object_locked(self, NULL);
     bool valid = device && device->refs;
+    if (valid && dsound_guid_equal(iid, &iid_idirectsound8) &&
+        !device->version8) {
+        dsound_unlock_irqrestore(irq_flags);
+        return DSERR_NOINTERFACE;
+    }
     if (valid)
         device->refs++;
     dsound_unlock_irqrestore(irq_flags);
@@ -1830,8 +1876,17 @@ static HRESULT WINAPI ds_CreateSoundBuffer(PVOID self, PVOID description,
     if (result != DS_OK)
         return result;
 
+    uint64_t version_flags = dsound_lock_irqsave();
+    DSOUND_DEVICE *version_device =
+        dsound_device_from_object_locked(self, NULL);
+    bool version8 = version_device && version_device->version8;
+    dsound_unlock_irqrestore(version_flags);
     DWORD actual_flags = 0;
     result = dsound_validate_buffer_request(&view, &actual_flags);
+    /* Effects and deferred hardware allocation are not implemented by the
+     * software mixer. DS8 callers must not be told to upgrade to DS8. */
+    if (version8 && result == DSERR_DS8_REQUIRED)
+        result = DSERR_CONTROLUNAVAIL;
     if (result != DS_OK) {
         dsound_log_buffer_rejection(&view, result);
         return result;
@@ -1866,6 +1921,11 @@ static HRESULT WINAPI ds_CreateSoundBuffer(PVOID self, PVOID description,
             return result;
         }
         if (view.buffer_bytes % block_align) {
+            dsound_log_buffer_rejection(&view, DSERR_INVALIDPARAM);
+            return DSERR_INVALIDPARAM;
+        }
+        if (version8 && (view.flags & DSBCAPS_CTRL3D) &&
+            format.channels != 1) {
             dsound_log_buffer_rejection(&view, DSERR_INVALIDPARAM);
             return DSERR_INVALIDPARAM;
         }
@@ -2220,6 +2280,22 @@ static HRESULT WINAPI ds_Initialize(PVOID self, LPCGUID device)
     return result;
 }
 
+static HRESULT WINAPI ds_VerifyCertification(PVOID self, DWORD *certified)
+{
+    if (!dsound_guest_writable(certified, sizeof(*certified),
+                               dsound_compat_call(self),
+                               "IDirectSound8::VerifyCertification"))
+        return DSERR_INVALIDPARAM;
+    uint64_t irq_flags = dsound_lock_irqsave();
+    DSOUND_DEVICE *device = dsound_device_from_object_locked(self, NULL);
+    HRESULT result = !device || !device->refs ? DSERR_INVALIDCALL
+                   : !device->initialized ? DSERR_UNINITIALIZED : DS_OK;
+    dsound_unlock_irqrestore(irq_flags);
+    if (result == DS_OK)
+        *certified = 1; /* DS_UNCERTIFIED: no DirectX driver certification. */
+    return result;
+}
+
 static HRESULT WINAPI dsb_QueryInterface(PVOID self, LPCGUID iid,
                                           PVOID output)
 {
@@ -2245,7 +2321,9 @@ static HRESULT WINAPI dsb_QueryInterface(PVOID self, LPCGUID iid,
 
     uint32_t slot = (uint32_t)(buffer - process->buffers);
     if (dsound_guid_equal(iid, &iid_iunknown) ||
-        dsound_guid_equal(iid, &iid_idirectsoundbuffer)) {
+        dsound_guid_equal(iid, &iid_idirectsoundbuffer) ||
+        (dsound_guid_equal(iid, &iid_idirectsoundbuffer8) &&
+         !buffer->primary && buffer->device->version8)) {
         result_object = process->buffer_objects[slot];
     } else if (dsound_guid_equal(iid, &iid_idirectsound3dlistener) &&
                buffer->primary && (buffer->flags & DSBCAPS_CTRL3D)) {
@@ -3612,7 +3690,55 @@ static HRESULT WINAPI ds3db32_SetVelocity(PVOID self, DWORD x, DWORD y,
                              dsound_float_from_bits(z), apply);
 }
 
-HRESULT WINAPI DirectSoundCreate(LPCGUID device, PVOID output, PVOID outer)
+/* These slots exist on Buffer8 even when no effect engine is available.
+ * PCM buffers retain their ordinary playback path; unsupported effects must
+ * return an error, never a fabricated effect object or an absent vtable slot. */
+static HRESULT dsb_effect_state(PVOID self)
+{
+    uint64_t irq_flags = dsound_lock_irqsave();
+    DSOUND_BUFFER *buffer = dsound_buffer_from_object_locked(self, NULL);
+    HRESULT result = !buffer || !buffer->refs ? DSERR_INVALIDCALL
+                   : DSERR_CONTROLUNAVAIL;
+    dsound_unlock_irqrestore(irq_flags);
+    return result;
+}
+
+static HRESULT WINAPI dsb_SetFX(PVOID self, DWORD count, PVOID effects,
+                                DWORD *results)
+{
+    if ((!count && (effects || results)) || (count && !effects))
+        return DSERR_INVALIDPARAM;
+    return dsb_effect_state(self);
+}
+
+static HRESULT WINAPI dsb_AcquireResources(PVOID self, DWORD flags, DWORD count,
+                                           DWORD *results)
+{
+    (void)self;
+    if ((flags & ~3U) || (flags & 3U) == 3U || count || results)
+        return DSERR_INVALIDPARAM;
+    /* Windows rejects this call on buffers created without CTRLFX or
+     * LOCDEFER. Neither kind is currently supported by this mixer. */
+    return DSERR_INVALIDCALL;
+}
+
+static HRESULT WINAPI dsb_GetObjectInPath(PVOID self, LPCGUID object,
+                                          DWORD index, LPCGUID iid,
+                                          PVOID output)
+{
+    (void)index;
+    bool compat32 = dsound_compat_call(self);
+    if (!dsound_store_pointer(compat32, output, NULL) ||
+        !dsound_guest_readable(object, sizeof(*object), compat32,
+                               "IDirectSoundBuffer8::GetObjectInPath class") ||
+        !dsound_guest_readable(iid, sizeof(*iid), compat32,
+                               "IDirectSoundBuffer8::GetObjectInPath IID"))
+        return DSERR_INVALIDPARAM;
+    return dsb_effect_state(self);
+}
+
+static HRESULT dsound_create(LPCGUID device, PVOID output, PVOID outer,
+                             bool version8)
 {
     if (!output)
         return DSERR_INVALIDPARAM;
@@ -3639,6 +3765,8 @@ HRESULT WINAPI DirectSoundCreate(LPCGUID device, PVOID output, PVOID outer)
     uint64_t irq_flags = dsound_lock_irqsave();
     DSOUND_DEVICE *device_state =
         dsound_allocate_device_locked(process, true);
+    if (device_state)
+        device_state->version8 = version8;
     PVOID object = device_state ? device_state->object : NULL;
     dsound_unlock_irqrestore(irq_flags);
     if (!device_state)
@@ -3650,7 +3778,18 @@ HRESULT WINAPI DirectSoundCreate(LPCGUID device, PVOID output, PVOID outer)
     return DS_OK;
 }
 
-static HRESULT dsound_com_activate(LPCGUID iid, PVOID outer, PVOID output)
+HRESULT WINAPI DirectSoundCreate(LPCGUID device, PVOID output, PVOID outer)
+{
+    return dsound_create(device, output, outer, false);
+}
+
+HRESULT WINAPI DirectSoundCreate8(LPCGUID device, PVOID output, PVOID outer)
+{
+    return dsound_create(device, output, outer, true);
+}
+
+static HRESULT dsound_com_create(LPCGUID iid, PVOID outer, PVOID output,
+                                 bool version8)
 {
     if (!output)
         return DSERR_INVALIDPARAM;
@@ -3660,7 +3799,8 @@ static HRESULT dsound_com_activate(LPCGUID iid, PVOID outer, PVOID output)
     if (!iid || !dsound_guest_readable(iid, sizeof(*iid), compat32,
                                        "DirectSound COM activation IID") ||
         (!dsound_guid_equal(iid, &iid_iunknown) &&
-                 !dsound_guid_equal(iid, &iid_idirectsound)))
+         !dsound_guid_equal(iid, &iid_idirectsound) &&
+         !(version8 && dsound_guid_equal(iid, &iid_idirectsound8))))
         return DSERR_NOINTERFACE;
     if (outer)
         return DSERR_NOAGGREGATION;
@@ -3670,6 +3810,8 @@ static HRESULT dsound_com_activate(LPCGUID iid, PVOID outer, PVOID output)
         return DSERR_OUTOFMEMORY;
     uint64_t irq_flags = dsound_lock_irqsave();
     DSOUND_DEVICE *device = dsound_allocate_device_locked(process, false);
+    if (device)
+        device->version8 = version8;
     PVOID object = device ? device->object : NULL;
     dsound_unlock_irqrestore(irq_flags);
     if (!device)
@@ -3681,8 +3823,34 @@ static HRESULT dsound_com_activate(LPCGUID iid, PVOID outer, PVOID output)
     return DS_OK;
 }
 
+static HRESULT dsound_com_activate(LPCGUID iid, PVOID outer, PVOID output)
+{
+    return dsound_com_create(iid, outer, output, false);
+}
+
+static HRESULT dsound8_com_activate(LPCGUID iid, PVOID outer, PVOID output)
+{
+    return dsound_com_create(iid, outer, output, true);
+}
+
 typedef BOOL (WINAPI *DSENUMCALLBACKA)(LPGUID, PCSTR, PCSTR, PVOID);
 typedef BOOL (WINAPI *DSENUMCALLBACKW)(LPGUID, PCWSTR, PCWSTR, PVOID);
+
+static HRESULT WINAPI dsound_GetDeviceID(LPCGUID source, LPGUID destination)
+{
+    if (!source || !destination ||
+        !dsound_guest_readable(source, sizeof(*source), g_compat32_mode,
+                               "GetDeviceID source") ||
+        !dsound_guest_writable(destination, sizeof(*destination), g_compat32_mode,
+                               "GetDeviceID destination"))
+        return DSERR_INVALIDPARAM;
+    /* Unknown and capture devices must not be reported as usable PCM outputs. */
+    GUID requested = *source;
+    if (!dsound_playback_device_supported(&requested) || !audio_output_is_ready())
+        return DSERR_NODRIVER;
+    *destination = dsound_pcm_output;
+    return DS_OK;
+}
 
 HRESULT WINAPI DirectSoundEnumerateA(PVOID callback, PVOID context)
 {
@@ -3692,9 +3860,13 @@ HRESULT WINAPI DirectSoundEnumerateA(PVOID callback, PVOID context)
         return DS_OK;
 
     static const char description64[] = "Primary Sound Driver";
+    static const char physical64[] = "Osito PCM Output";
     static const char module64[] = "dsound.dll";
     if (!g_compat32_mode) {
-        ((DSENUMCALLBACKA)callback)(NULL, description64, module64, context);
+        if (((DSENUMCALLBACKA)callback)(NULL, description64, module64, context)) {
+            GUID device = dsound_pcm_output;
+            ((DSENUMCALLBACKA)callback)(&device, physical64, module64, context);
+        }
         return DS_OK;
     }
 
@@ -3706,11 +3878,17 @@ HRESULT WINAPI DirectSoundEnumerateA(PVOID callback, PVOID context)
     char *module = (char *)(strings + 64);
     memcpy(description, description64, sizeof(description64));
     memcpy(module, module64, sizeof(module64));
+    memcpy(strings + 128, physical64, sizeof(physical64));
+    memcpy(strings + 256, &dsound_pcm_output, sizeof(dsound_pcm_output));
     uint32_t args[4] = {
         0, (uint32_t)(ULONG_PTR)description, (uint32_t)(ULONG_PTR)module,
         (uint32_t)(ULONG_PTR)context,
     };
-    compat32_callback_args((uint32_t)(ULONG_PTR)callback, 4, args);
+    if (compat32_callback_args((uint32_t)(ULONG_PTR)callback, 4, args)) {
+        args[0] = (uint32_t)(ULONG_PTR)(strings + 256);
+        args[1] = (uint32_t)(ULONG_PTR)(strings + 128);
+        compat32_callback_args((uint32_t)(ULONG_PTR)callback, 4, args);
+    }
     VirtualFree(strings, 0, MEM_RELEASE);
     return DS_OK;
 }
@@ -3728,8 +3906,14 @@ HRESULT WINAPI DirectSoundEnumerateW(PVOID callback, PVOID context)
     static const WCHAR module64[] = {
         'd','s','o','u','n','d','.','d','l','l',0
     };
+    static const WCHAR physical64[] = {
+        'O','s','i','t','o',' ','P','C','M',' ','O','u','t','p','u','t',0
+    };
     if (!g_compat32_mode) {
-        ((DSENUMCALLBACKW)callback)(NULL, description64, module64, context);
+        if (((DSENUMCALLBACKW)callback)(NULL, description64, module64, context)) {
+            GUID device = dsound_pcm_output;
+            ((DSENUMCALLBACKW)callback)(&device, physical64, module64, context);
+        }
         return DS_OK;
     }
 
@@ -3741,11 +3925,17 @@ HRESULT WINAPI DirectSoundEnumerateW(PVOID callback, PVOID context)
     WCHAR *module = (WCHAR *)(void *)(strings + 128);
     memcpy(description, description64, sizeof(description64));
     memcpy(module, module64, sizeof(module64));
+    memcpy(strings + 256, physical64, sizeof(physical64));
+    memcpy(strings + 384, &dsound_pcm_output, sizeof(dsound_pcm_output));
     uint32_t args[4] = {
         0, (uint32_t)(ULONG_PTR)description, (uint32_t)(ULONG_PTR)module,
         (uint32_t)(ULONG_PTR)context,
     };
-    compat32_callback_args((uint32_t)(ULONG_PTR)callback, 4, args);
+    if (compat32_callback_args((uint32_t)(ULONG_PTR)callback, 4, args)) {
+        args[0] = (uint32_t)(ULONG_PTR)(strings + 384);
+        args[1] = (uint32_t)(ULONG_PTR)(strings + 256);
+        compat32_callback_args((uint32_t)(ULONG_PTR)callback, 4, args);
+    }
     VirtualFree(strings, 0, MEM_RELEASE);
     return DS_OK;
 }
@@ -4025,8 +4215,10 @@ typedef struct {
 
 static const SHIM_EXPORT dsound_exports[] = {
     { "DirectSoundCreate", (PVOID)DirectSoundCreate, 3, CC_STDCALL },
+    { "DirectSoundCreate8", (PVOID)DirectSoundCreate8, 3, CC_STDCALL },
     { "DirectSoundEnumerateA", (PVOID)DirectSoundEnumerateA, 2, CC_STDCALL },
     { "DirectSoundEnumerateW", (PVOID)DirectSoundEnumerateW, 2, CC_STDCALL },
+    { "GetDeviceID", (PVOID)dsound_GetDeviceID, 2, CC_STDCALL },
     { "DirectSoundCaptureCreate", (PVOID)DirectSoundCaptureCreate, 3, CC_STDCALL },
     { "DirectSoundCaptureEnumerateA", (PVOID)DirectSoundCaptureEnumerateA, 2, CC_STDCALL },
     { "DirectSoundCaptureEnumerateW", (PVOID)DirectSoundCaptureEnumerateW, 2, CC_STDCALL },
@@ -4050,8 +4242,21 @@ static int dsound_strcmp(const char *left, const char *right)
 
 PVOID dsound_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 {
-    (void)ordinal;
-    if (by_ordinal || !func_name)
+    if (by_ordinal) {
+        /* The public dsound.dll ordinals are not export-table indices. */
+        switch (ordinal) {
+        case 1: return (PVOID)DirectSoundCreate;
+        case 2: return (PVOID)DirectSoundEnumerateA;
+        case 3: return (PVOID)DirectSoundEnumerateW;
+        case 6: return (PVOID)DirectSoundCaptureCreate;
+        case 7: return (PVOID)DirectSoundCaptureEnumerateA;
+        case 8: return (PVOID)DirectSoundCaptureEnumerateW;
+        case 9: return (PVOID)dsound_GetDeviceID;
+        case 11: return (PVOID)DirectSoundCreate8;
+        default: return NULL;
+        }
+    }
+    if (!func_name)
         return NULL;
     for (uint32_t i = 0; dsound_exports[i].name; i++) {
         if (dsound_strcmp(func_name, dsound_exports[i].name) == 0)
@@ -4070,6 +4275,9 @@ PVOID dsound_shim_init(void)
 #endif
     HRESULT result = ole32_register_class(&clsid_directsound,
                                           dsound_com_activate);
+    if (result == DS_OK)
+        result = ole32_register_class(&clsid_directsound8,
+                                      dsound8_com_activate);
     if (result != DS_OK) {
         serial_puts("[DSOUND] failed to register COM class: 0x");
         serial_puthex((uint32_t)result, 8);

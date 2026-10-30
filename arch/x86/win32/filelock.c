@@ -8,6 +8,7 @@
 
 #include "filelock.h"
 #include "ntsyscall.h"
+#include "ntprocess.h"
 #include "../kernel/smp.h"
 
 extern void *kmalloc(uint64_t size);
@@ -31,12 +32,27 @@ typedef struct _NT_FILE_RANGE_LOCK {
     PVOID completion_context;
 } NT_FILE_RANGE_LOCK;
 
+typedef struct _NT_FILE_IO_ENTRY {
+    struct _NT_FILE_IO_ENTRY *next;
+    PVOID identity;
+    ULONG owner_pid;
+    ULONGLONG offset;
+    ULONGLONG length;
+    BOOL write;
+    ULONGLONG cookie;
+} NT_FILE_IO_ENTRY;
+
 static spinlock_t g_file_range_lock = SPINLOCK_INIT;
 static NT_FILE_RANGE_LOCK *g_file_range_locks;
-static NT_FILE_IO_GUARD *g_file_io_guards;
+static NT_FILE_IO_ENTRY *g_file_io_guards;
+static ULONGLONG g_file_io_cookie;
 static NT_FILE_RANGE_LOCK *g_file_lock_waiters_head;
 static NT_FILE_RANGE_LOCK *g_file_lock_waiters_tail;
 
+#ifdef FILELOCK_HOST_TEST
+static uint64_t file_range_lock_irqsave(void);
+static void file_range_unlock_irqrestore(uint64_t flags);
+#else
 static uint64_t file_range_lock_irqsave(void)
 {
     uint64_t flags;
@@ -51,6 +67,7 @@ static void file_range_unlock_irqrestore(uint64_t flags)
     if (flags & (1ULL << 9))
         __asm__ volatile ("sti" ::: "memory");
 }
+#endif
 
 static ULONGLONG file_range_last(ULONGLONG offset, ULONGLONG length)
 {
@@ -111,7 +128,7 @@ static BOOL file_lock_conflicts_locked(PVOID identity,
             return TRUE;
     }
 
-    for (NT_FILE_IO_GUARD *guard = g_file_io_guards; guard;
+    for (NT_FILE_IO_ENTRY *guard = g_file_io_guards; guard;
          guard = guard->next) {
         if (guard->identity != identity ||
             !file_ranges_overlap(guard->offset, guard->length,
@@ -294,14 +311,22 @@ NTSTATUS nt_file_lock_range_request(
     BOOL asynchronous = completion &&
         !(create_options &
           (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT));
+    PVOID sync_request = !asynchronous && !fail_immediately
+        ? nt_thread_sync_io_begin() : NULL;
 
     for (;;) {
+        if (nt_thread_sync_io_cancelled(sync_request)) {
+            nt_thread_sync_io_end(sync_request);
+            kfree(request);
+            return STATUS_CANCELLED;
+        }
         flags = file_range_lock_irqsave();
         PFILE_OBJECT locked_file = NULL;
         status = file_lock_resolve(handle, owner_pid, &locked_file);
         if (!NT_SUCCESS(status) || locked_file != initial_file ||
             locked_file->osfs_file != request->identity) {
             file_range_unlock_irqrestore(flags);
+            nt_thread_sync_io_end(sync_request);
             kfree(request);
             return NT_SUCCESS(status) ? STATUS_INVALID_HANDLE : status;
         }
@@ -314,16 +339,19 @@ NTSTATUS nt_file_lock_range_request(
             request->next = g_file_range_locks;
             g_file_range_locks = request;
             file_range_unlock_irqrestore(flags);
+            nt_thread_sync_io_end(sync_request);
             return STATUS_SUCCESS;
         }
         if (fail_immediately) {
             file_range_unlock_irqrestore(flags);
+            nt_thread_sync_io_end(sync_request);
             kfree(request);
             return STATUS_LOCK_NOT_GRANTED;
         }
         if (asynchronous) {
             file_lock_enqueue_waiter_locked(request);
             file_range_unlock_irqrestore(flags);
+            nt_thread_sync_io_end(sync_request);
             return STATUS_PENDING;
         }
         file_range_unlock_irqrestore(flags);
@@ -392,24 +420,29 @@ NTSTATUS nt_file_io_guard_begin(PFILE_OBJECT file, ULONG owner_pid,
                                 ULONGLONG offset, ULONGLONG length,
                                 BOOL write, NT_FILE_IO_GUARD *guard)
 {
+    if (guard)
+        guard->cookie = 0;
     if (!file || !file->osfs_file || !owner_pid || !guard)
         return STATUS_INVALID_PARAMETER;
 
-    guard->next = NULL;
-    guard->identity = file->osfs_file;
-    guard->owner_file = file;
-    guard->owner_pid = owner_pid;
-    guard->offset = offset;
-    guard->length = length;
-    guard->write = write ? TRUE : FALSE;
-    guard->active = FALSE;
     if (!length)
         return STATUS_SUCCESS;
+
+    /* Global traversal can run under any process CR3. Never publish the
+     * caller's stack, even though it is accessible while issuing this I/O. */
+    NT_FILE_IO_ENTRY *entry = kmalloc(sizeof(*entry));
+    if (!entry)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    entry->identity = file->osfs_file;
+    entry->owner_pid = owner_pid;
+    entry->offset = offset;
+    entry->length = length;
+    entry->write = write ? TRUE : FALSE;
 
     uint64_t flags = file_range_lock_irqsave();
     for (NT_FILE_RANGE_LOCK *lock = g_file_range_locks; lock;
          lock = lock->next) {
-        if (lock->identity != guard->identity ||
+        if (lock->identity != entry->identity ||
             !file_ranges_overlap(lock->offset, lock->length,
                                  offset, length))
             continue;
@@ -417,31 +450,71 @@ NTSTATUS nt_file_io_guard_begin(PFILE_OBJECT file, ULONG owner_pid,
             (lock->exclusive &&
              !file_lock_same_owner(lock, owner_pid, file))) {
             file_range_unlock_irqrestore(flags);
+            kfree(entry);
             return STATUS_FILE_LOCK_CONFLICT;
         }
     }
 
-    guard->next = g_file_io_guards;
-    guard->active = TRUE;
-    g_file_io_guards = guard;
+    if (g_file_io_cookie == ~0ULL) {
+        file_range_unlock_irqrestore(flags);
+        kfree(entry);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    ULONGLONG cookie = ++g_file_io_cookie;
+    entry->cookie = cookie;
+    entry->next = g_file_io_guards;
+    g_file_io_guards = entry;
     file_range_unlock_irqrestore(flags);
+    guard->cookie = cookie;
     return STATUS_SUCCESS;
 }
 
 void nt_file_io_guard_end(NT_FILE_IO_GUARD *guard)
 {
-    if (!guard || !guard->active)
+    if (!guard || !guard->cookie)
         return;
+    ULONGLONG cookie = guard->cookie;
+    guard->cookie = 0;
 
     uint64_t flags = file_range_lock_irqsave();
-    NT_FILE_IO_GUARD **link = &g_file_io_guards;
-    while (*link && *link != guard)
+    NT_FILE_IO_ENTRY **link = &g_file_io_guards;
+    while (*link && (*link)->cookie != cookie)
         link = &(*link)->next;
-    if (*link == guard)
-        *link = guard->next;
-    guard->next = NULL;
-    guard->active = FALSE;
+    NT_FILE_IO_ENTRY *entry = *link;
+    if (entry)
+        *link = entry->next;
     file_range_unlock_irqrestore(flags);
+    if (entry) {
+        kfree(entry);
+        file_lock_service_waiters();
+    }
+}
+
+void nt_file_io_guards_release_process(ULONG owner_pid)
+{
+    if (!owner_pid)
+        return;
+    NT_FILE_IO_ENTRY *retired = NULL;
+    uint64_t flags = file_range_lock_irqsave();
+    NT_FILE_IO_ENTRY **link = &g_file_io_guards;
+    while (*link) {
+        NT_FILE_IO_ENTRY *entry = *link;
+        if (entry->owner_pid != owner_pid) {
+            link = &entry->next;
+            continue;
+        }
+        *link = entry->next;
+        entry->next = retired;
+        retired = entry;
+    }
+    file_range_unlock_irqrestore(flags);
+    if (!retired)
+        return;
+    while (retired) {
+        NT_FILE_IO_ENTRY *next = retired->next;
+        kfree(retired);
+        retired = next;
+    }
     file_lock_service_waiters();
 }
 

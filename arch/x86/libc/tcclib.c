@@ -1380,7 +1380,13 @@ uint128_t __udivti3(uint128_t a, uint128_t b)
 void __assert_fail(const char *expr, const char *file, unsigned int line, const char *func)
 {
     _stdio_init();
-    fprintf(stderr, "assert failed: %s at %s:%u (%s)\n", expr, file, line, func ? func : "?");
+    fprintf(stderr, "assert failed: %s at %s:%u (%s), caller=%p\n",
+            expr, file, line, func ? func : "?", __builtin_return_address(0));
+#ifdef OSITO_ASSERT_STACK_TRACE
+    const void *const *stack = (const void *const *)__builtin_frame_address(0) + 2;
+    for (unsigned i = 0; i < 8; i++)
+        fprintf(stderr, "assert stack[%u]=%p\n", i, stack[i]);
+#endif
     __syscall1(SYS_exit, 1);
     __builtin_unreachable();
 }

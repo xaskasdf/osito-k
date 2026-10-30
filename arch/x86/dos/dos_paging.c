@@ -9,14 +9,14 @@ bool dos_page_probe(dos_vm_t *vm, uint32_t linear, unsigned access,
     if (fault) *fault = (dos_page_fault_t){0};
     if (!vm || !vm->cpu || !vm->mem || !translation) return false;
     dos_page_translation_t result = {
-        .physical = linear, .pde = UINT32_MAX, .pte = UINT32_MAX
+        .physical = dos_a20_address(vm, linear), .pde = UINT32_MAX, .pte = UINT32_MAX
     };
     unsigned error = access & (DOS_PAGE_WRITE | DOS_PAGE_USER);
     if (vm->cpu->cr0 & DOS_CR0_PG) {
-        result.pde = (vm->cpu->cr3 & 0xFFFFF000u) + (linear >> 22) * 4u;
+        result.pde = dos_a20_address(vm, (vm->cpu->cr3 & 0xFFFFF000u) + (linear >> 22) * 4u);
         uint32_t pde = dos_mem_read32(vm, result.pde);
         if (!(pde & 1u)) goto page_fault;
-        result.pte = (pde & 0xFFFFF000u) + ((linear >> 12) & 0x3FFu) * 4u;
+        result.pte = dos_a20_address(vm, (pde & 0xFFFFF000u) + ((linear >> 12) & 0x3FFu) * 4u);
         uint32_t pte = dos_mem_read32(vm, result.pte);
         if (!(pte & 1u)) goto page_fault;
 
@@ -28,7 +28,7 @@ bool dos_page_probe(dos_vm_t *vm, uint32_t linear, unsigned access,
             error |= 1u;
             goto page_fault;
         }
-        result.physical = (pte & 0xFFFFF000u) | (linear & 0xFFFu);
+        result.physical = dos_a20_address(vm, (pte & 0xFFFFF000u) | (linear & 0xFFFu));
     }
     *translation = result;
     return true;

@@ -31,6 +31,7 @@ API int CALL GetDIBits(HANDLE, HANDLE, UINT, UINT, void *, INFO *, UINT);
 API BOOL CALL BitBlt(HANDLE, int, int, int, int, HANDLE, int, int, DWORD);
 API BOOL CALL StretchBlt(HANDLE, int, int, int, int, HANDLE, int, int, int, int, DWORD);
 API int CALL StretchDIBits(HANDLE, int, int, int, int, int, int, int, int, const void *, const INFO *, UINT, DWORD);
+API int CALL SetDIBitsToDevice(HANDLE, int, int, DWORD, DWORD, int, int, UINT, UINT, const void *, const INFO *, UINT);
 API BOOL CALL PatBlt(HANDLE, int, int, int, int, DWORD);
 API HANDLE CALL CreateSolidBrush(DWORD);
 API BOOL CALL GdiFlush(void);
@@ -195,6 +196,48 @@ static void channel_ramp(void)
     SelectObject(a,ao); SelectObject(b,bo); DeleteObject(ab); DeleteObject(bb); DeleteDC(a); DeleteDC(b);
 }
 
+static void unscaled_rows(unsigned source_bpp, unsigned dest_bpp, int source_bottom, int dest_bottom)
+{
+    unsigned char source[24], *pixels = 0;
+    unsigned source_bytes = source_bpp / 8, dest_bytes = dest_bpp / 8;
+    unsigned pitch = (5 * dest_bytes + 3) & ~3u;
+    INFO si = info(3, source_bottom ? 2 : -2, source_bpp, 0, 0);
+    INFO di = info(5, dest_bottom ? 3 : -3, dest_bpp, 0, 0);
+    HANDLE dc = CreateCompatibleDC(0);
+    HANDLE bitmap = CreateDIBSection(dc, &di, 0, (void **)&pixels, 0, 0);
+    check(dc && bitmap && pixels, "unscaled row destination allocated");
+    if (!dc || !bitmap || !pixels) ExitProcess(2);
+    HANDLE old = SelectObject(dc, bitmap);
+    memset(source, 0xc7, sizeof(source));
+    for (unsigned y = 0; y < 2; y++) for (unsigned x = 0; x < 3; x++) {
+        DWORD color = (y + 1) * 0x302010 + x * 0x010307;
+        unsigned at = (source_bottom ? 1 - y : y) * 12 + x * source_bytes;
+        for (unsigned c = 0; c < 3; c++) source[at + c] = (unsigned char)(color >> (c * 8));
+        if (source_bytes == 4) source[at + 3] = (unsigned char)(x * 64);
+    }
+    for (unsigned api = 0; api < 2; api++) {
+        memset(pixels, 0x55, pitch * 3);
+        int rows = api ? SetDIBitsToDevice(dc, 1, 1, 3, 2, 0, 0, 0, 2, source, &si, 0)
+                       : StretchDIBits(dc, 1, 1, 3, 2, 0, 0, 3, 2, source, &si, 0, COPY);
+        check(rows == 2, "unscaled DIB reports two rows");
+        GdiFlush();
+        for (unsigned y = 0; y < 3; y++) for (unsigned byte = 0; byte < pitch; byte++) {
+            unsigned x = byte / dest_bytes, channel = byte % dest_bytes;
+            unsigned char expected = 0x55;
+            if (y >= 1 && x >= 1 && x < 4) {
+                /* RGB is portable; the Osito host suite checks opaque coverage. */
+                if (channel == 3) continue;
+                DWORD color = y * 0x302010 + (x - 1) * 0x010307;
+                expected = (unsigned char)(color >> (channel * 8));
+            }
+            unsigned at = (dest_bottom ? 2 - y : y) * pitch + byte;
+            check(pixels[at] == expected, "unscaled DIB colors, orientation and untouched padding");
+        }
+    }
+    SelectObject(dc, old);
+    check(DeleteObject(bitmap) && DeleteDC(dc), "unscaled DIB resources released");
+}
+
 void mainCRTStartup(void)
 {
     static const DWORD rgb555[3]={0x7C00,0x3E0,0x1F}, rgb565[3]={0xF800,0x7E0,0x1F};
@@ -210,6 +253,11 @@ void mainCRTStartup(void)
     cross_format();
     shared_dib();
     channel_ramp();
+    for (unsigned sb = 24; sb <= 32; sb += 8)
+        for (unsigned db = 24; db <= 32; db += 8)
+            for (int source_bottom = 0; source_bottom < 2; source_bottom++)
+                for (int dest_bottom = 0; dest_bottom < 2; dest_bottom++)
+                    unscaled_rows(sb, db, source_bottom, dest_bottom);
     report("[GDI-DIB] checks=0x"); hex(checks); report(" failures=0x"); hex(failures);
     report(failures ? " FAIL\n" : " PASS\n");
     ExitProcess(failures ? 3 : 0);

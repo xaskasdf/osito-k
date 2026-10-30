@@ -21,6 +21,7 @@
 #include "dllloader.h"
 #include "kernel32_shim.h"
 #include "msvcrt_shim.h"
+#include "crt_math.h"
 #include "ntsyscall.h"
 #include "wdbg.h"
 #include "win32_abi.h"
@@ -62,7 +63,12 @@ int g_compat32_mode = 0;
 #define RUNTIME_MATH_PAGE  (RUNTIME_ATOF_PAGE + 1)
 #define RUNTIME_X87_WRAPPER_OFFSET 0x400U
 #define RUNTIME_X87_WRAPPER_SIZE   128U
-#define COMPAT32_RUNTIME_PAGES (RUNTIME_MATH_PAGE + 1)
+#define RUNTIME_MATH_PAGES 2U
+#define RUNTIME_CI_ADAPTER_OFFSET 0x1400U
+#define RUNTIME_CI_ADAPTER_SIZE   32U
+#define RUNTIME_SSE_ADAPTER_OFFSET 0x1800U
+#define RUNTIME_SSE_ADAPTER_SIZE   256U
+#define COMPAT32_RUNTIME_PAGES (RUNTIME_MATH_PAGE + RUNTIME_MATH_PAGES)
 #define COMPAT32_RUNTIME_BYTES (COMPAT32_RUNTIME_PAGES * 4096U)
 #define THUNK_NAME_POOL_SIZE (COMPAT32_MAX_THUNKS * 256U)
 #define THUNK_NAME_MAX 512U
@@ -138,6 +144,10 @@ static int emit_x87_cdecl_result_wrapper(uint8_t *code,
                                          uint32_t wrapper_addr,
                                          uint32_t helper_addr,
                                          uint8_t num_args);
+static int emit_x87_intrinsic_adapter(uint8_t *code, uint32_t address,
+                                      uint32_t wrapper, uint8_t operands);
+static int emit_sse2_intrinsic_adapter(uint8_t *code, uint32_t address,
+                                      uint32_t helper);
 static uint32_t compat32_make_thunk_runtime(uint64_t target,
                                             const char *name,
                                             uint8_t num_args,
@@ -1340,22 +1350,52 @@ void compat32_init(void)
             const void *bits_helper;
             const char *name;
             const char *helper_name;
+            uint8_t words;
+            uint8_t x87_operands;
         } bridges[] = {
             {(const void *)crt_strtod, (const void *)crt_strtod_compat32,
-             "strtod", "__osito_strtod_compat32_bits"},
+             "strtod", "__osito_strtod_compat32_bits", 2, 0},
             {(const void *)crt_ceil, (const void *)crt_ceil_compat32,
-             "ceil", "__osito_ceil_compat32_bits"},
+             "ceil", "__osito_ceil_compat32_bits", 2, 0},
             {(const void *)crt_floor, (const void *)crt_floor_compat32,
-             "floor", "__osito_floor_compat32_bits"},
+             "floor", "__osito_floor_compat32_bits", 2, 0},
+            {(const void *)crt_frexp, (const void *)crt_frexp_compat32,
+             "frexp", "__osito_frexp_compat32_bits", 3, 0},
+            {(const void *)crt_ldexp, (const void *)crt_ldexp_compat32,
+             "ldexp", "__osito_ldexp_compat32_bits", 3, 0},
+            {(const void *)crt_modf, (const void *)crt_modf_compat32,
+             "modf", "__osito_modf_compat32_bits", 3, 0},
+#define CI_BRIDGE(name, operands) \
+            {(const void *)crt_CI##name, (const void *)crt_CI##name##_compat32, \
+             "_CI" #name, "__osito_CI" #name "_bits", 2 * operands, operands}
+            CI_BRIDGE(asin, 1), CI_BRIDGE(atan, 1), CI_BRIDGE(atan2, 2),
+            CI_BRIDGE(cos, 1), CI_BRIDGE(cosh, 1), CI_BRIDGE(log, 1),
+            CI_BRIDGE(sin, 1), CI_BRIDGE(sinh, 1), CI_BRIDGE(tan, 1),
+            CI_BRIDGE(tanh, 1),
+#undef CI_BRIDGE
+#define SCALAR_BRIDGE(name, words) \
+            {(const void *)crt_##name, (const void *)crt_##name##_compat32, \
+             #name, "__osito_" #name "_bits", words, 0}
+            SCALAR_BRIDGE(cos, 2), SCALAR_BRIDGE(sin, 2),
+            SCALAR_BRIDGE(acos, 2), SCALAR_BRIDGE(log10, 2),
+            SCALAR_BRIDGE(pow, 4),
+            SCALAR_BRIDGE(log, 2), SCALAR_BRIDGE(exp, 2),
+            SCALAR_BRIDGE(asin, 2), SCALAR_BRIDGE(atan, 2),
+            SCALAR_BRIDGE(atan2, 4), SCALAR_BRIDGE(fmod, 4),
+#undef SCALAR_BRIDGE
         };
         _Static_assert(RUNTIME_X87_WRAPPER_OFFSET +
                        sizeof(bridges) / sizeof(bridges[0]) *
-                           RUNTIME_X87_WRAPPER_SIZE <= 4096U,
-                       "x87 result wrappers must fit the runtime math page");
+                           RUNTIME_X87_WRAPPER_SIZE <= RUNTIME_CI_ADAPTER_OFFSET,
+                       "x87 result wrappers must precede intrinsic adapters");
+        _Static_assert(RUNTIME_CI_ADAPTER_OFFSET +
+                       sizeof(bridges) / sizeof(bridges[0]) *
+                           RUNTIME_CI_ADAPTER_SIZE <= RUNTIME_SSE_ADAPTER_OFFSET,
+                       "intrinsic adapters must fit the runtime math pages");
         for (unsigned i = 0; i < sizeof(bridges) / sizeof(bridges[0]); i++) {
             uint32_t helper_addr = compat32_make_thunk_runtime(
                 (uint64_t)(ULONG_PTR)bridges[i].bits_helper,
-                bridges[i].helper_name, 2, CC_CDECL);
+                bridges[i].helper_name, bridges[i].words, CC_CDECL);
             uint32_t wrapper_offset = RUNTIME_MATH_PAGE * 4096U +
                                       RUNTIME_X87_WRAPPER_OFFSET +
                                       i * RUNTIME_X87_WRAPPER_SIZE;
@@ -1363,9 +1403,18 @@ void compat32_init(void)
             if (helper_addr &&
                 emit_x87_cdecl_result_wrapper(
                     thunk_pool + wrapper_offset, wrapper_addr,
-                    helper_addr, 2) == 0) {
+                    helper_addr, bridges[i].words) == 0) {
+                uint32_t target_addr = wrapper_addr;
+                if (bridges[i].x87_operands) {
+                    uint32_t adapter_offset = RUNTIME_MATH_PAGE * 4096U +
+                        RUNTIME_CI_ADAPTER_OFFSET + i * RUNTIME_CI_ADAPTER_SIZE;
+                    target_addr = compat32_runtime_addr + adapter_offset;
+                    if (emit_x87_intrinsic_adapter(thunk_pool + adapter_offset,
+                            target_addr, wrapper_addr, bridges[i].x87_operands))
+                        continue;
+                }
                 win32_abi_register_compat32_direct(
-                    bridges[i].native_target, wrapper_addr);
+                    bridges[i].native_target, target_addr);
                 serial_puts("[COMPAT32] ");
                 serial_puts(bridges[i].name);
                 serial_puts(" x87 wrapper at 0x");
@@ -1378,6 +1427,36 @@ void compat32_init(void)
                 serial_puts(bridges[i].name);
                 serial_puts(" x87 wrapper\n");
             }
+        }
+    }
+    {
+        static const struct {
+            const void *target, *helper;
+            const char *name;
+            uint8_t words;
+        } entries[] = {
+#define SSE2_BRIDGE(name, count) \
+            { (const void *)crt_sse2_##name, (const void *)crt_sse2_##name##_bits, \
+              "__osito_sse2_" #name "_bits", count }
+            SSE2_BRIDGE(pow, 4), SSE2_BRIDGE(sqrt, 2), SSE2_BRIDGE(log, 2),
+            SSE2_BRIDGE(sin, 2), SSE2_BRIDGE(log10, 2), SSE2_BRIDGE(cos, 2),
+            SSE2_BRIDGE(exp, 2),
+#undef SSE2_BRIDGE
+        };
+        _Static_assert(RUNTIME_SSE_ADAPTER_OFFSET +
+                       sizeof(entries) / sizeof(entries[0]) * RUNTIME_SSE_ADAPTER_SIZE <=
+                       RUNTIME_MATH_PAGES * 4096U, "SSE2 adapters fit the existing math pages");
+        for (unsigned i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+            uint32_t helper = compat32_make_thunk_runtime(
+                (uint64_t)(ULONG_PTR)entries[i].helper, entries[i].name,
+                entries[i].words, CC_CDECL);
+            uint32_t offset = RUNTIME_MATH_PAGE * 4096U +
+                              RUNTIME_SSE_ADAPTER_OFFSET + i * RUNTIME_SSE_ADAPTER_SIZE;
+            uint32_t address = compat32_runtime_addr + offset;
+            if (helper && !emit_sse2_intrinsic_adapter(thunk_pool + offset, address, helper))
+                win32_abi_register_compat32_direct(entries[i].target, address);
+            else
+                serial_puts("[COMPAT32] Failed to install SSE2 intrinsic adapter\n");
         }
     }
 #endif
@@ -1461,6 +1540,68 @@ static int emit_x87_cdecl_result_wrapper(uint8_t *code,
 
     if (p > RUNTIME_X87_WRAPPER_SIZE) return -1;
     while (p < RUNTIME_X87_WRAPPER_SIZE) code[p++] = 0xCC;
+    return 0;
+}
+
+/* MSVC intrinsics receive their operands on x87, with the last argument at
+ * ST(0). Spill and pop only those operands before calling the ordinary cdecl
+ * wrapper; live values below them remain on the caller's x87 stack. */
+static int emit_x87_intrinsic_adapter(uint8_t *code, uint32_t address,
+                                      uint32_t wrapper, uint8_t operands)
+{
+    if (!code || !address || !wrapper || operands < 1 || operands > 2)
+        return -1;
+    unsigned pos = 0;
+    code[pos++] = 0x83; code[pos++] = 0xEC; code[pos++] = operands * 8;
+    if (operands == 2) {
+        code[pos++] = 0xDD; code[pos++] = 0x5C; code[pos++] = 0x24;
+        code[pos++] = 0x08; /* fstp qword [esp+8] */
+    }
+    code[pos++] = 0xDD; code[pos++] = 0x1C; code[pos++] = 0x24;
+                           /* fstp qword [esp] */
+    code[pos++] = 0xE8;
+    int32_t relative = (int32_t)(wrapper - (address + pos + 4));
+    __builtin_memcpy(code + pos, &relative, sizeof(relative));
+    pos += sizeof(relative);
+    code[pos++] = 0x83; code[pos++] = 0xC4; code[pos++] = operands * 8;
+    code[pos++] = 0xC3;
+    while (pos < RUNTIME_CI_ADAPTER_SIZE) code[pos++] = 0xCC;
+    return 0;
+}
+
+/* Native i386 register adapter. Save XMM state and volatile integer
+ * registers before the normal DWORD thunk; the x87 stack is never touched.
+ * The helper returns exact double bits in EDX:EAX. Preserve the high half of
+ * XMM0 and all other XMM registers, returning only its low double. */
+static int emit_sse2_intrinsic_adapter(uint8_t *code, uint32_t address,
+                                      uint32_t helper)
+{
+    if (!code || !address || !helper) return -1;
+    unsigned p = 0;
+#define E(v) code[p++] = (uint8_t)(v)
+    E(0x50); E(0x51); E(0x52);               /* push eax/ecx/edx */
+    E(0x81); E(0xec); E(0x90); E(0); E(0); E(0); /* sub esp,144 */
+    for (unsigned i = 0; i < 8; i++) {
+        E(0xf3); E(0x0f); E(0x7f); E(0x84 | (i << 3)); E(0x24);
+        E(16 + i * 16); E(0); E(0); E(0); /* movdqu [esp+16+i*16],xmmN */
+    }
+    E(0xf2); E(0x0f); E(0x11); E(0x04); E(0x24); /* movsd [esp],xmm0 */
+    E(0xf2); E(0x0f); E(0x11); E(0x4c); E(0x24); E(8); /* [esp+8],xmm1 */
+    E(0xe8);
+    int32_t relative = (int32_t)(helper - (address + p + 4U));
+    __builtin_memcpy(code + p, &relative, sizeof(relative)); p += sizeof(relative);
+    E(0x89); E(0x04); E(0x24);                /* mov [esp],eax */
+    E(0x89); E(0x54); E(0x24); E(4);          /* mov [esp+4],edx */
+    for (unsigned i = 0; i < 8; i++) {
+        E(0xf3); E(0x0f); E(0x6f); E(0x84 | (i << 3)); E(0x24);
+        E(16 + i * 16); E(0); E(0); E(0); /* movdqu xmmN,[esp+16+i*16] */
+    }
+    E(0x66); E(0x0f); E(0x12); E(0x04); E(0x24); /* movlpd xmm0,[esp] */
+    E(0x81); E(0xc4); E(0x90); E(0); E(0); E(0); /* add esp,144 */
+    E(0x5a); E(0x59); E(0x58); E(0xc3);       /* pop edx/ecx/eax; ret */
+#undef E
+    if (p > RUNTIME_SSE_ADAPTER_SIZE) return -1;
+    while (p < RUNTIME_SSE_ADAPTER_SIZE) code[p++] = 0xcc;
     return 0;
 }
 
@@ -1884,7 +2025,9 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                     patch_status = STATUS_NO_MEMORY;
                     goto patch_failed;
                 }
-                iat_entry->u1.Function = thunk_addr;
+                patch_status = pe_write_image_pointer(
+                    &iat_entry->u1.Function, thunk_addr, TRUE);
+                if (!NT_SUCCESS(patch_status)) goto patch_failed;
                 continue;
             }
 
@@ -1909,7 +2052,9 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                     patch_status = STATUS_CONFLICTING_ADDRESSES;
                     goto patch_failed;
                 }
-                iat_entry->u1.Function = (uint32_t)data_target;
+                patch_status = pe_write_image_pointer(
+                    &iat_entry->u1.Function, data_target, TRUE);
+                if (!NT_SUCCESS(patch_status)) goto patch_failed;
                 direct++;
                 serial_puts("[IAT-DATA] ");
                 serial_puts(func_name ? func_name : "<ordinal>");
@@ -1926,10 +2071,16 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
              * produces an unmapped low-address jump. */
             BOOL kernel_target =
                 (uint64_t)(ULONG_PTR)resolved >= KERNEL_VBASE;
-            if (shim || kernel_target) {
+            LOADED_MODULE *mapped = kernel_target ? NULL :
+                dll_find_module_by_address(resolved);
+            BOOL mapped_shim = mapped && mapped->synthetic_shim &&
+                mapped->published_exports && mapped->image.Is32Bit;
+            if ((shim && !mapped_shim) || kernel_target) {
                 uint32_t direct_target = win32_abi_compat32_direct(resolved);
                 if (direct_target) {
-                    iat_entry->u1.Function = direct_target;
+                    patch_status = pe_write_image_pointer(
+                        &iat_entry->u1.Function, direct_target, TRUE);
+                    if (!NT_SUCCESS(patch_status)) goto patch_failed;
                     direct++;
                     serial_puts("[IAT32-DIRECT] ");
                     serial_puts(func_name ? func_name : "<ordinal>");
@@ -1958,16 +2109,15 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                     patch_status = STATUS_NO_MEMORY;
                     goto patch_failed;
                 }
-                iat_entry->u1.Function = thunk_addr;
+                patch_status = pe_write_image_pointer(
+                    &iat_entry->u1.Function, thunk_addr, TRUE);
+                if (!NT_SUCCESS(patch_status)) goto patch_failed;
                 patched++;
             } else {
                 /*
                  * Import from a real PE32 DLL (32-bit code in same compat mode).
                  * Write the address directly — no thunk needed.
                  */
-                /* Use volatile to ensure the write hits memory */
-                volatile uint32_t *iat_ptr =
-                    (volatile uint32_t *)&iat_entry->u1.Function;
                 LOADED_MODULE *target_module =
                     dll_find_module_by_address(resolved);
                 if (!target_module || !target_module->image.Is32Bit) {
@@ -1981,7 +2131,9 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                     patch_status = STATUS_INVALID_IMAGE_FORMAT;
                     goto patch_failed;
                 }
-                *iat_ptr = (uint32_t)(ULONG_PTR)resolved;
+                patch_status = pe_write_image_pointer(
+                    &iat_entry->u1.Function, (ULONG_PTR)resolved, TRUE);
+                if (!NT_SUCCESS(patch_status)) goto patch_failed;
                 direct++;
             }
         }

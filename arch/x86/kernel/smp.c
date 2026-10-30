@@ -16,6 +16,7 @@
  */
 
 #include "smp.h"
+#include "acpi_reset.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -714,12 +715,67 @@ hang:
     for (;;) __asm__ volatile ("cli; hlt");
 }
 
+static const char *acpi_reboot_target(acpi_reset_register_t *reset)
+{
+    acpi_rsdp_t *rsdp = find_rsdp();
+    acpi_sdt_header_t *fadt = rsdp ? find_acpi_table(rsdp, "FACP") : NULL;
+    const char *error = acpi_reset_prepare(fadt, fadt ? fadt->length : 0, reset);
+    if (!error) {
+        serial_puts("[REBOOT] ACPI reset space="); serial_putdec(reset->space);
+        serial_puts(" address="); serial_puthex(reset->address, 16);
+        serial_puts(" value="); serial_puthex(reset->value, 2); serial_puts("\n");
+    } else {
+        serial_puts("[REBOOT] ACPI reset unavailable: "); serial_puts(error);
+        serial_puts("; legacy fallback\n");
+    }
+    return error;
+}
+
+static bool acpi_reboot_checkpoint(const char *reason)
+{
+    extern bool boot_diag_checkpoint(const char *);
+    bool saved = boot_diag_checkpoint(reason);
+    const char *message = saved ? "[REBOOT] Checkpoint accepted by storage\n" :
+                                 "[REBOOT] Checkpoint unavailable or failed\n";
+    serial_puts(message);
+    fb_puts(message);
+    return saved;
+}
+
+int acpi_reboot_check(void)
+{
+    serial_puts("[REBOOT] Check only; reset disabled\n");
+    fb_puts("[REBOOT] Check only; reset disabled\n");
+    acpi_reset_register_t reset;
+    const char *error = acpi_reboot_target(&reset);
+    bool saved = acpi_reboot_checkpoint("reboot-check");
+    return !error && saved ? 0 : -1;
+}
+
 void acpi_reboot(void)
 {
-    serial_puts("[ACPI] Reboot\n");
+    extern bool osfs2_is_mounted(void);
+    extern int disk_flush(void);
+    fb_puts("\n[REBOOT] Preparing reset...\n");
+    acpi_reboot_checkpoint("reboot-enter");
+    acpi_reset_register_t reset;
+    const char *error = acpi_reboot_target(&reset);
+    acpi_reboot_checkpoint("reboot-request");
+    if (osfs2_is_mounted() && disk_flush() < 0) {
+        serial_puts("[REBOOT] Filesystem flush failed; reboot cancelled\n");
+        fb_puts("[REBOOT] Filesystem flush failed; reboot cancelled\n");
+        return;
+    }
     __asm__ volatile ("cli");
-    __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0xFE), "Nd"((uint16_t)0x64));
-    for (volatile int i = 0; i < 10000000; i++);
+    if (!error) {
+        acpi_reset_write(&reset);
+        for (unsigned i = 0; i < 1000000; i++) __asm__ volatile ("pause");
+        serial_puts("[REBOOT] ACPI reset returned; trying legacy fallback\n");
+    }
+    acpi_reset_8042();
+    for (unsigned i = 0; i < 1000000; i++) __asm__ volatile ("pause");
+    serial_puts("[REBOOT] Legacy reset returned; last-resort triple fault\n");
+    fb_puts("[REBOOT] Reset failed; trying triple fault\n");
     struct { uint16_t limit; uint64_t base; } __attribute__((packed)) null_idt = {0, 0};
     __asm__ volatile ("lidt %0; int3" : : "m"(null_idt));
     for (;;) __asm__ volatile ("hlt");

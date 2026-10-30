@@ -13,6 +13,11 @@
 
 #include "nttypes.h"
 
+BOOL WINAPI WaitOnAddress(volatile void *address, void *compare,
+                          SIZE_T size, DWORD milliseconds);
+void WINAPI WakeByAddressSingle(void *address);
+void WINAPI WakeByAddressAll(void *address);
+
 /* ── Console handle constants (Windows convention) ──────────── */
 
 #define WIN32_STD_INPUT_HANDLE  ((ULONG)-10)
@@ -51,6 +56,8 @@ BOOL    WINAPI CopyFileW(PCWSTR lpExistingFileName, PCWSTR lpNewFileName, BOOL b
 BOOL    WINAPI DeleteFileA(PCSTR lpFileName);
 BOOL    WINAPI DeleteFileW(PCWSTR lpFileName);
 BOOL    WINAPI MoveFileA(PCSTR lpExistingFileName, PCSTR lpNewFileName);
+BOOL    WINAPI MoveFileExA_k32(PCSTR existing_name, PCSTR new_name, DWORD flags);
+BOOL    WINAPI MoveFileExW_k32(PCWSTR existing_name, PCWSTR new_name, DWORD flags);
 BOOL    WINAPI MoveFileW(PCWSTR lpExistingFileName, PCWSTR lpNewFileName);
 
 /* ── Console API ────────────────────────────────────────────── */
@@ -58,6 +65,7 @@ BOOL    WINAPI MoveFileW(PCWSTR lpExistingFileName, PCWSTR lpNewFileName);
 HANDLE  WINAPI GetStdHandle(DWORD nStdHandle);
 BOOL    WINAPI SetStdHandle(DWORD nStdHandle, HANDLE hHandle);
 BOOL    WINAPI AllocConsole(void);
+BOOL    WINAPI AttachConsole(DWORD dwProcessId);
 BOOL    WINAPI FreeConsole(void);
 
 BOOL    WINAPI WriteConsoleA(HANDLE hConsoleOutput, PCVOID lpBuffer,
@@ -107,6 +115,7 @@ BOOL    WINAPI UnmapViewOfFile(PCVOID lpBaseAddress);
 /* ── Heap API ───────────────────────────────────────────────── */
 
 HANDLE  WINAPI GetProcessHeap(void);
+BOOL    kernel32_heap_lock_owned_by_current(void);
 PVOID   WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes);
 BOOL    WINAPI HeapFree(HANDLE hHeap, DWORD dwFlags, PVOID lpMem);
 SIZE_T  WINAPI HeapSize(HANDLE hHeap, DWORD dwFlags, PCVOID lpMem);
@@ -218,6 +227,8 @@ HANDLE WINAPI GetCurrentThread(void);
 DWORD  WINAPI SuspendThread(HANDLE hThread);
 DWORD  WINAPI ResumeThread(HANDLE hThread);
 BOOL   WINAPI TerminateThread(HANDLE hThread, DWORD dwExitCode);
+BOOL   kernel32_thread_termination_pending(void);
+void   kernel32_thread_termination_checkpoint(void);
 void   WINAPI ExitThread(DWORD dwExitCode) __attribute__((noreturn));
 DWORD  WINAPI WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
 DWORD  WINAPI WaitForMultipleObjects(DWORD nCount, const HANDLE *lpHandles,
@@ -269,6 +280,12 @@ BOOL   k32_iocp_complete_handle_status_for_owner(
 BOOL   k32_iocp_wake_handle_for_owner(HANDLE file, DWORD owner_pid);
 void   k32_iocp_forget_file(HANDLE file);
 void   k32_iocp_thread_blocking(void);
+/* Job associations own a subsystem handle so caller close/exit cannot recycle
+ * the event-backed port until the job drops its reference. */
+NTSTATUS k32_iocp_reference_job(HANDLE handle, PVOID *port, PHANDLE reference);
+void   k32_iocp_release_job(HANDLE reference);
+void   k32_iocp_post_job(PVOID port, DWORD message, ULONG_PTR key, ULONG pid);
+void   k32_iocp_release_event(PVOID event);
 BOOL   WINAPI GetQueuedCompletionStatusEx(HANDLE port, PVOID entries,
                                           ULONG count, ULONG *removed,
                                           DWORD timeout_ms, BOOL alertable);
@@ -494,6 +511,7 @@ PVOID   kernel32_shim_init(void);
 
 /* Internal process state inherited by CreateProcess children. */
 const char *kernel32_current_directory_relative(void);
+const char *kernel32_current_directory_backing(void);
 
 /* Internal NT/Win32 bridge for OsitoFS virtual directory handles. Paths are
  * already normalized and do not include a drive prefix. */
@@ -505,9 +523,14 @@ NTSTATUS kernel32_inherit_process_environment(DWORD parent_pid,
                                                DWORD child_pid);
 NTSTATUS kernel32_initialize_process_console(DWORD process_id,
                                               BOOL attached);
+typedef struct {
+    BOOL use_std_handles;
+    HANDLE input, output, error;
+} K32_CONSOLE_STARTUP;
 NTSTATUS kernel32_inherit_process_console(DWORD parent_pid,
                                            DWORD child_pid,
-                                           DWORD creation_flags);
+                                           DWORD creation_flags,
+                                           const K32_CONSOLE_STARTUP *startup);
 BOOL    kernel32_query_process_console(DWORD process_id,
                                        HANDLE *console_handle,
                                        HANDLE *standard_input,
@@ -515,8 +538,16 @@ BOOL    kernel32_query_process_console(DWORD process_id,
                                        HANDLE *standard_error);
 /* Launch a child without exposing PROCESS_INFORMATION across the native/PE32
  * ABI boundary. Intended for higher-level Win32 APIs such as ShellExecute. */
+/* Internal source token must remain pinned until this call returns. */
+BOOL kernel32_create_process_token_w(PCVOID primary_token, PCWSTR application,
+    PWSTR command, PVOID process_attributes, PVOID thread_attributes,
+    BOOL inherit_handles, DWORD flags, PVOID environment, PCWSTR directory,
+    PVOID startup, PVOID information);
 BOOL    kernel32_launch_process_a(PCSTR application, PCSTR command_line,
                                   PCSTR current_directory);
+BOOL    kernel32_launch_process_ex_a(PCSTR application, PCSTR command_line,
+                                     PCSTR directory, DWORD flags, WORD show,
+                                     PHANDLE process_out);
 /* Internal bounded access to a PE image resource. The returned pointer remains
  * owned by the loaded module and is valid for the module's lifetime. */
 BOOL    kernel32_resource_data_w(HANDLE module, PCWSTR name, PCWSTR type,
@@ -531,5 +562,6 @@ void    kernel32_release_process_waits(DWORD process_id);
 SIZE_T  kernel32_build_environment_block_w(DWORD process_id, PWSTR buffer,
                                            SIZE_T capacity);
 void    k32_power_request_release(PVOID object);
+void    k32_atom_release_job(ULONGLONG namespace_id);
 
 #endif /* KERNEL32_SHIM_H */

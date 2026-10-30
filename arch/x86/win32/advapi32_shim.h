@@ -10,6 +10,20 @@
 
 #include "nttypes.h"
 
+/* Internal token references. Static identities are immortal; filtered copies
+ * are owned by handles, impersonating threads and in-flight API calls. */
+void advapi32_token_retain(PCVOID token);
+void advapi32_token_release(PCVOID token);
+/* Independent primary-token copy; NULL source selects the local identity. */
+PVOID advapi32_token_create_primary(PCVOID source);
+/* Native shell bootstrap only; never exported as a guest elevation API. */
+PVOID advapi32_token_create_admin_primary(void);
+BOOL advapi32_effective_is_admin(void);
+/* SysV core: output is a kernel HANDLE, never a guest-width pointer. */
+NTSTATUS advapi32_open_token(HANDLE source, ACCESS_MASK access, ULONG attributes,
+                            BOOL thread, BOOL open_as_self, PHANDLE output);
+NTSTATUS advapi32_reference_impersonation_token(HANDLE token, PVOID *object);
+
 /* ── Registry types ────────────────────────────────────────── */
 
 typedef HANDLE HKEY;
@@ -87,6 +101,8 @@ LONG WINAPI RegEnumKeyExA(HKEY hKey, DWORD dwIndex, PSTR lpName,
                           DWORD *lpcchName, DWORD *lpReserved,
                           PSTR lpClass, DWORD *lpcchClass,
                           PVOID lpftLastWriteTime);
+LONG WINAPI RegEnumKeyA(HKEY hKey, DWORD index, PSTR name, DWORD capacity);
+LONG WINAPI RegEnumKeyW(HKEY hKey, DWORD index, PWSTR name, DWORD capacity);
 LONG WINAPI RegEnumValueA(HKEY hKey, DWORD dwIndex, PSTR lpValueName,
                           DWORD *lpcchValueName, DWORD *lpReserved,
                           DWORD *lpType, BYTE *lpData, DWORD *lpcbData);
@@ -146,6 +162,7 @@ BOOL WINAPI CryptAcquireContextW(PHCRYPTPROV phProv, PCWSTR container,
 BOOL WINAPI CryptGenRandom(HCRYPTPROV provider, DWORD length, BYTE *buffer);
 BOOL WINAPI CryptReleaseContext(HCRYPTPROV provider, DWORD flags);
 DWORD advapi32_crypto_release_process(DWORD process_id);
+ULONGLONG advapi32_process_logon_id(void);
 int advapi32_registry_selftest(void);
 void WINAPI MapGenericMask(DWORD *access_mask,
                            const GENERIC_MAPPING *generic_mapping);

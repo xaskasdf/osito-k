@@ -11,6 +11,7 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "../include/boot_info.h"
 #include "../include/compat_iret.h"
 #include "smp.h"
 
@@ -248,7 +249,7 @@ out:
  * - virt_offset == 0 gives an identity map (the old behavior).
  * - virt_offset == KERNEL_VBASE gives the upper-half direct map.
  * Both can coexist — the kernel currently installs both. */
-static void paging_map_range_at(uint64_t phys_start, uint64_t phys_end,
+static int paging_map_range_at(uint64_t phys_start, uint64_t phys_end,
                                 uint64_t virt_offset, uint64_t extra_flags)
 {
     uint64_t flags_2m = PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | extra_flags;
@@ -263,13 +264,16 @@ static void paging_map_range_at(uint64_t phys_start, uint64_t phys_end,
         uint64_t virt = phys + virt_offset;
         /* Use 2MB page if aligned and enough space */
         if ((phys & (LARGE_PAGE_SIZE - 1)) == 0 && (phys_end - phys) >= LARGE_PAGE_SIZE) {
-            paging_map_2m(virt, phys, flags_2m);
+            if (paging_map_2m(virt, phys, flags_2m) < 0)
+                return -1;
             phys += LARGE_PAGE_SIZE;
         } else {
-            paging_map_4k(virt, phys, flags_4k);
+            if (paging_map_4k(virt, phys, flags_4k) < 0)
+                return -1;
             phys += PAGE_SIZE;
         }
     }
+    return 0;
 }
 
 /* ── Identity map a range (thin wrapper) ────────────────────── */
@@ -839,31 +843,40 @@ void paging_switch(uint64_t cr3)
  * hands out one of those pages and memsets it to zero, the active
  * address translation is destroyed → triple fault.
  *
- * Walk PML4 → PDPT → PD and reserve every page used by the
+ * Walk PML4 → PDPT → PD → PT and reserve every page used by the
  * current page table tree.  After CR3 switch we free them.
  */
 
-#define OLD_PT_MAX 32
+#define OLD_PT_MAX 4096
 static uint64_t old_pt_pages[OLD_PT_MAX];
 static uint32_t old_pt_count;
+
+static void reserve_old_pt_page(uint64_t page)
+{
+    for (uint32_t i = 0; i < old_pt_count; i++)
+        if (old_pt_pages[i] == page)
+            return;
+    if (old_pt_count == OLD_PT_MAX) {
+        serial_puts("[PAGE] FATAL: too many bootstrap page tables\n");
+        for (;;) __asm__ volatile ("cli; hlt");
+    }
+    mem_reserve_range(page, 1);
+    old_pt_pages[old_pt_count++] = page;
+}
 
 static void reserve_old_page_tables(uint64_t cr3_phys)
 {
     old_pt_count = 0;
 
     uint64_t pml4_page = cr3_phys & ~(PAGE_SIZE - 1);
-    mem_reserve_range(pml4_page, 1);
-    if (old_pt_count < OLD_PT_MAX)
-        old_pt_pages[old_pt_count++] = pml4_page;
+    reserve_old_pt_page(pml4_page);
 
     uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(pml4_page);
     for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
         if (!(pml4[i] & PTE_PRESENT)) continue;
 
         uint64_t pdpt_page = pml4[i] & PTE_ADDR_MASK;
-        mem_reserve_range(pdpt_page, 1);
-        if (old_pt_count < OLD_PT_MAX)
-            old_pt_pages[old_pt_count++] = pdpt_page;
+        reserve_old_pt_page(pdpt_page);
 
         uint64_t *pdpt = (uint64_t *)PHYS_TO_VIRT(pdpt_page);
         for (int j = 0; j < ENTRIES_PER_TABLE; j++) {
@@ -871,18 +884,23 @@ static void reserve_old_page_tables(uint64_t cr3_phys)
             if (pdpt[j] & PTE_LARGE) continue;  /* 1GB page, no PD */
 
             uint64_t pd_page = pdpt[j] & PTE_ADDR_MASK;
-            mem_reserve_range(pd_page, 1);
-            if (old_pt_count < OLD_PT_MAX)
-                old_pt_pages[old_pt_count++] = pd_page;
-
-            /* Don't descend into PT level — 2MB large pages don't
-             * have PT entries, and 4KB PTs are unlikely in UEFI. */
+            reserve_old_pt_page(pd_page);
+            uint64_t *pd = (uint64_t *)PHYS_TO_VIRT(pd_page);
+            for (int k = 0; k < ENTRIES_PER_TABLE; k++) {
+                if ((pd[k] & PTE_PRESENT) && !(pd[k] & PTE_LARGE))
+                    reserve_old_pt_page(pd[k] & PTE_ADDR_MASK);
+            }
         }
     }
 
     serial_puts("[PAGE] Reserved ");
     serial_putdec(old_pt_count);
     serial_puts(" old page-table pages\n");
+}
+
+void __initk paging_reserve_boot_tables(void)
+{
+    if (!old_pt_count) reserve_old_page_tables(read_cr3());
 }
 
 static void free_old_page_tables(void)
@@ -909,7 +927,7 @@ void __initk paging_init(void)
 
     /* Reserve active UEFI/old page table pages so the allocator
      * doesn't hand them out while we're still using them. */
-    reserve_old_page_tables(old_cr3);
+    paging_reserve_boot_tables();
 
     pt_pages_used = 0;
 
@@ -946,6 +964,29 @@ void __initk paging_init(void)
     serial_puthex(KERNEL_VBASE, 16);
     serial_puts("...\n");
     paging_map_range_at(0, highest, KERNEL_VBASE, 0);
+    /* GOP BARs can be well above RAM (for example at 256 GiB). Preserve
+     * the aperture before switching CR3, including the paging status text.
+     * Start uncached; main.c installs WC after configuring the PAT. */
+    extern boot_info_t saved_boot_info;
+    if (saved_boot_info.fb_base && saved_boot_info.fb_pitch && saved_boot_info.fb_height) {
+        uint64_t base = saved_boot_info.fb_base;
+        uint64_t row = (uint64_t)saved_boot_info.fb_pitch * 4;
+        uint64_t size = row * saved_boot_info.fb_height;
+        uint64_t flags = PTE_PWT | PTE_PCD;
+        if (base >= (1ULL << 39) ||
+            saved_boot_info.fb_height > ((1ULL << 39) - base) / row ||
+            paging_map_range_at(base, base + size, 0, flags) < 0 ||
+            paging_map_range_at(base, base + size, KERNEL_VBASE, flags) < 0) {
+            serial_puts("[PAGE] FATAL: Cannot preserve GOP framebuffer mapping\n");
+            fb_puts(" FATAL: Cannot preserve GOP framebuffer mapping\n");
+            for (;;) __asm__ volatile ("cli; hlt");
+        }
+        serial_puts("[PAGE] Preserved GOP aperture at 0x");
+        serial_puthex(base, 16);
+        serial_puts(" bytes=");
+        serial_putdec(size);
+        serial_puts("\n");
+    }
     x86_compat_iret_init(kernel_pml4);
 
     serial_puts("[PAGE] Page tables built: ");

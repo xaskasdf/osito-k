@@ -5,10 +5,14 @@
  */
 
 #include "shell32_shim.h"
+#include "system_paths.h"
+#include "shell_fileop.h"
 #include "kernel32_shim.h"
 #include "ole32_shim.h"
 #include "advapi32_shim.h"
 #include "win32_abi.h"
+#include "compat32.h"
+#include "comdlg32_shim.h"
 #include "../kernel/smp.h"
 
 extern void serial_puts(const char *s);
@@ -506,9 +510,10 @@ static BOOL shell_build_command_line(PCSTR file, PCSTR parameters,
 
 static HINSTANCE shell_execute_common(PCSTR api, PCSTR operation, PCSTR file,
                                       PCSTR parameters, PCSTR directory,
-                                      int show_command)
+                                      int show_command, DWORD creation_flags,
+                                      PHANDLE process_out)
 {
-    (void)show_command;
+    if (process_out) *process_out = NULL;
     serial_puts("[SHELL32] ShellExecute");
     serial_puts(api);
     serial_puts(" verb=");
@@ -541,7 +546,9 @@ static HINSTANCE shell_execute_common(PCSTR api, PCSTR operation, PCSTR file,
     char command_line[4096];
     if (!shell_build_command_line(file, parameters, command_line))
         return shell_execute_error(206); /* ERROR_FILENAME_EXCED_RANGE */
-    if (!kernel32_launch_process_a(file, command_line, directory)) {
+    if (!kernel32_launch_process_ex_a(file, command_line, directory,
+                                      creation_flags, (WORD)show_command,
+                                      process_out)) {
         DWORD error = GetLastError();
         return shell_execute_error(error ? error : 5);
     }
@@ -566,7 +573,7 @@ HINSTANCE WINAPI ShellExecuteA(HWND hwnd, PCSTR lpOperation, PCSTR lpFile,
 {
     (void)hwnd;
     return shell_execute_common("A", lpOperation, lpFile, lpParameters,
-                                lpDirectory, nShowCmd);
+                                lpDirectory, nShowCmd, 0, NULL);
 }
 
 HINSTANCE WINAPI ShellExecuteW(HWND hwnd, PCWSTR lpOperation, PCWSTR lpFile,
@@ -587,7 +594,76 @@ HINSTANCE WINAPI ShellExecuteW(HWND hwnd, PCWSTR lpOperation, PCWSTR lpFile,
     return shell_execute_common("W", lpOperation ? operation : NULL,
                                 lpFile ? file : NULL,
                                 lpParameters ? parameters : NULL,
-                                lpDirectory ? directory : NULL, nShowCmd);
+                                lpDirectory ? directory : NULL, nShowCmd,
+                                0, NULL);
+}
+
+static BOOL shell_execute_ex(PVOID information, BOOL wide)
+{
+    if (!information) { SetLastError(87); return FALSE; }
+    BYTE *data = (BYTE *)information;
+    BOOL compat32 = g_compat32_mode;
+    SIZE_T pointer_size = compat32 ? 4 : 8;
+    DWORD size = shell_read_u32(data, 0);
+    if (size != (compat32 ? 60U : 112U)) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER; do not write past cbSize. */
+        return FALSE;
+    }
+    DWORD mask = shell_read_u32(data, 4);
+    SIZE_T instance_offset = compat32 ? 32 : 56;
+    SIZE_T process_offset = compat32 ? 56 : 104;
+    shell_write_pointer(data, process_offset, 0);
+    /* Class/PIDL delegates, hotkeys, environment expansion and service-provider
+     * sites require shell facilities that are not implemented here. */
+    const DWORD unsupported = 0x0000000FU | 0x00000020U | 0x00000200U |
+                              0x02000000U | 0x08000000U;
+    if (mask & unsupported) {
+        shell_write_pointer(data, instance_offset,
+                              (ULONG_PTR)shell_execute_error(50));
+        return FALSE;
+    }
+    PCVOID verb = (PCVOID)shell_read_pointer(data, 8 + pointer_size);
+    PCVOID file = (PCVOID)shell_read_pointer(data, 8 + 2 * pointer_size);
+    PCVOID parameters = (PCVOID)shell_read_pointer(data, 8 + 3 * pointer_size);
+    PCVOID directory = (PCVOID)shell_read_pointer(data, 8 + 4 * pointer_size);
+    int show = (int)shell_read_u32(data, 8 + 5 * pointer_size);
+    char verb_utf8[32], file_utf8[260], parameters_utf8[4096], directory_utf8[260];
+    if (wide) {
+        if (!shell_wide_to_utf8((PCWSTR)verb, verb_utf8, sizeof(verb_utf8)) ||
+            !shell_wide_to_utf8((PCWSTR)file, file_utf8, sizeof(file_utf8)) ||
+            !shell_wide_to_utf8((PCWSTR)parameters, parameters_utf8, sizeof(parameters_utf8)) ||
+            !shell_wide_to_utf8((PCWSTR)directory, directory_utf8, sizeof(directory_utf8))) {
+            DWORD error = GetLastError();
+            shell_write_pointer(data, instance_offset,
+                                  (ULONG_PTR)shell_execute_error(error ? error : 206));
+            return FALSE;
+        }
+        if (verb) verb = verb_utf8;
+        if (file) file = file_utf8;
+        if (parameters) parameters = parameters_utf8;
+        if (directory) directory = directory_utf8;
+    }
+    HANDLE process = NULL;
+    DWORD flags = mask & 0x00008000U ? 0 : 0x00000010U; /* CREATE_NEW_CONSOLE */
+    HINSTANCE result = shell_execute_common(wide ? "ExW" : "ExA",
+        (PCSTR)verb, (PCSTR)file, (PCSTR)parameters, (PCSTR)directory,
+        show, flags, &process);
+    shell_write_pointer(data, instance_offset, (ULONG_PTR)result);
+    if ((ULONG_PTR)result <= 32) return FALSE;
+    if (mask & 0x00000040U) shell_write_pointer(data, process_offset, (ULONG_PTR)process);
+    else if (process) CloseHandle(process);
+    SetLastError(0);
+    return TRUE;
+}
+
+BOOL WINAPI ShellExecuteExA(PVOID information)
+{
+    return shell_execute_ex(information, FALSE);
+}
+
+BOOL WINAPI ShellExecuteExW(PVOID information)
+{
+    return shell_execute_ex(information, TRUE);
 }
 
 BOOL WINAPI Shell_NotifyIconA(DWORD dwMessage, PVOID lpData)
@@ -648,7 +724,7 @@ static void WINAPI SHGetSettings_k32(PVOID settings, DWORD mask)
 
 static BOOL WINAPI IsUserAnAdmin_k32(void)
 {
-    return TRUE;
+    return advapi32_effective_is_admin();
 }
 
 static void shell_write_wide_text(BYTE *output, DWORD output_size,
@@ -857,11 +933,12 @@ static HRESULT WINAPI SHGetFolderPathW_k32(HWND hwnd, int csidl, HANDLE token,
         case 0x05: path = "C:\\Users\\osito\\Documents"; break;
         case 0x1A: path = "C:\\Users\\osito\\AppData\\Roaming"; break;
         case 0x1C: path = "C:\\Users\\osito\\AppData\\Local"; break;
-        case 0x14: path = "C:\\Windows\\Fonts"; break;
+        case 0x14: path = WIN32_WINDOWS_DIRECTORY "\\Fonts"; break;
         case 0x20: path = "C:\\Users\\osito\\AppData\\Local\\Microsoft\\Windows\\INetCache"; break;
         case 0x23: path = "C:\\ProgramData"; break;
-        case 0x24:
-        case 0x25: path = "C:\\System"; break;
+        case 0x24: path = WIN32_WINDOWS_DIRECTORY; break;
+        case 0x25: path = WIN32_SYSTEM32_DIRECTORY; break;
+        case 0x29: path = WIN32_SYSWOW64_DIRECTORY; break;
         case 0x26:
         case 0x2A: path = "C:\\System\\Program Files"; break;
         case 0x2B:
@@ -919,51 +996,91 @@ typedef struct __attribute__((packed)) {
     WORD terminator;
 } SHELL_PATH_PIDL;
 
-static HRESULT WINAPI SHGetSpecialFolderLocation_k32(HWND hwnd, int csidl,
-                                                      PVOID out_pidl)
+PVOID shell32_make_path_pidl(PCWSTR path)
 {
-    if (!out_pidl) return (HRESULT)0x80070057;
-    if (g_compat32_mode)
-        *(uint32_t *)out_pidl = 0;
-    else
-        *(PVOID *)out_pidl = NULL;
-
-    WCHAR path[260];
-    HRESULT status = SHGetFolderPathW_k32(hwnd, csidl, NULL, 0, path);
-    if (status != 0) return status;
-
-    SHELL_PATH_PIDL *pidl =
-        (SHELL_PATH_PIDL *)shim_CoTaskMemAlloc(sizeof(*pidl));
-    if (!pidl) return (HRESULT)0x8007000E;
+    UINT length = 0;
+    if (!path) return NULL;
+    while (length < 260 && path[length]) length++;
+    if (length == 260) { SetLastError(206); return NULL; }
+    SHELL_PATH_PIDL *pidl = shim_CoTaskMemAlloc(sizeof(*pidl));
+    if (!pidl) return NULL;
     shell_zero(pidl, sizeof(*pidl));
     pidl->cb = (WORD)(sizeof(*pidl) - sizeof(pidl->terminator));
     pidl->magic = SHELL_PATH_PIDL_MAGIC;
     shell_copy_wide(pidl->path, path, 260);
+    return pidl;
+}
 
-    if (g_compat32_mode)
-        *(uint32_t *)out_pidl = (uint32_t)(ULONG_PTR)pidl;
-    else
-        *(PVOID *)out_pidl = pidl;
-    return 0;
+BOOL shell32_pidl_path(PCVOID raw_pidl, PWSTR out_path)
+{
+    if (!raw_pidl || !out_path ||
+        !win32_user_range_readable(raw_pidl, sizeof(SHELL_PATH_PIDL), g_compat32_mode != 0))
+        return FALSE;
+    const SHELL_PATH_PIDL *pidl = raw_pidl;
+    if (pidl->cb != sizeof(*pidl) - sizeof(pidl->terminator) ||
+        pidl->magic != SHELL_PATH_PIDL_MAGIC || pidl->terminator != 0)
+        return FALSE;
+    UINT length = 0;
+    while (length < 260 && pidl->path[length]) length++;
+    if (length == 260) return FALSE;
+    shell_copy_wide(out_path, pidl->path, 260);
+    return TRUE;
+}
+
+static HRESULT WINAPI SHGetSpecialFolderLocation_k32(HWND hwnd, int csidl,
+                                                      PVOID out_pidl)
+{
+    if (!out_pidl || !win32_user_range_writable(out_pidl, g_compat32_mode ? 4 : 8,
+                                                g_compat32_mode != 0))
+        return (HRESULT)0x80070057;
+    if (g_compat32_mode) *(DWORD *)out_pidl = 0;
+    else *(PVOID *)out_pidl = NULL;
+    WCHAR path[260];
+    HRESULT status = SHGetFolderPathW_k32(hwnd, csidl, NULL, 0, path);
+    if (status != 0) return status;
+    PVOID pidl = shell32_make_path_pidl(path);
+    if (!pidl) return (HRESULT)0x8007000E;
+    if (g_compat32_mode) *(DWORD *)out_pidl = (DWORD)(ULONG_PTR)pidl;
+    else *(PVOID *)out_pidl = pidl;
+    return S_OK;
 }
 
 static BOOL WINAPI SHGetPathFromIDListW_k32(PCVOID raw_pidl, PWSTR out_path)
 {
-    if (!raw_pidl || !out_path) {
-        SetLastError(87); /* ERROR_INVALID_PARAMETER */
-        return FALSE;
+    if (!out_path || !win32_user_range_writable(out_path, 260 * sizeof(WCHAR),
+                                                 g_compat32_mode != 0)) {
+        SetLastError(87); return FALSE;
     }
-
-    const SHELL_PATH_PIDL *pidl = (const SHELL_PATH_PIDL *)raw_pidl;
-    if (pidl->cb != sizeof(*pidl) - sizeof(pidl->terminator) ||
-        pidl->magic != SHELL_PATH_PIDL_MAGIC || pidl->terminator != 0) {
-        out_path[0] = 0;
-        SetLastError(87);
-        return FALSE;
-    }
-    shell_copy_wide(out_path, pidl->path, 260);
+    out_path[0] = 0;
+    if (!shell32_pidl_path(raw_pidl, out_path)) { SetLastError(87); return FALSE; }
     SetLastError(0);
     return TRUE;
+}
+
+static BOOL WINAPI SHGetPathFromIDListA_k32(PCVOID raw_pidl, PSTR out_path)
+{
+    if (!out_path || !win32_user_range_writable(out_path, 260, g_compat32_mode != 0)) {
+        SetLastError(87); return FALSE;
+    }
+    out_path[0] = 0;
+    WCHAR wide[260];
+    if (!shell32_pidl_path(raw_pidl, wide)) { SetLastError(87); return FALSE; }
+    return WideCharToMultiByte(0, 0, wide, -1, out_path, 260, NULL, NULL) != 0;
+}
+
+static PVOID WINAPI SHBrowseForFolderA_k32(PVOID descriptor)
+{
+    return comdlg32_select_folder(descriptor,FALSE);
+}
+
+static PVOID WINAPI SHBrowseForFolderW_k32(PVOID descriptor)
+{
+    return comdlg32_select_folder(descriptor,TRUE);
+}
+
+static HRESULT WINAPI SHGetMalloc_k32(PVOID allocator)
+{
+    return shim_CoGetMalloc(1, allocator);
 }
 
 static int WINAPI SHCreateDirectoryExA_k32(HWND hwnd, PCSTR path,
@@ -1136,6 +1253,16 @@ static WCHAR shlwapi_lower(WCHAR c)
     return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
 }
 
+static BOOL WINAPI shlwapi_PathFileExistsW(PCWSTR path)
+{
+    if (!path) return FALSE;
+    DWORD saved = GetLastError();
+    DWORD attributes = GetFileAttributesW(path);
+    if (attributes == 0xffffffffU) return FALSE;
+    SetLastError(saved);
+    return TRUE;
+}
+
 static PWSTR WINAPI shlwapi_PathFindExtensionW(PCWSTR path)
 {
     if (!path) return NULL;
@@ -1161,6 +1288,27 @@ static void WINAPI shlwapi_PathRemoveExtensionW(PWSTR path)
 {
     PWSTR extension = shlwapi_PathFindExtensionW(path);
     if (extension && *extension == '.') *extension = 0;
+}
+
+static BOOL WINAPI shlwapi_PathRemoveFileSpecW(PWSTR path)
+{
+    if (!path || !*path) return FALSE;
+    PWSTR root = path;
+    if (path[0] && path[1] == ':') root += 2;
+    if (*root == '\\') {
+        root++;
+        if (root == path + 1 && *root == '\\') root++;
+    }
+    PWSTR component = root;
+    for (PWSTR cursor = root; *cursor; cursor++) {
+        /* The legacy API recognizes backslashes only. A run of trailing
+         * separators is removed together, while drive/UNC roots survive. */
+        if (*cursor == '\\' && (cursor == root || cursor[-1] != '\\'))
+            component = cursor;
+    }
+    if (!*component) return FALSE;
+    *component = 0;
+    return TRUE;
 }
 
 static BOOL shlwapi_match_one(PCWSTR file, PCWSTR spec, PCWSTR spec_end)
@@ -1270,8 +1418,11 @@ static LONG WINAPI shlwapi_SHDeleteKeyA(HKEY key, PCSTR subkey)
 typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT shell32_exports[] = {
+    { "SHFileOperationA", (PVOID)shell_SHFileOperationA, 1, CC_STDCALL },
     { "ShellExecuteA",      (PVOID)ShellExecuteA,     6, CC_STDCALL },
     { "ShellExecuteW",      (PVOID)ShellExecuteW,     6, CC_STDCALL },
+    { "ShellExecuteExA",    (PVOID)ShellExecuteExA,   1, CC_STDCALL },
+    { "ShellExecuteExW",    (PVOID)ShellExecuteExW,   1, CC_STDCALL },
     { "CommandLineToArgvW", (PVOID)CommandLineToArgvW,2, CC_STDCALL },
     { "Shell_NotifyIconA",  (PVOID)Shell_NotifyIconA, 2, CC_STDCALL },
     { "Shell_NotifyIconW",  (PVOID)Shell_NotifyIconW, 2, CC_STDCALL },
@@ -1291,15 +1442,21 @@ static const SHIM_EXPORT shell32_exports[] = {
     { "SHGetKnownFolderPath", (PVOID)SHGetKnownFolderPath_k32, 4, CC_STDCALL },
     { "SHGetSpecialFolderLocation", (PVOID)SHGetSpecialFolderLocation_k32, 3, CC_STDCALL },
     { "SHGetPathFromIDListW",       (PVOID)SHGetPathFromIDListW_k32, 2, CC_STDCALL },
+    { "SHGetPathFromIDListA",       (PVOID)SHGetPathFromIDListA_k32, 2, CC_STDCALL },
+    { "SHBrowseForFolderA",        (PVOID)SHBrowseForFolderA_k32, 1, CC_STDCALL },
+    { "SHBrowseForFolderW",        (PVOID)SHBrowseForFolderW_k32, 1, CC_STDCALL },
+    { "SHGetMalloc",               (PVOID)SHGetMalloc_k32, 1, CC_STDCALL },
     { NULL, NULL, 0, CC_STDCALL }
 };
 
 static const SHIM_EXPORT shlwapi_exports[] = {
+    { "PathFileExistsW",      (PVOID)shlwapi_PathFileExistsW,      1, CC_STDCALL },
     { "AssocQueryStringW",    (PVOID)shlwapi_AssocQueryStringW,    6, CC_STDCALL },
     { "PathFindExtensionW",   (PVOID)shlwapi_PathFindExtensionW,   1, CC_STDCALL },
     { "PathFindFileNameW",    (PVOID)shlwapi_PathFindFileNameW,    1, CC_STDCALL },
     { "PathMatchSpecW",       (PVOID)shlwapi_PathMatchSpecW,       2, CC_STDCALL },
     { "PathRemoveExtensionW", (PVOID)shlwapi_PathRemoveExtensionW, 1, CC_STDCALL },
+    { "PathRemoveFileSpecW",  (PVOID)shlwapi_PathRemoveFileSpecW,  1, CC_STDCALL },
     { "SHCreateMemStream",    (PVOID)shlwapi_SHCreateMemStream,    2, CC_STDCALL },
     { "QISearch",             (PVOID)shlwapi_QISearch,             4, CC_STDCALL },
     { "IsOS",                 (PVOID)shlwapi_IsOS,                 1, CC_STDCALL },

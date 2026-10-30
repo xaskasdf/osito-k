@@ -12,6 +12,7 @@
 #include "dos_io.h"
 #include "dos_jit.h"
 #include "dos_paging.h"
+#include "dos_fpu.h"
 
 /* ── External interfaces ─────────────────────────────────────────── */
 
@@ -31,6 +32,7 @@ extern void sched_yield(void);
 #define DOS_CR0_EM (1U << 2)
 #define DOS_CR0_TS (1U << 3)
 #define DOS_CR0_ET (1U << 4)
+#define DOS_CR0_NE (1U << 5)
 #define DOS_CR0_NW (1U << 29)
 #define DOS_CR0_CD (1U << 30)
 #define DOS_CR0_VALID 0xE005003FU
@@ -57,9 +59,9 @@ static void cpu_cpuid(cpu8086_state_t *cpu)
         cpu->ecx = 0x20555043U; /* "CPU " */
         break;
     case 1:
-        /* Pentium-class integer core. No optional feature is advertised
-         * until its instruction and state-management contracts exist. */
+        /* The x87 contract is mediated; MMX/SSE/FXSAVE are not guest features. */
         cpu->eax = DOS_CPUID_SIGNATURE;
+        cpu->edx = 1; /* On-chip x87. */
         break;
     case DOS_CPUID_MAX_EXTENDED:
         cpu->eax = DOS_CPUID_MAX_EXTENDED;
@@ -76,7 +78,7 @@ extern void dos_vga_mode13_present(void);
 
 /* ── Memory write (with VGA dirty tracking) ──────────────────────── */
 
-void dos_mem_write8(dos_vm_t *vm, uint32_t addr, uint8_t val)
+void dos_phys_write8(dos_vm_t *vm, uint32_t addr, uint8_t val)
 {
     if (!vm || !vm->mem || addr >= vm->total_mem_size)
         return;
@@ -120,6 +122,67 @@ void dos_mem_write8(dos_vm_t *vm, uint32_t addr, uint8_t val)
         dos_vga_mark_dirty(vm, addr);
 }
 
+void dos_mem_write8(dos_vm_t *vm, uint32_t addr, uint8_t val)
+{
+    if (vm) dos_phys_write8(vm, dos_a20_address(vm, addr), val);
+}
+
+static bool dos_memory_span(dos_vm_t *vm, uint32_t addr, uint32_t size,
+                              uint8_t **direct, bool gate)
+{
+    if (direct) *direct = NULL;
+    if (!vm || !vm->mem || (uint64_t)addr + size > 0x100000000ULL) return false;
+    if (!size) {
+        uint32_t physical = gate ? dos_a20_address(vm, addr) : addr;
+        if (physical > vm->total_mem_size) return false;
+        if (direct) *direct = vm->mem + physical;
+        return true;
+    }
+    uint32_t done = 0, first = 0;
+    bool contiguous = true;
+    while (done < size) {
+        uint32_t address = addr + done;
+        uint32_t part = DOS_PAGE_SIZE - (address & (DOS_PAGE_SIZE - 1u));
+        if (part > size - done) part = size - done;
+        uint32_t physical = gate ? dos_a20_address(vm, address) : address;
+        if (vm->io && vm->vga_mode == 0x13u && !vm->vbe_active &&
+            physical - DOS_VGA_APERTURE_BASE < DOS_VGA_APERTURE_SIZE)
+            contiguous = false;
+        physical = dos_vbe_memory_address(vm, physical);
+        uint32_t frame = physical - DOS_EMS_PAGE_FRAME_BASE;
+        if (frame < DOS_EMS_FRAME_PAGES * DOS_EMS_PAGE_SIZE) {
+            uint32_t backing = vm->ems_frame_bases[frame / DOS_EMS_PAGE_SIZE];
+            if (backing) {
+                uint64_t mapped = (uint64_t)backing + (frame & (DOS_EMS_PAGE_SIZE - 1u));
+                if (mapped > UINT32_MAX) return false;
+                physical = (uint32_t)mapped;
+            }
+        }
+        if (physical > vm->total_mem_size || part > vm->total_mem_size - physical)
+            return false;
+        if ((physical >= DOS_CONV_TOP && physical < DOS_VRAM_BASE + DOS_VRAM_SIZE) ||
+            (physical >= DOS_VBE_FB_BASE && physical < DOS_VBE_FB_BASE + DOS_VBE_FB_SIZE))
+            contiguous = false;
+        if (!done) first = physical;
+        else if ((uint64_t)first + done != physical) contiguous = false;
+        done += part;
+    }
+    if (direct && contiguous) *direct = vm->mem + first;
+    return true;
+}
+
+bool dos_mem_guest_span(dos_vm_t *vm, uint32_t addr, uint32_t size,
+                         uint8_t **direct)
+{
+    return dos_memory_span(vm, addr, size, direct, true);
+}
+
+bool dos_phys_guest_span(dos_vm_t *vm, uint32_t addr, uint32_t size,
+                          uint8_t **direct)
+{
+    return dos_memory_span(vm, addr, size, direct, false);
+}
+
 void dos_mem_write16(dos_vm_t *vm, uint32_t addr, uint16_t val)
 {
     dos_mem_write8(vm, addr,     (uint8_t)(val & 0xFF));
@@ -142,8 +205,8 @@ void cpu8086_init(cpu8086_state_t *cpu, dos_vm_t *vm)
     cpu->fs = 0; cpu->gs = 0;
     cpu->eip = 0;
     cpu->eflags = FLAGS_FIXED;
-    /* The interpreter exposes the x86 software-emulation contract. */
-    cpu->cr0 = DOS_CR0_ET | DOS_CR0_EM | DOS_CR0_MP;
+    /* DOS starts with PC/AT IRQ13 reporting. A guest may select native #MF. */
+    cpu->cr0 = DOS_CR0_ET | DOS_CR0_MP;
     cpu->cr2 = 0; cpu->cr3 = 0;
     for (unsigned i = 0; i < 8; i++) cpu->dr[i] = 0;
     cpu->dr[6] = 0xFFFF0FF0u;
@@ -725,7 +788,7 @@ static bool cpu_memory_addresses_at_cpl(cpu8086_state_t *cpu, uint32_t linear,
         uint32_t current = linear + done;
         unsigned part = DOS_PAGE_SIZE - (current & (DOS_PAGE_SIZE - 1u));
         if (part > size - done) part = size - done;
-        uint32_t physical = current;
+        uint32_t physical = dos_a20_address(vm, current);
         if (paging) {
             dos_page_fault_t fault;
             if (!dos_page_probe(vm, current, access, &pages[count], &fault)) {
@@ -749,9 +812,9 @@ static bool cpu_memory_addresses(cpu8086_state_t *cpu, uint32_t linear,
                                         cpu8086_cpl(cpu), insn_eip, addresses);
 }
 
-static bool cpu_operand_addresses(cpu8086_state_t *cpu, unsigned segment,
-                                   uint32_t offset, unsigned size, bool write,
-                                   uint32_t insn_eip, uint32_t *addresses)
+static bool cpu_operand_probe(cpu8086_state_t *cpu, unsigned segment,
+                                uint32_t offset, unsigned size, bool write, bool dirty,
+                                uint32_t insn_eip, uint32_t *addresses)
 {
     dos_vm_t *vm = cpu->vm;
     const cpu_system_segment_t *cache = &cpu->segment_cache[segment];
@@ -771,14 +834,36 @@ static bool cpu_operand_addresses(cpu8086_state_t *cpu, unsigned segment,
     if (expand_down ? offset <= limit || last > top : last > limit)
         goto segment_fault;
 
-    /* These operands are at most eight bytes. Validate both possible pages
+    /* These operands are at most 108 bytes. Validate both possible pages
      * before A/D updates, memory writes, or a side-effecting port read. */
-    return cpu_memory_addresses(cpu, base + offset, size, write, write,
+    return cpu_memory_addresses(cpu, base + offset, size, write, dirty,
                                  insn_eip, addresses);
 
 segment_fault:
     (void)cpu_deliver_exception(vm, segment == 2 ? 12u : 13u,
                                 insn_eip, 0, true);
+    return false;
+}
+
+static bool cpu_operand_addresses(cpu8086_state_t *cpu, unsigned segment,
+                                   uint32_t offset, unsigned size, bool write,
+                                   uint32_t insn_eip, uint32_t *addresses)
+{
+    return cpu_operand_probe(cpu, segment, offset, size, write, write, insn_eip, addresses);
+}
+
+/* Returns false without retiring a WAIT stalled on the PC/AT error latch. */
+static bool cpu_fpu_wait(dos_vm_t *vm, uint32_t insn_eip)
+{
+    if (!dos_fpu_pending(vm)) return true;
+    if (vm->cpu->cr0 & DOS_CR0_NE) {
+        (void)cpu_deliver_exception(vm, 16, insn_eip, 0, false);
+        return false;
+    }
+    if (vm->native_fp->ignne) return true;
+    vm->cpu->eip = insn_eip;
+    dos_fpu_sync_irq(vm);
+    if (!cpu8086_service_interrupts(vm)) sched_yield();
     return false;
 }
 
@@ -1341,14 +1426,15 @@ static bool cpu_far_tss_stack(cpu8086_state_t *cpu, unsigned cpl, uint32_t insn_
 }
 
 static void cpu_far_commit(cpu8086_state_t *cpu, uint16_t selector, uint32_t target,
-                            const dpmi_descriptor_ref_t *code)
+                            const dpmi_descriptor_ref_t *code, bool trace_pending)
 {
     cpu->eip = target;
     if (code) cpu8086_cache_cs(cpu, selector, &code->descriptor, selector & 3u);
     else cpu8086_load_real_cs(cpu, selector);
     /* The checked descriptor is already available. Do not reread a table
      * that a just-written return frame could alias. */
-    if (cpu->protected_mode && cpu->op_size_32 && (selector & 3u) == 3u)
+    /* IRET can clear TF in the restored flags while its own #DB is still due. */
+    if (!trace_pending && cpu->protected_mode && cpu->op_size_32 && (selector & 3u) == 3u)
         dos_transfer_to_native(cpu->vm);
 }
 
@@ -1473,6 +1559,7 @@ static bool cpu_task_switch(cpu8086_state_t *cpu, uint16_t selector, cpu_task_so
 
     /* Commit: all subsequent descriptor/stack faults belong to the incoming
      * task. Install every visible selector before qualifying any descriptor. */
+    vm->cpu_event_serial++;
     descriptor.access |= 2u;
     cpu8086_cache_tr(cpu, selector, &descriptor);
     cpu->cr0 |= DOS_CR0_TS;
@@ -1631,7 +1718,8 @@ static void cpu_far_transfer(cpu8086_state_t *cpu, uint16_t selector, uint32_t t
         cpu->esp = next;
         if (inward) cpu8086_cache_segment(cpu, 2, stack_selector, &new_ss.descriptor);
     }
-    cpu_far_commit(cpu, selector, target, cpu->protected_mode ? &code : NULL);
+    cpu_far_commit(cpu, selector, target, cpu->protected_mode ? &code : NULL,
+                    (cpu->eflags & FLAG_TF) != 0);
 }
 
 static void cpu_far_return(cpu8086_state_t *cpu, unsigned width, unsigned discard,
@@ -1698,7 +1786,8 @@ static void cpu_far_return(cpu8086_state_t *cpu, unsigned width, unsigned discar
         cpu8086_cache_segment(cpu, 2, stack_selector, &new_ss.descriptor);
     for (unsigned s = 0; s < 6; s++) if (clear_segments & (1u << s))
         cpu8086_cache_segment(cpu, s, 0, NULL);
-    cpu_far_commit(cpu, selector, target, cpu->protected_mode ? &code : NULL);
+    cpu_far_commit(cpu, selector, target, cpu->protected_mode ? &code : NULL,
+                    (cpu->eflags & FLAG_TF) != 0);
 }
 
 static bool cpu_iret_read(cpu8086_state_t *cpu, const cpu_stack_access_t *stack,
@@ -1812,7 +1901,16 @@ static void cpu_interrupt_return(cpu8086_state_t *cpu, unsigned width,
     if (width == 2) mask &= 0xFFFFu;
     /* Permissions use the old CPL/IOPL, including on an outward return.
      * No architectural registers change before the last faultable access. */
-    cpu->eflags = (((old_flags & ~mask) | (frame[2] & mask)) & 0x003F7FD5u) | FLAGS_FIXED;
+    uint32_t flags = (((old_flags & ~mask) | (frame[2] & mask)) & 0x003F7FD5u) | FLAGS_FIXED;
+    if (pm) {
+        int host_return = dos_pm_interrupt_return_iret(cpu->vm, selector, target,
+                                                       stack_selector, next, flags);
+        if (host_return) {
+            if (host_return < 0) cpu_far_fault(cpu, 13, 0, insn_eip);
+            return;
+        }
+    }
+    cpu->eflags = flags;
     cpu->esp = next;
     if (outward) {
         cpu8086_cache_segment(cpu, 2, stack_selector, &new_ss.descriptor);
@@ -1827,7 +1925,7 @@ static void cpu_interrupt_return(cpu8086_state_t *cpu, unsigned width,
         }
     }
     cpu8086_restore_virtual_flags(cpu);
-    cpu_far_commit(cpu, selector, target, pm ? &code : NULL);
+    cpu_far_commit(cpu, selector, target, pm ? &code : NULL, (old_flags & FLAG_TF) != 0);
 }
 
 static bool cpu_idt_gate_enter(cpu8086_state_t *cpu, uint8_t vector,
@@ -1864,8 +1962,7 @@ static bool cpu_idt_gate_enter(cpu8086_state_t *cpu, uint8_t vector,
     dpmi_descriptor_ref_t code, new_ss;
     if (type == 5) {
         uint32_t flags = cpu8086_flags_image(cpu);
-        if (kind == CPU_EVENT_EXCEPTION && vector != 1 && vector != 3 && vector != 4 &&
-            vector != 8 && vector != 18) flags |= FLAG_RF;
+        if (kind == CPU_EVENT_EXCEPTION) flags = cpu8086_exception_flags(flags, vector);
         return cpu_task_switch(cpu, selector, CPU_TASK_CALL, return_eip, fault_eip,
                                  flags, has_error, error);
     }
@@ -1895,8 +1992,7 @@ static bool cpu_idt_gate_enter(cpu8086_state_t *cpu, uint8_t vector,
     if (!cpu_near_target_valid(cpu, target, dpmi_desc_get_limit(d), fault_eip)) return false;
 
     uint32_t flags = cpu8086_flags_image(cpu);
-    if (kind == CPU_EVENT_EXCEPTION && vector != 1 && vector != 3 && vector != 4 &&
-        vector != 8 && vector != 18) flags |= FLAG_RF;
+    if (kind == CPU_EVENT_EXCEPTION) flags = cpu8086_exception_flags(flags, vector);
     uint32_t values[10];
     unsigned count = 0;
     if (v86) {
@@ -2054,6 +2150,20 @@ void cpu8086_rm_service(dos_vm_t *vm, uint8_t service)
         return;
     }
     uint16_t saved = (uint16_t)cpu_modrm_read(cpu, &slot, 2);
+    if (service == 0x27) {
+        /* INT 27h names its PSP through the caller's CS, not the ROM CS.
+         * Include the bridge's own interrupt frame when it has one. */
+        uint16_t words[6];
+        unsigned outer = vm->software_int_frame_bytes / 2u;
+        if (outer > 3u || !cpu8086_read_stack_words(cpu, words, outer + 3u)) {
+            cpu->running = false;
+            cpu->exit_code = -1;
+            return;
+        }
+        dos_terminate_resident(vm, words[outer + 1u],
+            (uint16_t)(((uint32_t)cpu->dx + 15u) >> 4), 0);
+        return;
+    }
     uint32_t previous = vm->software_int_return_flags;
     vm->software_int_return_flags = saved;
     dos_int_dispatch(vm, service);
@@ -2070,7 +2180,10 @@ bool cpu8086_deliver_guest_interrupt(dos_vm_t *vm, uint8_t vector,
     cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
     if (!cpu || (cpu->protected_mode && !cpu8086_uses_guest_idt(cpu)) || cpu->delivery_fault)
         return false;
+    vm->cpu_event_serial++;
     cpu->irq_shadow = 0;
+    if (vector == 1u && kind != CPU_EVENT_SOFTWARE && kind != CPU_EVENT_SOFTWARE_EXCEPTION)
+        cpu->dr[7] &= ~(1u << 13);
     cpu->rep_compare.active = false;
     cpu->halted = false;
     for (;;) {
@@ -3002,7 +3115,7 @@ static bool cpu_string_memory(cpu8086_state_t *cpu, uint8_t opcode,
     bool compare = operation == 0xA6u || operation == 0xAEu;
     uint32_t count = cpu->rep_active ? (adr32 ? cpu->ecx : cpu->cx) : 1u;
     unsigned iterations = count > CPU_STRING_ITERATIONS ? CPU_STRING_ITERATIONS : count;
-    if (cpu->irq_shadow && iterations > 1u) iterations = 1;
+    if ((cpu->irq_shadow || (cpu->eflags & FLAG_TF)) && iterations > 1u) iterations = 1;
     int32_t delta = cpu->eflags & FLAG_DF ? -(int32_t)width : (int32_t)width;
     uint32_t next_eip = cpu->eip;
     uint32_t original_flags = cpu->rep_compare.active ? cpu->rep_compare.eflags : cpu->eflags;
@@ -3067,7 +3180,7 @@ static bool cpu_string_port_io(cpu8086_state_t *cpu, bool input,
     uint32_t count = cpu->rep_active ? (adr32 ? cpu->ecx : cpu->cx) : 1u;
     int32_t delta = cpu->eflags & FLAG_DF ? -(int32_t)width : (int32_t)width;
     unsigned iterations = count > CPU_STRING_ITERATIONS ? CPU_STRING_ITERATIONS : count;
-    if (cpu->irq_shadow && iterations > 1u) iterations = 1;
+    if ((cpu->irq_shadow || (cpu->eflags & FLAG_TF)) && iterations > 1u) iterations = 1;
     for (unsigned i = 0; i < iterations; i++) {
         uint32_t offset = input ? (adr32 ? cpu->edi : cpu->di)
                                 : (adr32 ? cpu->esi : cpu->si);
@@ -3129,6 +3242,13 @@ bool cpu8086_service_interrupts(dos_vm_t *vm)
     if (keyboard_pending && dos_io_irq_begin(vm, 1, &vector) &&
         cpu_deliver_hw_interrupt(vm, vector))
         return true;
+
+    dos_fpu_sync_irq(vm);
+    if (!(cpu->cr0 & DOS_CR0_NE) && vm->native_fp && vm->native_fp->irq_pending &&
+        dos_io_irq_begin(vm, 13, &vector) && cpu_deliver_hw_interrupt(vm, vector)) {
+        vm->native_fp->irq_pending = false;
+        return true;
+    }
 
     uint8_t audio_irq = 0;
     uint32_t audio_pending = 0;
@@ -3229,8 +3349,13 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
             prev_cs = cpu->cs;
         }
 
+        /* EXEC admission/unwind can stop the restored caller. */
+        if (!cpu->running) continue;
+        dpmi_apply_coprocessor(cpu);
+
         if (!single_step && vm->interpreter_stop_active &&
             vm->current_psp == vm->interpreter_stop_psp &&
+            vm->dpmi.client_id == vm->interpreter_stop_client_id &&
             (vm->interpreter_stop_signal ? *vm->interpreter_stop_signal :
              (cpu->protected_mode == vm->interpreter_stop_protected &&
               cpu->cs == vm->interpreter_stop_cs &&
@@ -3253,6 +3378,9 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
         uint64_t previous_insns = cpu->insn_count;
         bool had_irq_shadow = cpu->irq_shadow != 0;
         bool string_pending = false;
+        bool trace = (cpu->eflags & FLAG_TF) != 0;
+        bool suppress_trace = false;
+        uint64_t event_serial = vm->cpu_event_serial;
         if (cpu->rep_compare.active &&
             (cpu->cs != cpu->rep_compare.cs || insn_eip != cpu->rep_compare.eip))
             cpu->rep_compare.active = false;
@@ -3286,6 +3414,7 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
                     bool crosses_stop = vm->interpreter_stop_active &&
                         !vm->interpreter_stop_signal &&
                         vm->current_psp == vm->interpreter_stop_psp &&
+                        vm->dpmi.client_id == vm->interpreter_stop_client_id &&
                         cpu->protected_mode == vm->interpreter_stop_protected &&
                         cpu->cs == vm->interpreter_stop_cs &&
                         vm->interpreter_stop_ip > ip &&
@@ -3313,6 +3442,7 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
         if (vm->step_limit) vm->step_count++;
 
         /* Reset prefix state */
+        uint32_t fetch_resume_flag = cpu->eflags & FLAG_RF;
         cpu->seg_override = -1;
         cpu->rep_active   = false;
         cpu->rep_type     = 0;
@@ -3390,6 +3520,12 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
         }
 
         /* ── Dispatch opcode ─────────────────────────────────────── */
+
+        /* RF belongs to instruction entry, not retirement: IRETD and task
+         * switches may load a new image. The unavailable-x87 checks precede
+         * this boundary, as do code-fetch/CS-limit checks below. */
+        bool fp_fault = (opcode >= 0xD8 && opcode <= 0xDF) || opcode == 0x9B;
+        if (!fp_fault) cpu->eflags &= ~FLAG_RF;
 
         switch (opcode) {
 
@@ -4126,6 +4262,7 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
             break;
         case 0x17: /* POP SS */
             cpu_pop_segment(cpu, 2, op32 ? 4u : 2u, lock_prefix, insn_eip);
+            suppress_trace = true;
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -4815,7 +4952,10 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
             cpu_system_segment_t loaded;
             if (!cpu_prepare_segment_load(cpu, segment, val, insn_eip, &loaded)) break;
             cpu_commit_segment_load(cpu, segment, val, &loaded);
-            if (segment == 2 && !cpu->irq_shadow) cpu->irq_shadow = 2;
+            if (segment == 2) {
+                suppress_trace = true;
+                if (!cpu->irq_shadow) cpu->irq_shadow = 2;
+            }
             break;
         }
 
@@ -4853,6 +4993,7 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
          *  XCHG AX, reg16  (0x90 - 0x97)  (0x90 = NOP)
          * ════════════════════════════════════════════════════════════ */
         case 0x90: /* NOP (XCHG AX,AX) */
+            if (lock_prefix) (void)cpu_deliver_exception(vm, 6, insn_eip, 0, false);
             break;
         case 0x91: case 0x92: case 0x93:
         case 0x94: case 0x95: case 0x96: case 0x97: {
@@ -4907,8 +5048,12 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
          * ════════════════════════════════════════════════════════════ */
         case 0x9B: /* FWAIT/WAIT */
             if ((cpu->cr0 & (DOS_CR0_MP | DOS_CR0_TS)) ==
-                (DOS_CR0_MP | DOS_CR0_TS))
+                (DOS_CR0_MP | DOS_CR0_TS)) {
                 (void)cpu_deliver_exception(vm, 7, insn_eip, 0, false);
+                break;
+            }
+            if (!cpu_fpu_wait(vm, insn_eip)) goto execution_complete;
+            cpu->eflags &= ~FLAG_RF;
             break;
         case 0x9E: /* SAHF — AH → flags low byte */
             cpu->flags = (cpu->flags & 0xFF00) | (cpu->ah & 0xD5) | FLAGS_FIXED;
@@ -5118,6 +5263,9 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
                 (void)cpu_deliver_exception(vm, 6, insn_eip, 0, false);
                 break;
             }
+            /* A host service may restore the CPU image synchronously. INT
+             * still retires as a transfer, not a step at its return address. */
+            vm->cpu_event_serial++;
             if ((!cpu->protected_mode || cpu8086_uses_guest_idt(cpu)) &&
                 !dos_vcpi_pm_entry_source(vm, int_num)) {
                 (void)cpu8086_deliver_guest_interrupt(vm, int_num, CPU_EVENT_SOFTWARE,
@@ -5130,7 +5278,7 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
              * spam dominates wall-clock (every [INT] is ~40 bytes at 115200
              * baud → caps the emulator at ~3000 insns/s). Unhandled INTs
              * still print via default: cases in dos_api.c / dos_dpmi.c. */
-            if (cpu->insn_count < 5000) {
+            if (cpu->insn_count < 5000 && dos_trace_record(vm)) {
                 serial_puts("[INT] ");
                 serial_puthex(int_num, 2);
                 serial_puts(" AH=");
@@ -5143,6 +5291,10 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
             uint16_t saved_cs = cpu->cs;
             uint32_t saved_eip = cpu->eip;
             uint32_t saved_eflags = cpu8086_flags_image(cpu);
+            /* This private gate completes the client's IRET on a locked
+             * stack. It must not consume the RF image that IRETD restored. */
+            if (dos_pm_interrupt_return_source(vm, int_num))
+                saved_eflags |= fetch_resume_flag;
 
             if (cpu_deliver_pm_software_interrupt(vm, int_num,
                                                   saved_eip, insn_eip))
@@ -5909,8 +6061,38 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
          * ════════════════════════════════════════════════════════════ */
         case 0xD8: case 0xD9: case 0xDA: case 0xDB:
         case 0xDC: case 0xDD: case 0xDE: case 0xDF: {
-            /* A guest x87 emulator can handle vector 7 and retry or skip. */
-            (void)cpu_deliver_exception(vm, 7, insn_eip, 0, false);
+            modrm_byte = CPU_FETCH8(cpu);
+            m = CPU_DECODE_MODRM(cpu, modrm_byte);
+            dos_fpu_op_t fp_op;
+            if (lock_prefix || !dos_fpu_decode(opcode, modrm_byte, op32, &fp_op)) {
+                (void)cpu_deliver_exception(vm, 6, insn_eip, 0, false);
+                break;
+            }
+            if (cpu->cr0 & (DOS_CR0_EM | DOS_CR0_TS)) {
+                (void)cpu_deliver_exception(vm, 7, insn_eip, 0, false);
+                break;
+            }
+            if (fp_op.waiting && !cpu_fpu_wait(vm, insn_eip)) goto execution_complete;
+            cpu->eflags &= ~FLAG_RF;
+            if (!dos_fpu_ensure(vm)) break;
+            uint8_t operand[108] = {0};
+            uint32_t addresses[108];
+            if (fp_op.size) {
+                if (!cpu_operand_probe(cpu, m.seg_index, m.offset, fp_op.size,
+                                         fp_op.write, false, insn_eip, addresses)) break;
+                if (!fp_op.write)
+                    for (unsigned i = 0; i < fp_op.size; i++)
+                        operand[i] = dos_mem_read8(vm, addresses[i]);
+            }
+            bool stored = dos_fpu_execute(vm, &fp_op, opcode, modrm_byte, op32,
+                                           insn_eip, m.seg_index, m.offset, operand);
+            if (fp_op.write && stored) {
+                /* No guest callback occurs between the probe and commit. */
+                if (!cpu_memory_addresses(cpu, cpu_segment_linear(cpu, m.seg_index, m.offset),
+                                            fp_op.size, true, true, insn_eip, addresses)) break;
+                for (unsigned i = 0; i < fp_op.size; i++)
+                    dos_mem_write8(vm, addresses[i], operand[i]);
+            }
             break;
         }
 
@@ -5928,20 +6110,33 @@ static int cpu8086_run_internal(dos_vm_t *vm, bool single_step)
 fetch_fault:
         cpu->eip = insn_eip;
         if (cpu->rep_compare.active) cpu->eflags = cpu->rep_compare.eflags;
+        cpu->eflags = (cpu->eflags & ~FLAG_RF) | fetch_resume_flag;
         if (fetch->fault.raised) cpu_raise_page_fault(cpu, insn_eip, &fetch->fault);
         else (void)cpu_deliver_exception(vm, 13, insn_eip, 0, true);
 
 instruction_complete:
         if (cpu->irq_shadow) cpu->irq_shadow--;
+        /* A non-final REP yield resumes the same instruction. Preserve RF
+         * for an intervening trap/IRQ or a saved interpreter continuation. */
+        if (string_pending && vm->cpu_event_serial == event_serial) cpu->eflags |= FLAG_RF;
         /* Increment instruction counter */
         cpu->insn_count++;
+        if (trace && !suppress_trace && cpu->running &&
+            vm->cpu_event_serial == event_serial) {
+            /* Sample TF before execution (including POPF clearing it).
+             * Faults, interrupts and task switches own their own delivery. */
+            cpu->dr[6] |= 1u << 14;
+            cpu->dr[7] &= ~(1u << 13);
+            (void)cpu_deliver_exception(vm, 1, cpu->eip, 0x8000u, false);
+        }
 execution_complete:
         if (vm->step_limit_reached) cpu_stop_for_step_limit(vm);
         if (single_step) break;
         /* Return to the suspended host before polling IRQs can replace the
          * destination just validated by its exception-return stub. */
         if (vm->interpreter_stop_active && vm->interpreter_stop_signal &&
-            *vm->interpreter_stop_signal && vm->current_psp == vm->interpreter_stop_psp)
+            *vm->interpreter_stop_signal && vm->current_psp == vm->interpreter_stop_psp &&
+            vm->dpmi.client_id == vm->interpreter_stop_client_id)
             continue;
 
         /* Trace PM instructions for debugging */
@@ -5968,7 +6163,8 @@ execution_complete:
         }
 
         /* Detect CS changes in PM */
-        if (cpu->pm_cs_loaded && cpu->cs != prev_cs && cpu->insn_count < 1000000) {
+        if (cpu->pm_cs_loaded && cpu->cs != prev_cs &&
+            cpu->insn_count < 1000000 && dos_trace_record(vm)) {
             serial_puts("[CS] ");
             serial_puthex(prev_cs, 4);
             serial_puts(" -> ");
@@ -6077,6 +6273,7 @@ static bool cpu_run_until(dos_vm_t *vm, bool protected_mode,
     uint16_t saved_stop_cs = vm->interpreter_stop_cs;
     uint32_t saved_stop_ip = vm->interpreter_stop_ip;
     uint16_t saved_stop_psp = vm->interpreter_stop_psp;
+    uint64_t saved_stop_client_id = vm->interpreter_stop_client_id;
     bool saved_stop_protected = vm->interpreter_stop_protected;
     const bool *saved_stop_signal = vm->interpreter_stop_signal;
     bool saved_running = vm->cpu->running;
@@ -6084,6 +6281,7 @@ static bool cpu_run_until(dos_vm_t *vm, bool protected_mode,
     vm->interpreter_stop_cs = stop_cs;
     vm->interpreter_stop_ip = stop_ip;
     vm->interpreter_stop_psp = vm->current_psp;
+    vm->interpreter_stop_client_id = vm->dpmi.client_id;
     vm->interpreter_stop_protected = protected_mode;
     vm->interpreter_stop_reached = false;
     vm->interpreter_stop_active = true;
@@ -6098,6 +6296,7 @@ static bool cpu_run_until(dos_vm_t *vm, bool protected_mode,
     vm->interpreter_stop_cs = saved_stop_cs;
     vm->interpreter_stop_ip = saved_stop_ip;
     vm->interpreter_stop_psp = saved_stop_psp;
+    vm->interpreter_stop_client_id = saved_stop_client_id;
     vm->interpreter_stop_protected = saved_stop_protected;
     vm->interpreter_stop_signal = saved_stop_signal;
     vm->native_resume_armed = saved_resume_armed;

@@ -17,6 +17,7 @@
 #include "ntsyscall.h"
 #include "handle.h"
 #include "kernel32_shim.h"
+#include "nt_event.h"
 #include "../kernel/smp.h"
 
 #ifndef NTSYNC_TRACE_DIAGNOSTICS
@@ -43,7 +44,6 @@ extern uint32_t compat32_get_last_caller_eip(void);
 
 #define STATUS_TIMEOUT              ((NTSTATUS)0x00000102)
 #define STATUS_WAIT_0               ((NTSTATUS)0x00000000)
-#define STATUS_SEMAPHORE_LIMIT_EXCEEDED ((NTSTATUS)0xC0000046)
 #define MAXIMUM_WAIT_OBJECTS        64
 #define THREAD_STATE_TERMINATED     4
 
@@ -60,6 +60,7 @@ typedef struct _EVENT_OBJECT {
     uint64_t timer_due_tick;
     uint64_t timer_period_ticks;
     uint64_t trace_id;
+    uint64_t references;
 } EVENT_OBJECT;
 
 #define MAX_EVENTS  MAX_HANDLES
@@ -102,6 +103,8 @@ typedef struct _NTSYNC_WAITER {
     BOOL            has_deadline;
     uint64_t        deadline;
     NTSTATUS        completion_status;
+    volatile void  *address;
+    uint32_t        address_bucket, address_prev, address_next;
     OBJECT_TYPE_ID  types[MAXIMUM_WAIT_OBJECTS];
     PVOID           objects[MAXIMUM_WAIT_OBJECTS];
 } NTSYNC_WAITER;
@@ -109,6 +112,9 @@ typedef struct _NTSYNC_WAITER {
 static NTSYNC_WAITER *g_waiters;
 static int g_waiter_capacity;
 static volatile ULONG g_waiter_count;
+/* Links encode scheduler index + 1 so static zero initialization is empty. */
+#define NTSYNC_ADDRESS_BUCKETS 256u
+static struct { uint32_t head, tail; } g_address_waiters[NTSYNC_ADDRESS_BUCKETS];
 #if NTSYNC_TRACE_DIAGNOSTICS
 static volatile ULONG g_waiter_trace_count;
 #endif
@@ -359,14 +365,44 @@ void ntsync_debug_dump_process_events(ULONG owner_pid)
 
 #endif
 
+static inline uint64_t ntsync_irq_save(void);
+static inline void ntsync_irq_restore(uint64_t flags);
+
 void ntsync_debug_dump_waiter(int proc_idx)
 {
-    if (!g_waiters || proc_idx < 0 || proc_idx >= g_waiter_capacity)
+    struct {
+        OBJECT_TYPE_ID type;
+        uint64_t address;
+        BOOL event, signaled, timer;
+        int event_type;
+    } objects[4] = {0};
+    uint64_t flags = ntsync_irq_save();
+    if (!g_waiters || proc_idx < 0 || proc_idx >= g_waiter_capacity) {
+        ntsync_irq_restore(flags);
         return;
-
-    NTSYNC_WAITER *waiter = &g_waiters[proc_idx];
+    }
+    NTSYNC_WAITER snapshot = g_waiters[proc_idx];
+    for (ULONG i = 0; i < snapshot.count && i < 4; i++) {
+        objects[i].type = snapshot.types[i];
+        objects[i].address = (uint64_t)(ULONG_PTR)snapshot.objects[i];
+        /* Inactive slots retain old pointer values, not object references. */
+        if (snapshot.active && snapshot.types[i] == OBJ_TYPE_EVENT &&
+            snapshot.objects[i]) {
+            EVENT_OBJECT *event = snapshot.objects[i];
+            objects[i].event = TRUE;
+            objects[i].event_type = event->type;
+            objects[i].signaled = event->signaled;
+            objects[i].timer = event->timer_active;
+        }
+    }
+    ntsync_irq_restore(flags);
+    const NTSYNC_WAITER *waiter = &snapshot;
     serial_puts("[NTWAIT-SNAP] slot=");
     serial_putdec((uint64_t)proc_idx);
+    serial_puts(" owner=");
+    serial_putdec(waiter->owner_pid);
+    serial_puts(" tid=");
+    serial_putdec(waiter->owner_tid);
     serial_puts(" active=");
     serial_putdec(waiter->active);
     serial_puts(" timeout=");
@@ -385,17 +421,16 @@ void ntsync_debug_dump_waiter(int proc_idx)
         serial_puts(" obj");
         serial_putdec(i);
         serial_puts("=");
-        serial_putdec(waiter->types[i]);
+        serial_putdec(objects[i].type);
         serial_puts("@0x");
-        serial_puthex((uint64_t)(ULONG_PTR)waiter->objects[i], 16);
-        if (waiter->types[i] == OBJ_TYPE_EVENT && waiter->objects[i]) {
-            EVENT_OBJECT *event = (EVENT_OBJECT *)waiter->objects[i];
+        serial_puthex(objects[i].address, 16);
+        if (objects[i].event) {
             serial_puts("(type=");
-            serial_putdec(event->type);
+            serial_putdec(objects[i].event_type);
             serial_puts(" sig=");
-            serial_putdec(event->signaled);
+            serial_putdec(objects[i].signaled);
             serial_puts(" timer=");
-            serial_putdec(event->timer_active);
+            serial_putdec(objects[i].timer);
             serial_puts(")");
         }
     }
@@ -404,17 +439,27 @@ void ntsync_debug_dump_waiter(int proc_idx)
 
 static inline uint64_t ntsync_irq_save(void)
 {
+#ifdef NTSYNC_HOST_TEST
+    extern uint64_t ntsync_host_lock(void);
+    return ntsync_host_lock();
+#else
     uint64_t flags;
     __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     spin_lock(&g_ntsync_lock);
     return flags;
+#endif
 }
 
 static inline void ntsync_irq_restore(uint64_t flags)
 {
+#ifdef NTSYNC_HOST_TEST
+    extern void ntsync_host_unlock(uint64_t flags);
+    ntsync_host_unlock(flags);
+#else
     spin_unlock(&g_ntsync_lock);
     if (flags & (1ULL << 9))
         __asm__ volatile ("sti" ::: "memory");
+#endif
 }
 
 static void ntsync_trace_event_operation(const char *operation, HANDLE handle,
@@ -490,6 +535,18 @@ uint64_t ntsync_object_identity(OBJECT_TYPE_ID type, PVOID object)
     return identity;
 }
 
+static void ntsync_address_unlink(NTSYNC_WAITER *waiter)
+{
+    if (!waiter->address) return;
+    uint32_t prev = waiter->address_prev, next = waiter->address_next;
+    if (prev) g_waiters[prev - 1].address_next = next;
+    else g_address_waiters[waiter->address_bucket].head = next;
+    if (next) g_waiters[next - 1].address_prev = prev;
+    else g_address_waiters[waiter->address_bucket].tail = prev;
+    waiter->address = NULL;
+    waiter->address_prev = waiter->address_next = 0;
+}
+
 void ntsync_cancel_waiter(int proc_idx)
 {
     if (!g_waiters || proc_idx < 0 || proc_idx >= g_waiter_capacity)
@@ -497,6 +554,7 @@ void ntsync_cancel_waiter(int proc_idx)
 
     uint64_t flags = ntsync_irq_save();
     NTSYNC_WAITER *waiter = &g_waiters[proc_idx];
+    ntsync_address_unlink(waiter);
     if (waiter->active) {
         waiter->active = FALSE;
         if (g_waiter_count)
@@ -600,6 +658,7 @@ static BOOL ntsync_waiter_ready_locked(const NTSYNC_WAITER *waiter,
 static void ntsync_complete_waiter_locked(NTSYNC_WAITER *waiter,
                                           NTSTATUS status, BOOL timed_out)
 {
+    ntsync_address_unlink(waiter);
     waiter->active = FALSE;
     waiter->timed_out = timed_out;
     waiter->completed = TRUE;
@@ -607,6 +666,119 @@ static void ntsync_complete_waiter_locked(NTSYNC_WAITER *waiter,
     if (g_waiter_count)
         g_waiter_count--;
     sched_unblock(waiter->proc_idx);
+}
+
+BOOL WINAPI WaitOnAddress(volatile void *address, void *compare,
+                          SIZE_T size, DWORD milliseconds)
+{
+    if (!address || !compare || (size != 1 && size != 2 && size != 4 && size != 8)) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    extern void win32_main_termination_checkpoint(void);
+    win32_main_termination_checkpoint();
+    ULONG pid = win32_current_process_id();
+    if (!pid) pid = 1;
+    int slot = sched_current_get();
+    /* Shared with object waits: one owned record per task, removed by the
+     * existing scheduler cancellation hook before process memory is freed. */
+    ntsync_cancel_waiter(slot);
+    uint64_t flags = ntsync_irq_save();
+    BOOL equal = TRUE;
+    for (SIZE_T i = 0; i < size; ++i)
+        if (((volatile const unsigned char *)address)[i] !=
+            ((const unsigned char *)compare)[i]) { equal = FALSE; break; }
+    if (!equal || !milliseconds) {
+        ntsync_irq_restore(flags);
+        if (equal) SetLastError(1460); /* ERROR_TIMEOUT */
+        return !equal;
+    }
+    if (!g_waiters || slot < 0 || slot >= g_waiter_capacity) {
+        ntsync_irq_restore(flags);
+        SetLastError(8); /* Cannot allocate a scheduler wait record. */
+        return FALSE;
+    }
+    uint32_t bucket = (uint32_t)(((ULONG_PTR)address >> 3) ^ pid) &
+                      (NTSYNC_ADDRESS_BUCKETS - 1);
+    NTSYNC_WAITER *waiter = &g_waiters[slot];
+    waiter->proc_idx = slot;
+    waiter->owner_pid = pid;
+    waiter->owner_tid = (ULONG)proc_current_pid();
+    waiter->count = 0; /* Tick handles the deadline, never polls user memory. */
+    waiter->wait_type = 1;
+    waiter->has_deadline = milliseconds != 0xffffffffu;
+    uint64_t now = idt_get_ticks(), ticks = ((uint64_t)milliseconds + 9) / 10;
+    waiter->deadline = ticks > UINT64_MAX - now ? UINT64_MAX : now + ticks;
+    waiter->timed_out = waiter->completed = FALSE;
+    waiter->completion_status = STATUS_WAIT_0;
+    waiter->address = address;
+    waiter->address_bucket = bucket;
+    waiter->address_prev = g_address_waiters[bucket].tail;
+    waiter->address_next = 0;
+    if (waiter->address_prev) g_waiters[waiter->address_prev - 1].address_next = slot + 1;
+    else g_address_waiters[bucket].head = slot + 1;
+    g_address_waiters[bucket].tail = slot + 1;
+    waiter->active = TRUE;
+    ++g_waiter_count;
+    ntsync_irq_restore(flags);
+
+    /* A wake may happen after registration but before the scheduler changes
+     * state. Reconcile it under the same lock before yielding (no lost wake). */
+    int blocked_slot = sched_block_current();
+    flags = ntsync_irq_save();
+    if (blocked_slot != slot) {
+        if (waiter->active) {
+            ntsync_address_unlink(waiter);
+            waiter->active = FALSE;
+            --g_waiter_count;
+        }
+    } else if (!waiter->active) sched_unblock(slot);
+    ntsync_irq_restore(flags);
+    sched_yield();
+    win32_main_termination_checkpoint();
+
+    flags = ntsync_irq_save();
+    BOOL timed_out = waiter->completed && waiter->timed_out;
+    if (waiter->active) {
+        /* An external scheduler wake is an allowed spurious wake. */
+        ntsync_address_unlink(waiter);
+        waiter->active = FALSE;
+        --g_waiter_count;
+    }
+    waiter->completed = waiter->timed_out = FALSE;
+    ntsync_irq_restore(flags);
+    if (timed_out) SetLastError(1460);
+    return !timed_out;
+}
+
+static void ntsync_address_wake(void *address, BOOL all)
+{
+    if (!address) return;
+    ULONG pid = win32_current_process_id();
+    if (!pid) pid = 1;
+    uint32_t bucket = (uint32_t)(((ULONG_PTR)address >> 3) ^ pid) &
+                      (NTSYNC_ADDRESS_BUCKETS - 1);
+    uint64_t flags = ntsync_irq_save();
+    uint32_t link = g_address_waiters[bucket].head;
+    while (link) {
+        NTSYNC_WAITER *waiter = &g_waiters[link - 1];
+        link = waiter->address_next;
+        if (waiter->address == address && waiter->owner_pid == pid) {
+            ntsync_complete_waiter_locked(waiter, STATUS_WAIT_0, FALSE);
+            if (!all) break; /* FIFO within a process/address. */
+        }
+    }
+    ntsync_irq_restore(flags);
+}
+
+void WINAPI WakeByAddressSingle(void *address)
+{
+    ntsync_address_wake(address, FALSE);
+}
+
+void WINAPI WakeByAddressAll(void *address)
+{
+    ntsync_address_wake(address, TRUE);
 }
 
 static void ntsync_wake_object_locked(OBJECT_TYPE_ID type, PVOID object)
@@ -697,15 +869,12 @@ NTSTATUS sys_NtCreateEvent(ULONG_PTR *args)
     evt->timer_due_tick = 0;
     evt->timer_period_ticks = 0;
     evt->trace_id = ntsync_next_object_identity_locked();
+    __atomic_store_n(&evt->references,1,__ATOMIC_RELEASE); /* creator */
     ntsync_irq_restore(flags);
 
     NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_EVENT,
                                    DesiredAccess, evt, EventHandle);
-    if (!NT_SUCCESS(status)) {
-        flags = ntsync_irq_save();
-        evt->allocated = FALSE;
-        ntsync_irq_restore(flags);
-    }
+    ntsync_event_release(evt); /* handle allocation retained its own reference */
     if (NT_SUCCESS(status) && ObjectAttributes) {
         HANDLE created_handle = *EventHandle;
         HANDLE effective_handle = created_handle;
@@ -736,6 +905,20 @@ NTSTATUS sys_NtCreateEvent(ULONG_PTR *args)
 }
 
 /* ── NtSetEvent ─────────────────────────────────────────────── */
+
+void ntsync_event_set_state(PVOID object, BOOL signaled)
+{
+    EVENT_OBJECT *evt = object;
+    uint64_t flags = ntsync_irq_save();
+    evt->signaled = signaled;
+    if (signaled) {
+        ntsync_event_trace_signal(evt, win32_current_process_id(), FALSE);
+        ntsync_wake_object_locked(OBJ_TYPE_EVENT, evt);
+    } else {
+        ntsync_event_trace_reset(evt, win32_current_process_id());
+    }
+    ntsync_irq_restore(flags);
+}
 
 NTSTATUS ntsync_set_event_for_process(HANDLE EventHandle, ULONG owner_pid,
                                       LONG *PreviousState)
@@ -890,7 +1073,7 @@ NTSTATUS sys_NtReleaseMutant(ULONG_PTR *args)
     uint64_t flags = ntsync_irq_save();
     if (!mut->owned || mut->owner_tid != (ULONG)proc_current_pid()) {
         ntsync_irq_restore(flags);
-        return STATUS_UNSUCCESSFUL;  /* not owned */
+        return STATUS_MUTANT_NOT_OWNED;
     }
 
     if (PreviousCount)
@@ -958,37 +1141,86 @@ NTSTATUS sys_NtReleaseSemaphore(ULONG_PTR *args)
     LONG    ReleaseCount    = (LONG)args[1];
     LONG   *PreviousCount   = (LONG *)args[2];
 
+    if (ReleaseCount <= 0) return STATUS_INVALID_PARAMETER;
+    ULONG owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    NTSTATUS status = handle_retain_for_process(&g_handle_table, SemaphoreHandle, owner_pid);
+    if (!NT_SUCCESS(status)) return status;
     SEMAPHORE_OBJECT *sem = NULL;
-    NTSTATUS status = handle_lookup(&g_handle_table, SemaphoreHandle,
-                                    OBJ_TYPE_SEMAPHORE, (PVOID *)&sem);
-    if (!NT_SUCCESS(status))
+    ACCESS_MASK access = 0;
+    status = handle_lookup_access_for_process(&g_handle_table, SemaphoreHandle,
+        owner_pid, OBJ_TYPE_SEMAPHORE, (PVOID *)&sem, &access);
+    if (NT_SUCCESS(status) && !(access & (GENERIC_ALL | GENERIC_WRITE | 2u)))
+        status = STATUS_ACCESS_DENIED;
+    if (!NT_SUCCESS(status)) {
+        nt_close_handle_for_process(SemaphoreHandle, owner_pid);
         return status;
+    }
 
     uint64_t flags = ntsync_irq_save();
-    if (PreviousCount)
-        *PreviousCount = sem->count;
-
-    if (ReleaseCount <= 0 || sem->count + ReleaseCount > sem->max_count) {
+    if (ReleaseCount > sem->max_count - sem->count) {
         ntsync_irq_restore(flags);
+        nt_close_handle_for_process(SemaphoreHandle, owner_pid);
         return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
     }
 
+    LONG previous = sem->count;
     sem->count += ReleaseCount;
     ntsync_wake_object_locked(OBJ_TYPE_SEMAPHORE, sem);
     ntsync_irq_restore(flags);
+    nt_close_handle_for_process(SemaphoreHandle, owner_pid);
+    if (PreviousCount) *PreviousCount = previous;
     return STATUS_SUCCESS;
+}
+
+BOOL ntsync_event_retain(PVOID object)
+{
+    if (!object) return FALSE;
+    EVENT_OBJECT *evt=object;
+    uint64_t refs=__atomic_load_n(&evt->references,__ATOMIC_ACQUIRE);
+    while (refs && refs!=UINT64_MAX) {
+        if (__atomic_compare_exchange_n(&evt->references,&refs,refs+1,FALSE,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+void ntsync_event_release(PVOID object)
+{
+    if (!object) return;
+    EVENT_OBJECT *evt=object;
+    if (__atomic_fetch_sub(&evt->references,1,__ATOMIC_ACQ_REL)!=1) return;
+    /* The zero count prevents resurrection while subsystem cleanup runs.
+     * Keep allocated set until every cleanup callback has stopped using it. */
+    k32_iocp_release_event(evt);
+    uint64_t flags=ntsync_irq_save();
+    evt->timer_active=FALSE; evt->allocated=FALSE;
+    ntsync_irq_restore(flags);
+}
+
+NTSTATUS ntsync_reference_event_for_process(HANDLE handle,DWORD pid,PVOID *object)
+{
+    return handle_reference_event_for_process(&g_handle_table,handle,pid,object);
+}
+
+void ntsync_signal_event_reference(PVOID object,DWORD actor_pid)
+{
+    EVENT_OBJECT *evt=object;
+    uint64_t flags=ntsync_irq_save();
+    evt->signaled=TRUE;
+    ntsync_event_trace_signal(evt,actor_pid,FALSE);
+    ntsync_wake_object_locked(OBJ_TYPE_EVENT,evt);
+    ntsync_irq_restore(flags);
 }
 
 void ntsync_release_object(OBJECT_TYPE_ID type, PVOID object)
 {
     if (!object)
         return;
+    if (type==OBJ_TYPE_EVENT) { ntsync_event_release(object); return; }
 
     uint64_t flags = ntsync_irq_save();
-    if (type == OBJ_TYPE_EVENT) {
-        ((EVENT_OBJECT *)object)->timer_active = FALSE;
-        ((EVENT_OBJECT *)object)->allocated = FALSE;
-    } else if (type == OBJ_TYPE_MUTANT)
+    if (type == OBJ_TYPE_MUTANT)
         ((MUTANT_OBJECT *)object)->allocated = FALSE;
     else if (type == OBJ_TYPE_SEMAPHORE)
         ((SEMAPHORE_OBJECT *)object)->allocated = FALSE;
@@ -1203,6 +1435,10 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
         if (!entries[i]) {
             ntsync_release_wait_handles(Handles, retained_count);
             return STATUS_INVALID_HANDLE;
+        }
+        if (!(entries[i]->access & (SYNCHRONIZE | GENERIC_ALL | GENERIC_EXECUTE))) {
+            ntsync_release_wait_handles(Handles, retained_count);
+            return STATUS_ACCESS_DENIED;
         }
     }
 
@@ -1457,12 +1693,10 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
 
 void nt_sync_register_syscalls(NT_SERVICE_TABLE *table)
 {
-    g_waiter_count = 0;
-#if NTSYNC_TRACE_DIAGNOSTICS
-    g_waiter_trace_count = 0;
-    g_event_lifecycle_trace_count = 0;
-#endif
-
+    /* Object pools and pending waits have system lifetime. Registering another
+     * SSDT (including a subsequent shell launch) must preserve live children.
+     * Static storage and kcalloc supply the initial zero state. */
+    uint64_t flags = ntsync_irq_save();
     if (!g_waiters) {
         g_waiter_capacity = (int)sched_capacity_get();
         g_waiters = (NTSYNC_WAITER *)kcalloc(
@@ -1476,21 +1710,7 @@ void nt_sync_register_syscalls(NT_SERVICE_TABLE *table)
             serial_puts("\n");
         }
     }
-
-    for (int i = 0; i < g_waiter_capacity; i++) {
-        g_waiters[i].active = FALSE;
-        g_waiters[i].completed = FALSE;
-    }
-    for (int i = 0; i < MAX_EVENTS; i++)
-        g_events[i].allocated = FALSE;
-#if NTSYNC_TRACE_DIAGNOSTICS
-    for (int i = 0; i < NTSYNC_EVENT_TRACE_SLOTS; i++)
-        g_event_traces[i].used = FALSE;
-#endif
-    for (int i = 0; i < MAX_MUTANTS; i++)
-        g_mutants[i].allocated = FALSE;
-    for (int i = 0; i < MAX_SEMAPHORES; i++)
-        g_semaphores[i].allocated = FALSE;
+    ntsync_irq_restore(flags);
 
     table->handlers[NTSYS_CreateEvent]    = sys_NtCreateEvent;
     table->arg_counts[NTSYS_CreateEvent]  = 5;

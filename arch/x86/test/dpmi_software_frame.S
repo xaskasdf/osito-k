@@ -201,6 +201,13 @@ stack_handler:
     movl %ss:4 + 6*FIELD(%ebp), %eax
     cmpl bad_sp, %eax
     jne fail
+    testl $0x10000, %ss:4 + 5*FIELD(%ebp)
+    jz fail
+    andl $~0x10000, %ss:4 + 5*FIELD(%ebp)
+    testb $1, faults
+    jz repair_stack
+    orl $0x10000, %ss:4 + 5*FIELD(%ebp)
+repair_stack:
     movl saved_sp, %eax
     movl %eax, %ss:4 + 6*FIELD(%ebp)
     .else
@@ -227,6 +234,17 @@ stack_handler:
     lret
 
 software_handler:
+    .if PM32
+    pushl %ebp
+    .if STACK32
+    movl %esp, %ebp
+    .else
+    movzwl %sp, %ebp
+    .endif
+    testl $0x10000, %ss:4 + 2*FIELD(%ebp)
+    popl %ebp
+    jnz fail
+    .endif
     incb invokes
     iret
 

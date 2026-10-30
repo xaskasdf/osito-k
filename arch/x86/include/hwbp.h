@@ -52,5 +52,6 @@ bool hwbp_dispatch(x86_interrupt_frame_t *frame);
 
 /* Shell helpers. */
 void hwbp_list(void);
+int hwbp_command(int argc, char **argv);
 
 #endif /* OSITOK_HWBP_H */

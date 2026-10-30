@@ -10,6 +10,8 @@
 
 #include "pe.h"
 #include "ntsyscall.h"
+#include "ntprocess.h"
+#include "ntjob.h"
 #include "ntdll_shim.h"
 #include "kernel32_shim.h"
 #include "msvcrt_shim.h"
@@ -24,8 +26,8 @@ static USHORT g_exe_subsystem_minor_version;
 #include "scm.h"
 #include "user32_shim.h"
 #include "gdi32_shim.h"
+#include "d3dkmt.h"
 #include "opengl32_shim.h"
-#include "dxgi_shim.h"
 #include "version_shim.h"
 #include "libusb_shim.h"
 #include "ddraw_shim.h"
@@ -37,6 +39,17 @@ static USHORT g_exe_subsystem_minor_version;
 #include "ole32_shim.h"
 #include "oleacc_shim.h"
 #include "crypt32_shim.h"
+#include "imagehlp_shim.h"
+#include "secur32_shim.h"
+#include "urlmon_shim.h"
+#include "advpack_shim.h"
+#include "rpcrt4_shim.h"
+#include "cabinet_shim.h"
+#include "msi_shim.h"
+#include "msi_install.h"
+#include "setupapi_inf.h"
+#include "mmio_shim.h"
+#include "wow64.h"
 #include "comctl32_shim.h"
 #include "comdlg32_shim.h"
 #include "richedit_shim.h"
@@ -44,6 +57,8 @@ static USHORT g_exe_subsystem_minor_version;
 #include "win32_abi.h"
 #include "handle.h"
 #include "../include/paging.h"
+#include "../include/interrupt.h"
+#include "../kernel/terminal_control.h"
 
 /* ── External kernel interfaces ─────────────────────────────── */
 
@@ -59,6 +74,7 @@ extern void *proc_find_ptr(uint16_t pid);
 extern uint32_t proc_state_of(void *process);
 extern void  sched_yield(void);
 extern HANDLE_TABLE g_handle_table;
+extern DWORD kernel32_release_process_handles(DWORD process_id);
 extern void nt_process_complete_child(PVOID process_object,
                                       PVOID thread_object,
                                       NTSTATUS exit_status);
@@ -295,13 +311,13 @@ static int pe_allocation_conflict_snapshot(uint64_t base, uint64_t size)
     return 0;
 }
 
-BOOL pe_va_query_range(ULONGLONG address, ULONGLONG *base,
-                       ULONGLONG *size, ULONGLONG *next_base)
+BOOL pe_va_query_range_for_owner(ULONG owner_pid, ULONGLONG address,
+                                  ULONGLONG *base, ULONGLONG *size,
+                                  ULONGLONG *next_base)
 {
     uint64_t found_base = 0;
     uint64_t found_size = 0;
     uint64_t next = 0;
-    DWORD owner_pid = pe_va_owner();
     int count = __atomic_load_n(&pe_va_count, __ATOMIC_ACQUIRE);
 
     for (int i = 0; i < count; i++) {
@@ -324,6 +340,13 @@ BOOL pe_va_query_range(ULONGLONG address, ULONGLONG *base,
     if (size) *size = found_size;
     if (next_base) *next_base = next;
     return found_size ? TRUE : FALSE;
+}
+
+BOOL pe_va_query_range(ULONGLONG address, ULONGLONG *base,
+                       ULONGLONG *size, ULONGLONG *next_base)
+{
+    return pe_va_query_range_for_owner(pe_va_owner(), address, base, size,
+                                        next_base);
 }
 
 BOOL pe_va_range_contains(ULONGLONG base, ULONGLONG size)
@@ -690,9 +713,10 @@ void pe_log_hex(const char *prefix, ULONGLONG val)
  * then loaded PE modules, then falls back to searching all shims.
  */
 PVOID pe_resolve_import(const char *dll_name, const char *func_name,
-                        USHORT ordinal, BOOL by_ordinal)
+                        USHORT ordinal, BOOL by_ordinal, NTSTATUS *status)
 {
-    return dll_resolve_import(dll_name, func_name, ordinal, by_ordinal);
+    return dll_resolve_import_status(dll_name, func_name, ordinal,
+                                     by_ordinal, status);
 }
 
 /* ── PEB/TEB setup ──────────────────────────────────────────── */
@@ -1016,8 +1040,22 @@ static WIN32_COMPAT_PROCESS_BLOCK *g_main_compat_environment32;
 static WIN64_PROCESS_BLOCK *g_main_environment64;
 
 typedef struct {
+    volatile int requester_kernel_pid;
+    volatile BOOL primary_parked;
+    volatile BOOL primary_frame_pending;
+    NTSTATUS status;
+} WIN32_ORDERLY_EXIT;
+static volatile unsigned g_orderly_primary_requests;
+
+typedef struct {
     BOOL used;
     BOOL exit_ready;
+    volatile BOOL teardown_started;
+    volatile BOOL creation_ready;
+    volatile BOOL creation_ack;
+    volatile BOOL primary_suspended;
+    NTSTATUS creation_status;
+    int creator_kernel_pid;
     int kernel_pid;
     ULONG process_id;
     ULONG parent_process_id;
@@ -1032,11 +1070,13 @@ typedef struct {
     NTSTATUS exit_status;
     volatile BOOL exit_requested;
     int exit_requester_kernel_pid;
+    WIN32_ORDERLY_EXIT orderly_exit;
     char image_path[260];
     char exe_name[64];
     char command_line[WIN32_CHILD_COMMAND_LINE_CAP];
     WCHAR command_line_w[WIN32_CHILD_COMMAND_LINE_CAP];
     char current_directory[WIN32_CHILD_CURRENT_DIRECTORY_CAP];
+    char current_directory_physical[WIN32_CHILD_CURRENT_DIRECTORY_CAP];
     RTL_USER_PROCESS_PARAMETERS process_parameters;
     WCHAR image_path_w[WIN32_PROCESS_IMAGE_PATH_CAP];
     WCHAR current_directory_w[WIN32_PROCESS_IMAGE_PATH_CAP];
@@ -1085,9 +1125,12 @@ static TEB *win64_main_teb(void)
 typedef struct {
     volatile BOOL active;
     volatile BOOL exit_requested;
+    volatile BOOL force_console_exit;
+    uint32_t control_generation;
     int owner_kernel_pid;
     int exit_requester_kernel_pid;
     NTSTATUS exit_status;
+    WIN32_ORDERLY_EXIT orderly_exit;
     uint64_t exit_jmpbuf[9];
 } WIN32_MAIN_CONTEXT;
 
@@ -1098,7 +1141,6 @@ static WIN32_CHILD_CONTEXT *win32_current_child(void)
 #ifndef TEST_HARNESS
     extern DWORD win32_current_thread_process_id(void);
     extern int32_t proc_current_pid(void);
-    extern uint64_t proc_get_gs_base(void);
     int pid = proc_current_pid();
 
     /* A child process's primary scheduler task is not represented in the
@@ -1118,21 +1160,8 @@ static WIN32_CHILD_CONTEXT *win32_current_child(void)
         g_win32_main.owner_kernel_pid == pid)
         return NULL;
 
-    /* Worker TEBs identify their owning child without touching the sparse,
-     * dynamically sized thread-context array. */
-    TEB *teb = (TEB *)(ULONG_PTR)proc_get_gs_base();
-    PPEB process_peb = teb ? teb->ProcessEnvironmentBlock : NULL;
-    if (process_peb) {
-        for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
-            WIN32_CHILD_CONTEXT *child = &g_win32_children[i];
-            if (__atomic_load_n(&child->used, __ATOMIC_ACQUIRE) &&
-                (process_peb == win32_child_peb(child) ||
-                 process_peb == &child->peb))
-                return child;
-        }
-    }
-
-    /* Fall back for early worker startup, before its TEB is authoritative. */
+    /* PEB virtual addresses repeat in private address spaces. Use the
+     * immutable scheduler-thread owner, including before its TEB is ready. */
     DWORD thread_owner_pid = win32_current_thread_process_id();
     if (thread_owner_pid) {
         for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
@@ -1815,10 +1844,27 @@ void win32_update_loader_image_reference(ULONG process_id, PVOID image_base,
     }
 }
 
+/* Keep the original UTF-16 command separate from its legacy byte view. This
+ * copy may target its own source during a process-parameter refresh. */
+static BOOL win32_copy_command_line_w(const char *narrow, PCWSTR wide,
+                                       WCHAR *destination, SIZE_T capacity)
+{
+    if (!wide) return win32_copy_ascii_w(narrow, destination, capacity);
+    if (!destination || !capacity) return FALSE;
+    SIZE_T i = 0;
+    while (i + 1 < capacity && wide[i]) {
+        destination[i] = wide[i];
+        i++;
+    }
+    BOOL complete = wide[i] == 0;
+    destination[i] = 0;
+    return complete;
+}
+
 static BOOL win32_populate_compat_process_block_data(
     WIN32_COMPAT_PROCESS_BLOCK *block, DWORD process_id,
     const char *image_path, const char *exe_name, const char *command_line,
-    const char *current_directory, BOOL reset)
+    const char *current_directory, BOOL reset, PCWSTR wide_command)
 {
     if (!block) return FALSE;
 
@@ -1832,8 +1878,9 @@ static BOOL win32_populate_compat_process_block_data(
                           sizeof(block->current_directory)) ||
         !win32_build_image_path_w(image_path, block->image_path_w,
                                   WIN32_PROCESS_IMAGE_PATH_CAP) ||
-        !win32_copy_ascii_w(command_line, block->command_line_w,
-                            WIN32_CHILD_COMMAND_LINE_CAP) ||
+        !win32_copy_command_line_w(command_line, wide_command,
+                                    block->command_line_w,
+                                    WIN32_CHILD_COMMAND_LINE_CAP) ||
         !win32_build_current_directory_w(
             current_directory, block->current_directory_w,
             WIN32_PROCESS_IMAGE_PATH_CAP) ||
@@ -1898,7 +1945,7 @@ static BOOL win32_populate_compat_process_block(WIN32_CHILD_CONTEXT *child,
     return win32_populate_compat_process_block_data(
         child->compat_environment32, child->process_id,
         child->image_path, child->exe_name, child->command_line,
-        child->current_directory, reset);
+        child->current_directory, reset, child->command_line_w);
 }
 
 static BOOL win32_populate_process_parameters(
@@ -1910,11 +1957,12 @@ static BOOL win32_populate_process_parameters(
     WCHAR *desktop_info_w, SIZE_T desktop_capacity,
     WCHAR *environment_w, SIZE_T environment_capacity,
     DWORD process_id, const char *image_path, const char *command_line,
-    const char *current_directory, BOOL reset)
+    const char *current_directory, BOOL reset, PCWSTR wide_command)
 {
     if (reset) memset(parameters, 0, sizeof(*parameters));
     if (!win32_build_image_path_w(image_path, image_path_w, image_capacity) ||
-        !win32_copy_ascii_w(command_line, command_line_w, command_capacity) ||
+        !win32_copy_command_line_w(command_line, wide_command,
+                                    command_line_w, command_capacity) ||
         !win32_build_current_directory_w(current_directory,
                                           current_directory_w,
                                           current_directory_capacity) ||
@@ -2054,7 +2102,7 @@ BOOL win32_refresh_current_process_parameters(void)
                 desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
                 environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
                 child->process_id, child->image_path, child->command_line,
-                child->current_directory, FALSE))
+                child->current_directory, FALSE, child->command_line_w))
             return FALSE;
         if (child->compat_environment32 &&
             !win32_populate_compat_process_block(child, FALSE))
@@ -2090,13 +2138,13 @@ BOOL win32_refresh_current_process_parameters(void)
             desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
             environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
             1, win32_image_path, win32_command_line,
-            kernel32_current_directory_relative(), FALSE))
+            kernel32_current_directory_relative(), FALSE, NULL))
         return FALSE;
     if (g_main_compat_environment32 &&
         !win32_populate_compat_process_block_data(
             g_main_compat_environment32, 1, win32_image_path,
             win32_exe_name, win32_command_line,
-            kernel32_current_directory_relative(), FALSE))
+            kernel32_current_directory_relative(), FALSE, NULL))
         return FALSE;
     return nt_process_set_peb(NULL, peb);
 }
@@ -2220,13 +2268,19 @@ const char *win32_current_directory_override(void)
     /* The child context is authoritative.  The low-memory PE32 block is a
      * process-parameter snapshot and is refreshed after a CWD change. */
     const char *directory = child->current_directory;
-    return directory[0] ? directory : NULL;
+    return directory;
 }
 
-BOOL win32_set_current_directory_override(const char *path)
+const char *win32_current_directory_backing_override(void)
 {
     WIN32_CHILD_CONTEXT *child = win32_current_child();
-    if (!child || !path) return FALSE;
+    return child ? child->current_directory_physical : NULL;
+}
+
+BOOL win32_set_current_directory_override(const char *path, const char *backing)
+{
+    WIN32_CHILD_CONTEXT *child = win32_current_child();
+    if (!child || !path || !backing) return FALSE;
 
     SIZE_T i = 0;
     while (path[i] && i < WIN32_CHILD_CURRENT_DIRECTORY_CAP - 1) {
@@ -2235,6 +2289,12 @@ BOOL win32_set_current_directory_override(const char *path)
     }
     if (path[i]) return FALSE;
     child->current_directory[i] = 0;
+    i = 0;
+    while (backing[i] && i < WIN32_CHILD_CURRENT_DIRECTORY_CAP - 1) {
+        child->current_directory_physical[i] = backing[i];
+        i++;
+    }
+    child->current_directory_physical[i] = 0;
     return TRUE;
 }
 
@@ -2269,17 +2329,42 @@ DWORD win32_current_process_id(void)
     return child ? child->process_id : 1;
 }
 
+/* Namespace 1 is also the default for unrelated kernel services. Exception
+ * ownership must use the scheduler task, not that default namespace alone. */
+BOOL win32_execution_owned(void)
+{
+#ifndef TEST_HARNESS
+    extern DWORD win32_current_thread_process_id(void);
+    WIN32_CHILD_CONTEXT *child = win32_current_child();
+    if (child && child->exit_ready) return TRUE;
+    return __atomic_load_n(&g_win32_main.active, __ATOMIC_ACQUIRE) &&
+           (g_win32_main.owner_kernel_pid == proc_current_pid() ||
+            win32_current_thread_process_id() == 1);
+#else
+    return FALSE;
+#endif
+}
+
+uint32_t win32_process_peb32_address(DWORD process_id)
+{
+    /* Return an address in the target CR3, never dereference a foreign PEB. */
+    if (process_id == 1 &&
+        __atomic_load_n(&g_win32_main.active, __ATOMIC_ACQUIRE))
+        return g_main_compat_environment32
+            ? (uint32_t)(ULONG_PTR)&g_main_compat_environment32->peb : 0;
+    for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
+        WIN32_CHILD_CONTEXT *child = &g_win32_children[i];
+        if (__atomic_load_n(&child->used, __ATOMIC_ACQUIRE) &&
+            child->process_id == process_id)
+            return (uint32_t)(ULONG_PTR)child->peb32;
+    }
+    return 0;
+}
+
 BOOL win32_process_cr3(DWORD process_id, uint64_t *out_cr3)
 {
     extern uint64_t proc_get_cr3_pid(int pid);
     if (!process_id || !out_cr3) return FALSE;
-
-    if (process_id == win32_current_process_id()) {
-        uint64_t cr3 = proc_current_cr3();
-        if (!cr3) cr3 = paging_get_kernel_cr3();
-        *out_cr3 = cr3;
-        return TRUE;
-    }
 
     int kernel_pid = -1;
     if (process_id == 1 &&
@@ -2295,7 +2380,16 @@ BOOL win32_process_cr3(DWORD process_id, uint64_t *out_cr3)
             }
         }
     }
-    if (kernel_pid <= 0) return FALSE;
+    if (kernel_pid <= 0) {
+        /* Native in-kernel contract tests also use namespace 1. A network
+         * worker's default Win32 PID must never override an active PE owner. */
+        if (process_id != 1 || win32_current_process_id() != 1 ||
+            __atomic_load_n(&g_win32_main.active, __ATOMIC_ACQUIRE))
+            return FALSE;
+        uint64_t cr3 = proc_current_cr3();
+        *out_cr3 = cr3 ? cr3 : paging_get_kernel_cr3();
+        return TRUE;
+    }
 
     uint64_t cr3 = proc_get_cr3_pid(kernel_pid);
     if (!cr3) return FALSE;
@@ -2309,10 +2403,116 @@ DWORD win32_current_process_thread_id(void)
     return child ? child->thread_id : 1;
 }
 
-BOOL win32_main_termination_pending(void)
+static void __attribute__((noreturn)) win32_deliver_child_exit(void);
+
+static WIN32_ORDERLY_EXIT *win32_current_orderly_exit(void)
+{
+    WIN32_CHILD_CONTEXT *child = win32_current_child();
+    if (child) return &child->orderly_exit;
+    return win32_execution_owned() ? &g_win32_main.orderly_exit : NULL;
+}
+
+BOOL win32_process_creation_closed(void)
+{
+    WIN32_ORDERLY_EXIT *state = win32_current_orderly_exit();
+    return state && __atomic_load_n(&state->requester_kernel_pid,
+                                     __ATOMIC_ACQUIRE) != 0;
+}
+
+/* Only the primary scheduler continuation is retained. Guest execution has
+ * stopped, and its NT thread object is signaled before DLL shutdown begins.
+ * The requester keeps its own TEB/TLS and runs every guest callback itself. */
+static BOOL win32_orderly_primary_pending(void)
+{
+    /* Timer IRQs ordinarily need only this atomic load, not a child-table
+     * walk. Requests are counted until the primary acknowledges its park. */
+    if (!__atomic_load_n(&g_orderly_primary_requests, __ATOMIC_ACQUIRE))
+        return FALSE;
+    WIN32_CHILD_CONTEXT *child = win32_current_child();
+    int primary = child ? child->kernel_pid : g_win32_main.owner_kernel_pid;
+    if (proc_current_pid() != primary) return FALSE;
+    WIN32_ORDERLY_EXIT *state = child ? &child->orderly_exit
+                                     : &g_win32_main.orderly_exit;
+    int requester = __atomic_load_n(&state->requester_kernel_pid,
+                                    __ATOMIC_ACQUIRE);
+    return requester > 0 && requester != primary &&
+           __atomic_load_n(&state->primary_frame_pending, __ATOMIC_ACQUIRE);
+}
+
+static void win32_orderly_park_primary(void)
+{
+    if (!win32_orderly_primary_pending()) return;
+    WIN32_CHILD_CONTEXT *child = win32_current_child();
+    WIN32_ORDERLY_EXIT *state = child ? &child->orderly_exit
+                                     : &g_win32_main.orderly_exit;
+    volatile BOOL *requested = child ? &child->exit_requested
+                                     : &g_win32_main.exit_requested;
+    extern PVOID win32_current_primary_thread_object(void);
+    extern void nt_thread_park_primary(PVOID, NTSTATUS);
+    extern int sched_sleep_ticks(uint64_t);
+    nt_thread_park_primary(win32_current_primary_thread_object(), state->status);
+    if (__atomic_exchange_n(&state->primary_frame_pending, FALSE,
+                            __ATOMIC_ACQ_REL))
+        __atomic_sub_fetch(&g_orderly_primary_requests, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&state->primary_parked, TRUE, __ATOMIC_RELEASE);
+    while (__atomic_load_n(requested, __ATOMIC_ACQUIRE) != TRUE) {
+        int requester = __atomic_load_n(&state->requester_kernel_pid,
+                                        __ATOMIC_ACQUIRE);
+        void *task = proc_find_ptr((uint16_t)requester);
+        if (!task || proc_state_of(task) == PE_VA_PROC_ZOMBIE) {
+            /* A callback fault can kill its owner before final exit delivery.
+             * Complete forced cleanup, never resume this primary's guest code. */
+            if (child) child->exit_status = STATUS_UNSUCCESSFUL;
+            else g_win32_main.exit_status = STATUS_UNSUCCESSFUL;
+            __atomic_store_n(requested, TRUE, __ATOMIC_RELEASE);
+            break;
+        }
+        (void)sched_sleep_ticks(1);
+    }
+}
+
+void win32_orderly_process_exit(DWORD exit_code)
+{
+    WIN32_ORDERLY_EXIT *state = win32_current_orderly_exit();
+    if (!state) return;
+    int requester = proc_current_pid();
+    /* A recursive ExitProcess terminates immediately. The caller's final NT
+     * termination still delivers the requested status to the primary owner. */
+    if (__atomic_load_n(&state->requester_kernel_pid, __ATOMIC_ACQUIRE) == requester)
+        return;
+    dll_loader_lock_enter();
+    state->status = (NTSTATUS)exit_code;
+    __atomic_store_n(&state->requester_kernel_pid, requester, __ATOMIC_RELEASE);
+    WIN32_CHILD_CONTEXT *child = win32_current_child();
+    int primary = child ? child->kernel_pid : g_win32_main.owner_kernel_pid;
+    extern int proc_wake_pid(int);
+    extern int sched_sleep_ticks(uint64_t);
+    extern int win32_terminate_process_peers(DWORD, DWORD, int);
+    if (primary != requester) {
+        __atomic_store_n(&state->primary_frame_pending, TRUE, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&g_orderly_primary_requests, 1, __ATOMIC_RELEASE);
+        (void)proc_wake_pid(primary);
+        while (!__atomic_load_n(&state->primary_parked, __ATOMIC_ACQUIRE))
+            (void)sched_sleep_ticks(1);
+    }
+    (void)win32_terminate_process_peers(win32_current_process_id(), exit_code,
+                                       requester);
+    dll_shutdown_process();
+    dll_loader_lock_leave();
+}
+
+BOOL win32_termination_requested(void)
 {
 #ifndef TEST_HARNESS
     extern int32_t proc_current_pid(void);
+    if (kernel32_thread_termination_pending())
+        return TRUE;
+    if (win32_orderly_primary_pending()) return TRUE;
+    WIN32_CHILD_CONTEXT *child = win32_current_child();
+    if (child && child->kernel_pid == proc_current_pid())
+        return child->exit_ready &&
+               __atomic_load_n(&child->exit_requested,
+                               __ATOMIC_ACQUIRE) == TRUE;
     if (proc_current_pid() != g_win32_main.owner_kernel_pid)
         return FALSE;
 #endif
@@ -2321,15 +2521,26 @@ BOOL win32_main_termination_pending(void)
                            __ATOMIC_ACQUIRE) == TRUE;
 }
 
-void win32_main_termination_checkpoint(void)
+BOOL win32_main_termination_pending(void)
 {
-    if (!win32_main_termination_pending()) return;
+#ifndef TEST_HARNESS
+    /* A nested Win32 call must not unwind a host lock or an install journal. */
+    if (kernel32_heap_lock_owned_by_current() ||
+        dll_loader_lock_owned_by_current_thread() || msi_install_deferred_current() ||
+        d3dkmt_deferred_current())
+        return FALSE;
+#endif
+    return win32_termination_requested();
+}
 
 #ifndef TEST_HARNESS
+static void __attribute__((noreturn)) win32_deliver_main_exit(void)
+{
     extern int32_t proc_current_pid(void);
     extern void kern_longjmp(uint64_t *buf, int val);
     extern void sched_reset_current_compat_ist1(void);
     NTSTATUS status = g_win32_main.exit_status;
+    __atomic_store_n(&g_win32_main.force_console_exit, FALSE, __ATOMIC_RELEASE);
     __atomic_store_n(&g_win32_main.exit_requested, FALSE, __ATOMIC_RELEASE);
     serial_puts("[WINEXEC-EXIT] delivered to main kpid=");
     serial_putdec((uint64_t)(uint32_t)proc_current_pid());
@@ -2342,6 +2553,107 @@ void win32_main_termination_checkpoint(void)
     sched_reset_current_compat_ist1();
     kern_longjmp(g_win32_main.exit_jmpbuf, 2);
     __builtin_unreachable();
+}
+#endif
+
+void win32_main_termination_checkpoint(void)
+{
+    if (!win32_main_termination_pending()) return;
+
+#ifndef TEST_HARNESS
+    extern int32_t proc_current_pid(void);
+    extern void sched_reset_current_compat_ist1(void);
+    kernel32_thread_termination_checkpoint();
+    win32_orderly_park_primary();
+    WIN32_CHILD_CONTEXT *child = win32_current_child();
+    if (child && child->kernel_pid == proc_current_pid()) {
+        sched_reset_current_compat_ist1();
+        win32_deliver_child_exit();
+    }
+    win32_deliver_main_exit();
+#endif
+}
+
+/* Maintenance requests must return to SSH, not terminate the requesting task.
+ * The console mailbox pins the launch ID until this owner returns. Delivery
+ * uses the existing main-thread checkpoints outside host critical sections. */
+int win32_request_console_exit(int owner_kernel_pid, uint32_t status)
+{
+    if (owner_kernel_pid <= 0 ||
+        !__atomic_load_n(&g_win32_main.active, __ATOMIC_ACQUIRE) ||
+        g_win32_main.owner_kernel_pid != owner_kernel_pid)
+        return -1;
+#ifndef TEST_HARNESS
+    extern int32_t proc_current_pid(void);
+    extern int proc_wake_pid(int pid);
+    BOOL expected = FALSE;
+    if (!__atomic_compare_exchange_n(&g_win32_main.exit_requested, &expected,
+                                     (BOOL)2, FALSE, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE))
+        return expected == TRUE ? 1 : -1;
+    g_win32_main.exit_status = (NTSTATUS)status;
+    g_win32_main.exit_requester_kernel_pid = proc_current_pid();
+    __atomic_store_n(&g_win32_main.exit_requested, TRUE, __ATOMIC_RELEASE);
+    if (proc_wake_pid(owner_kernel_pid) != 0) {
+        __atomic_store_n(&g_win32_main.exit_requested, FALSE, __ATOMIC_RELEASE);
+        return -1;
+    }
+    return 0;
+#else
+    (void)status;
+    return -1;
+#endif
+}
+
+static bool win32_terminal_request(uint32_t generation, int signal)
+{
+    if (signal != 9 && signal != 15) return false;
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    bool accepted = false;
+    if (generation && generation == g_win32_main.control_generation &&
+        __atomic_load_n(&g_win32_main.active, __ATOMIC_ACQUIRE)) {
+        accepted = win32_request_console_exit(g_win32_main.owner_kernel_pid,
+                                               (uint32_t)(128 + signal)) >= 0;
+        if (accepted && signal == 9) {
+            g_win32_main.exit_status = 137;
+            __atomic_store_n(&g_win32_main.force_console_exit, TRUE, __ATOMIC_RELEASE);
+        }
+    }
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+    return accepted;
+}
+
+/* Called on the interrupted owner's timer frame. Force only guest execution:
+ * an interrupted shim must first unwind its kernel critical sections. Switch
+ * back to the owner's saved host stack and 64-bit selector before cleanup,
+ * including when the stopped program is PE32. The trampoline never returns. */
+void win32_force_console_frame(x86_interrupt_frame_t *frame)
+{
+#ifndef TEST_HARNESS
+    extern BOOL kernel32_cancel_guest_frame(x86_interrupt_frame_t *);
+    if (kernel32_cancel_guest_frame(frame)) return;
+    BOOL orderly = win32_orderly_primary_pending();
+    if (!orderly && (!__atomic_load_n(&g_win32_main.force_console_exit, __ATOMIC_ACQUIRE) ||
+        proc_current_pid() != g_win32_main.owner_kernel_pid ||
+        !win32_main_termination_pending())) return;
+    if (orderly && !win32_main_termination_pending()) return;
+    uint16_t cs = (uint16_t)frame->cs;
+    if (cs != 0x38 && cs != 0x40 && cs != 0x23) return;
+    if (!win32_user_range_executable((const void *)(ULONG_PTR)frame->rip, 1,
+                                     cs != 0x38)) return;
+    WIN32_CHILD_CONTEXT *child = orderly ? win32_current_child() : NULL;
+    uint64_t *jump = child ? child->exit_jmpbuf : g_win32_main.exit_jmpbuf;
+    uint64_t stack = (jump[6] & ~15ULL) - 8;
+    if (stack < 0x100000 || !jump[7]) return;
+    frame->rip = (uint64_t)(ULONG_PTR)(orderly ? win32_main_termination_checkpoint
+                                               : win32_deliver_main_exit);
+    frame->rsp = stack;
+    frame->cs = 0x38;
+    frame->ss = 0x30;
+    frame->rflags = (frame->rflags & ~(0x100ULL | 0x400ULL)) | 0x200ULL;
+#else
+    (void)frame;
 #endif
 }
 
@@ -2362,8 +2674,9 @@ BOOL win32_terminate_current_main(NTSTATUS status)
         g_win32_main.exit_requester_kernel_pid = current_kernel_pid;
         __atomic_store_n(&g_win32_main.exit_requested, TRUE,
                          __ATOMIC_RELEASE);
-        win32_main_termination_checkpoint();
-        __builtin_unreachable();
+        /* An explicit ExitProcess is nonreturning, unlike a checkpoint that
+         * may defer another task's cancellation until host locks unwind. */
+        win32_deliver_main_exit();
     }
 
     BOOL expected = FALSE;
@@ -2407,8 +2720,16 @@ HANDLE win32_current_process_thread_handle(void)
 PVOID win32_current_primary_thread_object(void)
 {
     WIN32_CHILD_CONTEXT *child = win32_current_child();
-    if (!child)
+    if (!child) {
+#ifndef TEST_HARNESS
+        extern int32_t proc_current_pid(void);
+        extern PVOID nt_process_primary_thread_object(ULONG tid);
+        if (__atomic_load_n(&g_win32_main.active, __ATOMIC_ACQUIRE) &&
+            g_win32_main.owner_kernel_pid == proc_current_pid())
+            return nt_process_primary_thread_object(win32_current_process_thread_id());
+#endif
         return NULL;
+    }
 #ifndef TEST_HARNESS
     extern int32_t proc_current_pid(void);
     if (child->kernel_pid != proc_current_pid())
@@ -2433,6 +2754,7 @@ BOOL win32_resume_primary_thread_execution(PVOID thread_object)
             return FALSE;
 
         extern int proc_wake_pid(int pid);
+        __atomic_store_n(&child->primary_suspended, FALSE, __ATOMIC_RELEASE);
         if (proc_wake_pid(kernel_pid) < 0)
             return FALSE;
 
@@ -2504,7 +2826,7 @@ static BOOL setup_main_compat_environment32(void)
     if (!win32_populate_compat_process_block_data(
             block, 1, win32_image_path, win32_exe_name,
             win32_command_line, kernel32_current_directory_relative(),
-            TRUE)) {
+            TRUE, NULL)) {
         (void)nt_vm_release_allocation_for_process(1, allocation);
         return FALSE;
     }
@@ -2594,7 +2916,7 @@ static BOOL setup_environment(PVOID image_base, BOOL initialize_loader64)
             desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
             environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
             1, win32_image_path, win32_command_line,
-            kernel32_current_directory_relative(), TRUE))
+            kernel32_current_directory_relative(), TRUE, NULL))
         goto fail;
     win32_initialize_peb(peb, parameters, image_base, process_heaps,
                          g_exe_subsystem, g_exe_subsystem_major_version,
@@ -2761,39 +3083,27 @@ extern uint64_t  osfs2_file_size(void *file);
 
 static void win32_child_run(WIN32_CHILD_CONTEXT *child);
 
+#define WIN32_CHILD_SLOTS(M) \
+    M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7) \
+    M(8) M(9) M(10) M(11) M(12) M(13) M(14) M(15) \
+    M(16) M(17) M(18) M(19) M(20) M(21) M(22) M(23) \
+    M(24) M(25) M(26) M(27) M(28) M(29) M(30) M(31)
 #define WIN32_CHILD_ENTRY(n) \
     static void win32_child_entry_##n(void) \
     { \
         win32_child_run(&g_win32_children[n]); \
     }
-WIN32_CHILD_ENTRY(0)
-WIN32_CHILD_ENTRY(1)
-WIN32_CHILD_ENTRY(2)
-WIN32_CHILD_ENTRY(3)
-WIN32_CHILD_ENTRY(4)
-WIN32_CHILD_ENTRY(5)
-WIN32_CHILD_ENTRY(6)
-WIN32_CHILD_ENTRY(7)
-WIN32_CHILD_ENTRY(8)
-WIN32_CHILD_ENTRY(9)
-WIN32_CHILD_ENTRY(10)
-WIN32_CHILD_ENTRY(11)
-WIN32_CHILD_ENTRY(12)
-WIN32_CHILD_ENTRY(13)
-WIN32_CHILD_ENTRY(14)
-WIN32_CHILD_ENTRY(15)
+WIN32_CHILD_SLOTS(WIN32_CHILD_ENTRY)
 #undef WIN32_CHILD_ENTRY
 
-static void (*const win32_child_entries[MAX_WIN32_CHILDREN])(void) = {
-    win32_child_entry_0, win32_child_entry_1,
-    win32_child_entry_2, win32_child_entry_3,
-    win32_child_entry_4, win32_child_entry_5,
-    win32_child_entry_6, win32_child_entry_7,
-    win32_child_entry_8, win32_child_entry_9,
-    win32_child_entry_10, win32_child_entry_11,
-    win32_child_entry_12, win32_child_entry_13,
-    win32_child_entry_14, win32_child_entry_15,
+#define WIN32_CHILD_ENTRY(n) win32_child_entry_##n,
+static void (*const win32_child_entries[])(void) = {
+    WIN32_CHILD_SLOTS(WIN32_CHILD_ENTRY)
 };
+#undef WIN32_CHILD_ENTRY
+#undef WIN32_CHILD_SLOTS
+_Static_assert(sizeof(win32_child_entries) / sizeof(win32_child_entries[0]) ==
+               MAX_WIN32_CHILDREN, "every child context needs an entry point");
 
 static void child_copy_string(char *dst, SIZE_T capacity, const char *src)
 {
@@ -3012,7 +3322,7 @@ static NTSTATUS setup_child_environment(WIN32_CHILD_CONTEXT *child,
             desktop_info_w, WIN32_PROCESS_DESKTOP_CAP,
             environment_w, WIN32_PROCESS_ENVIRONMENT_CAP,
             child->process_id, child->image_path, child->command_line,
-            child->current_directory, TRUE)) {
+            child->current_directory, TRUE, child->command_line_w)) {
         if (tls_phys) mem_free_pages(tls_phys, 4);
         child_free_compat_environment32(child);
         child->tls_vector = NULL;
@@ -3146,6 +3456,21 @@ static void win64_call_child_entry(PVOID entry, PVOID stack_top,
 #endif
 }
 
+static void win32_child_creation_wait(void)
+{
+    extern int sched_sleep_ticks(uint64_t ticks);
+    if (sched_sleep_ticks(1) < 0) sched_yield();
+}
+
+static BOOL win32_child_creation_acknowledged(WIN32_CHILD_CONTEXT *child)
+{
+    if (__atomic_load_n(&child->creation_ack, __ATOMIC_ACQUIRE)) return TRUE;
+    void *creator = proc_find_ptr((uint16_t)child->creator_kernel_pid);
+    if (creator && proc_state_of(creator) != PE_VA_PROC_ZOMBIE) return FALSE;
+    __atomic_store_n(&child->creation_ack, TRUE, __ATOMIC_RELEASE);
+    return TRUE;
+}
+
 static void win32_child_run(WIN32_CHILD_CONTEXT *child)
 {
     extern int32_t proc_current_pid(void);
@@ -3164,13 +3489,12 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
     void *file = osfs2_find_ci(child->image_path);
     uint64_t file_size = osfs2_file_size(file);
     uint64_t file_pages = (file_size + 4095) / 4096;
-    void *file_phys = file_pages ? mem_alloc_pages(file_pages) : NULL;
+    void *volatile file_phys = file_pages ? mem_alloc_pages(file_pages) : NULL;
     BYTE *file_data = file_phys ? (BYTE *)PHYS_TO_VIRT(file_phys) : NULL;
     PE_IMAGE_INFO info = {0};
     PVOID stack_allocation = NULL;
     PVOID stack_limit = NULL;
     PVOID stack_base = NULL;
-    BOOL image_loaded = FALSE;
     BOOL compat32 = FALSE;
 
     if (!file || !file_size) {
@@ -3216,6 +3540,14 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
     }
     g_compat32_mode = compat32 ? 1 : 0;
 
+    /* The child reopens its lexical CWD with its own architecture/default
+     * redirector, rather than inheriting the parent's disabled/native handle. */
+    if (!win32_redirect_path(child->current_directory_physical) ||
+        !win32_directory_exists_normalized(child->current_directory_physical)) {
+        child->exit_status = STATUS_OBJECT_PATH_NOT_FOUND;
+        goto done;
+    }
+
     child->exit_status = setup_child_environment(child, NULL, NULL, NULL,
                                                   compat32);
     if (!NT_SUCCESS(child->exit_status)) goto done;
@@ -3223,14 +3555,12 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
     int load_jump = kern_setjmp(child->exit_jmpbuf);
     if (load_jump == 0) {
         child->exit_ready = TRUE;
-        child->exit_status = pe_load_named(file_data, file_size, &info,
-                                           child->image_path);
+        child->exit_status = pe_map_named(file_data, file_size, &info,
+                                          child->image_path);
     } else if (load_jump != 2) {
         child->exit_status = STATUS_UNSUCCESSFUL;
     }
-    child->exit_ready = FALSE;
     if (load_jump != 0 || !NT_SUCCESS(child->exit_status)) goto done;
-    image_loaded = TRUE;
     if (info.Is32Bit != compat32) {
         child->exit_status = STATUS_INVALID_IMAGE_FORMAT;
         goto done;
@@ -3259,15 +3589,8 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
             info.MajorSubsystemVersion;
         child->peb32->ImageSubsystemMinorVersion =
             info.MinorSubsystemVersion;
-        child->exit_status = compat32_patch_iat(&info);
-        if (NT_SUCCESS(child->exit_status))
-            child->exit_status = pe_finalize_image_protections(&info);
-        if (NT_SUCCESS(child->exit_status))
-            child->exit_status = compat32_attach_tls(&info);
-        compat32_setup_teb(child->teb32);
-    } else {
-        child->exit_status = pe_finalize_image_protections(&info);
     }
+    child->exit_status = pe_finalize_image_protections(&info);
     if (!NT_SUCCESS(child->exit_status)) {
         serial_puts("[WINEXEC-CHILD] final protection setup failed: 0x");
         serial_puthex((uint32_t)child->exit_status, 8);
@@ -3310,6 +3633,32 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
         compat32_setup_teb(child->teb32);
     }
 
+    child->exit_status = dll_prepare_process();
+    if (!NT_SUCCESS(child->exit_status)) goto done;
+
+    /* Kernel preparation may run while the initial guest thread is suspended.
+     * No imported DLL entry, TLS callback or EXE entry runs before this gate.
+     * Pin the context until the creator has copied all return values. */
+    if (file_phys) {
+        mem_free_pages(file_phys, file_pages);
+        file_phys = NULL;
+    }
+    child->creation_status = STATUS_SUCCESS;
+    __atomic_store_n(&child->creation_ready, TRUE, __ATOMIC_RELEASE);
+    while (!win32_child_creation_acknowledged(child) ||
+           __atomic_load_n(&child->primary_suspended, __ATOMIC_ACQUIRE)) {
+        win32_main_termination_checkpoint();
+        win32_child_creation_wait();
+    }
+    win32_main_termination_checkpoint();
+    child->exit_status = pe_bind_mapped_image(&info, child->image_path);
+    if (NT_SUCCESS(child->exit_status) && compat32)
+        child->exit_status = compat32_patch_iat(&info);
+    if (NT_SUCCESS(child->exit_status) && compat32)
+        child->exit_status = compat32_attach_tls(&info);
+    if (!NT_SUCCESS(child->exit_status)) goto done;
+    child->exit_ready = FALSE;
+
     int jump_reason = kern_setjmp(child->exit_jmpbuf);
     if (jump_reason == 0) {
         child->exit_ready = TRUE;
@@ -3322,12 +3671,11 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
         if (!compat32 && NT_SUCCESS(child->exit_status)) {
             win64_call_child_entry(info.EntryPoint, stack_top, child_peb,
                                    info.Subsystem == IMAGE_SUBSYSTEM_NATIVE);
-            child->exit_status = STATUS_SUCCESS;
+            ExitProcess(0);
         }
     } else if (jump_reason != 2) {
         child->exit_status = STATUS_UNSUCCESSFUL;
     }
-    child->exit_ready = FALSE;
     if (compat32) {
         __asm__ volatile (
             "mov $0x30, %%ax\n"
@@ -3339,6 +3687,12 @@ static void win32_child_run(WIN32_CHILD_CONTEXT *child)
     }
 
 done:
+    /* An exit context stops accepting longjmp delivery during cleanup, but
+     * that does not make it an uninitialized child. Repeated termination
+     * must leave the current owner to release its VM and shared resources. */
+    __atomic_store_n(&child->teardown_started, TRUE, __ATOMIC_RELEASE);
+    child->exit_ready = FALSE;
+    nt_process_begin_vm_teardown(child->process_id);
     /* A PE exception reaches this frame through kern_longjmp(), bypassing
      * iretq and therefore preserving the trap gate's IF=0 state. Teardown
      * can wait on process-owned locks, so resume normal task interrupt state
@@ -3356,10 +3710,10 @@ done:
      * before releasing either resource; otherwise they resume in freed PE
      * code after the child main thread exits. */
     {
-        extern int win32_terminate_process_threads(PPEB owner,
+        extern int win32_terminate_process_threads(DWORD owner_pid,
                                                     DWORD exit_code);
         int stopped = win32_terminate_process_threads(
-            win32_child_peb(child), (DWORD)child->exit_status);
+            child->process_id, (DWORD)child->exit_status);
         if (stopped) {
             serial_puts("[WINEXEC-CHILD] stopped owned threads=");
             serial_putdec((uint64_t)stopped);
@@ -3371,6 +3725,11 @@ done:
 
     wsock_release_process(child->process_id);
     advapi32_crypto_release_process(child->process_id);
+    crypt32_release_process(child->process_id);
+    urlmon_release_process(child->process_id);
+    advpack_release_process(child->process_id);
+    setupapi_release_process(child->process_id);
+    mmio_process_cleanup(child->process_id);
     advapi32_service_release_process(child->process_id);
     advapi32_registry_flush();
 
@@ -3403,8 +3762,6 @@ done:
         win64_tls_release_process(win32_child_teb(child));
     }
     dll_release_process(child->process_id);
-    nt_process_complete_child(child->process_object, child->thread_object,
-                              child->exit_status);
     serial_puts("[WINEXEC-CHILD] exit pid=");
     serial_putdec(child->process_id);
     serial_puts(" status=0x");
@@ -3414,7 +3771,7 @@ done:
         mem_free_pages((void *)VIRT_TO_PHYS(child->tls_vector), 4);
         child->tls_vector = NULL;
     }
-    if (image_loaded)
+    if (info.ImageBase)
         pe_unload_for_owner(&info, child->process_id);
     if (file_phys) mem_free_pages(file_phys, file_pages);
     /* Keep the compat TEB mapped until every Win32-facing unload operation
@@ -3425,7 +3782,21 @@ done:
     child_free_compat_environment32(child);
     nt_vm_release_process(child->process_id);
     kernel32_release_process_environment(child->process_id);
+    if (!__atomic_load_n(&child->creation_ready, __ATOMIC_ACQUIRE)) {
+        child->creation_status = NT_SUCCESS(child->exit_status)
+            ? STATUS_CANCELLED : child->exit_status;
+        __atomic_store_n(&child->creation_ready, TRUE, __ATOMIC_RELEASE);
+    }
+    while (!win32_child_creation_acknowledged(child))
+        win32_child_creation_wait();
+    /* Publish completion only after teardown, before this context can be
+     * reused. Otherwise ResumeThread can match the preceding child's slot. */
+    uint64_t finish_flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(finish_flags) :: "memory");
+    nt_process_complete_child(child->process_object, child->thread_object,
+                              child->exit_status);
     __atomic_store_n(&child->used, FALSE, __ATOMIC_RELEASE);
+    if (finish_flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
 }
 
 static void __attribute__((noreturn)) win32_deliver_child_exit(void)
@@ -3479,12 +3850,11 @@ BOOL win32_terminate_current_child(NTSTATUS status)
     if (__atomic_compare_exchange_n(&child->exit_requested, &expected, TRUE,
                                     FALSE, __ATOMIC_ACQ_REL,
                                     __ATOMIC_ACQUIRE)) {
-        extern int proc_inject_noreturn_pid(int pid, void (*entry)(void));
+        extern int proc_wake_pid(int pid);
         child->exit_status = status;
         child->exit_requester_kernel_pid = current_kernel_pid;
         __atomic_thread_fence(__ATOMIC_RELEASE);
-        if (proc_inject_noreturn_pid(child->kernel_pid,
-                                    win32_deliver_child_exit) != 0) {
+        if (proc_wake_pid(child->kernel_pid) != 0) {
             __atomic_store_n(&child->exit_requested, FALSE,
                              __ATOMIC_RELEASE);
             serial_puts("[WINEXEC-EXIT] failed to schedule main kpid=");
@@ -3507,9 +3877,9 @@ BOOL win32_terminate_current_child(NTSTATUS status)
     if (irq_flags & (1ULL << 9))
         __asm__ volatile ("sti" ::: "memory");
 
-    /* ExitProcess never returns to the requesting worker. The scheduler will
-     * run the injected main-thread trampoline and perform process cleanup on
-     * the stack that owns the saved setjmp context. */
+    /* ExitProcess never returns to the requesting worker. The owning main
+     * thread consumes the request at a checkpoint after releasing host locks,
+     * retaining both its scheduler identity and its saved setjmp stack. */
     {
         extern void proc_exit(int32_t code);
         proc_exit((int32_t)status);
@@ -3519,25 +3889,44 @@ BOOL win32_terminate_current_child(NTSTATUS status)
 
 BOOL win32_terminate_child(HANDLE process_handle, NTSTATUS status)
 {
-    HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, process_handle);
-    if (!entry || entry->type != OBJ_TYPE_PROCESS) return FALSE;
+    extern BOOL nt_process_id(HANDLE, DWORD *);
+    extern BOOL win32_terminate_process_id(DWORD, NTSTATUS);
+    DWORD pid;
+    return nt_process_id(process_handle, &pid) && win32_terminate_process_id(pid, status);
+}
+
+BOOL win32_terminate_process_id(DWORD process_id, NTSTATUS status)
+{
+    if (process_id == 1)
+        return win32_request_console_exit(g_win32_main.owner_kernel_pid,
+                                           (uint32_t)status) >= 0;
 
     for (int i = 0; i < MAX_WIN32_CHILDREN; i++) {
         WIN32_CHILD_CONTEXT *child = &g_win32_children[i];
-        if (!child->used || child->process_object != entry->object) continue;
+        uint64_t irq_flags;
+        __asm__ volatile ("pushfq; popq %0; cli"
+                          : "=r"(irq_flags) :: "memory");
+        if (!child->used || child->process_id != process_id) {
+            if (irq_flags & (1ULL << 9))
+                __asm__ volatile ("sti" ::: "memory");
+            continue;
+        }
+        if (__atomic_load_n(&child->teardown_started, __ATOMIC_ACQUIRE)) {
+            if (irq_flags & (1ULL << 9))
+                __asm__ volatile ("sti" ::: "memory");
+            return TRUE;
+        }
 
-        /* Windows makes TerminateProcess asynchronous: stop execution in the
-         * target, run process teardown, then signal its process object.  Hand
-         * control to the target's main-thread exit context so win32_child_run
-         * can stop every worker before releasing DLLs, VMAs and the PEB. */
+        /* Wake the owner without replacing its interrupted instruction. A
+         * saved frame may be inside HeapAlloc or another host critical
+         * section; bypassing it would strand locks shared with other PEs.
+         * The owner's regular checkpoints consume the termination request. */
         if (child->kernel_pid > 0 && child->exit_ready) {
             extern int32_t proc_current_pid(void);
-            extern int proc_inject_noreturn_pid(int pid, void (*entry)(void));
-            uint64_t irq_flags;
+            extern int proc_wake_pid(int pid);
             BOOL requested = FALSE;
+            int kernel_pid = child->kernel_pid;
 
-            __asm__ volatile ("pushfq; popq %0; cli"
-                              : "=r"(irq_flags) :: "memory");
             if (__atomic_load_n(&child->exit_requested, __ATOMIC_ACQUIRE)) {
                 requested = TRUE;
             } else {
@@ -3545,8 +3934,7 @@ BOOL win32_terminate_child(HANDLE process_handle, NTSTATUS status)
                 child->exit_requester_kernel_pid = proc_current_pid();
                 __atomic_store_n(&child->exit_requested, TRUE,
                                  __ATOMIC_RELEASE);
-                if (proc_inject_noreturn_pid(child->kernel_pid,
-                                             win32_deliver_child_exit) == 0) {
+                if (proc_wake_pid(child->kernel_pid) == 0) {
                     requested = TRUE;
                 } else {
                     __atomic_store_n(&child->exit_requested, FALSE,
@@ -3558,24 +3946,26 @@ BOOL win32_terminate_child(HANDLE process_handle, NTSTATUS status)
 
             if (requested) {
                 serial_puts("[WINEXEC-TERM] queued pid=");
-                serial_putdec(child->process_id);
+                serial_putdec(process_id);
                 serial_puts(" kpid=");
-                serial_putdec((uint64_t)(uint32_t)child->kernel_pid);
+                serial_putdec((uint64_t)(uint32_t)kernel_pid);
                 serial_puts(" status=0x");
                 serial_puthex((uint32_t)status, 8);
                 serial_puts("\n");
                 return TRUE;
             }
+        } else if (irq_flags & (1ULL << 9)) {
+            __asm__ volatile ("sti" ::: "memory");
         }
 
         /* A target that has not published an exit context cannot run normal
          * teardown. Quiesce all workers before making the owning task a
          * zombie; this keeps the reaper from freeing a live address space. */
         {
-            extern int win32_terminate_process_threads(PPEB owner,
+            extern int win32_terminate_process_threads(DWORD owner_pid,
                                                         DWORD exit_code);
             int stopped = win32_terminate_process_threads(
-                win32_child_peb(child), (DWORD)status);
+                child->process_id, (DWORD)status);
             serial_puts("[WINEXEC-TERM] forced pid=");
             serial_putdec(child->process_id);
             serial_puts(" stopped_threads=");
@@ -3588,18 +3978,27 @@ BOOL win32_terminate_child(HANDLE process_handle, NTSTATUS status)
         extern int proc_kill_pid(int pid);
         child->exit_ready = FALSE;
         child->exit_status = status;
-        nt_process_complete_child(child->process_object, child->thread_object,
-                                  status);
         if (child->kernel_pid > 0) proc_kill_pid(child->kernel_pid);
+        kernel32_release_process_handles(child->process_id);
         if (child->kernel_pid > 0)
             opengl32_release_process((DWORD)child->kernel_pid);
         ddraw_release_process(child->process_id);
         wsock_release_process(child->process_id);
         ole32_release_process(child->process_id);
         advapi32_crypto_release_process(child->process_id);
+        crypt32_release_process(child->process_id);
+        urlmon_release_process(child->process_id);
+        advpack_release_process(child->process_id);
+        setupapi_release_process(child->process_id);
+        mmio_process_cleanup(child->process_id);
         advapi32_registry_flush();
         kernel32_release_process_environment(child->process_id);
+        uint64_t finish_flags;
+        __asm__ volatile ("pushfq; popq %0; cli" : "=r"(finish_flags) :: "memory");
+        nt_process_complete_child(child->process_object, child->thread_object,
+                                  status);
         __atomic_store_n(&child->used, FALSE, __ATOMIC_RELEASE);
+        if (finish_flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
         return TRUE;
     }
     return FALSE;
@@ -3612,15 +4011,16 @@ NTSTATUS win32_spawn_child(const char *image_path, const char *command_line,
                            DWORD *process_id, DWORD *thread_id,
                            const HANDLE *inherited_handles,
                            DWORD inherited_handle_count,
-                           DWORD creation_flags)
+                           DWORD creation_flags,
+                           BOOL inherit_all_handles,
+                           const K32_CONSOLE_STARTUP *console_startup,
+                           PCVOID primary_token, PCWSTR wide_command)
 {
-    extern int sched_spawn_in_address_space_blocked(
+    extern int sched_spawn_detached_in_address_space_blocked(
         const char *, void (*)(void), uint64_t, int);
     extern int proc_wake_pid(int pid);
     extern uint64_t paging_create_process_cr3(void);
     extern void paging_free_process_cr3(uint64_t);
-    extern NTSTATUS nt_process_create_child(PHANDLE, PHANDLE, ULONG *, ULONG *,
-                                             PVOID *, PVOID *, BOOL);
 
     BOOL create_suspended = (creation_flags & 0x4) != 0;
 
@@ -3650,12 +4050,23 @@ NTSTATUS win32_spawn_child(const char *image_path, const char *command_line,
         serial_puts("[WINEXEC-CHILD] child context table full\n");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    child->primary_suspended = create_suspended;
+    child->creator_kernel_pid = proc_current_pid();
 
     NTSTATUS status = nt_process_create_child(
         &child->process_handle, &child->thread_handle,
         &child->process_id, &child->thread_id,
-        &child->process_object, &child->thread_object, create_suspended);
+        &child->process_object, &child->thread_object, create_suspended, primary_token);
     if (!NT_SUCCESS(status)) goto fail;
+
+    status = nt_job_inherit(child->parent_process_id, child->process_id, creation_flags);
+    if (!NT_SUCCESS(status)) goto fail_child;
+
+    if (inherit_all_handles) {
+        status = handle_inherit_all_for_process(&g_handle_table,
+            child->parent_process_id, child->process_id);
+        if (!NT_SUCCESS(status)) goto fail_child;
+    }
 
     for (DWORD i = 0; i < inherited_handle_count; i++) {
         status = handle_retain_for_process(&g_handle_table,
@@ -3678,7 +4089,8 @@ NTSTATUS win32_spawn_child(const char *image_path, const char *command_line,
     }
 
     status = kernel32_inherit_process_console(
-        child->parent_process_id, child->process_id, creation_flags);
+        child->parent_process_id, child->process_id, creation_flags,
+        console_startup);
     if (!NT_SUCCESS(status))
         goto fail_child;
 
@@ -3701,20 +4113,24 @@ NTSTATUS win32_spawn_child(const char *image_path, const char *command_line,
     child_copy_string(child->exe_name, sizeof(child->exe_name), name);
     child_copy_string(child->command_line, sizeof(child->command_line),
                       command_line ? command_line : image_path);
-    for (SIZE_T i = 0; i < WIN32_CHILD_COMMAND_LINE_CAP; i++) {
-        child->command_line_w[i] = (WCHAR)(BYTE)child->command_line[i];
-        if (!child->command_line[i]) break;
+    if (!win32_copy_command_line_w(child->command_line, wide_command,
+                                    child->command_line_w,
+                                    WIN32_CHILD_COMMAND_LINE_CAP)) {
+        status = STATUS_INVALID_PARAMETER;
+        goto fail_child;
     }
     child_copy_string(child->current_directory,
                       sizeof(child->current_directory),
                       current_directory ? current_directory
                                         : kernel32_current_directory_relative());
+    child_copy_string(child->current_directory_physical,
+                      sizeof(child->current_directory_physical), child->current_directory);
     PVOID spawned_object = child->process_object;
     uint64_t child_cr3 = paging_create_process_cr3();
     int kernel_pid = child_cr3
-        ? sched_spawn_in_address_space_blocked("win32_process",
-                                               win32_child_entries[slot],
-                                               child_cr3, TRUE)
+        ? sched_spawn_detached_in_address_space_blocked("win32_process",
+                                                        win32_child_entries[slot],
+                                                        child_cr3, TRUE)
         : -1;
     if (kernel_pid < 0) {
         if (child_cr3)
@@ -3726,12 +4142,25 @@ NTSTATUS win32_spawn_child(const char *image_path, const char *command_line,
         child->process_object == spawned_object &&
         child->kernel_pid < 0)
         __atomic_store_n(&child->kernel_pid, kernel_pid, __ATOMIC_RELEASE);
+    nt_thread_bind_cpu_accounting(child->thread_object, (uint32_t)kernel_pid);
 
-    if (!create_suspended && proc_wake_pid(kernel_pid) < 0) {
+    if (proc_wake_pid(kernel_pid) < 0) {
         extern int proc_kill_pid(int pid);
         proc_kill_pid(kernel_pid);
         status = STATUS_UNSUCCESSFUL;
         goto fail_child;
+    }
+
+    while (!__atomic_load_n(&child->creation_ready, __ATOMIC_ACQUIRE))
+        win32_child_creation_wait();
+    status = child->creation_status;
+    if (!NT_SUCCESS(status)) {
+        HANDLE failed_thread = child->thread_handle;
+        HANDLE failed_process = child->process_handle;
+        __atomic_store_n(&child->creation_ack, TRUE, __ATOMIC_RELEASE);
+        handle_close(&g_handle_table, failed_thread);
+        handle_close(&g_handle_table, failed_process);
+        return status;
     }
 
     if (create_suspended) {
@@ -3745,6 +4174,7 @@ NTSTATUS win32_spawn_child(const char *image_path, const char *command_line,
     *thread_handle = child->thread_handle;
     if (process_id) *process_id = child->process_id;
     if (thread_id) *thread_id = child->thread_id;
+    __atomic_store_n(&child->creation_ack, TRUE, __ATOMIC_RELEASE);
     return STATUS_SUCCESS;
 
 fail_child:
@@ -3753,6 +4183,7 @@ fail_child:
             &g_handle_table,
             child->inherited_handles[--child->inherited_handle_count],
             child->process_id);
+    kernel32_release_process_handles(child->process_id);
     nt_process_complete_child(child->process_object, child->thread_object,
                               status);
     handle_close(&g_handle_table, child->thread_handle);
@@ -3772,7 +4203,12 @@ static void win32_cleanup_main_process(PE_IMAGE_INFO *info,
                                        BOOL compat32,
                                        NTSTATUS exit_status)
 {
+    terminal_control_release(g_win32_main.control_generation);
+    g_win32_main.control_generation = 0;
+    __atomic_store_n(&g_win32_main.force_console_exit, FALSE, __ATOMIC_RELEASE);
     const DWORD process_id = 1;
+    nt_process_begin_vm_teardown(process_id);
+    nt_process_end_main_cpu_accounting();
     PPEB process_peb = win64_main_peb();
     TEB *process_teb = win64_main_teb();
 
@@ -3802,9 +4238,9 @@ static void win32_cleanup_main_process(PE_IMAGE_INFO *info,
      * stop gracefully before force-retiring any remaining process threads. */
     winmm_release_process(process_id);
 
-    extern int win32_terminate_process_threads(PPEB owner, DWORD exit_code);
+    extern int win32_terminate_process_threads(DWORD owner_pid, DWORD exit_code);
     int stopped = win32_terminate_process_threads(
-        process_peb, (DWORD)exit_status);
+        process_id, (DWORD)exit_status);
     if (stopped) {
         serial_puts("[WINEXEC] stopped owned threads=");
         serial_putdec((uint64_t)stopped);
@@ -3815,6 +4251,11 @@ static void win32_cleanup_main_process(PE_IMAGE_INFO *info,
 
     wsock_release_process(process_id);
     advapi32_crypto_release_process(process_id);
+    crypt32_release_process(process_id);
+    urlmon_release_process(process_id);
+    advpack_release_process(process_id);
+    setupapi_release_process(process_id);
+    mmio_process_cleanup(process_id);
     advapi32_service_release_process(process_id);
     advapi32_registry_flush();
 
@@ -3893,8 +4334,9 @@ static void win32_cleanup_main_process(PE_IMAGE_INFO *info,
  *
  * Returns: exit code from the PE, or -1 on load failure
  */
-int winexec_run(const uint8_t *file_data, uint64_t file_size)
+int winexec_run_ex(const uint8_t *file_data, uint64_t file_size, BOOL administrator)
 {
+    memset(&g_win32_main.orderly_exit, 0, sizeof(g_win32_main.orderly_exit));
     serial_puts("\n=== OsitoK Windows Compatibility Layer ===\n");
 
     USHORT image_subsystem = 0;
@@ -3910,6 +4352,10 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puts("[WINEXEC] unsupported PE image\n");
         return -1;
     }
+    /* The headless shell defers background services at boot. Win32 child and
+     * worker tasks also need reclamation when no desktop has been launched. */
+    extern void proc_start_reaper(void);
+    proc_start_reaper();
     BOOL compat32 = image_bits == 32;
     g_exe_subsystem = image_subsystem;
     g_exe_subsystem_major_version = image_subsystem_major_version;
@@ -3929,6 +4375,11 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     wsock_release_process(1);
     ole32_release_process(1);
     advapi32_crypto_release_process(1);
+    crypt32_release_process(1);
+    urlmon_release_process(1);
+    advpack_release_process(1);
+    setupapi_release_process(1);
+    mmio_process_cleanup(1);
     nt_vm_release_process(1);
     kernel32_release_process_environment(1);
     opengl32_release_process((DWORD)proc_current_tgid());
@@ -3947,11 +4398,22 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     /* Initialize subsystems */
     NT_SERVICE_TABLE ssdt;
     nt_syscall_init(&ssdt);
+    nt_process_begin_main_cpu_accounting((uint32_t)proc_current_pid());
+    if (administrator && !nt_process_set_main_admin()) {
+        serial_puts("[WINEXEC] failed to create administrative token\n");
+        nt_process_end_main_cpu_accounting();
+        g_compat32_mode = 0;
+        g_exe_subsystem = 0;
+        g_exe_subsystem_major_version = 0;
+        g_exe_subsystem_minor_version = 0;
+        return -1;
+    }
     ntdll_shim_init();
     kernel32_shim_init();
     if (!NT_SUCCESS(kernel32_initialize_process_console(
             1, image_subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI))) {
         serial_puts("[WINEXEC] failed to initialize console state\n");
+        nt_process_end_main_cpu_accounting();
         g_compat32_mode = 0;
         g_exe_subsystem = 0;
         g_exe_subsystem_major_version = 0;
@@ -3962,6 +4424,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     shell32_shim_init();  /* release tray-owned icon copies before user32 */
     user32_shim_init();   /* re-exec: window/input/activation state reset */
     oleacc_shim_init();
+    ole32_shim_init();   /* publish built-in installer COM class providers */
     ddraw_shim_init();    /* re-exec: surfaces/COM proxies/display-mode reset */
     dinput8_shim_init();  /* re-exec: DirectInput COM32 thunks are process-local */
     dsound_shim_init();   /* publish the DirectSound COM class provider */
@@ -3980,7 +4443,8 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     dll_register_shim("mf.dll",       kernel32_resolve);
     dll_register_shim("mfplat.dll",   kernel32_resolve);
     dll_register_shim("mfreadwrite.dll", kernel32_resolve);
-    dll_register_shim("d3d9.dll",     kernel32_resolve);
+    /* Direct3D and DXGI are installed PE runtimes. Their imports target
+     * the OS/driver ABI; do not shadow them with renderer substitutes. */
     dll_register_shim("dxva2.dll",    kernel32_resolve);
     dll_register_shim("dbghelp.dll",  kernel32_resolve);
     dll_register_shim("api-ms-win-power-base-l1-1-0.dll", kernel32_resolve);
@@ -4002,7 +4466,6 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     dll_register_shim("msimg32.dll",  gdi32_resolve);
     dll_register_shim("dwrite.dll",   gdi32_resolve);
     dll_register_shim("opengl32.dll", opengl32_resolve);
-    dll_register_shim("dxgi.dll",     dxgi_resolve);
     dll_register_shim("version.dll",  version_resolve);
     dll_register_shim("ddraw.dll",    ddraw_resolve);
     dll_register_shim("dsound.dll",   dsound_resolve);
@@ -4022,6 +4485,13 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     dll_register_shim("crypt32.dll", crypt32_resolve);
     dll_register_shim("ncrypt.dll", ncrypt_resolve);
     dll_register_shim("wintrust.dll", wintrust_resolve);
+    dll_register_shim("imagehlp.dll", imagehlp_resolve);
+    dll_register_shim("secur32.dll", secur32_resolve);
+    dll_register_shim("urlmon.dll", urlmon_resolve);
+    dll_register_shim("advpack.dll", advpack_resolve);
+    dll_register_shim("rpcrt4.dll", rpcrt4_resolve);
+    dll_register_shim("cabinet.dll", cabinet_resolve);
+    dll_register_shim("msi.dll", msi_resolve);
     dll_register_shim("comctl32.dll", comctl32_resolve);
     dll_register_shim("comdlg32.dll", comdlg32_resolve);
     dll_register_shim_ex("riched32.dll", richedit_resolve,
@@ -4043,7 +4513,6 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         extern const WIN32_EXPORT *user32_abi_table(int *);
         extern const WIN32_EXPORT *gdi32_abi_table(int *);
         extern const WIN32_EXPORT *opengl32_abi_table(int *);
-        extern const WIN32_EXPORT *dxgi_abi_table(int *);
         extern const WIN32_EXPORT *version_abi_table(int *);
         extern const WIN32_EXPORT *ddraw_abi_table(int *);
         extern const WIN32_EXPORT *dsound_abi_table(int *);
@@ -4061,67 +4530,68 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         extern const WIN32_EXPORT *comctl32_abi_table(int *);
         extern const WIN32_EXPORT *comdlg32_abi_table(int *);
         extern const WIN32_EXPORT *libusb_abi_table(int *);
-        int n;
-        win32_abi_register("ntdll.dll",    ntdll_abi_table(&n),    n);
-        win32_abi_register("kernel32.dll", kernel32_abi_table(&n), n);
-        win32_abi_register("psapi.dll",    kernel32_abi_table(&n), n);
-        win32_abi_register("setupapi.dll", kernel32_abi_table(&n), n);
-        win32_abi_register("cfgmgr32.dll", kernel32_abi_table(&n), n);
-        win32_abi_register("hid.dll",      kernel32_abi_table(&n), n);
-        win32_abi_register("mf.dll",       kernel32_abi_table(&n), n);
-        win32_abi_register("mfplat.dll",   kernel32_abi_table(&n), n);
-        win32_abi_register("mfreadwrite.dll", kernel32_abi_table(&n), n);
-        win32_abi_register("d3d9.dll",     kernel32_abi_table(&n), n);
-        win32_abi_register("dxva2.dll",    kernel32_abi_table(&n), n);
-        win32_abi_register("dbghelp.dll",  kernel32_abi_table(&n), n);
-        win32_abi_register("api-ms-win-power-base-l1-1-0.dll",
-                           kernel32_abi_table(&n), n);
-        win32_abi_register("api-ms-win-power-setting-l1-1-0.dll",
-                           kernel32_abi_table(&n), n);
-        win32_abi_register("msvcrt.dll",   msvcrt_abi_table(&n),   n);
-        win32_abi_register("ucrtbase.dll", msvcrt_abi_table(&n),   n);
-        win32_abi_register("vcruntime140.dll",
-                           msvcrt_abi_table(&n), n);
-        win32_abi_register("vcruntime140_1.dll",
-                           msvcrt_abi_table(&n), n);
-        win32_abi_register("advapi32.dll", advapi32_abi_table(&n), n);
-        win32_abi_register("wevtapi.dll",  advapi32_abi_table(&n), n);
-        win32_abi_register("bcrypt.dll",   advapi32_abi_table(&n), n);
-        win32_abi_register("bcryptprimitives.dll",
-                           advapi32_abi_table(&n), n);
-        win32_abi_register("user32.dll",   user32_abi_table(&n),   n);
-        win32_abi_register("imm32.dll",    user32_abi_table(&n),   n);
-        win32_abi_register("api-ms-win-shcore-scaling-l1-1-1.dll",
-                           user32_abi_table(&n), n);
-        win32_abi_register("wtsapi32.dll", user32_abi_table(&n), n);
-        win32_abi_register("dwmapi.dll",   user32_abi_table(&n), n);
-        win32_abi_register("gdi32.dll",    gdi32_abi_table(&n),    n);
-        win32_abi_register("msimg32.dll",  gdi32_abi_table(&n),    n);
-        win32_abi_register("dwrite.dll",   gdi32_abi_table(&n),    n);
-        win32_abi_register("opengl32.dll", opengl32_abi_table(&n), n);
-        win32_abi_register("dxgi.dll",     dxgi_abi_table(&n),     n);
-        win32_abi_register("version.dll",  version_abi_table(&n),  n);
-        win32_abi_register("ddraw.dll",    ddraw_abi_table(&n),    n);
-        win32_abi_register("dsound.dll",   dsound_abi_table(&n),   n);
-        win32_abi_register("dinput8.dll",  dinput8_abi_table(&n),  n);
-        win32_abi_register("wsock32.dll",  wsock32_abi_table(&n),  n);
-        win32_abi_register("ws2_32.dll",   wsock32_abi_table(&n),  n);
-        win32_abi_register("mswsock.dll",  wsock32_abi_table(&n),  n);
-        win32_abi_register("iphlpapi.dll", wsock32_abi_table(&n),  n);
-        win32_abi_register("wininet.dll",  wsock32_abi_table(&n),  n);
-        win32_abi_register("winhttp.dll",  wsock32_abi_table(&n),  n);
-        win32_abi_register("shell32.dll",  shell32_abi_table(&n),  n);
-        win32_abi_register("shlwapi.dll",  shlwapi_abi_table(&n),  n);
-        win32_abi_register("winmm.dll",    winmm_abi_table(&n),    n);
-        win32_abi_register("ole32.dll",    ole32_abi_table(&n),    n);
-        win32_abi_register("oleaut32.dll", oleaut32_abi_table(&n), n);
-        win32_abi_register("oleacc.dll", oleacc_abi_table(&n), n);
-        win32_abi_register("crypt32.dll", crypt32_abi_table(&n), n);
-        win32_abi_register("ncrypt.dll", ncrypt_abi_table(&n), n);
-        win32_abi_register("wintrust.dll", wintrust_abi_table(&n), n);
-        win32_abi_register("comctl32.dll", comctl32_abi_table(&n), n);
-        win32_abi_register("comdlg32.dll", comdlg32_abi_table(&n), n);
-        win32_abi_register("libusb-1.0.dll", libusb_abi_table(&n), n);
+        win32_abi_register_provider("ntdll.dll", ntdll_abi_table);
+        win32_abi_register_provider("kernel32.dll", kernel32_abi_table);
+        win32_abi_register_provider("psapi.dll", kernel32_abi_table);
+        win32_abi_register_provider("setupapi.dll", kernel32_abi_table);
+        win32_abi_register_provider("cfgmgr32.dll", kernel32_abi_table);
+        win32_abi_register_provider("hid.dll", kernel32_abi_table);
+        win32_abi_register_provider("mf.dll", kernel32_abi_table);
+        win32_abi_register_provider("mfplat.dll", kernel32_abi_table);
+        win32_abi_register_provider("mfreadwrite.dll", kernel32_abi_table);
+        win32_abi_register_provider("dxva2.dll", kernel32_abi_table);
+        win32_abi_register_provider("dbghelp.dll", kernel32_abi_table);
+        win32_abi_register_provider("api-ms-win-power-base-l1-1-0.dll", kernel32_abi_table);
+        win32_abi_register_provider("api-ms-win-power-setting-l1-1-0.dll", kernel32_abi_table);
+        win32_abi_register_provider("msvcrt.dll", msvcrt_abi_table);
+        win32_abi_register_provider("ucrtbase.dll", msvcrt_abi_table);
+        win32_abi_register_provider("vcruntime140.dll", msvcrt_abi_table);
+        win32_abi_register_provider("vcruntime140_1.dll", msvcrt_abi_table);
+        win32_abi_register_provider("advapi32.dll", advapi32_abi_table);
+        win32_abi_register_provider("wevtapi.dll", advapi32_abi_table);
+        win32_abi_register_provider("bcrypt.dll", advapi32_abi_table);
+        win32_abi_register_provider("bcryptprimitives.dll", advapi32_abi_table);
+        win32_abi_register_provider("user32.dll", user32_abi_table);
+        win32_abi_register_provider("imm32.dll", user32_abi_table);
+        win32_abi_register_provider("api-ms-win-shcore-scaling-l1-1-1.dll", user32_abi_table);
+        win32_abi_register_provider("wtsapi32.dll", user32_abi_table);
+        win32_abi_register_provider("dwmapi.dll", user32_abi_table);
+        win32_abi_register_provider("gdi32.dll", gdi32_abi_table);
+        win32_abi_register_provider("msimg32.dll", gdi32_abi_table);
+        win32_abi_register_provider("dwrite.dll", gdi32_abi_table);
+        win32_abi_register_provider("opengl32.dll", opengl32_abi_table);
+        win32_abi_register_provider("version.dll", version_abi_table);
+        win32_abi_register_provider("ddraw.dll", ddraw_abi_table);
+        win32_abi_register_provider("dsound.dll", dsound_abi_table);
+        win32_abi_register_provider("dinput8.dll", dinput8_abi_table);
+        win32_abi_register_provider("wsock32.dll", wsock32_abi_table);
+        win32_abi_register_provider("ws2_32.dll", wsock32_abi_table);
+        win32_abi_register_provider("mswsock.dll", wsock32_abi_table);
+        win32_abi_register_provider("iphlpapi.dll", wsock32_abi_table);
+        win32_abi_register_provider("wininet.dll", wsock32_abi_table);
+        win32_abi_register_provider("winhttp.dll", wsock32_abi_table);
+        win32_abi_register_provider("shell32.dll", shell32_abi_table);
+        win32_abi_register_provider("shlwapi.dll", shlwapi_abi_table);
+        win32_abi_register_provider("winmm.dll", winmm_abi_table);
+        win32_abi_register_provider("ole32.dll", ole32_abi_table);
+        win32_abi_register_provider("oleaut32.dll", oleaut32_abi_table);
+        win32_abi_register_provider("oleacc.dll", oleacc_abi_table);
+        win32_abi_register_provider("crypt32.dll", crypt32_abi_table);
+        win32_abi_register_provider("ncrypt.dll", ncrypt_abi_table);
+        win32_abi_register_provider("wintrust.dll", wintrust_abi_table);
+        win32_abi_register_provider("imagehlp.dll", imagehlp_abi_table);
+        win32_abi_register_provider("secur32.dll", secur32_abi_table);
+        win32_abi_register_provider("urlmon.dll", urlmon_abi_table);
+        win32_abi_register_provider("advpack.dll", advpack_abi_table);
+        win32_abi_register_provider("rpcrt4.dll", rpcrt4_abi_table);
+        win32_abi_register_provider("cabinet.dll", cabinet_abi_table);
+        win32_abi_register_provider("msi.dll", msi_abi_table);
+        win32_abi_register_provider("comctl32.dll", comctl32_abi_table);
+        win32_abi_register_provider("comdlg32.dll", comdlg32_abi_table);
+        win32_abi_register_provider("libusb-1.0.dll", libusb_abi_table);
+        int ntdll_count = 0;
+        const WIN32_EXPORT *ntdll_table = ntdll_abi_table(&ntdll_count);
+        dll_register_shim_named_exports("ntdll.dll", ntdll_table, ntdll_count);
     }
 
     /*
@@ -4139,6 +4609,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         int32_t pid = proc_current_pid();
         if (pid <= 0 || sched_alloc_compat_ist1((uint32_t)pid) < 0) {
             serial_puts("[WINEXEC] failed to allocate PE32 private IST stacks\n");
+            nt_process_end_main_cpu_accounting();
             return -1;
         }
         serial_puts("[WINEXEC] PE32 private IST stacks ready pid=");
@@ -4155,6 +4626,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
      * into this TEB without erasing the ABI fields. */
     if (!setup_environment(NULL, !compat32)) {
         serial_puts("[WINEXEC] failed to initialize process environment\n");
+        nt_process_end_main_cpu_accounting();
         g_compat32_mode = 0;
         return -1;
     }
@@ -4164,6 +4636,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     if (compat32) {
         if (!setup_main_compat_environment32()) {
             serial_puts("[WINEXEC] failed to allocate low PE32 environment\n");
+            nt_process_end_main_cpu_accounting();
             g_compat32_mode = 0;
             return -1;
         }
@@ -4173,10 +4646,14 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
 
     serial_puts("[WINEXEC] loading PE...\n");
 
-    /* Load PE */
-    PE_IMAGE_INFO info;
-    NTSTATUS status = pe_load_named(file_data, file_size, &info,
-                                    win32_current_image_path());
+    /* Establish the same core image as CreateProcess before imported DLLs
+     * can execute. The application import order must not choose NTDLL's VA. */
+    PE_IMAGE_INFO info = {0};
+    NTSTATUS status = pe_map_named(file_data, file_size, &info,
+                                   win32_current_image_path());
+    if (NT_SUCCESS(status)) status = dll_prepare_process();
+    if (NT_SUCCESS(status))
+        status = pe_bind_mapped_image(&info, win32_current_image_path());
 
     if (!NT_SUCCESS(status)) {
         serial_puts("[WINEXEC] PE load failed: ");
@@ -4387,6 +4864,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                                            compat32, exit_status);
                 return (int32_t)exit_status;
             }
+            g_win32_main.control_generation = terminal_control_bind(win32_terminal_request);
             __atomic_store_n(&g_win32_main.active, TRUE,
                              __ATOMIC_RELEASE);
         }
@@ -4418,10 +4896,12 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                                        compat32, exit_status);
             return (int32_t)exit_status;
         }
+        g_win32_main.control_generation = terminal_control_bind(win32_terminal_request);
         __atomic_store_n(&g_win32_main.active, TRUE, __ATOMIC_RELEASE);
 
         win64_call_child_entry(info.EntryPoint, stack_top, win64_main_peb(),
                                info.Subsystem == IMAGE_SUBSYSTEM_NATIVE);
+        ExitProcess(0);
     }
 
     /* If entry point returns (unusual — most call ExitProcess) */
@@ -4432,4 +4912,9 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     win32_cleanup_main_process(&info, stack_allocation,
                                compat32, STATUS_SUCCESS);
     return 0;
+}
+
+int winexec_run(const uint8_t *file_data, uint64_t file_size)
+{
+    return winexec_run_ex(file_data, file_size, FALSE);
 }

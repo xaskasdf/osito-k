@@ -1,0 +1,10 @@
+#ifndef OSITOK_SOFTFLOAT_CONFIG_H
+#define OSITOK_SOFTFLOAT_CONFIG_H
+
+#define BX_LITTLE_ENDIAN 1
+#define BX_CPP_INLINE inline
+#define BX_CONST64(value) UINT64_C(value)
+#define SOFTFLOAT_FAST_INT64 1
+#define SOFTFLOAT_FAST_DIV64TO32 1
+
+#endif

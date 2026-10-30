@@ -1,4 +1,4 @@
-/* Native BUTTON/STATIC procedures, shared by PE32 and PE64 callers. */
+/* Native BUTTON/STATIC and read-only EDIT display, shared by PE32 and PE64. */
 #include "user32_controls.h"
 #include "gdi32_shim.h"
 #include "kernel32_shim.h"
@@ -34,6 +34,10 @@ struct U32_CONTROL {
     HFONT font;
     HANDLE image;
     UINT image_type;
+    int edit_first_line;
+    BOOL edit_custom_rect;
+    RECT edit_rect;
+    WCHAR edit_password;
 };
 
 U32_CONTROL *user32_control_create(UINT atom)
@@ -224,6 +228,148 @@ static void button_marker(HDC dc, RECT marker, BOOL radio, UINT checked,
     }
 }
 
+static UINT edit_layout(U32_CONTROL *control, HWND window, HDC dc, PWSTR text,
+                       RECT *format, int *line_height, int *line_count)
+{
+    DWORD style = control_style(window);
+    UINT flags = 0x800 | 0x40; /* DT_NOPREFIX | DT_EXPANDTABS */
+    if (style & 4) {
+        if (!(style & (0x80 | 0x00100000))) flags |= 0x10; /* word wrap */
+    } else flags |= 0x20;
+    flags |= (style & 3) == 1 ? 1 : (style & 3) == 2 ? 2 : 0;
+    GDI_TEXTMETRICW metrics;
+    *line_height = GetTextMetricsW(dc, &metrics) && metrics.height > 0
+        ? metrics.height : 16;
+    if (control->edit_custom_rect) *format = control->edit_rect;
+    else {
+        GetClientRect(window, format);
+        format->left++; format->right--;
+    }
+    if (format->right < format->left) format->right = format->left;
+    int64_t height = (int64_t)format->bottom - format->top;
+    if (height < 0) height = 0;
+    if (height > 0x7FFFFFFF) height = 0x7FFFFFFF;
+    if (style & 4) height = height / *line_height * *line_height;
+    format->bottom = (LONG)((int64_t)format->top + height);
+    RECT measured = *format;
+    int pixels = DrawTextW(dc, text, -1, &measured, flags | 0x400);
+    *line_count = pixels > 0 ? (pixels + *line_height - 1) / *line_height : 1;
+    int page = (int)height / *line_height;
+    if (page < 1) page = 1;
+    int maximum = *line_count > page ? *line_count - page : 0;
+    if (control->edit_first_line > maximum) control->edit_first_line = maximum;
+    return flags;
+}
+
+static int edit_scroll(U32_CONTROL *control, HWND window, int amount, BOOL pages)
+{
+    HDC dc = GetDC(window);
+    PWSTR text = user32_copy_window_text(window);
+    int difference = 0;
+    if (dc && text) {
+        HGDIOBJ old = SelectObject(dc, control->font ? control->font : GetStockObject(13));
+        RECT format; int height, lines;
+        edit_layout(control, window, dc, text, &format, &height, &lines);
+        int page = (format.bottom - format.top) / height;
+        if (page < 1) page = 1;
+        int maximum = lines > page ? lines - page : 0;
+        int64_t next = (int64_t)control->edit_first_line +
+            (int64_t)amount * (pages && page > 1 ? page - 1 : 1);
+        if (next < 0) next = 0;
+        if (next > maximum) next = maximum;
+        difference = (int)next - control->edit_first_line;
+        control->edit_first_line = (int)next;
+        SelectObject(dc, old);
+    }
+    if (dc) ReleaseDC(window, dc);
+    kfree(text);
+    if (difference) control_redraw(control, window);
+    return difference;
+}
+
+static BOOL edit_message(U32_CONTROL *control, HWND window, UINT message,
+                         WPARAM wp, LPARAM lp, LRESULT *result)
+{
+    DWORD style = control_style(window);
+    switch (message) {
+    case 0x000C: /* WM_SETTEXT: the window owns the ANSI/Unicode text storage. */
+        control->edit_first_line = 0;
+        return FALSE;
+    case WM_GETDLGCODE:
+        *result = 0x89 | ((style & 4) ? 4 : 0);
+        return TRUE;
+    case 0x00CE: /* EM_GETFIRSTVISIBLELINE */
+        *result = control->edit_first_line; return TRUE;
+    case 0x00D2: /* EM_GETPASSWORDCHAR */
+        *result = style & 0x20 ? (control->edit_password ? control->edit_password : '*') : 0;
+        return TRUE;
+    case 0x00CC: /* EM_SETPASSWORDCHAR */
+        if (!(style & 4)) {
+            control->edit_password = (WCHAR)wp;
+            SetWindowLongPtrA(window, -16, wp ? style | 0x20 : style & ~0x20U);
+            control_redraw(control, window);
+        }
+        return TRUE;
+    case 0x00B3: /* EM_SETRECT */
+    case 0x00B4: /* EM_SETRECTNP */
+        if (style & 4) {
+            control->edit_custom_rect = lp != 0;
+            if (lp) memcpy(&control->edit_rect, (PCVOID)lp, sizeof(RECT));
+            if (message == 0xB3) control_redraw(control, window);
+        }
+        return TRUE;
+    case 0x00B2: /* EM_GETRECT */
+    case 0x00BA: { /* EM_GETLINECOUNT */
+        HDC dc = GetDC(window);
+        PWSTR text = user32_copy_window_text(window);
+        if (dc && text) {
+            HGDIOBJ old = SelectObject(dc, control->font ? control->font : GetStockObject(13));
+            RECT format; int height, lines;
+            edit_layout(control, window, dc, text, &format, &height, &lines);
+            if (message == 0xB2 && lp) memcpy((PVOID)lp, &format, sizeof(RECT));
+            else if (message == 0xBA) *result = lines;
+            SelectObject(dc, old);
+        }
+        if (dc) ReleaseDC(window, dc);
+        kfree(text);
+        return TRUE;
+    }
+    case 0x00B6: /* EM_LINESCROLL (vertical component) */
+        if (style & 4) {
+            edit_scroll(control, window, (int)lp, FALSE);
+            *result = TRUE;
+        }
+        return TRUE;
+    case 0x00B5: /* EM_SCROLL */
+    case 0x0115: { /* WM_VSCROLL */
+        if (!(style & 4)) return TRUE;
+        int amount;
+        switch (wp & 0xFFFF) {
+        case 0: case 2: amount = -1; break;
+        case 1: case 3: amount = 1; break;
+        case 6: amount = -0x7FFFFFFF; break;
+        case 7: amount = 0x7FFFFFFF; break;
+        default: return TRUE;
+        }
+        int moved = edit_scroll(control, window, amount, (wp & 0xFFFF) == 2 || (wp & 0xFFFF) == 3);
+        if (message == 0xB5) *result = 0x10000 | ((UINT)moved & 0xFFFF);
+        return TRUE;
+    }
+    case WM_LBUTTONDOWN: SetFocus(window); return TRUE;
+    case 0x020A: /* WM_MOUSEWHEEL */
+        if (style & 4) edit_scroll(control, window, -3 * (short)(wp >> 16) / 120, FALSE);
+        return TRUE;
+    case WM_KEYDOWN:
+        if ((style & (4 | 0x800)) == (4 | 0x800)) {
+            if (wp == 0x21 || wp == 0x22) edit_scroll(control, window, wp == 0x21 ? -1 : 1, TRUE);
+            else if (wp == 0x26 || wp == 0x28) edit_scroll(control, window, wp == 0x26 ? -1 : 1, FALSE);
+            else if (wp == 0x24 || wp == 0x23) edit_scroll(control, window, wp == 0x24 ? -0x7FFFFFFF : 0x7FFFFFFF, FALSE);
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void control_paint(U32_CONTROL *control, HWND window, HDC dc)
 {
     RECT rect;
@@ -237,15 +383,23 @@ static void control_paint(U32_CONTROL *control, HWND window, HDC dc)
     }
     PWSTR caption = user32_copy_window_text(window);
     if (!caption) return;
+    if (control->atom == 0x81 && (style & 0x20) && !(style & 4))
+        for (SIZE_T i = 0; caption[i]; i++)
+            caption[i] = control->edit_password ? control->edit_password : '*';
     DWORD text_color = GetTextColor(dc), background_color = GetBkColor(dc);
     UINT alignment = SetTextAlign(dc, 0);
     int background_mode = SetBkMode(dc, 1);
-    HGDIOBJ font = SelectObject(dc, control->font ? control->font : GetStockObject(17));
+    HGDIOBJ font = SelectObject(dc, control->font ? control->font : GetStockObject(control->atom == 0x81 ? 13 : 17));
     SetTextColor(dc, GetSysColor(18));
     SetBkColor(dc, GetSysColor(15));
     HWND parent = GetParent(window);
     BOOL group = user32_control_is_groupbox(control, style);
     UINT message = control->atom == 0x80 && !group ? 0x0135 : 0x0138;
+    if (control->atom == 0x81) {
+        SetTextColor(dc, GetSysColor(8));
+        SetBkColor(dc, GetSysColor(5));
+        if (!(style & (0x800 | WS_DISABLED))) message = 0x0133;
+    }
     BOOL narrow = g_compat32_mode;
     LRESULT answer = parent ? SendMessageA(parent, message,
         (WPARAM)(ULONG_PTR)dc, (LPARAM)(ULONG_PTR)window) : 0;
@@ -258,7 +412,16 @@ static void control_paint(U32_CONTROL *control, HWND window, HDC dc)
     BOOL disabled = (style & WS_DISABLED) != 0;
     if (disabled && !(control->atom == 0x82 && type == 11))
         SetTextColor(dc, GetSysColor(17));
-    if (control->atom == 0x82) {
+    if (control->atom == 0x81) {
+        RECT format; int height, lines;
+        UINT flags = edit_layout(control, window, dc, caption, &format, &height, &lines);
+        uint64_t token;
+        if (gdi32_push_paint_clip(dc, (const GDI_RECT *)&format, &token)) {
+            format.top -= control->edit_first_line * height;
+            DrawTextW(dc, caption, -1, &format, flags);
+            gdi32_pop_paint_clip(dc, token, TRUE);
+        }
+    } else if (control->atom == 0x82) {
         if (type >= 4 && type <= 9) {
             int color = type % 3 == 1 ? 6 : type % 3 == 2 ? 1 : 5;
             if (type < 7) control_fill(dc, rect, color);
@@ -348,7 +511,7 @@ static void control_render(U32_CONTROL *control, HWND window, HDC dc)
     }
     /* STATIC bitmap printing uses the supplied DC's clip. A window DC is
      * already bounded to its client; BUTTON also clips owner-draw callbacks. */
-    if (control->atom != 0x80) { control_paint(control, window, dc); return; }
+    if (control->atom == 0x82) { control_paint(control, window, dc); return; }
     RECT client;
     uint64_t token;
     if (!GetClientRect(window, &client) ||
@@ -363,6 +526,15 @@ static BOOL control_message(U32_CONTROL *control, HWND window, UINT message,
     DWORD style = control_style(window);
     UINT type = style & BS_TYPEMASK;
     *result = 0;
+    if (control->atom == 0x81) {
+        if (edit_message(control, window, message, wp, lp, result)) return TRUE;
+        /* Shared font/paint/enable/size messages apply to EDIT too. All other
+         * messages fall through to its window's normal text/default handling. */
+        if (message != WM_GETFONT && message != WM_SETFONT &&
+            message != WM_ERASEBKGND && message != WM_PAINT &&
+            message != WM_PRINTCLIENT && message != WM_ENABLE &&
+            message != WM_SIZE) return FALSE;
+    }
     switch (message) {
     case WM_NCHITTEST:
         if (user32_control_is_groupbox(control, style)) {

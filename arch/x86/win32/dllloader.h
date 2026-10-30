@@ -33,9 +33,11 @@ typedef struct _LOADED_MODULE {
     char            path[260];      /* canonical OsitoFS path, if known */
     PE_IMAGE_INFO   image;          /* PE image info */
     BOOL            synthetic_shim; /* mapped PE facade for a built-in shim */
+    BOOL            published_exports; /* complete named function EAT */
     PVOID           dll_main;       /* DllMain entry point (if DLL) */
     BOOL            initialized;    /* DllMain(ATTACH) called? */
     BOOL            thread_notifications_disabled;
+    uint64_t        pending_attach_order; /* mapped graph awaiting TLS/DllMain */
     ULONG           init_order;     /* completed process-attach order */
     int             ref_count;      /* LoadLibrary reference count */
     BOOL            pinned;         /* retained until process teardown */
@@ -70,6 +72,10 @@ BOOL dll_loader_lock_owned_by_current_thread(void);
 /* Return 32 or 64 from the mapped main executable, or 0 before publication. */
 int dll_current_process_bitness(void);
 
+/* Map and pin the process's NTDLL after the main image is published, before
+ * import binding or CreateProcess returns. Does not execute guest code. */
+NTSTATUS dll_prepare_process(void);
+
 /* Initialize PE32+ static TLS and run process-attach TLS callbacks. */
 NTSTATUS win64_attach_tls(PE_IMAGE_INFO *info);
 
@@ -83,6 +89,11 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size);
  * `append_dll` supports explicit LoadLibrary("name") calls; import-table
  * dependencies already carry their file extension. */
 PVOID dll_load_from_fs(const char *dll_name, BOOL append_dll);
+
+/* Resolve a version-resource filename with the process loader policy, without
+ * loading it or changing module references. Output is a physical OsitoFS path:
+ * subsequent file reads must not apply WOW64 redirection a second time. */
+BOOL dll_resolve_data_path(const char *name, char fs_path[260]);
 
 /* LoadLibraryEx variant. Search flags are inherited by import-table
  * dependencies while the image is being mapped. */
@@ -154,6 +165,13 @@ BOOL dll_release_module(PVOID image_base);
 
 /* Drop every private DLL image owned by a terminating process. */
 void dll_release_process(ULONG owner_pid);
+/* Explicit loader shutdown: normal guest callbacks, separate from forced
+ * image teardown. Caller is in the owning process with its TEB still valid. */
+void dll_shutdown_process(void);
+BOOL dll_shutdown_in_progress(void);
+BOOL dll_within_loader_callout(void);
+void win32_tls_process_detach_image(PVOID image_base,BOOL compat32);
+void win32_tls_notify_image(PVOID image_base, BOOL compat32, DWORD reason);
 
 /* Notify initialized same-bitness DLLs owned by the current process. */
 void dll_notify_thread(DWORD reason);
@@ -173,6 +191,14 @@ void dll_register_shim(const char *dll_name, shim_resolver_fn resolver);
 void dll_register_shim_ex(const char *dll_name, shim_resolver_fn resolver,
                           shim_lifecycle_fn lifecycle);
 
+/* Opt in only providers with complete static function descriptors and no
+ * pre-existing public ordinals/data exports. Ordinal = descriptor index + 1.
+ * The same provider also supplies win32_abi_register_provider(). */
+struct _WIN32_EXPORT;
+void dll_register_shim_named_exports(const char *dll_name,
+                                      const struct _WIN32_EXPORT *table,
+                                      int count);
+
 /* Return TRUE when a DLL name resolves through the built-in shim registry. */
 BOOL dll_is_shim(const char *dll_name);
 
@@ -190,5 +216,12 @@ PVOID dll_get_shim_export_thunk(const char *dll_name, PVOID target);
  */
 PVOID dll_resolve_import(const char *dll_name, const char *func_name,
                          USHORT ordinal, BOOL by_ordinal);
+
+/* Preserve a failed dependency load across recursive imports/forwarders.
+ * Missing DLLs/exports remain subject to the PE compatibility policy; other
+ * failures must stop binding before guest callbacks or the entry point. */
+PVOID dll_resolve_import_status(const char *dll_name, const char *func_name,
+                                USHORT ordinal, BOOL by_ordinal,
+                                NTSTATUS *status);
 
 #endif /* DLLLOADER_H */

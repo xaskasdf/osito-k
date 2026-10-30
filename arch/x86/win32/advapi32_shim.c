@@ -5,18 +5,24 @@
  * versioned hive on OsitoFS.
  *
  * Registry paths are normalized to lowercase with backslashes and retain the
- * caller's WOW64 view. The persistent image contains no application defaults.
+ * caller's WOW64 view. Platform metadata is initialized separately from the
+ * application values written by installers.
  */
 
 #include "advapi32_shim.h"
 #include "handle.h"
 #include "kernel32_shim.h"
+#include "wow64.h"
 #include "ntsyscall.h"
+#include "ntprocess.h"
+#include "ntdll_shim.h"
 #include "scm.h"
 #include "win32_abi.h"
+#include "compat32.h"
 #include "../fs/ositofs3.h"
 #include "../fs/vfs.h"
 #include "../kernel/smp.h"
+#include "../lib/bearssl/inc/bearssl_hash.h"
 #include "ositofs3_format.h"
 
 extern void serial_puts(const char *s);
@@ -26,13 +32,6 @@ extern void random_get_bytes(void *buf, uint32_t len);
 extern PVOID WINAPI LocalAlloc(UINT uFlags, SIZE_T dwBytes);
 extern PVOID WINAPI LocalFree(PVOID hMem);
 extern void WINAPI SetLastError(DWORD dwErrCode);
-extern BOOL WINAPI CreateProcessW(PCWSTR lpApp, PWSTR lpCmd,
-                                  PVOID process_attributes,
-                                  PVOID thread_attributes,
-                                  BOOL inherit_handles, DWORD creation_flags,
-                                  PVOID environment, PCWSTR current_directory,
-                                  PVOID startup_info,
-                                  PVOID process_information);
 extern HANDLE_TABLE g_handle_table;
 extern BOOL nt_process_id(HANDLE handle, DWORD *process_id);
 extern DWORD win32_current_process_id(void);
@@ -40,6 +39,7 @@ extern PVOID win32_current_thread_object(void);
 extern void *kmalloc(uint64_t size);
 extern void kfree(void *ptr);
 extern uint64_t idt_get_ticks(void);
+extern void sched_yield(void);
 extern bool osfs2_is_mounted(void);
 extern void *osfs2_find(const char *name);
 extern uint64_t osfs2_file_size(void *file);
@@ -95,14 +95,23 @@ static int reg_string_valid(const char *text, SIZE_T capacity)
 
 /* ── Registry store ────────────────────────────────────────── */
 
-#define MAX_REG_KEYS    128
-#define MAX_REG_VALUES  256
+/* Bounded hive capacity includes both WOW64 views and installed COM classes.
+ * The compact version-1 disk format remains unchanged. */
+#define MAX_REG_KEYS    2048
+#define MAX_REG_VALUES  4096
 #define MAX_REG_PATH    256
 #define MAX_REG_DATA    512
 
 #define REG_VIEW_SHARED 0
 #define REG_VIEW_32     1
 #define REG_VIEW_64     2
+
+/* Old version-1 hives mixed A/W payloads without recording their encoding.
+ * Keep those bytes opaque. New writes carry an encoding in a reserved byte
+ * of the same disk record, so no heuristic can corrupt an existing value. */
+#define REG_DATA_LEGACY 0
+#define REG_DATA_ANSI   1
+#define REG_DATA_UTF16  2
 
 typedef struct {
     char    path[MAX_REG_PATH];     /* full normalized path e.g. "HKLM\\software\\foo" */
@@ -119,6 +128,7 @@ typedef struct {
     DWORD   data_len;
     int     used;
     BYTE    view;                   /* shared, 32-bit, or 64-bit value */
+    BYTE    encoding;               /* string payload encoding, or legacy/raw */
 } REG_VALUE;
 
 static REG_KEY   reg_keys[MAX_REG_KEYS];
@@ -161,7 +171,8 @@ typedef struct __attribute__((packed)) {
     DWORD type;
     DWORD data_len;
     BYTE view;
-    BYTE reserved[3];
+    BYTE encoding;
+    BYTE reserved[2];
     char key_path[MAX_REG_PATH];
     char name[128];
     BYTE data[MAX_REG_DATA];
@@ -214,12 +225,17 @@ static int reg_path_has_prefix(const char *path, const char *prefix)
     return *path == 0 || *path == '\\';
 }
 
-/* Windows redirects the software hives according to the caller's ABI. HKCR
- * is a merged view over the corresponding Software\\Classes hives. */
+/* Ordinary HKCU software settings are shared, including communication between
+ * a 64-bit client and 32-bit applications. Only these per-user COM branches
+ * are redirected on the Windows 7+ compatibility profile. */
 static int reg_path_is_redirected(const char *path)
 {
     return reg_path_has_prefix(path, "hklm\\software") ||
-           reg_path_has_prefix(path, "hkcu\\software") ||
+           reg_path_has_prefix(path, "hkcu\\software\\classes\\clsid") ||
+           reg_path_has_prefix(path, "hkcu\\software\\classes\\directshow") ||
+           reg_path_has_prefix(path, "hkcu\\software\\classes\\interface") ||
+           reg_path_has_prefix(path, "hkcu\\software\\classes\\media type") ||
+           reg_path_has_prefix(path, "hkcu\\software\\classes\\mediafoundation") ||
            reg_path_has_prefix(path, "hkcr");
 }
 
@@ -319,10 +335,17 @@ static void build_path(char *out, HKEY root, const char *subkey)
             out[pos++] = c;
         }
     }
+    /* A trailing separator does not change a registry key's identity. */
+    while (pos && out[pos - 1] == '\\') pos--;
     out[pos] = 0;
 }
 
 /* ── Registry values ──────────────────────────────────────── */
+
+static int reg_string_type(DWORD type)
+{
+    return type == REG_SZ || type == REG_EXPAND_SZ || type == REG_MULTI_SZ;
+}
 
 static LONG reg_set_value_view(const char *key_path, const char *name,
                                DWORD type, const void *data, DWORD data_len,
@@ -357,6 +380,8 @@ static LONG reg_set_value_view(const char *key_path, const char *name,
             continue;
 
         reg_values[i].type = type;
+        reg_values[i].encoding = reg_string_type(type) ? REG_DATA_ANSI
+                                                      : REG_DATA_LEGACY;
         reg_values[i].data_len =
             data_len < MAX_REG_DATA ? data_len : MAX_REG_DATA;
         if (data && reg_values[i].data_len)
@@ -370,6 +395,8 @@ static LONG reg_set_value_view(const char *key_path, const char *name,
             reg_strcpy(reg_values[i].key_path, key_path);
             reg_strcpy(reg_values[i].name, value_name);
             reg_values[i].type     = type;
+            reg_values[i].encoding = reg_string_type(type) ? REG_DATA_ANSI
+                                                          : REG_DATA_LEGACY;
             reg_values[i].data_len = data_len < MAX_REG_DATA ? data_len : MAX_REG_DATA;
             if (data && reg_values[i].data_len)
                 reg_memcpy(reg_values[i].data, data, reg_values[i].data_len);
@@ -416,6 +443,34 @@ static int reg_store_prepare_directories(void)
         osfs3_mkdir("System\\Registry") < 0)
         return 0;
     return 1;
+}
+
+static unsigned reg_shared_priority(BYTE view)
+{
+    /* Existing shared writes supersede incorrectly separated legacy copies.
+     * Old hives have no timestamps; choose 64-bit, then 32-bit consistently. */
+    return view == REG_VIEW_SHARED ? 3 : view;
+}
+
+static void reg_restore_shared_values(void)
+{
+    /* Old kernels stored HKCU\\Software values in separate ABI views. Resolve
+     * them once while loading, so reads, enumeration, replacement and deletion
+     * all operate on one value. Handles keep their view for COM descendants.
+     * Loading itself does not overwrite the persisted hive. */
+    for (int i = 0; i < MAX_REG_VALUES; i++) {
+        REG_VALUE *value = &reg_values[i];
+        if (!value->used || reg_path_is_redirected(value->key_path)) continue;
+        for (int j = i + 1; j < MAX_REG_VALUES; j++) {
+            REG_VALUE *other = &reg_values[j];
+            if (!other->used || reg_stricmp(value->key_path, other->key_path) ||
+                reg_stricmp(value->name, other->name)) continue;
+            if (reg_shared_priority(other->view) > reg_shared_priority(value->view))
+                *value = *other;
+            other->used = 0;
+        }
+        value->view = REG_VIEW_SHARED;
+    }
 }
 
 static int reg_store_load(void)
@@ -478,6 +533,7 @@ static int reg_store_load(void)
     if (valid) {
         for (DWORD i = 0; i < header->value_count; i++) {
             if (!reg_store_view_valid(values[i].view) ||
+                values[i].encoding > REG_DATA_UTF16 ||
                 values[i].data_len > MAX_REG_DATA ||
                 !reg_store_path_valid(values[i].key_path,
                                       sizeof(values[i].key_path)) ||
@@ -513,8 +569,10 @@ static int reg_store_load(void)
             reg_memcpy(reg_values[i].data, values[i].data,
                        values[i].data_len);
         reg_values[i].view = values[i].view;
+        reg_values[i].encoding = values[i].encoding;
         reg_values[i].used = 1;
     }
+    reg_restore_shared_values();
     DWORD key_count = header->key_count;
     DWORD value_count = header->value_count;
     kfree(image);
@@ -534,7 +592,10 @@ static int reg_store_save(void)
     BYTE *image = (BYTE *)kmalloc(REG_STORE_MAX_SIZE);
     if (!image) return 0;
 
-    spin_lock(&reg_store_lock);
+    /* Hive publication holds this lock across filesystem I/O, which can
+     * yield. INT 0x2E shims are cooperatively scheduled: a busy waiter would
+     * prevent the suspended writer from ever releasing the lock. */
+    while (!spin_trylock(&reg_store_lock)) sched_yield();
     spin_lock(&reg_lock);
     DWORD key_count = 0, value_count = 0;
     for (int i = 0; i < MAX_REG_KEYS; i++)
@@ -573,6 +634,7 @@ static int reg_store_save(void)
         values[value_index].type = reg_values[i].type;
         values[value_index].data_len = reg_values[i].data_len;
         values[value_index].view = reg_values[i].view;
+        values[value_index].encoding = reg_values[i].encoding;
         reg_strcpy(values[value_index].key_path, reg_values[i].key_path);
         reg_strcpy(values[value_index].name, reg_values[i].name);
         if (reg_values[i].data_len)
@@ -650,6 +712,48 @@ void advapi32_reg_install_set(const char *path_lc_backslash, const char *name,
     reg_store_maybe_flush(0);
 }
 
+static REG_VALUE *reg_find_value(const char *key_path, const char *name,
+                                 BYTE view);
+
+static void reg_seed_platform_defaults(void)
+{
+    /* The Win32 platform provides the core API namespace; legacy DirectX
+     * setup supplies the optional side-by-side DLLs. This version identifies
+     * the compatibility profile used by setup, not graphics device support.
+     * Device creation/capability queries still report the backend's limits.
+     * Never infer that an optional runtime has already been installed. */
+    static const char *const paths[] = {
+        "hklm\\software",
+        "hklm\\software\\microsoft",
+        "hklm\\software\\microsoft\\directx"
+    };
+    static const char version[] = "4.09.00.0904";
+    const char *directx = paths[2];
+    for (BYTE view = REG_VIEW_32; view <= REG_VIEW_64; view++) {
+        int ready = 1;
+        for (unsigned i = 0; i < sizeof(paths)/sizeof(paths[0]); i++) {
+            ULONG previous = next_handle_id;
+            if (!reg_ensure_key(paths[i], view)) {
+                ready = 0;
+                break;
+            }
+            if (next_handle_id != previous) reg_mark_dirty_locked();
+        }
+        /* Preserve persisted overrides, even empty/differently typed values,
+         * and values in a legacy shared view. Only missing values are seeded.
+         * The initializer owns the store until reg_init_state becomes 2. */
+        if (ready && !reg_find_value(directx, "Version", view)) {
+            if (reg_set_value_view(directx, "Version", REG_SZ, version,
+                                   sizeof(version), view) == ERROR_SUCCESS)
+                reg_mark_dirty_locked();
+            else
+                ready = 0;
+        }
+        if (!ready)
+            serial_puts("[REG-STORE] platform metadata exceeds hive capacity\n");
+    }
+}
+
 static void reg_init(void)
 {
     DWORD state = __atomic_load_n(&reg_init_state, __ATOMIC_ACQUIRE);
@@ -667,12 +771,13 @@ static void reg_init(void)
         if (osfs2_is_mounted()) (void)reg_store_load();
         else
             serial_puts("[REG-STORE] filesystem unavailable; volatile registry\n");
+        reg_seed_platform_defaults();
         __atomic_store_n(&reg_init_state, 2, __ATOMIC_RELEASE);
         return;
     }
 
     while (__atomic_load_n(&reg_init_state, __ATOMIC_ACQUIRE) == 1)
-        __asm__ volatile ("pause");
+        sched_yield(); /* The initializer may be suspended in hive I/O. */
 
 }
 
@@ -767,14 +872,16 @@ LONG WINAPI RegOpenKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD ulOptions,
     serial_puts("\n");
 #endif
 
-    /* A key exists in this view if either a key object or a value is visible.
+    /* The store can contain a descendant without a materialized ancestor
+     * (including hives saved by older kernels). Its ancestors still exist in
+     * that view, even when no value was written on the ancestor itself.
      * Materialize a view-specific handle even for shared keys so descendants
      * inherit the caller's selected view. */
     int exists = 0;
     for (int i = 0; i < MAX_REG_KEYS; i++) {
         if (reg_keys[i].used &&
-            reg_stricmp(reg_keys[i].path, path) == 0 &&
-            (!reg_path_is_redirected(path) || reg_keys[i].view == view)) {
+            reg_path_has_prefix(reg_keys[i].path, path) &&
+            reg_view_visible(reg_keys[i].path, reg_keys[i].view, view)) {
             exists = 1;
             break;
         }
@@ -783,8 +890,8 @@ LONG WINAPI RegOpenKeyExA(HKEY hKey, PCSTR lpSubKey, DWORD ulOptions,
     if (!exists) {
         for (int i = 0; i < MAX_REG_VALUES; i++) {
             if (reg_values[i].used &&
-                reg_stricmp(reg_values[i].key_path, path) == 0 &&
-                reg_view_visible(path, reg_values[i].view, view)) {
+                reg_path_has_prefix(reg_values[i].key_path, path) &&
+                reg_view_visible(reg_values[i].key_path, reg_values[i].view, view)) {
                 exists = 1;
                 break;
             }
@@ -869,10 +976,48 @@ static LONG WINAPI RegCreateKeyA_k32(HKEY hKey, PCSTR lpSubKey,
                            NULL, phkResult, NULL);
 }
 
-LONG WINAPI RegQueryValueExA(HKEY hKey, PCSTR lpValueName, DWORD *lpReserved,
-                             DWORD *lpType, BYTE *lpData, DWORD *lpcbData)
+static LONG reg_copy_value_data(const REG_VALUE *value, int wide,
+                                DWORD *type, BYTE *data, DWORD *size)
 {
-    (void)lpReserved;
+    if (data && !size) return 87; /* ERROR_INVALID_PARAMETER */
+    if (type) *type = value->type;
+    if (!size) return ERROR_SUCCESS;
+    const BYTE *source = value->data;
+    DWORD bytes = value->data_len;
+    union { WCHAR wide[MAX_REG_DATA]; BYTE bytes[MAX_REG_DATA * 2]; } converted;
+    if (bytes && reg_string_type(value->type) &&
+        ((wide && value->encoding == REG_DATA_ANSI) ||
+         (!wide && value->encoding == REG_DATA_UTF16))) {
+        DWORD saved_error = GetLastError();
+        int count;
+        if (wide) {
+            count = MultiByteToWideChar(0, 0, (PCSTR)value->data, bytes,
+                                        converted.wide, MAX_REG_DATA);
+            bytes = count > 0 ? (DWORD)count * sizeof(WCHAR) : 0;
+        } else {
+            count = WideCharToMultiByte(0, 0, (PCWSTR)value->data,
+                                        bytes / sizeof(WCHAR),
+                                        (PSTR)converted.bytes,
+                                        sizeof(converted.bytes), NULL, NULL);
+            bytes = count > 0 ? (DWORD)count : 0;
+        }
+        SetLastError(saved_error);
+        if (count <= 0) return 1113; /* ERROR_NO_UNICODE_TRANSLATION */
+        source = converted.bytes;
+    }
+    DWORD capacity = *size;
+    *size = bytes;
+    if (data) {
+        if (capacity < bytes) return ERROR_MORE_DATA;
+        reg_memcpy(data, source, bytes);
+    }
+    return ERROR_SUCCESS;
+}
+
+static LONG reg_query_value_encoded(HKEY hKey, PCSTR lpValueName,
+                                     DWORD *lpType, BYTE *lpData,
+                                     DWORD *lpcbData, int wide)
+{
     reg_init();
 
     const char *key_path = NULL;
@@ -897,26 +1042,21 @@ LONG WINAPI RegQueryValueExA(HKEY hKey, PCSTR lpValueName, DWORD *lpReserved,
     REG_VALUE *value = reg_find_value(key_path, val_name, view);
     if (value) snapshot = *value;
     spin_unlock(&reg_lock);
-    if (value) {
-        if (lpType) *lpType = snapshot.type;
-
-        if (lpcbData) {
-            if (lpData) {
-                if (*lpcbData < snapshot.data_len) {
-                    *lpcbData = snapshot.data_len;
-                    return ERROR_MORE_DATA;
-                }
-                reg_memcpy(lpData, snapshot.data, snapshot.data_len);
-            }
-            *lpcbData = snapshot.data_len;
-        }
-        return ERROR_SUCCESS;
-    }
+    if (value)
+        return reg_copy_value_data(&snapshot, wide, lpType, lpData, lpcbData);
 
 #ifndef OK_QUIET
     serial_puts("[REG]   value not found\n");
 #endif
     return ERROR_FILE_NOT_FOUND;
+}
+
+LONG WINAPI RegQueryValueExA(HKEY hKey, PCSTR lpValueName, DWORD *lpReserved,
+                             DWORD *lpType, BYTE *lpData, DWORD *lpcbData)
+{
+    (void)lpReserved;
+    return reg_query_value_encoded(hKey, lpValueName, lpType, lpData,
+                                    lpcbData, 0);
 }
 
 LONG WINAPI RegSetValueExA(HKEY hKey, PCSTR lpValueName, DWORD Reserved,
@@ -939,6 +1079,16 @@ LONG WINAPI RegSetValueExA(HKEY hKey, PCSTR lpValueName, DWORD Reserved,
     spin_unlock(&reg_lock);
     if (status == ERROR_SUCCESS) reg_store_maybe_flush(0);
     return status;
+}
+
+static LONG WINAPI RegDisablePredefinedCache(void)
+{
+    /* Neither HKCU nor the other predefined roots cache opened handles:
+     * build_path/reg_key_context resolve the pseudo-handle on every use.
+     * Both cache-disable APIs therefore already have their requested policy.
+     * Do not initialize/flush the hive, close caller handles, or set LastError.
+     * Per-user HKCU/HKU mapping remains a separate registry limitation. */
+    return ERROR_SUCCESS;
 }
 
 LONG WINAPI RegCloseKey(HKEY hKey)
@@ -1214,6 +1364,36 @@ LONG WINAPI RegEnumKeyExA(HKEY hKey, DWORD dwIndex, PSTR lpName,
     return ERROR_MORE_DATA;
 }
 
+LONG WINAPI RegEnumKeyA(HKEY hKey, DWORD index, PSTR name, DWORD capacity)
+{
+    char child[MAX_REG_PATH];
+    DWORD length = sizeof(child);
+    LONG status = RegEnumKeyExA(hKey, index, child, &length, NULL,
+                                NULL, NULL, NULL);
+    if (status != ERROR_SUCCESS)
+        return status == ERROR_FILE_NOT_FOUND ? 6 : status;
+    if (!name) return 87;
+    if (capacity > length) {
+        reg_strcpy(name, child);
+        return ERROR_SUCCESS;
+    }
+    /* The native ANSI legacy API writes a terminated, one-character-short
+     * name when capacity equals the name length, still returning MORE_DATA.
+     * Smaller buffers remain untouched. The wide API does not truncate. */
+    if (capacity == length && capacity) {
+        for (DWORD i = 0; i + 1 < capacity; i++) name[i] = child[i];
+        name[capacity - 1] = 0;
+    }
+    return ERROR_MORE_DATA;
+}
+
+LONG WINAPI RegEnumKeyW(HKEY hKey, DWORD index, PWSTR name, DWORD capacity)
+{
+    LONG status = RegEnumKeyExW(hKey, index, name, &capacity, NULL,
+                                NULL, NULL, NULL);
+    return status == ERROR_FILE_NOT_FOUND ? 6 : status;
+}
+
 LONG WINAPI RegEnumValueA(HKEY hKey, DWORD dwIndex, PSTR lpValueName,
                           DWORD *lpcchValueName, DWORD *lpReserved,
                           DWORD *lpType, BYTE *lpData, DWORD *lpcbData)
@@ -1246,16 +1426,7 @@ LONG WINAPI RegEnumValueA(HKEY hKey, DWORD dwIndex, PSTR lpValueName,
         reg_strcpy(lpValueName, snapshot.name);
         *lpcchValueName = name_len;
     }
-    if (lpType) *lpType = snapshot.type;
-    if (lpcbData) {
-        if (lpData && *lpcbData < snapshot.data_len) {
-            *lpcbData = snapshot.data_len;
-            return ERROR_MORE_DATA;
-        }
-        if (lpData) reg_memcpy(lpData, snapshot.data, snapshot.data_len);
-        *lpcbData = snapshot.data_len;
-    }
-    return ERROR_SUCCESS;
+    return reg_copy_value_data(&snapshot, 0, lpType, lpData, lpcbData);
 }
 
 LONG WINAPI RegEnumKeyExW(HKEY hKey, DWORD dwIndex, PWSTR lpName,
@@ -1328,8 +1499,10 @@ LONG WINAPI RegQueryInfoKeyW(HKEY hKey, PWSTR lpClass, DWORD *lpcchClass,
         DWORD name_len = (DWORD)reg_strlen(value->name);
         values++;
         if (name_len > max_value_name_len) max_value_name_len = name_len;
-        if (value->data_len > max_value_len)
-            max_value_len = value->data_len;
+        DWORD bytes = value->data_len;
+        if (reg_string_type(value->type) && value->encoding == REG_DATA_ANSI)
+            bytes *= sizeof(WCHAR);
+        if (bytes > max_value_len) max_value_len = bytes;
     }
     spin_unlock(&reg_lock);
 
@@ -1449,6 +1622,8 @@ LONG WINAPI RegCreateKeyExW(HKEY hKey, PCWSTR lpSubKey, DWORD Reserved,
 LONG WINAPI RegSetValueExW(HKEY hKey, PCWSTR lpValueName, DWORD Reserved,
                            DWORD dwType, const BYTE *lpData, DWORD cbData)
 {
+    (void)Reserved;
+    reg_init();
     char ansi_name[128];
     wide_to_ansi(ansi_name, lpValueName, 128);
 #ifndef OK_QUIET
@@ -1456,7 +1631,22 @@ LONG WINAPI RegSetValueExW(HKEY hKey, PCWSTR lpValueName, DWORD Reserved,
     serial_puts(ansi_name);
     serial_puts("\n");
 #endif
-    return RegSetValueExA(hKey, ansi_name, Reserved, dwType, lpData, cbData);
+    const char *path = NULL;
+    BYTE view;
+    spin_lock(&reg_lock);
+    if (!reg_key_context(hKey, &path, &view)) {
+        spin_unlock(&reg_lock);
+        return ERROR_FILE_NOT_FOUND;
+    }
+    LONG status = reg_set_value_view(path, ansi_name, dwType, lpData, cbData, view);
+    if (status == ERROR_SUCCESS) {
+        REG_VALUE *value = reg_find_value(path, ansi_name, view);
+        value->encoding = reg_string_type(dwType) ? REG_DATA_UTF16 : REG_DATA_LEGACY;
+        reg_mark_dirty_locked();
+    }
+    spin_unlock(&reg_lock);
+    if (status == ERROR_SUCCESS) reg_store_maybe_flush(0);
+    return status;
 }
 
 LONG WINAPI RegOpenKeyExW(HKEY hKey, PCWSTR lpSubKey, DWORD ulOptions,
@@ -1472,9 +1662,15 @@ LONG WINAPI RegOpenKeyExW(HKEY hKey, PCWSTR lpSubKey, DWORD ulOptions,
     return RegOpenKeyExA(hKey, ansi_subkey, ulOptions, samDesired, phkResult);
 }
 
+static LONG WINAPI RegOpenKeyW(HKEY key, PCWSTR subkey, PHKEY result)
+{
+    return RegOpenKeyExW(key, subkey, 0, 0, result);
+}
+
 LONG WINAPI RegQueryValueExW(HKEY hKey, PCWSTR lpValueName, DWORD *lpReserved,
                              DWORD *lpType, BYTE *lpData, DWORD *lpcbData)
 {
+    (void)lpReserved;
     char ansi_name[128];
     wide_to_ansi(ansi_name, lpValueName, 128);
 #ifndef OK_QUIET
@@ -1482,7 +1678,7 @@ LONG WINAPI RegQueryValueExW(HKEY hKey, PCWSTR lpValueName, DWORD *lpReserved,
     serial_puts(ansi_name);
     serial_puts("\n");
 #endif
-    return RegQueryValueExA(hKey, ansi_name, lpReserved, lpType, lpData, lpcbData);
+    return reg_query_value_encoded(hKey, ansi_name, lpType, lpData, lpcbData, 1);
 }
 
 LONG WINAPI RegEnumValueW(HKEY hKey, DWORD dwIndex, PWSTR lpValueName,
@@ -1519,17 +1715,7 @@ LONG WINAPI RegEnumValueW(HKEY hKey, DWORD dwIndex, PWSTR lpValueName,
         lpValueName[name_len] = 0;
     }
     if (lpcchValueName) *lpcchValueName = name_len;
-    if (lpType) *lpType = snapshot.type;
-
-    if (lpcbData) {
-        if (lpData && *lpcbData < snapshot.data_len) {
-            *lpcbData = snapshot.data_len;
-            return ERROR_MORE_DATA;
-        }
-        if (lpData) reg_memcpy(lpData, snapshot.data, snapshot.data_len);
-        *lpcbData = snapshot.data_len;
-    }
-    return ERROR_SUCCESS;
+    return reg_copy_value_data(&snapshot, 1, lpType, lpData, lpcbData);
 }
 
 LONG WINAPI RegDeleteValueW(HKEY hKey, PCWSTR lpValueName)
@@ -2031,12 +2217,195 @@ BOOL WINAPI CryptReleaseContext(HCRYPTPROV provider, DWORD flags)
     return TRUE;
 }
 
+/* Hash state is process-owned and independent of application pointers. The
+ * provider lock protects identities/state transitions, never a bulk digest. */
+#define MAX_CRYPT_HASHES 256
+enum { CRYPT_HASH_FREE, CRYPT_HASH_READY, CRYPT_HASH_BUSY };
+typedef struct {
+    ULONG_PTR handle;
+    HCRYPTPROV provider;
+    DWORD owner, algorithm, size, state;
+    BOOL finished;
+    union {
+        br_md5_context md5;
+        br_sha1_context sha1;
+        br_sha256_context sha256;
+        br_sha512_context sha512;
+    } value;
+} CRYPT_HASH_CONTEXT;
+static CRYPT_HASH_CONTEXT crypt_hashes[MAX_CRYPT_HASHES];
+static DWORD crypt_next_hash = 0xB1000000U;
+
+static CRYPT_HASH_CONTEXT *crypt_hash_acquire(ULONG_PTR handle)
+{
+    if (!handle || handle > 0xffffffffU) return NULL;
+    DWORD owner = crypt_current_process_id();
+    for (;;) {
+        uint64_t irq_flags = crypt_lock_irqsave();
+        CRYPT_HASH_CONTEXT *found = NULL;
+        BOOL busy = FALSE;
+        for (unsigned i = 0; i < MAX_CRYPT_HASHES; i++) {
+            CRYPT_HASH_CONTEXT *context = &crypt_hashes[i];
+            if (context->state == CRYPT_HASH_FREE || context->handle != handle ||
+                context->owner != owner) continue;
+            if (context->state == CRYPT_HASH_READY) {
+                context->state = CRYPT_HASH_BUSY;
+                found = context;
+            } else busy = TRUE;
+            break;
+        }
+        crypt_unlock_irqrestore(irq_flags);
+        if (found || !busy) return found;
+        sched_yield();
+    }
+}
+
+static BOOL crypt_hash_finish(CRYPT_HASH_CONTEXT *context, DWORD error)
+{
+    if (context) {
+        uint64_t irq_flags = crypt_lock_irqsave();
+        context->state = CRYPT_HASH_READY;
+        crypt_unlock_irqrestore(irq_flags);
+    }
+    if (error) SetLastError(error);
+    return error == 0;
+}
+
+static BOOL WINAPI CryptCreateHash(HCRYPTPROV provider, DWORD algorithm,
+                                    ULONG_PTR key, DWORD flags, PVOID output)
+{
+    if (!win32_user_range_writable(output, g_compat32_mode ? 4 : 8, g_compat32_mode)) {
+        SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
+    }
+    DWORD owner = crypt_current_process_id();
+    uint64_t irq_flags = crypt_lock_irqsave();
+    CRYPT_PROVIDER_CONTEXT *provider_context = crypt_provider_lookup_locked(provider, owner);
+    DWORD error = 0, size = 0;
+    CRYPT_HASH_CONTEXT *context = NULL;
+    if (!provider_context) error = ERROR_INVALID_PARAMETER;
+    else if (flags) error = NTE_BAD_FLAGS;
+    else if (key) error = 0x80090003U; /* NTE_BAD_KEY: no keyed hash surface. */
+    else {
+        DWORD type = provider_context->provider_type;
+        if (type == PROV_RSA_FULL || type == PROV_RSA_AES) {
+            if (algorithm == 0x8003) size = 16; /* CALG_MD5 */
+            if (algorithm == 0x8004) size = 20; /* CALG_SHA1 */
+            if (type == PROV_RSA_AES) {
+                if (algorithm == 0x800c) size = 32;
+                if (algorithm == 0x800d) size = 48;
+                if (algorithm == 0x800e) size = 64;
+            }
+        }
+        if (!size) error = 0x80090008U; /* NTE_BAD_ALGID */
+        else {
+            for (unsigned i = 0; i < MAX_CRYPT_HASHES; i++)
+                if (crypt_hashes[i].state == CRYPT_HASH_FREE) { context = &crypt_hashes[i]; break; }
+            if (!context || crypt_next_hash == 0xffffffffU) error = NTE_NO_MEMORY;
+        }
+    }
+    if (!error) {
+        memset(context, 0, sizeof(*context));
+        context->handle = ++crypt_next_hash;
+        context->provider = provider;
+        context->owner = owner;
+        context->algorithm = algorithm;
+        context->size = size;
+        context->state = CRYPT_HASH_BUSY;
+    }
+    crypt_unlock_irqrestore(irq_flags);
+    if (error) { SetLastError(error); return FALSE; }
+    switch (algorithm) {
+    case 0x8003: br_md5_init(&context->value.md5); break;
+    case 0x8004: br_sha1_init(&context->value.sha1); break;
+    case 0x800c: br_sha256_init(&context->value.sha256); break;
+    case 0x800d: br_sha384_init(&context->value.sha512); break;
+    case 0x800e: br_sha512_init(&context->value.sha512); break;
+    }
+    crypt_store_provider(output, context->handle);
+    return crypt_hash_finish(context, 0);
+}
+
+static BOOL WINAPI CryptHashData(ULONG_PTR handle, const BYTE *data,
+                                  DWORD length, DWORD flags)
+{
+    CRYPT_HASH_CONTEXT *context = crypt_hash_acquire(handle);
+    if (!context) return crypt_hash_finish(NULL, ERROR_INVALID_PARAMETER);
+    if (flags & ~1U) return crypt_hash_finish(context, NTE_BAD_FLAGS);
+    /* The Microsoft CSP ignores CRYPT_USERDATA. A zero-byte update is also
+     * accepted after finalization; it does not change the hash state. */
+    if (!length) return crypt_hash_finish(context, 0);
+    if (context->finished) return crypt_hash_finish(context, 0x8009000cU);
+    if (!win32_user_range_readable(data, length, g_compat32_mode))
+        return crypt_hash_finish(context, ERROR_INVALID_PARAMETER);
+    for (DWORD offset = 0; offset < length;) {
+        DWORD bytes = length - offset;
+        if (bytes > 65536U) bytes = 65536U;
+        switch (context->algorithm) {
+        case 0x8003: br_md5_update(&context->value.md5, data + offset, bytes); break;
+        case 0x8004: br_sha1_update(&context->value.sha1, data + offset, bytes); break;
+        case 0x800c: br_sha256_update(&context->value.sha256, data + offset, bytes); break;
+        case 0x800d: case 0x800e:
+            br_sha512_update(&context->value.sha512, data + offset, bytes); break;
+        }
+        offset += bytes;
+        if (offset < length) sched_yield();
+    }
+    return crypt_hash_finish(context, 0);
+}
+
+static BOOL WINAPI CryptGetHashParam(ULONG_PTR handle, DWORD parameter,
+                                      BYTE *data, DWORD *length, DWORD flags)
+{
+    CRYPT_HASH_CONTEXT *context = crypt_hash_acquire(handle);
+    if (!context) return crypt_hash_finish(NULL, ERROR_INVALID_PARAMETER);
+    if (flags) return crypt_hash_finish(context, NTE_BAD_FLAGS);
+    if (parameter != 1 && parameter != 2 && parameter != 4)
+        return crypt_hash_finish(context, 0x8009000aU); /* NTE_BAD_TYPE */
+    if (!win32_user_range_writable(length, sizeof(*length), g_compat32_mode))
+        return crypt_hash_finish(context, ERROR_INVALID_PARAMETER);
+    DWORD needed = parameter == 2 ? context->size : 4;
+    DWORD capacity = *length;
+    *length = needed;
+    if (!data) return crypt_hash_finish(context, 0);
+    if (capacity < needed) return crypt_hash_finish(context, ERROR_MORE_DATA);
+    if (!win32_user_range_writable(data, needed, g_compat32_mode))
+        return crypt_hash_finish(context, ERROR_INVALID_PARAMETER);
+    if (parameter == 1) memcpy(data, &context->algorithm, sizeof(DWORD));
+    else if (parameter == 4) memcpy(data, &context->size, sizeof(DWORD));
+    else {
+        switch (context->algorithm) {
+        case 0x8003: br_md5_out(&context->value.md5, data); break;
+        case 0x8004: br_sha1_out(&context->value.sha1, data); break;
+        case 0x800c: br_sha256_out(&context->value.sha256, data); break;
+        case 0x800d: br_sha384_out(&context->value.sha512, data); break;
+        case 0x800e: br_sha512_out(&context->value.sha512, data); break;
+        }
+        context->finished = TRUE;
+    }
+    return crypt_hash_finish(context, 0);
+}
+
+static BOOL WINAPI CryptDestroyHash(ULONG_PTR handle)
+{
+    CRYPT_HASH_CONTEXT *context = crypt_hash_acquire(handle);
+    if (!context) return crypt_hash_finish(NULL, ERROR_INVALID_PARAMETER);
+    uint64_t irq_flags = crypt_lock_irqsave();
+    memset(context, 0, sizeof(*context));
+    crypt_unlock_irqrestore(irq_flags);
+    return TRUE;
+}
+
 DWORD advapi32_crypto_release_process(DWORD process_id)
 {
     if (!process_id) return 0;
 
     DWORD released = 0;
     uint64_t irq_flags = crypt_lock_irqsave();
+    /* All owned workers have stopped before this hook. Hash contexts may
+     * have been abandoned while busy, so reclaim every state for the owner. */
+    for (unsigned i = 0; i < MAX_CRYPT_HASHES; i++)
+        if (crypt_hashes[i].state != CRYPT_HASH_FREE && crypt_hashes[i].owner == process_id)
+            memset(&crypt_hashes[i], 0, sizeof(crypt_hashes[i]));
     for (int i = 0; i < MAX_CRYPT_PROVIDERS; i++) {
         CRYPT_PROVIDER_CONTEXT *context = &crypt_providers[i];
         if (!context->used || context->owner_pid != process_id)
@@ -2168,30 +2537,216 @@ static const LOCAL_INTEGRITY_SID g_anonymous_sid = {
 };
 
 typedef struct {
+    PCVOID sid;
+    DWORD sid_size;
+    DWORD attributes;
+} LOCAL_TOKEN_GROUP;
+
+static const LOCAL_INTEGRITY_SID g_everyone_sid = {
+    1, 1, {0, 0, 0, 0, 0, 1}, {0}
+};
+static const LOCAL_INTEGRITY_SID g_authenticated_users_sid = {
+    1, 1, {0, 0, 0, 0, 0, 5}, {11}
+};
+static const BUILTIN_USERS_SID g_builtin_users_sid = {
+    1, 2, {0, 0, 0, 0, 0, 5}, {32, 545}
+};
+static const BUILTIN_USERS_SID g_builtin_admin_sid = {
+    1, 2, {0, 0, 0, 0, 0, 5}, {32, 544}
+};
+static const LOCAL_INTEGRITY_SID g_owner_rights_sid = {
+    1, 1, {0, 0, 0, 0, 0, 3}, {4}
+};
+static const LOCAL_TOKEN_GROUP g_local_token_groups[] = {
+    { &g_everyone_sid, sizeof(g_everyone_sid), 7 },
+    { &g_authenticated_users_sid, sizeof(g_authenticated_users_sid), 7 },
+    { &g_builtin_users_sid, sizeof(g_builtin_users_sid), 7 },
+};
+
+typedef struct {
+    DWORD references;
+    ACL_HEADER acl;
+} TOKEN_DEFAULT_ACL;
+
+typedef struct {
     DWORD token_type;
     DWORD impersonation_level;
     PCVOID user_sid;
     DWORD user_sid_size;
+    ULONGLONG authentication_id;
+    const LOCAL_TOKEN_GROUP *groups;
+    DWORD group_count;
+    DWORD user_attributes;
+    const LOCAL_TOKEN_GROUP *restricted;
+    DWORD restricted_count;
+    DWORD filter_flags;
+    BOOL has_restrictions;
+    BOOL allocated;
+    DWORD references;
+    TOKEN_DEFAULT_ACL *default_dacl;
+    ULONGLONG token_id;
+    ULONGLONG modified_id;
+    DWORD integrity_level;
 } LOCAL_TOKEN_OBJECT;
 
-static const LOCAL_TOKEN_OBJECT g_local_primary_token = {
-    .token_type = 1,             /* TokenPrimary */
-    .impersonation_level = 2,    /* SecurityImpersonation */
-    .user_sid = &g_local_user_sid,
-    .user_sid_size = sizeof(g_local_user_sid),
+/* Immutable identities may be shared by handles and thread impersonation
+ * references. Duplicating changes type/level, not the source token. */
+#define LOCAL_TOKEN_VARIANT(sid, group_list, count, type, level) { \
+    .token_type = type, .impersonation_level = level, \
+    .user_sid = &(sid), .user_sid_size = sizeof(sid), \
+    .groups = group_list, .group_count = count, .integrity_level = 8192 }
+#define LOCAL_TOKEN_VARIANTS(sid, groups, count) { \
+    LOCAL_TOKEN_VARIANT(sid, groups, count, 1, 2), \
+    LOCAL_TOKEN_VARIANT(sid, groups, count, 2, 0), \
+    LOCAL_TOKEN_VARIANT(sid, groups, count, 2, 1), \
+    LOCAL_TOKEN_VARIANT(sid, groups, count, 2, 2), \
+    LOCAL_TOKEN_VARIANT(sid, groups, count, 2, 3) }
+static const LOCAL_TOKEN_OBJECT g_local_tokens[2][5] = {
+    LOCAL_TOKEN_VARIANTS(g_local_user_sid, g_local_token_groups, 3),
+    LOCAL_TOKEN_VARIANTS(g_anonymous_sid, NULL, 0),
 };
-static const LOCAL_TOKEN_OBJECT g_local_impersonation_token = {
-    .token_type = 2,             /* TokenImpersonation */
-    .impersonation_level = 2,
-    .user_sid = &g_local_user_sid,
-    .user_sid_size = sizeof(g_local_user_sid),
-};
-static const LOCAL_TOKEN_OBJECT g_anonymous_token = {
-    .token_type = 2,
-    .impersonation_level = 2,
-    .user_sid = &g_anonymous_sid,
-    .user_sid_size = sizeof(g_anonymous_sid),
-};
+#undef LOCAL_TOKEN_VARIANTS
+#undef LOCAL_TOKEN_VARIANT
+#define g_local_primary_token       g_local_tokens[0][0]
+#define g_local_impersonation_token g_local_tokens[0][3]
+#define g_anonymous_token           g_local_tokens[1][3]
+static DWORD g_token_live_objects;
+static DWORD g_token_live_policies;
+static ULONGLONG g_token_next_luid;
+static spinlock_t g_token_policy_lock = SPINLOCK_INIT;
+
+static uint64_t token_policy_lock(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&g_token_policy_lock);
+    return flags;
+}
+
+static void token_policy_unlock(uint64_t flags)
+{
+    spin_unlock(&g_token_policy_lock);
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+}
+
+static void token_acl_release(TOKEN_DEFAULT_ACL *policy)
+{
+    if (policy && !__atomic_sub_fetch(&policy->references, 1, __ATOMIC_ACQ_REL)) {
+        __atomic_sub_fetch(&g_token_live_policies, 1, __ATOMIC_RELAXED);
+        kfree(policy);
+    }
+}
+
+static TOKEN_DEFAULT_ACL *token_acl_reference(const LOCAL_TOKEN_OBJECT *token)
+{
+    uint64_t flags = token_policy_lock();
+    TOKEN_DEFAULT_ACL *policy = token->default_dacl;
+    if (policy) __atomic_add_fetch(&policy->references, 1, __ATOMIC_RELAXED);
+    token_policy_unlock(flags);
+    return policy;
+}
+
+void advapi32_token_retain(PCVOID object)
+{
+    LOCAL_TOKEN_OBJECT *token = (LOCAL_TOKEN_OBJECT *)object;
+    if (token && token->allocated)
+        __atomic_add_fetch(&token->references, 1, __ATOMIC_RELAXED);
+}
+
+void advapi32_token_release(PCVOID object)
+{
+    LOCAL_TOKEN_OBJECT *token = (LOCAL_TOKEN_OBJECT *)object;
+    if (token && token->allocated &&
+        !__atomic_sub_fetch(&token->references, 1, __ATOMIC_ACQ_REL)) {
+        __atomic_sub_fetch(&g_token_live_objects, 1, __ATOMIC_RELAXED);
+        token_acl_release(token->default_dacl);
+        kfree(token);
+    }
+}
+
+static LOCAL_TOKEN_OBJECT *token_copy(const LOCAL_TOKEN_OBJECT *source,
+                                      const LOCAL_TOKEN_GROUP *restricted,
+                                      DWORD restricted_count)
+{
+    ULONGLONG entries = (ULONGLONG)source->group_count + restricted_count;
+    ULONGLONG size = sizeof(*source) + entries * sizeof(LOCAL_TOKEN_GROUP) +
+                     source->user_sid_size;
+    for (DWORD i = 0; i < source->group_count; i++) size += source->groups[i].sid_size;
+    for (DWORD i = 0; i < restricted_count; i++) size += restricted[i].sid_size;
+    /* TokenInformation lengths use DWORDs in both ABIs. */
+    if (size > 0xffffffffU) { SetLastError(8); return NULL; }
+    LOCAL_TOKEN_OBJECT *copy = kmalloc(size);
+    if (!copy) { SetLastError(8); return NULL; }
+    reg_memset(copy, 0, sizeof(*copy));
+    copy->token_type = source->token_type;
+    copy->impersonation_level = source->impersonation_level;
+    copy->user_sid_size = source->user_sid_size;
+    copy->authentication_id = source->authentication_id;
+    copy->group_count = source->group_count;
+    copy->user_attributes = source->user_attributes;
+    copy->filter_flags = source->filter_flags;
+    copy->has_restrictions = source->has_restrictions;
+    uint64_t flags = token_policy_lock();
+    copy->default_dacl = source->default_dacl;
+    copy->integrity_level = source->integrity_level;
+    if (copy->default_dacl)
+        __atomic_add_fetch(&copy->default_dacl->references, 1, __ATOMIC_RELAXED);
+    token_policy_unlock(flags);
+    copy->token_id = __atomic_add_fetch(&g_token_next_luid, 1, __ATOMIC_RELAXED);
+    copy->modified_id = __atomic_add_fetch(&g_token_next_luid, 1, __ATOMIC_RELAXED);
+    copy->allocated = TRUE;
+    copy->references = 1;
+    __atomic_add_fetch(&g_token_live_objects, 1, __ATOMIC_RELAXED);
+    LOCAL_TOKEN_GROUP *groups = (void *)(copy + 1);
+    BYTE *sid = (void *)(groups + entries);
+    copy->user_sid = sid;
+    reg_memcpy(sid, source->user_sid, source->user_sid_size);
+    sid += source->user_sid_size;
+    copy->groups = groups;
+    copy->restricted = groups + source->group_count;
+    copy->restricted_count = restricted_count;
+    for (ULONGLONG i = 0; i < entries; i++) {
+        const LOCAL_TOKEN_GROUP *input = i < source->group_count
+            ? &source->groups[i] : &restricted[i - source->group_count];
+        groups[i] = *input;
+        groups[i].sid = sid;
+        reg_memcpy(sid, input->sid, input->sid_size);
+        sid += input->sid_size;
+    }
+    return copy;
+}
+
+PVOID advapi32_token_create_primary(PCVOID object)
+{
+    const LOCAL_TOKEN_OBJECT *source = object ? object : &g_local_primary_token;
+    LOCAL_TOKEN_OBJECT *copy = token_copy(source, source->restricted, source->restricted_count);
+    if (copy) {
+        copy->token_type = 1;
+        copy->impersonation_level = 2;
+    }
+    return copy;
+}
+
+PVOID advapi32_token_create_admin_primary(void)
+{
+    static const LOCAL_TOKEN_GROUP groups[] = {
+        { &g_everyone_sid, sizeof(g_everyone_sid), 7 },
+        { &g_authenticated_users_sid, sizeof(g_authenticated_users_sid), 7 },
+        { &g_builtin_users_sid, sizeof(g_builtin_users_sid), 7 },
+        { &g_builtin_admin_sid, sizeof(g_builtin_admin_sid), 15 },
+    };
+    LOCAL_TOKEN_OBJECT source = g_local_primary_token;
+    source.groups = groups;
+    source.group_count = sizeof(groups) / sizeof(groups[0]);
+    source.integrity_level = 12288; /* SECURITY_MANDATORY_HIGH_RID */
+    return advapi32_token_create_primary(&source);
+}
+
+ULONGLONG advapi32_process_logon_id(void)
+{
+    /* The current token model has one local logon session. */
+    return g_local_primary_token.authentication_id;
+}
 
 typedef struct {
     DWORD access_permissions;
@@ -2351,7 +2906,7 @@ static BOOL WINAPI InitializeAcl_stub(PVOID acl, DWORD acl_length, DWORD revisio
 static BOOL acl_measure(const ACL_HEADER *header, DWORD *bytes_in_use)
 {
     if (!header ||
-        (header->revision != ACL_REVISION && header->revision != 4) ||
+        header->revision < ACL_REVISION || header->revision > 4 ||
         header->size < sizeof(*header)) {
         SetLastError(1336); /* ERROR_INVALID_ACL */
         return FALSE;
@@ -2844,6 +3399,142 @@ static BOOL WINAPI AddAccessAllowedAce_stub(PVOID acl, DWORD revision,
     return TRUE;
 }
 
+static DWORD acl_bounded_sid_length(const BYTE *ace, DWORD size, DWORD offset)
+{
+    if (offset > size || size - offset < 8 ||
+        ace[offset] != 1 || ace[offset + 1] > 15)
+        return 0;
+    DWORD length = 8 + 4 * ace[offset + 1];
+    return length <= size - offset ? length : 0;
+}
+
+static DWORD acl_mandatory_measure(const ACL_HEADER *acl, DWORD *used)
+{
+    if (!acl_measure(acl, used)) return ERROR_INVALID_ACL;
+    DWORD offset = sizeof(*acl);
+    for (DWORD i = 0; i < acl->ace_count; i++) {
+        const BYTE *ace = (const BYTE *)acl + offset;
+        DWORD size = *(const USHORT *)(ace + 2);
+        DWORD sid_offset = 8;
+        BOOL known = TRUE;
+        switch (ace[0]) {
+        case 0: case 1: case 2: case 3: /* Basic access/audit ACEs. */
+        case 9: case 10: case 13: case 14: /* Callback ACEs. */
+        case 17: case 19: case 20: /* Label, scoped policy, trust label. */
+            break;
+        case 4: { /* Compound ACE: server SID followed by client SID. */
+            if (acl->revision < 3 || size < 24 ||
+                *(const USHORT *)(ace + 8) != 1) return ERROR_INVALID_ACL;
+            DWORD server = acl_bounded_sid_length(ace, size, 12);
+            if (!server || size < 24 + server) return ERROR_INVALID_ACL;
+            sid_offset = 12 + server;
+            break;
+        }
+        case 5: case 6: case 7: case 8:
+        case 11: case 12: case 15: case 16: { /* Object ACEs. */
+            if (acl->revision < 4 || size < 24) return ERROR_INVALID_ACL;
+            DWORD flags = *(const DWORD *)(ace + 8);
+            sid_offset = 12 + ((flags & 1) ? 16 : 0) + ((flags & 2) ? 16 : 0);
+            break;
+        }
+        case 18: /* Resource claims require a separate relative-claim parser. */
+            return ERROR_NOT_SUPPORTED;
+        case 21: { /* Access-filter ACE carries a conditional expression. */
+            DWORD sid = acl_bounded_sid_length(ace, size, 8);
+            if (!sid || size - 8 - sid < 6 ||
+                *(const DWORD *)(ace + 8 + sid) != 0x78747261)
+                return ERROR_INVALID_ACL;
+            break;
+        }
+        default:
+            known = FALSE; /* Preserve opaque ACEs; do not evaluate them. */
+            break;
+        }
+        if (known && ((size & 3) ||
+                      !acl_bounded_sid_length(ace, size, sid_offset)))
+            return ERROR_INVALID_ACL;
+        offset += size;
+    }
+    return ERROR_SUCCESS;
+}
+
+static BOOL WINAPI AddMandatoryAce_stub(PVOID acl, DWORD revision, DWORD flags,
+                                        DWORD policy, PVOID label_sid)
+{
+    BYTE sid[68];
+    ACL_HEADER captured;
+    if (!win32_user_range_readable(label_sid, 8, g_compat32_mode)) {
+        SetLastError(998); /* ERROR_NOACCESS */
+        return FALSE;
+    }
+    reg_memcpy(sid, label_sid, 8);
+    if (sid[0] != 1 || sid[1] > 15) {
+        SetLastError(1337); /* ERROR_INVALID_SID */
+        return FALSE;
+    }
+    DWORD sid_length = 8 + 4 * sid[1];
+    if (!win32_user_range_readable(label_sid, sid_length, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    reg_memcpy(sid + 8, (const BYTE *)label_sid + 8, sid_length - 8);
+    if (sid[2] || sid[3] || sid[4] || sid[5] || sid[6] || sid[7] != 16) {
+        SetLastError(87); /* SECURITY_MANDATORY_LABEL_AUTHORITY required. */
+        return FALSE;
+    }
+    if (!win32_user_range_readable(acl, sizeof(captured), g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    reg_memcpy(&captured, acl, sizeof(captured));
+    if (revision > 4 || captured.revision > 4) {
+        SetLastError(1306); /* ERROR_REVISION_MISMATCH */
+        return FALSE;
+    }
+    if ((flags & ~0x1fU) || (policy & ~7U)) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    if (((ULONG_PTR)acl & 1) || captured.revision < ACL_REVISION ||
+        captured.size < sizeof(captured)) {
+        SetLastError(ERROR_INVALID_ACL);
+        return FALSE;
+    }
+    if (!win32_user_range_readable(acl, captured.size, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    /* Validate a bounded snapshot before touching the caller's ACL. The SID
+     * is captured too, including when it aliases the destination buffer. */
+    ACL_HEADER *copy = kmalloc(captured.size);
+    if (!copy) { SetLastError(8); return FALSE; }
+    reg_memcpy(copy, acl, captured.size);
+    DWORD used = 0;
+    DWORD error = copy->size != captured.size ? ERROR_INVALID_ACL :
+                  acl_mandatory_measure(copy, &used);
+    DWORD ace_size = 8 + sid_length;
+    if (!error && ace_size > captured.size - used)
+        error = 1344; /* ERROR_ALLOTTED_SPACE_EXCEEDED */
+    if (!error &&
+        (!win32_user_range_writable(acl, sizeof(captured), g_compat32_mode) ||
+         !win32_user_range_writable((BYTE *)acl + used, ace_size, g_compat32_mode)))
+        error = 998;
+    if (!error) {
+        BYTE *ace = (BYTE *)acl + used;
+        ace[0] = 17; /* SYSTEM_MANDATORY_LABEL_ACE_TYPE */
+        ace[1] = (BYTE)flags;
+        *(USHORT *)(ace + 2) = (USHORT)ace_size;
+        *(DWORD *)(ace + 4) = policy;
+        reg_memcpy(ace + 8, sid, sid_length);
+        ACL_HEADER *header = acl;
+        header->ace_count = copy->ace_count + 1;
+        header->revision = (BYTE)(revision > copy->revision ? revision : copy->revision);
+    }
+    kfree(copy);
+    if (error) SetLastError(error);
+    return error == 0;
+}
+
 static BOOL WINAPI InitializeSecurityDescriptor(PVOID descriptor, DWORD revision)
 {
     if (!descriptor || revision != SECURITY_DESCRIPTOR_REVISION) {
@@ -2914,6 +3605,57 @@ static void security_store_pointer(PVOID target, PVOID value)
         *(DWORD *)target = (DWORD)(ULONG_PTR)value;
     else
         *(PVOID *)target = value;
+}
+
+static BOOL security_descriptor_set_identity(PVOID descriptor, PVOID sid,
+                                              BOOL defaulted, BOOL owner)
+{
+    if (!win32_user_range_readable(descriptor, 4, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    if (*(BYTE *)descriptor != SECURITY_DESCRIPTOR_REVISION) {
+        SetLastError(1305); /* ERROR_UNKNOWN_REVISION */
+        return FALSE;
+    }
+    USHORT *control = (USHORT *)((BYTE *)descriptor + 2);
+    if (*control & SE_SELF_RELATIVE) {
+        SetLastError(ERROR_INVALID_SECURITY_DESCR);
+        return FALSE;
+    }
+    SIZE_T size = g_compat32_mode ? sizeof(SECURITY_DESCRIPTOR32)
+                                 : sizeof(SECURITY_DESCRIPTOR64);
+    if (!win32_user_range_writable(descriptor, size, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    /* An absolute descriptor references the caller's SID; it does not copy
+     * or dereference it. NULL clears the identity without clearing its
+     * independently supplied defaulted flag. */
+    if (g_compat32_mode) {
+        SECURITY_DESCRIPTOR32 *sd = descriptor;
+        if (owner) sd->owner = (DWORD)(ULONG_PTR)sid;
+        else sd->group = (DWORD)(ULONG_PTR)sid;
+    } else {
+        SECURITY_DESCRIPTOR64 *sd = descriptor;
+        if (owner) sd->owner = sid;
+        else sd->group = sid;
+    }
+    USHORT flag = owner ? SE_OWNER_DEFAULTED : SE_GROUP_DEFAULTED;
+    *control = (USHORT)((*control & ~flag) | (defaulted ? flag : 0));
+    return TRUE;
+}
+
+static BOOL WINAPI SetSecurityDescriptorOwner(PVOID descriptor, PVOID owner,
+                                                BOOL defaulted)
+{
+    return security_descriptor_set_identity(descriptor, owner, defaulted, TRUE);
+}
+
+static BOOL WINAPI SetSecurityDescriptorGroup(PVOID descriptor, PVOID group,
+                                                BOOL defaulted)
+{
+    return security_descriptor_set_identity(descriptor, group, defaulted, FALSE);
 }
 
 static BOOL WINAPI AllocateAndInitializeSid_stub(
@@ -3412,7 +4154,7 @@ static BOOL set_file_security_common(PCSTR file_name, DWORD security_info,
         return set_file_security_error(ERROR_INVALID_SECURITY_DESCR);
 
     char normalized[260];
-    if (!win32_normalize_path(file_name, normalized))
+    if (!win32_resolve_file_path(file_name, normalized))
         return set_file_security_error(ERROR_FILENAME_EXCED_RANGE);
     vfs_node_t node;
     if (!vfs_find(normalized, VFS_MODE_WIN32, &node)) {
@@ -3889,50 +4631,374 @@ static BOOL WINAPI LookupAccountNameW_stub(
     return TRUE;
 }
 
-static BOOL WINAPI OpenProcessToken_stub(HANDLE process,
-                                          DWORD desired_access,
-                                          PHANDLE token)
+static DWORD token_map_access(DWORD access)
 {
-    if (!token) {
-        SetLastError(87); /* ERROR_INVALID_PARAMETER */
-        return FALSE;
-    }
+    const GENERIC_MAPPING mapping = {0x2001a, 0x201e0, 0x20005, 0xf01ff};
+    MapGenericMask(&access, &mapping);
+    if (access & 0x02000000) /* MAXIMUM_ALLOWED for the local token owner */
+        access = (access & ~0x02000000U) | mapping.GenericAll;
+    return access;
+}
 
-    ULONG_PTR process_value = (ULONG_PTR)process;
-    DWORD process_id = win32_current_process_id();
-    if (process_value != (ULONG_PTR)NT_CURRENT_PROCESS &&
-        (DWORD)process_value != 0xFFFFFFFFU &&
-        !nt_process_id(process, &process_id)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
-        return FALSE;
-    }
+NTSTATUS advapi32_open_token(HANDLE source, ACCESS_MASK access, ULONG attributes,
+                            BOOL thread, BOOL open_as_self, PHANDLE output)
+{
+    if (!output) return STATUS_INVALID_PARAMETER;
+    ULONG_PTR value = (ULONG_PTR)source;
+    if (g_compat32_mode && value == 0xffffffffU) source = NT_CURRENT_PROCESS;
+    if (g_compat32_mode && value == 0xfffffffeU) source = NT_CURRENT_THREAD;
+    if (source == (thread ? NT_CURRENT_PROCESS : NT_CURRENT_THREAD))
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    if (source != (thread ? NT_CURRENT_THREAD : NT_CURRENT_PROCESS) &&
+        value > 0xffffffffU) return STATUS_INVALID_HANDLE;
 
-    HANDLE new_token = NULL;
-    NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_TOKEN,
-                                   desired_access,
-                                   (PVOID)&g_local_primary_token,
-                                   &new_token);
-    if (!NT_SUCCESS(status)) {
-        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+    PVOID object = NULL;
+    NTSTATUS status = thread ? nt_thread_reference_impersonation_token(source, &object)
+                            : nt_process_reference_primary_token(source, &object);
+    if (!NT_SUCCESS(status)) return status;
+    const LOCAL_TOKEN_OBJECT *token = object;
+    if (thread && token->impersonation_level == 0) {
+        status = STATUS_CANT_OPEN_ANONYMOUS;
+        goto done;
+    }
+    if (!thread || !open_as_self) {
+        const LOCAL_TOKEN_OBJECT *subject = nt_thread_get_impersonation_token(
+            win32_current_thread_object());
+        BOOL bad_level = subject && subject->impersonation_level < 2;
+        advapi32_token_release(subject);
+        if (bad_level) { status = STATUS_BAD_IMPERSONATION_LEVEL; goto done; }
+    }
+    if (attributes & OBJ_OPENLINK) { status = STATUS_INVALID_PARAMETER; goto done; }
+    /* The local token model has no SeSecurityPrivilege. Generic rights must
+     * be mapped before validating the token object's supported access mask. */
+    access = token_map_access(access);
+    if (access & 0x01000000U) { status = STATUS_PRIVILEGE_NOT_HELD; goto done; }
+    if (!access || (access & ~0x000f01ffU)) { status = STATUS_ACCESS_DENIED; goto done; }
+    HANDLE handle = NULL;
+    status = handle_alloc(&g_handle_table, OBJ_TYPE_TOKEN, access, object, &handle);
+    if (NT_SUCCESS(status) && (attributes & OBJ_INHERIT)) {
+        status = handle_update_flags_for_process(&g_handle_table, handle,
+            win32_current_process_id(), HANDLE_USER_FLAG_INHERIT, HANDLE_USER_FLAG_INHERIT);
+        if (!NT_SUCCESS(status)) handle_close(&g_handle_table, handle);
+    }
+    if (NT_SUCCESS(status)) *output = handle;
+done:
+    advapi32_token_release(object);
+    return status;
+}
+
+static BOOL token_open_win32(HANDLE source, DWORD access, BOOL thread,
+                            BOOL open_as_self, PHANDLE output)
+{
+    if (!output) { SetLastError(87); return FALSE; }
+    if (!win32_user_range_writable(output, g_compat32_mode ? 4 : sizeof(HANDLE),
+                                   g_compat32_mode)) {
+        SetLastError(998);
         return FALSE;
     }
-    if (g_compat32_mode)
-        *(DWORD *)(void *)token = (DWORD)(ULONG_PTR)new_token;
-    else
-        *token = new_token;
+    HANDLE handle = NULL;
+    NTSTATUS status = advapi32_open_token(source, access, 0, thread, open_as_self, &handle);
+    if (!NT_SUCCESS(status)) { SetLastError(RtlNtStatusToDosError(status)); return FALSE; }
+    if (g_compat32_mode) *(DWORD *)(void *)output = (DWORD)(ULONG_PTR)handle;
+    else *output = handle;
     SetLastError(0);
     return TRUE;
 }
 
-static const LOCAL_TOKEN_OBJECT *token_object_info(PVOID object)
+static BOOL WINAPI OpenProcessToken_stub(HANDLE process, DWORD access, PHANDLE token)
 {
-    if (object == &g_local_primary_token)
-        return &g_local_primary_token;
-    if (object == &g_local_impersonation_token)
-        return &g_local_impersonation_token;
-    if (object == &g_anonymous_token)
-        return &g_anonymous_token;
-    return NULL;
+    return token_open_win32(process, access, FALSE, FALSE, token);
+}
+
+static const LOCAL_TOKEN_OBJECT *token_query_access(HANDLE token,
+                                                     DWORD required,
+                                                     DWORD *granted)
+{
+    PVOID object = NULL;
+    ACCESS_MASK access = 0;
+    NTSTATUS status = handle_reference_token_for_process(
+        &g_handle_table, token, win32_current_process_id(), required, &object, &access);
+    if (!NT_SUCCESS(status)) {
+        SetLastError(status == STATUS_ACCESS_DENIED ? 5 : 6);
+        return NULL;
+    }
+    if (granted) *granted = access;
+    return object;
+}
+
+static BOOL token_sid_equal(PCVOID left, PCVOID right)
+{
+    const BYTE *a = left, *b = right;
+    if (!a || !b || a[0] != 1 || b[0] != 1 || a[1] != b[1] || a[1] > 15)
+        return FALSE;
+    for (DWORD i = 0; i < 8U + 4U * a[1]; i++)
+        if (a[i] != b[i]) return FALSE;
+    return TRUE;
+}
+
+static BOOL token_has_sid(const LOCAL_TOKEN_OBJECT *token, PCVOID sid,
+                          BOOL denying, BOOL owner)
+{
+    if (token_sid_equal(token->user_sid, sid))
+        return !(token->user_attributes & 0x10) || (denying && !owner);
+    for (DWORD i = 0; i < token->group_count; i++) {
+        const LOCAL_TOKEN_GROUP *group = &token->groups[i];
+        DWORD flags = group->attributes;
+        if (owner && !(flags & 8)) continue; /* SE_GROUP_OWNER */
+        if (flags & 0x10) { /* SE_GROUP_USE_FOR_DENY_ONLY */
+            if (!denying || owner) continue;
+        } else if (!(flags & 4)) {
+            continue; /* SE_GROUP_ENABLED */
+        }
+        if (token_sid_equal(group->sid, sid)) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL token_membership_enabled(const LOCAL_TOKEN_OBJECT *token, PCVOID sid)
+{
+    if (!token_has_sid(token, sid, FALSE, FALSE)) return FALSE;
+    if (!token->restricted_count) return TRUE;
+    for (DWORD i = 0; i < token->restricted_count; i++) {
+        const LOCAL_TOKEN_GROUP *group = &token->restricted[i];
+        if ((group->attributes & 4) && !(group->attributes & 0x10) &&
+            token_sid_equal(group->sid, sid)) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL WINAPI CheckTokenMembership(HANDLE token, PVOID sid_to_check,
+                                          BOOL *is_member)
+{
+    DWORD saved_error = GetLastError();
+    if (!win32_user_range_writable(is_member, sizeof(*is_member), g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    *is_member = FALSE;
+    BYTE sid[68];
+    if (!win32_user_range_readable(sid_to_check, 8, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    reg_memcpy(sid, sid_to_check, 8);
+    if (sid[0] != 1 || sid[1] > 15) {
+        SetLastError(1337);
+        return FALSE;
+    }
+    DWORD size = 8 + 4 * sid[1];
+    if (!win32_user_range_readable(sid_to_check, size, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    reg_memcpy(sid + 8, (const BYTE *)sid_to_check + 8, size - 8);
+
+    HANDLE opened = NULL;
+    BOOL implicit = token == NULL;
+    BOOL primary_fallback = FALSE;
+    if (implicit) {
+        NTSTATUS status = advapi32_open_token(NT_CURRENT_THREAD, 8, 0,
+                                              TRUE, FALSE, &opened);
+        if (status == STATUS_NO_TOKEN) {
+            status = advapi32_open_token(NT_CURRENT_PROCESS, 8, 0,
+                                         FALSE, FALSE, &opened);
+            primary_fallback = TRUE;
+        }
+        if (!NT_SUCCESS(status)) {
+            SetLastError(RtlNtStatusToDosError(status));
+            return FALSE;
+        }
+        token = opened;
+    }
+    const LOCAL_TOKEN_OBJECT *object = token_query_access(token, 8, NULL);
+    if (opened) handle_close(&g_handle_table, opened);
+    if (!object) return FALSE;
+
+    DWORD error = 0;
+    if (implicit && object->has_restrictions) {
+        /* Token-object DACLs are not modeled yet. An already-open explicit
+         * handle carries checked TOKEN_QUERY rights; acquiring one implicitly
+         * while filtered must not silently bypass the missing access check. */
+        error = ERROR_NOT_SUPPORTED;
+    } else if (object->token_type != 2 && !primary_fallback) {
+        error = 1309; /* ERROR_NO_IMPERSONATION_TOKEN */
+    } else if (!primary_fallback && object->impersonation_level < 1) {
+        error = 1346; /* ERROR_BAD_IMPERSONATION_LEVEL */
+    } else {
+        /* Membership is a read query. WRITE_RESTRICTED applies its second
+         * SID pass only to write access; disabled/deny-only SIDs still fail. */
+        *is_member = object->filter_flags & 8
+            ? token_has_sid(object, sid, FALSE, FALSE)
+            : token_membership_enabled(object, sid);
+    }
+    advapi32_token_release(object);
+    SetLastError(error ? error : saved_error);
+    return error == 0;
+}
+
+BOOL advapi32_effective_is_admin(void)
+{
+    PVOID object = NULL;
+    NTSTATUS status = nt_thread_reference_impersonation_token(NT_CURRENT_THREAD, &object);
+    if (status == STATUS_NO_TOKEN)
+        status = nt_process_reference_primary_token(NT_CURRENT_PROCESS, &object);
+    if (!NT_SUCCESS(status)) return FALSE;
+    BOOL result = token_membership_enabled(object, &g_builtin_admin_sid);
+    advapi32_token_release(object);
+    return result;
+}
+
+static BOOL token_access_check(PVOID descriptor, const LOCAL_TOKEN_OBJECT *local,
+                                     DWORD desired, const GENERIC_MAPPING *mapping,
+                                     PVOID privileges, DWORD *privileges_length,
+                                     DWORD *granted, BOOL *access_status)
+{
+    (void)privileges_length;
+    if (local->token_type != 2) {
+        SetLastError(1309); /* ERROR_NO_IMPERSONATION_TOKEN */
+        return FALSE;
+    }
+    if (local->impersonation_level < 1) {
+        SetLastError(1346); /* ERROR_BAD_IMPERSONATION_LEVEL */
+        return FALSE;
+    }
+    if (desired & 0xf0000000U) {
+        SetLastError(1360); /* ERROR_GENERIC_NOT_MAPPED */
+        return FALSE;
+    }
+    DWORD saved_error = GetLastError();
+    SetLastError(0);
+    if (!IsValidSecurityDescriptor_stub(descriptor)) {
+        DWORD error = GetLastError();
+        SetLastError(error == 1336 ? error : 1338);
+        return FALSE;
+    }
+    SetLastError(saved_error);
+    if (
+        !security_descriptor_part(descriptor, 0) ||
+        !security_descriptor_part(descriptor, 1)) {
+        SetLastError(1338); /* ERROR_INVALID_SECURITY_DESCR */
+        return FALSE;
+    }
+    /* The current local tokens contain no privileges. In particular a NULL
+     * DACL does not grant SeSecurityPrivilege. */
+    if (desired & 0x01000000U) { /* ACCESS_SYSTEM_SECURITY */
+        *granted = 0;
+        *access_status = FALSE;
+        SetLastError(1314); /* ERROR_PRIVILEGE_NOT_HELD */
+        return TRUE;
+    }
+    USHORT control = ((SECURITY_DESCRIPTOR32 *)descriptor)->control;
+    const ACL_HEADER *sacl = (control & SE_SACL_PRESENT)
+        ? security_descriptor_part(descriptor, 2) : NULL;
+    if (sacl && sacl->ace_count) {
+        /* Mandatory labels/resource policies need a separate evaluator. */
+        SetLastError(50); /* ERROR_NOT_SUPPORTED: never silently grant */
+        return FALSE;
+    }
+    const ACL_HEADER *dacl = (control & SE_DACL_PRESENT)
+        ? security_descriptor_part(descriptor, 3) : NULL;
+    BOOL is_owner = token_has_sid(local, security_descriptor_part(descriptor, 0),
+                                  FALSE, TRUE);
+    BOOL owner_rights = FALSE;
+    if (dacl) {
+        DWORD offset = sizeof(*dacl);
+        for (DWORD i = 0; i < dacl->ace_count; i++) {
+            const BYTE *ace = (const BYTE *)dacl + offset;
+            USHORT size = *(const USHORT *)(ace + 2);
+            if (!(ace[1] & 8)) { /* INHERIT_ONLY_ACE does not apply */
+                if (ace[0] > 1) {
+                    SetLastError(50); /* object/callback ACEs are not evaluated */
+                    return FALSE;
+                }
+                if (size < 16 || ace[8] != 1 || ace[9] > 15 ||
+                    16U + 4U * ace[9] > size) {
+                    SetLastError(1336); /* ERROR_INVALID_ACL */
+                    return FALSE;
+                }
+                if (token_sid_equal(ace + 8, &g_owner_rights_sid))
+                    owner_rights = TRUE;
+            }
+            offset += size; /* header and each ACE bound checked above */
+        }
+    }
+
+    BOOL maximum = (desired & 0x02000000U) != 0;
+    DWORD required = desired & ~0x02000000U;
+    DWORD allowed = 0;
+    for (DWORD pass = 0; pass < (local->restricted_count ? 2U : 1U); pass++) {
+        LOCAL_TOKEN_OBJECT restricted = {
+            .groups = local->restricted,
+            .group_count = local->restricted_count,
+        };
+        const LOCAL_TOKEN_OBJECT *subject = pass ? &restricted : local;
+        BOOL owner = is_owner && (!pass || token_has_sid(subject,
+            security_descriptor_part(descriptor, 0), FALSE, FALSE));
+        DWORD pass_allowed = owner && !owner_rights ? READ_CONTROL | WRITE_DAC : 0;
+        DWORD denied = 0;
+        DWORD write_mask = (mapping->GenericWrite & ~READ_CONTROL) |
+                           DELETE | WRITE_DAC | WRITE_OWNER;
+        DWORD pass_required = pass && (local->filter_flags & 8)
+            ? required & write_mask : required;
+        if (!dacl) {
+            pass_allowed = maximum ? mapping->GenericAll | required : required;
+        } else {
+            DWORD offset = sizeof(*dacl);
+            for (DWORD i = 0; i < dacl->ace_count; i++) {
+                if (!maximum && !(pass_required & ~pass_allowed)) break;
+                const BYTE *ace = (const BYTE *)dacl + offset;
+                offset += *(const USHORT *)(ace + 2);
+                if (ace[1] & 8) continue;
+                BOOL matches = token_sid_equal(ace + 8, &g_owner_rights_sid)
+                    ? owner : token_has_sid(subject, ace + 8, ace[0] == 1, FALSE);
+                if (!matches) continue;
+                DWORD mask = *(const DWORD *)(ace + 4);
+                if (ace[0] == 1) {
+                    denied |= mask & ~pass_allowed;
+                    if (!maximum && (denied & pass_required)) break;
+                } else {
+                    pass_allowed |= mask & ~denied;
+                }
+            }
+        }
+        if (!pass) allowed = pass_allowed;
+        else if (local->filter_flags & 8) {
+            allowed &= pass_allowed | ~write_mask;
+        } else allowed &= pass_allowed;
+    }
+    BOOL success = !(required & ~allowed) &&
+                   (maximum ? allowed != 0 : required != 0);
+    ((DWORD *)privileges)[1] = 0;
+    *access_status = success;
+    *granted = success ? (maximum ? allowed : required) : 0;
+    if (!success) SetLastError(5);
+    return TRUE;
+}
+
+static BOOL WINAPI AccessCheck_stub(PVOID descriptor, HANDLE token,
+                                     DWORD desired, const GENERIC_MAPPING *mapping,
+                                     PVOID privileges, DWORD *privileges_length,
+                                     DWORD *granted, BOOL *access_status)
+{
+    if (!privileges_length || !granted || !access_status || !mapping) {
+        SetLastError(87);
+        return FALSE;
+    }
+    /* Buffer negotiation precedes token lookup on Windows. Even an invalid
+     * handle clears PrivilegeCount once the buffer is large enough. */
+    if (*privileges_length < 20) {
+        *privileges_length = 20;
+        SetLastError(122);
+        return FALSE;
+    }
+    if (!privileges) { SetLastError(998); return FALSE; }
+    *(DWORD *)privileges = 0;
+    const LOCAL_TOKEN_OBJECT *local = token_query_access(token, 8, NULL);
+    if (!local) return FALSE;
+    BOOL result = token_access_check(descriptor, local, desired, mapping,
+                                    privileges, privileges_length, granted, access_status);
+    advapi32_token_release(local);
+    return result;
 }
 
 static BOOL token_resolve_thread(HANDLE handle, PVOID *thread_object)
@@ -3960,64 +5026,43 @@ static void token_store_handle(PHANDLE destination, HANDLE value)
 static BOOL WINAPI OpenThreadToken_stub(HANDLE thread, DWORD desired_access,
                                          BOOL open_as_self, PHANDLE token)
 {
-    (void)open_as_self;
-    if (!token) {
-        SetLastError(87); /* ERROR_INVALID_PARAMETER */
-        return FALSE;
-    }
+    return token_open_win32(thread, desired_access, TRUE, open_as_self, token);
+}
 
-    PVOID thread_object = NULL;
-    if (!token_resolve_thread(thread, &thread_object)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
-        return FALSE;
+NTSTATUS advapi32_reference_impersonation_token(HANDLE token, PVOID *object)
+{
+    if (!object) return STATUS_INVALID_PARAMETER;
+    *object = NULL;
+    if (token == NT_CURRENT_PROCESS || token == NT_CURRENT_THREAD)
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    if ((ULONG_PTR)token > 0xffffffffU) return STATUS_INVALID_HANDLE;
+    NTSTATUS status = handle_reference_token_for_process(&g_handle_table, token,
+        win32_current_process_id(), 4, object, NULL); /* TOKEN_IMPERSONATE */
+    if (NT_SUCCESS(status) && ((LOCAL_TOKEN_OBJECT *)*object)->token_type != 2) {
+        advapi32_token_release(*object);
+        *object = NULL;
+        return STATUS_BAD_TOKEN_TYPE;
     }
-
-    PVOID token_object = nt_thread_get_impersonation_token(thread_object);
-    if (!token_object) {
-        SetLastError(1008); /* ERROR_NO_TOKEN */
-        return FALSE;
-    }
-
-    HANDLE new_token = NULL;
-    NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_TOKEN,
-                                   desired_access, token_object, &new_token);
-    if (!NT_SUCCESS(status)) {
-        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
-        return FALSE;
-    }
-
-    token_store_handle(token, new_token);
-    SetLastError(0);
-    return TRUE;
+    return status;
 }
 
 static BOOL WINAPI SetThreadToken_stub(PHANDLE thread, HANDLE token)
 {
     HANDLE target = NT_CURRENT_THREAD;
     if (thread) {
+        if (!win32_user_range_readable(thread, g_compat32_mode ? 4 : sizeof(HANDLE),
+                                       g_compat32_mode)) {
+            SetLastError(998);
+            return FALSE;
+        }
         target = g_compat32_mode
                ? (HANDLE)(ULONG_PTR)*(DWORD *)(void *)thread
                : *thread;
     }
 
-    PVOID thread_object = NULL;
-    if (!token_resolve_thread(target, &thread_object)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
-        return FALSE;
-    }
-
-    PVOID token_object = NULL;
-    if (token && !NT_SUCCESS(handle_lookup(&g_handle_table, token,
-                                           OBJ_TYPE_TOKEN, &token_object))) {
-        SetLastError(6);
-        return FALSE;
-    }
-    if (token_object && !token_object_info(token_object)) {
-        SetLastError(6);
-        return FALSE;
-    }
-    if (!nt_thread_set_impersonation_token(thread_object, token_object)) {
-        SetLastError(6);
+    NTSTATUS status = nt_thread_assign_token_handle(target, token);
+    if (!NT_SUCCESS(status)) {
+        SetLastError(RtlNtStatusToDosError(status));
         return FALSE;
     }
 
@@ -4076,29 +5121,193 @@ static BOOL WINAPI ImpersonateNamedPipeClient_stub(HANDLE pipe)
     return TRUE;
 }
 
-static BOOL WINAPI GetTokenInformation_stub(HANDLE token,
+static BOOL token_default_dacl_information(const LOCAL_TOKEN_OBJECT *token,
+    PVOID information, DWORD length, DWORD *return_length)
+{
+    if (!win32_user_range_writable(return_length, sizeof(*return_length), g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    TOKEN_DEFAULT_ACL *policy = token_acl_reference(token);
+    DWORD header = g_compat32_mode ? 4 : 8;
+    DWORD size = policy ? policy->acl.size : 0;
+    DWORD required = header + size;
+    *return_length = required;
+    DWORD error = 0;
+    if (length < required) error = 122;
+    else if (!win32_user_range_writable(information, required, g_compat32_mode)) error = 998;
+    else {
+        BYTE *bytes = information;
+        security_store_pointer(bytes, policy ? bytes + header : NULL);
+        if (policy) reg_memcpy(bytes + header, &policy->acl, size);
+    }
+    token_acl_release(policy);
+    if (error) SetLastError(error);
+    return error == 0;
+}
+
+static BOOL token_default_acl_valid(const ACL_HEADER *acl)
+{
+    if (!acl_measure(acl, NULL)) return FALSE;
+    DWORD offset = sizeof(*acl);
+    for (DWORD i = 0; i < acl->ace_count; i++) {
+        const BYTE *ace = (const BYTE *)acl + offset;
+        DWORD size = *(const USHORT *)(ace + 2);
+        if (size & 3) return FALSE;
+        /* Standard allow, deny, audit and alarm ACEs carry a SID at offset 8.
+         * Other ACE layouts stay opaque here; AccessCheck rejects unsupported
+         * evaluators instead of granting access on their behalf. */
+        if (ace[0] <= 3 && (size < 16 || ace[8] != 1 || ace[9] > 15 ||
+                            16U + 4U * ace[9] > size)) return FALSE;
+        offset += size;
+    }
+    return TRUE;
+}
+
+static BOOL token_set_default_dacl(LOCAL_TOKEN_OBJECT *token, PVOID information, DWORD length)
+{
+    DWORD header = g_compat32_mode ? 4 : 8;
+    if (length < header) { SetLastError(24); return FALSE; } /* ERROR_BAD_LENGTH */
+    if (!win32_user_range_readable(information, header, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    const ACL_HEADER *input = g_compat32_mode
+        ? (PCVOID)(ULONG_PTR)*(DWORD *)information : *(PCVOID *)information;
+    TOKEN_DEFAULT_ACL *policy = NULL;
+    if (input) {
+        if (!win32_user_range_readable(input, sizeof(*input), g_compat32_mode)) {
+            SetLastError(998);
+            return FALSE;
+        }
+        ACL_HEADER captured;
+        reg_memcpy(&captured, input, sizeof(captured));
+        if (captured.size < sizeof(captured)) { SetLastError(1336); return FALSE; }
+        if (!win32_user_range_readable(input, captured.size, g_compat32_mode)) {
+            SetLastError(998);
+            return FALSE;
+        }
+        policy = kmalloc(sizeof(*policy) - sizeof(policy->acl) + captured.size);
+        if (!policy) { SetLastError(8); return FALSE; }
+        policy->references = 1;
+        reg_memcpy(&policy->acl, input, captured.size);
+        if (policy->acl.size != captured.size || !token_default_acl_valid(&policy->acl)) {
+            kfree(policy);
+            SetLastError(1336);
+            return FALSE;
+        }
+        __atomic_add_fetch(&g_token_live_policies, 1, __ATOMIC_RELAXED);
+    }
+    /* Readers pin an immutable ACL. Allocation, guest access and reclamation
+     * stay outside the publication lock, including queries concurrent with set. */
+    if (!token->allocated) { /* Only internal identity templates are static. */
+        token_acl_release(policy);
+        SetLastError(50);
+        return FALSE;
+    }
+    uint64_t flags = token_policy_lock();
+    TOKEN_DEFAULT_ACL *previous = token->default_dacl;
+    token->default_dacl = policy;
+    token->modified_id = __atomic_add_fetch(&g_token_next_luid, 1, __ATOMIC_RELAXED);
+    token_policy_unlock(flags);
+    token_acl_release(previous);
+    return TRUE;
+}
+
+static BOOL token_integrity_information(const LOCAL_TOKEN_OBJECT *token,
+    PVOID information, DWORD length, DWORD *returned)
+{
+    if (!win32_user_range_writable(returned, sizeof(*returned), g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    DWORD header = g_compat32_mode ? 8 : 16;
+    *returned = header + sizeof(g_local_integrity_sid);
+    if (length < *returned) { SetLastError(122); return FALSE; }
+    if (!win32_user_range_writable(information, *returned, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    LOCAL_INTEGRITY_SID sid = g_local_integrity_sid;
+    uint64_t flags = token_policy_lock();
+    sid.sub_authority[0] = token->integrity_level;
+    token_policy_unlock(flags);
+    BYTE *bytes = information;
+    reg_memset(bytes, 0, header);
+    security_store_pointer(bytes, bytes + header);
+    *(DWORD *)(bytes + (g_compat32_mode ? 4 : 8)) = 0x60;
+    reg_memcpy(bytes + header, &sid, sizeof(sid));
+    return TRUE;
+}
+
+static BOOL token_set_integrity(LOCAL_TOKEN_OBJECT *token, PVOID information, DWORD length)
+{
+    DWORD header = g_compat32_mode ? 8 : 16;
+    if (length < header) { SetLastError(24); return FALSE; }
+    if (!win32_user_range_readable(information, header, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    BYTE label[16] __attribute__((aligned(8)));
+    reg_memcpy(label, information, header);
+    DWORD attributes = *(DWORD *)(label + (g_compat32_mode ? 4 : 8));
+    if (attributes & ~0xe000007fU) { SetLastError(87); return FALSE; }
+    const BYTE *input = g_compat32_mode
+        ? (PCVOID)(ULONG_PTR)*(DWORD *)label : *(PCVOID *)label;
+    if (!win32_user_range_readable(input, 8, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    BYTE sid[68] __attribute__((aligned(4)));
+    reg_memcpy(sid, input, 8);
+    DWORD size = 8U + 4U * sid[1];
+    if (sid[0] != 1 || size > sizeof(sid)) { SetLastError(1337); return FALSE; }
+    if (!win32_user_range_readable(input, size, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    reg_memcpy(sid, input, size);
+    if (sid[0] != 1 || size != 8U + 4U * sid[1]) { SetLastError(1337); return FALSE; }
+    for (DWORD i = 2; i < 8; i++)
+        if (sid[i] != (i == 7 ? 16 : 0)) {
+            SetLastError(1299); /* ERROR_INVALID_LABEL */
+            return FALSE;
+        }
+    /* NT normalizes an integrity SID to its final RID (zero if absent). */
+    DWORD level = sid[1] ? *(DWORD *)(sid + size - 4) : 0;
+    DWORD error = 0;
+    uint64_t flags = token_policy_lock();
+    if (!token->allocated) error = 50;
+    else if (level > token->integrity_level) error = 1314; /* No SeTcbPrivilege. */
+    else {
+        token->integrity_level = level;
+        token->modified_id = __atomic_add_fetch(&g_token_next_luid, 1, __ATOMIC_RELAXED);
+    }
+    token_policy_unlock(flags);
+    if (error) SetLastError(error);
+    return !error;
+}
+
+static BOOL token_information(const LOCAL_TOKEN_OBJECT *local_token,
                                              DWORD information_class,
                                              PVOID information,
                                              DWORD information_length,
                                              DWORD *return_length)
 {
-    PVOID token_object = NULL;
+    if (information_class == 6)
+        return token_default_dacl_information(local_token, information,
+                                              information_length, return_length);
+    if (information_class == 25)
+        return token_integrity_information(local_token, information,
+                                            information_length, return_length);
     if (!return_length) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
-    if (!NT_SUCCESS(handle_lookup(&g_handle_table, token, OBJ_TYPE_TOKEN,
-                                  &token_object))) {
-        *return_length = 0;
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
-        return FALSE;
-    }
-    const LOCAL_TOKEN_OBJECT *local_token = token_object_info(token_object);
-    if (!local_token) {
-        *return_length = 0;
-        SetLastError(6);
-        return FALSE;
-    }
+    const LOCAL_TOKEN_GROUP *groups = information_class == 11
+        ? local_token->restricted : local_token->groups;
+    DWORD group_count = information_class == 11
+        ? local_token->restricted_count : local_token->group_count;
     DWORD required = 0;
     DWORD value = 0;
     BOOL fixed_dword = FALSE;
@@ -4108,15 +5317,20 @@ static BOOL WINAPI GetTokenInformation_stub(HANDLE token,
         required = (g_compat32_mode ? 8 : 16) + local_token->user_sid_size;
         break;
     case 2:  /* TokenGroups */
+    case 11: /* TokenRestrictedSids */
+        required = g_compat32_mode ? 4 : 8;
+        required += group_count * (g_compat32_mode ? 8 : 16);
+        for (DWORD i = 0; i < group_count; i++) required += groups[i].sid_size;
+        if (information_class == 2)
+            required += (g_compat32_mode ? 8 : 16) + sizeof(g_local_integrity_sid);
+        break;
     case 3:  /* TokenPrivileges */
-        required = sizeof(DWORD);
+        /* Windows requires sizeof(TOKEN_PRIVILEGES), even with count zero. */
+        required = sizeof(DWORD) * 4;
         break;
     case 4:  /* TokenOwner */
     case 5:  /* TokenPrimaryGroup */
         required = (g_compat32_mode ? 4 : 8) + local_token->user_sid_size;
-        break;
-    case 6:  /* TokenDefaultDacl */
-        required = g_compat32_mode ? 4 : 8;
         break;
     case 7:  /* TokenSource */
         required = 16;
@@ -4139,8 +5353,11 @@ static BOOL WINAPI GetTokenInformation_stub(HANDLE token,
         fixed_dword = TRUE;
         required = sizeof(DWORD);
         break;
-    case 15: /* TokenSandBoxInert */
     case 21: /* TokenHasRestrictions */
+        value = local_token->has_restrictions;
+        required = 1; /* BOOLEAN, not BOOL */
+        break;
+    case 15: /* TokenSandBoxInert: no SYSTEM/TrustedInstaller identity */
     case 23: /* TokenVirtualizationAllowed */
     case 24: /* TokenVirtualizationEnabled */
     case 26: /* TokenUIAccess */
@@ -4155,19 +5372,19 @@ static BOOL WINAPI GetTokenInformation_stub(HANDLE token,
         required = sizeof(DWORD);
         break;
     case 20: /* TokenElevation */
-        value = 1;
+        value = token_membership_enabled(local_token, &g_builtin_admin_sid);
         fixed_dword = TRUE;
         required = sizeof(DWORD);
-        break;
-    case 25: /* TokenIntegrityLevel */
-        required = (g_compat32_mode ? 8 : 16) +
-                   sizeof(g_local_integrity_sid);
         break;
     case 27: /* TokenMandatoryPolicy */
         value = 1; /* TOKEN_MANDATORY_POLICY_NO_WRITE_UP */
         fixed_dword = TRUE;
         required = sizeof(DWORD);
         break;
+    case 28: /* TokenLogonSid: this local session has no logon SID group. */
+        *return_length = 0;
+        SetLastError(1168); /* ERROR_NOT_FOUND, not an invalid info class */
+        return FALSE;
     case 31: /* TokenAppContainerSid */
         required = g_compat32_mode ? 4 : 8;
         break;
@@ -4185,14 +5402,40 @@ static BOOL WINAPI GetTokenInformation_stub(HANDLE token,
     BYTE *bytes = (BYTE *)information;
     for (DWORD i = 0; i < required; i++) bytes[i] = 0;
 
-    if (fixed_dword) {
+    if (information_class == 21) {
+        *bytes = (BYTE)value;
+    } else if (fixed_dword) {
         *(DWORD *)(void *)bytes = value;
     } else if (information_class == 1) {
         DWORD header_size = g_compat32_mode ? 8 : 16;
         PVOID sid = bytes + header_size;
         security_store_pointer(bytes, sid);
-        *(DWORD *)(void *)(bytes + (g_compat32_mode ? 4 : 8)) = 0;
+        *(DWORD *)(void *)(bytes + (g_compat32_mode ? 4 : 8)) = local_token->user_attributes;
         reg_memcpy(sid, local_token->user_sid, local_token->user_sid_size);
+    } else if (information_class == 2 || information_class == 11) {
+        DWORD header = g_compat32_mode ? 4 : 8;
+        DWORD stride = g_compat32_mode ? 8 : 16;
+        DWORD count = group_count + (information_class == 2);
+        BYTE *sid = bytes + header + stride * count;
+        *(DWORD *)bytes = count;
+        for (DWORD i = 0; i < group_count; i++) {
+            const LOCAL_TOKEN_GROUP *group = &groups[i];
+            BYTE *entry = bytes + header + i * stride;
+            security_store_pointer(entry, sid);
+            *(DWORD *)(entry + (g_compat32_mode ? 4 : 8)) = group->attributes;
+            reg_memcpy(sid, group->sid, group->sid_size);
+            sid += group->sid_size;
+        }
+        if (information_class == 2) {
+            BYTE *entry = bytes + header + group_count * stride;
+            LOCAL_INTEGRITY_SID integrity = g_local_integrity_sid;
+            uint64_t flags = token_policy_lock();
+            integrity.sub_authority[0] = local_token->integrity_level;
+            token_policy_unlock(flags);
+            security_store_pointer(entry, sid);
+            *(DWORD *)(entry + stride / 2) = 0x60;
+            reg_memcpy(sid, &integrity, sizeof(integrity));
+        }
     } else if (information_class == 4 || information_class == 5) {
         DWORD header_size = g_compat32_mode ? 4 : 8;
         PVOID sid = bytes + header_size;
@@ -4203,18 +5446,36 @@ static BOOL WINAPI GetTokenInformation_stub(HANDLE token,
         for (DWORD i = 0; i < sizeof(source) - 1; i++) bytes[i] = source[i];
         *(DWORD *)(void *)(bytes + 8) = win32_current_process_id();
     } else if (information_class == 10) {
+        reg_memcpy(bytes, &local_token->token_id, sizeof(local_token->token_id));
+        reg_memcpy(bytes + 8, &local_token->authentication_id,
+                   sizeof(local_token->authentication_id));
         *(DWORD *)(void *)(bytes + 24) = local_token->token_type;
         *(DWORD *)(void *)(bytes + 28) = local_token->impersonation_level;
-    } else if (information_class == 25) {
-        DWORD header_size = g_compat32_mode ? 8 : 16;
-        PVOID sid = bytes + header_size;
-        security_store_pointer(bytes, sid);
-        *(DWORD *)(void *)(bytes + (g_compat32_mode ? 4 : 8)) = 0x20;
-        reg_memcpy(sid, &g_local_integrity_sid,
-                   sizeof(g_local_integrity_sid));
+        uint64_t flags = token_policy_lock();
+        DWORD charged = local_token->user_sid_size +
+            (local_token->default_dacl ? local_token->default_dacl->acl.size : 0);
+        ULONGLONG modified = local_token->modified_id;
+        token_policy_unlock(flags);
+        *(DWORD *)(void *)(bytes + 32) = charged;
+        reg_memcpy(bytes + 48, &modified, sizeof(modified));
+        *(DWORD *)(void *)(bytes + 40) = local_token->group_count + 1;
     }
-    SetLastError(0);
+    if (information_class != 3)
+        SetLastError(0);
     return TRUE;
+}
+
+static BOOL WINAPI GetTokenInformation_stub(HANDLE token, DWORD information_class,
+                                            PVOID information, DWORD information_length,
+                                            DWORD *return_length)
+{
+    const LOCAL_TOKEN_OBJECT *local = token_query_access(
+        token, information_class == 7 ? 0x10 : 8, NULL);
+    if (!local) { if (return_length) *return_length = 0; return FALSE; }
+    BOOL result = token_information(local, information_class, information,
+                                    information_length, return_length);
+    advapi32_token_release(local);
+    return result;
 }
 
 typedef struct {
@@ -4303,31 +5564,203 @@ static BOOL WINAPI DuplicateTokenEx_stub(HANDLE existing_token,
                                           DWORD token_type,
                                           PHANDLE new_token)
 {
-    (void)token_attributes;
-    PVOID token_object = NULL;
     if (!new_token || impersonation_level > 3 ||
         (token_type != 1 && token_type != 2)) {
         SetLastError(87);
         return FALSE;
     }
-    if (!NT_SUCCESS(handle_lookup(&g_handle_table, existing_token,
-                                  OBJ_TYPE_TOKEN, &token_object))) {
-        SetLastError(6);
+    DWORD source_access = 0;
+    const LOCAL_TOKEN_OBJECT *source = token_query_access(existing_token, 2,
+                                                          &source_access);
+    if (!source) return FALSE;
+    if (source->token_type == 2 &&
+        ((token_type == 2 && impersonation_level > source->impersonation_level) ||
+         (token_type == 1 && source->impersonation_level < 2))) {
+        advapi32_token_release(source);
+        SetLastError(1346); /* ERROR_BAD_IMPERSONATION_LEVEL */
         return FALSE;
     }
+    BOOL inherit = FALSE;
+    if (token_attributes) {
+        const BYTE *attributes = token_attributes;
+        PVOID sd = g_compat32_mode
+            ? (PVOID)(ULONG_PTR)*(const DWORD *)(attributes + 4)
+            : *(PVOID const *)(attributes + 8);
+        if (sd) { /* Token object ACLs are not implemented yet. */
+            advapi32_token_release(source);
+            SetLastError(50);
+            return FALSE;
+        }
+        inherit = *(const DWORD *)(attributes + (g_compat32_mode ? 8 : 16)) != 0;
+    }
+    LOCAL_TOKEN_OBJECT *token_object = token_copy(source, source->restricted,
+                                                 source->restricted_count);
+    advapi32_token_release(source);
+    if (!token_object) return FALSE;
+    token_object->token_type = token_type;
+    token_object->impersonation_level = token_type == 1 ? 2 : impersonation_level;
+    DWORD access = desired_access ? token_map_access(desired_access) : source_access;
     HANDLE duplicate = NULL;
     NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_TOKEN,
-                                   desired_access, token_object, &duplicate);
+                                   access, (PVOID)token_object, &duplicate);
+    advapi32_token_release(token_object);
     if (!NT_SUCCESS(status)) {
         SetLastError(8);
         return FALSE;
     }
+    if (inherit)
+        handle_update_flags_for_process(&g_handle_table, duplicate,
+                                        win32_current_process_id(),
+                                        HANDLE_USER_FLAG_INHERIT,
+                                        HANDLE_USER_FLAG_INHERIT);
     if (g_compat32_mode)
         *(DWORD *)(void *)new_token = (DWORD)(ULONG_PTR)duplicate;
     else
         *new_token = duplicate;
-    SetLastError(0);
     return TRUE;
+}
+
+/* Snapshot SID_AND_ATTRIBUTES using the caller's pointer width. All SIDs are
+ * copied before filtering, so the resulting token owns no guest pointers. */
+static BOOL token_capture_groups(PCVOID input, DWORD count, LOCAL_TOKEN_GROUP **result)
+{
+    *result = NULL;
+    if (!count) return TRUE;
+    SIZE_T stride = g_compat32_mode ? 8 : 16;
+    ULONGLONG bytes = (ULONGLONG)count * (sizeof(LOCAL_TOKEN_GROUP) + 68);
+    if (bytes > 0xffffffffU) { SetLastError(87); return FALSE; }
+    if (!win32_user_range_readable(input, (SIZE_T)count * stride, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    LOCAL_TOKEN_GROUP *groups = kmalloc(bytes);
+    if (!groups) { SetLastError(8); return FALSE; }
+    BYTE *sids = (void *)(groups + count);
+    for (DWORD i = 0; i < count; i++) {
+        const BYTE *entry = (const BYTE *)input + i * stride;
+        const BYTE *sid = g_compat32_mode
+            ? (PCVOID)(ULONG_PTR)*(const DWORD *)entry : *(PCVOID const *)entry;
+        if (!win32_user_range_readable(sid, 8, g_compat32_mode)) goto inaccessible;
+        DWORD size = 8U + 4U * sid[1];
+        if (sid[0] != 1 || size > 68) goto invalid;
+        if (!win32_user_range_readable(sid, size, g_compat32_mode)) goto inaccessible;
+        BYTE *copy = sids + i * 68U;
+        reg_memcpy(copy, sid, size);
+        if (copy[0] != 1 || 8U + 4U * copy[1] != size) goto invalid;
+        groups[i] = (LOCAL_TOKEN_GROUP){copy, size, *(const DWORD *)(entry + stride / 2)};
+    }
+    *result = groups;
+    return TRUE;
+inaccessible:
+    kfree(groups);
+    SetLastError(998);
+    return FALSE;
+invalid:
+    kfree(groups);
+    SetLastError(1337); /* ERROR_INVALID_SID */
+    return FALSE;
+}
+
+static BOOL token_create_restricted(HANDLE existing, DWORD flags,
+    DWORD disable_count, PCVOID disable_sids, DWORD privilege_count,
+    PCVOID delete_privileges, DWORD restrict_count, PCVOID restrict_sids, PHANDLE output)
+{
+    if (!output || (flags & ~15U)) { SetLastError(87); return FALSE; }
+    if (flags & 4) { SetLastError(50); return FALSE; } /* LUA token policy */
+    if (!win32_user_range_writable(output, g_compat32_mode ? 4 : 8, g_compat32_mode)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    DWORD access;
+    const LOCAL_TOKEN_OBJECT *source = token_query_access(existing, 2, &access);
+    if (!source) return FALSE;
+    LOCAL_TOKEN_GROUP *disabled = NULL, *restricted = NULL;
+    LOCAL_TOKEN_OBJECT *copy = NULL;
+    BOOL result = FALSE;
+    if (privilege_count && !win32_user_range_readable(delete_privileges,
+            (SIZE_T)privilege_count * 12U, g_compat32_mode)) {
+        SetLastError(998);
+        goto done;
+    }
+    if (source->restricted_count && !(source->filter_flags & 8) && (flags & 8)) {
+        SetLastError(87); /* Filtering cannot weaken full to write-only. */
+        goto done;
+    }
+    /* The local identity has no privileges to remove. DISABLE_MAX_PRIVILEGE
+     * ignores PrivilegesToDelete, as Windows does. */
+    if (!(flags & 1) && privilege_count) { SetLastError(87); goto done; }
+    if (!token_capture_groups(disable_sids, disable_count, &disabled) ||
+        !token_capture_groups(restrict_sids, restrict_count, &restricted)) goto done;
+    DWORD kept = 0;
+    for (DWORD i = 0; i < restrict_count; i++) {
+        BOOL present = source->restricted_count == 0;
+        for (DWORD j = 0; j < source->restricted_count; j++)
+            if (token_sid_equal(restricted[i].sid, source->restricted[j].sid)) present = TRUE;
+        if (present) {
+            restricted[kept] = restricted[i];
+            restricted[kept++].attributes = 7;
+        }
+    }
+    if (source->restricted_count && !kept) { SetLastError(87); goto done; }
+    copy = token_copy(source, restricted, kept);
+    if (!copy) goto done;
+    copy->has_restrictions = TRUE;
+    /* An all-access restriction cannot be weakened to write-only by filtering
+     * it again. SANDBOX_INERT is ignored for this non-SYSTEM local identity. */
+    copy->filter_flags = source->restricted_count
+        ? source->filter_flags & flags & 8U : flags & 8U;
+    for (DWORD i = 0; i < disable_count; i++) {
+        if (token_sid_equal(copy->user_sid, disabled[i].sid))
+            copy->user_attributes = 0x10;
+        LOCAL_TOKEN_GROUP *groups = (LOCAL_TOKEN_GROUP *)copy->groups;
+        for (DWORD j = 0; j < copy->group_count; j++)
+            if (token_sid_equal(groups[j].sid, disabled[i].sid))
+                groups[j].attributes = 0x10;
+    }
+    HANDLE handle;
+    if (!NT_SUCCESS(handle_alloc(&g_handle_table, OBJ_TYPE_TOKEN, access, copy, &handle))) {
+        SetLastError(8);
+        goto done;
+    }
+    token_store_handle(output, handle);
+    result = TRUE;
+done:
+    advapi32_token_release(copy);
+    if (restricted) kfree(restricted);
+    if (disabled) kfree(disabled);
+    advapi32_token_release(source);
+    return result;
+}
+
+static BOOL WINAPI CreateRestrictedToken_impl(HANDLE existing, DWORD flags,
+    DWORD disable_count, PCVOID disable_sids, DWORD privilege_count,
+    PCVOID delete_privileges, DWORD restrict_count, PCVOID restrict_sids, PHANDLE output)
+{
+    BOOL result = token_create_restricted(existing, flags, disable_count, disable_sids,
+        privilege_count, delete_privileges, restrict_count, restrict_sids, output);
+    if (!result) {
+        DWORD error = GetLastError();
+        static DWORD failure_logs;
+        if (__atomic_add_fetch(&failure_logs, 1, __ATOMIC_RELAXED) <= 32) {
+            serial_puts("[TOKEN-FILTER] failed pid="); serial_putdec(win32_current_process_id());
+            serial_puts(" error="); serial_putdec(error);
+            serial_puts(" flags=0x"); serial_puthex(flags, 8);
+            serial_puts(" disabled/restricted="); serial_putdec(disable_count);
+            serial_puts("/"); serial_putdec(restrict_count);
+            serial_puts("\n");
+        }
+        SetLastError(error);
+    }
+    return result;
+}
+
+static BOOL WINAPI IsTokenRestricted_impl(HANDLE handle)
+{
+    const LOCAL_TOKEN_OBJECT *token = token_query_access(handle, 8, NULL);
+    if (!token) return FALSE;
+    BOOL result = token->restricted_count != 0;
+    advapi32_token_release(token);
+    return result;
 }
 
 static BOOL WINAPI AdjustTokenPrivileges_stub(HANDLE token,
@@ -4374,18 +5807,34 @@ static BOOL WINAPI SetTokenInformation_stub(HANDLE token,
                                              PVOID information,
                                              DWORD information_length)
 {
-    PVOID token_object = NULL;
-    if (!NT_SUCCESS(handle_lookup(&g_handle_table, token, OBJ_TYPE_TOKEN,
-                                  &token_object))) {
-        SetLastError(6);
+    const LOCAL_TOKEN_OBJECT *subject = token_query_access(token,
+        information_class == 12 ? 0x100 : 0x80, NULL);
+    if (!subject) return FALSE;
+    if (information_class == 6) {
+        BOOL result = token_set_default_dacl((LOCAL_TOKEN_OBJECT *)subject,
+                                             information, information_length);
+        advapi32_token_release(subject);
+        return result;
+    }
+    if (information_class == 25) {
+        BOOL result = token_set_integrity((LOCAL_TOKEN_OBJECT *)subject,
+                                          information, information_length);
+        advapi32_token_release(subject);
+        return result;
+    }
+    BOOL restricted = subject->has_restrictions;
+    advapi32_token_release(subject);
+    if (restricted) {
+        serial_puts("[ADVAPI32] SetTokenInformation: restricted token policy unsupported, class=");
+        serial_putdec(information_class);
+        serial_puts("\n");
+        SetLastError(50);
         return FALSE;
     }
-    (void)token_object;
     DWORD minimum = sizeof(DWORD);
     switch (information_class) {
     case 4:  /* TokenOwner */
     case 5:  /* TokenPrimaryGroup */
-    case 6:  /* TokenDefaultDacl */
         minimum = g_compat32_mode ? 4 : 8;
         break;
     case 12: /* TokenSessionId */
@@ -4396,9 +5845,6 @@ static BOOL WINAPI SetTokenInformation_stub(HANDLE token,
     case 27: /* TokenMandatoryPolicy */
     case 29: /* TokenIsAppContainer */
         minimum = sizeof(DWORD);
-        break;
-    case 25: /* TokenIntegrityLevel */
-        minimum = g_compat32_mode ? 8 : 16;
         break;
     default:
         SetLastError(87);
@@ -4439,19 +5885,111 @@ static BOOL WINAPI EqualSid_stub(PVOID first_sid, PVOID second_sid)
     return TRUE;
 }
 
+static BOOL token_primary_assignable(const LOCAL_TOKEN_OBJECT *subject,
+                                     const LOCAL_TOKEN_OBJECT *caller)
+{
+    if (subject->authentication_id != caller->authentication_id ||
+        !token_sid_equal(subject->user_sid, caller->user_sid)) return FALSE;
+    if (!(subject->user_attributes & 0x10) && (caller->user_attributes & 0x10))
+        return FALSE;
+    for (DWORD i = 0; i < subject->group_count; i++) {
+        const LOCAL_TOKEN_GROUP *group = &subject->groups[i];
+        if ((group->attributes & 4) && !(group->attributes & 0x10) &&
+            !token_has_sid(caller, group->sid, FALSE, FALSE)) return FALSE;
+    }
+    for (DWORD i = 0; i < caller->group_count; i++) {
+        const LOCAL_TOKEN_GROUP *group = &caller->groups[i];
+        if ((group->attributes & (4 | 0x10)) &&
+            !token_has_sid(subject, group->sid, TRUE, FALSE)) return FALSE;
+    }
+    if (caller->restricted_count) {
+        if (!subject->restricted_count ||
+            (!(caller->filter_flags & 8) && (subject->filter_flags & 8))) return FALSE;
+        for (DWORD i = 0; i < subject->restricted_count; i++) {
+            BOOL found = FALSE;
+            for (DWORD j = 0; j < caller->restricted_count; j++)
+                if (token_sid_equal(subject->restricted[i].sid, caller->restricted[j].sid))
+                    found = TRUE;
+            if (!found) return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL token_process_attributes(PCVOID attributes, BOOL *inherit)
+{
+    *inherit = FALSE;
+    if (!attributes) return TRUE;
+    DWORD size = g_compat32_mode ? 12 : 24;
+    if (!win32_user_range_readable(attributes, size, g_compat32_mode)) {
+        SetLastError(998); return FALSE;
+    }
+    const BYTE *bytes = attributes;
+    if (*(const DWORD *)bytes < size) { SetLastError(87); return FALSE; }
+    PCVOID descriptor = g_compat32_mode
+        ? (PCVOID)(ULONG_PTR)*(const DWORD *)(bytes + 4)
+        : *(PCVOID *)(bytes + 8);
+    /* Process object ACL storage/enforcement is separate from token policy. */
+    if (descriptor) { SetLastError(50); return FALSE; }
+    *inherit = *(const DWORD *)(bytes + (g_compat32_mode ? 8 : 16)) != 0;
+    return TRUE;
+}
+
 static BOOL WINAPI CreateProcessAsUserW_compat(
     HANDLE token, PCWSTR application_name, PWSTR command_line,
     PVOID process_attributes, PVOID thread_attributes, BOOL inherit_handles,
     DWORD creation_flags, PVOID environment, PCWSTR current_directory,
     PVOID startup_info, PVOID process_information)
 {
-    (void)token;
-    serial_puts("[ADVAPI32] CreateProcessAsUserW -> current identity\n");
-    return CreateProcessW(application_name, command_line,
-                          process_attributes, thread_attributes,
-                          inherit_handles, creation_flags, environment,
-                          current_directory, startup_info,
-                          process_information);
+    const LOCAL_TOKEN_OBJECT *subject = NULL;
+    if (token) {
+        subject = token_query_access(token, 0xb, NULL);
+        if (!subject) return FALSE;
+        PVOID caller = NULL;
+        DWORD error = subject->token_type == 2 && subject->impersonation_level < 2
+            ? 1346 : 0;
+        if (!error) {
+            NTSTATUS status = nt_process_reference_primary_token(NT_CURRENT_PROCESS, &caller);
+            if (!NT_SUCCESS(status)) error = 6;
+            /* No SE_ASSIGNPRIMARYTOKEN privilege exists in the local identity.
+             * Same-logon copies and further restrictions cannot grant more. */
+            else if (!token_primary_assignable(subject, caller)) error = 1314;
+        }
+        advapi32_token_release(caller);
+        if (error) {
+            advapi32_token_release(subject);
+            SetLastError(error);
+            return FALSE;
+        }
+    }
+    BOOL result = FALSE, inherit_process, inherit_thread;
+    if (!token_process_attributes(process_attributes, &inherit_process) ||
+        !token_process_attributes(thread_attributes, &inherit_thread)) goto done;
+    if (!win32_user_range_writable(process_information, g_compat32_mode ? 16 : 24,
+                                   g_compat32_mode) ||
+        !win32_user_range_readable(startup_info, g_compat32_mode ? 68 : 104,
+                                  g_compat32_mode)) {
+        SetLastError(998); goto done;
+    }
+    BYTE result_information[24] = {0};
+    result = kernel32_create_process_token_w(subject, application_name, command_line,
+        process_attributes, thread_attributes, inherit_handles, creation_flags,
+        environment, current_directory, startup_info, result_information);
+    if (result) {
+        HANDLE process = g_compat32_mode
+            ? (HANDLE)(ULONG_PTR)*(DWORD *)result_information : *(HANDLE *)result_information;
+        HANDLE thread = g_compat32_mode
+            ? (HANDLE)(ULONG_PTR)*((DWORD *)result_information + 1)
+            : *((HANDLE *)result_information + 1);
+        if (inherit_process) handle_update_flags_for_process(&g_handle_table, process,
+            win32_current_process_id(), 1, 1);
+        if (inherit_thread) handle_update_flags_for_process(&g_handle_table, thread,
+            win32_current_process_id(), 1, 1);
+        reg_memcpy(process_information, result_information, g_compat32_mode ? 16 : 24);
+    }
+done:
+    advapi32_token_release(subject);
+    return result;
 }
 
 /* ── Export table ──────────────────────────────────────────── */
@@ -4554,6 +6092,39 @@ static ETW_SESSION *etw_find_session_locked(ULONGLONG handle,
             return session;
     }
     return NULL;
+}
+
+/* Classic providers remain disabled until an ETW event sink is implemented.
+ * Still expose their import: rejecting a message must not prevent the provider
+ * DLL from loading. Do not inspect variadic payloads or report an event written
+ * when there is nowhere to record it. LastError belongs to the caller. */
+static ULONG etw_trace_message(ULONGLONG logger_handle)
+{
+    uint64_t flags = etw_lock_irqsave();
+    BOOL exists = etw_find_session_locked(logger_handle, NULL) != NULL;
+    etw_unlock_irqrestore(flags);
+    return exists ? 50 : 6; /* ERROR_NOT_SUPPORTED / ERROR_INVALID_HANDLE */
+}
+
+static ULONG WINAPI TraceMessage_k32(DWORD handle_low, DWORD handle_high,
+                                     ULONG message_flags, LPCGUID message_guid,
+                                     ULONG message_number)
+{
+    (void)message_flags;
+    (void)message_guid;
+    (void)message_number;
+    return etw_trace_message((ULONGLONG)handle_low |
+                             ((ULONGLONG)handle_high << 32));
+}
+
+static ULONG WINAPI TraceMessage_k64(ULONGLONG logger_handle,
+                                     ULONG message_flags, LPCGUID message_guid,
+                                     ULONG message_number)
+{
+    (void)message_flags;
+    (void)message_guid;
+    (void)message_number;
+    return etw_trace_message(logger_handle);
 }
 
 static ULONG WINAPI StartTraceA_stub(ULONGLONG *session_handle,
@@ -4897,19 +6468,41 @@ static LONG WINAPI RegDisableReflectionKey_stub(HKEY key)
     return ERROR_SUCCESS;
 }
 
+static uint64_t next_local_unique_id = 0x10000;
+
+static BOOL WINAPI AllocateLocallyUniqueId(PVOID output)
+{
+    if (!output) {
+        SetLastError(87);
+        return FALSE;
+    }
+    uint64_t value = __atomic_fetch_add(&next_local_unique_id, 1,
+                                        __ATOMIC_RELAXED);
+    DWORD *parts = output;
+    parts[0] = (DWORD)value;
+    parts[1] = (DWORD)(value >> 32);
+    return TRUE;
+}
+
 static const SHIM_EXPORT advapi32_exports[] = {
+    { "AllocateLocallyUniqueId", (PVOID)AllocateLocallyUniqueId, 1, CC_STDCALL },
     { "RegOpenKeyA",        (PVOID)RegOpenKeyA,      3, CC_STDCALL },
+    { "RegOpenKeyW",        (PVOID)RegOpenKeyW,      3, CC_STDCALL },
     { "RegOpenKeyExA",      (PVOID)RegOpenKeyExA,    5, CC_STDCALL },
     { "RegCreateKeyA",      (PVOID)RegCreateKeyA_k32, 3, CC_STDCALL },
     { "RegCreateKeyExA",    (PVOID)RegCreateKeyExA,  9, CC_STDCALL },
     { "RegQueryValueExA",   (PVOID)RegQueryValueExA, 6, CC_STDCALL },
     { "RegSetValueExA",     (PVOID)RegSetValueExA,   6, CC_STDCALL },
     { "RegCloseKey",        (PVOID)RegCloseKey,      1, CC_STDCALL },
+    { "RegDisablePredefinedCache", (PVOID)RegDisablePredefinedCache, 0, CC_STDCALL },
+    { "RegDisablePredefinedCacheEx", (PVOID)RegDisablePredefinedCache, 0, CC_STDCALL },
     { "RegFlushKey",        (PVOID)RegFlushKey,      1, CC_STDCALL },
     { "RegDeleteKeyA",      (PVOID)RegDeleteKeyA,    2, CC_STDCALL },
     { "RegDeleteKeyExA",    (PVOID)RegDeleteKeyExA,  4, CC_STDCALL },
     { "RegDeleteValueA",    (PVOID)RegDeleteValueA,  2, CC_STDCALL },
     { "RegEnumKeyExA",      (PVOID)RegEnumKeyExA,    8, CC_STDCALL },
+    { "RegEnumKeyA",        (PVOID)RegEnumKeyA,      4, CC_STDCALL },
+    { "RegEnumKeyW",        (PVOID)RegEnumKeyW,      4, CC_STDCALL },
     { "RegEnumValueA",      (PVOID)RegEnumValueA,    8, CC_STDCALL },
     { "RegQueryInfoKeyA",   (PVOID)RegQueryInfoKeyA, 12, CC_STDCALL },
     { "RegDeleteTreeA",     (PVOID)RegDeleteTreeA,   2, CC_STDCALL },
@@ -4929,6 +6522,7 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "GetUserNameW",       (PVOID)GetUserNameW,     2, CC_STDCALL },
     { "LookupAccountNameW", (PVOID)LookupAccountNameW_stub, 7, CC_STDCALL },
     { "MapGenericMask",     (PVOID)MapGenericMask,    2, CC_STDCALL },
+    { "AccessCheck",        (PVOID)AccessCheck_stub, 8, CC_STDCALL },
     { "InitializeSecurityDescriptor", (PVOID)InitializeSecurityDescriptor, 2, CC_STDCALL },
     { "CreateWellKnownSid", (PVOID)CreateWellKnownSid_stub, 4, CC_STDCALL },
     { "AllocateAndInitializeSid", (PVOID)AllocateAndInitializeSid_stub, 11, CC_STDCALL },
@@ -4950,6 +6544,8 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "LookupPrivilegeValueA", (PVOID)LookupPrivilegeValueA_stub, 3, CC_STDCALL },
     { "LookupPrivilegeValueW", (PVOID)LookupPrivilegeValueW_stub, 3, CC_STDCALL },
     { "DuplicateTokenEx",   (PVOID)DuplicateTokenEx_stub, 6, CC_STDCALL },
+    { "CreateRestrictedToken", (PVOID)CreateRestrictedToken_impl, 9, CC_STDCALL },
+    { "IsTokenRestricted", (PVOID)IsTokenRestricted_impl, 1, CC_STDCALL },
     { "AdjustTokenPrivileges", (PVOID)AdjustTokenPrivileges_stub, 6, CC_STDCALL },
     { "SetTokenInformation", (PVOID)SetTokenInformation_stub, 4, CC_STDCALL },
     { "IsValidSid",         (PVOID)IsValidSid_stub, 1, CC_STDCALL },
@@ -4959,7 +6555,10 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "AddAce",             (PVOID)AddAce_stub, 5, CC_STDCALL },
     { "GetAclInformation",  (PVOID)GetAclInformation_stub, 4, CC_STDCALL },
     { "AddAccessAllowedAce", (PVOID)AddAccessAllowedAce_stub, 4, CC_STDCALL },
+    { "AddMandatoryAce",    (PVOID)AddMandatoryAce_stub, 5, CC_STDCALL },
     { "SetSecurityDescriptorDacl", (PVOID)SetSecurityDescriptorDacl, 4, CC_STDCALL },
+    { "SetSecurityDescriptorOwner", (PVOID)SetSecurityDescriptorOwner, 3, CC_STDCALL },
+    { "SetSecurityDescriptorGroup", (PVOID)SetSecurityDescriptorGroup, 3, CC_STDCALL },
     { "IsValidSecurityDescriptor", (PVOID)IsValidSecurityDescriptor_stub, 1, CC_STDCALL },
     { "GetSecurityDescriptorControl", (PVOID)GetSecurityDescriptorControl_stub, 3, CC_STDCALL },
     { "GetSecurityDescriptorOwner", (PVOID)GetSecurityDescriptorOwner_stub, 3, CC_STDCALL },
@@ -4986,8 +6585,13 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "CryptAcquireContextW", (PVOID)CryptAcquireContextW, 5, CC_STDCALL },
     { "CryptGenRandom",       (PVOID)CryptGenRandom,       3, CC_STDCALL },
     { "CryptReleaseContext",  (PVOID)CryptReleaseContext,  2, CC_STDCALL },
+    { "CryptCreateHash",      (PVOID)CryptCreateHash,      5, CC_STDCALL },
+    { "CryptHashData",        (PVOID)CryptHashData,        4, CC_STDCALL },
+    { "CryptGetHashParam",    (PVOID)CryptGetHashParam,    5, CC_STDCALL },
+    { "CryptDestroyHash",     (PVOID)CryptDestroyHash,     1, CC_STDCALL },
     { "RegisterTraceGuidsW", (PVOID)RegisterTraceGuidsW_stub, 8, CC_STDCALL },
     { "UnregisterTraceGuids", (PVOID)UnregisterTraceGuids_stub, 1, CC_STDCALL },
+    { "TraceMessage",       (PVOID)TraceMessage_k32,       5, CC_CDECL },
     { "StartTraceA",        (PVOID)StartTraceA_stub,       3, CC_STDCALL },
     { "StopTraceA",         (PVOID)StopTraceA_k32,         4, CC_STDCALL },
     { "EnableTrace",        (PVOID)EnableTrace_k32,        6, CC_STDCALL },
@@ -5005,7 +6609,9 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "EvtQuery",            (PVOID)EvtQuery_stub,             4, CC_STDCALL },
     { "EvtRender",           (PVOID)EvtRender_stub,            7, CC_STDCALL },
     { "OpenSCManagerW",      (PVOID)OpenSCManagerW, 3, CC_STDCALL },
+    { "OpenSCManagerA",      (PVOID)OpenSCManagerA, 3, CC_STDCALL },
     { "OpenServiceW",        (PVOID)OpenServiceW, 3, CC_STDCALL },
+    { "OpenServiceA",        (PVOID)OpenServiceA, 3, CC_STDCALL },
     { "CreateServiceW",      (PVOID)CreateServiceW, 13, CC_STDCALL },
     { "ChangeServiceConfigW", (PVOID)ChangeServiceConfigW, 11, CC_STDCALL },
     { "ChangeServiceConfig2W", (PVOID)ChangeServiceConfig2W, 3, CC_STDCALL },
@@ -5015,6 +6621,7 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "QueryServiceStatus",  (PVOID)QueryServiceStatus, 2, CC_STDCALL },
     { "QueryServiceStatusEx", (PVOID)QueryServiceStatusEx, 5, CC_STDCALL },
     { "QueryServiceConfigW", (PVOID)QueryServiceConfigW, 4, CC_STDCALL },
+    { "QueryServiceConfigA", (PVOID)QueryServiceConfigA, 4, CC_STDCALL },
     { "CloseServiceHandle",  (PVOID)CloseServiceHandle, 1, CC_STDCALL },
     { "StartServiceCtrlDispatcherW", (PVOID)StartServiceCtrlDispatcherW, 1, CC_STDCALL },
     { "RegisterServiceCtrlHandlerW", (PVOID)RegisterServiceCtrlHandlerW, 2, CC_STDCALL },
@@ -5029,6 +6636,7 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "ReadEventLogW",       (PVOID)ReadEventLogW_scm, 7, CC_STDCALL },
     { "CloseEventLog",       (PVOID)CloseEventLog_scm, 1, CC_STDCALL },
     { "OpenProcessToken",    (PVOID)OpenProcessToken_stub, 3, CC_STDCALL },
+    { "CheckTokenMembership", (PVOID)CheckTokenMembership, 3, CC_STDCALL },
     { "CreateProcessAsUserW", (PVOID)CreateProcessAsUserW_compat, 11, CC_STDCALL },
     { NULL, NULL, 0, CC_STDCALL }
 };
@@ -5047,6 +6655,8 @@ static int advapi_strcmp(const char *a, const char *b)
 PVOID advapi32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 {
     if (by_ordinal) return NULL;
+    if (!g_compat32_mode && advapi_strcmp(func_name, "TraceMessage") == 0)
+        return (PVOID)TraceMessage_k64;
     if (!g_compat32_mode && advapi_strcmp(func_name, "StopTraceA") == 0)
         return (PVOID)StopTraceA_k64;
     if (!g_compat32_mode && advapi_strcmp(func_name, "EnableTrace") == 0)

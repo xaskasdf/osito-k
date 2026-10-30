@@ -12,6 +12,7 @@ typedef struct {
 
 int      osfs3_mount(uint64_t part_offset);
 bool     osfs3_is_mounted(void);
+uint64_t osfs3_partition_start(void);
 
 uint32_t osfs3_resolve_path(const char *path);
 uint32_t osfs3_resolve_path_ci(const char *path);
@@ -66,6 +67,8 @@ int      osfs3_write(void *file, uint64_t offset, const void *buf,
                      uint64_t len);
 int      osfs3_write_ex(void *file, uint64_t offset, const void *buf,
                         uint64_t len, uint32_t io_flags);
+int      osfs3_append_ex(void *file, uint64_t expected_size, const void *buf,
+                         uint64_t len, uint32_t io_flags);
 int      osfs3_write_data(void *file, uint64_t offset, const void *buf,
                           uint64_t len);
 int      osfs3_set_size_reserved(void *file, uint64_t size);

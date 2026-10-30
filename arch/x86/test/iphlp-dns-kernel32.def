@@ -1,0 +1,8 @@
+LIBRARY kernel32.dll
+EXPORTS
+GetStdHandle@4
+WriteFile@20
+LoadLibraryA@4
+GetProcAddress@8
+GetCommandLineA@0
+ExitProcess@4

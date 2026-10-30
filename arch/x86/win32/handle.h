@@ -17,6 +17,7 @@
 #define HANDLE_H
 
 #include "nttypes.h"
+#include "filecache.h"
 
 /* ── Object types ───────────────────────────────────────────── */
 
@@ -83,6 +84,7 @@ typedef struct _FILE_OBJECT {
     ULONG       flags;          /* FILE_OBJ_* */
     ULONG       create_options; /* FILE_* options supplied to NtCreateFile */
     volatile ULONG io_lock;     /* serializes synchronous file position */
+    NT_FILE_READ_STATE read_cache;
     BOOL        suppress_access_time;
     BOOL        suppress_write_time;
     BOOL        suppress_change_time;
@@ -144,6 +146,15 @@ NTSTATUS    handle_lookup_access_for_process(PHANDLE_TABLE table,
                                              OBJECT_TYPE_ID expected_type,
                                              PVOID *out_object,
                                              ACCESS_MASK *out_access);
+/* Acquire an object reference before dropping the table lock. The caller
+ * releases it with ntsync_event_release; closing the handle or exiting its
+ * process cannot revoke this reference. Requires EVENT_MODIFY_STATE. */
+NTSTATUS handle_reference_event_for_process(PHANDLE_TABLE,HANDLE,ULONG,PVOID *);
+
+/* Returns an owned token reference, acquired before dropping the table lock. */
+NTSTATUS    handle_reference_token_for_process(PHANDLE_TABLE table, HANDLE handle,
+                                               ULONG owner_pid, ACCESS_MASK required,
+                                               PVOID *object, ACCESS_MASK *access);
 
 /* Retain the same numeric handle for an inherited child owner. */
 NTSTATUS    handle_retain(PHANDLE_TABLE table,
@@ -160,7 +171,8 @@ NTSTATUS    handle_release_for_process(PHANDLE_TABLE table,
 NTSTATUS    handle_close(PHANDLE_TABLE table,
                          HANDLE handle);
 
-/* Atomically release a handle owner and return the affected entry. */
+/* Atomically release a handle owner and return the affected entry. Token
+ * references are released internally and returned with object == NULL. */
 NTSTATUS    handle_close_entry(PHANDLE_TABLE table,
                                HANDLE handle,
                                HANDLE_ENTRY *closed_entry);
@@ -193,6 +205,8 @@ NTSTATUS    handle_update_flags_for_process(PHANDLE_TABLE table,
                                              ULONG owner_pid,
                                              ULONG mask,
                                              ULONG flags);
+NTSTATUS handle_inherit_all_for_process(PHANDLE_TABLE table, ULONG source_pid,
+                                         ULONG target_pid);
 
 /* Copy queryable object metadata while the handle table lock guarantees the
  * object's lifetime. The returned snapshot contains no live object pointer. */
@@ -200,6 +214,11 @@ NTSTATUS    handle_snapshot_for_process(PHANDLE_TABLE table,
                                         HANDLE handle,
                                         ULONG owner_pid,
                                         HANDLE_OBJECT_SNAPSHOT *snapshot);
+
+/* Copy at most capacity numeric values to a kernel buffer and return the total
+ * visible to this owner. NULL/zero is a count-only snapshot. */
+ULONG       handle_enumerate_for_process(PHANDLE_TABLE table, ULONG owner_pid,
+                                         ULONG *values, ULONG capacity);
 
 BOOL        handle_object_referenced(PHANDLE_TABLE table,
                                      OBJECT_TYPE_ID type,

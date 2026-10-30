@@ -1,0 +1,26 @@
+LIBRARY kernel32.dll
+EXPORTS
+ExitProcess@4
+GetLastError@0
+GetCommandLineA@0
+GetModuleFileNameA@12
+GetStdHandle@4
+WriteFile@20
+CreateProcessA@40
+TerminateProcess@8
+GetExitCodeProcess@8
+CreateThread@24
+CreateEventA@16
+OpenEventA@12
+SetEvent@4
+ResetEvent@4
+WaitForSingleObject@8
+CloseHandle@4
+Sleep@4
+GetProcessHeap@0
+HeapLock@4
+HeapUnlock@4
+HeapAlloc@12
+HeapFree@12
+InitializeCriticalSection@4
+EnterCriticalSection@4

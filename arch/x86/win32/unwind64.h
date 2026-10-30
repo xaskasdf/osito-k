@@ -7,6 +7,11 @@ BOOL win32_unwind64_add_function_table(PRUNTIME_FUNCTION function_table,
                                        DWORD entry_count,
                                        ULONGLONG base_address);
 BOOL win32_unwind64_delete_function_table(PRUNTIME_FUNCTION function_table);
+NTSTATUS win32_unwind64_add_growable_table(PVOID *dynamic_table,
+    PRUNTIME_FUNCTION function_table, DWORD entry_count, DWORD maximum_count,
+    ULONG_PTR range_base, ULONG_PTR range_end);
+void win32_unwind64_grow_function_table(PVOID dynamic_table, DWORD new_count);
+void win32_unwind64_delete_growable_table(PVOID dynamic_table);
 PRUNTIME_FUNCTION win32_unwind64_lookup_function_entry(
     ULONGLONG control_pc, ULONGLONG *image_base,
     PUNWIND_HISTORY_TABLE history_table);

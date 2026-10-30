@@ -3,6 +3,17 @@
 
 #include "types.h"
 
+/* Key events use USB HID keyboard-page (0x07) usages on every transport.
+ * EXTENDED records a PS/2 E0 source, not a second key-code namespace.
+ * Modifier flags describe the state after the current transition. */
+#define KEY_FLAG_EXTENDED (1 << 0)
+#define KEY_FLAG_SHIFT    (1 << 1)
+#define KEY_FLAG_CTRL     (1 << 2)
+#define KEY_FLAG_ALT      (1 << 3)
+#define KEY_FLAG_CAPS     (1 << 4)
+
+void input_post_key(uint8_t usage, bool pressed, bool extended);
+
 #define INPUT_MOUSE_BUTTON_COUNT 3U
 
 /* A non-destructive snapshot for consumers that must not drain the shared

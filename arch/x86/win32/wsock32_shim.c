@@ -10,6 +10,10 @@
 #include "wsock32_shim.h"
 #include "kernel32_shim.h"
 #include "win32_abi.h"
+#include "compat32.h"
+#include "paging.h"
+#include "iproute.h"
+#include "ipinterface.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -51,6 +55,7 @@ extern int  net_tcp_accept_ready(int listener);
 extern void net_tcp_stop_listen(int listener);
 extern int  net_tcp_get_peer(int conn, uint8_t ip_out[4], uint16_t *port_out);
 extern int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
+extern bool net_dns_get_server(uint8_t ip_out[4]);
 extern int  net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
                          uint16_t src_port, const void *data, uint32_t len);
 extern int  kernel_sock_socket(int domain, int type, int protocol)
@@ -242,6 +247,8 @@ typedef struct {
     BYTE    connect_context_updated;
     BYTE    shutdown_receive;
     BYTE    shutdown_send;
+    BYTE    disconnecting;
+    BYTE    disconnected;
 } win32_socket_t;
 
 #define WSOCK_OPT_DEBUG          0x0001U
@@ -337,7 +344,9 @@ static void wsock_refresh_socket_event_for_process(win32_socket_t *ws,
 
 #define MAX_PENDING_ACCEPTEX 256
 #define MAX_PENDING_CONNECTEX 256
+#define MAX_PENDING_DISCONNECTEX 256
 #define MAX_PENDING_WSARECV 256
+#define MAX_PENDING_WSASEND 256
 #define MAX_WSARECV_BUFFERS 64
 #define WSOCK_CONNECT_TIMEOUT_MS 60000ULL
 
@@ -377,6 +386,22 @@ typedef struct {
 static wsock_pending_connect_t g_pending_connects[MAX_PENDING_CONNECTEX];
 
 typedef struct {
+    volatile LONG state; /* 0=free, 1=pending, 2=servicing, 3=sync complete */
+    DWORD owner_pid;
+    DWORD owner_tid;
+    BOOL compat32;
+    SOCKET socket;
+    DWORD socket_generation;
+    PVOID overlapped;
+    int conn_id;
+    BOOL reuse;
+    NTSTATUS result;
+} wsock_pending_disconnect_t;
+
+static wsock_pending_disconnect_t
+    g_pending_disconnects[MAX_PENDING_DISCONNECTEX];
+
+typedef struct {
     PVOID data;
     uint32_t length;
 } wsock_captured_buffer_t;
@@ -401,6 +426,34 @@ typedef struct {
 static wsock_pending_recv_t g_pending_recvs[MAX_PENDING_WSARECV];
 static volatile ULONGLONG g_pending_recv_next_sequence;
 static volatile LONG g_pending_recv_service_lock;
+
+/* Only published requests own a slot. Send servicing holds the socket
+ * lifecycle lock before this lock; cancellation needs only the latter. */
+typedef struct {
+    LONG state;
+    ULONGLONG sequence;
+    DWORD owner_pid;
+    DWORD owner_tid;
+    uint64_t owner_cr3;
+    BOOL compat32;
+    SOCKET socket;
+    DWORD socket_generation;
+    int conn_id;
+    DWORD count;
+    wsock_captured_buffer_t buffers[MAX_WSARECV_BUFFERS];
+    DWORD buffer_index;
+    DWORD buffer_offset;
+    DWORD transferred;
+    DWORD length;
+    PVOID overlapped;
+} wsock_pending_send_t;
+
+static wsock_pending_send_t g_pending_sends[MAX_PENDING_WSASEND];
+static ULONGLONG g_pending_send_next_sequence;
+static volatile LONG g_pending_send_lock;
+/* A shared kernel buffer avoids dereferencing a foreign process's WSABUF.
+ * It is protected by g_pending_send_lock and never retained by TCP. */
+static BYTE g_pending_send_stage[WSOCK_TCP_SEND_CAPACITY];
 
 typedef struct {
     uint32_t len;
@@ -825,7 +878,7 @@ static void wsock_process_states_release(void)
 static void wsock_socket_lifecycle_acquire(void)
 {
     while (__sync_lock_test_and_set(&g_wsock_socket_lifecycle_lock, 1))
-        __asm__ volatile ("pause");
+        sched_yield();
 }
 
 static void wsock_socket_lifecycle_release(void)
@@ -1321,6 +1374,119 @@ static int wsock_status_error(NTSTATUS status)
     return WSAEINVAL;
 }
 
+static void wsock_reset_disconnected_socket(win32_socket_t *socket, BOOL reuse)
+{
+    socket->disconnecting = 0;
+    socket->disconnected = !reuse;
+    socket->shutdown_receive = !reuse;
+    socket->shutdown_send = !reuse;
+    socket->accept_context_updated = 0;
+    socket->connect_context_updated = 0;
+    socket->connected_at_ms = 0;
+    socket->pending_error = 0;
+    socket->remote_port = 0;
+    ws_memset(socket->remote_ip, 0, sizeof(socket->remote_ip));
+    socket->event_pending = 0;
+    socket->event_ready_mask = 0;
+}
+
+/* The pending request owns the detached TCP connection, not any socket alias. */
+static void wsock_finish_pending_disconnect(wsock_pending_disconnect_t *pending,
+                                             NTSTATUS status, BOOL notify,
+                                             BOOL completed_async)
+{
+    if (pending->conn_id >= 0) {
+        net_tcp_release(pending->conn_id);
+        pending->conn_id = -1;
+    }
+
+    wsock_process_states_acquire();
+    for (int i = 0; i < MAX_WSOCK_PROCESS_STATES; i++) {
+        wsock_process_state_t *owner = &g_wsock_process_states[i];
+        if (!owner->used) continue;
+        for (int j = 0; j < MAX_WIN32_SOCKETS; j++) {
+            win32_socket_t *socket = &owner->sockets[j];
+            if (socket->in_use && socket->disconnecting &&
+                socket->generation == pending->socket_generation)
+                wsock_reset_disconnected_socket(socket, pending->reuse);
+        }
+    }
+    for (int i = 0; i < MAX_WSOCK_DUPLICATIONS; i++) {
+        wsock_duplication_t *duplicate = &g_wsock_duplications[i];
+        if (duplicate->state && duplicate->socket.disconnecting &&
+            duplicate->socket.generation == pending->socket_generation)
+            wsock_reset_disconnected_socket(&duplicate->socket, pending->reuse);
+    }
+    wsock_process_states_release();
+
+    pending->result = status;
+    if (notify && pending->overlapped) {
+        if (completed_async) {
+            k32_iocp_complete_handle_status_for_owner(
+                (HANDLE)(ULONG_PTR)pending->socket, 0, pending->overlapped,
+                pending->owner_pid, pending->compat32, status);
+        } else {
+            k32_iocp_complete_handle((HANDLE)(ULONG_PTR)pending->socket, 0,
+                                      pending->overlapped);
+        }
+    }
+    __atomic_store_n(&pending->state,
+                     notify && !pending->overlapped ? 3 : 0, __ATOMIC_RELEASE);
+}
+
+static void wsock_service_pending_disconnects(DWORD owner_filter)
+{
+    /* close/cleanup can service other pending I/O while holding this lock. */
+    if (__sync_lock_test_and_set(&g_wsock_socket_lifecycle_lock, 1))
+        return;
+    for (int i = 0; i < MAX_PENDING_DISCONNECTEX; i++) {
+        wsock_pending_disconnect_t *pending = &g_pending_disconnects[i];
+        if (__atomic_load_n(&pending->state, __ATOMIC_ACQUIRE) != 1 ||
+            (owner_filter && pending->owner_pid != owner_filter))
+            continue;
+        LONG expected = 1;
+        if (!__atomic_compare_exchange_n(&pending->state, &expected, 2,
+                                         FALSE, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+            continue;
+
+        wsock_process_state_t *owner = wsock_state_for_pid(pending->owner_pid);
+        int index = wsock_raw_index(pending->socket);
+        if (!owner || index < 0 || !owner->sockets[index].in_use ||
+            owner->sockets[index].generation != pending->socket_generation) {
+            net_tcp_abort(pending->conn_id);
+            wsock_finish_pending_disconnect(pending, STATUS_CANCELLED,
+                                              owner != NULL, TRUE);
+        } else if (net_tcp_state(pending->conn_id) == KERN_TCP_CLOSED) {
+            wsock_finish_pending_disconnect(pending, STATUS_SUCCESS, TRUE,
+                                              TRUE);
+        } else {
+            __atomic_store_n(&pending->state, 1, __ATOMIC_RELEASE);
+        }
+    }
+    wsock_socket_lifecycle_release();
+}
+
+/* Caller excludes receive servicing while detaching this shared backend. */
+static void wsock_cancel_disconnected_recvs(DWORD generation)
+{
+    for (int i = 0; i < MAX_PENDING_WSARECV; i++) {
+        wsock_pending_recv_t *pending = &g_pending_recvs[i];
+        if (__atomic_load_n(&pending->state, __ATOMIC_ACQUIRE) != 1 ||
+            pending->socket_generation != generation)
+            continue;
+        LONG expected = 1;
+        if (!__atomic_compare_exchange_n(&pending->state, &expected, 2,
+                                         FALSE, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+            continue;
+        k32_iocp_complete_handle_status_for_owner(
+            (HANDLE)(ULONG_PTR)pending->socket, 0, pending->overlapped,
+            pending->owner_pid, pending->compat32, STATUS_CANCELLED);
+        __atomic_store_n(&pending->state, 0, __ATOMIC_RELEASE);
+    }
+}
+
 /* owner_filter==0 services every process from the global network worker. */
 static void wsock_service_pending_connects(DWORD owner_filter)
 {
@@ -1680,14 +1846,215 @@ static void wsock_service_pending_recvs(DWORD owner_pid)
     __atomic_store_n(&g_pending_recv_service_lock, 0, __ATOMIC_RELEASE);
 }
 
+static void wsock_send_lock_acquire(void)
+{
+    while (__sync_lock_test_and_set(&g_pending_send_lock, 1))
+        sched_yield();
+}
+
+static void wsock_send_lock_release(void)
+{
+    __sync_lock_release(&g_pending_send_lock);
+}
+
+static BOOL wsock_send_has_earlier(const wsock_pending_send_t *candidate)
+{
+    for (int i = 0; i < MAX_PENDING_WSASEND; i++) {
+        const wsock_pending_send_t *other = &g_pending_sends[i];
+        if (other->state == 1 && other != candidate &&
+            other->socket_generation == candidate->socket_generation &&
+            other->conn_id == candidate->conn_id &&
+            other->sequence < candidate->sequence)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static NTSTATUS wsock_send_error_status(int error)
+{
+    if (error == WSAECONNRESET) return STATUS_CONNECTION_RESET;
+    if (error == WSAETIMEDOUT) return STATUS_IO_TIMEOUT;
+    if (error == WSAEFAULT) return STATUS_ACCESS_VIOLATION;
+    return STATUS_UNSUCCESSFUL;
+}
+
+/* Caller holds both locks. The captured CR3 stays live until process teardown
+ * discards its requests under the same locks. Each pass consumes bounded work. */
+static int wsock_send_advance(wsock_pending_send_t *pending, DWORD *budget)
+{
+    uint64_t current_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(current_cr3));
+    while (pending->buffer_index < pending->count) {
+        const wsock_captured_buffer_t *buffer =
+            &pending->buffers[pending->buffer_index];
+        if (pending->buffer_offset == buffer->length) {
+            pending->buffer_index++;
+            pending->buffer_offset = 0;
+            continue;
+        }
+        if (!*budget || !net_tcp_send_ready(pending->conn_id)) {
+            int state = net_tcp_state(pending->conn_id);
+            if (state == KERN_TCP_ESTABLISHED || state == KERN_TCP_CLOSE_WAIT)
+                return WSAEWOULDBLOCK;
+            return net_tcp_error(pending->conn_id) == KERN_TCP_ERROR_TIMED_OUT
+                 ? WSAETIMEDOUT : WSAECONNRESET;
+        }
+        DWORD amount = buffer->length - pending->buffer_offset;
+        if (amount > sizeof(g_pending_send_stage))
+            amount = sizeof(g_pending_send_stage);
+        if (amount > *budget) amount = *budget;
+        uint64_t source = (uint64_t)(ULONG_PTR)buffer->data +
+                          pending->buffer_offset;
+        uint64_t copied = 0;
+        if (paging_copy_between_cr3(
+                current_cr3, (uint64_t)(ULONG_PTR)g_pending_send_stage,
+                pending->owner_cr3, source, amount, &copied) != 0 ||
+            copied != amount)
+            return WSAEFAULT;
+        int sent = net_tcp_send(pending->conn_id, g_pending_send_stage, amount);
+        if (sent < 0)
+            return net_tcp_error(pending->conn_id) == KERN_TCP_ERROR_TIMED_OUT
+                 ? WSAETIMEDOUT : WSAECONNRESET;
+        if (!sent) return WSAEWOULDBLOCK;
+        pending->transferred += (DWORD)sent;
+        pending->buffer_offset += (DWORD)sent;
+        *budget -= (DWORD)sent;
+    }
+    return 0;
+}
+
+static void wsock_finish_pending_send(wsock_pending_send_t *pending,
+                                       NTSTATUS status)
+{
+    k32_iocp_complete_handle_status_for_owner(
+        (HANDLE)(ULONG_PTR)pending->socket, pending->transferred,
+        pending->overlapped, pending->owner_pid, pending->compat32, status);
+    serial_puts("[WSOCK] WSASend async complete socket=");
+    serial_puthex((uint32_t)pending->socket, 4);
+    serial_puts(" owner=");
+    serial_puthex(pending->owner_pid, 8);
+    serial_puts(" bytes=");
+    serial_puthex(pending->transferred, 8);
+    serial_puts(" status=");
+    serial_puthex((uint32_t)status, 8);
+    serial_puts("\n");
+    pending->state = 0;
+}
+
+/* FIFO uses the shared socket generation, including duplicated handles in
+ * other processes. A cancelled slot may leave a hole in the array. */
+static void wsock_service_pending_sends_locked(void)
+{
+    DWORD budget = WSOCK_TCP_SEND_CAPACITY * 4U;
+    BOOL completed;
+    do {
+        completed = FALSE;
+        for (int i = 0; i < MAX_PENDING_WSASEND; i++) {
+            wsock_pending_send_t *pending = &g_pending_sends[i];
+            if (pending->state != 1 || wsock_send_has_earlier(pending))
+                continue;
+            wsock_process_state_t *owner = wsock_state_for_pid(pending->owner_pid);
+            int index = wsock_raw_index(pending->socket);
+            if (!owner) {
+                pending->state = 0;
+                completed = TRUE;
+                continue;
+            }
+            if (index < 0 || !owner->sockets[index].in_use ||
+                owner->sockets[index].generation != pending->socket_generation ||
+                owner->sockets[index].kern_conn_id != pending->conn_id ||
+                owner->sockets[index].shutdown_send) {
+                wsock_finish_pending_send(pending, STATUS_CANCELLED);
+                completed = TRUE;
+                continue;
+            }
+            int error = wsock_send_advance(pending, &budget);
+            if (error == WSAEWOULDBLOCK) continue;
+            wsock_finish_pending_send(pending, error
+                ? wsock_send_error_status(error) : STATUS_SUCCESS);
+            completed = TRUE;
+        }
+    } while (completed && budget);
+}
+
+static void wsock_service_pending_sends(void)
+{
+    /* net_poll() may enter an API while close or a send owns this lock. */
+    if (__sync_lock_test_and_set(&g_wsock_socket_lifecycle_lock, 1)) return;
+    if (!__sync_lock_test_and_set(&g_pending_send_lock, 1)) {
+        wsock_service_pending_sends_locked();
+        wsock_send_lock_release();
+    }
+    wsock_socket_lifecycle_release();
+}
+
+static BOOL wsock_cancel_pending_sends(DWORD owner_pid, SOCKET socket,
+                                       PVOID overlapped, DWORD owner_tid,
+                                       DWORD generation, BOOL notify)
+{
+    BOOL cancelled = FALSE;
+    wsock_send_lock_acquire();
+    for (int i = 0; i < MAX_PENDING_WSASEND; i++) {
+        wsock_pending_send_t *pending = &g_pending_sends[i];
+        if (pending->state != 1 ||
+            (owner_pid && pending->owner_pid != owner_pid) ||
+            (socket != INVALID_SOCKET && pending->socket != socket) ||
+            (overlapped && pending->overlapped != overlapped) ||
+            (owner_tid && pending->owner_tid != owner_tid) ||
+            (generation && pending->socket_generation != generation))
+            continue;
+        if (notify)
+            wsock_finish_pending_send(pending, STATUS_CANCELLED);
+        else
+            pending->state = 0;
+        cancelled = TRUE;
+    }
+    wsock_send_lock_release();
+    return cancelled;
+}
+
+void wsock_cancel_thread_sends(DWORD owner_pid, DWORD owner_tid)
+{
+    if (owner_pid && owner_tid)
+        wsock_cancel_pending_sends(owner_pid, INVALID_SOCKET, NULL, owner_tid,
+                                     0, TRUE);
+}
+
+static int wsock_stream_send_ordered(SOCKET s, DWORD generation,
+                                     PCVOID buffer, DWORD length)
+{
+    wsock_socket_lifecycle_acquire();
+    wsock_send_lock_acquire();
+    wsock_process_state_t *owner = wsock_state_current();
+    int index = wsock_raw_index(s);
+    int result = -1;
+    if (index >= 0 && owner->sockets[index].in_use &&
+        owner->sockets[index].generation == generation &&
+        !owner->sockets[index].shutdown_send) {
+        win32_socket_t *socket = &owner->sockets[index];
+        wsock_pending_send_t candidate = {0};
+        candidate.socket_generation = generation;
+        candidate.conn_id = socket->kern_conn_id;
+        candidate.sequence = ~0ULL;
+        wsock_service_pending_sends_locked();
+        result = wsock_send_has_earlier(&candidate) ? 0 :
+                 net_tcp_send(socket->kern_conn_id, buffer, length);
+    }
+    wsock_send_lock_release();
+    wsock_socket_lifecycle_release();
+    return result;
+}
+
 void wsock_service_pending_io(void)
 {
     DWORD owner_pid = win32_current_process_id();
     net_poll();
     wsock_service_pending_connects(owner_pid);
+    wsock_service_pending_disconnects(owner_pid);
     wsock_wake_ready_pending_io();
     wsock_service_pending_accepts(owner_pid);
     wsock_service_pending_recvs(owner_pid);
+    wsock_service_pending_sends();
 }
 
 BOOL wsock_cancel_io(SOCKET socket, PVOID overlapped,
@@ -1695,7 +2062,26 @@ BOOL wsock_cancel_io(SOCKET socket, PVOID overlapped,
 {
     DWORD owner_pid = win32_current_process_id();
     DWORD owner_tid = GetCurrentThreadId();
-    BOOL cancelled = FALSE;
+    BOOL cancelled = wsock_cancel_pending_sends(
+        owner_pid, socket, overlapped, current_thread_only ? owner_tid : 0,
+        0, TRUE);
+
+    for (int i = 0; i < MAX_PENDING_DISCONNECTEX; i++) {
+        wsock_pending_disconnect_t *pending = &g_pending_disconnects[i];
+        if (__atomic_load_n(&pending->state, __ATOMIC_ACQUIRE) != 1 ||
+            pending->owner_pid != owner_pid || pending->socket != socket ||
+            (overlapped && pending->overlapped != overlapped) ||
+            (current_thread_only && pending->owner_tid != owner_tid))
+            continue;
+        LONG expected = 1;
+        if (!__atomic_compare_exchange_n(&pending->state, &expected, 2,
+                                         FALSE, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+            continue;
+        net_tcp_abort(pending->conn_id);
+        wsock_finish_pending_disconnect(pending, STATUS_CANCELLED, TRUE, TRUE);
+        cancelled = TRUE;
+    }
 
     for (int i = 0; i < MAX_PENDING_CONNECTEX; i++) {
         wsock_pending_connect_t *pending = &g_pending_connects[i];
@@ -1791,8 +2177,10 @@ BOOL wsock_cancel_io(SOCKET socket, PVOID overlapped,
 static void wsock_release_backend_on_process_exit(
     const win32_socket_t *socket)
 {
-    if (socket->kern_conn_id >= 0)
+    if (socket->kern_conn_id >= 0) {
         net_tcp_abort(socket->kern_conn_id);
+        net_tcp_release(socket->kern_conn_id);
+    }
     if (socket->kern_listener_id >= 0)
         net_tcp_stop_listen(socket->kern_listener_id);
     if (socket->kern_socket_id >= 0)
@@ -1801,6 +2189,25 @@ static void wsock_release_backend_on_process_exit(
 
 static void wsock_discard_process_async_state(DWORD process_id)
 {
+    wsock_cancel_pending_sends(process_id, INVALID_SOCKET, NULL, 0, 0, FALSE);
+    for (int i = 0; i < MAX_PENDING_DISCONNECTEX; i++) {
+        wsock_pending_disconnect_t *pending = &g_pending_disconnects[i];
+        if (!__atomic_load_n(&pending->state, __ATOMIC_ACQUIRE) ||
+            pending->owner_pid != process_id)
+            continue;
+        LONG expected = 1;
+        if (__atomic_compare_exchange_n(&pending->state, &expected, 2,
+                                         FALSE, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            net_tcp_abort(pending->conn_id);
+            wsock_finish_pending_disconnect(pending, STATUS_CANCELLED,
+                                              FALSE, TRUE);
+        } else if (expected == 3) {
+            __atomic_compare_exchange_n(&pending->state, &expected, 0,
+                                         FALSE, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE);
+        }
+    }
     for (int i = 0; i < MAX_PENDING_CONNECTEX; i++) {
         wsock_pending_connect_t *pending = &g_pending_connects[i];
         if (__atomic_load_n(&pending->state, __ATOMIC_ACQUIRE) &&
@@ -2088,7 +2495,9 @@ static void wsock_event_worker(void)
          * they wait. Drive the polled NIC here before deriving FD_* state so
          * network events are observable without API-side polling. */
         net_poll();
+        wsock_service_pending_sends();
         wsock_service_pending_connects(0);
+        wsock_service_pending_disconnects(0);
         wsock_wake_ready_pending_io();
         for (int state_index = 0;
              state_index < MAX_WSOCK_PROCESS_STATES; state_index++) {
@@ -3570,13 +3979,138 @@ static int WINAPI wsock_getaddrinfo(PCSTR node, PCSTR service,
     return 0;
 }
 
+static BOOL wsock_send_range_mapped(PCVOID pointer, SIZE_T size,
+                                     uint64_t cr3, BOOL writable)
+{
+    uint64_t first = (uint64_t)(ULONG_PTR)pointer;
+    if (!pointer || !size || size - 1U > ~first) return FALSE;
+    uint64_t last = first + size - 1U;
+    if ((first >> 47) != 0 && (first >> 47) != 0x1FFFFU) return FALSE;
+    if ((last >> 47) != (first >> 47)) return FALSE;
+    for (uint64_t page = first & ~0xFFFULL;; page += 4096U) {
+        uint64_t flags = 0;
+        if (paging_query_mapping_in_cr3(cr3, page, &flags, NULL) != 0 ||
+            !(flags & 1U) || (writable && !(flags & 2U)))
+            return FALSE;
+        if (page == (last & ~0xFFFULL)) return TRUE;
+    }
+}
+
+static int wsock_send_stream_captured(SOCKET s,
+                                      const wsock_captured_buffer_t *buffers,
+                                      DWORD count, DWORD length,
+                                      DWORD *bytes_sent, PVOID overlapped,
+                                      BOOL compat32, uint64_t owner_cr3)
+{
+    wsock_pending_send_t request = {0};
+    request.owner_pid = win32_current_process_id();
+    request.owner_tid = GetCurrentThreadId();
+    request.owner_cr3 = owner_cr3;
+    request.compat32 = compat32;
+    request.socket = s;
+    request.count = count;
+    request.length = length;
+    request.overlapped = overlapped;
+    for (DWORD i = 0; i < count; i++) request.buffers[i] = buffers[i];
+    ULONGLONG deadline = 0;
+    BOOL nonblocking = FALSE;
+    BOOL first = TRUE;
+    for (;;) {
+        wsock_socket_lifecycle_acquire();
+        wsock_send_lock_acquire();
+        int index = sock_to_index(s);
+        int error = index < 0 ? WSAENOTSOCK : 0;
+        win32_socket_t *socket = index < 0 ? NULL : &win32_sockets[index];
+        if (!error && socket->shutdown_send) error = WSAESHUTDOWN;
+        if (!error && (socket->kern_conn_id < 0 || socket->disconnecting ||
+                       socket->disconnected))
+            error = WSAENOTCONN;
+        if (!error && first) {
+            request.socket_generation = socket->generation;
+            request.conn_id = socket->kern_conn_id;
+            request.sequence = ++g_pending_send_next_sequence;
+            nonblocking = socket->nonblocking;
+            if (socket->send_timeout_ms)
+                deadline = GetTickCount64() + (DWORD)socket->send_timeout_ms;
+            first = FALSE;
+        } else if (!error &&
+                   (socket->generation != request.socket_generation ||
+                    socket->kern_conn_id != request.conn_id)) {
+            error = WSAENOTCONN;
+        }
+        wsock_pending_send_t *slot = NULL;
+        if (!error && overlapped) {
+            for (int i = 0; i < MAX_PENDING_WSASEND; i++) {
+                if (!g_pending_sends[i].state) {
+                    slot = &g_pending_sends[i];
+                    break;
+                }
+            }
+            if (!slot) error = WSAENOBUFS;
+            HANDLE event = compat32
+                ? (HANDLE)(ULONG_PTR)((const uint32_t *)overlapped)[4]
+                : (HANDLE)((const ULONG_PTR *)overlapped)[3];
+            event = (HANDLE)((ULONG_PTR)event & ~(ULONG_PTR)1U);
+            if (!error && event && !ResetEvent(event)) error = WSAEINVAL;
+        }
+        if (!error) {
+            if (!overlapped) wsock_service_pending_sends_locked();
+            DWORD budget = WSOCK_TCP_SEND_CAPACITY * 4U;
+            error = wsock_send_has_earlier(&request) ? WSAEWOULDBLOCK :
+                    wsock_send_advance(&request, &budget);
+            if (!error) {
+                if (bytes_sent) *bytes_sent = request.transferred;
+                if (overlapped)
+                    k32_iocp_complete_handle((HANDLE)(ULONG_PTR)s,
+                                              request.transferred, overlapped);
+            } else if (overlapped && error == WSAEWOULDBLOCK) {
+                *slot = request;
+                wsock_set_overlapped_status(overlapped, compat32,
+                                            STATUS_PENDING, 0);
+                slot->state = 1;
+                /* lpNumberOfBytesSent is undefined for pending sends. */
+                error = WSA_IO_PENDING;
+            } else if (!overlapped && nonblocking && request.transferred &&
+                       error == WSAEWOULDBLOCK) {
+                *bytes_sent = request.transferred;
+                error = 0;
+            } else if (overlapped && request.transferred) {
+                /* Once any bytes are consumed the accepted operation gets
+                 * exactly one error completion, rather than a retryable call. */
+                *slot = request;
+                wsock_set_overlapped_status(overlapped, compat32,
+                                            STATUS_PENDING, 0);
+                slot->state = 1;
+                wsock_finish_pending_send(slot, wsock_send_error_status(error));
+                error = WSA_IO_PENDING;
+            }
+        }
+        wsock_send_lock_release();
+        wsock_socket_lifecycle_release();
+        if (error != WSAEWOULDBLOCK || overlapped || nonblocking) {
+            wsa_last_error = error;
+            return error ? SOCKET_ERROR : 0;
+        }
+        if (deadline && GetTickCount64() >= deadline) {
+            wsa_last_error = WSAETIMEDOUT;
+            return SOCKET_ERROR;
+        }
+        Sleep(1);
+    }
+}
+
 static int WINAPI wsock_WSASendTo(SOCKET s, PCVOID buffers,
                                   DWORD count, DWORD *bytes_sent, DWORD flags,
                                   PVOID to, int tolen, PVOID overlapped,
                                   PVOID completion)
 {
-    if (bytes_sent) *bytes_sent = 0;
-    if (!buffers || count == 0 || count > 64) {
+    BOOL compat32 = g_compat32_mode;
+    uint64_t owner_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(owner_cr3));
+    if (!buffers || count == 0 || count > MAX_WSARECV_BUFFERS ||
+        !wsock_send_range_mapped(buffers,
+            count * (compat32 ? sizeof(WSABUF32) : sizeof(WSABUF64)),
+            owner_cr3, FALSE)) {
         wsa_last_error = WSAEFAULT;
         return SOCKET_ERROR;
     }
@@ -3588,8 +4122,24 @@ static int WINAPI wsock_WSASendTo(SOCKET s, PCVOID buffers,
         wsa_last_error = WSAEOPNOTSUPP;
         return SOCKET_ERROR;
     }
+    if ((bytes_sent && !wsock_send_range_mapped(bytes_sent, sizeof(DWORD),
+                                               owner_cr3, TRUE)) ||
+        (overlapped && !wsock_send_range_mapped(overlapped,
+                         compat32 ? 20U : 32U, owner_cr3, TRUE))) {
+        wsa_last_error = WSAEFAULT;
+        return SOCKET_ERROR;
+    }
+    wsock_captured_buffer_t captured[MAX_WSARECV_BUFFERS];
+    DWORD length = 0;
+    int error = wsock_capture_recv_buffers(buffers, count, compat32,
+                                           captured, &length);
+    if (error) {
+        wsa_last_error = error;
+        return SOCKET_ERROR;
+    }
     for (DWORD i = 0; i < count; i++) {
-        if (wsabuf_len(buffers, i) && !wsabuf_data(buffers, i)) {
+        if (captured[i].length && !wsock_send_range_mapped(captured[i].data,
+                      captured[i].length, owner_cr3, FALSE)) {
             wsa_last_error = WSAEFAULT;
             return SOCKET_ERROR;
         }
@@ -3604,12 +4154,7 @@ static int WINAPI wsock_WSASendTo(SOCKET s, PCVOID buffers,
     if (win32_sockets[socket_index].type == SOCK_DGRAM) {
         uint64_t datagram_length = 0;
         for (DWORD i = 0; i < count; i++) {
-            uint32_t length = wsabuf_len(buffers, i);
-            if (length && !wsabuf_data(buffers, i)) {
-                wsa_last_error = WSAEFAULT;
-                return SOCKET_ERROR;
-            }
-            datagram_length += length;
+            datagram_length += captured[i].length;
             if (datagram_length > 65507U) {
                 wsa_last_error = WSAEMSGSIZE;
                 return SOCKET_ERROR;
@@ -3627,9 +4172,9 @@ static int WINAPI wsock_WSASendTo(SOCKET s, PCVOID buffers,
         }
         DWORD offset = 0;
         for (DWORD i = 0; i < count; i++) {
-            uint32_t length = wsabuf_len(buffers, i);
+            uint32_t length = captured[i].length;
             if (!length) continue;
-            ws_memcpy(datagram + offset, wsabuf_data(buffers, i), length);
+            ws_memcpy(datagram + offset, captured[i].data, length);
             offset += length;
         }
         int sent = wsock_sendto(s, (PCSTR)datagram, (int)datagram_length,
@@ -3644,44 +4189,12 @@ static int WINAPI wsock_WSASendTo(SOCKET s, PCVOID buffers,
         return 0;
     }
 
-    DWORD total = 0;
-    for (DWORD i = 0; i < count; i++) {
-        uint32_t len = wsabuf_len(buffers, i);
-        PVOID data = wsabuf_data(buffers, i);
-        if (!len) continue;
-#if !defined(OK_QUIET) || !OK_QUIET
-        serial_puts("[WSOCK] WSASend len=");
-        serial_puthex(len, 8);
-        serial_puts(" buf=");
-        serial_puthex((uint64_t)(uintptr_t)data, 16);
-        serial_puts("\n");
-#endif
-        int trace_index = sock_to_index(s);
-        if (trace_index >= 0)
-            wsock_trace_loopback_payload("TX", &win32_sockets[trace_index],
-                                         data, len);
-        int sent = wsock_sendto(s, (PCSTR)data, (int)len, (int)flags,
-                                to, tolen);
-        if (sent == SOCKET_ERROR) {
-            if (!total) return SOCKET_ERROR;
-            break;
-        }
-        total += (DWORD)sent;
-        if ((DWORD)sent < len) break;
+    if (flags) {
+        wsa_last_error = WSAEOPNOTSUPP;
+        return SOCKET_ERROR;
     }
-    if (bytes_sent) *bytes_sent = total;
-    if (overlapped) {
-#if !defined(OK_QUIET) || !OK_QUIET
-        serial_puts("[WSOCK] WSASend complete bytes=");
-        serial_puthex(total, 8);
-        serial_puts(" overlapped=");
-        serial_puthex((uint64_t)(uintptr_t)overlapped, 16);
-        serial_puts("\n");
-#endif
-        k32_iocp_complete_handle((HANDLE)(ULONG_PTR)s, total, overlapped);
-    }
-    wsa_last_error = 0;
-    return 0;
+    return wsock_send_stream_captured(s, captured, count, length, bytes_sent,
+                                       overlapped, compat32, owner_cr3);
 }
 
 static int WINAPI wsock_WSASend(SOCKET s, PCVOID buffers,
@@ -4216,6 +4729,8 @@ static int wsock_prepare_connect(SOCKET s, PVOID name, int namelen,
 
     win32_socket_t *ws = &win32_sockets[idx];
     if (!name) return WSAEFAULT;
+    if (ws->disconnecting) return WSAEINVAL;
+    if (ws->disconnected) return WSAEISCONN;
     if (ws->connected) return WSAEISCONN;
     if (ws->connecting) return WSAEALREADY;
     if (ws->listening) return WSAEOPNOTSUPP;
@@ -4349,13 +4864,14 @@ int WINAPI wsock_send(SOCKET s, PCSTR buf, int len, int flags)
         if (ws->kern_conn_id < 0) { wsa_last_error = WSAENOTCONN; return SOCKET_ERROR; }
         ULONGLONG deadline = ws->send_timeout_ms
                            ? GetTickCount64() + (DWORD)ws->send_timeout_ms : 0;
-        int sent = net_tcp_send(ws->kern_conn_id, buf, (uint32_t)len);
+        DWORD generation = ws->generation;
+        int sent = wsock_stream_send_ordered(s, generation, buf, (uint32_t)len);
         while (sent == 0 && len > 0 && !ws->nonblocking &&
                net_tcp_state(ws->kern_conn_id) == KERN_TCP_ESTABLISHED) {
             if (deadline && GetTickCount64() >= deadline)
                 break;
             Sleep(1);
-            sent = net_tcp_send(ws->kern_conn_id, buf, (uint32_t)len);
+            sent = wsock_stream_send_ordered(s, generation, buf, (uint32_t)len);
         }
         if (sent < 0) {
             int error = wsock_tcp_send_error(ws);
@@ -6407,21 +6923,121 @@ static BOOL WINAPI wsock_connect_ex(SOCKET s, PVOID name, int namelen,
 static BOOL WINAPI wsock_disconnect_ex(SOCKET s, PVOID overlapped,
                                         DWORD flags, DWORD reserved)
 {
-    (void)overlapped;
-    (void)flags;
-    (void)reserved;
-    int idx = sock_to_index(s);
-    if (idx < 0) {
-        wsa_last_error = WSAENOTSOCK;
+    if (reserved || (flags & ~2U)) { /* TF_REUSE_SOCKET */
+        wsa_last_error = WSAEINVAL;
         return FALSE;
     }
+    BOOL compat32 = g_compat32_mode;
+    if (overlapped && !win32_user_range_writable(
+            overlapped, compat32 ? 20 : 32, compat32)) {
+        wsa_last_error = WSAEFAULT;
+        return FALSE;
+    }
+
+    /* A pending receive must not follow this socket onto its next connection. */
+    for (;;) {
+        wsock_socket_lifecycle_acquire();
+        LONG expected = 0;
+        if (__atomic_compare_exchange_n(&g_pending_recv_service_lock,
+                                         &expected, 1, FALSE,
+                                         __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+            break;
+        wsock_socket_lifecycle_release();
+        sched_yield();
+    }
+    int error = 0;
+    wsock_pending_disconnect_t *slot = NULL;
+    int idx = sock_to_index(s);
+    if (idx < 0) {
+        error = WSAENOTSOCK;
+        goto fail;
+    }
     win32_socket_t *ws = &win32_sockets[idx];
-    if (ws->kern_conn_id >= 0) net_tcp_shutdown(ws->kern_conn_id);
+    if (ws->type != SOCK_STREAM) {
+        error = WSAEOPNOTSUPP;
+        goto fail;
+    }
+    if (!ws->connected || ws->kern_conn_id < 0 || ws->disconnecting) {
+        error = WSAENOTCONN;
+        goto fail;
+    }
+    for (int i = 0; i < MAX_PENDING_DISCONNECTEX; i++) {
+        LONG expected = 0;
+        if (__atomic_compare_exchange_n(&g_pending_disconnects[i].state,
+                                         &expected, 2, FALSE,
+                                         __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            slot = &g_pending_disconnects[i];
+            break;
+        }
+    }
+    if (!slot) {
+        error = WSAENOBUFS;
+        goto fail;
+    }
+    if (overlapped) {
+        NTSTATUS status;
+        DWORD bytes;
+        HANDLE event;
+        wsock_overlapped_status(overlapped, &status, &bytes, &event);
+        event = (HANDLE)((ULONG_PTR)event & ~(ULONG_PTR)1U);
+        if (event && !ResetEvent(event)) {
+            error = WSAEINVAL;
+            goto fail;
+        }
+        wsock_set_overlapped_status(overlapped, compat32, STATUS_PENDING, 0);
+    }
+
+    slot->owner_pid = win32_current_process_id();
+    slot->owner_tid = GetCurrentThreadId();
+    slot->compat32 = compat32;
+    slot->socket = s;
+    slot->socket_generation = ws->generation;
+    slot->conn_id = ws->kern_conn_id;
+    slot->reuse = (flags & 2U) != 0;
+    slot->overlapped = overlapped;
+    slot->result = STATUS_PENDING;
     ws->kern_conn_id = -1;
     ws->connected = 0;
     ws->connecting = 0;
-    wsa_last_error = 0;
-    return TRUE;
+    ws->disconnecting = 1;
+    ws->shutdown_receive = 1;
+    ws->shutdown_send = 1;
+    wsock_propagate_shared_state(ws);
+    wsock_cancel_disconnected_recvs(ws->generation);
+    wsock_cancel_pending_sends(0, INVALID_SOCKET, NULL, 0, ws->generation, TRUE);
+    net_tcp_shutdown(slot->conn_id);
+    BOOL immediate = net_tcp_state(slot->conn_id) == KERN_TCP_CLOSED;
+    if (immediate)
+        wsock_finish_pending_disconnect(slot, STATUS_SUCCESS, TRUE, FALSE);
+    else
+        __atomic_store_n(&slot->state, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_pending_recv_service_lock, 0, __ATOMIC_RELEASE);
+    wsock_socket_lifecycle_release();
+
+    if (overlapped) {
+        wsa_last_error = immediate ? 0 : WSA_IO_PENDING;
+        return immediate;
+    }
+    while (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != 3) {
+        net_poll();
+        wsock_service_pending_disconnects(slot->owner_pid);
+        if (__atomic_load_n(&slot->state, __ATOMIC_ACQUIRE) != 3 &&
+            sched_sleep_ticks(1) < 0)
+            sched_yield();
+    }
+    NTSTATUS result = slot->result;
+    __atomic_store_n(&slot->state, 0, __ATOMIC_RELEASE);
+    wsa_last_error = NT_SUCCESS(result) ? 0 : wsock_status_error(result);
+    return NT_SUCCESS(result);
+
+fail:
+    if (slot) __atomic_store_n(&slot->state, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_pending_recv_service_lock, 0, __ATOMIC_RELEASE);
+    wsock_socket_lifecycle_release();
+    wsa_last_error = error;
+    return FALSE;
 }
 
 /* Byte order conversion — these are pure functions, no network needed */
@@ -7380,7 +7996,8 @@ static BOOL WINAPI wsock_AcceptEx(SOCKET listen_socket, SOCKET accept_socket,
     win32_socket_t *listener = &win32_sockets[listen_idx];
     win32_socket_t *accepted = &win32_sockets[accept_idx];
     if (!listener->listening || listener->kern_listener_id < 0 ||
-        accepted->connected) {
+        accepted->connected || accepted->disconnecting ||
+        accepted->disconnected) {
         wsa_last_error = WSAEINVAL;
         return FALSE;
     }
@@ -7487,6 +8104,13 @@ typedef struct {
 } iphlp_prefix64_t;
 
 typedef struct {
+    uint32_t length, reserved;
+    uint64_t next, sockaddr;
+    int32_t sockaddr_length;
+    uint32_t pad;
+} iphlp_dns64_t;
+
+typedef struct {
     uint32_t length, if_index;
     uint64_t next, adapter_name, first_unicast;
     uint64_t first_anycast, first_multicast, first_dns_server;
@@ -7495,17 +8119,28 @@ typedef struct {
     uint32_t physical_address_length, flags, mtu, if_type, oper_status;
     uint32_t ipv6_if_index, zone_indices[16];
     uint64_t first_prefix;
-    uint8_t tail[264];
+    uint64_t tx_speed, rx_speed, first_wins, first_gateway;
+    uint32_t ipv4_metric, ipv6_metric;
+    uint64_t luid;
+    uint64_t dhcpv4_sockaddr;
+    int32_t dhcpv4_sockaddr_length;
+    uint32_t dhcpv4_pad, compartment_id;
+    GUID network_guid;
+    uint32_t connection_type;
+    uint8_t tail[176];
 } iphlp_adapter64_t;
 
 typedef struct {
     iphlp_adapter64_t adapter;
     iphlp_unicast64_t unicast;
     iphlp_prefix64_t prefix;
+    iphlp_dns64_t dns;
     uint8_t unicast_sockaddr[16];
     uint8_t prefix_sockaddr[16];
-    char adapter_name[8];
+    uint8_t dns_sockaddr[16];
+    char adapter_name[40];
     WCHAR friendly_name[8];
+    WCHAR description[257];
     WCHAR dns_suffix[1];
 } iphlp_payload64_t;
 
@@ -7535,6 +8170,16 @@ typedef struct {
 typedef struct {
     union {
         uint64_t alignment;
+        struct { uint32_t length, reserved; } fields;
+    } header;
+    uint32_t next, sockaddr;
+    int32_t sockaddr_length;
+    uint32_t pad;
+} iphlp_dns32_t;
+
+typedef struct {
+    union {
+        uint64_t alignment;
         struct { uint32_t length, if_index; } fields;
     } header;
     uint32_t next, adapter_name, first_unicast;
@@ -7544,17 +8189,28 @@ typedef struct {
     uint32_t physical_address_length, flags, mtu, if_type, oper_status;
     uint32_t ipv6_if_index, zone_indices[16];
     uint32_t first_prefix;
-    uint8_t tail[232];
+    uint64_t tx_speed, rx_speed;
+    uint32_t first_wins, first_gateway, ipv4_metric, ipv6_metric;
+    uint64_t luid;
+    uint32_t dhcpv4_sockaddr;
+    int32_t dhcpv4_sockaddr_length;
+    uint32_t compartment_id;
+    GUID network_guid;
+    uint32_t connection_type;
+    uint8_t tail[160];
 } iphlp_adapter32_t;
 
 typedef struct {
     iphlp_adapter32_t adapter;
     iphlp_unicast32_t unicast;
     iphlp_prefix32_t prefix;
+    iphlp_dns32_t dns;
     uint8_t unicast_sockaddr[16];
     uint8_t prefix_sockaddr[16];
-    char adapter_name[8];
+    uint8_t dns_sockaddr[16];
+    char adapter_name[40];
     WCHAR friendly_name[8];
+    WCHAR description[257];
     WCHAR dns_suffix[1];
 } iphlp_payload32_t;
 
@@ -7568,7 +8224,17 @@ _Static_assert(sizeof(iphlp_adapter32_t) == 376, "IP_ADAPTER_ADDRESSES32 layout"
 _Static_assert(sizeof(iphlp_unicast32_t) == 48,
                "IP_ADAPTER_UNICAST_ADDRESS32 layout");
 _Static_assert(sizeof(iphlp_prefix32_t) == 24, "IP_ADAPTER_PREFIX32 layout");
-_Static_assert(sizeof(iphlp_payload32_t) == 512, "GetAdaptersAddresses32 payload");
+_Static_assert(sizeof(iphlp_dns32_t) == 24, "IP_ADAPTER_DNS_SERVER_ADDRESS32 layout");
+_Static_assert(sizeof(iphlp_dns64_t) == 32, "IP_ADAPTER_DNS_SERVER_ADDRESS64 layout");
+_Static_assert(__builtin_offsetof(iphlp_dns32_t, sockaddr) == 12,
+               "IP_ADAPTER_DNS_SERVER_ADDRESS32 Address offset");
+_Static_assert(__builtin_offsetof(iphlp_dns64_t, sockaddr) == 16,
+               "IP_ADAPTER_DNS_SERVER_ADDRESS64 Address offset");
+_Static_assert(sizeof(iphlp_payload32_t) == 1096, "GetAdaptersAddresses32 payload");
+_Static_assert(__builtin_offsetof(iphlp_adapter32_t, luid) == 176, "IP_ADAPTER_ADDRESSES32 Luid");
+_Static_assert(__builtin_offsetof(iphlp_adapter64_t, luid) == 224, "IP_ADAPTER_ADDRESSES64 Luid");
+_Static_assert(__builtin_offsetof(iphlp_adapter32_t, connection_type) == 212, "IP_ADAPTER_ADDRESSES32 ConnectionType");
+_Static_assert(__builtin_offsetof(iphlp_adapter64_t, connection_type) == 268, "IP_ADAPTER_ADDRESSES64 ConnectionType");
 _Static_assert(__builtin_offsetof(iphlp_adapter32_t, friendly_name) == 40,
                "IP_ADAPTER_ADDRESSES32 FriendlyName offset");
 _Static_assert(__builtin_offsetof(iphlp_adapter32_t, first_prefix) == 140,
@@ -7581,6 +8247,7 @@ _Static_assert(__builtin_offsetof(iphlp_adapter32_t, first_prefix) == 140,
 #define IPHLP_ERROR_NO_DATA              232U
 
 #define IPHLP_GAA_SKIP_UNICAST        0x0001U
+#define IPHLP_GAA_SKIP_DNS_SERVER     0x0008U
 #define IPHLP_GAA_INCLUDE_PREFIX      0x0010U
 #define IPHLP_GAA_SKIP_FRIENDLY_NAME  0x0020U
 
@@ -7739,33 +8406,30 @@ static DWORD WINAPI iphlp_GetIfTable(PVOID table, DWORD *size, BOOL order)
     iphlp_if_row_t *rows =
         (iphlp_if_row_t *)((BYTE *)table + sizeof(DWORD));
 
-    iphlp_if_row_t *ethernet = &rows[0];
-    iphlp_copy_wide_ascii(ethernet->wsz_name,
-                          IPHLP_MAX_INTERFACE_NAME_LEN,
-                          "\\DEVICE\\TCPIP_OSITO0");
-    ethernet->index = 1;
-    ethernet->type = 6;             /* IF_TYPE_ETHERNET_CSMACD */
-    ethernet->mtu = 1500;
-    ethernet->speed = 1000000000U;
-    ethernet->physical_address_length = 6;
-    net_get_mac(ethernet->physical_address);
-    ethernet->admin_status = 1;     /* MIB_IF_ADMIN_STATUS_UP */
-    ethernet->oper_status = 5;      /* MIB_IF_OPER_STATUS_OPERATIONAL */
-    ethernet->description_length = iphlp_copy_description(
-        ethernet->description, IPHLP_MAXLEN_IFDESCR, "OsitoK Ethernet");
-
-    iphlp_if_row_t *loopback = &rows[1];
-    iphlp_copy_wide_ascii(loopback->wsz_name,
-                          IPHLP_MAX_INTERFACE_NAME_LEN,
-                          "\\DEVICE\\TCPIP_LOOPBACK");
-    loopback->index = 2;
-    loopback->type = 24;            /* IF_TYPE_SOFTWARE_LOOPBACK */
-    loopback->mtu = 65536;
-    loopback->speed = 10000000U;
-    loopback->admin_status = 1;
-    loopback->oper_status = 5;
-    loopback->description_length = iphlp_copy_description(
-        loopback->description, IPHLP_MAXLEN_IFDESCR, "OsitoK Loopback");
+    for (DWORD i = 0; i < row_count; i++) {
+        iphlp_if_row2_t current;
+        iphlp_interface_row(i + 1, &current);
+        iphlp_if_row_t *row = &rows[i];
+        char device[64] = "\\DEVICE\\TCPIP_";
+        iphlp_interface_guid_name(&current.guid, device + 14);
+        iphlp_copy_wide_ascii(row->wsz_name, IPHLP_MAX_INTERFACE_NAME_LEN, device);
+        row->index = current.index;
+        row->type = current.type;
+        row->mtu = current.mtu;
+        row->speed = current.tx_speed > 0xffffffffU ? 0xffffffffU : (DWORD)current.tx_speed;
+        row->physical_address_length = current.address_length;
+        ws_memcpy(row->physical_address, current.address, current.address_length);
+        row->admin_status = current.admin_status;
+        row->oper_status = current.oper_status == 1 ? 5 : 0;
+        row->in_octets = (DWORD)current.in_octets;
+        row->in_ucast_packets = (DWORD)current.in_ucast_packets;
+        row->in_nucast_packets = (DWORD)current.in_nucast_packets;
+        row->out_octets = (DWORD)current.out_octets;
+        row->out_ucast_packets = (DWORD)current.out_ucast_packets;
+        row->out_nucast_packets = (DWORD)current.out_nucast_packets;
+        row->description_length = iphlp_copy_description(row->description,
+            IPHLP_MAXLEN_IFDESCR, iphlp_interface_description(current.index));
+    }
 
     *size = required;
     return 0;
@@ -7836,14 +8500,15 @@ static DWORD WINAPI iphlp_GetAdaptersInfo(PVOID info, DWORD *size)
 
     iphlp_adapter_info32_t *adapter = (iphlp_adapter_info32_t *)info;
     ws_memset(adapter, 0, sizeof(*adapter));
-    iphlp_copy_ascii(adapter->adapter_name, sizeof(adapter->adapter_name),
-                     "{OSITOK-ETH0}");
+    iphlp_if_row2_t current;
+    iphlp_interface_row(1, &current);
+    iphlp_interface_guid_name(&current.guid, adapter->adapter_name);
     iphlp_copy_ascii(adapter->description, sizeof(adapter->description),
-                     "OsitoK Ethernet");
-    adapter->address_length = 6;
-    net_get_mac(adapter->address);
-    adapter->index = 1;
-    adapter->type = 6;             /* MIB_IF_TYPE_ETHERNET */
+                     iphlp_interface_description(1));
+    adapter->address_length = current.address_length;
+    ws_memcpy(adapter->address, current.address, current.address_length);
+    adapter->index = current.index;
+    adapter->type = current.type;
     adapter->dhcp_enabled = TRUE;
 
     char address[16];
@@ -8070,6 +8735,12 @@ static ULONG WINAPI iphlp_GetAdaptersAddresses(ULONG family, ULONG flags,
                         (ip[0] || ip[1] || ip[2] || ip[3]);
     BOOL have_prefix = have_unicast &&
                        (flags & IPHLP_GAA_INCLUDE_PREFIX);
+    uint8_t dns_ip[4];
+    BOOL have_dns = !(flags & IPHLP_GAA_SKIP_DNS_SERVER) &&
+                    net_dns_get_server(dns_ip);
+
+    iphlp_if_row2_t current;
+    iphlp_interface_row(1, &current);
 
     if (g_compat32_mode) {
         iphlp_payload32_t *p = (iphlp_payload32_t *)addresses;
@@ -8080,19 +8751,26 @@ static ULONG WINAPI iphlp_GetAdaptersAddresses(ULONG family, ULONG flags,
         p->adapter.adapter_name = (uint32_t)(uintptr_t)p->adapter_name;
         p->adapter.first_unicast = have_unicast
             ? (uint32_t)(uintptr_t)&p->unicast : 0;
+        p->adapter.first_dns_server = have_dns
+            ? (uint32_t)(uintptr_t)&p->dns : 0;
         p->adapter.dns_suffix = (uint32_t)(uintptr_t)p->dns_suffix;
-        p->adapter.description = (uint32_t)(uintptr_t)p->friendly_name;
+        p->adapter.description = (uint32_t)(uintptr_t)p->description;
         if (!(flags & IPHLP_GAA_SKIP_FRIENDLY_NAME))
             p->adapter.friendly_name = (uint32_t)(uintptr_t)p->friendly_name;
-        p->adapter.physical_address_length = 6;
-        net_get_mac(p->adapter.physical_address);
+        p->adapter.physical_address_length = current.address_length;
+        ws_memcpy(p->adapter.physical_address, current.address, current.address_length);
         p->adapter.flags = 0x84; /* DHCPv4 + IPv4 enabled */
-        p->adapter.mtu = 1500;
-        p->adapter.if_type = 6; /* IF_TYPE_ETHERNET_CSMACD */
-        p->adapter.oper_status = 1; /* IfOperStatusUp */
+        p->adapter.mtu = current.mtu;
+        p->adapter.if_type = current.type;
+        p->adapter.oper_status = current.oper_status;
+        p->adapter.tx_speed = current.tx_speed;
+        p->adapter.rx_speed = current.rx_speed;
+        p->adapter.luid = current.luid;
+        p->adapter.connection_type = current.connection_type;
         p->adapter.first_prefix = have_prefix
             ? (uint32_t)(uintptr_t)&p->prefix : 0;
-        iphlp_copy_ascii(p->adapter_name, sizeof(p->adapter_name), "osito0");
+        iphlp_interface_guid_name(&current.guid, p->adapter_name);
+        ws_memcpy(p->description, current.description, sizeof(p->description));
         iphlp_copy_wide_ascii(p->friendly_name,
                               sizeof(p->friendly_name) / sizeof(WCHAR),
                               "osito0");
@@ -8111,6 +8789,14 @@ static ULONG WINAPI iphlp_GetAdaptersAddresses(ULONG family, ULONG flags,
         p->unicast_sockaddr[0] = 2; /* AF_INET */
         ws_memcpy(p->unicast_sockaddr + 4, ip, 4);
 
+        if (have_dns) {
+            p->dns.header.fields.length = sizeof(p->dns);
+            p->dns.sockaddr = (uint32_t)(uintptr_t)p->dns_sockaddr;
+            p->dns.sockaddr_length = sizeof(p->dns_sockaddr);
+            p->dns_sockaddr[0] = 2; /* AF_INET, resolver port left unspecified */
+            ws_memcpy(p->dns_sockaddr + 4, dns_ip, 4);
+        }
+
         p->prefix.header.fields.length = sizeof(p->prefix);
         p->prefix.sockaddr = (uint32_t)(uintptr_t)p->prefix_sockaddr;
         p->prefix.sockaddr_length = sizeof(p->prefix_sockaddr);
@@ -8127,19 +8813,26 @@ static ULONG WINAPI iphlp_GetAdaptersAddresses(ULONG family, ULONG flags,
         p->adapter.adapter_name = (uint64_t)(uintptr_t)p->adapter_name;
         p->adapter.first_unicast = have_unicast
             ? (uint64_t)(uintptr_t)&p->unicast : 0;
+        p->adapter.first_dns_server = have_dns
+            ? (uint64_t)(uintptr_t)&p->dns : 0;
         p->adapter.dns_suffix = (uint64_t)(uintptr_t)p->dns_suffix;
-        p->adapter.description = (uint64_t)(uintptr_t)p->friendly_name;
+        p->adapter.description = (uint64_t)(uintptr_t)p->description;
         if (!(flags & IPHLP_GAA_SKIP_FRIENDLY_NAME))
             p->adapter.friendly_name = (uint64_t)(uintptr_t)p->friendly_name;
-        p->adapter.physical_address_length = 6;
-        net_get_mac(p->adapter.physical_address);
+        p->adapter.physical_address_length = current.address_length;
+        ws_memcpy(p->adapter.physical_address, current.address, current.address_length);
         p->adapter.flags = 0x84; /* DHCPv4 + IPv4 enabled */
-        p->adapter.mtu = 1500;
-        p->adapter.if_type = 6; /* IF_TYPE_ETHERNET_CSMACD */
-        p->adapter.oper_status = 1; /* IfOperStatusUp */
+        p->adapter.mtu = current.mtu;
+        p->adapter.if_type = current.type;
+        p->adapter.oper_status = current.oper_status;
+        p->adapter.tx_speed = current.tx_speed;
+        p->adapter.rx_speed = current.rx_speed;
+        p->adapter.luid = current.luid;
+        p->adapter.connection_type = current.connection_type;
         p->adapter.first_prefix = have_prefix
             ? (uint64_t)(uintptr_t)&p->prefix : 0;
-        iphlp_copy_ascii(p->adapter_name, sizeof(p->adapter_name), "osito0");
+        iphlp_interface_guid_name(&current.guid, p->adapter_name);
+        ws_memcpy(p->description, current.description, sizeof(p->description));
         iphlp_copy_wide_ascii(p->friendly_name,
                               sizeof(p->friendly_name) / sizeof(WCHAR),
                               "osito0");
@@ -8157,6 +8850,14 @@ static ULONG WINAPI iphlp_GetAdaptersAddresses(ULONG family, ULONG flags,
         p->unicast.on_link_prefix_length = prefix_length;
         p->unicast_sockaddr[0] = 2; /* AF_INET */
         ws_memcpy(p->unicast_sockaddr + 4, ip, 4);
+
+        if (have_dns) {
+            p->dns.length = sizeof(p->dns);
+            p->dns.sockaddr = (uint64_t)(uintptr_t)p->dns_sockaddr;
+            p->dns.sockaddr_length = sizeof(p->dns_sockaddr);
+            p->dns_sockaddr[0] = 2;
+            ws_memcpy(p->dns_sockaddr + 4, dns_ip, 4);
+        }
 
         p->prefix.length = sizeof(p->prefix);
         p->prefix.sockaddr = (uint64_t)(uintptr_t)p->prefix_sockaddr;
@@ -8216,7 +8917,10 @@ static const SHIM_EXPORT wsock_exports[] = {
     { "GetAcceptExSockaddrs", (PVOID)wsock_GetAcceptExSockaddrs, 8, CC_STDCALL },
     { "GetExtendedTcpTable",  (PVOID)iphlp_GetExtendedTcpTable,  6, CC_STDCALL },
     { "GetIfTable",           (PVOID)iphlp_GetIfTable,           3, CC_STDCALL },
+    { "GetIfEntry2",          (PVOID)iphlp_GetIfEntry2,          1, CC_STDCALL },
+    { "ConvertInterfaceGuidToLuid", (PVOID)iphlp_ConvertInterfaceGuidToLuid, 2, CC_STDCALL },
     { "GetIpAddrTable",       (PVOID)iphlp_GetIpAddrTable,       3, CC_STDCALL },
+    { "GetBestInterface",     (PVOID)iphlp_GetBestInterface,    2, CC_STDCALL },
     { "GetFriendlyIfIndex",   (PVOID)iphlp_GetFriendlyIfIndex,   1, CC_STDCALL },
     { "GetAdaptersInfo",      (PVOID)iphlp_GetAdaptersInfo,      2, CC_STDCALL },
     { "GetAdaptersAddresses", (PVOID)iphlp_GetAdaptersAddresses, 5, CC_STDCALL },

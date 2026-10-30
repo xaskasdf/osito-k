@@ -17,9 +17,16 @@ HINSTANCE WINAPI ShellExecuteA(HWND hwnd, PCSTR lpOperation, PCSTR lpFile,
                                 PCSTR lpParameters, PCSTR lpDirectory, int nShowCmd);
 HINSTANCE WINAPI ShellExecuteW(HWND hwnd, PCWSTR lpOperation, PCWSTR lpFile,
                                 PCWSTR lpParameters, PCWSTR lpDirectory, int nShowCmd);
+BOOL WINAPI ShellExecuteExA(PVOID information);
+BOOL WINAPI ShellExecuteExW(PVOID information);
 PVOID WINAPI CommandLineToArgvW(PCWSTR lpCmdLine, int *pNumArgs);
 BOOL WINAPI Shell_NotifyIconA(DWORD message, PVOID data);
 BOOL WINAPI Shell_NotifyIconW(DWORD message, PVOID data);
+
+/* Shared filesystem PIDLs for the native folder picker. Buffers have 260
+ * WCHARs; the creator takes trusted internal text, the parser validates PIDLs. */
+PVOID shell32_make_path_pidl(PCWSTR path);
+BOOL shell32_pidl_path(PCVOID pidl, PWSTR path);
 
 /* Shim init / resolve */
 PVOID shell32_shim_init(void);

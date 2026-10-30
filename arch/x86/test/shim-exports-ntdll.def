@@ -1,0 +1,3 @@
+LIBRARY NTDLL.dll
+EXPORTS
+NtQueryInformationProcess@20

@@ -1,0 +1,17 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+    ExitProcess
+    GetStdHandle
+    GetCurrentProcessId
+    GetCommandLineA
+    WriteFile
+    CreateFileA
+    LockFile
+    UnlockFile
+    GetLastError
+    CloseHandle
+    VirtualAlloc
+    VirtualFree
+    CreateProcessA
+    WaitForSingleObject
+    GetExitCodeProcess

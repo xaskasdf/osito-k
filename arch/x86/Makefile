@@ -68,6 +68,14 @@ ifeq ($(COMPAT_TRACE),1)
   KCFLAGS += -DCOMPAT_TRACE=1
 endif
 
+# Physical native GGTT/GT takeover qualification; never enabled implicitly.
+INTEL_GGTT_DIAGNOSTIC ?= 0
+KCFLAGS += -DINTEL_GGTT_DIAGNOSTIC=$(INTEL_GGTT_DIAGNOSTIC)
+INTEL_BCS_DIAGNOSTIC ?= 0
+KCFLAGS += -DINTEL_BCS_DIAGNOSTIC=$(INTEL_BCS_DIAGNOSTIC)
+INTEL_SCANOUT_DIAGNOSTIC ?= 0
+KCFLAGS += -DINTEL_SCANOUT_DIAGNOSTIC=$(INTEL_SCANOUT_DIAGNOSTIC)
+
 # Focused completion-port tracing. This remains useful with QUIET=1 and is
 # deliberately bounded in kernel32_shim.c so Steam diagnostics stay readable.
 #   make -C arch/x86 CLANG=1 QUIET=1 IOCP_TRACE=1
@@ -85,6 +93,18 @@ ifeq ($(WIN32_TRACE),1)
              -DNTSYNC_TRACE_DIAGNOSTICS=1
 endif
 
+# Record only failed dynamic DLL/export lookups, including their original
+# last-error value. Use for delayed-load failures without tracing successful
+# calls in Steam/CEF.
+WIN32_LOOKUP_TRACE ?= 0
+ifeq ($(WIN32_LOOKUP_TRACE),1)
+  KCFLAGS += -DK32_LOOKUP_FAILURE_TRACE=1
+  # Optional exact return address: persist a targeted failure before the
+  # application's fatal hook. Zero avoids disk I/O for ordinary probes.
+  WIN32_LOOKUP_CHECKPOINT_CALLER ?= 0
+  KCFLAGS += -DK32_LOOKUP_CHECKPOINT_CALLER=$(WIN32_LOOKUP_CHECKPOINT_CALLER)
+endif
+
 # Per-operation virtual-memory tracing is useful for allocator corruption
 # investigations, but Steam/CEF can issue thousands of successful calls per
 # second. Keep failures and aggregate VM statistics enabled in normal builds.
@@ -94,6 +114,12 @@ ifeq ($(WIN32_VM_TRACE),1)
   KCFLAGS += -DWIN32_VM_TRACE=1
 endif
 
+# Bounded timing samples and cumulative counters, without per-allocation logs.
+WIN32_LATENCY_TRACE ?= 0
+ifeq ($(WIN32_LATENCY_TRACE),1)
+  KCFLAGS += -DWIN32_LATENCY_TRACE=1
+endif
+
 # DOS API and MCB tracing is intentionally opt-in. Native DOS programs can
 # issue these calls in tight loops, and COM1 output is expensive under QEMU.
 #   make -C arch/x86 CLANG=1 DOS_TRACE=1
@@ -101,6 +127,13 @@ DOS_TRACE ?= 0
 ifeq ($(DOS_TRACE),1)
   DOS_TRACE_FLAGS = -DDOS_DIAGNOSTICS=1
   KCFLAGS += $(DOS_TRACE_FLAGS)
+endif
+
+# Bounded in-memory IRQ/PIC/PIT observations, with no serial output.
+# Read the sequence-tagged ring through a debugger on diagnostic builds.
+DOS_IRQ_TRACE ?= 0
+ifeq ($(DOS_IRQ_TRACE),1)
+  KCFLAGS += -DDOS_IRQ_DIAGNOSTICS=1
 endif
 
 # Diagnose native PE calls that return from a Win32 shim with interrupts
@@ -181,31 +214,49 @@ endif
 
 BUILD    = build
 
+# Linux/WSL UART fault-injection tests, independent of QEMU and guest files.
+HOST_CC ?= cc
+SERIAL_HOST_SANITIZERS ?=
+.PHONY: serial-host-test
+serial-host-test: | $(BUILD)/test
+	$(HOST_CC) -std=c11 -ffreestanding -O2 -Wall -Wextra -Werror $(SERIAL_HOST_SANITIZERS) \
+		-DSERIAL_HOST_TEST kernel/serial_tx.c kernel/serial_test.c -o $(BUILD)/test/serial-core-host
+	$(BUILD)/test/serial-core-host
+	$(HOST_CC) -std=c11 -ffreestanding -O2 -Wall -Wextra -Werror $(SERIAL_HOST_SANITIZERS) \
+		-include test/serial_uart_host.h kernel/serial.c kernel/serial_tx.c \
+		test/serial_uart_host.c -o $(BUILD)/test/serial-uart-host
+	$(BUILD)/test/serial-uart-host
+
 # ── Source files ──────────────────────────────────────────────
 
 BOOT_SRC = boot/boot_efi.c
+WPA_KERN_SRC = kernel/random_secure.c kernel/wpa2_crypto.c kernel/wpa2_rsn.c kernel/wpa2.c kernel/wpa2_selftest.c
+DRIVER_KERN_SRC = kernel/driver_manager.c kernel/driver_store.c kernel/driver_firmware.c kernel/driver_services.c kernel/wlan_profiles.c
 
-KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
-           kernel/pci.c kernel/memory.c kernel/mem_extern.c kernel/net.c \
+KERN_SRC = kernel/main.c kernel/serial.c kernel/serial_tx.c kernel/serial_test.c kernel/framebuffer.c \
+           kernel/pci.c kernel/acpi_reset.c kernel/dma_diag.c kernel/memory.c kernel/mem_extern.c kernel/net.c kernel/kexec.c kernel/kernel_update.c fs/boot_kernel.c \
            kernel/dhcp.c kernel/ntp.c kernel/ipv6.c kernel/mdns.c \
            kernel/tensor.c \
            kernel/tensor_avx2.c kernel/inference.c kernel/idt.c \
            kernel/paging.c kernel/compat_iret.c kernel/heap.c kernel/syscall.c \
            kernel/elf.c kernel/process.c \
-           kernel/keyboard.c kernel/terminal.c kernel/shell.c kernel/pkg.c \
+           kernel/keyboard.c kernel/terminal.c kernel/terminal_control.c kernel/shell.c kernel/pkg.c \
            kernel/crypto.c kernel/tls.c kernel/http.c kernel/claude.c \
-           kernel/tokenizer.c kernel/smp.c kernel/smp_work.c kernel/spec_prefetch.c kernel/spec_analyze.c kernel/spec_tls.c kernel/dynlink.c \
+           $(WPA_KERN_SRC) \
+           kernel/tokenizer.c kernel/smp.c kernel/smp_work.c kernel/sched_signal.c kernel/spec_prefetch.c kernel/spec_analyze.c kernel/spec_tls.c kernel/dynlink.c \
            kernel/zlib.c kernel/git.c \
-           kernel/shm.c kernel/compositor.c kernel/display.c \
+           kernel/shm.c kernel/compositor.c kernel/display.c kernel/display_source.c \
            kernel/input_events.c kernel/memcompress.c \
            kernel/kmod.c kernel/wayland.c kernel/pty.c \
-           kernel/socket.c kernel/timers.c kernel/power.c \
+           kernel/socket.c kernel/timers.c kernel/power.c kernel/thermal.c kernel/thermal_sample.c kernel/cpu_idle.c kernel/lockup.c kernel/pollobj.c \
            kernel/sysv_ipc.c kernel/vt.c \
            kernel/blkdev.c kernel/strace.c kernel/caps.c \
            kernel/klog.c kernel/boot_diag.c kernel/random.c kernel/oom.c kernel/ns.c \
            kernel/panic.c kernel/sysfs.c kernel/netfilter.c \
            kernel/crypto2.c kernel/sched_rt.c kernel/dm.c \
            kernel/evdev.c kernel/sysctl.c kernel/tls13.c kernel/tls13_server.c kernel/sshd.c \
+           kernel/file_sync.c kernel/file_sync_fs.c \
+           kernel/screen_capture.c kernel/screen_capture_gop.c $(DRIVER_KERN_SRC) \
            kernel/fuse.c kernel/kprof.c kernel/msync.c \
            kernel/io_uring.c kernel/bpf.c kernel/kthread.c kernel/initramfs.c \
            kernel/trace.c kernel/seccomp.c kernel/workqueue.c \
@@ -225,42 +276,72 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/inferconnect.c kernel/inferconnect_rpc.c kernel/inferconnect_client.c \
            kernel/inferconnect_oict.c kernel/inference_shims.c kernel/agent_simple.c \
            kernel/cluster.c kernel/cluster_rendezvous.c
-ASM_SRC  = kernel/isr_stubs.S kernel/compat_iret_tail.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
+ASM_SRC  = kernel/isr_stubs.S kernel/compat_iret_tail.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S kernel/msr_safe.S kernel/cpu_idle_wait.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/rtl8111.c drivers/gpu.c drivers/gsp.c \
-           drivers/intel_gfx.c \
+           drivers/intel_gfx.c drivers/intel_gfx_display.c drivers/intel_gfx_display_source.c drivers/intel_scanout_test.c \
+           drivers/intel_ggtt.c \
+           drivers/intel_ggtt_space.c \
+           drivers/intel_gt.c \
+           drivers/intel_bcs.c drivers/intel_cs.c drivers/intel_rcs.c drivers/intel_rcs_draw.c drivers/intel_gen9_texture.c \
+           drivers/intel_rcs_sampled.c drivers/intel_rcs_vertex.c drivers/intel_rcs_sampled_test.c drivers/intel_rcs_vertex_test.c drivers/intel_bcs_queue.c \
+           drivers/intel_bcs_worker.c \
+           drivers/intel_bcs_irq.c \
+           drivers/intel_bcs_context.c \
+           drivers/intel_gpu_buffer.c \
+           drivers/intel_gpu_memory.c \
+           drivers/intel_gpu_kmt.c \
+           drivers/intel_gpu_contexts.c \
+           drivers/intel_gpu_fences.c \
+           drivers/intel_gpu_kmt_context.c \
+           drivers/intel_gpu_kmt_render.c \
+           drivers/intel_gpu_kmt_fence.c \
+           drivers/intel_gpu_service.c \
+           drivers/intel_gpu_capture.c drivers/intel_gen9_shader.c \
+           drivers/intel_gpu_jobs.c \
+           drivers/intel_gpu_executor.c \
+           drivers/intel_gpu_bcs_owner.c \
+           drivers/intel_gfx_driver.c \
+           drivers/intel_gpu_cpu_view.c \
+           drivers/intel_ppgtt.c \
+           drivers/intel_gfx_memory.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c \
-           drivers/xhci.c drivers/hid_parser.c drivers/hda.c \
+           drivers/xhci.c drivers/hid_parser.c drivers/ps2.c drivers/hda.c \
            drivers/virtio.c drivers/virtio_blk.c drivers/virtio_net.c drivers/virtio_gpu.c \
            drivers/virtio_gpu_3d.c drivers/nvk_backend.c drivers/nvk_backend_res.c \
-           drivers/usb_storage.c
+           drivers/usb_storage.c drivers/iwx.c drivers/iwx_fw.c drivers/iwx_scan.c drivers/iwx_link.c drivers/iwx_data.c
 FS_SRC   = fs/ositofs2.c fs/ositofs3.c fs/gpt.c fs/gguf.c fs/vfs.c fs/fat32.c \
            fs/tmpfs.c fs/iso9660.c fs/ext2.c fs/exfat.c fs/ntfs.c \
            fs/udf.c fs/squashfs.c fs/hfsplus.c fs/btrfs.c fs/apfs.c
 WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
-            win32/handle.c win32/filelock.c win32/ntsyscall.c win32/ntprocess.c win32/ntsync.c \
+	win32/handle.c win32/filelock.c win32/filecache.c win32/ntsyscall.c win32/ntprocess.c win32/ntjob.c win32/ntsync.c \
             win32/dllloader.c win32/unwind64.c win32/wdbg.c win32/if_audit.c win32/win32_abi.c \
-             win32/wintime.c win32/kernel32_shim.c win32/profile.c \
-             win32/ntdll_shim.c \
-            win32/msvcrt_shim.c win32/crt_float.c \
+             win32/wintime.c win32/kernel32_shim.c win32/osversion.c win32/timer_queue.c win32/profile.c \
+             win32/ntdll_shim.c win32/delay_load.c \
+            win32/msvcrt_shim.c win32/crt_secure.c win32/crt_float.c win32/crt_math.c win32/crt_args.c win32/crt_startup.c win32/crt_exit.c \
              win32/user32_shim.c win32/user32_text.c win32/user32_controls.c win32/user32_listbox.c win32/gdi32_shim.c win32/opengl32_shim.c \
              win32/libusb_shim.c \
-             win32/dxgi_shim.c win32/version_shim.c \
+             win32/dxgi_shim.c win32/d3dkmt.c win32/d3dkmt_cpu.c win32/d3dkmt_wait.c win32/d3dkmt_registry.c win32/version_shim.c \
             win32/advapi32_shim.c win32/scm.c \
             win32/ddraw_shim.c win32/dsound_shim.c win32/dinput8_shim.c \
-            win32/ole32_shim.c win32/oleacc_shim.c \
-             win32/crypt32_shim.c win32/authenticode.c win32/shell32_shim.c \
-            win32/comctl32_shim.c win32/comdlg32_shim.c \
+            win32/ole32_shim.c win32/variant.c win32/iproute.c win32/ipinterface.c win32/oleacc_shim.c \
+             win32/crypt32_shim.c win32/imagehlp_shim.c win32/secur32_shim.c win32/authenticode.c win32/urlmon_shim.c win32/advpack_shim.c win32/rpcrt4_shim.c win32/cabinet_shim.c win32/setupapi_inf.c win32/mmio_shim.c win32/wow64.c win32/installengine.c win32/shell32_shim.c win32/shell_fileop.c \
+            win32/comctl32_shim.c win32/propertysheet.c win32/comdlg32_shim.c \
             win32/richedit_shim.c \
             win32/winmm_shim.c win32/wsock32_shim.c \
-            win32/ole2.c win32/msi.c win32/cab.c \
+            win32/ole2.c win32/msi.c win32/msi_condition.c win32/msi_package.c win32/msi_plan.c \
+            win32/msi_payload.c win32/msi_format.c win32/msi_registry.c win32/msi_apply.c \
+            win32/msi_win32_io.c win32/msi_actions.c win32/msi_summary.c win32/msi_registration.c win32/msi_engine.c win32/msi_shim.c win32/msi_products.c win32/msi_discovery.c win32/msi_components.c win32/msi_install.c win32/msi_selftest.c win32/msi_engine_test.c \
+            win32/fold_string.c win32/short_path.c win32/binary_type.c \
+            win32/cab.c win32/cab_lzx.c win32/setupapi_cab.c \
             win32/zip.c win32/msix.c win32/installer.c
-WIN32_ASM = win32/int2e_stub.S win32/context64.S
-DOS_ASM  = dos/dos_int_stub.S
+WIN32_ASM = win32/int2e_stub.S win32/context64.S win32/nt64_service.S
+DOS_ASM  = dos/dos_int_stub.S dos/dos_fpu_irq_test.S
 DOS_SRC  = dos/dos_init.c dos/dos_exec.c dos/dos_loader.c \
            dos/dos_mem.c dos/cpu8086.c dos/dos_int.c \
            dos/dos_api.c dos/dos_bios.c dos/dos_time.c dos/dos_find.c \
            dos/dos_vga.c dos/dos_vbe.c dos/dos_io.c dos/dos_mouse.c \
-           dos/dos_audio.c \
+           dos/dos_audio.c dos/dos_fpu.c dos/dos_fpu_test.c dos/dos_a20_test.c \
+           dos/dos_xms.c dos/dos_xms_test.c dos/dos_umb_test.c \
            dos/dos_dpmi.c dos/dos_vcpi.c dos/dos_jit.c dos/dos_paging.c
 GUI_SRC  = ../../gui/gui_draw.c ../../gui/gui_text.c \
            ../../gui/gui_panel.c ../../gui/gui_dock.c \
@@ -276,14 +357,33 @@ KERN_OBJ  = $(KERN_SRC:%.c=$(BUILD)/%.o)
 ASM_OBJ   = $(ASM_SRC:%.S=$(BUILD)/%.o)
 DRV_OBJ   = $(DRV_SRC:%.c=$(BUILD)/%.o)
 FS_OBJ    = $(FS_SRC:%.c=$(BUILD)/%.o)
+WIN32_SRC += $(wildcard win32/math/*.c)
 WIN32_OBJ = $(WIN32_SRC:%.c=$(BUILD)/%.o)
 WIN32_ASM_OBJ = $(WIN32_ASM:%.S=$(BUILD)/%.o)
 DOS_OBJ   = $(DOS_SRC:%.c=$(BUILD)/%.o)
+DOS_NUMERIC_SRC = dos/dos_fpu_softfloat.cc dos/dos_fpu_state.cc $(wildcard lib/softfloat3e/*.cc lib/softfloat3e/8086-SSE/*.cc lib/bochs-transcendental/*.cc)
+DOS_NUMERIC_OBJ = $(DOS_NUMERIC_SRC:%.cc=$(BUILD)/%.o)
+DOS_OBJ += $(DOS_NUMERIC_OBJ)
 DOS_ASM_OBJ = $(DOS_ASM:%.S=$(BUILD)/%.o)
 GUI_OBJ   = $(patsubst ../../gui/%.c,$(BUILD)/gui/%.o,$(GUI_SRC))
+WPA_CRYPTO_SRC = lib/bearssl/src/hash/sha1.c lib/bearssl/src/mac/hmac.c \
+                 lib/bearssl/src/hash/md5.c lib/bearssl/src/hash/sha2small.c lib/bearssl/src/hash/sha2big.c \
+                 lib/bearssl/src/codec/dec32be.c lib/bearssl/src/codec/enc32be.c \
+                 lib/bearssl/src/codec/dec32le.c lib/bearssl/src/codec/enc32le.c \
+                 lib/bearssl/src/codec/dec64be.c lib/bearssl/src/codec/enc64be.c \
+                 lib/bearssl/src/symcipher/aes_ct.c lib/bearssl/src/symcipher/aes_ct_dec.c \
+                 lib/bearssl/src/symcipher/aes_ct_cbcdec.c
+WPA_CRYPTO_OBJ = $(WPA_CRYPTO_SRC:%.c=$(BUILD)/%.o)
+SSH_SRC = $(wildcard lib/tinyssh/upstream/*.c) lib/tinyssh/osito_port.c
+SSH_OBJ = $(SSH_SRC:%.c=$(BUILD)/%.o)
+SSH_HEADERS = $(wildcard lib/tinyssh/*.h lib/tinyssh/upstream/*.h lib/tinyssh/upstream/cryptoint/*.h lib/tinyssh/port/*.h lib/tinyssh/port/sys/*.h)
 
 ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
 KERNEL_C_OBJ = $(KERN_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(DOS_OBJ) $(GUI_OBJ)
+ALL_KERN_OBJ += $(WPA_CRYPTO_OBJ)
+KERNEL_C_OBJ += $(WPA_CRYPTO_OBJ)
+ALL_KERN_OBJ += $(SSH_OBJ)
+KERNEL_C_OBJ += $(SSH_OBJ)
 KERNEL_FLAGS_ID := $(shell printf '%s\n' '$(CC) $(KCFLAGS) $(KCFLAGS_PRECOMP) $(AVXFLAGS) $(WIN32_IF_AUDIT_FLAGS)' | cksum | cut -d' ' -f1)
 KERNEL_FLAGS_STAMP = $(BUILD)/.kernel-cflags-$(KERNEL_FLAGS_ID)
 
@@ -291,27 +391,40 @@ KERNEL_FLAGS_STAMP = $(BUILD)/.kernel-cflags-$(KERNEL_FLAGS_ID)
 
 # Minimal kernel: excludes all new subsystems from Apr 2026 session.
 # Use when full kernel crashes (e.g., BSS overlap with NVMe DMA).
-KERN_MINIMAL = kernel/main.c kernel/serial.c kernel/framebuffer.c \
-               kernel/pci.c kernel/memory.c kernel/mem_extern.c kernel/net.c \
+KERN_MINIMAL = kernel/main.c kernel/serial.c kernel/framebuffer.c kernel/lockup.c \
+               $(WPA_KERN_SRC) \
+               kernel/pci.c kernel/acpi_reset.c kernel/dma_diag.c kernel/memory.c kernel/mem_extern.c kernel/net.c kernel/kexec.c kernel/kernel_update.c fs/boot_kernel.c \
                kernel/tensor.c kernel/tensor_avx2.c kernel/inference.c \
                kernel/idt.c kernel/paging.c kernel/compat_iret.c kernel/heap.c kernel/syscall.c \
                kernel/elf.c kernel/process.c \
-               kernel/keyboard.c kernel/terminal.c kernel/shell.c kernel/pkg.c \
+               kernel/keyboard.c kernel/terminal.c kernel/terminal_control.c kernel/shell.c kernel/pkg.c kernel/sshd.c \
+               kernel/file_sync.c kernel/file_sync_fs.c \
+               kernel/screen_capture.c kernel/screen_capture_gop.c $(DRIVER_KERN_SRC) \
                kernel/crypto.c kernel/tls.c kernel/http.c kernel/claude.c \
                kernel/tokenizer.c kernel/smp.c kernel/dynlink.c \
                kernel/zlib.c kernel/git.c \
-               kernel/shm.c kernel/compositor.c kernel/display.c \
+               kernel/shm.c kernel/compositor.c kernel/display.c kernel/display_source.c \
                kernel/input_events.c kernel/memcompress.c
 DRV_MINIMAL  = drivers/nvme.c drivers/i211.c drivers/rtl8111.c drivers/gpu.c drivers/gsp.c \
                drivers/intel_gfx.c \
+               drivers/intel_ggtt.c \
+               drivers/intel_ggtt_space.c \
+               drivers/intel_gt.c \
+               drivers/intel_bcs.c drivers/intel_cs.c drivers/intel_rcs.c drivers/intel_rcs_draw.c drivers/intel_gen9_texture.c \
+               drivers/intel_rcs_sampled.c drivers/intel_rcs_vertex.c drivers/intel_rcs_sampled_test.c drivers/intel_rcs_vertex_test.c drivers/intel_bcs_queue.c \
+               drivers/intel_bcs_context.c \
+               drivers/intel_gpu_buffer.c \
+               drivers/intel_gpu_memory.c \
+               drivers/intel_ppgtt.c \
+               drivers/intel_gfx_memory.c \
                drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c \
-               drivers/gpu_inference.c drivers/xhci.c drivers/hda.c
+               drivers/gpu_inference.c drivers/xhci.c drivers/hda.c drivers/iwx.c drivers/iwx_fw.c drivers/iwx_scan.c drivers/iwx_link.c drivers/iwx_data.c
 FS_MINIMAL   = fs/ositofs2.c fs/ositofs3.c fs/gpt.c fs/gguf.c fs/vfs.c
 KERN_MIN_OBJ = $(KERN_MINIMAL:%.c=$(BUILD)/%.o)
 DRV_MIN_OBJ  = $(DRV_MINIMAL:%.c=$(BUILD)/%.o)
 FS_MIN_OBJ   = $(FS_MINIMAL:%.c=$(BUILD)/%.o)
 ALL_MIN_OBJ  = $(KERN_MIN_OBJ) $(ASM_OBJ) $(DRV_MIN_OBJ) $(FS_MIN_OBJ) \
-               $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
+               $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ) $(WPA_CRYPTO_OBJ) $(SSH_OBJ)
 
 .PHONY: all clean check-deps legacy tcc tcc-clean minimal libvulkan pxe \
 	dos-dpmi-test dos-vbe-native-test dos-audio-native-test dos-flags-test dos-debug-test dos-string-io-test dos-exception-test dos-vga-test \
@@ -331,6 +444,12 @@ $(KERNEL_C_OBJ): $(KERNEL_FLAGS_STAMP)
 
 all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf libvulkan
 
+# Standalone PE system utilities; installed on disk, not embedded in kernel.elf.
+# Requires clang, llvm-dlltool and lld-link for both guest architectures.
+.PHONY: win32-system-tools
+win32-system-tools:
+	bash scripts/build-win32-system-tools.sh arch/x86/$(BUILD)/win32-system-tools
+
 dos-dpmi-test: $(BUILD)/test/dpmi_native.com
 
 dos-vbe-native-test: $(BUILD)/test/dpmi_vbe.com
@@ -338,6 +457,21 @@ dos-vbe-native-test: $(BUILD)/test/dpmi_vbe.com
 dos-audio-native-test: $(BUILD)/test/dpmi_audio.com
 
 dos-flags-test: $(BUILD)/test/dpflags16.com $(BUILD)/test/dpflags32.com
+dos-flags-test: $(BUILD)/test/dpnif16.com $(BUILD)/test/dpnif32.com
+
+.PHONY: dos-bios-move-test
+dos-bios-move-test: $(addprefix $(BUILD)/test/,bmovrm.com bmov16.com bmov32.com bmovs32.com)
+
+$(BUILD)/test/bmovrm.o: test/bios_move.S | $(BUILD)/test
+	as --32 --defsym MODE=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/bmov16.o: test/bios_move.S | $(BUILD)/test
+	as --32 --defsym MODE=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/bmov32.o: test/bios_move.S | $(BUILD)/test
+	as --32 --defsym MODE=2 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/bmovs32.o: test/bios_move.S | $(BUILD)/test
+	as --32 --defsym MODE=2 --defsym STACK32=0 -o $@ $<
+$(addprefix $(BUILD)/test/,bmovrm.com bmov16.com bmov32.com bmovs32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
 dos-rm-arguments-test: $(BUILD)/test/dpargs16.com $(BUILD)/test/dpargs32.com
 
@@ -358,6 +492,195 @@ dos-real-exception-test: $(BUILD)/test/dpre16.com $(BUILD)/test/dpre32.com \
 
 dos-callback-entry-test: $(BUILD)/test/dpce16.com $(BUILD)/test/dpce32.com \
 	$(BUILD)/test/dpces16.com $(BUILD)/test/dpces32.com
+
+.PHONY: dos-client-resources-test
+.PHONY: dos-client-routing-test
+.PHONY: dos-raw-entry-test
+.PHONY: dos-raw-client-test
+.PHONY: dos-exec-unwind-test
+dos-exec-unwind-test: $(addprefix $(BUILD)/test/,dxuc16.com dxuc32.com dxup16.com dxup32.com \
+	dxus16.com dxus32.com dxun16.com dxun32.com dxuns16.com dxuns32.com \
+	dxul16.com dxul32.com dxuls16.com dxuls32.com dxum16.com dxum32.com dxums16.com dxums32.com)
+
+$(BUILD)/test/dxul16.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym LOADONLY=1 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxul32.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym LOADONLY=1 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxuls16.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym LOADONLY=1 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxuls32.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym LOADONLY=1 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxum16.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym LOADONLY=1 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxum32.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym LOADONLY=1 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxums16.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym LOADONLY=1 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxums32.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym LOADONLY=1 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dxuc16.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=1 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxuc32.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=1 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxup16.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxup32.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxus16.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxus32.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxun16.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxun32.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxuns16.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxuns32.o: test/dpmi_exec_unwind.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dxuc16.com dxuc32.com dxup16.com dxup32.com dxus16.com dxus32.com dxun16.com dxun32.com dxuns16.com dxuns32.com dxul16.com dxul32.com dxuls16.com dxuls32.com dxum16.com dxum32.com dxums16.com dxums32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+dos-raw-client-test: $(addprefix $(BUILD)/test/,droc16.com droc32.com drop16.com drop32.com \
+	dros16.com dros32.com dron16.com dron32.com drons16.com drons32.com)
+
+$(BUILD)/test/droc16.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=1 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/droc32.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=1 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/drop16.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/drop32.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dros16.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dros32.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=0 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dron16.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dron32.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/drons16.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/drons32.o: test/dpmi_raw_client.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,droc16.com droc32.com drop16.com drop32.com dros16.com dros32.com dron16.com dron32.com drons16.com drons32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+dos-raw-entry-test: $(addprefix $(BUILD)/test/,dprw16.com dprw32.com dprws16.com dprws32.com)
+
+dos-client-routing-test: $(addprefix $(BUILD)/test/,dxcb16.com dxcb32.com \
+	dxbp16.com dxbp32.com dxbs16.com dxbs32.com dxbn16.com dxbn32.com dxbns16.com dxbns32.com)
+
+$(BUILD)/test/dxcb16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=3 --defsym RESOURCES=4 -o $@ $<
+$(BUILD)/test/dxcb32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=3 --defsym CHILD32=1 --defsym RESOURCES=4 -o $@ $<
+$(BUILD)/test/dxbp16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=4 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxbp32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=4 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxbs16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=4 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxbs32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=4 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxbn16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=4 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxbn32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=4 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxbns16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=4 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxbns32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=4 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dxcb16.com dxcb32.com dxbp16.com dxbp32.com dxbs16.com dxbs32.com dxbn16.com dxbn32.com dxbns16.com dxbns32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+dos-client-resources-test: $(addprefix $(BUILD)/test/,dxcnew.com dxsnew.com \
+	dxcp16.com dxcp32.com dxcs16.com dxcs32.com dxsp16.com dxsp32.com dxss16.com dxss32.com)
+
+$(BUILD)/test/dxcnew.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=3 --defsym RESOURCES=1 -o $@ $<
+$(BUILD)/test/dxsnew.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=3 --defsym RESOURCES=2 -o $@ $<
+$(BUILD)/test/dxcp16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=1 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxcp32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=1 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxcs16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=1 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxcs32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=1 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxsp16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=2 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxsp32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=2 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxss16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=2 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxss32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=2 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dxcnew.com dxsnew.com dxcp16.com dxcp32.com dxcs16.com dxcs32.com dxsp16.com dxsp32.com dxss16.com dxss32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+.PHONY: dos-client-resources32-test
+dos-client-resources32-test: $(addprefix $(BUILD)/test/,dxc32.com dxs32.com \
+	dxcn16.com dxcn32.com dxcns16.com dxcns32.com dxsn16.com dxsn32.com dxsns16.com dxsns32.com)
+
+$(BUILD)/test/dxc32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=3 --defsym CHILD32=1 --defsym RESOURCES=1 -o $@ $<
+$(BUILD)/test/dxs32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=3 --defsym CHILD32=1 --defsym RESOURCES=2 -o $@ $<
+$(BUILD)/test/dxcn16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=1 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxcn32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=1 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxcns16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=1 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxcns32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=1 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxsn16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=2 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxsn32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=2 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxsns16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=2 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxsns32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=2 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dxc32.com dxs32.com dxcn16.com dxcn32.com dxcns16.com dxcns32.com dxsn16.com dxsn32.com dxsns16.com dxsns32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+.PHONY: dos-client-real-stacks-test
+dos-client-real-stacks-test: $(addprefix $(BUILD)/test/,dxrmc16.com dxrmc32.com \
+	dxrmp16.com dxrmp32.com dxrms16.com dxrms32.com dxrmn16.com dxrmn32.com dxrmns16.com dxrmns32.com)
+
+$(BUILD)/test/dxrmc16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=3 --defsym RESOURCES=3 -o $@ $<
+$(BUILD)/test/dxrmc32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=3 --defsym CHILD32=1 --defsym RESOURCES=3 -o $@ $<
+$(BUILD)/test/dxrmp16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=3 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxrmp32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=3 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxrms16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=3 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxrms32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym RESOURCES=3 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxrmn16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=3 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxrmn32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=3 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dxrmns16.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=3 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dxrmns32.o: test/dpmi_exec_primary.S | $(BUILD)/test
+	as --32 --defsym CHILD=0 --defsym CHILD32=1 --defsym RESOURCES=3 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dxrmc16.com dxrmc32.com dxrmp16.com dxrmp32.com dxrms16.com dxrms32.com dxrmn16.com dxrmn32.com dxrmns16.com dxrmns32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
 dos-exec-primary-test: $(BUILD)/test/dpxp16.com $(BUILD)/test/dpxp32.com \
 	$(BUILD)/test/dpxps16.com $(BUILD)/test/dpxps32.com $(BUILD)/test/dpxreal.com \
@@ -390,7 +713,244 @@ $(addprefix $(BUILD)/test/,dpxp16.com dpxp32.com dpxps16.com dpxps32.com dpxreal
 dos-extended-exception-test: $(BUILD)/test/dpee16.com $(BUILD)/test/dpee32.com \
 	$(BUILD)/test/dpees16.com $(BUILD)/test/dpees32.com
 
-dos-debug-test: $(BUILD)/test/dpdebug16.com $(BUILD)/test/dpdebug32.com
+.PHONY: dos-decode-test
+dos-decode-test: $(addprefix $(BUILD)/test/,dpdec16.com dpdec32.com dpdecs16.com dpdecs32.com)
+
+$(BUILD)/test/dpdec16.o: test/dpmi_decode.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpdec32.o: test/dpmi_decode.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpdecs16.o: test/dpmi_decode.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpdecs32.o: test/dpmi_decode.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dpdec16.com dpdec32.com dpdecs16.com dpdecs32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+.PHONY: dos-native-irq-test
+.PHONY: dos-a20-test
+.PHONY: dos-xms-test
+.PHONY: dos-umb-test
+dos-umb-test: $(BUILD)/test/umblink.com
+$(BUILD)/test/umblink.o: test/dos_umb.S | $(BUILD)/test
+	as --32 -o $@ $<
+$(BUILD)/test/umblink.com: $(BUILD)/test/umblink.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+	test "$$(wc -c < $@)" -le 3584
+
+dos-xms-test: $(addprefix $(BUILD)/test/,xmsrm.com xmsp16.com xmsp32.com xmsps16.com)
+
+$(BUILD)/test/xmsrm.o: test/dos_xms.S | $(BUILD)/test
+	as --32 --defsym MODE=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/xmsp16.o: test/dos_xms.S | $(BUILD)/test
+	as --32 --defsym MODE=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/xmsp32.o: test/dos_xms.S | $(BUILD)/test
+	as --32 --defsym MODE=2 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/xmsps16.o: test/dos_xms.S | $(BUILD)/test
+	as --32 --defsym MODE=2 --defsym STACK32=0 -o $@ $<
+$(addprefix $(BUILD)/test/,xmsrm.com xmsp16.com xmsp32.com xmsps16.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+dos-a20-test: $(addprefix $(BUILD)/test/,a20rm.com a20p16.com a20p32.com a20ps16.com)
+
+$(BUILD)/test/a20rm.o: test/dos_a20.S | $(BUILD)/test
+	as --32 --defsym MODE=0 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/a20p16.o: test/dos_a20.S | $(BUILD)/test
+	as --32 --defsym MODE=1 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/a20p32.o: test/dos_a20.S | $(BUILD)/test
+	as --32 --defsym MODE=2 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/a20ps16.o: test/dos_a20.S | $(BUILD)/test
+	as --32 --defsym MODE=2 --defsym STACK32=0 -o $@ $<
+$(addprefix $(BUILD)/test/,a20rm.com a20p16.com a20p32.com a20ps16.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+dos-native-irq-test: $(addprefix $(BUILD)/test/,dpirq32.com dpirqs16.com dpirqh32.com dpirqhs.com dpirqd32.com dpirqds.com dpirqoff.com)
+
+$(BUILD)/test/dpirq32.o: test/dpmi_native_irq.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpirqs16.o: test/dpmi_native_irq.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpirqh32.o: test/dpmi_native_irq.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym HARDWARE=1 -o $@ $<
+
+$(BUILD)/test/dpirqhs.o: test/dpmi_native_irq.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym HARDWARE=1 -o $@ $<
+
+$(BUILD)/test/dpirqd32.o: test/dpmi_native_irq.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym HARDWARE=1 --defsym DIAGNOSTIC=1 -o $@ $<
+
+$(BUILD)/test/dpirqds.o: test/dpmi_native_irq.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym HARDWARE=1 --defsym DIAGNOSTIC=1 -o $@ $<
+
+$(BUILD)/test/dpirqoff.o: test/dpmi_native_irq.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym HARDWARE=1 --defsym DIAGNOSTIC=1 --defsym MASK_IRQ=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dpirq32.com dpirqs16.com dpirqh32.com dpirqhs.com dpirqd32.com dpirqds.com dpirqoff.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+.PHONY: dos-x87-routing-test
+.PHONY: dos-rom-ownership-test
+dos-rom-ownership-test: $(BUILD)/test/dprom16o.com $(BUILD)/test/dprom32o.com
+$(BUILD)/test/dprom16o.o: test/dpmi_rom_owner.S | $(BUILD)/test
+	as --32 --defsym PM32=0 -o $@ $<
+$(BUILD)/test/dprom32o.o: test/dpmi_rom_owner.S | $(BUILD)/test
+	as --32 --defsym PM32=1 -o $@ $<
+$(BUILD)/test/dprom16o.com $(BUILD)/test/dprom32o.com: %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+dos-x87-routing-test: $(BUILD)/test/dpmf16.com $(BUILD)/test/dpmf32.com
+
+.PHONY: dos-x87-test
+dos-x87-test: $(addprefix $(BUILD)/test/,dofprm.com dofp16.com dofp32.com dofpe32.com)
+
+$(BUILD)/test/dofprm.o: test/dos_x87.S | $(BUILD)/test
+	as --32 --defsym REAL=1 --defsym PM32=0 -o $@ $<
+$(BUILD)/test/dofp16.o: test/dos_x87.S | $(BUILD)/test
+	as --32 --defsym REAL=0 --defsym PM32=0 -o $@ $<
+$(BUILD)/test/dofp32.o: test/dos_x87.S | $(BUILD)/test
+	as --32 --defsym REAL=0 --defsym PM32=1 -o $@ $<
+$(BUILD)/test/dofpe32.o: test/dos_x87_edges.S | $(BUILD)/test
+	as --32 -o $@ $<
+$(addprefix $(BUILD)/test/,dofprm.com dofp16.com dofp32.com dofpe32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+.PHONY: dos-fp-state-test
+.PHONY: dos-x87-diagnostic-test
+dos-fp-state-test: dos-x87-diagnostic-test
+dos-x87-diagnostic-test: $(addprefix $(BUILD)/test/,dpxd16.com dpxd32.com dpxdp16.com dpxdp32.com dpxdc.com)
+
+$(BUILD)/test/dpxd16.o: test/dpmi_x87_diagnostic.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym PENDING=0 -o $@ $<
+$(BUILD)/test/dpxd32.o: test/dpmi_x87_diagnostic.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym PENDING=0 -o $@ $<
+$(BUILD)/test/dpxdp16.o: test/dpmi_x87_diagnostic.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym PENDING=1 -o $@ $<
+$(BUILD)/test/dpxdp32.o: test/dpmi_x87_diagnostic.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym PENDING=1 -o $@ $<
+$(BUILD)/test/dpxdc.o: test/dpmi_x87_diagnostic.S | $(BUILD)/test
+	as --32 --defsym CHILD_ONLY=1 -o $@ $<
+$(addprefix $(BUILD)/test/,dpxd16.com dpxd32.com dpxdp16.com dpxdp32.com dpxdc.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/dos/dos_int_stub.o: dos/dos_native_fp.h
+$(BUILD)/dos/dos_fpu_irq_test.o: dos/dos_native_fp.h
+$(BUILD)/kernel/isr_stubs.o: dos/dos_native_fp.h
+
+dos-fp-state-test: $(addprefix $(BUILD)/test/,dpfp16.com dpfp32.com dpfpr16.com dpfpr32.com dpfpc32.com dpfm16.com dpfm32.com dpfmi32.com)
+dos-fp-state-test: $(addprefix $(BUILD)/test/,dpcp16.com dpcp32.com dpcpc32.com)
+dos-fp-state-test: $(addprefix $(BUILD)/test/,dpfd16.com dpfd32.com dpfdr16.com dpfdr32.com)
+
+$(BUILD)/test/dpcp16.o: test/dpmi_coprocessor.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dpcp32.o: test/dpmi_coprocessor.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dpcpc32.o: test/dpmi_coprocessor.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym CHILD_ONLY=1 -o $@ $<
+$(addprefix $(BUILD)/test/,dpcp16.com dpcp32.com dpcpc32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpfm16.o: test/dpmi_fp_memory.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dpfm32.o: test/dpmi_fp_memory.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 -o $@ $<
+$(BUILD)/test/dpfmi32.o: test/dpmi_fp_memory.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym INTERPRETED=1 -o $@ $<
+$(addprefix $(BUILD)/test/,dpfm16.com dpfm32.com dpfmi32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpfpc32.o: test/dpmi_fp_state.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym RAW_ONLY=0 --defsym CHILD_ONLY=1 -o $@ $<
+
+$(BUILD)/test/dpfp16.o: test/dpmi_fp_state.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym RAW_ONLY=0 -o $@ $<
+
+$(BUILD)/test/dpfp32.o: test/dpmi_fp_state.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym RAW_ONLY=0 -o $@ $<
+
+$(BUILD)/test/dpfpr16.o: test/dpmi_fp_state.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym RAW_ONLY=1 -o $@ $<
+
+$(BUILD)/test/dpfpr32.o: test/dpmi_fp_state.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym RAW_ONLY=1 -o $@ $<
+
+$(BUILD)/test/dpfd16.o: test/dpmi_fp_state.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym RAW_ONLY=0 --defsym DIAGNOSTIC_STATE=1 -o $@ $<
+$(BUILD)/test/dpfd32.o: test/dpmi_fp_state.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym RAW_ONLY=0 --defsym DIAGNOSTIC_STATE=1 -o $@ $<
+$(BUILD)/test/dpfdr16.o: test/dpmi_fp_state.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 --defsym RAW_ONLY=1 --defsym DIAGNOSTIC_STATE=1 -o $@ $<
+$(BUILD)/test/dpfdr32.o: test/dpmi_fp_state.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 --defsym RAW_ONLY=1 --defsym DIAGNOSTIC_STATE=1 -o $@ $<
+$(addprefix $(BUILD)/test/,dpfd16.com dpfd32.com dpfdr16.com dpfdr32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(addprefix $(BUILD)/test/,dpfp16.com dpfp32.com dpfpr16.com dpfpr32.com dpfpc32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmf16.o: test/dpmi_x87_route.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmf32.o: test/dpmi_x87_route.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dpmf16.com dpmf32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+dos-debug-test: $(BUILD)/test/dpdebug16.com $(BUILD)/test/dpdebug32.com \
+	$(BUILD)/test/dpdr16.com $(BUILD)/test/dpdr32.com \
+	$(BUILD)/test/dpdrs16.com $(BUILD)/test/dpdrs32.com \
+	$(BUILD)/test/dpst16.com $(BUILD)/test/dpst32.com \
+	$(BUILD)/test/dpsts16.com $(BUILD)/test/dpsts32.com \
+	$(BUILD)/test/dpsth32.com $(BUILD)/test/dpsths16.com \
+	$(BUILD)/test/dpsti32.com $(BUILD)/test/dpstis16.com
+
+$(BUILD)/test/dpsti32.o: test/dpmi_step.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 --defsym IRET_HANDOFF=1 -o $@ $<
+
+$(BUILD)/test/dpstis16.o: test/dpmi_step.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 --defsym IRET_HANDOFF=1 -o $@ $<
+
+$(BUILD)/test/dpsth32.o: test/dpmi_step.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 --defsym HANDOFF=1 -o $@ $<
+
+$(BUILD)/test/dpsths16.o: test/dpmi_step.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 --defsym HANDOFF=1 -o $@ $<
+
+$(BUILD)/test/dpst16.o: test/dpmi_step.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpst32.o: test/dpmi_step.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpsts16.o: test/dpmi_step.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpsts32.o: test/dpmi_step.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dpst16.com dpst32.com dpsts16.com dpsts32.com dpsth32.com dpsths16.com dpsti32.com dpstis16.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpdr16.o: test/dpmi_debug_route.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpdr32.o: test/dpmi_debug_route.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpdrs16.o: test/dpmi_debug_route.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpdrs32.o: test/dpmi_debug_route.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(addprefix $(BUILD)/test/,dpdr16.com dpdr32.com dpdrs16.com dpdrs32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
 dos-string-io-test: $(BUILD)/test/dpstr16.com $(BUILD)/test/dpstr32.com
 
@@ -471,6 +1031,13 @@ $(BUILD)/test/dpmi_flags16.o: test/dpmi_flags.S | $(BUILD)/test
 
 $(BUILD)/test/dpmi_flags32.o: test/dpmi_flags.S | $(BUILD)/test
 	as --32 --defsym PM32=1 -o $@ $<
+
+$(BUILD)/test/dpnif16.o: test/dpmi_native_if.S | $(BUILD)/test
+	as --32 --defsym STACK32=0 -o $@ $<
+$(BUILD)/test/dpnif32.o: test/dpmi_native_if.S | $(BUILD)/test
+	as --32 --defsym STACK32=1 -o $@ $<
+$(addprefix $(BUILD)/test/,dpnif16.com dpnif32.com): %.com: %.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
 $(BUILD)/test/dpdebug16.com: $(BUILD)/test/dpmi_debug16.o test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
@@ -593,6 +1160,30 @@ $(BUILD)/test/dpmi_callback_register_stack16.o: test/dpmi_callback_register.S | 
 	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
 
 $(BUILD)/test/dpmi_callback_register_stack32.o: test/dpmi_callback_register.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dprw16.com: $(BUILD)/test/dpmi_raw_entry16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprw32.com: $(BUILD)/test/dpmi_raw_entry32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprws16.com: $(BUILD)/test/dpmi_raw_entry_stack16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dprws32.com: $(BUILD)/test/dpmi_raw_entry_stack32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpmi_raw_entry16.o: test/dpmi_raw_entry.S | $(BUILD)/test
+	as --32 --defsym PM32=0 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_raw_entry32.o: test/dpmi_raw_entry.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=1 -o $@ $<
+
+$(BUILD)/test/dpmi_raw_entry_stack16.o: test/dpmi_raw_entry.S | $(BUILD)/test
+	as --32 --defsym PM32=1 --defsym STACK32=0 -o $@ $<
+
+$(BUILD)/test/dpmi_raw_entry_stack32.o: test/dpmi_raw_entry.S | $(BUILD)/test
 	as --32 --defsym PM32=0 --defsym STACK32=1 -o $@ $<
 
 $(BUILD)/test/dpce16.com: $(BUILD)/test/dpmi_callback_entry16.o test/dpmi_native.ld
@@ -968,6 +1559,34 @@ $(BUILD)/test/dpio32.com: $(BUILD)/test/dpmi_file_io32.o test/dpmi_native.ld
 $(BUILD)/test/dpmi_file_io32.o: test/dpmi_file_io.S | $(BUILD)/test
 	as --32 --defsym CLIENT32=1 -o $@ $<
 
+.PHONY: dos-file-pressure-test
+dos-file-pressure-test: $(BUILD)/test/dpfio16.com $(BUILD)/test/dpfio32.com \
+	$(BUILD)/test/dpfi16f.com $(BUILD)/test/dpfi32f.com
+
+$(BUILD)/test/dpfio16.com: $(BUILD)/test/dpfio16.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpfio32.com: $(BUILD)/test/dpfio32.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpfi16f.com: $(BUILD)/test/dpfi16f.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpfi32f.com: $(BUILD)/test/dpfi32f.o test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+$(BUILD)/test/dpfio16.o: test/dpmi_file_pressure.S | $(BUILD)/test
+	as --32 -o $@ $<
+
+$(BUILD)/test/dpfio32.o: test/dpmi_file_pressure.S | $(BUILD)/test
+	as --32 --defsym CLIENT32=1 -o $@ $<
+
+$(BUILD)/test/dpfi16f.o: test/dpmi_file_pressure.S | $(BUILD)/test
+	as --32 --defsym RELEASE_ARENA=1 -o $@ $<
+
+$(BUILD)/test/dpfi32f.o: test/dpmi_file_pressure.S | $(BUILD)/test
+	as --32 --defsym CLIENT32=1 --defsym RELEASE_ARENA=1 -o $@ $<
+
 $(BUILD)/test/dpcon16.com: $(BUILD)/test/dpmi_console16.o test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
@@ -1043,6 +1662,24 @@ $(BUILD)/test/dos_truename.o: test/dos_truename.S | $(BUILD)/test
 
 $(BUILD)/test/dosexec.com: $(BUILD)/test/dos_exec_contract.o \
 		test/dpmi_native.ld
+	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
+
+.PHONY: dos-tsr-test
+dos-tsr-test: $(addprefix $(BUILD)/test/,tsrtest.com tsrload.com tsrc31.com tsrc27.com tsrrom.com tsrmid.com dexmz.exe)
+
+$(BUILD)/test/tsrtest.o: test/dos_tsr.S | $(BUILD)/test
+	as --32 --defsym LOAD_ONLY=0 -o $@ $<
+$(BUILD)/test/tsrload.o: test/dos_tsr.S | $(BUILD)/test
+	as --32 --defsym LOAD_ONLY=1 -o $@ $<
+$(BUILD)/test/tsrc31.o: test/dos_tsr_child.S | $(BUILD)/test
+	as --32 --defsym TSR_KIND=31 -o $@ $<
+$(BUILD)/test/tsrc27.o: test/dos_tsr_child.S | $(BUILD)/test
+	as --32 --defsym TSR_KIND=27 -o $@ $<
+$(BUILD)/test/tsrrom.o: test/dos_tsr_child.S | $(BUILD)/test
+	as --32 --defsym TSR_KIND=28 -o $@ $<
+$(BUILD)/test/tsrmid.o: test/dos_tsr_middle.S | $(BUILD)/test
+	as --32 -o $@ $<
+$(addprefix $(BUILD)/test/,tsrtest.com tsrload.com tsrc31.com tsrc27.com tsrrom.com tsrmid.com): %.com: %.o test/dpmi_native.ld
 	ld -m elf_i386 -T test/dpmi_native.ld -o $@ $<
 
 $(BUILD)/test/dos_exec_contract.o: test/dos_exec_contract.S | $(BUILD)/test
@@ -1174,10 +1811,10 @@ $(BUILD)/boot.so: $(BOOT_OBJ)
 $(BUILD)/boot-pxe.so: $(BOOT_PXE_OBJ)
 	$(LD) $(BLDFLAGS) -o $@ $^ $(BLIBS)
 
-$(BUILD)/boot_efi.o: boot/boot_efi.c | $(BUILD)
+$(BUILD)/boot_efi.o: boot/boot_efi.c boot/boot_paging.h include/boot_trace.h | $(BUILD)
 	$(CC) $(BFLAGS) -c -o $@ $<
 
-$(BUILD)/boot_efi_pxe.o: boot/boot_efi.c | $(BUILD)
+$(BUILD)/boot_efi_pxe.o: boot/boot_efi.c boot/boot_paging.h include/boot_trace.h | $(BUILD)
 	$(CC) $(BFLAGS) -DOK_PXE_EMBED_KERNEL=1 -c -o $@ $<
 
 $(BUILD)/boot_pxe_kernel.o: boot/kernel_embed.S $(BUILD)/kernel.elf | $(BUILD)
@@ -1190,6 +1827,20 @@ $(BUILD)/kernel.elf: $(ALL_KERN_OBJ) kernel.ld
 	@echo "Built: $@ ($$(stat -c%s $@) bytes)"
 
 # Kernel C files
+$(BUILD)/lib/tinyssh/%.o: lib/tinyssh/%.c $(SSH_HEADERS)
+	@mkdir -p $(@D)
+	$(CC) $(KCFLAGS) -mgeneral-regs-only -fwrapv -Wno-unused-parameter \
+		-Ilib/tinyssh/port -Ilib/tinyssh/upstream -Ilib/tinyssh/upstream/cryptoint -c -o $@ $<
+
+$(BUILD)/kernel/serial.o $(BUILD)/kernel/serial_tx.o: KCFLAGS += -mgeneral-regs-only
+$(BUILD)/kernel/wpa2.o $(BUILD)/kernel/wpa2_crypto.o $(BUILD)/kernel/wpa2_rsn.o $(BUILD)/kernel/wpa2_selftest.o $(BUILD)/kernel/random_secure.o: KCFLAGS += -Ilib/bearssl/port -mgeneral-regs-only
+$(BUILD)/win32/advapi32_shim.o: KCFLAGS += -Ilib/bearssl/port
+
+$(BUILD)/lib/bearssl/%.o: lib/bearssl/%.c
+	@mkdir -p $(@D)
+	$(CC) $(KCFLAGS) -mgeneral-regs-only -DBR_LE_UNALIGNED=0 -DBR_BE_UNALIGNED=0 \
+		-Ilib/bearssl/port -Ilib/bearssl/inc -Ilib/bearssl/src -c -o $@ $<
+
 $(BUILD)/kernel/%.o: kernel/%.c | $(BUILD)/kernel
 	$(CC) $(KCFLAGS) -c -o $@ $<
 
@@ -1215,6 +1866,10 @@ $(BUILD)/fs/%.o: fs/%.c | $(BUILD)/fs
 	$(CC) $(KCFLAGS) -c -o $@ $<
 
 # Win32 compatibility layer — shims run on the guest thread's SIMD state.
+$(BUILD)/win32/math/%.o: win32/math/%.c | $(BUILD)/win32
+	@mkdir -p $(@D)
+	$(CC) $(KCFLAGS) -ffp-contract=off -fno-tree-vectorize -fno-slp-vectorize -c -o $@ $<
+
 $(BUILD)/win32/%.o: win32/%.c | $(BUILD)/win32
 	$(CC) $(KCFLAGS) $(WIN32_IF_AUDIT_FLAGS) -fno-tree-vectorize -fno-slp-vectorize -Iwin32 -c -o $@ $<
 
@@ -1250,6 +1905,13 @@ $(BUILD)/dos/%.o: dos/%.c | $(BUILD)/dos
 $(BUILD)/dos/%.o: dos/%.S | $(BUILD)/dos
 	$(CC) -c -o $@ $<
 
+# Integer-only, freestanding C++ arithmetic; use compiler standard headers.
+$(DOS_NUMERIC_OBJ): $(BUILD)/%.o: %.cc
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -std=c11 -Iinclude -I../../include/common -I../../gui,$(KCFLAGS)) \
+	    -x c++ -std=c++11 -fno-exceptions -fno-rtti -mgeneral-regs-only \
+	    -Ilib -Ilib/softfloat3e -Ilib/softfloat3e/include -c -o $@ $<
+
 # GUI shared library
 $(BUILD)/gui/%.o: ../../gui/%.c | $(BUILD)/gui
 	$(CC) $(KCFLAGS) -c -o $@ $<
@@ -1271,6 +1933,8 @@ TCCFLAGS = -c -nostdlib -Iinclude -I../../include/common -D__KERNEL_X86__=1 \
 # Files that MUST use GCC (SSE/AVX asm constraints, special builtins)
 GCC_ONLY_C = kernel/tensor.c kernel/tensor_avx2.c \
              win32/compat32.c win32/msvcrt_shim.c win32/opengl32_shim.c
+GCC_ONLY_C += $(WPA_KERN_SRC)
+GCC_ONLY_C += win32/crt_math.c $(wildcard win32/math/*.c)
 
 # Everything else uses TCC
 TCC_KERN_SRC = $(filter-out $(GCC_ONLY_C),$(KERN_SRC))
@@ -1290,11 +1954,14 @@ TCC_DOS_OBJ   = $(TCC_DOS_SRC:%.c=$(TCCDIR)/%.o)
 GCC_TENSOR_OBJ    = $(TCCDIR)/kernel/tensor.o $(TCCDIR)/kernel/tensor_avx2.o
 GCC_WIN32_COMPAT  = $(TCCDIR)/win32/compat32.o $(TCCDIR)/win32/msvcrt_shim.o \
                     $(TCCDIR)/win32/opengl32_shim.o
+GCC_WIN32_COMPAT += $(TCCDIR)/win32/crt_math.o \
+                    $(patsubst %.c,$(TCCDIR)/%.o,$(wildcard win32/math/*.c))
 GCC_ASM_OBJ       = $(ASM_SRC:%.S=$(TCCDIR)/%.o)
 GCC_WIN32_ASM_OBJ = $(WIN32_ASM:%.S=$(TCCDIR)/%.o)
 
 ALL_TCC_OBJ = $(TCC_KERN_OBJ) $(TCC_DRV_OBJ) $(TCC_FS_OBJ) $(TCC_WIN32_OBJ) $(TCC_DOS_OBJ) \
-              $(GCC_TENSOR_OBJ) $(GCC_WIN32_COMPAT) $(GCC_ASM_OBJ) $(GCC_WIN32_ASM_OBJ)
+              $(GCC_TENSOR_OBJ) $(GCC_WIN32_COMPAT) $(GCC_ASM_OBJ) $(GCC_WIN32_ASM_OBJ) $(DOS_NUMERIC_OBJ)
+ALL_TCC_OBJ += $(WPA_KERN_SRC:%.c=$(BUILD)/%.o) $(WPA_CRYPTO_OBJ)
 
 .PHONY: tcc tcc-clean
 
@@ -1334,6 +2001,13 @@ $(TCCDIR)/win32/compat32.o: win32/compat32.c | $(TCCDIR)/win32
 
 $(TCCDIR)/win32/msvcrt_shim.o: win32/msvcrt_shim.c | $(TCCDIR)/win32
 	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
+
+$(TCCDIR)/win32/crt_math.o: win32/crt_math.c | $(TCCDIR)/win32
+	$(CC) $(KCFLAGS_PRECOMP) -ffp-contract=off -Iwin32 -c -o $@ $<
+
+$(TCCDIR)/win32/math/%.o: win32/math/%.c | $(TCCDIR)/win32
+	@mkdir -p $(@D)
+	$(CC) $(KCFLAGS_PRECOMP) -ffp-contract=off -c -o $@ $<
 
 $(TCCDIR)/win32/opengl32_shim.o: win32/opengl32_shim.c | $(TCCDIR)/win32
 	$(CC) $(KCFLAGS_PRECOMP) -fno-tree-vectorize -fno-slp-vectorize -Iwin32 -Ilib/opengl/mesa/include -c -o $@ $<

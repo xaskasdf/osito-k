@@ -10,6 +10,7 @@
 #define USER32_SHIM_H
 
 #include "nttypes.h"
+#include "../include/compositor_surface.h"
 
 /* ── Window handle ─────────────────────────────────────────── */
 
@@ -40,6 +41,16 @@ typedef LRESULT (WINAPI *WNDPROC)(HWND, DWORD, WPARAM, LPARAM);
 typedef BOOL (WINAPI *WNDENUMPROC)(HWND, LPARAM);
 typedef LRESULT (WINAPI *HOOKPROC)(int, WPARAM, LPARAM);
 
+#define WS_EX_LAYERED 0x00080000u
+#define WS_EX_TRANSPARENT 0x00000020u
+#define ULW_COLORKEY 1u
+#define ULW_ALPHA 2u
+#define ULW_OPAQUE 4u
+typedef struct { LONG cx, cy; } U32_SIZE;
+typedef struct {
+    BYTE BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat;
+} U32_BLENDFUNCTION;
+
 /* ── Window Messages ───────────────────────────────────────── */
 
 #define WM_NULL             0x0000
@@ -54,6 +65,7 @@ typedef LRESULT (WINAPI *HOOKPROC)(int, WPARAM, LPARAM);
 #define WM_PAINT            0x000F
 #define WM_CLOSE            0x0010
 #define WM_QUIT             0x0012
+#define WM_QUERYOPEN        0x0013
 #define WM_ERASEBKGND       0x0014
 #define WM_SHOWWINDOW       0x0018
 #define WM_GETOBJECT        0x003D
@@ -97,6 +109,7 @@ typedef LRESULT (WINAPI *HOOKPROC)(int, WPARAM, LPARAM);
 #define WM_MOUSEHWHEEL      0x020E
 #define WM_CAPTURECHANGED   0x0215
 #define WM_MOVING           0x0216
+#define WM_SIZING           0x0214
 #define WM_ENTERSIZEMOVE    0x0231
 #define WM_EXITSIZEMOVE     0x0232
 #define WM_NCMOUSEHOVER     0x02A0
@@ -649,6 +662,7 @@ HWND    WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
                                HINSTANCE hInstance, PVOID lpParam);
 BOOL    WINAPI DestroyWindow(HWND hWnd);
 BOOL    WINAPI ShowWindow(HWND hWnd, int nCmdShow);
+BOOL    WINAPI OpenIcon(HWND hWnd);
 BOOL    WINAPI UpdateWindow(HWND hWnd);
 BOOL    WINAPI SetWindowTextA(HWND hWnd, PCSTR lpString);
 int     WINAPI GetWindowTextLengthA(HWND hWnd);
@@ -666,6 +680,8 @@ HDWP    WINAPI DeferWindowPos(HDWP hWinPosInfo, HWND hWnd,
 BOOL    WINAPI EndDeferWindowPos(HDWP hWinPosInfo);
 BOOL    user32_get_window_surface(HWND hwnd, void **pixels, int *width,
                                   int *height, int *pitch);
+BOOL    user32_acquire_window_dc_surface(HWND hwnd, BOOL whole,
+                                         compositor_surface_ref_t *surface);
 uint32_t user32_get_window_compositor_id(HWND hwnd);
 void    user32_mark_window_dirty(HWND hwnd);
 
@@ -721,6 +737,11 @@ BOOL    WINAPI SetLayeredWindowAttributes(HWND hWnd, DWORD crKey,
                                            BYTE bAlpha, DWORD dwFlags);
 BOOL    WINAPI GetLayeredWindowAttributes(HWND hWnd, DWORD *crKey,
                                           BYTE *alpha, DWORD *flags);
+BOOL    WINAPI UpdateLayeredWindow(HWND window, HDC destination_dc,
+                                    const POINT *position, const U32_SIZE *size,
+                                    HDC source_dc, const POINT *source,
+                                    DWORD color_key, const U32_BLENDFUNCTION *blend,
+                                    DWORD flags);
 HWND    WINAPI GetForegroundWindow(void);
 HWND    WINAPI WindowFromPoint(POINT Point);
 HWND    WINAPI GetAncestor(HWND hWnd, UINT gaFlags);
@@ -786,22 +807,46 @@ BOOL user32_get_display_resolution(uint32_t index, uint32_t *width,
                                    uint32_t *height);
 
 /* Misc */
+BOOL    WINAPI MessageBeep(UINT type);
 int     WINAPI MessageBoxA(HWND hWnd, PCSTR lpText, PCSTR lpCaption, DWORD uType);
 int     WINAPI MessageBoxW(HWND hWnd, PCWSTR lpText, PCWSTR lpCaption, DWORD uType);
 HCURSOR WINAPI LoadCursorA(HINSTANCE hInstance, PCSTR lpCursorName);
 HICON   WINAPI LoadIconA(HINSTANCE hInstance, PCSTR lpIconName);
 HICON   WINAPI LoadIconW(HINSTANCE hInstance, PCWSTR lpIconName);
 HICON   WINAPI CreateIconIndirect(const ICONINFO *icon_info);
+HICON   WINAPI CreateIconFromResource(PVOID bits, DWORD bytes, BOOL is_icon,
+                                      DWORD version);
+HICON   WINAPI CreateIconFromResourceEx(PVOID bits, DWORD bytes, BOOL is_icon,
+                                        DWORD version, int width, int height,
+                                        UINT flags);
+UINT    WINAPI GetRawInputDeviceList(PVOID output, UINT *count, UINT size);
+UINT    WINAPI GetRawInputDeviceInfoA(HANDLE device, UINT command, PVOID output, UINT *count);
+UINT    WINAPI GetRawInputDeviceInfoW(HANDLE device, UINT command, PVOID output, UINT *count);
+BOOL    WINAPI RegisterRawInputDevices(PCVOID input, UINT count, UINT size);
+UINT    WINAPI GetRegisteredRawInputDevices(PVOID output, UINT *count, UINT size);
+UINT    WINAPI GetRawInputData(HANDLE handle, UINT command, PVOID output, UINT *size, UINT header_size);
 HICON   WINAPI CopyIcon(HICON icon);
 BOOL    WINAPI GetIconInfo(HICON icon, ICONINFO *icon_info);
 BOOL    WINAPI DrawIconEx(HDC hdc, int x, int y, HICON icon, int width,
                           int height, UINT step, HBRUSH brush, UINT flags);
 BOOL    WINAPI DestroyIcon(HICON icon);
 HDC     WINAPI GetDC(HWND hWnd);
+#define DCX_WINDOW           0x00000001u
+#define DCX_CACHE            0x00000002u
+#define DCX_NORESETATTRS      0x00000004u
+#define DCX_CLIPCHILDREN      0x00000008u
+#define DCX_CLIPSIBLINGS      0x00000010u
+#define DCX_PARENTCLIP        0x00000020u
+#define DCX_EXCLUDERGN        0x00000040u
+#define DCX_INTERSECTRGN      0x00000080u
+#define DCX_LOCKWINDOWUPDATE  0x00000400u
+#define DCX_USESTYLE          0x00010000u
+HDC     WINAPI GetDCEx(HWND hWnd, HANDLE hrgnClip, DWORD flags);
 HDC     WINAPI GetWindowDC(HWND hWnd);
 HWND    WINAPI WindowFromDC(HDC hDC);
 int     WINAPI ReleaseDC(HWND hWnd, HDC hDC);
 BOOL    WINAPI InvalidateRect(HWND hWnd, const RECT *lpRect, BOOL bErase);
+BOOL    WINAPI InvalidateRgn(HWND hWnd, HANDLE region, BOOL erase);
 BOOL    user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
                                             BOOL allow_window_changes,
                                             int width, int height);
@@ -882,6 +927,7 @@ BOOL    WINAPI EnumWindows(WNDENUMPROC lpfn, LPARAM lParam);
 
 /* Clipboard */
 BOOL    WINAPI OpenClipboard(HANDLE hWndNewOwner);
+HWND    WINAPI GetClipboardOwner(void);
 BOOL    WINAPI CloseClipboard(void);
 BOOL    WINAPI EmptyClipboard(void);
 HANDLE  WINAPI SetClipboardData(UINT uFormat, HANDLE hMem);
@@ -919,6 +965,7 @@ LONG_PTR WINAPI SetWindowLongPtrW(HWND hWnd, int nIndex, LONG_PTR dwNewLong);
 LONG_PTR WINAPI GetClassLongPtrW(HWND hWnd, int nIndex);
 LONG_PTR WINAPI SetClassLongPtrW(HWND hWnd, int nIndex, LONG_PTR dwNewLong);
 LONG    WINAPI SetClassLongW(HWND hWnd, int nIndex, LONG dwNewLong);
+int     WINAPI GetClassNameA(HWND hWnd, PSTR class_name, int max_count);
 int     WINAPI GetClassNameW(HWND hWnd, PWSTR class_name, int max_count);
 BOOL    WINAPI IsWindow(HWND hWnd);
 BOOL    WINAPI IsIconic(HWND hWnd);
@@ -931,6 +978,7 @@ BOOL    WINAPI EnumChildWindows(HWND hWndParent, WNDENUMPROC lpEnumFunc,
 BOOL    WINAPI ClientToScreen(HWND hWnd, PVOID lpPoint);
 BOOL    WINAPI ScreenToClient(HWND hWnd, PVOID lpPoint);
 BOOL    WINAPI GetUpdateRect(HWND hWnd, PVOID lpRect, BOOL bErase);
+int     WINAPI GetUpdateRgn(HWND hWnd, HANDLE region, BOOL erase);
 int     WINAPI FillRect(HDC hDC, PVOID lprc, HBRUSH hbr);
 BOOL    WINAPI DrawFocusRect(HDC hDC, PVOID lprc);
 int     WINAPI DrawTextA(HDC hdc, PCSTR lpchText, int cchText, PVOID lprc, UINT format);
@@ -1015,8 +1063,10 @@ BOOL  WINAPI SetMenu(HWND hWnd, HMENU hMenu);
 HWND  WINAPI SetParent(HWND hWndChild, HWND hWndNewParent);
 HWND  WINAPI SetActiveWindow(HWND hWnd);
 BOOL  WINAPI SystemParametersInfoW(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni);
+UINT user32_wheel_scroll_lines(void);
 BOOL  WINAPI UnregisterHotKey(HWND hWnd, int id);
 BOOL  WINAPI ValidateRect(HWND hWnd, const RECT *lpRect);
+BOOL  WINAPI ValidateRgn(HWND hWnd, HANDLE region);
 
 /* ── Shim init / resolve ───────────────────────────────────── */
 

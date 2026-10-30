@@ -199,6 +199,12 @@ void disk_set_active(int dev_idx)
 
 int disk_active(void) { return active_dev; }
 
+bool disk_is_usb(void)
+{
+    return active_dev >= 0 && devices[active_dev].active &&
+           devices[active_dev].type == BLKDEV_USB;
+}
+
 uint32_t disk_lba_size(void)
 {
     if (active_dev < 0) return 0;
@@ -338,8 +344,9 @@ int disk_flush(void)
 /*
  * Read `len` bytes starting at byte_offset on the active device.
  * Translates byte coordinates to LBA + intra-sector offset. Aligned NVMe
- * spans use the caller buffer directly; partial boundary sectors use a
- * temporary aligned buffer. Returns 0 on success, -1 on any sub-read
+ * spans use the caller buffer directly; USB batches up to 64 KiB in a
+ * physically backed bounce buffer. Other partial/bounced reads use 8 KiB.
+ * Returns 0 on success, -1 on any sub-read
  * failure or when no device is active.
  */
 int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
@@ -361,6 +368,12 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
      * not guaranteed to be physically contiguous across two pages. */
     uint32_t ssz   = d->sector_size;
     if (ssz > 8192) return -1;
+    uint32_t bounce_bytes = 8192;
+    if (d->type == BLKDEV_USB) {
+        uint32_t intra = (uint32_t)(byte_offset % ssz);
+        while (bounce_bytes < 65536 && len > bounce_bytes - intra)
+            bounce_bytes *= 2;
+    }
     void *tmp_phys = NULL;
     uint8_t *tmp = NULL;
     int result = 0;
@@ -388,12 +401,16 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
         }
 
         if (!tmp_phys) {
-            tmp_phys = mem_alloc_aligned(8192, 4096);
+            tmp_phys = mem_alloc_aligned(bounce_bytes, 4096);
+            if (!tmp_phys && bounce_bytes > 8192) {
+                bounce_bytes = 8192;
+                tmp_phys = mem_alloc_aligned(bounce_bytes, 4096);
+            }
             if (!tmp_phys) return -1;
             tmp = (uint8_t *)PHYS_TO_VIRT(tmp_phys);
         }
-        uint32_t want   = (uint32_t)((left < (8192U - intra))
-                                     ? left : (8192U - intra));
+        uint32_t available = (bounce_bytes / ssz) * ssz - intra;
+        uint32_t want = (uint32_t)(left < available ? left : available);
         uint32_t sectors = (intra + want + ssz - 1) / ssz;
 
         if (d->read(lba, sectors, tmp) < 0) {
@@ -408,7 +425,7 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
         off  += want;
         left -= want;
     }
-    if (tmp_phys) mem_free_pages(tmp_phys, 2);
+    if (tmp_phys) mem_free_pages(tmp_phys, bounce_bytes / 4096);
     return result;
 }
 

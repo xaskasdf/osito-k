@@ -10,6 +10,7 @@ EXPORTS
     BitBlt@36
     StretchBlt@44
     StretchDIBits@52
+    SetDIBitsToDevice@48
     PatBlt@24
     CreateSolidBrush@4
     GdiFlush@0

@@ -6,20 +6,35 @@
  */
 
 #include "kernel32_shim.h"
+#include "fold_string.h"
+#include "short_path.h"
+#include "binary_type.h"
+#include "setupapi_inf.h"
+#include "setupapi_cab.h"
+#include "system_paths.h"
+#include "wow64.h"
+#include "osversion.h"
 #include "ntdll_shim.h"
 #include "../fs/ositofs_metadata.h"
 #include "../fs/ositofs3.h"
 #include "ntsyscall.h"
+#include "ntprocess.h"
+#include "ntjob.h"
 #include "dllloader.h"
+#include "delay_load.h"
 #include "handle.h"
 #include "filelock.h"
 #include "unwind64.h"
 #include "win32_abi.h"
 #include "wsock32_shim.h"
 #include "wintime.h"
+#include "timer_queue.h"
+#include "msi_install.h"
+#include "d3dkmt.h"
 #include "../fs/vfs.h"
 #include "../include/paging.h"
 #include "../include/cpu_features.h"
+#include "../include/interrupt.h"
 #include "../kernel/smp.h"
 
 /* ── Kernel interfaces (forward declarations) ─────────────── */
@@ -27,6 +42,10 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern BOOL win32_is_current_loader_lock(PVOID lock);
+extern int WINAPI MessageBoxA(HANDLE window, PCSTR text, PCSTR caption,
+                              DWORD type);
+extern int WINAPI MessageBoxW(HANDLE window, PCWSTR text, PCWSTR caption,
+                              DWORD type);
 
 typedef struct _SYSTEMTIME {
     WORD wYear;
@@ -47,6 +66,14 @@ typedef struct _SYSTEMTIME {
 
 #ifndef K32_VERBOSE_DIAGNOSTICS
 #define K32_VERBOSE_DIAGNOSTICS 0
+#endif
+
+#ifndef K32_LOOKUP_FAILURE_TRACE
+#define K32_LOOKUP_FAILURE_TRACE 0
+#endif
+
+#ifndef K32_LOOKUP_CHECKPOINT_CALLER
+#define K32_LOOKUP_CHECKPOINT_CALLER 0
 #endif
 
 /* ── Shim handle table for dynamically loaded shim DLLs ────── */
@@ -86,44 +113,6 @@ extern void  kfree(void *ptr);
 extern NTSTATUS ntsync_set_event_for_process(HANDLE, ULONG, LONG *);
 extern HANDLE_TABLE g_handle_table;
 
-#define K32_MAX_JOB_OBJECTS 8
-#define K32_MAX_JOB_PROCESSES 8
-#define K32_JOB_OBJECT_LIMIT_KILL_ON_CLOSE 0x00002000U
-
-typedef struct {
-    BOOL in_use;
-    DWORD limit_flags;
-    HANDLE processes[K32_MAX_JOB_PROCESSES];
-} K32_JOB_OBJECT;
-
-static K32_JOB_OBJECT k32_jobs[K32_MAX_JOB_OBJECTS];
-
-static void job_terminate_processes(K32_JOB_OBJECT *job, DWORD exit_code)
-{
-    extern BOOL win32_terminate_child(HANDLE, NTSTATUS);
-
-    for (int i = 0; i < K32_MAX_JOB_PROCESSES; i++) {
-        if (job->processes[i])
-            win32_terminate_child(job->processes[i], (NTSTATUS)exit_code);
-    }
-}
-
-static void job_release(K32_JOB_OBJECT *job, BOOL honor_kill_on_close)
-{
-    if (!job || !job->in_use)
-        return;
-    if (honor_kill_on_close &&
-        (job->limit_flags & K32_JOB_OBJECT_LIMIT_KILL_ON_CLOSE)) {
-        serial_puts("[K32-JOB] last handle closed; terminating processes\n");
-        job_terminate_processes(job, 1);
-    }
-    for (int i = 0; i < K32_MAX_JOB_PROCESSES; i++) {
-        if (job->processes[i])
-            handle_close(&g_handle_table, job->processes[i]);
-    }
-    memset(job, 0, sizeof(*job));
-}
-
 /* Keep direct TEB reads in sync with GetLastError(). */
 extern TEB g_teb;
 extern TEB *win64_current_teb(void);
@@ -133,7 +122,8 @@ extern const char *win32_current_image_path(void);
 extern const char *win32_current_command_line(void);
 extern const WCHAR *win32_current_command_line_w(void);
 extern const char *win32_current_directory_override(void);
-extern BOOL win32_set_current_directory_override(const char *path);
+extern const char *win32_current_directory_backing_override(void);
+extern BOOL win32_set_current_directory_override(const char *path, const char *backing);
 extern BOOL win32_refresh_current_process_parameters(void);
 extern void win32_refresh_current_console_parameters(void);
 extern BOOL win32_current_is_gui_app(void);
@@ -431,6 +421,37 @@ static void ascii_to_unicode_buf(const char *src, WCHAR *buf, int max_chars)
     buf[i] = 0;
 }
 
+/* OsitoFS paths contain UTF-8 bytes. Convert at the W API boundary; the NT
+ * file adapter still carries those bytes in widened code units internally. */
+static DWORD k32_file_name_utf8(PCWSTR input, char output[260])
+{
+    if (!input || !*input) return 3; /* ERROR_PATH_NOT_FOUND */
+    unsigned written = 0;
+    for (unsigned i = 0; input[i]; i++) {
+        uint32_t cp = input[i];
+        if (cp >= 0xd800 && cp <= 0xdbff) {
+            uint32_t low = input[++i];
+            if (low < 0xdc00 || low > 0xdfff)
+                return 1113; /* ERROR_NO_UNICODE_TRANSLATION */
+            cp = 0x10000 + ((cp - 0xd800) << 10) + low - 0xdc00;
+        } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+            return 1113;
+        }
+        unsigned bytes = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        if (written + bytes >= 260)
+            return 206; /* ERROR_FILENAME_EXCED_RANGE; never open a prefix. */
+        if (bytes == 1) output[written++] = (char)cp;
+        else {
+            output[written++] = (char)((bytes == 2 ? 0xc0 : bytes == 3 ? 0xe0 : 0xf0) |
+                                        (cp >> (6 * (bytes - 1))));
+            for (unsigned n = bytes - 1; n; n--)
+                output[written++] = (char)(0x80 | ((cp >> (6 * (n - 1))) & 0x3f));
+        }
+    }
+    output[written] = 0;
+    return 0;
+}
+
 #define K32_OBJECT_NAME_MAX 128
 #define K32_MAX_NAMED_OBJECTS 512
 typedef struct {
@@ -620,6 +641,23 @@ static HANDLE named_object_open(K32_NAMED_OBJECT *objects, int count,
     return handle;
 }
 
+static HANDLE open_named_sync_k32(K32_NAMED_OBJECT *objects, int count,
+                                   OBJECT_TYPE_ID type, const char *name,
+                                   ACCESS_MASK access, BOOL inherit)
+{
+    HANDLE handle = named_object_open(objects, count, type, name, access);
+    if (!handle || !inherit) return handle;
+    NTSTATUS status = handle_update_flags_for_process(
+        &g_handle_table, handle, win32_current_process_id(),
+        HANDLE_USER_FLAG_INHERIT, HANDLE_USER_FLAG_INHERIT);
+    if (!NT_SUCCESS(status)) {
+        CloseHandle(handle);
+        set_last_error_from_status(status);
+        return NULL;
+    }
+    return handle;
+}
+
 static HANDLE named_object_publish_access(K32_NAMED_OBJECT *objects, int count,
                                           OBJECT_TYPE_ID type,
                                           const char *name, HANDLE created,
@@ -674,11 +712,18 @@ static HANDLE named_object_publish(K32_NAMED_OBJECT *objects, int count,
 }
 
 static char win32_current_directory[260];
+static char win32_current_directory_physical[260];
 
 const char *kernel32_current_directory_relative(void)
 {
     const char *child_directory = win32_current_directory_override();
     return child_directory ? child_directory : win32_current_directory;
+}
+
+const char *kernel32_current_directory_backing(void)
+{
+    const char *child_directory = win32_current_directory_backing_override();
+    return child_directory ? child_directory : win32_current_directory_physical;
 }
 
 static void win32_reset_current_directory(void)
@@ -698,6 +743,7 @@ static void win32_reset_current_directory(void)
             win32_current_directory[n++] = *p == '/' ? '\\' : *p;
     }
     win32_current_directory[n] = 0;
+    memcpy(win32_current_directory_physical, win32_current_directory, (size_t)n + 1);
 }
 
 bool win32_normalize_path(PCSTR path, char out[260])
@@ -1061,6 +1107,8 @@ typedef struct {
     BOOL used;
     BOOL attached;
     DWORD process_id;
+    DWORD parent_process_id;
+    BOOL use_std_handles;
     HANDLE standard_input;
     HANDLE standard_output;
     HANDLE standard_error;
@@ -1133,6 +1181,26 @@ static void k32_console_set_defaults(K32_PROCESS_CONSOLE *state,
         ? console_default_handle(WIN32_STD_ERROR_HANDLE) : NULL;
 }
 
+static HANDLE k32_console_attach_handle(HANDLE current, DWORD which,
+                                        BOOL preserve)
+{
+    if (!preserve || !current || current == (HANDLE)(ULONG_PTR)4 ||
+        current == (HANDLE)(ULONG_PTR)8 || current == (HANDLE)(ULONG_PTR)12)
+        return console_default_handle(which);
+    return current;
+}
+
+static void k32_console_attach_locked(K32_PROCESS_CONSOLE *state)
+{
+    state->attached = TRUE;
+    state->standard_input = k32_console_attach_handle(
+        state->standard_input, WIN32_STD_INPUT_HANDLE, state->use_std_handles);
+    state->standard_output = k32_console_attach_handle(
+        state->standard_output, WIN32_STD_OUTPUT_HANDLE, state->use_std_handles);
+    state->standard_error = k32_console_attach_handle(
+        state->standard_error, WIN32_STD_ERROR_HANDLE, state->use_std_handles);
+}
+
 NTSTATUS kernel32_initialize_process_console(DWORD process_id,
                                               BOOL attached)
 {
@@ -1146,7 +1214,8 @@ NTSTATUS kernel32_initialize_process_console(DWORD process_id,
 
 NTSTATUS kernel32_inherit_process_console(DWORD parent_pid,
                                            DWORD child_pid,
-                                           DWORD creation_flags)
+                                           DWORD creation_flags,
+                                           const K32_CONSOLE_STARTUP *startup)
 {
     if (!parent_pid || !child_pid || parent_pid == child_pid)
         return STATUS_INVALID_PARAMETER;
@@ -1169,6 +1238,14 @@ NTSTATUS kernel32_inherit_process_console(DWORD parent_pid,
         k32_console_set_defaults(child, TRUE);
     } else {
         k32_console_set_defaults(child, FALSE);
+    }
+    child->parent_process_id = parent_pid;
+    child->use_std_handles = startup && startup->use_std_handles;
+    if (child->use_std_handles) {
+        child->standard_input = startup->input;
+        child->standard_output = startup->output;
+        child->standard_error = startup->error;
+        if (child->attached) k32_console_attach_locked(child);
     }
     k32_console_unlock_irqrestore(flags);
     return STATUS_SUCCESS;
@@ -1300,6 +1377,9 @@ static HANDLE named_pipe_cancel_pending_server(HANDLE server)
 
 #define K32_FILE_FLAG_BACKUP_SEMANTICS 0x02000000U
 #define K32_FILE_FLAG_OVERLAPPED       0x40000000U
+#define K32_FILE_FLAG_NO_BUFFERING     0x20000000U
+#define K32_FILE_FLAG_RANDOM_ACCESS    0x10000000U
+#define K32_FILE_FLAG_SEQUENTIAL_SCAN  0x08000000U
 
 static ULONG k32_file_create_options(DWORD flags, BOOL directory)
 {
@@ -1307,6 +1387,12 @@ static ULONG k32_file_create_options(DWORD flags, BOOL directory)
                               : FILE_NON_DIRECTORY_FILE;
     if (!(flags & K32_FILE_FLAG_OVERLAPPED))
         options |= FILE_SYNCHRONOUS_IO_NONALERT;
+    if (flags & K32_FILE_FLAG_NO_BUFFERING)
+        options |= FILE_NO_INTERMEDIATE_BUFFERING;
+    if (flags & K32_FILE_FLAG_RANDOM_ACCESS)
+        options |= FILE_RANDOM_ACCESS;
+    if (flags & K32_FILE_FLAG_SEQUENTIAL_SCAN)
+        options |= FILE_SEQUENTIAL_ONLY;
     return options;
 }
 
@@ -1314,6 +1400,20 @@ static ACCESS_MASK k32_file_desired_access(DWORD desired_access)
 {
     /* NtCreateFile expands generic rights and preserves specific rights. */
     return (ACCESS_MASK)desired_access | SYNCHRONIZE;
+}
+
+/* Win32 paths have already been redirected; direct NT calls resolve separately. */
+static NTSTATUS k32_create_resolved_file(PHANDLE fh, ACCESS_MASK access,
+    POBJECT_ATTRIBUTES oa, PIO_STATUS_BLOCK iosb, PLARGE_INTEGER allocation,
+    ULONG attrs, ULONG share, ULONG disposition, ULONG options,
+    PVOID ea, ULONG ea_length, const char *physical_path)
+{
+    ULONG_PTR args[11] = {
+        (ULONG_PTR)fh, access, (ULONG_PTR)oa, (ULONG_PTR)iosb,
+        (ULONG_PTR)allocation, attrs, share, disposition, options,
+        (ULONG_PTR)ea, ea_length
+    };
+    return nt_create_file_resolved(args, physical_path);
 }
 
 HANDLE WINAPI CreateFileA(PCSTR lpFileName, DWORD dwDesiredAccess,
@@ -1341,7 +1441,7 @@ HANDLE WINAPI CreateFileA(PCSTR lpFileName, DWORD dwDesiredAccess,
 
     /* Build NT path from Win32 path */
     char fs_path[260];
-    if (!win32_normalize_path(lpFileName, fs_path)) {
+    if (!win32_resolve_file_path(lpFileName, fs_path)) {
         SetLastError(lpFileName ? 206 : 87);
         return INVALID_HANDLE_VALUE;
     }
@@ -1364,7 +1464,7 @@ HANDLE WINAPI CreateFileA(PCSTR lpFileName, DWORD dwDesiredAccess,
         win32_directory_exists_normalized(fs_path);
     ULONG create_options = k32_file_create_options(dwFlagsAndAttributes,
                                                     directory_open);
-    NTSTATUS status = NtCreateFile(
+    NTSTATUS status = k32_create_resolved_file(
         &file_handle,
         nt_access,
         &oa,
@@ -1375,7 +1475,8 @@ HANDLE WINAPI CreateFileA(PCSTR lpFileName, DWORD dwDesiredAccess,
         win32_to_nt_disposition(dwCreationDisposition),
         create_options,
         NULL,                                   /* EaBuffer */
-        0                                       /* EaLength */
+        0,                                      /* EaLength */
+        fs_path
     );
 
     if (!NT_SUCCESS(status)) {
@@ -1395,20 +1496,14 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
     (void)lpSecurityAttributes;
     (void)hTemplateFile;
 
-    char fname_ascii[260];
-    int fname_len = 0;
-    if (lpFileName) {
-        for (int i = 0; i < 259 && lpFileName[i]; i++) {
-            char c = (char)(lpFileName[i] & 0xFF);
-            fname_ascii[i] = c;
-            fname_len = i + 1;
-        }
-        fname_ascii[fname_len] = 0;
-    } else {
-        fname_ascii[0] = 0;
+    char fname_utf8[260];
+    DWORD path_error = k32_file_name_utf8(lpFileName, fname_utf8);
+    if (path_error) {
+        SetLastError(path_error);
+        return INVALID_HANDLE_VALUE;
     }
 
-    HANDLE pipe_client = named_pipe_take_client(fname_ascii);
+    HANDLE pipe_client = named_pipe_take_client(fname_utf8);
     if (pipe_client != INVALID_HANDLE_VALUE) {
         serial_puts("[K32-PIPE] connected client=0x");
         serial_puthex((uint64_t)(ULONG_PTR)pipe_client, 8);
@@ -1420,13 +1515,13 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
     serial_puts("[CreateFileW] ptr=0x");
     serial_puthex((uint64_t)lpFileName, 16);
     serial_puts(" '");
-    serial_puts(fname_ascii);
+    serial_puts(fname_utf8);
     serial_puts("'\n");
 #endif
 
     char fs_path[260];
-    if (!win32_normalize_path(lpFileName ? fname_ascii : NULL, fs_path)) {
-        SetLastError(lpFileName ? 206 : 87);
+    if (!win32_resolve_file_path(fname_utf8, fs_path)) {
+        SetLastError(206);
         return INVALID_HANDLE_VALUE;
     }
 
@@ -1469,12 +1564,12 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
             serial_puts("\n");
         }
     }
-    NTSTATUS status = NtCreateFile(
+    NTSTATUS status = k32_create_resolved_file(
         &file_handle, nt_access, &oa, &iosb, NULL,
         FILE_ATTRIBUTE_NORMAL, dwShareMode,
         win32_to_nt_disposition(dwCreationDisposition),
         create_options,
-        NULL, 0
+        NULL, 0, fs_path
     );
 
     if (trace_profile) {
@@ -1498,6 +1593,7 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
 BOOL WINAPI ReadFile(HANDLE hFile, PVOID lpBuffer, DWORD nNumberOfBytesToRead,
               DWORD *lpNumberOfBytesRead, PVOID lpOverlapped)
 {
+    if (lpNumberOfBytesRead) *lpNumberOfBytesRead = 0;
     static volatile uint32_t regular_read_trace_count;
     FILE_OBJECT *file_object = NULL;
     BOOL pipe_read =
@@ -1622,6 +1718,7 @@ BOOL WINAPI ReadFile(HANDLE hFile, PVOID lpBuffer, DWORD nNumberOfBytesToRead,
 BOOL WINAPI WriteFile(HANDLE hFile, PCVOID lpBuffer, DWORD nNumberOfBytesToWrite,
                DWORD *lpNumberOfBytesWritten, PVOID lpOverlapped)
 {
+    if (lpNumberOfBytesWritten) *lpNumberOfBytesWritten = 0;
     FILE_OBJECT *file_object = NULL;
     BOOL pipe_write =
         NT_SUCCESS(handle_lookup(&g_handle_table, hFile, OBJ_TYPE_FILE,
@@ -1772,10 +1869,7 @@ static BOOL WINAPI WriteFileEx_k32(HANDLE file, PCVOID buffer, DWORD length,
 BOOL WINAPI CloseHandle(HANDLE hObject)
 {
     DWORD owner_pid = win32_current_process_id();
-    K32_JOB_OBJECT *job = NULL;
     HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, hObject);
-    if (entry && entry->type == OBJ_TYPE_JOB)
-        job = (K32_JOB_OBJECT *)entry->object;
 
     /* NtClose may release the pipe object while another CPU is servicing an
      * overlapped request. Cancel first and wait until no service routine still
@@ -1817,9 +1911,6 @@ BOOL WINAPI CloseHandle(HANDLE hObject)
         set_last_error_from_status(status);
         return FALSE;
     }
-    if (job &&
-        !handle_object_referenced(&g_handle_table, OBJ_TYPE_JOB, job))
-        job_release(job, TRUE);
     HANDLE pending_client = named_pipe_cancel_pending_server(hObject);
     if (pending_client != INVALID_HANDLE_VALUE)
         (void)nt_close_handle_for_process(pending_client, owner_pid);
@@ -2093,8 +2184,6 @@ DWORD kernel32_release_process_handles(DWORD process_id)
     HANDLE handle;
     while ((handle = handle_take_owned(&g_handle_table, process_id)) != NULL) {
         HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, handle);
-        K32_JOB_OBJECT *job = entry && entry->type == OBJ_TYPE_JOB
-                            ? (K32_JOB_OBJECT *)entry->object : NULL;
 
         if (entry && entry->type == OBJ_TYPE_FILE) {
             (void)k32_cancel_pipe_io_for_process(handle, NULL, FALSE,
@@ -2115,10 +2204,6 @@ DWORD kernel32_release_process_handles(DWORD process_id)
             break;
         }
 
-        if (job &&
-            !handle_object_referenced(&g_handle_table, OBJ_TYPE_JOB, job))
-            job_release(job, TRUE);
-
         HANDLE pending_client = named_pipe_cancel_pending_server(handle);
         if (pending_client != INVALID_HANDLE_VALUE)
             (void)nt_force_close_handle_for_process(pending_client,
@@ -2126,182 +2211,13 @@ DWORD kernel32_release_process_handles(DWORD process_id)
         iocp_forget_handle_for_process(handle, process_id);
         released++;
     }
+    /* Workers are quiescent and their pending lock requests are cancelled. */
+    nt_file_io_guards_release_process(process_id);
     k32_process_affinity_release(process_id);
     return released;
 }
 
 /* ── Console API ────────────────────────────────────────────── */
-
-HANDLE WINAPI CreateJobObjectW(PVOID job_attributes, PCWSTR name)
-{
-    (void)job_attributes;
-    (void)name;
-
-    for (int i = 0; i < K32_MAX_JOB_OBJECTS; i++) {
-        K32_JOB_OBJECT *job = &k32_jobs[i];
-        if (job->in_use &&
-            !handle_object_referenced(&g_handle_table, OBJ_TYPE_JOB, job))
-            job_release(job, TRUE);
-        if (job->in_use)
-            continue;
-
-        memset(job, 0, sizeof(*job));
-        job->in_use = TRUE;
-        HANDLE handle = NULL;
-        NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_JOB,
-                                       GENERIC_ALL, job, &handle);
-        if (!NT_SUCCESS(status)) {
-            memset(job, 0, sizeof(*job));
-            set_last_error_from_status(status);
-            return NULL;
-        }
-        serial_puts("[K32-JOB] create handle=0x");
-        serial_puthex((uint64_t)(ULONG_PTR)handle, 8);
-        serial_puts("\n");
-        SetLastError(0);
-        return handle;
-    }
-
-    SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
-    return NULL;
-}
-
-BOOL WINAPI SetInformationJobObject(HANDLE job_handle, DWORD info_class,
-                                    PCVOID info, DWORD info_size)
-{
-    K32_JOB_OBJECT *job = NULL;
-    DWORD required = g_compat32_mode ? 108 : 144;
-    if (!NT_SUCCESS(handle_lookup(&g_handle_table, job_handle, OBJ_TYPE_JOB,
-                                  (PVOID *)&job))) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
-        return FALSE;
-    }
-    if (info_class != 9 || !info || info_size < required) {
-        SetLastError(info_class == 9 ? 24 : 87); /* BAD_LENGTH / INVALID_PARAMETER */
-        return FALSE;
-    }
-
-    job->limit_flags = *(const DWORD *)((const BYTE *)info + 16);
-    serial_puts("[K32-JOB] set limits=0x");
-    serial_puthex(job->limit_flags, 8);
-    serial_puts("\n");
-    SetLastError(0);
-    return TRUE;
-}
-
-BOOL WINAPI AssignProcessToJobObject(HANDLE job_handle, HANDLE process_handle)
-{
-    K32_JOB_OBJECT *job = NULL;
-    PVOID process_object = NULL;
-    if (!NT_SUCCESS(handle_lookup(&g_handle_table, job_handle, OBJ_TYPE_JOB,
-                                  (PVOID *)&job)) ||
-        !NT_SUCCESS(handle_lookup(&g_handle_table, process_handle,
-                                  OBJ_TYPE_PROCESS, &process_object))) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
-        return FALSE;
-    }
-
-    int free_slot = -1;
-    for (int i = 0; i < K32_MAX_JOB_PROCESSES; i++) {
-        if (!job->processes[i]) {
-            if (free_slot < 0)
-                free_slot = i;
-            continue;
-        }
-        PVOID assigned_object = NULL;
-        if (NT_SUCCESS(handle_lookup(&g_handle_table, job->processes[i],
-                                     OBJ_TYPE_PROCESS, &assigned_object)) &&
-            assigned_object == process_object) {
-            SetLastError(0);
-            return TRUE;
-        }
-    }
-    if (free_slot < 0) {
-        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
-        return FALSE;
-    }
-
-    HANDLE retained = NULL;
-    NTSTATUS status = handle_duplicate(&g_handle_table, process_handle,
-                                       &g_handle_table, &retained, 0, FALSE,
-                                       DUPLICATE_SAME_ACCESS);
-    if (!NT_SUCCESS(status)) {
-        set_last_error_from_status(status);
-        return FALSE;
-    }
-    job->processes[free_slot] = retained;
-    serial_puts("[K32-JOB] assign process handle=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)process_handle, 8);
-    serial_puts("\n");
-    SetLastError(0);
-    return TRUE;
-}
-
-BOOL WINAPI QueryInformationJobObject(HANDLE job_handle, DWORD info_class,
-                                      PVOID info, DWORD info_size,
-                                      DWORD *return_size)
-{
-    K32_JOB_OBJECT *job = NULL;
-    if (!NT_SUCCESS(handle_lookup(&g_handle_table, job_handle, OBJ_TYPE_JOB,
-                                  (PVOID *)&job))) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
-        return FALSE;
-    }
-
-    DWORD required;
-    if (info_class == 1)
-        required = 48; /* JOBOBJECT_BASIC_ACCOUNTING_INFORMATION */
-    else if (info_class == 9)
-        required = g_compat32_mode ? 108 : 144;
-    else {
-        if (return_size) *return_size = 0;
-        SetLastError(87); /* ERROR_INVALID_PARAMETER */
-        return FALSE;
-    }
-    if (return_size) *return_size = required;
-    if (!info || info_size < required) {
-        SetLastError(24); /* ERROR_BAD_LENGTH */
-        return FALSE;
-    }
-
-    memset(info, 0, required);
-    if (info_class == 9) {
-        *(DWORD *)((BYTE *)info + 16) = job->limit_flags;
-    } else {
-        DWORD total = 0;
-        DWORD active = 0;
-        extern BOOL nt_process_object_signaled(PVOID object);
-        for (int i = 0; i < K32_MAX_JOB_PROCESSES; i++) {
-            PVOID process_object = NULL;
-            if (!job->processes[i] ||
-                !NT_SUCCESS(handle_lookup(&g_handle_table, job->processes[i],
-                                          OBJ_TYPE_PROCESS,
-                                          &process_object)))
-                continue;
-            total++;
-            if (!nt_process_object_signaled(process_object))
-                active++;
-        }
-        *(DWORD *)((BYTE *)info + 36) = total;
-        *(DWORD *)((BYTE *)info + 40) = active;
-        *(DWORD *)((BYTE *)info + 44) = total - active;
-    }
-    SetLastError(0);
-    return TRUE;
-}
-
-BOOL WINAPI TerminateJobObject(HANDLE job_handle, UINT exit_code)
-{
-    K32_JOB_OBJECT *job = NULL;
-    if (!NT_SUCCESS(handle_lookup(&g_handle_table, job_handle, OBJ_TYPE_JOB,
-                                  (PVOID *)&job))) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
-        return FALSE;
-    }
-    job_terminate_processes(job, exit_code);
-    SetLastError(0);
-    return TRUE;
-}
 
 #define K32_ATTRIBUTE_LIST_MAGIC 0x41545452U
 #define K32_MAX_PROCESS_ATTRIBUTES 16
@@ -2418,9 +2334,11 @@ void WINAPI DeleteProcThreadAttributeList(PVOID list)
 static BOOL process_retain_inherited_handles(PVOID startup_info, DWORD flags,
                                              BOOL inherit_handles,
                                              HANDLE retained[],
-                                             DWORD *retained_count)
+                                             DWORD *retained_count,
+                                             BOOL *inherit_all)
 {
     *retained_count = 0;
+    *inherit_all = inherit_handles;
     if (!(flags & K32_EXTENDED_STARTUPINFO_PRESENT))
         return TRUE;
     if (!startup_info) {
@@ -2457,6 +2375,7 @@ static BOOL process_retain_inherited_handles(PVOID startup_info, DWORD flags,
         K32_PROCESS_ATTRIBUTE *entry = &attributes->entries[i];
         if (entry->attribute != K32_PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
             continue;
+        *inherit_all = FALSE;
         if (!inherit_handles || !entry->value) {
             SetLastError(87);
             goto fail;
@@ -2580,12 +2499,45 @@ BOOL WINAPI AllocConsole(void)
         SetLastError(state ? 5 : 8); /* ACCESS_DENIED / NOT_ENOUGH_MEMORY */
         return FALSE;
     }
-    k32_console_set_defaults(state, TRUE);
+    k32_console_attach_locked(state);
     k32_console_unlock_irqrestore(flags);
 
     win32_refresh_current_console_parameters();
     SetLastError(0);
     return TRUE;
+}
+
+BOOL WINAPI AttachConsole(DWORD dwProcessId)
+{
+    if (!k32_console_ensure_current()) {
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return FALSE;
+    }
+
+    DWORD process_id = GetCurrentProcessId();
+    if (!process_id) process_id = 1;
+    DWORD error = 0;
+    uint64_t flags = k32_console_lock_irqsave();
+    K32_PROCESS_CONSOLE *state = k32_console_find_locked(process_id);
+    if (!state) {
+        error = 8;
+    } else if (state->attached) {
+        error = 5; /* ERROR_ACCESS_DENIED, even for an invalid target */
+    } else {
+        DWORD target_id = dwProcessId == (DWORD)-1
+                        ? state->parent_process_id : dwProcessId;
+        K32_PROCESS_CONSOLE *target = k32_console_find_locked(target_id);
+        if (!target)
+            error = 87; /* ERROR_INVALID_PARAMETER: no live process */
+        else if (!target->attached)
+            error = 6; /* ERROR_INVALID_HANDLE: process has no console */
+        else
+            k32_console_attach_locked(state);
+    }
+    k32_console_unlock_irqrestore(flags);
+    if (!error) win32_refresh_current_console_parameters();
+    SetLastError(error);
+    return error == 0;
 }
 
 BOOL WINAPI FreeConsole(void)
@@ -2657,6 +2609,8 @@ void WINAPI ExitProcess(DWORD uExitCode)
         serial_puthex((uint64_t)__builtin_return_address(0), 16);
         serial_puts("\n");
     }
+    extern void win32_orderly_process_exit(DWORD);
+    win32_orderly_process_exit(uExitCode);
     NtTerminateProcess(NT_CURRENT_PROCESS, (NTSTATUS)uExitCode);
     /* Never returns */
     for (;;) __asm__ volatile("hlt");
@@ -2670,11 +2624,9 @@ HANDLE WINAPI GetCurrentProcess(void)
 HANDLE WINAPI OpenProcess(DWORD desired_access, BOOL inherit_handle,
                           DWORD process_id)
 {
-    (void)inherit_handle;
     HANDLE handle = NULL;
-    extern NTSTATUS nt_process_open(ULONG pid, ACCESS_MASK access,
-                                    PHANDLE out_handle);
-    NTSTATUS status = nt_process_open(process_id, desired_access, &handle);
+    NTSTATUS status = nt_process_open_client(process_id, 0, desired_access,
+                                              inherit_handle, &handle);
     if (!NT_SUCCESS(status)) {
         set_last_error_from_status(status);
         return NULL;
@@ -2750,8 +2702,21 @@ static BOOL WINAPI IsWow64Process2_k32(HANDLE process,
 
 static BOOL WINAPI IsProcessorFeaturePresent_k32(DWORD feature)
 {
-    (void)feature;
-    return FALSE;
+    /* The boot CPU detector and scheduler own the usable SIMD state. A CPU
+     * instruction bit alone is insufficient for AVX: XSAVE must be active.
+     * AVX-512 remains unavailable because XCR0 enables only x87/SSE/AVX. */
+    switch (feature) {
+    case 6:  return cpu_features.sse;    /* PF_XMMI_INSTRUCTIONS_AVAILABLE */
+    case 10: return cpu_features.sse2;   /* PF_XMMI64_INSTRUCTIONS_AVAILABLE */
+    case 13: return cpu_features.sse3;
+    case 17: return cpu_xsave_active != 0; /* PF_XSAVE_ENABLED */
+    case 36: return cpu_features.ssse3;
+    case 37: return cpu_features.sse4_1;
+    case 38: return cpu_features.sse4_2;
+    case 39: return cpu_xsave_active && cpu_features.avx;
+    case 40: return cpu_xsave_active && cpu_features.avx && cpu_features.avx2;
+    default: return FALSE; /* Includes unsupported and unknown feature IDs. */
+    }
 }
 
 DWORD WINAPI GetCurrentProcessId(void)
@@ -3005,10 +2970,10 @@ static DWORD WINAPI GetProcessId_k32(HANDLE process)
         return 0;
     }
     if (process == NT_CURRENT_PROCESS) return GetCurrentProcessId();
-    extern BOOL nt_process_id(HANDLE handle, DWORD *process_id);
     DWORD process_id = 0;
-    if (!nt_process_id(process, &process_id)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+    NTSTATUS status = nt_process_query_identity(process, &process_id, NULL);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
         return 0;
     }
     return process_id;
@@ -3016,17 +2981,18 @@ static DWORD WINAPI GetProcessId_k32(HANDLE process)
 
 static DWORD WINAPI GetThreadId_k32(HANDLE thread)
 {
-    if (thread == NT_CURRENT_THREAD)
+    if (thread == NT_CURRENT_THREAD ||
+        (g_compat32_mode && (ULONG_PTR)thread == 0xfffffffeU))
         return GetCurrentThreadId();
     if (!thread) {
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return 0;
     }
 
-    extern BOOL nt_thread_id(HANDLE handle, DWORD *thread_id);
     DWORD thread_id = 0;
-    if (!nt_thread_id(thread, &thread_id)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+    NTSTATUS status = nt_thread_query_identity(thread, &thread_id, NULL);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
         return 0;
     }
     SetLastError(0);
@@ -3814,21 +3780,28 @@ static PVOID WINAPI VirtualAllocEx_k32(HANDLE process, PVOID address,
                                         SIZE_T size, DWORD allocation_type,
                                         DWORD protect)
 {
-    if (!k32_process_handle_valid(process)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+    PVOID base = address;
+    ULONG_PTR args[6] = {(ULONG_PTR)process, (ULONG_PTR)&base, 0,
+                         (ULONG_PTR)&size, allocation_type, protect};
+    NTSTATUS status = sys_NtAllocateVirtualMemory(args);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
         return NULL;
     }
-    return VirtualAlloc(address, size, allocation_type, protect);
+    return base;
 }
 
 static BOOL WINAPI VirtualFreeEx_k32(HANDLE process, PVOID address,
                                       SIZE_T size, DWORD free_type)
 {
-    if (!k32_process_handle_valid(process)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+    ULONG_PTR args[4] = {(ULONG_PTR)process, (ULONG_PTR)&address,
+                         (ULONG_PTR)&size, free_type};
+    NTSTATUS status = sys_NtFreeVirtualMemory(args);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
         return FALSE;
     }
-    return VirtualFree(address, size, free_type);
+    return TRUE;
 }
 
 static BOOL WINAPI FlushInstructionCache_k32(HANDLE process,
@@ -4227,7 +4200,7 @@ static void heap_lock_release(void)
     __sync_lock_release(&heap_lock);
 }
 
-static BOOL heap_lock_owned_by_current(void)
+BOOL kernel32_heap_lock_owned_by_current(void)
 {
     uint32_t owner = (uint32_t)proc_current_pid() + 1;
     return __atomic_load_n(&heap_lock, __ATOMIC_ACQUIRE) &&
@@ -5715,7 +5688,93 @@ static void angle_gpa_trace_result(PCSTR name, PVOID result,
     serial_puts(")\n");
 }
 
-PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
+#if K32_LOOKUP_FAILURE_TRACE
+static BOOL k32_diagnostic_copy(PVOID output, PCVOID source, SIZE_T size);
+
+static void k32_lookup_trace_text(char **cursor, char *end, PCSTR text)
+{
+    if (!text) text = "<null>";
+    for (SIZE_T i = 0; i < 128 && *cursor < end; i++) {
+        char c;
+        /* Failed lookups may carry invalid pointers. Never add a fault while
+         * collecting diagnostics, including during concurrent unmapping. */
+        if (!k32_diagnostic_copy(&c, text + i, 1)) {
+            *(*cursor)++ = '?';
+            return;
+        }
+        if (!c) return;
+        *(*cursor)++ = c >= 32 && c < 127 ? c : '?';
+    }
+    if (*cursor < end) *(*cursor)++ = '~';
+}
+
+static void k32_lookup_trace_hex(char **cursor, char *end, ULONG_PTR value)
+{
+    static const char digits[] = "0123456789abcdef";
+    k32_lookup_trace_text(cursor, end, "0x");
+    BOOL significant = FALSE;
+    for (int shift = (int)(sizeof(value) * 8) - 4; shift >= 0; shift -= 4) {
+        unsigned digit = (unsigned)((value >> shift) & 15);
+        if (!digit && !significant && shift) continue;
+        significant = TRUE;
+        if (*cursor < end) *(*cursor)++ = digits[digit];
+    }
+}
+
+static void k32_lookup_failure_trace(PCSTR kind, HANDLE module,
+                                     PCSTR dll_name, PCSTR proc_name,
+                                     ULONG_PTR caller)
+{
+    DWORD error = GetLastError();
+    if (!dll_name && module) {
+        LOADED_MODULE *loaded = dll_find_module_by_base((PVOID)module);
+        if (loaded) dll_name = loaded->name;
+    }
+    char line[512], *cursor = line, *end = line + sizeof(line) - 2;
+    k32_lookup_trace_text(&cursor, end, "[K32-LOOKUP-FAIL] kind=");
+    k32_lookup_trace_text(&cursor, end, kind);
+    k32_lookup_trace_text(&cursor, end, " pid=");
+    k32_lookup_trace_hex(&cursor, end, win32_current_process_id());
+    k32_lookup_trace_text(&cursor, end, " tid=");
+    k32_lookup_trace_hex(&cursor, end, GetCurrentThreadId());
+    k32_lookup_trace_text(&cursor, end, " error=");
+    k32_lookup_trace_hex(&cursor, end, error);
+    k32_lookup_trace_text(&cursor, end, " module=");
+    k32_lookup_trace_hex(&cursor, end, (ULONG_PTR)module);
+    k32_lookup_trace_text(&cursor, end, " dll=");
+    k32_lookup_trace_text(&cursor, end, dll_name);
+    if (proc_name) {
+        if ((ULONG_PTR)proc_name <= 0xFFFF) {
+            k32_lookup_trace_text(&cursor, end, " ordinal=");
+            k32_lookup_trace_hex(&cursor, end, (ULONG_PTR)proc_name);
+        } else {
+            k32_lookup_trace_text(&cursor, end, " name=");
+            k32_lookup_trace_text(&cursor, end, proc_name);
+        }
+    }
+    k32_lookup_trace_text(&cursor, end, " caller=");
+    k32_lookup_trace_hex(&cursor, end, caller);
+    *cursor++ = '\n';
+    *cursor = 0;
+    /* One record keeps concurrent callers' fields together. Logging must
+     * preserve the API's last error, including failures that leave it alone. */
+    serial_puts(line);
+    /* Opt-in diagnostic for one verified caller in the application image.
+     * Run while still in the ordinary lookup context, before a fatal hook
+     * can trap or abandon the process. Never turn optional API probes into
+     * unconditional disk writes, and preserve their original last error. */
+    if (K32_LOOKUP_CHECKPOINT_CALLER &&
+        caller == (ULONG_PTR)K32_LOOKUP_CHECKPOINT_CALLER) {
+        extern bool boot_diag_checkpoint(const char *reason);
+        bool saved = boot_diag_checkpoint("win32-lookup-failure");
+        serial_puts(saved ? "[K32-LOOKUP-CHECKPOINT] saved\n"
+                         : "[K32-LOOKUP-CHECKPOINT] unavailable\n");
+    }
+    SetLastError(error);
+}
+#endif
+
+static PVOID WINAPI k32_get_proc_address_impl(HANDLE hModule, PCSTR lpProcName)
 {
     if (!lpProcName) return NULL;
     ULONG_PTR proc_value = (ULONG_PTR)lpProcName;
@@ -5725,6 +5784,13 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
     BOOL trace_angle_request = FALSE;
     LOADED_MODULE *loaded_module = hModule
         ? dll_find_module_by_base((PVOID)hModule) : NULL;
+
+    if (loaded_module && loaded_module->published_exports) {
+        PVOID fn = dll_resolve_export(loaded_module, proc_name, ordinal,
+                                      by_ordinal);
+        if (!fn) SetLastError(127); /* ERROR_PROC_NOT_FOUND */
+        return fn;
+    }
 
     /* If hModule is a loaded PE module, search its exports */
     if (loaded_module && loaded_module->synthetic_shim) {
@@ -5866,6 +5932,17 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
     if (trace_angle_request)
         angle_gpa_trace_result(proc_name, result,
                                result ? "global" : "missing");
+    return result;
+}
+
+PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
+{
+    PVOID result = k32_get_proc_address_impl(hModule, lpProcName);
+#if K32_LOOKUP_FAILURE_TRACE
+    if (!result)
+        k32_lookup_failure_trace("proc", hModule, NULL, lpProcName,
+                                 (ULONG_PTR)__builtin_return_address(0));
+#endif
     return result;
 }
 
@@ -6298,8 +6375,8 @@ static BOOL copy_file_common_a(PCSTR lpExistingFileName,
     }
 
     char source_path[260], destination_path[260];
-    if (!win32_normalize_path(lpExistingFileName, source_path) ||
-        !win32_normalize_path(lpNewFileName, destination_path)) {
+    if (!win32_resolve_file_path(lpExistingFileName, source_path) ||
+        !win32_resolve_file_path(lpNewFileName, destination_path)) {
         error = 206; /* ERROR_FILENAME_EXCED_RANGE */
         goto done;
     }
@@ -6394,6 +6471,19 @@ done:
 
     g_last_error = ok ? 0 : error ? error : 5;
     sync_last_error();
+    /* Retain failures after the initial copy sample. Installers may replace
+     * this last error while formatting their own diagnostic message. */
+    if (!ok && !trace) {
+        serial_puts("[K32-COPY-FAIL] '");
+        serial_puts(lpExistingFileName ? lpExistingFileName : "<null>");
+        serial_puts("' -> '");
+        serial_puts(lpNewFileName ? lpNewFileName : "<null>");
+        serial_puts("' bytes=");
+        serial_putdec(copied);
+        serial_puts(" error=");
+        serial_putdec(g_last_error);
+        serial_puts("\n");
+    }
     if (trace) {
         serial_puts(" result=");
         serial_putdec(ok);
@@ -6480,7 +6570,7 @@ static BOOL delete_osfs_file(PCSTR path)
     }
 
     char fs_path[260];
-    if (!win32_normalize_path(path, fs_path)) {
+    if (!win32_resolve_file_path(path, fs_path)) {
         g_last_error = 206; /* ERROR_FILENAME_EXCED_RANGE */
         sync_last_error();
         return FALSE;
@@ -6489,7 +6579,7 @@ static BOOL delete_osfs_file(PCSTR path)
 
     void *file = osfs2_find_ci(path);
     if (!file) {
-        g_last_error = win32_directory_exists_normalized(path)
+        g_last_error = win32_directory_exists_normalized(fs_path)
             ? 5 /* ERROR_ACCESS_DENIED */
             : 2 /* ERROR_FILE_NOT_FOUND */;
         sync_last_error();
@@ -6519,6 +6609,7 @@ static BOOL delete_osfs_file(PCSTR path)
     }
     stored_name[i] = 0;
 
+    nt_section_cache_drop_file(file);
     int result = osfs2_delete(stored_name);
     g_last_error = result == 0 ? 0 : result == -2 ? 32 : 5;
     sync_last_error();
@@ -6754,8 +6845,8 @@ static BOOL move_osfs_file(PCSTR old_path, PCSTR new_path, bool replace)
     }
 
     char old_name[260], new_name[260];
-    if (!win32_normalize_path(old_path, old_name) ||
-        !win32_normalize_path(new_path, new_name)) {
+    if (!win32_resolve_file_path(old_path, old_name) ||
+        !win32_resolve_file_path(new_path, new_name)) {
         g_last_error = 206; /* ERROR_FILENAME_EXCED_RANGE */
         sync_last_error();
         if (trace) serial_puts(" result=-1 error=206\n");
@@ -6828,7 +6919,25 @@ BOOL WINAPI MoveFileW(PCWSTR lpExistingFileName, PCWSTR lpNewFileName)
     return move_osfs_file_w(lpExistingFileName, lpNewFileName, false);
 }
 
-static BOOL WINAPI MoveFileExW_k32(PCWSTR existing_name, PCWSTR new_name,
+BOOL WINAPI MoveFileExA_k32(PCSTR existing_name, PCSTR new_name,
+                                    DWORD flags)
+{
+    if (flags & ~0x3FU || ((flags & 4) && (flags & 2))) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    if (flags & 4) {
+        /* No persistent rename queue is processed at boot yet. */
+        SetLastError(120); /* ERROR_CALL_NOT_IMPLEMENTED */
+        return FALSE;
+    }
+    /* OsitoFS has one mounted namespace and commits rename metadata before
+     * returning. COPY_ALLOWED and WRITE_THROUGH need no extra copy here. */
+    return move_osfs_file(existing_name, new_name,
+                          (flags & 1) != 0); /* MOVEFILE_REPLACE_EXISTING */
+}
+
+BOOL WINAPI MoveFileExW_k32(PCWSTR existing_name, PCWSTR new_name,
                                     DWORD flags)
 {
     return move_osfs_file_w(existing_name, new_name,
@@ -6996,11 +7105,15 @@ static BOOL WINAPI VirtualProtectEx_k32(HANDLE process, PVOID address,
                                          SIZE_T size, DWORD new_protect,
                                          DWORD *old_protect)
 {
-    if (!k32_process_handle_valid(process)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+    if (!old_protect) { SetLastError(87); return FALSE; }
+    ULONG_PTR args[5] = {(ULONG_PTR)process, (ULONG_PTR)&address,
+                         (ULONG_PTR)&size, new_protect, (ULONG_PTR)old_protect};
+    NTSTATUS status = sys_NtProtectVirtualMemory(args);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
         return FALSE;
     }
-    return VirtualProtect(address, size, new_protect, old_protect);
+    return TRUE;
 }
 
 /* ── Memory query ──────────────────────────────────────────── */
@@ -7056,11 +7169,30 @@ SIZE_T WINAPI VirtualQuery(PVOID lpAddress, PVOID lpBuffer, SIZE_T dwLength)
 static SIZE_T WINAPI VirtualQueryEx_k32(HANDLE process, PVOID address,
                                          PVOID buffer, SIZE_T length)
 {
-    if (!k32_process_handle_valid(process)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+    SIZE_T required = g_compat32_mode ? sizeof(MEMORY_BASIC_INFORMATION32_K32)
+                                     : sizeof(MEMORY_BASIC_INFORMATION_K32);
+    if (!buffer || length < required) { SetLastError(87); return 0; }
+    MEMORY_BASIC_INFORMATION_K32 info = {0};
+    ULONG_PTR args[6] = {(ULONG_PTR)process, (ULONG_PTR)address, 0,
+                         (ULONG_PTR)&info, sizeof(info), 0};
+    NTSTATUS status = sys_NtQueryVirtualMemory(args);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
         return 0;
     }
-    return VirtualQuery(address, buffer, length);
+    if (g_compat32_mode) {
+        MEMORY_BASIC_INFORMATION32_K32 *out = buffer;
+        out->BaseAddress = (uint32_t)(ULONG_PTR)info.BaseAddress;
+        out->AllocationBase = (uint32_t)(ULONG_PTR)info.AllocationBase;
+        out->AllocationProtect = info.AllocationProtect;
+        out->RegionSize = info.RegionSize > UINT32_MAX ? UINT32_MAX : info.RegionSize;
+        out->State = info.State;
+        out->Protect = info.Protect;
+        out->Type = info.Type;
+    } else {
+        *(MEMORY_BASIC_INFORMATION_K32 *)buffer = info;
+    }
+    return required;
 }
 
 /* ── String API (commonly needed by CRT) ────────────────────── */
@@ -7116,6 +7248,66 @@ static PWSTR WINAPI lstrcatW_k32(PWSTR dst, PCWSTR src)
     while (*end) end++;
     lstrcpyW_k32(end, src);
     return dst;
+}
+
+static PSTR WINAPI lstrcatA_k32(PSTR dst, PCSTR src)
+{
+    if (!dst) return NULL;
+    PSTR end = dst;
+    while (*end) end++;
+    lstrcpyA_k32(end, src);
+    return dst;
+}
+
+static PSTR WINAPI lstrcpynA_k32(PSTR dst, PCSTR src, int capacity)
+{
+    if (!dst || capacity <= 0) return dst;
+    int i = 0;
+    if (src)
+        while (i < capacity - 1 && src[i]) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+    return dst;
+}
+
+static int WINAPI lstrcmpA_k32(PCSTR a, PCSTR b)
+{
+    extern int WINAPI CompareStringA(DWORD, DWORD, PCSTR, int, PCSTR, int);
+    if (!a || !b) return a ? 1 : b ? -1 : 0;
+    return CompareStringA(0x0400, 0, a, -1, b, -1) - 2;
+}
+
+static int WINAPI _lopen_k32(PCSTR path, int mode)
+{
+    DWORD access, sharing;
+    switch (mode & 3) {
+    case 0: access = GENERIC_READ; break;
+    case 1: access = GENERIC_WRITE; break;
+    case 2: access = GENERIC_READ | GENERIC_WRITE; break;
+    default: SetLastError(87); return -1;
+    }
+    switch (mode & 0x70) {
+    case 0: case 0x40: sharing = FILE_SHARE_READ | FILE_SHARE_WRITE; break;
+    case 0x10: sharing = 0; break;
+    case 0x20: sharing = FILE_SHARE_READ; break;
+    case 0x30: sharing = FILE_SHARE_WRITE; break;
+    default: SetLastError(87); return -1;
+    }
+    HANDLE file = CreateFileA(path, access, sharing, NULL, 3 /* OPEN_EXISTING */,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    return file == INVALID_HANDLE_VALUE ? -1 : (int)(ULONG_PTR)file;
+}
+
+static LONG WINAPI _llseek_k32(int file, LONG offset, int origin)
+{
+    return (LONG)SetFilePointer((HANDLE)(LONG_PTR)file, offset, NULL,
+                                (DWORD)origin);
+}
+
+static int WINAPI _lclose_k32(int file)
+{
+    /* The Win32 pseudo-process handle is accepted by this legacy API. */
+    if (file == -1) return 0;
+    return CloseHandle((HANDLE)(LONG_PTR)file) ? 0 : -1;
 }
 
 static int WINAPI lstrcmpW_k32(PCWSTR a, PCWSTR b)
@@ -7373,6 +7565,12 @@ void WINAPI EnterCriticalSection(LPCRITICAL_SECTION lpCS)
             *recursion_count = 1;
             return;
         }
+        /* A guest lock can remain owned by a primary thread already doing
+         * process teardown. Retire a cancelled contender before waiting for
+         * that owner; teardown itself waits for every worker to stop. The
+         * checkpoint still defers cancellation while host locks are held. */
+        extern void win32_main_termination_checkpoint(void);
+        win32_main_termination_checkpoint();
         DWORD spin_count = critical_spin_count(lpCS);
         for (DWORD spin = 0; spin < (spin_count ? spin_count : 100); spin++) {
             __asm__ volatile ("pause" ::: "memory");
@@ -7443,6 +7641,28 @@ static BOOL srw_try_acquire(PVOID lock)
                                        0, 1) == 0;
 }
 
+/* Bit zero owns the writer; each reader contributes two. Keep the state
+ * pointer-sized for PE64 and DWORD-sized for a PE32 SRWLOCK. */
+static BOOL srw_try_acquire_shared(PVOID lock)
+{
+    if (g_compat32_mode) {
+        volatile uint32_t *state = (volatile uint32_t *)lock;
+        for (;;) {
+            uint32_t old = *state;
+            if ((old & 1U) || old == 0xFFFFFFFEU) return FALSE;
+            if (__sync_val_compare_and_swap(state, old, old + 2U) == old)
+                return TRUE;
+        }
+    }
+    volatile ULONG_PTR *state = (volatile ULONG_PTR *)lock;
+    for (;;) {
+        ULONG_PTR old = *state;
+        if ((old & 1) || old == (ULONG_PTR)-2) return FALSE;
+        if (__sync_val_compare_and_swap(state, old, old + 2) == old)
+            return TRUE;
+    }
+}
+
 static void WINAPI InitializeSRWLock_k32(PVOID lock)
 {
     if (!lock) return;
@@ -7458,6 +7678,8 @@ static void WINAPI AcquireSRWLockExclusive_k32(PVOID lock)
     extern void sched_yield(void);
 
     while (!srw_try_acquire(lock)) {
+        extern void win32_main_termination_checkpoint(void);
+        win32_main_termination_checkpoint();
         for (int spin = 0; spin < 100; spin++)
             __asm__ volatile ("pause" ::: "memory");
         sched_yield();
@@ -7480,17 +7702,29 @@ static void WINAPI ReleaseSRWLockExclusive_k32(PVOID lock)
 
 static void WINAPI AcquireSRWLockShared_k32(PVOID lock)
 {
-    AcquireSRWLockExclusive_k32(lock);
+    if (!lock) return;
+    extern void sched_yield(void);
+    while (!srw_try_acquire_shared(lock)) {
+        extern void win32_main_termination_checkpoint(void);
+        win32_main_termination_checkpoint();
+        for (int spin = 0; spin < 100; spin++)
+            __asm__ volatile ("pause" ::: "memory");
+        sched_yield();
+    }
 }
 
 static BOOL WINAPI TryAcquireSRWLockShared_k32(PVOID lock)
 {
-    return TryAcquireSRWLockExclusive_k32(lock);
+    return lock && srw_try_acquire_shared(lock);
 }
 
 static void WINAPI ReleaseSRWLockShared_k32(PVOID lock)
 {
-    ReleaseSRWLockExclusive_k32(lock);
+    if (!lock) return;
+    if (g_compat32_mode)
+        __sync_sub_and_fetch((volatile uint32_t *)lock, 2U);
+    else
+        __sync_sub_and_fetch((volatile ULONG_PTR *)lock, 2);
 }
 
 static void WINAPI InitializeConditionVariable_k32(PVOID condition)
@@ -7515,8 +7749,7 @@ static BOOL WINAPI SleepConditionVariableSRW_k32(PVOID condition, PVOID lock,
                                                    DWORD milliseconds,
                                                    ULONG flags)
 {
-    /* ponytail: shared SRW waits need shared-lock support when first used. */
-    if (!condition || !lock || flags != 0) {
+    if (!condition || !lock || (flags & ~1U)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
@@ -7525,19 +7758,23 @@ static BOOL WINAPI SleepConditionVariableSRW_k32(PVOID condition, PVOID lock,
         ? *(volatile uint32_t *)condition
         : *(volatile ULONG_PTR *)condition;
     DWORD start = GetTickCount();
+    BOOL shared = (flags & 1U) != 0;
 
-    ReleaseSRWLockExclusive_k32(lock);
+    if (shared) ReleaseSRWLockShared_k32(lock);
+    else ReleaseSRWLockExclusive_k32(lock);
     while ((g_compat32_mode ? *(volatile uint32_t *)condition
                             : *(volatile ULONG_PTR *)condition) == generation) {
         if (milliseconds != 0xFFFFFFFFU &&
             (DWORD)(GetTickCount() - start) >= milliseconds) {
-            AcquireSRWLockExclusive_k32(lock);
+            if (shared) AcquireSRWLockShared_k32(lock);
+            else AcquireSRWLockExclusive_k32(lock);
             SetLastError(1460); /* ERROR_TIMEOUT */
             return FALSE;
         }
         Sleep(milliseconds == 0 ? 0 : 1);
     }
-    AcquireSRWLockExclusive_k32(lock);
+    if (shared) AcquireSRWLockShared_k32(lock);
+    else AcquireSRWLockExclusive_k32(lock);
     return TRUE;
 }
 
@@ -8585,8 +8822,8 @@ static BOOL win32_tls_attach_thread(void)
 {
     uint32_t *vector = tls_current_vector32();
     DWORD owner_pid = win32_current_process_id();
-    extern uint32_t compat32_callback_args(uint32_t, int, const uint32_t *);
     if (!vector || !owner_pid) return FALSE;
+    dll_loader_lock_enter();
 
     for (int i = 0; i < static_tls_module_count; i++) {
         static_tls_module_t *mod = &static_tls_modules[i];
@@ -8594,21 +8831,14 @@ static BOOL win32_tls_attach_thread(void)
         uint8_t *block = win32_tls_alloc_block(mod);
         if (!block) {
             tls_free_static_vector(vector, owner_pid);
+            dll_loader_lock_leave();
             return FALSE;
         }
         vector[mod->index] = (uint32_t)(ULONG_PTR)block;
     }
 
-    for (int i = 0; i < static_tls_module_count; i++) {
-        static_tls_module_t *mod = &static_tls_modules[i];
-        if (mod->owner_pid != owner_pid) continue;
-        for (uint32_t j = 0; j < mod->callback_count; j++) {
-            uint32_t callback = *(uint32_t *)(ULONG_PTR)
-                (mod->callbacks_addr + j * sizeof(uint32_t));
-            uint32_t args[3] = { mod->image_base, DLL_THREAD_ATTACH, 0 };
-            compat32_callback_args(callback, 3, args);
-        }
-    }
+    dll_notify_thread(DLL_THREAD_ATTACH);
+    dll_loader_lock_leave();
     return TRUE;
 }
 
@@ -8616,19 +8846,11 @@ static void win32_tls_detach_thread(void)
 {
     uint32_t *vector = tls_current_vector32();
     DWORD owner_pid = win32_current_process_id();
-    extern uint32_t compat32_callback_args(uint32_t, int, const uint32_t *);
     if (!vector || !owner_pid) return;
-
-    for (int i = static_tls_module_count - 1; i >= 0; i--) {
-        static_tls_module_t *mod = &static_tls_modules[i];
-        if (mod->owner_pid != owner_pid) continue;
-        for (uint32_t j = 0; j < mod->callback_count; j++) {
-            uint32_t callback = *(uint32_t *)(ULONG_PTR)
-                (mod->callbacks_addr + j * sizeof(uint32_t));
-            uint32_t args[3] = { mod->image_base, DLL_THREAD_DETACH, 0 };
-            compat32_callback_args(callback, 3, args);
-        }
-    }
+    dll_loader_lock_enter();
+    dll_notify_thread(DLL_THREAD_DETACH);
+    dll_loader_lock_leave();
+    wsock_cancel_thread_sends(owner_pid, GetCurrentThreadId());
     tls_free_static_vector(vector, owner_pid);
 }
 
@@ -8646,7 +8868,6 @@ static void win32_tls_detach_thread(void)
  *     We link it to the kernel PID so WaitForSingleObject works.
  */
 
-static DWORD g_thread_id_counter = 1;
 
 extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs,
                                         const uint32_t *args);
@@ -8727,8 +8948,10 @@ typedef struct {
     HANDLE          handle;        /* handle into g_handle_table */
     PVOID           thread_object; /* stable identity across handle reuse */
     volatile int    terminated;    /* 1 = thread function returned */
-    volatile int    reclaim_pending;
-    volatile int    exit_jmp_ready; /* PE64 ExitThread may unwind safely */
+    volatile int    reclaim_pending; /* 1 scheduler reap, 2 process VM release */
+    volatile int    exit_jmp_ready; /* ExitThread may unwind to the host stack */
+    volatile int    cancel_state;   /* 0 none, 1 requested, 2 delivered */
+    DWORD           cancel_code;
     DWORD           exit_code;
     uint64_t        exit_jmpbuf[9]; /* scheduler-stack continuation */
     int             kernel_pid;    /* kernel PID from sched_spawn */
@@ -8750,10 +8973,16 @@ typedef struct {
     WCHAR           description[64];
 } win32_thread_ctx_t;
 
+typedef struct {
+    int kernel_pid;
+    win32_thread_ctx_t *context;
+} win32_thread_lookup_t;
+
 static win32_thread_ctx_t *g_win32_threads;
 static volatile BYTE *g_win32_thread_slot_reserved;
-static win32_thread_ctx_t **g_win32_threads_by_sched_slot;
+static win32_thread_lookup_t *g_win32_threads_by_sched_slot;
 static int g_win32_thread_capacity;
+static volatile unsigned g_win32_process_stops;
 static int g_win32_thread_sched_capacity;
 static volatile uint32_t g_win32_thread_table_state;
 static spinlock_t g_win32_thread_stack_lock = SPINLOCK_INIT;
@@ -8821,7 +9050,7 @@ static BOOL win32_thread_table_ensure(void)
         g_win32_threads = contexts;
         g_win32_thread_slot_reserved = reserved;
         g_win32_thread_capacity = (int)capacity;
-        g_win32_threads_by_sched_slot = (win32_thread_ctx_t **)kcalloc(
+        g_win32_threads_by_sched_slot = (win32_thread_lookup_t *)kcalloc(
             scheduler_capacity, sizeof(*g_win32_threads_by_sched_slot));
         g_win32_thread_sched_capacity = g_win32_threads_by_sched_slot
             ? (int)scheduler_capacity : 0;
@@ -8945,21 +9174,44 @@ static void win64_tls_free_block(PVOID block, SIZE_T size)
         mem_free_pages((void *)VIRT_TO_PHYS(block), pages);
 }
 
-static void win64_tls_free_vector_locked(DWORD owner_pid, PVOID *vector)
+static void win64_tls_free_vector_locked(DWORD owner_pid, uint64_t owner_cr3,
+                                          PVOID *vector)
 {
     if (!vector) return;
+    uint64_t current_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(current_cr3));
+    if (!owner_cr3) owner_cr3 = current_cr3;
     for (int i = 0; i < static_tls64_module_count; i++) {
         static_tls64_module_t *mod = &static_tls64_modules[i];
-        if (mod->owner_pid != owner_pid || !vector[mod->index]) continue;
-        win64_tls_free_block(vector[mod->index], mod->total_size);
-        vector[mod->index] = NULL;
+        if (mod->owner_pid != owner_pid) continue;
+        PVOID block = NULL;
+        PVOID empty = NULL;
+        uint64_t slot = (uint64_t)(ULONG_PTR)(vector + mod->index);
+        /* The reaper and TerminateThread caller need not share the target's
+         * CR3. Its scheduler task keeps that address space alive until reap.
+         * Clear the target slot before releasing its backing, without ever
+         * dereferencing its private TLS vector in the caller's address space. */
+        if (paging_copy_between_cr3(current_cr3, (uint64_t)(ULONG_PTR)&block,
+                                    owner_cr3, slot, sizeof(block), NULL) < 0 ||
+            (block && paging_copy_between_cr3(
+                owner_cr3, slot, current_cr3, (uint64_t)(ULONG_PTR)&empty,
+                sizeof(empty), NULL) < 0)) {
+            serial_puts("[K32-TLS] inaccessible vector slot owner=");
+            serial_putdec(owner_pid);
+            serial_puts(" va=0x");
+            serial_puthex(slot, 16);
+            serial_puts("\n");
+            continue;
+        }
+        win64_tls_free_block(block, mod->total_size);
     }
 }
 
-static void win64_tls_free_vector(DWORD owner_pid, PVOID *vector)
+static void win64_tls_free_vector(DWORD owner_pid, uint64_t owner_cr3,
+                                   PVOID *vector)
 {
     static_tls64_lock_acquire();
-    win64_tls_free_vector_locked(owner_pid, vector);
+    win64_tls_free_vector_locked(owner_pid, owner_cr3, vector);
     static_tls64_lock_release();
 }
 
@@ -9003,9 +9255,7 @@ static BOOL win64_tls_attach_thread(win32_thread_ctx_t *ctx)
 {
     if (!ctx || !ctx->tls_vector64) return FALSE;
     DWORD owner_pid = ctx->owner_pid;
-    static_tls64_module_t attached[MAX_STATIC_TLS64_MODULES];
-    int attached_count = 0;
-
+    dll_loader_lock_enter();
     static_tls64_lock_acquire();
     for (int i = 0; i < static_tls64_module_count; i++) {
         static_tls64_module_t *mod = &static_tls64_modules[i];
@@ -9013,27 +9263,17 @@ static BOOL win64_tls_attach_thread(win32_thread_ctx_t *ctx)
             continue;
         ctx->tls_vector64[mod->index] = win64_tls_alloc_block(mod);
         if (!ctx->tls_vector64[mod->index]) {
-            win64_tls_free_vector_locked(owner_pid, ctx->tls_vector64);
+            win64_tls_free_vector_locked(owner_pid, ctx->owner_cr3,
+                                         ctx->tls_vector64);
             static_tls64_lock_release();
+            dll_loader_lock_leave();
             return FALSE;
         }
     }
 
-    for (int i = 0; i < static_tls64_module_count; i++) {
-        static_tls64_module_t *mod = &static_tls64_modules[i];
-        if (mod->owner_pid == owner_pid)
-            attached[attached_count++] = *mod;
-    }
     static_tls64_lock_release();
-
-    typedef void (WINAPI *tls_callback_fn)(PVOID, DWORD, PVOID);
-    for (int i = 0; i < attached_count; i++) {
-        static_tls64_module_t *mod = &attached[i];
-        uint64_t *callbacks = (uint64_t *)mod->callbacks_addr;
-        for (DWORD j = 0; j < mod->callback_count; j++)
-            ((tls_callback_fn)(ULONG_PTR)callbacks[j])(
-                mod->image_base, DLL_THREAD_ATTACH, NULL);
-    }
+    dll_notify_thread(DLL_THREAD_ATTACH);
+    dll_loader_lock_leave();
     return TRUE;
 }
 
@@ -9041,27 +9281,9 @@ static void win64_tls_detach_thread(win32_thread_ctx_t *ctx, BOOL callbacks)
 {
     if (!ctx || !ctx->tls_vector64) return;
     DWORD owner_pid = ctx->owner_pid;
-    static_tls64_module_t attached[MAX_STATIC_TLS64_MODULES];
-    int attached_count = 0;
-
-    static_tls64_lock_acquire();
-    for (int i = 0; i < static_tls64_module_count; i++) {
-        if (static_tls64_modules[i].owner_pid == owner_pid)
-            attached[attached_count++] = static_tls64_modules[i];
-    }
-    static_tls64_lock_release();
-
-    if (callbacks) {
-        typedef void (WINAPI *tls_callback_fn)(PVOID, DWORD, PVOID);
-        for (int i = attached_count - 1; i >= 0; i--) {
-            static_tls64_module_t mod = attached[i];
-            uint64_t *entries = (uint64_t *)mod.callbacks_addr;
-            for (DWORD j = 0; j < mod.callback_count; j++)
-                ((tls_callback_fn)(ULONG_PTR)entries[j])(
-                    mod.image_base, DLL_THREAD_DETACH, NULL);
-        }
-    }
-    win64_tls_free_vector(owner_pid, ctx->tls_vector64);
+    if (callbacks) dll_notify_thread(DLL_THREAD_DETACH);
+    wsock_cancel_thread_sends(owner_pid, ctx->tid);
+    win64_tls_free_vector(owner_pid, ctx->owner_cr3, ctx->tls_vector64);
 }
 
 DWORD win64_tls_alloc_static_index(void)
@@ -9164,6 +9386,89 @@ BOOL win64_tls_register_static(DWORD index, PVOID image_base, PVOID raw_start,
     static_tls64_lock_release();
 
     return TRUE;
+}
+
+/* Caller retains the image under its process loader lock. TLS process detach
+ * precedes DllMain and uses a NULL reserved argument, also at normal shutdown.
+ * Snapshot callback addresses before entering guest code. */
+void win32_tls_notify_image(PVOID image_base, BOOL compat32, DWORD reason)
+{
+    DWORD owner=win32_current_process_id(),count=0;
+    ULONG_PTR entries[64];
+    if (!image_base || !owner) return;
+    if (compat32) {
+        for (int i=0;i<static_tls_module_count;i++) {
+            const static_tls_module_t *mod=&static_tls_modules[i];
+            if (mod->owner_pid!=owner || mod->image_base!=(uint32_t)(ULONG_PTR)image_base) continue;
+            count=mod->callback_count;
+            if (count>64) return;
+            for (DWORD j=0;j<count;j++) entries[j]=((DWORD *)(ULONG_PTR)mod->callbacks_addr)[j];
+            break;
+        }
+    } else {
+        static_tls64_lock_acquire();
+        for (int i=0;i<static_tls64_module_count;i++) {
+            const static_tls64_module_t *mod=&static_tls64_modules[i];
+            if (mod->owner_pid!=owner || mod->image_base!=image_base) continue;
+            count=mod->callback_count;
+            if (count>64) {static_tls64_lock_release();return;}
+            for (DWORD j=0;j<count;j++) entries[j]=((ULONG_PTR *)mod->callbacks_addr)[j];
+            break;
+        }
+        static_tls64_lock_release();
+    }
+    for (DWORD i=0;i<count;i++) {
+        if (compat32) {
+            uint32_t args[3]={(uint32_t)(ULONG_PTR)image_base,reason,0};
+            compat32_callback_args((uint32_t)entries[i],3,args);
+        } else {
+            typedef void (WINAPI *tls_fn)(PVOID,DWORD,PVOID);
+            ((tls_fn)entries[i])(image_base,reason,NULL);
+        }
+    }
+}
+
+void win32_tls_process_detach_image(PVOID image_base, BOOL compat32)
+{
+    win32_tls_notify_image(image_base, compat32, DLL_PROCESS_DETACH);
+}
+
+/* Called with the process loader lock held, after DllMain's final callback
+ * and before its image is unmapped. Remove descriptors as well as blocks:
+ * a later CreateThread must never call into an unloaded PE32 image. */
+void win32_tls_unregister_image(PVOID image_base)
+{
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid || !image_base) return;
+    uint32_t *current = tls_current_vector32();
+
+    for (int i = 0; i < static_tls_module_count;) {
+        static_tls_module_t mod = static_tls_modules[i];
+        if (mod.owner_pid != owner_pid ||
+            mod.image_base != (uint32_t)(ULONG_PTR)image_base) {
+            i++;
+            continue;
+        }
+        if (current && current[mod.index]) {
+            (void)nt_vm_release_allocation_for_process(
+                owner_pid, (void *)(ULONG_PTR)current[mod.index]);
+            current[mod.index] = 0;
+        }
+        for (int j = 0; j < g_win32_thread_capacity; j++) {
+            win32_thread_ctx_t *ctx = &g_win32_threads[j];
+            if (!ctx->compat32 || ctx->owner_pid != owner_pid ||
+                !ctx->tls_vector || ctx->tls_vector == current ||
+                !ctx->tls_vector[mod.index])
+                continue;
+            (void)nt_vm_release_allocation_for_process(
+                owner_pid, (void *)(ULONG_PTR)ctx->tls_vector[mod.index]);
+            ctx->tls_vector[mod.index] = 0;
+        }
+        for (int j = i + 1; j < static_tls_module_count; j++)
+            static_tls_modules[j - 1] = static_tls_modules[j];
+        static_tls_module_count--;
+        TlsFree(mod.index);
+    }
 }
 
 void win64_tls_unregister_image(PVOID image_base)
@@ -9352,20 +9657,30 @@ static void tls_clear_slot_process(DWORD index, DWORD process_id)
 /* Look up context by kernel PID (called from thread entry) */
 static win32_thread_ctx_t *find_ctx_by_pid(int pid)
 {
-    int current_slot = -1;
-    if (g_win32_threads_by_sched_slot && pid == proc_current_pid()) {
+    win32_thread_lookup_t *lookup = NULL;
+    if (g_win32_threads_by_sched_slot && pid > 0 &&
+        pid == proc_current_pid()) {
         extern int sched_current_get(void);
-        current_slot = sched_current_get();
+        int current_slot = sched_current_get();
         if (current_slot >= 0 &&
             current_slot < g_win32_thread_sched_capacity) {
-            win32_thread_ctx_t *ctx = __atomic_load_n(
-                &g_win32_threads_by_sched_slot[current_slot],
-                __ATOMIC_ACQUIRE);
-            if (ctx &&
-                __atomic_load_n(&ctx->active, __ATOMIC_ACQUIRE) &&
-                __atomic_load_n(&ctx->kernel_pid,
-                                __ATOMIC_ACQUIRE) == pid)
-                return ctx;
+            lookup = &g_win32_threads_by_sched_slot[current_slot];
+            if (__atomic_load_n(&lookup->kernel_pid,
+                                __ATOMIC_ACQUIRE) == pid) {
+                win32_thread_ctx_t *ctx = __atomic_load_n(
+                    &lookup->context, __ATOMIC_ACQUIRE);
+                /* Primary Win32 threads and native tasks have no entry in
+                 * this table. A worker's context is bound to its new native
+                 * PID before CreateThread makes it runnable, so a current
+                 * task's miss cannot later become a hit for that same PID.
+                 * Checking the PID also invalidates misses on slot reuse. */
+                if (!ctx)
+                    return NULL;
+                if (__atomic_load_n(&ctx->active, __ATOMIC_ACQUIRE) &&
+                    __atomic_load_n(&ctx->kernel_pid,
+                                    __ATOMIC_ACQUIRE) == pid)
+                    return ctx;
+            }
         }
     }
 
@@ -9373,14 +9688,17 @@ static win32_thread_ctx_t *find_ctx_by_pid(int pid)
         if (__atomic_load_n(&g_win32_threads[i].active, __ATOMIC_ACQUIRE) &&
             __atomic_load_n(&g_win32_threads[i].kernel_pid,
                             __ATOMIC_ACQUIRE) == pid) {
-            if (current_slot >= 0 &&
-                current_slot < g_win32_thread_sched_capacity) {
-                __atomic_store_n(
-                    &g_win32_threads_by_sched_slot[current_slot],
-                    &g_win32_threads[i], __ATOMIC_RELEASE);
+            if (lookup) {
+                __atomic_store_n(&lookup->context, &g_win32_threads[i],
+                                 __ATOMIC_RELEASE);
+                __atomic_store_n(&lookup->kernel_pid, pid, __ATOMIC_RELEASE);
             }
             return &g_win32_threads[i];
         }
+    }
+    if (lookup) {
+        __atomic_store_n(&lookup->context, NULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&lookup->kernel_pid, pid, __ATOMIC_RELEASE);
     }
     return NULL;
 }
@@ -9426,15 +9744,6 @@ static win32_thread_ctx_t *find_ctx_by_handle(HANDLE h)
     return NULL;
 }
 
-static win32_thread_ctx_t *find_ctx_by_tid(DWORD tid)
-{
-    for (int i = 0; i < g_win32_thread_capacity; i++) {
-        if (g_win32_threads[i].active && g_win32_threads[i].tid == tid)
-            return &g_win32_threads[i];
-    }
-    return NULL;
-}
-
 /* Allocate a free slot */
 static win32_thread_ctx_t *alloc_thread_ctx(void)
 {
@@ -9470,6 +9779,8 @@ static win32_thread_ctx_t *alloc_thread_ctx(void)
         ctx->terminated = 0;
         ctx->reclaim_pending = 0;
         ctx->exit_jmp_ready = 0;
+        ctx->cancel_state = 0;
+        ctx->cancel_code = 0;
         ctx->exit_code = 0;
         memset(ctx->exit_jmpbuf, 0, sizeof(ctx->exit_jmpbuf));
         ctx->thread_object = NULL;
@@ -9658,11 +9969,9 @@ static void __attribute__((noinline))
 win64_thread_dispatch(win32_thread_ctx_t *ctx)
 {
     if (win64_tls_attach_thread(ctx)) {
-        dll_notify_thread(DLL_THREAD_ATTACH);
         LPTHREAD_START_ROUTINE start =
             (LPTHREAD_START_ROUTINE)(ULONG_PTR)ctx->func_addr;
         ctx->exit_code = start((PVOID)ctx->param);
-        dll_notify_thread(DLL_THREAD_DETACH);
         win64_tls_detach_thread(ctx, TRUE);
     } else {
         serial_puts("[K32-THREAD] PE64 TLS attach failed\n");
@@ -9709,6 +10018,8 @@ static void win32_thread_entry_common(void)
 
     /* If created suspended, spin until resumed */
     while (ctx->suspended) {
+        extern void win32_main_termination_checkpoint(void);
+        win32_main_termination_checkpoint();
         sched_yield();
     }
 
@@ -9722,9 +10033,7 @@ static void win32_thread_entry_common(void)
     serial_puts("\n");
 #endif
 
-    int exit_jump = 0;
-    if (!ctx->compat32)
-        exit_jump = kern_setjmp(ctx->exit_jmpbuf);
+    int exit_jump = kern_setjmp(ctx->exit_jmpbuf);
 
     /* kern_longjmp restores the scheduler stack saved above. Reacquire the
      * context instead of relying on optimized locals across returns_twice. */
@@ -9734,26 +10043,37 @@ static void win32_thread_entry_common(void)
         return;
     }
 
-    if (!ctx->compat32 && exit_jump != 0) {
+    if (exit_jump != 0) {
         __atomic_store_n(&ctx->exit_jmp_ready, 0, __ATOMIC_RELEASE);
+        if (ctx->compat32) {
+            /* ExitThread bypassed the INT2E/callback epilogue. The saved
+             * scheduler stack is live now, so reset the gate before freeing
+             * callback stacks, TLS and the guest execution stack. */
+#ifndef TEST_HARNESS
+            extern void sched_reset_current_compat_ist1(void);
+            sched_reset_current_compat_ist1();
+#endif
+            compat32_release_thread_state();
+            win32_thread_release_tls32_environment(ctx);
+        }
 #ifndef OK_QUIET
         serial_puts("[K32-THREAD] ExitThread unwound TID=");
         serial_putdec(ctx->tid);
         serial_puts("\n");
 #endif
     } else if (ctx->compat32) {
+        __atomic_store_n(&ctx->exit_jmp_ready, 1, __ATOMIC_RELEASE);
         compat32_setup_teb(ctx->teb);
         if (win32_tls_attach_thread()) {
-            dll_notify_thread(DLL_THREAD_ATTACH);
             uint32_t arg = (uint32_t)ctx->param;
             ctx->exit_code = compat32_thread_entry_on_stack(
                 (uint32_t)ctx->func_addr, 1, &arg,
                 (uint32_t)(ULONG_PTR)((BYTE *)ctx->stack_base - 64));
-            dll_notify_thread(DLL_THREAD_DETACH);
             win32_tls_detach_thread();
         } else {
             serial_puts("[K32-THREAD] static TLS attach failed\n");
         }
+        __atomic_store_n(&ctx->exit_jmp_ready, 0, __ATOMIC_RELEASE);
         compat32_release_thread_state();
         win32_thread_release_tls32_environment(ctx);
     } else {
@@ -9769,6 +10089,8 @@ static void win32_thread_entry_common(void)
 #endif
 
     user32_release_thread(ctx->owner_pid, ctx->tid);
+
+    wsock_cancel_thread_sends(ctx->owner_pid, ctx->tid);
 
     if (!ctx->compat32)
         win64_thread_release_environment(ctx);
@@ -9797,16 +10119,14 @@ static void win32_thread_entry_common(void)
      * kernel process as ZOMBIE when we return, which is correct. */
 }
 
-HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
+static HANDLE create_thread_impl(PVOID lpThreadAttributes, SIZE_T dwStackSize,
                            LPTHREAD_START_ROUTINE lpStartAddress,
                            PVOID lpParameter, DWORD dwCreationFlags,
                            DWORD *lpThreadId)
 {
     (void)lpThreadAttributes;
 
-    DWORD tid = __atomic_add_fetch(&g_thread_id_counter, 1,
-                                   __ATOMIC_RELAXED);
-    if (lpThreadId) *lpThreadId = tid;
+    DWORD tid = 0;
 
     BOOL compat32 = g_compat32_mode;
 #ifndef OK_QUIET
@@ -9968,15 +10288,18 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
 
     status = sys_NtCreateThread(nt_args);
     if (!NT_SUCCESS(status)) {
-#ifdef OK_QUIET
-        serial_puts("[K32] CreateThread: NT object allocation failed; using TID handle\n");
-#else
-        serial_puts(" (NT thread alloc failed, continuing with TID handle)\n");
-#endif
-        /* Fall back to using the TID as a pseudo-handle */
-        thread_handle = (HANDLE)(ULONG_PTR)tid;
+        win32_thread_release_tls32_environment(ctx);
+        win64_thread_release_environment(ctx);
+        win32_thread_release_stack(ctx);
+        __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
+        set_last_error_from_status(status);
+        return NULL;
     }
 
+    tid = (DWORD)(ULONG_PTR)client_id.UniqueThread;
+    ctx->tid = tid;
+    if (ctx->teb) ctx->teb->ClientId_UniqueThread = tid;
+    if (ctx->teb64) ctx->teb64->ClientId.UniqueThread = client_id.UniqueThread;
     ctx->handle = thread_handle;
     HANDLE_ENTRY *thread_entry = handle_get_entry(&g_handle_table, thread_handle);
     ctx->thread_object = thread_entry && thread_entry->type == OBJ_TYPE_THREAD
@@ -9996,16 +10319,11 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
 #else
         serial_puts(" FAILED (sched_spawn)\n");
 #endif
-        win32_thread_release_tls32_environment(ctx);
-        win64_thread_release_environment(ctx);
-        win32_thread_release_stack(ctx);
-        __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
-        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
-        sync_last_error();
-        return NULL;
+        goto fail_native_thread;
     }
 
     __atomic_store_n(&ctx->kernel_pid, kpid, __ATOMIC_RELEASE);
+    nt_thread_bind_cpu_accounting(ctx->thread_object, (uint32_t)kpid);
     {
         extern uint64_t proc_get_gs_base(void);
         extern void proc_set_gs_base_pid(int pid, uint64_t addr);
@@ -10021,25 +10339,13 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
 #else
         serial_puts(" FAILED (IST1 allocation)\n");
 #endif
-        win32_thread_release_tls32_environment(ctx);
-        win64_thread_release_environment(ctx);
-        win32_thread_release_stack(ctx);
-        __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
-        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
-        sync_last_error();
-        return NULL;
+        goto fail_native_thread;
     }
     if (!ctx->suspended && proc_wake_pid(kpid) < 0) {
         extern int proc_kill_pid(int pid);
         proc_kill_pid(kpid);
-        win32_thread_release_tls32_environment(ctx);
-        win64_thread_release_environment(ctx);
-        win32_thread_release_stack(ctx);
-        __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
-        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
-        sync_last_error();
         serial_puts("[K32] CreateThread FAILED (sched wake)\n");
-        return NULL;
+        goto fail_native_thread;
     }
 
 #if defined(K32_TRACE_THREAD_CREATE) && K32_TRACE_THREAD_CREATE
@@ -10069,7 +10375,41 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
     serial_puts("\n");
 #endif
 
+    if (lpThreadId) *lpThreadId = tid;
     return thread_handle;
+
+fail_native_thread:
+    {
+        extern void win32_mark_thread_terminated(PVOID object, NTSTATUS status);
+        win32_mark_thread_terminated(ctx->thread_object, STATUS_NO_MEMORY);
+        CloseHandle(thread_handle);
+        ctx->thread_object = NULL;
+    }
+    win32_thread_release_tls32_environment(ctx);
+    win64_thread_release_environment(ctx);
+    win32_thread_release_stack(ctx);
+    __atomic_store_n(&ctx->active, 0, __ATOMIC_RELEASE);
+    SetLastError(8);
+    return NULL;
+}
+
+HANDLE WINAPI CreateThread(PVOID attributes, SIZE_T stack_size,
+                           LPTHREAD_START_ROUTINE start, PVOID argument,
+                           DWORD flags, DWORD *thread_id)
+{
+    /* Serialize admission with process shutdown and DLL initialization. The
+     * waiter is cancelable; the owner cannot be killed halfway through spawn. */
+    dll_loader_lock_enter();
+    extern BOOL win32_process_creation_closed(void);
+    if (win32_process_creation_closed()) {
+        dll_loader_lock_leave();
+        SetLastError(5); /* ERROR_ACCESS_DENIED, as during Windows shutdown */
+        return NULL;
+    }
+    HANDLE result = create_thread_impl(attributes, stack_size, start, argument,
+                                       flags, thread_id);
+    dll_loader_lock_leave();
+    return result;
 }
 
 static HANDLE WINAPI CreateRemoteThread_k32(
@@ -10250,40 +10590,13 @@ static BOOL WINAPI SwitchToThread_k32(void)
 static HANDLE WINAPI OpenThread_k32(DWORD dwDesiredAccess,
                                     BOOL bInheritHandle, DWORD dwThreadId)
 {
-    win32_thread_ctx_t *ctx = find_ctx_by_tid(dwThreadId);
     HANDLE handle = NULL;
-
-    if (!ctx) {
-        if (dwThreadId == win32_current_process_thread_id()) {
-            extern PVOID nt_process_primary_thread_object(ULONG tid);
-            PVOID object = nt_process_primary_thread_object(dwThreadId);
-            NTSTATUS status = object
-                ? handle_alloc(&g_handle_table, OBJ_TYPE_THREAD,
-                               dwDesiredAccess, object, &handle)
-                : STATUS_INVALID_PARAMETER;
-            if (NT_SUCCESS(status)) return handle;
-            set_last_error_from_status(status);
-            return NULL;
-        }
-        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+    NTSTATUS status = nt_thread_open(0, dwThreadId, dwDesiredAccess,
+                                     bInheritHandle, &handle);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
         return NULL;
     }
-
-    if (ctx->thread_object) {
-        NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_THREAD,
-                                       dwDesiredAccess, ctx->thread_object,
-                                       &handle);
-        if (!NT_SUCCESS(status)) {
-            set_last_error_from_status(status);
-            return NULL;
-        }
-        return handle;
-    }
-
-    if (!DuplicateHandle(GetCurrentProcess(), ctx->handle,
-                         GetCurrentProcess(), &handle, dwDesiredAccess,
-                         bInheritHandle, 0))
-        return NULL;
     return handle;
 }
 
@@ -10298,19 +10611,9 @@ static BOOL WINAPI GetExitCodeThread_k32(HANDLE hThread, DWORD *lpExitCode)
         return TRUE;
     }
 
-    win32_thread_ctx_t *ctx = find_ctx_by_handle(hThread);
-    if (ctx) {
-        *lpExitCode = ctx->terminated ? ctx->exit_code : 259;
-        return TRUE;
-    }
-
-    HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, hThread);
-    extern BOOL nt_process_thread_exit_code(PVOID object, DWORD *exit_code);
-    if (entry && entry->type == OBJ_TYPE_THREAD &&
-        nt_process_thread_exit_code(entry->object, lpExitCode))
-        return TRUE;
-
-    SetLastError(6); /* ERROR_INVALID_HANDLE */
+    NTSTATUS status = nt_thread_query_identity(hThread, NULL, lpExitCode);
+    if (NT_SUCCESS(status)) return TRUE;
+    set_last_error_from_status(status);
     return FALSE;
 }
 
@@ -10432,22 +10735,8 @@ DWORD WINAPI ResumeThread(HANDLE hThread)
     };
     NTSTATUS status = sys_NtResumeThread(args);
     if (!NT_SUCCESS(status)) {
-        /* Preserve the pseudo-handle fallback used when NT thread object
-         * allocation fails after a scheduler context was already reserved. */
-        win32_thread_ctx_t *ctx = find_ctx_by_handle(hThread);
-        if (!ctx) {
-            set_last_error_from_status(status);
-            return (DWORD)-1;
-        }
-        previous_count = ctx->suspended ? 1 : 0;
-        if (previous_count) {
-            ctx->suspended = 0;
-            extern int proc_wake_pid(int pid);
-            if (proc_wake_pid(ctx->kernel_pid) < 0) {
-                SetLastError(6); /* ERROR_INVALID_HANDLE */
-                return (DWORD)-1;
-            }
-        }
+        set_last_error_from_status(status);
+        return (DWORD)-1;
     }
 
 #ifndef OK_QUIET
@@ -10463,6 +10752,7 @@ DWORD WINAPI ResumeThread(HANDLE hThread)
 static void mark_thread_ctx_terminated(win32_thread_ctx_t *ctx,
                                        DWORD exit_code, BOOL release_tls)
 {
+    wsock_cancel_thread_sends(ctx->owner_pid, ctx->tid);
     ctx->exit_code = exit_code;
     ctx->terminated = 1;
     if (ctx->thread_object) {
@@ -10490,9 +10780,20 @@ void win32_kernel_thread_reaped(uint32_t kernel_pid, int exit_code)
         if (ctx->kernel_pid != (int)kernel_pid ||
             (!ctx->active && !ctx->reclaim_pending))
             continue;
+        BOOL cancelled = __atomic_load_n(&ctx->cancel_state,
+                                         __ATOMIC_ACQUIRE) != 0;
         if (ctx->active) {
-            mark_thread_ctx_terminated(ctx, (DWORD)exit_code, TRUE);
+            mark_thread_ctx_terminated(ctx, (DWORD)exit_code, !cancelled);
             user32_release_thread(ctx->owner_pid, ctx->tid);
+        }
+        if (cancelled) {
+            /* A peer can still be leaving a host-locked guest callback.
+             * Forced cancellation skips guest cleanup, so that peer may
+             * retain links into this stack or TLS. Keep the context pinned
+             * until process TLS/VM teardown, after every worker has stopped.
+             * The scheduler task itself is already safe to reclaim. */
+            __atomic_store_n(&ctx->reclaim_pending, 2, __ATOMIC_RELEASE);
+            return;
         }
         win32_thread_release_stack(ctx);
         return;
@@ -10505,6 +10806,18 @@ static BOOL terminate_thread_ctx(win32_thread_ctx_t *ctx, DWORD exit_code)
     extern void *proc_find_ptr(uint16_t pid);
     if (!ctx)
         return FALSE;
+
+    /* MSI/KMT own rollback state on this host stack. Request cancellation
+     * without discarding the stack; its checkpoint runs after rollback and
+     * resource release. Other threads retain the existing termination path. */
+    if (msi_install_deferred_for_kernel_pid(ctx->kernel_pid) ||
+        d3dkmt_deferred_for_kernel_pid(ctx->kernel_pid)) {
+        extern int proc_wake_pid(int pid);
+        ctx->cancel_code = exit_code;
+        __atomic_store_n(&ctx->cancel_state, 1, __ATOMIC_RELEASE);
+        (void)proc_wake_pid(ctx->kernel_pid);
+        return TRUE;
+    }
 
     /* A fault may already have zombified and reaped the scheduler task before
      * its owning PE process performs thread cleanup. In that case the Win32
@@ -10527,32 +10840,105 @@ static BOOL terminate_thread_ctx(win32_thread_ctx_t *ctx, DWORD exit_code)
     return TRUE;
 }
 
-int win32_terminate_process_threads(PPEB owner, DWORD exit_code)
+BOOL kernel32_thread_termination_pending(void)
 {
-    if (!owner) return 0;
+    win32_thread_ctx_t *ctx = find_ctx_by_pid(proc_current_pid());
+    return ctx && __atomic_load_n(&ctx->cancel_state, __ATOMIC_ACQUIRE) == 1;
+}
 
-    uint64_t irq_flags;
-    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(irq_flags) :: "memory");
+void kernel32_thread_termination_checkpoint(void)
+{
+    win32_thread_ctx_t *ctx = find_ctx_by_pid(proc_current_pid());
+    if (!ctx || __atomic_load_n(&ctx->cancel_state, __ATOMIC_ACQUIRE) != 1)
+        return;
+    /* The caller has checked host critical-section ownership. Process-wide
+     * cancellation does not run guest DLL_THREAD_DETACH callbacks. The reaper
+     * releases TLS/stack only after this task is no longer executing. */
+    __atomic_store_n(&ctx->cancel_state, 2, __ATOMIC_RELEASE);
+    extern void proc_exit_detached(int32_t code);
+    proc_exit_detached((int32_t)ctx->cancel_code);
+    __builtin_unreachable();
+}
+
+int win32_terminate_process_peers(DWORD owner_pid, DWORD exit_code,
+                                 int except_kernel_pid)
+{
+    if (!owner_pid) return 0;
+    __atomic_add_fetch(&g_win32_process_stops, 1, __ATOMIC_RELEASE);
+    extern int proc_wake_pid(int pid);
+    extern int proc_disown_zombie_pid(int pid);
+    extern int sched_sleep_ticks(uint64_t ticks);
+    extern void proc_start_reaper(void);
     int count = 0;
-    for (int i = 0; i < g_win32_thread_capacity; i++) {
-        win32_thread_ctx_t *ctx = &g_win32_threads[i];
-        if (ctx->active && ctx->owner_peb == owner) {
-            serial_puts("[WIN32-THREAD-STOP] kernel_pid=");
-            serial_putdec((uint64_t)ctx->kernel_pid);
-            serial_puts(" tid=");
-            serial_putdec(ctx->tid);
-            serial_puts(" entry=0x");
-            serial_puthex(ctx->func_addr, 16);
-            serial_puts(" owner=0x");
-            serial_puthex((uint64_t)(ULONG_PTR)owner, 16);
-            serial_puts("\n");
-            if (terminate_thread_ctx(ctx, exit_code))
+    for (;;) {
+        BOOL pending = FALSE;
+        uint64_t irq_flags;
+        __asm__ volatile ("pushfq; popq %0; cli" : "=r"(irq_flags) :: "memory");
+        for (int i = 0; i < g_win32_thread_capacity; i++) {
+            win32_thread_ctx_t *ctx = &g_win32_threads[i];
+            if (ctx->owner_pid != owner_pid ||
+                ctx->kernel_pid == except_kernel_pid ||
+                (!ctx->active && ctx->reclaim_pending != 1))
+                continue;
+            pending = TRUE;
+            if (ctx->active && !ctx->cancel_state) {
+                ctx->cancel_code = exit_code;
+                __atomic_store_n(&ctx->cancel_state, 1, __ATOMIC_RELEASE);
+                (void)proc_wake_pid(ctx->kernel_pid);
                 count++;
+            }
+            (void)proc_disown_zombie_pid(ctx->kernel_pid);
         }
+        if (irq_flags & (1ULL << 9))
+            __asm__ volatile ("sti" ::: "memory");
+        if (!pending) {
+            __atomic_sub_fetch(&g_win32_process_stops, 1, __ATOMIC_RELEASE);
+            return count;
+        }
+        /* Keep SSH and the zombie reaper schedulable while workers unwind.
+         * State 2 pins guest stacks/TLS for process teardown but no longer
+         * owns a scheduler task. Never free them under a still-live peer. */
+        proc_start_reaper();
+        (void)sched_sleep_ticks(1);
     }
-    if (irq_flags & (1ULL << 9))
-        __asm__ volatile ("sti" ::: "memory");
-    return count;
+}
+
+int win32_terminate_process_threads(DWORD owner_pid, DWORD exit_code)
+{
+    return win32_terminate_process_peers(owner_pid, exit_code, -1);
+}
+
+static void __attribute__((noreturn)) kernel32_cancel_guest_thread(void)
+{
+    extern void sched_reset_current_compat_ist1(void);
+    extern void proc_exit_detached(int32_t);
+    sched_reset_current_compat_ist1();
+    kernel32_thread_termination_checkpoint();
+    proc_exit_detached((int32_t)STATUS_UNSUCCESSFUL);
+    __builtin_unreachable();
+}
+
+BOOL kernel32_cancel_guest_frame(x86_interrupt_frame_t *frame)
+{
+    if (!__atomic_load_n(&g_win32_process_stops, __ATOMIC_ACQUIRE))
+        return FALSE;
+    win32_thread_ctx_t *ctx = find_ctx_by_pid(proc_current_pid());
+    if (!ctx || __atomic_load_n(&ctx->cancel_state, __ATOMIC_ACQUIRE) != 1 ||
+        !__atomic_load_n(&ctx->exit_jmp_ready, __ATOMIC_ACQUIRE)) return FALSE;
+    extern BOOL win32_main_termination_pending(void);
+    if (!win32_main_termination_pending()) return FALSE;
+    uint16_t cs = (uint16_t)frame->cs;
+    if (cs != 0x38 && cs != 0x40 && cs != 0x23) return FALSE;
+    if (!win32_user_range_executable((const void *)(ULONG_PTR)frame->rip, 1,
+                                     ctx->compat32)) return FALSE;
+    uint64_t stack = (ctx->exit_jmpbuf[6] & ~15ULL) - 8;
+    if (stack < 0x100000 || !ctx->exit_jmpbuf[7]) return FALSE;
+    frame->rip = (uint64_t)(ULONG_PTR)kernel32_cancel_guest_thread;
+    frame->rsp = stack;
+    frame->cs = 0x38;
+    frame->ss = 0x30;
+    frame->rflags = (frame->rflags & ~(0x100ULL | 0x400ULL)) | 0x200ULL;
+    return TRUE;
 }
 
 BOOL WINAPI TerminateThread(HANDLE hThread, DWORD dwExitCode)
@@ -11201,6 +11587,8 @@ void kernel32_release_process_waits(DWORD process_id)
 {
     if (!process_id)
         return;
+
+    k32_timer_queues_release_process(process_id);
 
     /* Process teardown calls this after terminating its worker threads. No
      * dispatcher can still access these slots, so retained object references
@@ -11862,11 +12250,72 @@ HANDLE WINAPI CreateEventW(PVOID lpEventAttributes, BOOL bManualReset,
         (uint64_t)(ULONG_PTR)__builtin_return_address(0));
 }
 
-static HANDLE create_semaphore_k32(LONG initial_count, LONG maximum_count)
+/* Generic rights are object-specific: READ/WRITE do not grant a wait.
+ * Legacy handles can retain GENERIC_ALL; extended creators store the expanded
+ * mask, including MAXIMUM_ALLOWED for the current default security model. */
+static ACCESS_MASK sync_access_k32(ACCESS_MASK access, BOOL mutex)
 {
+    ACCESS_MASK result = access & ~0xF2000000u;
+    if (access & GENERIC_READ) result |= 0x00020001u;
+    if (access & GENERIC_WRITE) result |= mutex ? 0x00020001u : 0x00020002u;
+    if (access & GENERIC_EXECUTE) result |= 0x00120000u;
+    if (access & (GENERIC_ALL | 0x02000000u)) result |= mutex ? 0x001F0001u : 0x001F0003u;
+    return result;
+}
+static BOOL sync_attributes_k32(PVOID attributes, BOOL *inherit)
+{
+    *inherit = FALSE;
+    if (!attributes) return TRUE;
+    BOOL compat32 = g_compat32_mode;
+    if (!win32_user_range_readable(attributes, compat32 ? 12 : 24, compat32)) {
+        SetLastError(998); return FALSE;
+    }
+    ULONG_PTR descriptor;
+    if (compat32) {
+        descriptor = ((ULONG *)attributes)[1];
+        *inherit = ((ULONG *)attributes)[2] != 0;
+    } else {
+        descriptor = *(ULONG_PTR *)((BYTE *)attributes + 8);
+        *inherit = *(BOOL *)((BYTE *)attributes + 16) != 0;
+    }
+    /* Native sync objects do not yet retain arbitrary ACL descriptors. Never
+     * silently accept a security restriction that cannot be enforced. */
+    if (descriptor) { SetLastError(50); return FALSE; }
+    return TRUE;
+}
+static HANDLE sync_inherit_k32(HANDLE handle, BOOL inherit)
+{
+    if (!handle || !inherit) return handle;
+    DWORD saved = GetLastError();
+    ULONG pid = win32_current_process_id();
+    if (!pid) pid = 1;
+    NTSTATUS status = handle_update_flags_for_process(&g_handle_table, handle,
+        pid, HANDLE_USER_FLAG_INHERIT, HANDLE_USER_FLAG_INHERIT);
+    if (!NT_SUCCESS(status)) {
+        CloseHandle(handle); set_last_error_from_status(status); return NULL;
+    }
+    SetLastError(saved);
+    return handle;
+}
+
+#define K32_MAX_NAMED_SEMAPHORES K32_MAX_NAMED_OBJECTS
+static K32_NAMED_OBJECT named_semaphores[K32_MAX_NAMED_SEMAPHORES];
+
+static HANDLE create_semaphore_k32(LONG initial_count, LONG maximum_count,
+                                    const char *name, ACCESS_MASK access)
+{
+    if (name && *name) {
+        HANDLE existing = named_object_open(
+            named_semaphores, K32_MAX_NAMED_SEMAPHORES, OBJ_TYPE_SEMAPHORE,
+            name, access);
+        if (existing) {
+            SetLastError(183); /* ERROR_ALREADY_EXISTS */
+            return existing;
+        }
+    }
     HANDLE handle = NULL;
     ULONG_PTR args[5] = {
-        (ULONG_PTR)&handle, GENERIC_ALL, 0,
+        (ULONG_PTR)&handle, access, 0,
         (ULONG_PTR)initial_count, (ULONG_PTR)maximum_count
     };
     NTSTATUS status = sys_NtCreateSemaphore(args);
@@ -11874,6 +12323,24 @@ static HANDLE create_semaphore_k32(LONG initial_count, LONG maximum_count)
         set_last_error_from_status(status);
         return NULL;
     }
+    if (name && *name) {
+        BOOL already_exists = FALSE;
+        HANDLE published = named_object_publish_access(
+            named_semaphores, K32_MAX_NAMED_SEMAPHORES, OBJ_TYPE_SEMAPHORE,
+            name, handle, access, &already_exists);
+        if (!published) {
+            CloseHandle(handle);
+            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+            return NULL;
+        }
+        if (already_exists) {
+            CloseHandle(handle);
+            SetLastError(183); /* ERROR_ALREADY_EXISTS */
+            return published;
+        }
+        handle = published;
+    }
+    SetLastError(0);
     return handle;
 }
 
@@ -11881,16 +12348,69 @@ static HANDLE WINAPI CreateSemaphoreA_k32(PVOID attributes, LONG initial_count,
                                            LONG maximum_count, PCSTR name)
 {
     (void)attributes;
-    (void)name;
-    return create_semaphore_k32(initial_count, maximum_count);
+    char normalized[K32_OBJECT_NAME_MAX];
+    if (!named_object_name_a(name, normalized)) {
+        SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
+        return NULL;
+    }
+    return create_semaphore_k32(initial_count, maximum_count, normalized, GENERIC_ALL);
 }
 
 static HANDLE WINAPI CreateSemaphoreW_k32(PVOID attributes, LONG initial_count,
                                            LONG maximum_count, PCWSTR name)
 {
     (void)attributes;
-    (void)name;
-    return create_semaphore_k32(initial_count, maximum_count);
+    char normalized[K32_OBJECT_NAME_MAX];
+    if (!named_object_name_w(name, normalized)) {
+        SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
+        return NULL;
+    }
+    return create_semaphore_k32(initial_count, maximum_count, normalized, GENERIC_ALL);
+}
+
+static HANDLE WINAPI CreateSemaphoreExA_k32(PVOID attributes, LONG initial_count,
+    LONG maximum_count, PCSTR source, DWORD flags, DWORD access)
+{
+    BOOL inherit;
+    if (flags) { SetLastError(87); return NULL; }
+    if (!sync_attributes_k32(attributes, &inherit)) return NULL;
+    char name[K32_OBJECT_NAME_MAX];
+    if (!named_object_name_a(source, name)) { SetLastError(206); return NULL; }
+    return sync_inherit_k32(create_semaphore_k32(initial_count, maximum_count,
+        name, sync_access_k32(access, FALSE)), inherit);
+}
+static HANDLE WINAPI CreateSemaphoreExW_k32(PVOID attributes, LONG initial_count,
+    LONG maximum_count, PCWSTR source, DWORD flags, DWORD access)
+{
+    BOOL inherit;
+    if (flags) { SetLastError(87); return NULL; }
+    if (!sync_attributes_k32(attributes, &inherit)) return NULL;
+    char name[K32_OBJECT_NAME_MAX];
+    if (!named_object_name_w(source, name)) { SetLastError(206); return NULL; }
+    return sync_inherit_k32(create_semaphore_k32(initial_count, maximum_count,
+        name, sync_access_k32(access, FALSE)), inherit);
+}
+
+static HANDLE WINAPI OpenSemaphoreA_k32(DWORD access, BOOL inherit, PCSTR source)
+{
+    char name[K32_OBJECT_NAME_MAX];
+    if (!source || !named_object_name_a(source, name)) {
+        SetLastError(source ? 206 : 87);
+        return NULL;
+    }
+    return open_named_sync_k32(named_semaphores, K32_MAX_NAMED_SEMAPHORES,
+                               OBJ_TYPE_SEMAPHORE, name, access, inherit);
+}
+
+static HANDLE WINAPI OpenSemaphoreW_k32(DWORD access, BOOL inherit, PCWSTR source)
+{
+    char name[K32_OBJECT_NAME_MAX];
+    if (!source || !named_object_name_w(source, name)) {
+        SetLastError(source ? 206 : 87);
+        return NULL;
+    }
+    return open_named_sync_k32(named_semaphores, K32_MAX_NAMED_SEMAPHORES,
+                               OBJ_TYPE_SEMAPHORE, name, access, inherit);
 }
 
 static BOOL WINAPI ReleaseSemaphore_k32(HANDLE semaphore, LONG release_count,
@@ -12201,7 +12721,7 @@ static BOOL WINAPI CancelWaitableTimer_k32(HANDLE timer)
 }
 
 /* ponytail: fixed queues; grow these only if a workload fills them. */
-#define MAX_IOCP_PORTS        64
+#define MAX_IOCP_PORTS        MAX_HANDLES
 #define MAX_IOCP_PACKETS      256
 #define MAX_IOCP_ASSOCIATIONS 512
 #define MAX_PENDING_PIPE_READS 256
@@ -12220,6 +12740,7 @@ typedef struct {
     BOOL used;
     DWORD owner_pid;
     HANDLE handle;
+    PVOID event_object;
     volatile LONG lock;
     DWORD concurrency_limit;
     DWORD active_count;
@@ -12268,7 +12789,12 @@ typedef struct {
 _Static_assert(sizeof(K32_PENDING_PIPE_READ) == 0x10078,
                "pending pipe layout changed");
 
-static IOCP_PORT g_iocp_ports[MAX_IOCP_PORTS];
+/* Allocate stable port records on demand. Completed records stay reusable so
+ * readers retain the same address guarantees as the former fixed array. */
+static IOCP_PORT *g_iocp_ports[MAX_IOCP_PORTS];
+static ULONG g_iocp_slot_count;
+static DWORD g_iocp_live_ports;
+static DWORD g_iocp_job_references;
 static IOCP_ASSOCIATION g_iocp_associations[MAX_IOCP_ASSOCIATIONS];
 static K32_PENDING_PIPE_READ g_pending_pipe_reads[MAX_PENDING_PIPE_READS];
 static volatile LONG g_iocp_association_lock;
@@ -12371,11 +12897,16 @@ static BOOL pending_pipe_has_older_locked(int slot)
 
 static IOCP_PORT *iocp_find_for_process(HANDLE handle, DWORD owner_pid)
 {
-    for (int i = 0; i < MAX_IOCP_PORTS; i++) {
-        if (g_iocp_ports[i].used &&
-            g_iocp_ports[i].owner_pid == owner_pid &&
-            g_iocp_ports[i].handle == handle)
-            return &g_iocp_ports[i];
+    PVOID event = NULL;
+    if ((ULONG_PTR)handle > 0xffffffffU ||
+        !NT_SUCCESS(handle_lookup_for_process(&g_handle_table, handle, owner_pid,
+                                              OBJ_TYPE_EVENT, &event)))
+        return NULL;
+    ULONG slots = __atomic_load_n(&g_iocp_slot_count, __ATOMIC_ACQUIRE);
+    for (ULONG i = 0; i < slots; i++) {
+        IOCP_PORT *port = g_iocp_ports[i];
+        if (port->used && port->event_object == event)
+            return port;
     }
     return NULL;
 }
@@ -12395,32 +12926,108 @@ static void iocp_unlock(IOCP_PORT *port, uint64_t flags)
     iocp_irq_unlock(&port->lock, flags);
 }
 
+void k32_iocp_release_event(PVOID event)
+{
+    DWORD *active_tids = NULL;
+    uint64_t flags = iocp_association_lock();
+    for (ULONG i = 0; i < g_iocp_slot_count; i++) {
+        IOCP_PORT *port = g_iocp_ports[i];
+        if (!port->used || port->event_object != event) continue;
+        port->used = FALSE;
+        port->event_object = NULL;
+        active_tids = port->active_tids;
+        port->active_tids = NULL;
+        g_iocp_live_ports--;
+        break;
+    }
+    iocp_association_unlock(flags);
+    kfree(active_tids);
+}
+
+NTSTATUS k32_iocp_reference_job(HANDLE handle, PVOID *object, PHANDLE reference)
+{
+    *object = NULL;
+    *reference = NULL;
+    uint64_t flags = iocp_association_lock();
+    IOCP_PORT *port = iocp_find(handle);
+    PVOID event = NULL;
+    ACCESS_MASK access = 0;
+    NTSTATUS status = port ? handle_lookup_access_for_process(&g_handle_table,
+        handle, win32_current_process_id(), OBJ_TYPE_EVENT, &event, &access)
+        : STATUS_INVALID_HANDLE;
+    if (NT_SUCCESS(status) && !(access & (GENERIC_ALL | 2U)))
+        status = STATUS_ACCESS_DENIED; /* IO_COMPLETION_MODIFY_STATE */
+    if (NT_SUCCESS(status))
+        status = handle_duplicate_for_process(&g_handle_table, handle,
+            win32_current_process_id(), &g_handle_table, reference,
+            HANDLE_OWNER_SUBSYSTEM, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    if (NT_SUCCESS(status)) {
+        *object = port;
+        g_iocp_job_references++;
+    }
+    iocp_association_unlock(flags);
+    return status;
+}
+
+void k32_iocp_release_job(HANDLE reference)
+{
+    if (!reference) return;
+    if (NT_SUCCESS(nt_close_handle_for_process(reference, HANDLE_OWNER_SUBSYSTEM)))
+        __atomic_sub_fetch(&g_iocp_job_references, 1, __ATOMIC_RELAXED);
+}
+
 static IOCP_PORT *iocp_create(HANDLE handle, DWORD concurrency_limit)
 {
     if (!win32_thread_table_ensure())
         return NULL;
 
     DWORD owner_pid = win32_current_process_id();
+    PVOID event = NULL;
+    if (!NT_SUCCESS(handle_lookup(&g_handle_table, handle, OBJ_TYPE_EVENT, &event)))
+        return NULL;
     IOCP_PORT *port = iocp_find(handle);
-    if (!port) {
-        for (int i = 0; i < MAX_IOCP_PORTS; i++) {
-            if (!g_iocp_ports[i].used) {
-                port = &g_iocp_ports[i];
+    if (port) return port;
+    DWORD *active_tids = (DWORD *)kcalloc(g_win32_thread_capacity, sizeof(DWORD));
+    if (!active_tids) return NULL;
+
+    IOCP_PORT *fresh = NULL;
+    uint64_t flags;
+    for (;;) {
+        flags = iocp_association_lock();
+        for (ULONG i = 0; i < g_iocp_slot_count; i++) {
+            if (!g_iocp_ports[i]->used) {
+                port = g_iocp_ports[i];
                 break;
             }
         }
-    }
-    if (!port)
-        return NULL;
+        if (port || fresh || g_iocp_slot_count == MAX_IOCP_PORTS)
+            break;
+        iocp_association_unlock(flags);
 
-    if (!port->active_tids) {
-        port->active_tids = (DWORD *)kcalloc(g_win32_thread_capacity,
-                                             sizeof(*port->active_tids));
-        if (!port->active_tids)
+        /* Heap allocation must not hold the IRQ-disabled association lock.
+         * Recheck the pool after allocation: another CPU may release a slot. */
+        fresh = (IOCP_PORT *)kcalloc(1, sizeof(*fresh));
+        if (!fresh) {
+            kfree(active_tids);
             return NULL;
+        }
+    }
+    BOOL publish_slot = FALSE;
+    if (!port && fresh && g_iocp_slot_count < MAX_IOCP_PORTS) {
+        port = fresh;
+        fresh = NULL;
+        publish_slot = TRUE;
+    }
+    if (!port) {
+        iocp_association_unlock(flags);
+        kfree(fresh);
+        kfree(active_tids);
+        return NULL;
     }
 
     port->handle = handle;
+    port->event_object = event;
+    port->active_tids = active_tids;
     port->owner_pid = owner_pid;
     port->lock = 0;
     if (!concurrency_limit) {
@@ -12439,6 +13046,14 @@ static IOCP_PORT *iocp_create(HANDLE handle, DWORD concurrency_limit)
     port->tail = 0;
     port->count = 0;
     port->used = TRUE;
+    g_iocp_live_ports++;
+    if (publish_slot) {
+        g_iocp_ports[g_iocp_slot_count] = port;
+        __atomic_store_n(&g_iocp_slot_count, g_iocp_slot_count + 1,
+                         __ATOMIC_RELEASE);
+    }
+    iocp_association_unlock(flags);
+    kfree(fresh);
     return port;
 }
 
@@ -12468,8 +13083,9 @@ static void iocp_release_thread(DWORD tid)
     if (!tid)
         return;
     k32_io_completion_release_thread(tid);
-    for (int i = 0; i < MAX_IOCP_PORTS; i++) {
-        IOCP_PORT *port = &g_iocp_ports[i];
+    ULONG slots = __atomic_load_n(&g_iocp_slot_count, __ATOMIC_ACQUIRE);
+    for (ULONG i = 0; i < slots; i++) {
+        IOCP_PORT *port = g_iocp_ports[i];
         if (!port->used)
             continue;
         uint64_t flags = iocp_lock(port);
@@ -12487,8 +13103,9 @@ void k32_iocp_thread_blocking(void)
 
 static void iocp_activate_for_port(IOCP_PORT *target, DWORD tid)
 {
-    for (int i = 0; i < MAX_IOCP_PORTS; i++) {
-        IOCP_PORT *port = &g_iocp_ports[i];
+    ULONG slots = __atomic_load_n(&g_iocp_slot_count, __ATOMIC_ACQUIRE);
+    for (ULONG i = 0; i < slots; i++) {
+        IOCP_PORT *port = g_iocp_ports[i];
         if (!port->used || port == target)
             continue;
         uint64_t flags = iocp_lock(port);
@@ -12614,8 +13231,6 @@ void k32_iocp_forget_file(HANDLE file)
 
 static void iocp_forget_handle_for_process(HANDLE handle, DWORD owner_pid)
 {
-    IOCP_PORT *port = iocp_find_for_process(handle, owner_pid);
-
     uint64_t association_flags = iocp_association_lock();
     for (int i = 0; i < MAX_IOCP_ASSOCIATIONS; i++) {
         IOCP_ASSOCIATION *association = &g_iocp_associations[i];
@@ -12625,10 +13240,6 @@ static void iocp_forget_handle_for_process(HANDLE handle, DWORD owner_pid)
             association->used = FALSE;
     }
     iocp_association_unlock(association_flags);
-    if (port) {
-        port->used = FALSE;
-        port->owner_pid = 0;
-    }
     for (int i = 0; i < MAX_PENDING_PIPE_READS; i++) {
         BYTE *write_stage = NULL;
         uint64_t pending_flags = pending_pipe_read_lock();
@@ -12666,15 +13277,8 @@ static void iocp_reset_all(void)
             g_iocp_associations[i].used = FALSE;
     }
     iocp_association_unlock(association_flags);
-    for (int i = 0; i < MAX_IOCP_PORTS; i++) {
-        if (g_iocp_ports[i].used && g_iocp_ports[i].owner_pid == owner_pid) {
-            g_iocp_ports[i].used = FALSE;
-            g_iocp_ports[i].owner_pid = 0;
-            g_iocp_ports[i].lock = 0;
-            kfree(g_iocp_ports[i].active_tids);
-            g_iocp_ports[i].active_tids = NULL;
-        }
-    }
+    /* Port lifetime follows the event object, not the creating process. Other
+     * processes or jobs may still own references after this process exits. */
     for (int i = 0; i < MAX_PENDING_PIPE_READS; i++) {
         BYTE *write_stage = NULL;
         uint64_t pending_flags = pending_pipe_read_lock();
@@ -12862,7 +13466,7 @@ HANDLE WINAPI CreateIoCompletionPort(HANDLE hFile, HANDLE hExistingCompletionPor
     return handle;
 }
 
-static BOOL iocp_post_packet_status_ex(IOCP_PORT *port,
+static DWORD iocp_enqueue_packet(IOCP_PORT *port,
                                         DWORD dwNumberOfBytesTransferred,
                                         ULONG_PTR dwCompletionKey,
                                         PVOID lpOverlapped,
@@ -12887,8 +13491,7 @@ static BOOL iocp_post_packet_status_ex(IOCP_PORT *port,
     uint64_t port_flags = iocp_lock(port);
     if (port->count == MAX_IOCP_PACKETS) {
         iocp_unlock(port, port_flags);
-        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
-        return FALSE;
+        return 8; /* ERROR_NOT_ENOUGH_MEMORY */
     }
 
     IOCP_PACKET *packet = &port->packets[port->tail];
@@ -12905,8 +13508,7 @@ static BOOL iocp_post_packet_status_ex(IOCP_PORT *port,
     if (pending_pipe_slot >= 0) {
         if (pending_pipe_slot >= MAX_PENDING_PIPE_READS) {
             iocp_unlock(port, port_flags);
-            SetLastError(87); /* ERROR_INVALID_PARAMETER */
-            return FALSE;
+            return 87; /* ERROR_INVALID_PARAMETER */
         }
         uint64_t pending_flags = pending_pipe_read_lock();
         K32_PENDING_PIPE_READ *pending =
@@ -12917,8 +13519,7 @@ static BOOL iocp_post_packet_status_ex(IOCP_PORT *port,
             pending->overlapped != lpOverlapped) {
             pending_pipe_read_unlock(pending_flags);
             iocp_unlock(port, port_flags);
-            SetLastError(1168); /* ERROR_NOT_FOUND */
-            return FALSE;
+            return 1168; /* ERROR_NOT_FOUND */
         }
         pending->packet_queued = TRUE;
         pending_pipe_read_unlock(pending_flags);
@@ -12926,10 +13527,19 @@ static BOOL iocp_post_packet_status_ex(IOCP_PORT *port,
 
     port->tail = (port->tail + 1) % MAX_IOCP_PACKETS;
     port->count++;
-    extern NTSTATUS ntsync_set_event_for_process(HANDLE, ULONG, LONG *);
-    (void)ntsync_set_event_for_process(port->handle, port->owner_pid, NULL);
+    ntsync_event_set_state(port->event_object, TRUE);
     iocp_unlock(port, port_flags);
-    return TRUE;
+    return 0;
+}
+
+static BOOL iocp_post_packet_status_ex(IOCP_PORT *port, DWORD bytes, ULONG_PTR key,
+                                      PVOID overlapped, NTSTATUS status,
+                                      LONG pending_slot, DWORD generation)
+{
+    DWORD error = iocp_enqueue_packet(port, bytes, key, overlapped, status,
+                                      pending_slot, generation);
+    if (error) SetLastError(error);
+    return error == 0;
 }
 
 static BOOL iocp_post_packet_ex(IOCP_PORT *port,
@@ -12951,6 +13561,13 @@ static BOOL iocp_post_packet(IOCP_PORT *port,
 {
     return iocp_post_packet_ex(port, dwNumberOfBytesTransferred,
                                dwCompletionKey, lpOverlapped, -1, 0);
+}
+
+void k32_iocp_post_job(PVOID object, DWORD message, ULONG_PTR key, ULONG pid)
+{
+    /* Exit notification can run after the guest TEB has been unmapped. */
+    (void)iocp_enqueue_packet(object, message, key, (PVOID)(ULONG_PTR)pid,
+                              STATUS_SUCCESS, -1, 0);
 }
 
 BOOL WINAPI PostQueuedCompletionStatus(HANDLE hCompletionPort,
@@ -12990,7 +13607,7 @@ static BOOL iocp_try_dequeue(IOCP_PORT *port, DWORD tid,
             port->head = (port->head + 1) % MAX_IOCP_PACKETS;
             port->count--;
             if (!port->count)
-                ResetEvent(port->handle);
+                ntsync_event_set_state(port->event_object, FALSE);
             found = TRUE;
         }
     } else {
@@ -12999,7 +13616,7 @@ static BOOL iocp_try_dequeue(IOCP_PORT *port, DWORD tid,
          * event signaled with an empty queue: GQCS would otherwise spin and
          * starve the process on a single CPU.  Posting is serialized by the
          * same lock, so resetting here cannot discard a queued completion. */
-        ResetEvent(port->handle);
+        ntsync_event_set_state(port->event_object, FALSE);
     }
     iocp_unlock(port, port_flags);
     if (found && k32_mojo_trace_current() &&
@@ -13093,7 +13710,12 @@ static BOOL k32_iocp_complete_handle_status_for_process(
 
     BOOL status_stored = TRUE;
     BOOL event_loaded = TRUE;
-    if (owner_pid != win32_current_process_id()) {
+    extern BOOL win32_process_cr3(DWORD process_id, uint64_t *out_cr3);
+    uint64_t owner_cr3 = 0, current_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(current_cr3));
+    BOOL same_address_space = owner_pid == win32_current_process_id() &&
+        win32_process_cr3(owner_pid, &owner_cr3) && owner_cr3 == current_cr3;
+    if (!same_address_space) {
         if (compat32) {
             uint32_t event_value = 0;
             event_loaded = k32_copy_from_process(
@@ -13749,6 +14371,16 @@ static void k32_pipe_wait_quiescent_for_process(HANDLE file,
     }
 }
 
+static BOOL WINAPI CancelSynchronousIo_k32(HANDLE thread)
+{
+    DWORD error = nt_thread_cancel_sync_io(thread);
+    if (error) {
+        SetLastError(error);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static BOOL WINAPI CancelIo_k32(HANDLE file)
 {
     if (!file || file == INVALID_HANDLE_VALUE) {
@@ -14044,8 +14676,6 @@ static BOOL iocp_wait_packet(HANDLE hCompletionPort, IOCP_PORT *port,
             } else {
                 remaining = dwMilliseconds - (DWORD)elapsed_ms;
             }
-            if (wait == WAIT_TIMEOUT && wait_slice >= remaining)
-                deadline_reached = TRUE;
         }
     }
 }
@@ -14386,12 +15016,12 @@ extern NTSTATUS sys_NtReleaseMutant(ULONG_PTR *);
 #define K32_MAX_NAMED_MUTEXES K32_MAX_NAMED_OBJECTS
 static K32_NAMED_OBJECT named_mutexes[K32_MAX_NAMED_MUTEXES];
 
-static HANDLE create_mutex_k32(BOOL initial_owner, const char *name)
+static HANDLE create_mutex_k32(BOOL initial_owner, const char *name, ACCESS_MASK access)
 {
     if (name && *name) {
         HANDLE existing = named_object_open(
             named_mutexes, K32_MAX_NAMED_MUTEXES, OBJ_TYPE_MUTANT,
-            name, GENERIC_ALL);
+            name, access);
         if (existing) {
             SetLastError(183); /* ERROR_ALREADY_EXISTS */
             return existing;
@@ -14400,7 +15030,7 @@ static HANDLE create_mutex_k32(BOOL initial_owner, const char *name)
 
     HANDLE handle = NULL;
     ULONG_PTR args[4] = {
-        (ULONG_PTR)&handle, GENERIC_ALL, 0, (ULONG_PTR)initial_owner
+        (ULONG_PTR)&handle, access, 0, (ULONG_PTR)initial_owner
     };
     NTSTATUS status = sys_NtCreateMutant(args);
     if (!NT_SUCCESS(status)) {
@@ -14409,9 +15039,9 @@ static HANDLE create_mutex_k32(BOOL initial_owner, const char *name)
     }
     if (name && *name) {
         BOOL already_exists = FALSE;
-        HANDLE published = named_object_publish(
+        HANDLE published = named_object_publish_access(
             named_mutexes, K32_MAX_NAMED_MUTEXES, OBJ_TYPE_MUTANT,
-            name, handle, &already_exists);
+            name, handle, access, &already_exists);
         if (!published) {
             CloseHandle(handle);
             SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
@@ -14436,7 +15066,7 @@ HANDLE WINAPI CreateMutexA(PVOID lpMutexAttributes, BOOL bInitialOwner, PCSTR lp
         SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
         return NULL;
     }
-    return create_mutex_k32(bInitialOwner, name);
+    return create_mutex_k32(bInitialOwner, name, GENERIC_ALL);
 }
 
 HANDLE WINAPI CreateMutexW(PVOID lpMutexAttributes, BOOL bInitialOwner, PCWSTR lpName)
@@ -14447,7 +15077,50 @@ HANDLE WINAPI CreateMutexW(PVOID lpMutexAttributes, BOOL bInitialOwner, PCWSTR l
         SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
         return NULL;
     }
-    return create_mutex_k32(bInitialOwner, name);
+    return create_mutex_k32(bInitialOwner, name, GENERIC_ALL);
+}
+
+static HANDLE WINAPI CreateMutexExA_k32(PVOID attributes, PCSTR source, DWORD flags, DWORD access)
+{
+    BOOL inherit;
+    if (flags & ~1u) { SetLastError(87); return NULL; }
+    if (!sync_attributes_k32(attributes, &inherit)) return NULL;
+    char name[K32_OBJECT_NAME_MAX];
+    if (!named_object_name_a(source, name)) { SetLastError(206); return NULL; }
+    return sync_inherit_k32(create_mutex_k32(flags & 1u, name,
+        sync_access_k32(access, TRUE)), inherit);
+}
+static HANDLE WINAPI CreateMutexExW_k32(PVOID attributes, PCWSTR source, DWORD flags, DWORD access)
+{
+    BOOL inherit;
+    if (flags & ~1u) { SetLastError(87); return NULL; }
+    if (!sync_attributes_k32(attributes, &inherit)) return NULL;
+    char name[K32_OBJECT_NAME_MAX];
+    if (!named_object_name_w(source, name)) { SetLastError(206); return NULL; }
+    return sync_inherit_k32(create_mutex_k32(flags & 1u, name,
+        sync_access_k32(access, TRUE)), inherit);
+}
+
+static HANDLE WINAPI OpenMutexA_k32(DWORD access, BOOL inherit, PCSTR source)
+{
+    char name[K32_OBJECT_NAME_MAX];
+    if (!source || !named_object_name_a(source, name)) {
+        SetLastError(source ? 206 : 87);
+        return NULL;
+    }
+    return open_named_sync_k32(named_mutexes, K32_MAX_NAMED_MUTEXES,
+                               OBJ_TYPE_MUTANT, name, access, inherit);
+}
+
+static HANDLE WINAPI OpenMutexW_k32(DWORD access, BOOL inherit, PCWSTR source)
+{
+    char name[K32_OBJECT_NAME_MAX];
+    if (!source || !named_object_name_w(source, name)) {
+        SetLastError(source ? 206 : 87);
+        return NULL;
+    }
+    return open_named_sync_k32(named_mutexes, K32_MAX_NAMED_MUTEXES,
+                               OBJ_TYPE_MUTANT, name, access, inherit);
 }
 
 /* ── DLL / Module API ──────────────────────────────────────── */
@@ -14461,62 +15134,15 @@ extern void *osfs2_find_ci(const char *name);
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern uint64_t osfs2_file_size(void *file);
 
-/* DLLs that are known to not exist — return NULL immediately to avoid
- * deep recursive searches or stack overflows in dll_load. */
-static int is_unavailable_dll(const char *name)
-{
-    /* Extract basename */
-    const char *bn = name;
-    for (const char *p = name; *p; p++)
-        if (*p == '\\' || *p == '/') bn = p + 1;
-
-    /* Most entries are exact DLL stems. Prefix matching here used to reject
-     * hidapi.dll while trying to reject hid.dll. */
-    static const char *skip_exact[] = {
-        "RICHED32", "RICHED20", "COMCTL32", "HHCTRL", "VERSION",
-        "RPCRT4", "SHLWAPI", "SETUPAPI", "CRYPT32", "WLDAP32",
-        "SECUR32", "d3d8", "d3d9", "d3d11",
-        "HID", "CFGMGR32",
-        NULL
-    };
-    static const char *skip_prefix[] = {
-        "dinput", "XINPUT", NULL
-    };
-    for (int i = 0; skip_exact[i]; i++) {
-        const char *a = bn, *b = skip_exact[i];
-        int match = 1;
-        while (*b) {
-            char ca = *a, cb = *b;
-            if (ca >= 'a' && ca <= 'z') ca -= 32;
-            if (cb >= 'a' && cb <= 'z') cb -= 32;
-            if (ca != cb) { match = 0; break; }
-            a++; b++;
-        }
-        if (match && (*a == 0 ||
-                      (a[0] == '.' &&
-                       (a[1] == 'd' || a[1] == 'D') &&
-                       (a[2] == 'l' || a[2] == 'L') &&
-                       (a[3] == 'l' || a[3] == 'L') && a[4] == 0)))
-            return 1;
-    }
-    for (int i = 0; skip_prefix[i]; i++) {
-        const char *a = bn, *b = skip_prefix[i];
-        int match = 1;
-        while (*b) {
-            char ca = *a, cb = *b;
-            if (ca >= 'a' && ca <= 'z') ca -= 32;
-            if (cb >= 'a' && cb <= 'z') cb -= 32;
-            if (ca != cb) { match = 0; break; }
-            a++; b++;
-        }
-        if (match) return 1;
-    }
-    return 0;
-}
-
-static HANDLE load_library_a_flags(PCSTR lpLibFileName, DWORD search_flags)
+static HANDLE load_library_a_flags_impl(PCSTR lpLibFileName, DWORD search_flags)
 {
     if (!lpLibFileName) return NULL;
+    /* LOAD_WITH_ALTERED_SEARCH_PATH and LOAD_LIBRARY_SEARCH_* select mutually
+     * exclusive strategies, even when the module is already loaded. */
+    if ((search_flags & 0x8U) && (search_flags & 0x1F00U)) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return NULL;
+    }
 
     BOOL trace_loader = K32_VERBOSE_DIAGNOSTICS &&
         __atomic_fetch_sub(&g_loader_trace_budget, 1,
@@ -14526,10 +15152,6 @@ static HANDLE load_library_a_flags(PCSTR lpLibFileName, DWORD search_flags)
         serial_puts(lpLibFileName);
         serial_puts("'\n");
     }
-
-    /* Fast-reject known-missing DLLs */
-    if (is_unavailable_dll(lpLibFileName) && !dll_is_shim(lpLibFileName))
-        return NULL;
 
 #ifndef OK_QUIET
     serial_puts("[K32] LoadLibraryA: ");
@@ -14578,11 +15200,24 @@ static HANDLE load_library_a_flags(PCSTR lpLibFileName, DWORD search_flags)
 #ifndef OK_QUIET
     serial_puts("[K32] DLL not found\n");
 #endif
-    if (GetLastError() != 193) /* Preserve ERROR_BAD_EXE_FORMAT. */
+    DWORD error = GetLastError();
+    /* Preserve failures from a found image and its initialization. */
+    if (!error)
         SetLastError(126); /* ERROR_MOD_NOT_FOUND */
     if (trace_loader)
         serial_puts("[K32-LOADER] module not found\n");
     return NULL;
+}
+
+static HANDLE load_library_a_flags(PCSTR lpLibFileName, DWORD search_flags)
+{
+    HANDLE result = load_library_a_flags_impl(lpLibFileName, search_flags);
+#if K32_LOOKUP_FAILURE_TRACE
+    if (!result)
+        k32_lookup_failure_trace("dll", NULL, lpLibFileName, NULL,
+                                 (ULONG_PTR)__builtin_return_address(0));
+#endif
+    return result;
 }
 
 HANDLE WINAPI LoadLibraryA(PCSTR lpLibFileName)
@@ -15069,7 +15704,9 @@ static PVOID WINAPI AddDllDirectory_k32(PCWSTR new_directory)
         SetLastError(206);
         return NULL;
     }
-    if (!win32_directory_exists_normalized(normalized)) {
+    char physical_directory[260];
+    if (!win32_resolve_file_path(path, physical_directory) ||
+        !win32_directory_exists_normalized(physical_directory)) {
         SetLastError(3); /* ERROR_PATH_NOT_FOUND */
         return NULL;
     }
@@ -15117,6 +15754,31 @@ void WINAPI GetSystemTimeAsFileTime(PVOID lpSystemTimeAsFileTime)
     memcpy(lpSystemTimeAsFileTime, &filetime, sizeof(filetime));
 }
 
+static BOOL WINAPI GetSystemTimeAdjustment(DWORD *adjustment, DWORD *increment,
+                                            BOOL *disabled)
+{
+    if (!adjustment || !increment || !disabled) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    /* The scheduler clock advances in 10 ms ticks; there is no adjustable
+     * Win32 clock-rate service. Both intervals are expressed in 100 ns. */
+    *adjustment = 100000;
+    *increment = 100000;
+    *disabled = TRUE;
+    return TRUE;
+}
+
+static BOOL WINAPI SetSystemTime(const SYSTEMTIME *time)
+{
+    (void)time;
+    /* Applications do not hold SE_SYSTEMTIME_NAME in the compatibility
+     * environment. In particular, a pthread clock_settime must not pretend
+     * to change the kernel clock. */
+    SetLastError(1314); /* ERROR_PRIVILEGE_NOT_HELD */
+    return FALSE;
+}
+
 static void WINAPI GetSystemTimePreciseAsFileTime_k32(PVOID file_time)
 {
     GetSystemTimeAsFileTime(file_time);
@@ -15162,11 +15824,34 @@ BOOL WINAPI GetThreadTimes(HANDLE hThread, PVOID creation, PVOID exit,
 static BOOL WINAPI QueryThreadCycleTime_k32(HANDLE thread,
                                              ULONGLONG *cycle_time)
 {
-    if (!cycle_time || !GetThreadId_k32(thread)) {
-        if (!cycle_time) SetLastError(87); /* ERROR_INVALID_PARAMETER */
+    if (!cycle_time) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
     }
-    *cycle_time = (ULONGLONG)idt_get_ticks() * 100000ULL;
+    if (g_compat32_mode && (ULONG_PTR)thread == UINT32_MAX - 1U)
+        thread = NT_CURRENT_THREAD;
+    NTSTATUS status = nt_thread_query_cycles(thread, cycle_time);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL WINAPI QueryProcessCycleTime_k32(HANDLE process,
+                                              ULONGLONG *cycle_time)
+{
+    if (!cycle_time) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    if (g_compat32_mode && (ULONG_PTR)process == UINT32_MAX)
+        process = NT_CURRENT_PROCESS;
+    NTSTATUS status = nt_process_query_cycles(process, cycle_time);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
     return TRUE;
 }
 
@@ -15213,11 +15898,18 @@ static WORD WINAPI GetMaximumProcessorGroupCount_k32(void)
 static BOOL WINAPI GetProcessHandleCount_k32(HANDLE process,
                                               DWORD *handle_count)
 {
-    if (!handle_count || !k32_process_handle_valid(process)) {
-        SetLastError(!handle_count ? 87 : 6);
+    if (!win32_user_range_writable(handle_count, sizeof(*handle_count),
+                                   g_compat32_mode)) {
+        SetLastError(998);
         return FALSE;
     }
-    *handle_count = g_handle_table.count;
+    ULONG count = 0;
+    NTSTATUS status = nt_process_query_handle_count(process, &count);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
+    *handle_count = count;
     return TRUE;
 }
 
@@ -15463,6 +16155,7 @@ void WINAPI GetSystemInfo(LPSYSTEM_INFO lpSystemInfo)
     }
 
     lpSystemInfo->wProcessorArchitecture  = 9; /* PROCESSOR_ARCHITECTURE_AMD64 */
+    lpSystemInfo->wReserved               = 0;
     lpSystemInfo->dwPageSize              = 4096;
     lpSystemInfo->lpMinimumApplicationAddress = (PVOID)(ULONG_PTR)0x10000;
     lpSystemInfo->lpMaximumApplicationAddress = (PVOID)(ULONG_PTR)0x7FFFFFFEFFFF;
@@ -15474,6 +16167,19 @@ void WINAPI GetSystemInfo(LPSYSTEM_INFO lpSystemInfo)
     lpSystemInfo->dwAllocationGranularity = 65536;
     lpSystemInfo->wProcessorLevel         = 6;
     lpSystemInfo->wProcessorRevision      = 0;
+}
+
+static void WINAPI GetNativeSystemInfo_k32(LPSYSTEM_INFO information)
+{
+    GetSystemInfo(information);
+    if (!information || !g_compat32_mode) return;
+
+    /* WOW64 reports the native architecture in the caller's 36-byte layout.
+     * Its native address limit is not the non-LAA process's 2 GiB limit. */
+    BYTE *p = (BYTE *)information;
+    *(WORD *)(p + 0) = 9; /* PROCESSOR_ARCHITECTURE_AMD64 */
+    *(DWORD *)(p + 12) = 0xfffeffffU;
+    *(DWORD *)(p + 24) = 8664; /* PROCESSOR_AMD_X8664 */
 }
 
 #define K32_RELATION_PROCESSOR_CORE    0U
@@ -15577,17 +16283,51 @@ static BOOL WINAPI GetLogicalProcessorInformationEx_k32(
     return TRUE;
 }
 
+static void k32_process_version(DWORD version[3])
+{
+    DWORD saved_error = GetLastError(), size = 0;
+    PCVOID manifest = NULL;
+    unsigned level = 62;
+    if (kernel32_resource_data_w(NULL, (PCWSTR)(ULONG_PTR)1,
+                                 (PCWSTR)(ULONG_PTR)24, &manifest, &size))
+        level = osversion_manifest_level(manifest, size);
+    version[0] = level == 100 ? WIN32_NT_VERSION_MAJOR : 6;
+    version[1] = level == 100 ? WIN32_NT_VERSION_MINOR : level == 63 ? 3 : 2;
+    version[2] = level == 100 ? WIN32_NT_VERSION_BUILD : level == 63 ? 9600 : 9200;
+    SetLastError(saved_error);
+}
+
+static BOOL k32_get_version_info(PVOID information, BOOL wide)
+{
+    if (!win32_user_range_readable(information, sizeof(DWORD), g_compat32_mode)) {
+        SetLastError(998); return FALSE;
+    }
+    BYTE *p = information;
+    DWORD base = wide ? 276 : 148, size = *(DWORD *)p;
+    if (size != base && size != base + 8) {
+        SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+        return FALSE;
+    }
+    if (!win32_user_range_writable(p, size, g_compat32_mode)) {
+        SetLastError(998); return FALSE;
+    }
+    DWORD version[3];
+    k32_process_version(version);
+    for (DWORD i = 4; i < size; i++) p[i] = 0;
+    *(DWORD *)(p + 4) = version[0];
+    *(DWORD *)(p + 8) = version[1];
+    *(DWORD *)(p + 12) = version[2];
+    *(DWORD *)(p + 16) = WIN32_NT_PLATFORM_ID;
+    if (size == base + 8) {
+        *(WORD *)(p + base + 4) = 0x100; /* VER_SUITE_SINGLEUSERTS */
+        p[base + 6] = 1; /* VER_NT_WORKSTATION */
+    }
+    return TRUE;
+}
+
 BOOL WINAPI GetVersionExA(LPOSVERSIONINFOA lpVersionInformation)
 {
-    if (!lpVersionInformation) return FALSE;
-    /* Windows 10 22H2, still compatible with the legacy Win32 path. */
-    lpVersionInformation->dwMajorVersion = WIN32_NT_VERSION_MAJOR;
-    lpVersionInformation->dwMinorVersion = WIN32_NT_VERSION_MINOR;
-    lpVersionInformation->dwBuildNumber  = WIN32_NT_VERSION_BUILD;
-    lpVersionInformation->dwPlatformId   = WIN32_NT_PLATFORM_ID;
-    for (int i = 0; i < 128; i++)
-        lpVersionInformation->szCSDVersion[i] = 0;
-    return TRUE;
+    return k32_get_version_info(lpVersionInformation, FALSE);
 }
 
 BOOL WINAPI GetProductInfo(DWORD major, DWORD minor, DWORD sp_major,
@@ -15620,11 +16360,15 @@ DWORD WINAPI GetFullPathNameA(PCSTR lpFileName, DWORD nBufferLength,
     lpBuffer[0] = 'C'; lpBuffer[1] = ':'; lpBuffer[2] = '\\';
     memcpy(lpBuffer + 3, path, path_len + 1);
     if (lpFilePart) {
-        *lpFilePart = lpBuffer;
+        PSTR file_part = lpBuffer;
         for (DWORD i = 0; i < len; i++) {
             if (lpBuffer[i] == '\\' || lpBuffer[i] == '/')
-                *lpFilePart = lpBuffer + i + 1;
+                file_part = lpBuffer + i + 1;
         }
+        if (g_compat32_mode)
+            *(uint32_t *)lpFilePart = (uint32_t)(ULONG_PTR)file_part;
+        else
+            *lpFilePart = file_part;
     }
     return len;
 }
@@ -15650,7 +16394,7 @@ DWORD WINAPI GetFileAttributesA(PCSTR lpFileName)
     }
 
     char relative[260];
-    if (!win32_normalize_path(lpFileName, relative)) {
+    if (!win32_resolve_file_path(lpFileName, relative)) {
         g_last_error = 206; /* ERROR_FILENAME_EXCED_RANGE */
         sync_last_error();
         return (DWORD)-1;
@@ -15664,14 +16408,12 @@ DWORD WINAPI GetFileAttributesA(PCSTR lpFileName)
     }
 
     /* Match the same normalized path semantics used by CreateFile. */
-    if (k32_find_file_exact_ci(relative)) {
+    osfs2_file_t *file = k32_find_file_exact_ci(relative);
+    if (file) {
         DWORD attributes = FILE_ATTRIBUTE_NORMAL;
-        vfs_node_t node;
-        uint16_t mode;
-        if (vfs_find(relative, VFS_MODE_WIN32, &node) &&
-            vfs_get_mode(&node, &mode) == VFS_STATUS_OK &&
-            !(mode & 0222U))
-            attributes = FILE_ATTRIBUTE_READONLY;
+        uint8_t stored;
+        if (osfs2_file_get_dos_attributes(file, &stored) == 0 && stored)
+            attributes = stored;
         if (trace_profile) {
             serial_puts("[K32-PROFILE] attr file '");
             serial_puts(relative);
@@ -15697,7 +16439,7 @@ DWORD WINAPI GetFileAttributesA(PCSTR lpFileName)
         serial_puts(relative);
         serial_puts("'\n");
     }
-    g_last_error = 2; /* ERROR_FILE_NOT_FOUND */
+    g_last_error = k32_directory_parent_exists(relative) ? 2 : 3;
     sync_last_error();
     return (DWORD)-1; /* INVALID_FILE_ATTRIBUTES */
 }
@@ -15710,9 +16452,18 @@ BOOL WINAPI SetFileAttributesA(PCSTR lpFileName, DWORD dwFileAttributes)
     }
 
     char relative[260];
-    if (!win32_normalize_path(lpFileName, relative)) {
+    if (!win32_resolve_file_path(lpFileName, relative)) {
         SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
         return FALSE;
+    }
+
+    osfs2_file_t *file = k32_find_file_exact_ci(relative);
+    if (file) {
+        if (osfs2_file_set_dos_attributes(file,
+                dwFileAttributes & OSFS_DOS_ATTR_MASK) < 0) {
+            SetLastError(5); return FALSE;
+        }
+        SetLastError(0); return TRUE;
     }
 
     vfs_node_t node;
@@ -15751,7 +16502,7 @@ BOOL WINAPI CreateDirectoryA(PCSTR lpPathName, PVOID lpSecurityAttributes)
         sync_last_error();
         return FALSE;
     }
-    if (!win32_normalize_path(lpPathName, path) ||
+    if (!win32_resolve_file_path(lpPathName, path) ||
         strlen(path) >= K32_VIRTUAL_DIR_PATH) {
         g_last_error = 206; /* ERROR_FILENAME_EXCED_RANGE */
         sync_last_error();
@@ -15800,7 +16551,7 @@ BOOL WINAPI RemoveDirectoryA(PCSTR lpPathName)
         sync_last_error();
         return FALSE;
     }
-    if (!win32_normalize_path(lpPathName, path) ||
+    if (!win32_resolve_file_path(lpPathName, path) ||
         strlen(path) >= K32_VIRTUAL_DIR_PATH) {
         g_last_error = 206;
         sync_last_error();
@@ -15903,6 +16654,34 @@ BOOL WINAPI CreateSymbolicLinkW(PCWSTR lpSymlinkFileName,
     return FALSE;
 }
 
+static BOOL WINAPI CreateHardLinkW_k32(PCWSTR file_name,
+                                        PCWSTR existing_name,
+                                        PVOID security_attributes)
+{
+    (void)security_attributes;
+    if (!file_name || !existing_name || !*file_name || !*existing_name) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    /* The writable OsitoFS backends have no operation that creates another
+     * directory entry for the same inode. A copy would violate link identity,
+     * sharing and unlink semantics, so expose the filesystem limitation. */
+    SetLastError(50); /* ERROR_NOT_SUPPORTED */
+    return FALSE;
+}
+
+static BOOL WINAPI GetNumaHighestNodeNumber_k32(ULONG *highest_node)
+{
+    if (!highest_node) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    /* The physical allocator and SMP scheduler currently expose one shared
+     * memory domain. No SRAT proximity domains are configured in this kernel. */
+    *highest_node = 0;
+    return TRUE;
+}
+
 DWORD WINAPI GetCurrentDirectoryW(DWORD nBufferLength, PWSTR lpBuffer)
 {
     const char *current_directory = kernel32_current_directory_relative();
@@ -15926,15 +16705,19 @@ BOOL WINAPI SetCurrentDirectoryA(PCSTR lpPathName)
         SetLastError(lpPathName ? 206 : 87);
         return FALSE;
     }
-    if (!win32_directory_exists_normalized(path)) {
+    char physical_directory[260];
+    if (!win32_resolve_file_path(lpPathName, physical_directory) ||
+        !win32_directory_exists_normalized(physical_directory)) {
         serial_puts("[K32-CWD-FAIL] missing path='C:\\");
         serial_puts(path);
         serial_puts("'\n");
         SetLastError(3); /* ERROR_PATH_NOT_FOUND */
         return FALSE;
     }
-    if (!win32_set_current_directory_override(path))
+    if (!win32_set_current_directory_override(path, physical_directory)) {
         strcpy(win32_current_directory, path);
+        strcpy(win32_current_directory_physical, physical_directory);
+    }
     if (!win32_refresh_current_process_parameters()) {
         SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
         return FALSE;
@@ -15984,9 +16767,10 @@ BOOL WINAPI SetFileAttributesW(PCWSTR lpFileName, DWORD dwFileAttributes)
 
 DWORD WINAPI GetSystemDirectoryA(PSTR lpBuffer, DWORD uSize)
 {
-    const char *dir = "C:\\Windows\\System32";
+    const char *dir = WIN32_SYSTEM32_DIRECTORY;
     DWORD len = 0;
     while (dir[len]) len++;
+    if (uSize <= len) return len + 1;
     if (lpBuffer && uSize > len) {
         for (DWORD i = 0; i <= len; i++) lpBuffer[i] = dir[i];
     }
@@ -15995,10 +16779,10 @@ DWORD WINAPI GetSystemDirectoryA(PSTR lpBuffer, DWORD uSize)
 
 DWORD WINAPI GetSystemDirectoryW(PWSTR lpBuffer, DWORD uSize)
 {
-    static const WCHAR dir[] = {'C',':','\\','W','i','n','d','o','w','s','\\',
-                                 'S','y','s','t','e','m','3','2',0};
+    const char *dir = WIN32_SYSTEM32_DIRECTORY;
     DWORD len = 0;
     while (dir[len]) len++;
+    if (uSize <= len) return len + 1;
     if (lpBuffer && uSize > len) {
         for (DWORD i = 0; i <= len; i++) lpBuffer[i] = dir[i];
     }
@@ -16007,9 +16791,10 @@ DWORD WINAPI GetSystemDirectoryW(PWSTR lpBuffer, DWORD uSize)
 
 DWORD WINAPI GetWindowsDirectoryA(PSTR lpBuffer, DWORD uSize)
 {
-    const char *dir = "C:\\Windows";
+    const char *dir = WIN32_WINDOWS_DIRECTORY;
     DWORD len = 0;
     while (dir[len]) len++;
+    if (uSize <= len) return len + 1;
     if (lpBuffer && uSize > len) {
         for (DWORD i = 0; i <= len; i++) lpBuffer[i] = dir[i];
     }
@@ -16018,9 +16803,10 @@ DWORD WINAPI GetWindowsDirectoryA(PSTR lpBuffer, DWORD uSize)
 
 DWORD WINAPI GetWindowsDirectoryW(PWSTR lpBuffer, DWORD uSize)
 {
-    static const WCHAR dir[] = {'C',':','\\','W','i','n','d','o','w','s',0};
+    const char *dir = WIN32_WINDOWS_DIRECTORY;
     DWORD len = 0;
     while (dir[len]) len++;
+    if (uSize <= len) return len + 1;
     if (lpBuffer && uSize > len) {
         for (DWORD i = 0; i <= len; i++) lpBuffer[i] = dir[i];
     }
@@ -16030,6 +16816,26 @@ DWORD WINAPI GetWindowsDirectoryW(PWSTR lpBuffer, DWORD uSize)
 /* ── Find File ─────────────────────────────────────────────── */
 
 /* ── FindFirstFile/FindNextFile backed by OsitoFS ──────────── */
+
+static DWORD WINAPI GetSystemWow64DirectoryA(PSTR buffer, DWORD size)
+{
+    const char *dir = WIN32_SYSWOW64_DIRECTORY;
+    DWORD length = sizeof(WIN32_SYSWOW64_DIRECTORY) - 1;
+    if (size <= length) return length + 1;
+    if (buffer)
+        for (DWORD i = 0; i <= length; i++) buffer[i] = dir[i];
+    return length;
+}
+
+static DWORD WINAPI GetSystemWow64DirectoryW(PWSTR buffer, DWORD size)
+{
+    const char *dir = WIN32_SYSWOW64_DIRECTORY;
+    DWORD length = sizeof(WIN32_SYSWOW64_DIRECTORY) - 1;
+    if (size <= length) return length + 1;
+    if (buffer)
+        for (DWORD i = 0; i <= length; i++) buffer[i] = (WCHAR)dir[i];
+    return length;
+}
 
 #define MAX_FIND_HANDLES 8
 #define FIND_SEEN_SLOTS 32768
@@ -16041,6 +16847,9 @@ typedef struct {
     uint64_t seen[FIND_SEEN_SLOTS];
     osfs3_dir_cursor_t osfs3_cursor;
     bool use_osfs3_index;
+    bool case_sensitive;
+    bool directories_only;
+    bool on_disk_only;
     bool in_use;
 } find_handle_t;
 static find_handle_t find_handles[MAX_FIND_HANDLES];
@@ -16057,13 +16866,15 @@ static char find_fold(char c)
     return c;
 }
 
-static bool find_wildcard_match(const char *pattern, const char *name)
+static bool find_wildcard_match(const char *pattern, const char *name,
+                                 bool case_sensitive)
 {
     const char *star = NULL;
     const char *retry = NULL;
     while (*name) {
         if (*pattern == '?' ||
-            (*pattern != '*' && find_fold(*pattern) == find_fold(*name))) {
+            (*pattern != '*' && (case_sensitive ? *pattern == *name :
+                                  find_fold(*pattern) == find_fold(*name)))) {
             pattern++;
             name++;
         } else if (*pattern == '*') {
@@ -16158,7 +16969,9 @@ static bool find_next_entry(find_handle_t *state, LPWIN32_FIND_DATAA data)
                 &state->osfs3_cursor, child, sizeof(child), &is_directory,
                 &size, NULL);
             if (result <= 0) break;
-            if (!find_wildcard_match(state->pattern, child) ||
+            if ((state->directories_only && !is_directory) ||
+                !find_wildcard_match(state->pattern, child,
+                                      state->case_sensitive) ||
                 find_child_seen(state, child))
                 continue;
             fill_find_data_values(data, size, child, is_directory);
@@ -16173,7 +16986,9 @@ static bool find_next_entry(find_handle_t *state, LPWIN32_FIND_DATAA data)
             bool is_directory;
             if (!find_path_child(state->directory, osfs2_file_name(file), child,
                                  &is_directory) ||
-                !find_wildcard_match(state->pattern, child) ||
+                (state->directories_only && !is_directory) ||
+                !find_wildcard_match(state->pattern, child,
+                                      state->case_sensitive) ||
                 find_child_seen(state, child))
                 continue;
             state->next_idx = i + 1;
@@ -16183,13 +16998,16 @@ static bool find_next_entry(find_handle_t *state, LPWIN32_FIND_DATAA data)
         state->next_idx = limit;
     }
 
+    if (state->on_disk_only)
+        return false;
     for (int i = state->next_virtual_idx; i < K32_MAX_VIRTUAL_DIRS; i++) {
         char path[K32_VIRTUAL_DIR_PATH];
         char child[260];
         bool ignored;
         if (!k32_virtual_directory_copy(i, path) ||
             !find_path_child(state->directory, path, child, &ignored) ||
-            !find_wildcard_match(state->pattern, child) ||
+            !find_wildcard_match(state->pattern, child,
+                                  state->case_sensitive) ||
             find_child_seen(state, child))
             continue;
         state->next_virtual_idx = i + 1;
@@ -16200,21 +17018,29 @@ static bool find_next_entry(find_handle_t *state, LPWIN32_FIND_DATAA data)
     return false;
 }
 
-HANDLE WINAPI FindFirstFileA(PCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData)
+static HANDLE WINAPI FindFirstFileExA_k32(PCSTR lpFileName, DWORD info_level,
+                                           PVOID find_data, DWORD search_op,
+                                           PVOID search_filter, DWORD flags)
 {
+    LPWIN32_FIND_DATAA lpFindFileData = (LPWIN32_FIND_DATAA)find_data;
     static uint32_t trace_count;
     bool trace = trace_count < 32;
     if (trace_count == 32)
         serial_puts("[K32] further FindFirstFileA logs suppressed\n");
     trace_count++;
 
-    if (!lpFileName || !lpFindFileData) {
-        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
+    if (!lpFileName || !lpFindFileData || info_level > 1 || search_op > 2 ||
+        search_filter || (flags & ~7U)) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return INVALID_HANDLE_VALUE;
+    }
+    if (search_op == 2) { /* FindExSearchLimitToDevices */
+        SetLastError(50); /* ERROR_NOT_SUPPORTED */
         return INVALID_HANDLE_VALUE;
     }
 
     char path[260];
-    if (!win32_normalize_path(lpFileName, path)) {
+    if (!win32_resolve_file_path(lpFileName, path)) {
         g_last_error = 206; /* ERROR_FILENAME_EXCED_RANGE */
         return INVALID_HANDLE_VALUE;
     }
@@ -16245,6 +17071,9 @@ HANDLE WINAPI FindFirstFileA(PCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData
     memcpy(find_handles[slot].pattern, pattern, pattern_len + 1);
     find_handles[slot].next_idx = 0;
     find_handles[slot].next_virtual_idx = 0;
+    find_handles[slot].case_sensitive = (flags & 1U) != 0;
+    find_handles[slot].directories_only = search_op == 1;
+    find_handles[slot].on_disk_only = (flags & 4U) != 0;
     memset(find_handles[slot].seen, 0, sizeof(find_handles[slot].seen));
     find_handles[slot].use_osfs3_index = osfs3_is_mounted();
     memset(&find_handles[slot].osfs3_cursor, 0,
@@ -16275,6 +17104,11 @@ HANDLE WINAPI FindFirstFileA(PCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData
     }
 
     return (HANDLE)(ULONG_PTR)(slot + 0x100);  /* offset to avoid NULL */
+}
+
+HANDLE WINAPI FindFirstFileA(PCSTR file_name, LPWIN32_FIND_DATAA find_data)
+{
+    return FindFirstFileExA_k32(file_name, 0, find_data, 0, NULL, 0);
 }
 
 BOOL WINAPI FindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData)
@@ -16332,15 +17166,32 @@ static HANDLE WINAPI FindFirstFileExW_k32(PCWSTR file_name, DWORD info_level,
                                            PVOID find_data, DWORD search_op,
                                            PVOID search_filter, DWORD flags)
 {
-    (void)info_level;
-    (void)search_op;
-    (void)search_filter;
-    (void)flags;
     if (!file_name || !find_data) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return INVALID_HANDLE_VALUE;
     }
-    return FindFirstFileW(file_name, (LPWIN32_FIND_DATAW)find_data);
+    char narrow[260];
+    unsigned i = 0;
+    while (file_name[i] && i < sizeof(narrow) - 1) {
+        narrow[i] = (char)file_name[i];
+        i++;
+    }
+    if (file_name[i]) {
+        SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
+        return INVALID_HANDLE_VALUE;
+    }
+    narrow[i] = 0;
+    WIN32_FIND_DATAA data_a;
+    HANDLE handle = FindFirstFileExA_k32(narrow, info_level, &data_a,
+                                          search_op, search_filter, flags);
+    if (handle == INVALID_HANDLE_VALUE)
+        return handle;
+    LPWIN32_FIND_DATAW data_w = (LPWIN32_FIND_DATAW)find_data;
+    memset(data_w, 0, sizeof(*data_w));
+    memcpy(data_w, &data_a, __builtin_offsetof(WIN32_FIND_DATAA, cFileName));
+    for (i = 0; data_a.cFileName[i] && i < 259; i++)
+        data_w->cFileName[i] = (WCHAR)(unsigned char)data_a.cFileName[i];
+    return handle;
 }
 
 BOOL WINAPI FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)
@@ -16790,6 +17641,24 @@ ULONG WINAPI RemoveVectoredExceptionHandler(PVOID handle)
     return 0;
 }
 
+static void WINAPI FatalAppExitA(UINT action, PCSTR message)
+{
+    (void)action; /* Reserved by Win32; callers pass zero. */
+    MessageBoxA(NULL, message, "Fatal application error", 0x10U);
+    ExitProcess(0);
+}
+
+static void WINAPI FatalAppExitW(UINT action, PCWSTR message)
+{
+    (void)action;
+    static const WCHAR caption[] = {
+        'F','a','t','a','l',' ','a','p','p','l','i','c','a','t','i','o','n',
+        ' ','e','r','r','o','r',0
+    };
+    MessageBoxW(NULL, message, caption, 0x10U);
+    ExitProcess(0);
+}
+
 void WINAPI OutputDebugStringA(PCSTR lpOutputString)
 {
     if (lpOutputString) {
@@ -17107,73 +17976,134 @@ void WINAPI win32_raise_exception_impl(
 
 extern void WINAPI win32_debug_break_entry(void);
 
+static BOOL k32_diagnostic_copy(PVOID output, PCVOID source, SIZE_T size)
+{
+    if (!k32_range_readable(source, size))
+        return FALSE;
+#ifdef TEST_HARNESS
+    for (SIZE_T i = 0; i < size; i++)
+        ((BYTE *)output)[i] = ((const BYTE *)source)[i];
+    return TRUE;
+#else
+    uint64_t cr3, copied = 0;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    /* Keep translation and copying under the paging lock: a range check
+     * alone does not protect a raw read from concurrent unmapping. */
+    return paging_copy_between_cr3(cr3, (uint64_t)(ULONG_PTR)output,
+                                  cr3, (uint64_t)(ULONG_PTR)source,
+                                  size, &copied) == 0 && copied == size;
+#endif
+}
+
 /*
  * UnhandledExceptionFilter — default top-level filter.
  * Returns EXCEPTION_EXECUTE_HANDLER to terminate the process.
  */
 LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS ExceptionInfo)
 {
-    PEXCEPTION_RECORD record = ExceptionInfo ? ExceptionInfo->ExceptionRecord : NULL;
-    if (g_compat32_mode && ExceptionInfo)
-        record = (PEXCEPTION_RECORD)(ULONG_PTR)*(uint32_t *)ExceptionInfo;
+    BOOL compat32 = g_compat32_mode;
+    EXCEPTION_POINTERS pointers;
+    if (!ExceptionInfo)
+        return EXCEPTION_EXECUTE_HANDLER;
+    if (compat32) {
+        uint32_t pointers32[2];
+        if (!k32_diagnostic_copy(pointers32, ExceptionInfo, sizeof(pointers32))) {
+            serial_puts("[SEH] UnhandledExceptionFilter: pointers unreadable\n");
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+        pointers.ExceptionRecord = (PEXCEPTION_RECORD)(ULONG_PTR)pointers32[0];
+        pointers.ContextRecord = (PCONTEXT)(ULONG_PTR)pointers32[1];
+    } else if (!k32_diagnostic_copy(&pointers, ExceptionInfo, sizeof(pointers))) {
+        serial_puts("[SEH] UnhandledExceptionFilter: pointers unreadable\n");
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    if (!pointers.ExceptionRecord)
+        return EXCEPTION_EXECUTE_HANDLER;
 
-    if (record) {
-        ULONG_PTR exception_address = g_compat32_mode
-            ? *(uint32_t *)((BYTE *)record + 12)
-            : (ULONG_PTR)record->ExceptionAddress;
-        serial_puts("[SEH] UnhandledExceptionFilter: mode=");
-        serial_puts(g_compat32_mode ? "32" : "64");
-        serial_puts(" code=0x");
-        serial_puthex(record->ExceptionCode, 8);
-        serial_puts(" address=0x");
-        serial_puthex(exception_address, g_compat32_mode ? 8 : 16);
-        serial_puts("\n");
-        if (!g_compat32_mode && ExceptionInfo->ContextRecord) {
-            ULONG_PTR rsp = *(ULONG_PTR *)((BYTE *)ExceptionInfo->ContextRecord + 0x98);
+    DWORD code;
+    ULONG_PTR exception_address;
+    if (compat32) {
+        uint32_t header32[4]; /* code, flags, chained record, address */
+        if (!k32_diagnostic_copy(header32, pointers.ExceptionRecord,
+                                 sizeof(header32))) {
+            serial_puts("[SEH] UnhandledExceptionFilter: record unreadable\n");
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+        code = header32[0];
+        exception_address = header32[3];
+    } else {
+        EXCEPTION_RECORD record;
+        if (!k32_diagnostic_copy(&record, pointers.ExceptionRecord,
+                                 __builtin_offsetof(EXCEPTION_RECORD,
+                                                    NumberParameters))) {
+            serial_puts("[SEH] UnhandledExceptionFilter: record unreadable\n");
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+        code = record.ExceptionCode;
+        exception_address = (ULONG_PTR)record.ExceptionAddress;
+    }
+
+    serial_puts("[SEH] UnhandledExceptionFilter: mode=");
+    serial_puts(compat32 ? "32" : "64");
+    serial_puts(" code=0x");
+    serial_puthex(code, 8);
+    serial_puts(" address=0x");
+    serial_puthex(exception_address, compat32 ? 8 : 16);
+    serial_puts("\n");
+    if (!compat32 && pointers.ContextRecord) {
+        CONTEXT context;
+        if (!k32_diagnostic_copy(&context, pointers.ContextRecord,
+                                 __builtin_offsetof(CONTEXT, Rsp) +
+                                 sizeof(context.Rsp))) {
+            serial_puts("[SEH64-STACK] context=<unmapped>\n");
+        } else {
+            ULONG_PTR rsp = context.Rsp;
             serial_puts("[SEH64-STACK] rsp=0x");
             serial_puthex(rsp, 16);
             for (int i = 0; i < 256; i++) {
-                ULONG_PTR value = ((ULONG_PTR *)rsp)[i];
+                ULONG_PTR value, offset = (ULONG_PTR)i * sizeof(value);
+                if (rsp + offset < rsp ||
+                    !k32_diagnostic_copy(&value, (PCVOID)(rsp + offset),
+                                         sizeof(value))) {
+                    serial_puts(" +");
+                    serial_puthex(offset, 4);
+                    serial_puts("=<unmapped>");
+                    break;
+                }
                 LOADED_MODULE *module = dll_find_module_by_address((PVOID)value);
                 if (!module) continue;
                 serial_puts(" +");
-                serial_puthex((ULONG_PTR)i * sizeof(ULONG_PTR), 4);
+                serial_puthex(offset, 4);
                 serial_puts("=");
                 serial_puts(module->name);
                 serial_puts("+0x");
                 serial_puthex(value - (ULONG_PTR)module->image.ImageBase, 8);
             }
             serial_puts("\n");
-            ULONG_PTR file = *(ULONG_PTR *)(rsp + 0x220);
-            serial_puts("[SEH64-LOWIO] file=0x");
-            serial_puthex(file, 16);
-            for (int i = 0; i < 6; i++) {
-                serial_puts(" +");
-                serial_puthex((ULONG_PTR)i * sizeof(ULONG_PTR), 2);
-                serial_puts("=0x");
-                serial_puthex(((ULONG_PTR *)file)[i], 16);
-            }
-            serial_puts("\n");
         }
-        if (g_compat32_mode) {
-            extern uint32_t compat32_get_last_user_ebp(void);
-            uint32_t frame = compat32_get_last_user_ebp();
-            serial_puts("[GS-EBP]");
-            for (uint32_t i = 0; i < 4; i++) {
-                if (frame < 0x10000 || frame >= 0x7FFF0000) break;
-                uint32_t parent = *(volatile uint32_t *)(uintptr_t)frame;
-                uint32_t ret = *(volatile uint32_t *)(uintptr_t)(frame + 4);
-                serial_puts(" f"); serial_putdec(i);
-                serial_puts("=0x"); serial_puthex(frame, 8);
-                serial_puts(" r=0x"); serial_puthex(ret, 8);
-                if (parent <= frame || parent >= 0x7FFF0000) break;
-                frame = parent;
-            }
-            serial_puts("\n");
-        }
-        extern void compat32_dump_recent_calls(void);
-        compat32_dump_recent_calls();
     }
+    if (compat32) {
+        extern uint32_t compat32_get_last_user_ebp(void);
+        uint32_t frame = compat32_get_last_user_ebp();
+        serial_puts("[GS-EBP]");
+        for (uint32_t i = 0; i < 4; i++) {
+            if (frame < 0x10000 || frame >= 0x7FFF0000) break;
+            uint32_t pair[2];
+            if (!k32_diagnostic_copy(pair, (PCVOID)(ULONG_PTR)frame,
+                                     sizeof(pair))) {
+                serial_puts(" <unmapped>");
+                break;
+            }
+            serial_puts(" f"); serial_putdec(i);
+            serial_puts("=0x"); serial_puthex(frame, 8);
+            serial_puts(" r=0x"); serial_puthex(pair[1], 8);
+            if (pair[0] <= frame || pair[0] >= 0x7FFF0000) break;
+            frame = pair[0];
+        }
+        serial_puts("\n");
+    }
+    extern void compat32_dump_recent_calls(void);
+    compat32_dump_recent_calls();
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -17332,6 +18262,17 @@ void WINAPI InitializeSListHead(PVOID list_head)
         head->region = 1; /* HeaderX64 */
     }
     k32_slist_unlock_irqrestore(flags);
+}
+
+static WORD WINAPI QueryDepthSList_k32(PCVOID list_head)
+{
+    if (!list_head)
+        return 0;
+    uint64_t flags = k32_slist_lock_irqsave();
+    uint64_t value = *(const uint64_t *)list_head;
+    WORD depth = g_compat32_mode ? (WORD)(value >> 32) : (WORD)value;
+    k32_slist_unlock_irqrestore(flags);
+    return depth;
 }
 
 PVOID WINAPI InterlockedPushEntrySList(PVOID list_head, PVOID list_entry)
@@ -17824,7 +18765,7 @@ static BOOL process_extract_image(PCSTR app, PCSTR command, char path[260])
             return FALSE;
     }
     raw[length] = 0;
-    return win32_normalize_path(raw, path);
+    return win32_resolve_file_path(raw, path);
 }
 
 static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles,
@@ -17832,7 +18773,8 @@ static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles
                                   PCSTR current_directory,
                                   PVOID startup_info, PVOID information,
                                   PHANDLE launched_process,
-                                  PHANDLE launched_thread)
+                                  PHANDLE launched_thread, PCVOID primary_token,
+                                  PCWSTR wide_command)
 {
     if (launched_process) *launched_process = NULL;
     if (launched_thread) *launched_thread = NULL;
@@ -17848,7 +18790,9 @@ static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles
             SetLastError(206); /* ERROR_FILENAME_EXCED_RANGE */
             return FALSE;
         }
-        if (!win32_directory_exists_normalized(normalized_directory)) {
+        char physical_directory[260];
+        if (!win32_resolve_file_path(current_directory, physical_directory) ||
+            !win32_directory_exists_normalized(physical_directory)) {
             SetLastError(267); /* ERROR_DIRECTORY */
             return FALSE;
         }
@@ -17863,16 +18807,66 @@ static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles
 
     PCSTR command_to_spawn = command && *command ? command : app;
 
+    K32_CONSOLE_STARTUP console_startup = {0};
+    if (startup_info) {
+        const BYTE *startup = (const BYTE *)startup_info;
+        DWORD minimum_size = g_compat32_mode ? 68 : 104;
+        if (*(const DWORD *)startup < minimum_size) {
+            SetLastError(87);
+            return FALSE;
+        }
+        DWORD startup_flags = *(const DWORD *)(startup +
+                                                (g_compat32_mode ? 44 : 60));
+        console_startup.use_std_handles = (startup_flags & 0x100U) != 0;
+        if (console_startup.use_std_handles) {
+            if (g_compat32_mode) {
+                console_startup.input = (HANDLE)(ULONG_PTR)*(const DWORD *)(startup + 56);
+                console_startup.output = (HANDLE)(ULONG_PTR)*(const DWORD *)(startup + 60);
+                console_startup.error = (HANDLE)(ULONG_PTR)*(const DWORD *)(startup + 64);
+            } else {
+                console_startup.input = *(const HANDLE *)(startup + 80);
+                console_startup.output = *(const HANDLE *)(startup + 88);
+                console_startup.error = *(const HANDLE *)(startup + 96);
+            }
+        }
+    }
+
     HANDLE retained[K32_MAX_INHERITED_HANDLES];
     DWORD retained_count = 0;
+    BOOL inherit_all = FALSE;
     if (!process_retain_inherited_handles(startup_info, flags,
                                           inherit_handles, retained,
-                                          &retained_count))
+                                          &retained_count, &inherit_all))
         return FALSE;
+
+    if (!inherit_all && inherit_handles && console_startup.use_std_handles &&
+        !(flags & K32_EXTENDED_STARTUPINFO_PRESENT)) {
+        HANDLE standard[] = { console_startup.input, console_startup.output,
+                              console_startup.error };
+        DWORD owner_pid = GetCurrentProcessId();
+        if (!owner_pid) owner_pid = 1;
+        for (DWORD i = 0; i < 3; i++) {
+            if (standard[i] == (HANDLE)(ULONG_PTR)4 ||
+                standard[i] == (HANDLE)(ULONG_PTR)8 ||
+                standard[i] == (HANDLE)(ULONG_PTR)12)
+                continue;
+            ULONG handle_flags = 0;
+            /* Windows copies even invalid STARTUPINFO handles verbatim.
+             * Only inheritable redirected objects gain a child reference. */
+            if (!NT_SUCCESS(handle_query_flags_for_process(
+                    &g_handle_table, standard[i], owner_pid, &handle_flags)) ||
+                !(handle_flags & 1U))
+                continue;
+            DWORD j = 0;
+            while (j < retained_count && retained[j] != standard[i]) j++;
+            if (j == retained_count) retained[retained_count++] = standard[i];
+        }
+    }
 
     extern NTSTATUS win32_spawn_child(const char *, const char *, const char *,
                                       PCVOID, PHANDLE, PHANDLE, DWORD *, DWORD *,
-                                      const HANDLE *, DWORD, DWORD);
+                                      const HANDLE *, DWORD, DWORD, BOOL,
+                                      const K32_CONSOLE_STARTUP *, PCVOID, PCWSTR);
     HANDLE process = NULL;
     HANDLE thread = NULL;
     DWORD process_id = 0;
@@ -17880,7 +18874,8 @@ static BOOL create_process_common(PCSTR app, PCSTR command, BOOL inherit_handles
     NTSTATUS status = win32_spawn_child(
         image_path, command_to_spawn, directory_to_spawn, environment,
         &process, &thread, &process_id, &thread_id,
-        retained, retained_count, flags);
+        retained, retained_count, flags, inherit_all, &console_startup,
+        primary_token, wide_command);
     if (!NT_SUCCESS(status)) {
         serial_puts("[K32] CreateProcess -> failed status=0x");
         serial_puthex((uint32_t)status, 8);
@@ -17912,13 +18907,35 @@ BOOL kernel32_launch_process_a(PCSTR application, PCSTR command_line,
     HANDLE thread = NULL;
     if (!create_process_common(application, command_line, FALSE, 0, NULL,
                                current_directory, NULL, NULL,
-                               &process, &thread))
+                               &process, &thread, NULL, NULL))
         return FALSE;
 
     if (thread && thread != NT_CURRENT_THREAD)
         CloseHandle(thread);
     if (process && process != NT_CURRENT_PROCESS)
         CloseHandle(process);
+    SetLastError(0);
+    return TRUE;
+}
+
+/* Native outputs keep an internal caller independent of PROCESS_INFORMATION's
+ * PE32 layout. The returned process handle belongs to the caller. */
+BOOL kernel32_launch_process_ex_a(PCSTR application, PCSTR command_line,
+                                  PCSTR directory, DWORD flags, WORD show,
+                                  PHANDLE process_out)
+{
+    HANDLE process = NULL, thread = NULL;
+    BYTE startup[104] = {0};
+    *(DWORD *)startup = g_compat32_mode ? 68 : 104;
+    *(DWORD *)(startup + (g_compat32_mode ? 44 : 60)) = 1; /* STARTF_USESHOWWINDOW */
+    *(WORD *)(startup + (g_compat32_mode ? 48 : 64)) = show;
+    if (process_out) *process_out = NULL;
+    if (!create_process_common(application, command_line, FALSE, flags, NULL,
+                               directory, startup, NULL, &process, &thread, NULL, NULL))
+        return FALSE;
+    if (thread && thread != NT_CURRENT_THREAD) CloseHandle(thread);
+    if (process_out) *process_out = process;
+    else if (process && process != NT_CURRENT_PROCESS) CloseHandle(process);
     SetLastError(0);
     return TRUE;
 }
@@ -17933,10 +18950,11 @@ BOOL WINAPI CreateProcessA(PCSTR lpApp, PSTR lpCmd, PVOID a, PVOID b,
     if (lpCmd) serial_puts(lpCmd);
     serial_puts("\n");
     return create_process_common(lpApp, lpCmd, c, d, e, f, g, h,
-                                 NULL, NULL);
+                                 NULL, NULL, NULL, NULL);
 }
 
-BOOL WINAPI CreateProcessW(PCWSTR lpApp, PWSTR lpCmd, PVOID a, PVOID b,
+BOOL kernel32_create_process_token_w(PCVOID primary_token,
+                            PCWSTR lpApp, PWSTR lpCmd, PVOID a, PVOID b,
                             BOOL c, DWORD d, PVOID e, PCWSTR f, PVOID g, PVOID h)
 {
     (void)a; (void)b;
@@ -17981,7 +18999,17 @@ BOOL WINAPI CreateProcessW(PCWSTR lpApp, PWSTR lpCmd, PVOID a, PVOID b,
     return create_process_common(lpApp ? app_ascii : NULL,
                                  lpCmd ? cmd_ascii : NULL, c, d,
                                  e, f ? directory_ascii : NULL, g, h,
-                                 NULL, NULL);
+                                 NULL, NULL, primary_token,
+                                 lpCmd && *lpCmd ? lpCmd : lpApp);
+}
+
+BOOL WINAPI CreateProcessW(PCWSTR app, PWSTR command, PVOID process_attributes,
+    PVOID thread_attributes, BOOL inherit_handles, DWORD flags, PVOID environment,
+    PCWSTR directory, PVOID startup, PVOID information)
+{
+    return kernel32_create_process_token_w(NULL, app, command, process_attributes,
+        thread_attributes, inherit_handles, flags, environment, directory,
+        startup, information);
 }
 
 #define K32_FORMAT_MESSAGE_ALLOCATE_BUFFER 0x00000100U
@@ -18226,9 +19254,9 @@ BOOL WINAPI GetExitCodeProcess(HANDLE hProcess, DWORD *lpExitCode)
         *lpExitCode = 259; /* STILL_ACTIVE */
         return TRUE;
     }
-    extern BOOL nt_process_exit_code(HANDLE handle, DWORD *exit_code);
-    if (!nt_process_exit_code(hProcess, lpExitCode)) {
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+    NTSTATUS status = nt_process_query_identity(hProcess, NULL, lpExitCode);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
         return FALSE;
     }
     return TRUE;
@@ -18318,23 +19346,14 @@ static int WINAPI GetTimeFormatEx_k32(PCWSTR locale_name, DWORD flags,
 
 DWORD WINAPI GetVersion(void)
 {
-    /* Windows 10 22H2: major=10, minor=0, build=19045 */
-    return (WIN32_NT_VERSION_BUILD << 16) |
-           (WIN32_NT_VERSION_MINOR << 8) | WIN32_NT_VERSION_MAJOR;
+    DWORD version[3];
+    k32_process_version(version);
+    return (version[2] << 16) | (version[1] << 8) | version[0];
 }
 
 BOOL WINAPI GetVersionExW(PVOID lpVersionInformation)
 {
-    if (!lpVersionInformation) return FALSE;
-    BYTE *p = (BYTE *)lpVersionInformation;
-    /* Zero everything first (at least 276 bytes for OSVERSIONINFOW) */
-    for (int i = 0; i < 276; i++) p[i] = 0;
-    *(DWORD *)(p + 0)  = 276;  /* dwOSVersionInfoSize */
-    *(DWORD *)(p + 4)  = WIN32_NT_VERSION_MAJOR;
-    *(DWORD *)(p + 8)  = WIN32_NT_VERSION_MINOR;
-    *(DWORD *)(p + 12) = WIN32_NT_VERSION_BUILD;
-    *(DWORD *)(p + 16) = WIN32_NT_PLATFORM_ID;
-    return TRUE;
+    return k32_get_version_info(lpVersionInformation, TRUE);
 }
 
 #define K32_VER_EQUAL         1U
@@ -18367,11 +19386,14 @@ static uint64_t WINAPI VerSetConditionMask_k32(uint32_t mask_lo,
 {
     uint64_t mask = ((uint64_t)mask_hi << 32) | mask_lo;
     condition &= 7U;
-    for (uint32_t bit = 0; bit < 8; bit++) {
+    /* The native API sets the highest requested field. Callers normally pass
+     * one VER_* bit per call; preserve that behavior for combined masks too. */
+    for (uint32_t index = 8; index; index--) {
+        uint32_t bit = index - 1;
         if (type_mask & (1U << bit)) {
             uint32_t shift = bit * 3;
-            mask = (mask & ~(7ULL << shift)) |
-                   ((uint64_t)condition << shift);
+            mask |= (uint64_t)condition << shift;
+            break;
         }
     }
     return mask;
@@ -18388,9 +19410,18 @@ static uint64_t WINAPI VerSetConditionMask_k64(uint64_t mask,
 static BOOL verify_version_info(PVOID version_info, DWORD type_mask,
                                 uint64_t mask, BOOL wide)
 {
-    if (!version_info || !type_mask || (type_mask & ~0xFFU)) {
+    if (!version_info || (type_mask & ~0xFFU)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
+    }
+    if (!type_mask) {
+        SetLastError(160); /* ERROR_BAD_ARGUMENTS */
+        return FALSE;
+    }
+
+    if (!win32_user_range_readable(version_info, wide ? 284 : 156,
+                                    g_compat32_mode)) {
+        SetLastError(998); return FALSE;
     }
 
     const BYTE *p = (const BYTE *)version_info;
@@ -18401,11 +19432,10 @@ static BOOL verify_version_info(PVOID version_info, DWORD type_mask,
         return FALSE;
     }
 
-    uint32_t current[8] = {
-        WIN32_NT_VERSION_MINOR, WIN32_NT_VERSION_MAJOR,
-        WIN32_NT_VERSION_BUILD, WIN32_NT_PLATFORM_ID,
-        0, 0, 0, 1 /* VER_NT_WORKSTATION */
-    };
+    DWORD version[3];
+    k32_process_version(version);
+    uint32_t current[8] = {version[1], version[0], version[2],
+        WIN32_NT_PLATFORM_ID, 0, 0, 0x100, 1};
     uint32_t requested[8] = {
         *(const DWORD *)(p + 8), *(const DWORD *)(p + 4),
         *(const DWORD *)(p + 12), *(const DWORD *)(p + 16),
@@ -18420,12 +19450,40 @@ static BOOL verify_version_info(PVOID version_info, DWORD type_mask,
     }
 
     for (uint32_t bit = 0; bit < 8; bit++) {
-        if ((type_mask & (1U << bit)) &&
+        if ((type_mask & (1U << bit)) && !(0x33U & (1U << bit)) &&
             !version_field_matches(current[bit], requested[bit],
                                    (uint32_t)((mask >> (bit * 3)) & 7U))) {
             SetLastError(1150); /* ERROR_OLD_WIN_VERSION */
             return FALSE;
         }
+    }
+    /* Version, minor version and service pack form one ordered tuple. A
+     * strictly higher major version satisfies >= even with a smaller minor. */
+    const BYTE order[] = {1, 0, 5, 4};
+    uint32_t condition = K32_VER_EQUAL;
+    for (uint32_t i = 0; i < sizeof(order); i++) {
+        uint32_t bit = order[i];
+        if (!(type_mask & (1U << bit))) continue;
+        if (condition == K32_VER_EQUAL)
+            condition = (uint32_t)((mask >> (bit * 3)) & 7U);
+        if (condition < K32_VER_EQUAL || condition > K32_VER_LESS_EQUAL) {
+            SetLastError(1150); return FALSE;
+        }
+        if (current[bit] == requested[bit]) continue;
+        /* The native tuple comparison interprets the DWORD version fields
+         * as signed values, including a requested minor version of -1. */
+        uint32_t lhs = current[bit], rhs = requested[bit];
+        if (bit == 0 || bit == 1) { lhs ^= 0x80000000U; rhs ^= 0x80000000U; }
+        if (!version_field_matches(lhs, rhs, condition)) {
+            SetLastError(1150); return FALSE;
+        }
+        return TRUE;
+    }
+    /* Native callers omitting the final service-pack field also omit this
+     * final strict comparison; equal major/minor alone pass GREATER/LESS. */
+    if ((type_mask & 0x10U) &&
+        (condition == K32_VER_GREATER || condition == K32_VER_LESS)) {
+        SetLastError(1150); return FALSE;
     }
     return TRUE;
 }
@@ -18489,9 +19547,11 @@ BOOL WINAPI TerminateProcess(HANDLE hProcess, UINT uExitCode)
             proc_debug_dump_pid((uint32_t)ctx->kernel_pid);
         }
     }
-    if (hProcess == NT_CURRENT_PROCESS || !hProcess) {
-        ExitProcess(uExitCode);
-        return TRUE;
+    if (hProcess == NT_CURRENT_PROCESS ||
+        (g_compat32_mode && (ULONG_PTR)hProcess == UINT32_MAX)) {
+        /* Forced termination never runs DLL/TLS process-detach callbacks. */
+        return NT_SUCCESS(NtTerminateProcess(NT_CURRENT_PROCESS,
+                                             (NTSTATUS)uExitCode));
     }
     extern BOOL win32_terminate_child(HANDLE, NTSTATUS);
     if (win32_terminate_child(hProcess, (NTSTATUS)uExitCode)) return TRUE;
@@ -18571,7 +19631,7 @@ static BOOL WINAPI HeapUnlock_k32(HANDLE heap)
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
-    if (!heap_lock_owned_by_current()) {
+    if (!kernel32_heap_lock_owned_by_current()) {
         SetLastError(158); /* ERROR_NOT_LOCKED */
         return FALSE;
     }
@@ -18675,27 +19735,22 @@ void WINAPI __attribute__((noreturn)) ExitThread(DWORD dwExitCode)
      * not for forced TerminateThread).  Do this while the thread's TEB and
      * stack are still valid. */
     if (ctx->compat32) {
-        dll_notify_thread(DLL_THREAD_DETACH);
         win32_tls_detach_thread();
-        win32_thread_release_tls32_environment(ctx);
     } else {
-        dll_notify_thread(DLL_THREAD_DETACH);
         win64_tls_detach_thread(ctx, TRUE);
     }
     ctx->exit_code = dwExitCode;
 
-    /* A PE64 worker entered through win32_thread_entry_common has a saved
+    /* A worker entered through win32_thread_entry_common has a saved
      * continuation on the scheduler stack. Unwind there so stack release and
      * NT object signaling follow the same order as a normal thread return. */
-    if (!ctx->compat32 &&
-        __atomic_load_n(&ctx->exit_jmp_ready, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&ctx->exit_jmp_ready, __ATOMIC_ACQUIRE)) {
         kern_longjmp(ctx->exit_jmpbuf, 1);
         __builtin_unreachable();
     }
 
-    /* Compat32 still needs its callback gate to unwind before its PE stack can
-     * be reclaimed. Keep the context active for the scheduler reaper rather
-     * than publishing termination from a live INT 0x2E frame. */
+    /* A context that has not entered its dispatch continuation cannot release
+     * its live stack here. Retain it for process teardown. */
     proc_exit((int32_t)dwExitCode);
     __builtin_unreachable();
 }
@@ -18947,8 +20002,8 @@ BOOL WINAPI SetEnvironmentVariableW(PCWSTR lpName, PCWSTR lpValue)
 }
 
 static const K32_ENV_VALUE k32_environment[] = {
-    { "WINDIR",              "C:\\Windows" },
-    { "SYSTEMROOT",          "C:\\Windows" },
+    { "WINDIR",              WIN32_WINDOWS_DIRECTORY },
+    { "SYSTEMROOT",          WIN32_WINDOWS_DIRECTORY },
     { "TEMP",                "C:\\Temp" },
     { "TMP",                 "C:\\Temp" },
     { "LOCALAPPDATA",        "C:\\Users\\osito\\AppData\\Local" },
@@ -18961,7 +20016,7 @@ static const K32_ENV_VALUE k32_environment[] = {
     { "HOMEPATH",            "\\Users\\osito" },
     { "USERNAME",            "osito" },
     { "COMPUTERNAME",        "OSITOK" },
-    { "PATH",                "C:\\Windows\\System32;C:\\Windows" },
+    { "PATH",                WIN32_DEFAULT_PATH },
     { NULL, NULL }
 };
 
@@ -19379,6 +20434,8 @@ NTSTATUS kernel32_inherit_process_environment(DWORD parent_pid,
 void kernel32_release_process_environment(DWORD process_id)
 {
     if (!process_id) return;
+    /* Also covers a forced child exit before it published an exit context. */
+    nt_file_io_guards_release_process(process_id);
     uint64_t irq_flags = k32_environment_lock_irqsave();
     for (int i = 0; i < K32_MAX_DYNAMIC_ENV; i++) {
         if (k32_dynamic_environment[i].used &&
@@ -19678,6 +20735,10 @@ static DWORD WINAPI GetSystemDefaultLCID_k32(void) { return 0x0409; }
 static DWORD WINAPI GetThreadLocale_k32(void) { return 0x0409; }
 WORD WINAPI GetUserDefaultLangID(void) { return (WORD)GetUserDefaultLCID(); }
 static WORD WINAPI GetUserDefaultUILanguage_k32(void) { return 0x0409; }
+static WORD WINAPI GetSystemDefaultUILanguage_k32(void)
+{
+    return (WORD)GetSystemDefaultLCID_k32();
+}
 LONG WINAPI GetUserGeoID(DWORD geo_class)
 {
     if (geo_class == 16) /* GEOCLASS_NATION */
@@ -20080,13 +21141,20 @@ int WINAPI CompareStringOrdinal(PCWSTR string1, int count1,
 
 int WINAPI CompareStringA(DWORD loc, DWORD flags, PCSTR s1, int c1, PCSTR s2, int c2)
 {
-    (void)loc; (void)flags;
+    (void)loc;
     if (c1 < 0) { int n=0; while(s1[n]) n++; c1 = n; }
     if (c2 < 0) { int n=0; while(s2[n]) n++; c2 = n; }
     int n = c1 < c2 ? c1 : c2;
     for (int i = 0; i < n; i++) {
-        if ((unsigned char)s1[i] < (unsigned char)s2[i]) return 1; /* CSTR_LESS_THAN */
-        if ((unsigned char)s1[i] > (unsigned char)s2[i]) return 3; /* CSTR_GREATER_THAN */
+        unsigned char a = (unsigned char)s1[i], b = (unsigned char)s2[i];
+        /* Preserve the existing byte collation; NORM_IGNORECASE must at
+         * least match ASCII filenames independently of their casing. */
+        if (flags & 0x1U) {
+            if (a >= 'a' && a <= 'z') a -= 'a' - 'A';
+            if (b >= 'a' && b <= 'z') b -= 'a' - 'A';
+        }
+        if (a < b) return 1; /* CSTR_LESS_THAN */
+        if (a > b) return 3; /* CSTR_GREATER_THAN */
     }
     if (c1 < c2) return 1;
     if (c1 > c2) return 3;
@@ -20094,13 +21162,18 @@ int WINAPI CompareStringA(DWORD loc, DWORD flags, PCSTR s1, int c1, PCSTR s2, in
 }
 int WINAPI CompareStringW(DWORD loc, DWORD flags, PCWSTR s1, int c1, PCWSTR s2, int c2)
 {
-    (void)loc; (void)flags;
+    (void)loc;
     if (c1 < 0) { int n=0; while(s1[n]) n++; c1 = n; }
     if (c2 < 0) { int n=0; while(s2[n]) n++; c2 = n; }
     int n = c1 < c2 ? c1 : c2;
     for (int i = 0; i < n; i++) {
-        if (s1[i] < s2[i]) return 1;
-        if (s1[i] > s2[i]) return 3;
+        WCHAR a = s1[i], b = s2[i];
+        if (flags & 0x1U) { /* NORM_IGNORECASE; locale collation remains partial. */
+            a = k32_ordinal_upper(a);
+            b = k32_ordinal_upper(b);
+        }
+        if (a < b) return 1;
+        if (a > b) return 3;
     }
     if (c1 < c2) return 1;
     if (c1 > c2) return 3;
@@ -20591,12 +21664,29 @@ DWORD WINAPI GetFullPathNameW(PCWSTR lpFileName, DWORD nBufferLength,
     for (DWORD i = 0; i <= path_len; i++)
         lpBuffer[i + 3] = (WCHAR)(unsigned char)path[i];
     if (lpFilePart) {
-        *lpFilePart = lpBuffer;
+        PWSTR file_part = lpBuffer;
         for (DWORD i = 0; i < len; i++)
             if (lpBuffer[i] == '\\' || lpBuffer[i] == '/')
-                *lpFilePart = lpBuffer + i + 1;
+                file_part = lpBuffer + i + 1;
+        if (g_compat32_mode)
+            *(uint32_t *)lpFilePart = (uint32_t)(ULONG_PTR)file_part;
+        else
+            *lpFilePart = file_part;
     }
     return len;
+}
+
+static DWORD WINAPI GetShortPathNameA_k32(PCSTR path, PSTR output, DWORD size)
+{
+    if (!path) { SetLastError(87); return 0; }
+    if (GetFileAttributesA(path) == 0xFFFFFFFFU) return 0;
+    /* OsitoFS has no DOS aliases. As on Windows filesystems without 8.3
+     * names, an existing long path is itself a usable result. */
+    DWORD length = (DWORD)strlen(path);
+    if (size <= length) return length + 1;
+    if (!output) { SetLastError(87); return 0; }
+    for (DWORD i = 0; i <= length; i++) output[i] = path[i];
+    return length;
 }
 
 static DWORD WINAPI GetLongPathNameW_k32(PCWSTR short_path, PWSTR long_path,
@@ -20754,13 +21844,12 @@ static BOOL WINAPI GetVolumeInformationA_k32(
 
 DWORD WINAPI GetFileAttributesW(PCWSTR lpFileName)
 {
-    if (!lpFileName) return (DWORD)-1;
-    /* Convert wide to narrow and delegate */
     char narrow[260];
-    int i = 0;
-    for (; lpFileName[i] && i < 259; i++)
-        narrow[i] = (char)(lpFileName[i] & 0xFF);
-    narrow[i] = 0;
+    DWORD error = k32_file_name_utf8(lpFileName, narrow);
+    if (error) {
+        SetLastError(error);
+        return (DWORD)-1;
+    }
     return GetFileAttributesA(narrow);
 }
 
@@ -20850,6 +21939,18 @@ static BOOL WINAPI GetFileAttributesExA_k32(
     }
     wide_name[length] = 0;
     return GetFileAttributesExW_k32(wide_name, info_level, data);
+}
+
+static LONG WINAPI CompareFileTime(PCVOID first, PCVOID second)
+{
+    if (!first || !second) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+    ULONGLONG a, b;
+    memcpy(&a, first, sizeof(a));
+    memcpy(&b, second, sizeof(b));
+    return a < b ? -1 : a > b ? 1 : 0;
 }
 
 BOOL WINAPI FileTimeToLocalFileTime(PCVOID lpFileTime, PVOID lpLocalFileTime)
@@ -21613,7 +22714,7 @@ static BOOL k32_file_info_path(HANDLE root_handle, const WCHAR *wide_name,
         return TRUE;
     }
 
-    if (!win32_normalize_path(raw, path)) {
+    if (!win32_resolve_file_path(raw, path)) {
         SetLastError(206);
         return FALSE;
     }
@@ -22084,8 +23185,8 @@ static BOOL k32_resource_ansi_identifier(PCSTR value, WCHAR *buffer,
     return TRUE;
 }
 
-static HANDLE WINAPI FindResourceW_k32(HANDLE module, PCWSTR name,
-                                        PCWSTR type)
+static HANDLE k32_find_resource_language(HANDLE module, PCWSTR name,
+                                          PCWSTR type, WORD requested)
 {
     K32_RESOURCE_VIEW view;
     if (!k32_resource_view(module, &view)) {
@@ -22113,7 +23214,33 @@ static HANDLE WINAPI FindResourceW_k32(HANDLE module, PCWSTR name,
         SetLastError(1815); /* ERROR_RESOURCE_LANG_NOT_FOUND */
         return NULL;
     }
-    K32_RESOURCE_ENTRY *language = (K32_RESOURCE_ENTRY *)(languages + 1);
+    BOOL automatic = requested == 0 || requested == 0x0400 || requested == 0x0800;
+    K32_RESOURCE_ENTRY *language = automatic
+        ? (K32_RESOURCE_ENTRY *)(languages + 1) : NULL;
+    WORD ui = requested == 0x0800 ? GetSystemDefaultUILanguage_k32()
+                                 : GetUserDefaultUILanguage_k32();
+    WORD candidates[6];
+    UINT count = 0;
+    if (automatic) {
+        /* Neutral FindResource prefers the neutral entry; the default-user
+         * and default-system LANGIDs start with their configured language. */
+        if (!requested) candidates[count++] = 0;
+        candidates[count++] = ui;
+        candidates[count++] = (WORD)(ui & 0x03FFU);
+        if (requested) candidates[count++] = 0;
+        candidates[count++] = GetSystemDefaultUILanguage_k32();
+        candidates[count++] = 0x0409;
+    } else {
+        candidates[count++] = requested;
+        candidates[count++] = (WORD)(requested & 0x03FFU);
+        candidates[count++] = 0;
+    }
+    for (UINT i = 0; i < count; i++) {
+        K32_RESOURCE_ENTRY *preferred = k32_resource_find(&view, language_dir,
+            (PCWSTR)(ULONG_PTR)candidates[i]);
+        if (preferred) { language = preferred; break; }
+    }
+    if (!language) { SetLastError(1815); return NULL; }
     if (language->OffsetToData & K32_RESOURCE_DATA_IS_DIR) {
         SetLastError(1812);
         return NULL;
@@ -22125,6 +23252,28 @@ static HANDLE WINAPI FindResourceW_k32(HANDLE module, PCWSTR name,
         return NULL;
     }
     return (HANDLE)(view.resource + data_offset);
+}
+
+static HANDLE WINAPI FindResourceW_k32(HANDLE module, PCWSTR name, PCWSTR type)
+{
+    return k32_find_resource_language(module, name, type, 0);
+}
+
+static HANDLE WINAPI FindResourceExW_k32(HANDLE module, PCWSTR type,
+                                         PCWSTR name, WORD language)
+{
+    return k32_find_resource_language(module, name, type, language);
+}
+
+static HANDLE WINAPI FindResourceExA_k32(HANDLE module, PCSTR type,
+                                         PCSTR name, WORD language)
+{
+    WCHAR name_buffer[256], type_buffer[256];
+    PCWSTR wide_name, wide_type;
+    if (!k32_resource_ansi_identifier(name, name_buffer, &wide_name, 1814) ||
+        !k32_resource_ansi_identifier(type, type_buffer, &wide_type, 1813))
+        return NULL;
+    return k32_find_resource_language(module, wide_name, wide_type, language);
 }
 
 static HANDLE WINAPI FindResourceA_k32(HANDLE module, PCSTR name, PCSTR type)
@@ -22139,6 +23288,59 @@ static HANDLE WINAPI FindResourceA_k32(HANDLE module, PCSTR name, PCSTR type)
                                       1813 /* ERROR_RESOURCE_TYPE_NOT_FOUND */))
         return NULL;
     return FindResourceW_k32(module, wide_name, wide_type);
+}
+
+typedef BOOL (WINAPI *K32_ENUM_RESOURCE_LANGUAGE_PROC)(
+    HANDLE module, PCSTR type, PCSTR name, WORD language, LONG_PTR context);
+
+static BOOL WINAPI EnumResourceLanguagesA_k32(
+    HANDLE module, PCSTR type, PCSTR name,
+    K32_ENUM_RESOURCE_LANGUAGE_PROC callback, LONG_PTR context)
+{
+    K32_RESOURCE_VIEW view;
+    WCHAR type_buffer[256], name_buffer[256];
+    PCWSTR wide_type, wide_name;
+    if (!callback) { SetLastError(87); return FALSE; }
+    if (!k32_resource_ansi_identifier(type, type_buffer, &wide_type, 1813) ||
+        !k32_resource_ansi_identifier(name, name_buffer, &wide_name, 1814))
+        return FALSE;
+    if (!k32_resource_view(module, &view)) {
+        SetLastError(1812); return FALSE;
+    }
+    K32_RESOURCE_ENTRY *entry = k32_resource_find(&view, 0, wide_type);
+    if (!entry || !(entry->OffsetToData & K32_RESOURCE_DATA_IS_DIR)) {
+        SetLastError(1813); return FALSE;
+    }
+    entry = k32_resource_find(&view,
+        entry->OffsetToData & ~K32_RESOURCE_DATA_IS_DIR, wide_name);
+    if (!entry || !(entry->OffsetToData & K32_RESOURCE_DATA_IS_DIR)) {
+        SetLastError(1814); return FALSE;
+    }
+    K32_RESOURCE_DIRECTORY *directory = k32_resource_directory(&view,
+        entry->OffsetToData & ~K32_RESOURCE_DATA_IS_DIR);
+    if (!directory) { SetLastError(1812); return FALSE; }
+    ULONG count = (ULONG)directory->NumberOfNamedEntries + directory->NumberOfIdEntries;
+    if (!count) { SetLastError(1815); return FALSE; }
+    K32_RESOURCE_ENTRY *languages = (K32_RESOURCE_ENTRY *)(directory + 1);
+    for (ULONG i = 0; i < count; i++) {
+        if (languages[i].Name & K32_RESOURCE_NAME_IS_STRING) continue;
+        WORD language = (WORD)languages[i].Name;
+        BOOL keep_going;
+        if (g_compat32_mode) {
+            uint32_t args[5] = {(uint32_t)(ULONG_PTR)module,
+                (uint32_t)(ULONG_PTR)type, (uint32_t)(ULONG_PTR)name,
+                language, (uint32_t)context};
+            keep_going = (BOOL)compat32_callback_args(
+                (uint32_t)(ULONG_PTR)callback, 5, args);
+        } else {
+            keep_going = callback(module, type, name, language, context);
+        }
+        if (!keep_going) {
+            SetLastError(15106); /* ERROR_RESOURCE_ENUM_USER_STOP */
+            return FALSE;
+        }
+    }
+    return TRUE;
 }
 
 static PVOID WINAPI LoadResource_k32(HANDLE module, HANDLE resource)
@@ -22230,6 +23432,25 @@ static BOOL WINAPI ReadConsoleInputA_stub(HANDLE h, INPUT_RECORD *buf, DWORD len
 {
     (void)h; (void)buf; (void)len;
     if (read) *read = 0;
+    return FALSE;
+}
+
+static BOOL WINAPI ReadConsoleInputW_k32(HANDLE input, INPUT_RECORD *buffer,
+                                           DWORD count, DWORD *read)
+{
+    if (read)
+        *read = 0;
+    if (!k32_is_console_input(input)) {
+        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+    if (!read || !buffer || !count) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return FALSE;
+    }
+    /* Like ReadConsoleW, record-mode input requires a console event backend.
+     * The current terminal supplies a byte stream, not KEY_EVENT_RECORDs. */
+    SetLastError(50); /* ERROR_NOT_SUPPORTED */
     return FALSE;
 }
 
@@ -22644,6 +23865,24 @@ static BOOL WINAPI LocalFileTimeToFileTime_stub(const void *local, void *utc)
     return TRUE;
 }
 
+static BOOL WINAPI DosDateTimeToFileTime_k32(WORD date, WORD time, void *out)
+{
+    if (!out) { SetLastError(87); return FALSE; }
+    WINTIME_CALENDAR calendar = {0};
+    calendar.year = 1980 + (date >> 9);
+    calendar.month = (date >> 5) & 15;
+    calendar.day = date & 31;
+    calendar.hour = time >> 11;
+    calendar.minute = (time >> 5) & 63;
+    calendar.second = (time & 31) * 2;
+    uint64_t filetime;
+    if (wintime_calendar_to_filetime(&calendar, &filetime) < 0) {
+        SetLastError(87); return FALSE;
+    }
+    memcpy(out, &filetime, sizeof(filetime));
+    return TRUE;
+}
+
 static BOOL WINAPI SystemTimeToFileTime_stub(const void *st, void *ft)
 {
     if (!st || !ft) {
@@ -22683,6 +23922,111 @@ static BOOL WINAPI ReleaseMutex_stub(HANDLE h)
     return TRUE;
 }
 
+static DWORD WINAPI SignalObjectAndWait_k32(HANDLE signal, HANDLE wait,
+                                              DWORD milliseconds,
+                                              BOOL alertable)
+{
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid)
+        owner_pid = 1;
+    NTSTATUS status = handle_retain_for_process(&g_handle_table, signal,
+                                                owner_pid);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return WAIT_FAILED;
+    }
+    BOOL wait_retained = FALSE;
+    DWORD error = 0;
+    DWORD result = WAIT_FAILED;
+    HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, signal);
+    OBJECT_TYPE_ID signal_type = entry ? entry->type : OBJ_TYPE_NONE;
+    if (signal_type != OBJ_TYPE_EVENT && signal_type != OBJ_TYPE_SEMAPHORE &&
+        signal_type != OBJ_TYPE_MUTANT) {
+        error = 6; /* ERROR_INVALID_HANDLE */
+        goto done;
+    }
+    if (signal_type != OBJ_TYPE_MUTANT &&
+        !(entry->access & (GENERIC_ALL | GENERIC_WRITE | 2U))) {
+        error = 5; /* ERROR_ACCESS_DENIED: *_MODIFY_STATE */
+        goto done;
+    }
+    status = handle_retain_for_process(&g_handle_table, wait, owner_pid);
+    if (!NT_SUCCESS(status)) {
+        error = RtlNtStatusToDosError(status);
+        goto done;
+    }
+    wait_retained = TRUE;
+    entry = handle_get_entry(&g_handle_table, wait);
+    if (!entry || (entry->type != OBJ_TYPE_EVENT &&
+        entry->type != OBJ_TYPE_SEMAPHORE && entry->type != OBJ_TYPE_MUTANT &&
+        entry->type != OBJ_TYPE_THREAD && entry->type != OBJ_TYPE_PROCESS)) {
+        error = 6;
+        goto done;
+    }
+    if (!(entry->access & (SYNCHRONIZE | GENERIC_ALL | GENERIC_EXECUTE))) {
+        error = 5;
+        goto done;
+    }
+
+    ULONG_PTR args[3] = { (ULONG_PTR)signal, 0, 0 };
+    if (signal_type == OBJ_TYPE_EVENT)
+        status = NtSetEvent(signal, NULL);
+    else if (signal_type == OBJ_TYPE_SEMAPHORE) {
+        args[1] = 1;
+        status = sys_NtReleaseSemaphore(args);
+    } else {
+        status = sys_NtReleaseMutant(args);
+    }
+    if (!NT_SUCCESS(status)) {
+        if (signal_type == OBJ_TYPE_MUTANT && status == STATUS_MUTANT_NOT_OWNED)
+            error = 288; /* ERROR_NOT_OWNER */
+        else if (status == STATUS_SEMAPHORE_LIMIT_EXCEEDED)
+            error = 298; /* ERROR_TOO_MANY_POSTS */
+        else
+            error = RtlNtStatusToDosError(status);
+        goto done;
+    }
+
+    /* Windows does not promise an atomic signal/wait across processors.
+     * Retain both objects across the transition, then use the NT scheduler's
+     * blocking wait. Alertable waits also dispatch queued I/O completions. */
+    ULONGLONG start = GetTickCount64();
+    for (;;) {
+        if (alertable && k32_dispatch_io_completions()) {
+            result = K32_WAIT_IO_COMPLETION;
+            break;
+        }
+        DWORD remaining = milliseconds;
+        if (milliseconds != INFINITE) {
+            ULONGLONG elapsed = GetTickCount64() - start;
+            remaining = elapsed >= milliseconds ? 0 :
+                        milliseconds - (DWORD)elapsed;
+        }
+        DWORD interval = remaining;
+        if (alertable && (interval == INFINITE || interval > 10))
+            interval = 10;
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -(LONGLONG)interval * 10000;
+        status = NtWaitForSingleObject(wait, FALSE,
+                                       interval == INFINITE ? NULL : &timeout);
+        if (!NT_SUCCESS(status)) {
+            error = RtlNtStatusToDosError(status);
+            break;
+        }
+        if (status != STATUS_TIMEOUT || !alertable || remaining <= interval) {
+            result = (DWORD)status;
+            break;
+        }
+    }
+done:
+    if (wait_retained)
+        nt_force_close_handle_for_process(wait, owner_pid);
+    nt_force_close_handle_for_process(signal, owner_pid);
+    if (error)
+        SetLastError(error);
+    return result;
+}
+
 static void WINAPI OutputDebugStringW_stub(const WCHAR *s)
 {
     (void)s;
@@ -22697,7 +24041,7 @@ typedef struct {
     BOOL used;
     BOOL global_scope;
     WORD atom;
-    DWORD owner_pid;
+    ULONGLONG scope_id;
     DWORD references;
     WCHAR name[K32_ATOM_NAME_MAX + 1];
 } K32_ATOM_ENTRY;
@@ -22705,15 +24049,27 @@ typedef struct {
 static K32_ATOM_ENTRY k32_atom_table[K32_ATOM_SLOT_COUNT];
 static volatile LONG k32_atom_table_lock;
 
-static void k32_atom_lock(void)
+static uint64_t k32_atom_lock(void)
 {
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     while (__atomic_exchange_n(&k32_atom_table_lock, 1, __ATOMIC_ACQUIRE))
         __asm__ volatile ("pause");
+    return flags;
 }
 
-static void k32_atom_unlock(void)
+static void k32_atom_unlock(uint64_t flags)
 {
     __atomic_store_n(&k32_atom_table_lock, 0, __ATOMIC_RELEASE);
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+}
+
+/* Call under the atom lock: job membership and UI toggles are BSP metadata,
+ * so selecting the scope and using it form one non-preemptible transaction. */
+static ULONGLONG k32_atom_scope(BOOL global_scope)
+{
+    DWORD pid = GetCurrentProcessId();
+    return global_scope ? nt_job_global_atom_namespace(pid) : pid;
 }
 
 static WCHAR k32_atom_fold(WCHAR character)
@@ -22766,12 +24122,12 @@ static BOOL k32_atom_ansi_to_wide(PCSTR name, WCHAR *wide)
 
 static K32_ATOM_ENTRY *k32_atom_find_locked(WORD atom, PCWSTR name,
                                              BOOL global_scope,
-                                             DWORD owner_pid)
+                                             ULONGLONG scope_id)
 {
     for (UINT index = 0; index < K32_ATOM_SLOT_COUNT; index++) {
         K32_ATOM_ENTRY *entry = &k32_atom_table[index];
         if (!entry->used || entry->global_scope != global_scope) continue;
-        if (!global_scope && entry->owner_pid != owner_pid) continue;
+        if (entry->scope_id != scope_id) continue;
         if (atom) {
             if (entry->atom == atom) return entry;
         } else if (k32_atom_names_equal(entry->name, name)) {
@@ -22794,14 +24150,14 @@ static WORD k32_atom_add_w(PCWSTR name, BOOL global_scope)
         return (WORD)integer_atom;
     }
 
-    DWORD owner_pid = global_scope ? 0 : GetCurrentProcessId();
-    k32_atom_lock();
+    uint64_t flags = k32_atom_lock();
+    ULONGLONG scope_id = k32_atom_scope(global_scope);
     K32_ATOM_ENTRY *entry = k32_atom_find_locked(0, name, global_scope,
-                                                  owner_pid);
+                                                  scope_id);
     if (entry) {
         if (entry->references != 0xFFFFFFFFU) entry->references++;
         WORD atom = entry->atom;
-        k32_atom_unlock();
+        k32_atom_unlock(flags);
         SetLastError(0);
         return atom;
     }
@@ -22813,15 +24169,15 @@ static WORD k32_atom_add_w(PCWSTR name, BOOL global_scope)
         entry->used = TRUE;
         entry->global_scope = global_scope;
         entry->atom = (WORD)(K32_ATOM_FIRST + index);
-        entry->owner_pid = owner_pid;
+        entry->scope_id = scope_id;
         entry->references = 1;
         for (UINT i = 0; i <= length; i++) entry->name[i] = name[i];
         WORD atom = entry->atom;
-        k32_atom_unlock();
+        k32_atom_unlock(flags);
         SetLastError(0);
         return atom;
     }
-    k32_atom_unlock();
+    k32_atom_unlock(flags);
     SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
     return 0;
 }
@@ -22838,12 +24194,12 @@ static WORD k32_atom_find_w(PCWSTR name, BOOL global_scope)
         return (WORD)integer_atom;
     }
 
-    DWORD owner_pid = global_scope ? 0 : GetCurrentProcessId();
-    k32_atom_lock();
+    uint64_t flags = k32_atom_lock();
+    ULONGLONG scope_id = k32_atom_scope(global_scope);
     K32_ATOM_ENTRY *entry = k32_atom_find_locked(0, name, global_scope,
-                                                  owner_pid);
+                                                  scope_id);
     WORD atom = entry ? entry->atom : 0;
-    k32_atom_unlock();
+    k32_atom_unlock(flags);
     SetLastError(atom ? 0 : 2); /* ERROR_FILE_NOT_FOUND */
     return atom;
 }
@@ -22859,12 +24215,12 @@ static WORD k32_atom_delete(WORD atom, BOOL global_scope)
         return 0;
     }
 
-    DWORD owner_pid = global_scope ? 0 : GetCurrentProcessId();
-    k32_atom_lock();
+    uint64_t flags = k32_atom_lock();
+    ULONGLONG scope_id = k32_atom_scope(global_scope);
     K32_ATOM_ENTRY *entry = k32_atom_find_locked(atom, NULL, global_scope,
-                                                  owner_pid);
+                                                  scope_id);
     if (!entry) {
-        k32_atom_unlock();
+        k32_atom_unlock(flags);
         SetLastError(6);
         return atom;
     }
@@ -22873,7 +24229,7 @@ static WORD k32_atom_delete(WORD atom, BOOL global_scope)
     } else {
         memset(entry, 0, sizeof(*entry));
     }
-    k32_atom_unlock();
+    k32_atom_unlock(flags);
     SetLastError(0);
     return 0;
 }
@@ -22908,12 +24264,12 @@ static UINT k32_atom_get_name_w(WORD atom, PWSTR buffer, int size,
         return 0;
     }
 
-    DWORD owner_pid = global_scope ? 0 : GetCurrentProcessId();
-    k32_atom_lock();
+    uint64_t flags = k32_atom_lock();
+    ULONGLONG scope_id = k32_atom_scope(global_scope);
     K32_ATOM_ENTRY *entry = k32_atom_find_locked(atom, NULL, global_scope,
-                                                  owner_pid);
+                                                  scope_id);
     if (!entry) {
-        k32_atom_unlock();
+        k32_atom_unlock(flags);
         buffer[0] = 0;
         SetLastError(6);
         return 0;
@@ -22923,7 +24279,7 @@ static UINT k32_atom_get_name_w(WORD atom, PWSTR buffer, int size,
     UINT copied = length < (UINT)size ? length : (UINT)size - 1;
     for (UINT i = 0; i < copied; i++) buffer[i] = entry->name[i];
     buffer[copied] = 0;
-    k32_atom_unlock();
+    k32_atom_unlock(flags);
     SetLastError(copied < length ? 234 : 0);
     return copied;
 }
@@ -23047,14 +24403,26 @@ static UINT WINAPI GetAtomNameA_k32(WORD atom, PSTR buffer, int size)
 static void k32_atom_release_process(DWORD process_id)
 {
     if (!process_id) return;
-    k32_atom_lock();
+    uint64_t flags = k32_atom_lock();
     for (UINT index = 0; index < K32_ATOM_SLOT_COUNT; index++) {
         K32_ATOM_ENTRY *entry = &k32_atom_table[index];
         if (entry->used && !entry->global_scope &&
-            entry->owner_pid == process_id)
+            entry->scope_id == process_id)
             memset(entry, 0, sizeof(*entry));
     }
-    k32_atom_unlock();
+    k32_atom_unlock(flags);
+}
+
+void k32_atom_release_job(ULONGLONG namespace_id)
+{
+    if (!namespace_id) return; /* The unrestricted table has system lifetime. */
+    uint64_t flags = k32_atom_lock();
+    for (UINT index = 0; index < K32_ATOM_SLOT_COUNT; index++) {
+        K32_ATOM_ENTRY *entry = &k32_atom_table[index];
+        if (entry->used && entry->global_scope && entry->scope_id == namespace_id)
+            memset(entry, 0, sizeof(*entry));
+    }
+    k32_atom_unlock(flags);
 }
 
 /* ── Path and file attribute APIs ────────────────────────────── */
@@ -23115,19 +24483,35 @@ static UINT WINAPI GetTempFileNameW_k32(PCWSTR path, PCWSTR prefix,
     return 0;
 }
 
-static DWORD WINAPI GetSystemDirectoryA_k32(PSTR lpBuffer, DWORD uSize)
+static UINT WINAPI GetTempFileNameA_k32(PCSTR path, PCSTR prefix,
+                                       UINT unique, PSTR output)
 {
-    const char *dir = "System";
-    DWORD len = 6;
-    if (lpBuffer && uSize > len) {
-        for (DWORD i = 0; i <= len; i++) lpBuffer[i] = dir[i];
+    if (!path || !output) { SetLastError(87); return 0; }
+    WCHAR wide_path[260], wide_prefix[4], wide_output[260];
+    if (!MultiByteToWideChar(0, 0, path, -1, wide_path, 260)) return 0;
+    unsigned length = 0;
+    if (prefix) while (length < 3 && prefix[length]) length++;
+    int converted = length ? MultiByteToWideChar(0, 0, prefix, (int)length,
+                                                 wide_prefix, 3) : 0;
+    if (length && !converted) return 0;
+    wide_prefix[converted] = 0;
+    UINT result = GetTempFileNameW_k32(wide_path, wide_prefix, unique,
+                                       wide_output);
+    if (!result) return 0;
+    if (!WideCharToMultiByte(0, 0, wide_output, -1, output, 260, NULL, NULL)) {
+        DWORD error = GetLastError();
+        if (!unique) DeleteFileW(wide_output);
+        SetLastError(error);
+        return 0;
     }
-    return len;
+    return result;
 }
 
-static DWORD WINAPI GetWindowsDirectoryA_k32(PSTR lpBuffer, DWORD uSize)
+static BOOL WINAPI FreeResource_k32(HANDLE resource)
 {
-    return GetSystemDirectoryA_k32(lpBuffer, uSize);
+    (void)resource;
+    /* The obsolete Win16 release operation is a no-op on Win32/Win64. */
+    return FALSE;
 }
 
 static const GUID k32_ports_class_guid = {
@@ -23402,6 +24786,47 @@ static BOOL WINAPI SetupDiGetDeviceRegistryPropertyW_k32(
     return FALSE;
 }
 
+/* DXUpdate resolves its complete driver-registration interface before using
+ * any of it. These entry points explicitly reject unsupported driver-store
+ * operations; resolving them must not fabricate an installed INF or property.
+ * Keep the caller's output buffers untouched on ERROR_CALL_NOT_IMPLEMENTED. */
+static BOOL WINAPI SetupCopyOEMInfA_k32(
+    PCSTR source, PCSTR media_location, DWORD media_type, DWORD copy_style,
+    PSTR destination, DWORD destination_size, DWORD *required_size,
+    PVOID destination_component)
+{
+    (void)source; (void)media_location; (void)media_type; (void)copy_style;
+    (void)destination; (void)destination_size; (void)required_size;
+    (void)destination_component;
+    serial_puts("[SETUPAPI-UNSUPPORTED] SetupCopyOEMInfA: no driver-store installation performed\n");
+    SetLastError(120);
+    return FALSE;
+}
+
+static BOOL WINAPI SetupDiGetDeviceRegistryPropertyA_k32(
+    PVOID device_info_set, PVOID device_info_data, DWORD property,
+    DWORD *property_reg_data_type, BYTE *property_buffer,
+    DWORD property_buffer_size, DWORD *required_size)
+{
+    (void)device_info_set; (void)device_info_data; (void)property;
+    (void)property_reg_data_type; (void)property_buffer;
+    (void)property_buffer_size; (void)required_size;
+    serial_puts("[SETUPAPI-UNSUPPORTED] SetupDiGetDeviceRegistryPropertyA\n");
+    SetLastError(120);
+    return FALSE;
+}
+
+static BOOL WINAPI SetupDiSetDeviceRegistryPropertyA_k32(
+    PVOID device_info_set, PVOID device_info_data, DWORD property,
+    const BYTE *property_buffer, DWORD property_buffer_size)
+{
+    (void)device_info_set; (void)device_info_data; (void)property;
+    (void)property_buffer; (void)property_buffer_size;
+    serial_puts("[SETUPAPI-UNSUPPORTED] SetupDiSetDeviceRegistryPropertyA: no property changed\n");
+    SetLastError(120);
+    return FALSE;
+}
+
 static BOOL WINAPI SetupDiDestroyDeviceInfoList_k32(PVOID device_info_set)
 {
     if (device_info_set != &k32_empty_device_info_set) {
@@ -23657,6 +25082,16 @@ static BOOL WINAPI GetSystemPowerStatus_k32(SYSTEM_POWER_STATUS_K32 *status)
     return TRUE;
 }
 
+static BOOL WINAPI SetSystemPowerState_k32(BOOL suspend, BOOL force)
+{
+    (void)suspend;
+    (void)force;
+    /* No S3 resume or S4 image backend exists. A successful return promises
+     * that suspension and resumption happened; do not emulate that success. */
+    SetLastError(50); /* ERROR_NOT_SUPPORTED */
+    return FALSE;
+}
+
 static K32_POWER_REQUEST *power_request_lookup_k32(HANDLE handle)
 {
     K32_POWER_REQUEST *request = NULL;
@@ -23880,14 +25315,17 @@ static const K32_EXPORT k32_exports[] = {
     { "CloseHandle",             (PVOID)CloseHandle,             1, CC_STDCALL },
     { "GetStdHandle",            (PVOID)GetStdHandle,            1, CC_STDCALL },
     { "AllocConsole",            (PVOID)AllocConsole,            0, CC_STDCALL },
+    { "AttachConsole",           (PVOID)AttachConsole,           1, CC_STDCALL },
     { "FreeConsole",             (PVOID)FreeConsole,             0, CC_STDCALL },
     { "WriteConsoleA",           (PVOID)WriteConsoleA,           5, CC_STDCALL },
     { "ExitProcess",             (PVOID)ExitProcess,             1, CC_STDCALL },
     { "GetCurrentProcess",       (PVOID)GetCurrentProcess,       0, CC_STDCALL },
     { "OpenProcess",             (PVOID)OpenProcess,             3, CC_STDCALL },
     { "CreateJobObjectW",        (PVOID)CreateJobObjectW,        2, CC_STDCALL },
+    { "CreateJobObjectA",        (PVOID)CreateJobObjectA,        2, CC_STDCALL },
     { "SetInformationJobObject", (PVOID)SetInformationJobObject, 4, CC_STDCALL },
     { "AssignProcessToJobObject",(PVOID)AssignProcessToJobObject,2, CC_STDCALL },
+    { "IsProcessInJob",          (PVOID)IsProcessInJob,          3, CC_STDCALL },
     { "QueryInformationJobObject",(PVOID)QueryInformationJobObject,5, CC_STDCALL },
     { "TerminateJobObject",      (PVOID)TerminateJobObject,      2, CC_STDCALL },
     { "InitializeProcThreadAttributeList", (PVOID)InitializeProcThreadAttributeList, 4, CC_STDCALL },
@@ -23895,6 +25333,9 @@ static const K32_EXPORT k32_exports[] = {
     { "DeleteProcThreadAttributeList", (PVOID)DeleteProcThreadAttributeList, 1, CC_STDCALL },
     { "GetProcessMitigationPolicy", (PVOID)GetProcessMitigationPolicy_k32, 4, CC_STDCALL },
     { "SetProcessMitigationPolicy", (PVOID)SetProcessMitigationPolicy_k32, 3, CC_STDCALL },
+    { "Wow64DisableWow64FsRedirection", (PVOID)Wow64DisableWow64FsRedirection, 1, CC_STDCALL },
+    { "Wow64RevertWow64FsRedirection", (PVOID)Wow64RevertWow64FsRedirection, 1, CC_STDCALL },
+    { "Wow64EnableWow64FsRedirection", (PVOID)Wow64EnableWow64FsRedirection, 1, CC_STDCALL },
     { "IsWow64Process",          (PVOID)IsWow64Process_k32,      2, CC_STDCALL },
     { "IsWow64Process2",         (PVOID)IsWow64Process2_k32,     3, CC_STDCALL },
     { "IsProcessorFeaturePresent", (PVOID)IsProcessorFeaturePresent_k32, 1, CC_STDCALL },
@@ -23948,6 +25389,7 @@ static const K32_EXPORT k32_exports[] = {
     { "GetLastError",            (PVOID)GetLastError,            0, CC_STDCALL },
     { "SetLastError",            (PVOID)SetLastError,            1, CC_STDCALL },
     { "GetSystemPowerStatus",    (PVOID)GetSystemPowerStatus_k32, 1, CC_STDCALL },
+    { "SetSystemPowerState",     (PVOID)SetSystemPowerState_k32,  2, CC_STDCALL },
     { "CallNtPowerInformation",  (PVOID)CallNtPowerInformation_k32, 5, CC_STDCALL },
     { "PowerCreateRequest",      (PVOID)PowerCreateRequest_k32,   1, CC_STDCALL },
     { "PowerSetRequest",         (PVOID)PowerSetRequest_k32,      2, CC_STDCALL },
@@ -23956,6 +25398,30 @@ static const K32_EXPORT k32_exports[] = {
     { "PowerGetActiveScheme",    (PVOID)PowerGetActiveScheme_k32, 2, CC_STDCALL },
     { "PowerReadACValue",        (PVOID)PowerReadACValue_k32,     7, CC_STDCALL },
     { "PowerReadDCValue",        (PVOID)PowerReadDCValue_k32,     7, CC_STDCALL },
+    { "SetupOpenInfFileA", (PVOID)shim_SetupOpenInfFileA, 4, CC_STDCALL },
+    { "SetupGetInfInformationA", (PVOID)shim_SetupGetInfInformationA, 5, CC_STDCALL },
+    { "SetupGetInfInformationW", (PVOID)shim_SetupGetInfInformationW, 5, CC_STDCALL },
+    { "SetupQueryInfFileInformationA", (PVOID)shim_SetupQueryInfFileInformationA, 5, CC_STDCALL },
+    { "SetupQueryInfFileInformationW", (PVOID)shim_SetupQueryInfFileInformationW, 5, CC_STDCALL },
+    { "SetupQueryInfVersionInformationA", (PVOID)shim_SetupQueryInfVersionInformationA, 6, CC_STDCALL },
+    { "SetupQueryInfVersionInformationW", (PVOID)shim_SetupQueryInfVersionInformationW, 6, CC_STDCALL },
+    { "SetupCopyOEMInfA", (PVOID)SetupCopyOEMInfA_k32, 8, CC_STDCALL },
+    { "SetupDiGetDeviceRegistryPropertyA", (PVOID)SetupDiGetDeviceRegistryPropertyA_k32, 7, CC_STDCALL },
+    { "SetupDiSetDeviceRegistryPropertyA", (PVOID)SetupDiSetDeviceRegistryPropertyA_k32, 5, CC_STDCALL },
+    { "SetupFindFirstLineA", (PVOID)shim_SetupFindFirstLineA, 4, CC_STDCALL },
+    { "SetupFindFirstLineW", (PVOID)shim_SetupFindFirstLineW, 4, CC_STDCALL },
+    { "SetupFindNextLine", (PVOID)shim_SetupFindNextLine, 2, CC_STDCALL },
+    { "SetupGetLineTextA", (PVOID)shim_SetupGetLineTextA, 7, CC_STDCALL },
+    { "SetupGetLineTextW", (PVOID)shim_SetupGetLineTextW, 7, CC_STDCALL },
+    { "SetupIterateCabinetA", (PVOID)shim_SetupIterateCabinetA, 4, CC_STDCALL },
+    { "SetupIterateCabinetW", (PVOID)shim_SetupIterateCabinetW, 4, CC_STDCALL },
+    { "SetupCloseInfFile", (PVOID)shim_SetupCloseInfFile, 1, CC_STDCALL },
+    { "SetupOpenFileQueue", (PVOID)shim_SetupOpenFileQueue, 0, CC_STDCALL },
+    { "SetupCloseFileQueue", (PVOID)shim_SetupCloseFileQueue, 1, CC_STDCALL },
+    { "SetupInitDefaultQueueCallback", (PVOID)shim_SetupInitDefaultQueueCallback, 1, CC_STDCALL },
+    { "SetupTermDefaultQueueCallback", (PVOID)shim_SetupTermDefaultQueueCallback, 1, CC_STDCALL },
+    { "SetupDefaultQueueCallbackA", (PVOID)shim_SetupDefaultQueueCallbackA, 4, CC_STDCALL },
+    { "SetupInstallFromInfSectionA", (PVOID)shim_SetupInstallFromInfSectionA, 11, CC_STDCALL },
     { "SetupDiClassGuidsFromNameA", (PVOID)SetupDiClassGuidsFromNameA_k32, 4, CC_STDCALL },
     { "SetupDiClassGuidsFromNameW", (PVOID)SetupDiClassGuidsFromNameW_k32, 4, CC_STDCALL },
     { "SetupDiGetClassDevsA",    (PVOID)SetupDiGetClassDevsA_k32, 4, CC_STDCALL },
@@ -24032,7 +25498,6 @@ static const K32_EXPORT k32_exports[] = {
     { "MFCreateEventQueue",      (PVOID)MediaFoundationUnavailable_k32, 1, CC_STDCALL },
     { "MFGetService",            (PVOID)MediaFoundationUnavailable_k32, 4, CC_STDCALL },
     { "MFCreateSourceReaderFromMediaSource", (PVOID)MediaFoundationUnavailable_k32, 3, CC_STDCALL },
-    { "Direct3DCreate9Ex",       (PVOID)MediaFoundationUnavailable_k32, 2, CC_STDCALL },
     { "DXVA2CreateDirect3DDeviceManager9", (PVOID)MediaFoundationUnavailable_k32, 2, CC_STDCALL },
     { "MulDiv",                  (PVOID)MulDiv_k32,               3, CC_STDCALL },
     { "Sleep",                   (PVOID)Sleep,                   1, CC_STDCALL },
@@ -24043,6 +25508,8 @@ static const K32_EXPORT k32_exports[] = {
     { "GetProcAddress",          (PVOID)GetProcAddress,          2, CC_STDCALL },
     { "GetModuleHandleA",        (PVOID)GetModuleHandleA,        1, CC_STDCALL },
     { "GetModuleHandleW",        (PVOID)GetModuleHandleW,        1, CC_STDCALL },
+    { "ResolveDelayLoadedAPI",  (PVOID)ResolveDelayLoadedAPI,   6, CC_STDCALL },
+    { "DelayLoadFailureHook",   (PVOID)DelayLoadFailureHook,    2, CC_STDCALL },
     { "GetModuleHandleExA",      (PVOID)GetModuleHandleExA,      3, CC_STDCALL },
     { "GetModuleHandleExW",      (PVOID)GetModuleHandleExW,      3, CC_STDCALL },
     { "RtlPcToFileHeader",       (PVOID)RtlPcToFileHeader_k32,   2, CC_STDCALL },
@@ -24069,6 +25536,18 @@ static const K32_EXPORT k32_exports[] = {
     { "UnmapViewOfFile",         (PVOID)UnmapViewOfFile,         1, CC_STDCALL },
     { "FlushViewOfFile",         (PVOID)FlushViewOfFile_k32,     2, CC_STDCALL },
     { "lstrlenA",                (PVOID)lstrlenA,                1, CC_STDCALL },
+    { "lstrcmpA",                (PVOID)lstrcmpA_k32,           2, CC_STDCALL },
+    { "lstrcatA",                (PVOID)lstrcatA_k32,           2, CC_STDCALL },
+    { "lstrcpynA",               (PVOID)lstrcpynA_k32,          3, CC_STDCALL },
+    { "_lopen",                  (PVOID)_lopen_k32,             2, CC_STDCALL },
+    { "_llseek",                 (PVOID)_llseek_k32,            3, CC_STDCALL },
+    { "_lclose",                 (PVOID)_lclose_k32,            1, CC_STDCALL },
+    { "GetShortPathNameA",       (PVOID)GetShortPathNameA_k32,  3, CC_STDCALL },
+    { "GetShortPathNameW",       (PVOID)GetShortPathNameW,      3, CC_STDCALL },
+    { "FoldStringW",             (PVOID)FoldStringW,            5, CC_STDCALL },
+    { "GetBinaryTypeW",          (PVOID)GetBinaryTypeW,         2, CC_STDCALL },
+    { "DosDateTimeToFileTime",   (PVOID)DosDateTimeToFileTime_k32,3, CC_STDCALL },
+    { "EnumResourceLanguagesA",  (PVOID)EnumResourceLanguagesA_k32,5, CC_STDCALL },
     { "lstrlenW",                (PVOID)lstrlenW,                1, CC_STDCALL },
     { "lstrcpynW",               (PVOID)lstrcpynW_k32,           3, CC_STDCALL },
     { "lstrcpyA",                (PVOID)lstrcpyA_k32,            2, CC_STDCALL },
@@ -24102,6 +25581,9 @@ static const K32_EXPORT k32_exports[] = {
     { "SleepConditionVariableCS",          (PVOID)SleepConditionVariableCS_k32,        3, CC_STDCALL },
     { "WakeConditionVariable",              (PVOID)WakeAllConditionVariable_k32,        1, CC_STDCALL },
     { "WakeAllConditionVariable",           (PVOID)WakeAllConditionVariable_k32,        1, CC_STDCALL },
+    { "WaitOnAddress",                      (PVOID)WaitOnAddress,                      4, CC_STDCALL },
+    { "WakeByAddressSingle",                (PVOID)WakeByAddressSingle,                1, CC_STDCALL },
+    { "WakeByAddressAll",                   (PVOID)WakeByAddressAll,                   1, CC_STDCALL },
     { "InitOnceBeginInitialize",           (PVOID)InitOnceBeginInitialize_k32,       4, CC_STDCALL },
     { "InitOnceComplete",                  (PVOID)InitOnceComplete_k32,              3, CC_STDCALL },
     { "InitOnceExecuteOnce",               (PVOID)InitOnceExecuteOnce_k32,           4, CC_STDCALL },
@@ -24149,9 +25631,22 @@ static const K32_EXPORT k32_exports[] = {
     { "ResumeThread",            (PVOID)ResumeThread,            1, CC_STDCALL },
     { "TerminateThread",         (PVOID)TerminateThread,         2, CC_STDCALL },
     { "QueryThreadCycleTime",    (PVOID)QueryThreadCycleTime_k32, 2, CC_STDCALL },
+    { "QueryProcessCycleTime",   (PVOID)QueryProcessCycleTime_k32, 2, CC_STDCALL },
     { "SleepEx",                 (PVOID)SleepEx_k32,              2, CC_STDCALL },
     { "WaitForSingleObject",     (PVOID)WaitForSingleObject,     2, CC_STDCALL },
     { "WaitForSingleObjectEx",   (PVOID)WaitForSingleObjectEx_k32, 3, CC_STDCALL },
+    { "SignalObjectAndWait",     (PVOID)SignalObjectAndWait_k32, 4, CC_STDCALL },
+    { "CreateTimerQueue",        (PVOID)k32_CreateTimerQueue, 0, CC_STDCALL },
+    { "CreateThreadpoolTimer",   (PVOID)k32_CreateThreadpoolTimer, 3, CC_STDCALL },
+    { "SetThreadpoolTimer",      (PVOID)k32_SetThreadpoolTimer, 4, CC_STDCALL },
+    { "IsThreadpoolTimerSet",    (PVOID)k32_IsThreadpoolTimerSet, 1, CC_STDCALL },
+    { "WaitForThreadpoolTimerCallbacks", (PVOID)k32_WaitForThreadpoolTimerCallbacks, 2, CC_STDCALL },
+    { "CloseThreadpoolTimer",    (PVOID)k32_CloseThreadpoolTimer, 1, CC_STDCALL },
+    { "CreateTimerQueueTimer",   (PVOID)k32_CreateTimerQueueTimer, 7, CC_STDCALL },
+    { "ChangeTimerQueueTimer",   (PVOID)k32_ChangeTimerQueueTimer, 4, CC_STDCALL },
+    { "DeleteTimerQueueTimer",   (PVOID)k32_DeleteTimerQueueTimer, 3, CC_STDCALL },
+    { "DeleteTimerQueueEx",      (PVOID)k32_DeleteTimerQueueEx, 2, CC_STDCALL },
+    { "DeleteTimerQueue",        (PVOID)k32_DeleteTimerQueue, 1, CC_STDCALL },
     { "WaitForMultipleObjects",  (PVOID)WaitForMultipleObjects,  4, CC_STDCALL },
     { "RegisterWaitForSingleObject", (PVOID)RegisterWaitForSingleObject_k32, 6, CC_STDCALL },
     { "UnregisterWait",          (PVOID)UnregisterWait_k32,      1, CC_STDCALL },
@@ -24178,6 +25673,8 @@ static const K32_EXPORT k32_exports[] = {
     { "GetTickCount",            (PVOID)GetTickCount,            0, CC_STDCALL },
     { "GetTickCount64",          (PVOID)GetTickCount64,          0, CC_STDCALL },
     { "GetSystemTimeAsFileTime", (PVOID)GetSystemTimeAsFileTime, 1, CC_STDCALL },
+    { "GetSystemTimeAdjustment", (PVOID)GetSystemTimeAdjustment, 3, CC_STDCALL },
+    { "SetSystemTime",           (PVOID)SetSystemTime,           1, CC_STDCALL },
     { "GetSystemTimePreciseAsFileTime", (PVOID)GetSystemTimePreciseAsFileTime_k32, 1, CC_STDCALL },
     { "GetFileTime",             (PVOID)GetFileTime_k32,         4, CC_STDCALL },
     { "GetThreadTimes",          (PVOID)GetThreadTimes,          5, CC_STDCALL },
@@ -24185,7 +25682,7 @@ static const K32_EXPORT k32_exports[] = {
     { "RtlCaptureStackBackTrace",(PVOID)RtlCaptureStackBackTrace_stub, 4, CC_STDCALL },
     /* System */
     { "GetSystemInfo",           (PVOID)GetSystemInfo,           1, CC_STDCALL },
-    { "GetNativeSystemInfo",     (PVOID)GetSystemInfo,           1, CC_STDCALL },
+    { "GetNativeSystemInfo",     (PVOID)GetNativeSystemInfo_k32, 1, CC_STDCALL },
     { "GetProcessAffinityMask",  (PVOID)GetProcessAffinityMask_k32, 3, CC_STDCALL },
     { "SetProcessAffinityMask",  (PVOID)SetProcessAffinityMask_k32, 2, CC_STDCALL },
     { "GetCurrentProcessorNumber", (PVOID)GetCurrentProcessorNumber_k32, 0, CC_STDCALL },
@@ -24226,6 +25723,8 @@ static const K32_EXPORT k32_exports[] = {
     { "DebugBreak",              (PVOID)win32_debug_break_entry, 0, CC_STDCALL },
     { "RtlUnwind",               (PVOID)RtlUnwind,               4, CC_STDCALL },
     { "OutputDebugStringA",      (PVOID)OutputDebugStringA,      1, CC_STDCALL },
+    { "FatalAppExitA",           (PVOID)FatalAppExitA,           2, CC_STDCALL },
+    { "FatalAppExitW",           (PVOID)FatalAppExitW,           2, CC_STDCALL },
     /* String Conversion */
     { "MultiByteToWideChar",     (PVOID)MultiByteToWideChar,     6, CC_STDCALL },
     { "WideCharToMultiByte",     (PVOID)WideCharToMultiByte,     8, CC_STDCALL },
@@ -24236,6 +25735,9 @@ static const K32_EXPORT k32_exports[] = {
     { "InterlockedExchangeAdd",  (PVOID)InterlockedExchangeAdd,  2, CC_STDCALL },
     { "InterlockedCompareExchange",(PVOID)InterlockedCompareExchange,3, CC_STDCALL },
     { "InitializeSListHead",     (PVOID)InitializeSListHead,     1, CC_STDCALL },
+    { "QueryDepthSList",         (PVOID)QueryDepthSList_k32,     1, CC_STDCALL },
+    { "GetNumaHighestNodeNumber", (PVOID)GetNumaHighestNodeNumber_k32, 1, CC_STDCALL },
+    { "CreateHardLinkW",         (PVOID)CreateHardLinkW_k32,     3, CC_STDCALL },
     { "InterlockedPushEntrySList",(PVOID)InterlockedPushEntrySList,2, CC_STDCALL },
     { "InterlockedPopEntrySList",(PVOID)InterlockedPopEntrySList_k32, 1, CC_STDCALL },
     { "InterlockedFlushSList",   (PVOID)InterlockedFlushSList,   1, CC_STDCALL },
@@ -24251,6 +25753,7 @@ static const K32_EXPORT k32_exports[] = {
     { "DeleteFileW",             (PVOID)DeleteFileW,             1, CC_STDCALL },
     { "MoveFileA",               (PVOID)MoveFileA,               2, CC_STDCALL },
     { "MoveFileW",               (PVOID)MoveFileW,               2, CC_STDCALL },
+    { "MoveFileExA",             (PVOID)MoveFileExA_k32,         3, CC_STDCALL },
     { "MoveFileExW",             (PVOID)MoveFileExW_k32,         3, CC_STDCALL },
     { "MoveFileTransactedW",     (PVOID)MoveFileTransactedW_k32, 6, CC_STDCALL },
     { "ReplaceFileW",            (PVOID)ReplaceFileW_k32,        6, CC_STDCALL },
@@ -24268,15 +25771,22 @@ static const K32_EXPORT k32_exports[] = {
     { "GetSystemDirectoryW",     (PVOID)GetSystemDirectoryW,     2, CC_STDCALL },
     { "GetWindowsDirectoryA",    (PVOID)GetWindowsDirectoryA,    2, CC_STDCALL },
     { "GetWindowsDirectoryW",    (PVOID)GetWindowsDirectoryW,    2, CC_STDCALL },
+    { "GetSystemWow64DirectoryA",(PVOID)GetSystemWow64DirectoryA,2, CC_STDCALL },
+    { "GetSystemWow64DirectoryW",(PVOID)GetSystemWow64DirectoryW,2, CC_STDCALL },
     /* UT99: Find file W variants */
     { "FindFirstFileW",          (PVOID)FindFirstFileW,          2, CC_STDCALL },
     { "FindFirstFileExW",        (PVOID)FindFirstFileExW_k32,    6, CC_STDCALL },
+    { "FindFirstFileExA",        (PVOID)FindFirstFileExA_k32,    6, CC_STDCALL },
     { "FindNextFileW",           (PVOID)FindNextFileW,           2, CC_STDCALL },
     /* UT99: Module filename W */
     { "GetModuleFileNameW",      (PVOID)GetModuleFileNameW,      3, CC_STDCALL },
     /* UT99: Mutex */
     { "CreateMutexA",            (PVOID)CreateMutexA,            3, CC_STDCALL },
     { "CreateMutexW",            (PVOID)CreateMutexW,            3, CC_STDCALL },
+    { "CreateMutexExA",          (PVOID)CreateMutexExA_k32,      4, CC_STDCALL },
+    { "CreateMutexExW",          (PVOID)CreateMutexExW_k32,      4, CC_STDCALL },
+    { "OpenMutexA",              (PVOID)OpenMutexA_k32,          3, CC_STDCALL },
+    { "OpenMutexW",              (PVOID)OpenMutexW_k32,          3, CC_STDCALL },
     /* UT99: Thread priority */
     { "GetThreadPriority",       (PVOID)GetThreadPriority_k32,   1, CC_STDCALL },
     { "SetThreadPriority",       (PVOID)SetThreadPriority,       2, CC_STDCALL },
@@ -24297,6 +25807,10 @@ static const K32_EXPORT k32_exports[] = {
     { "CreateEventW",            (PVOID)CreateEventW,            4, CC_STDCALL },
     { "CreateSemaphoreA",        (PVOID)CreateSemaphoreA_k32,    4, CC_STDCALL },
     { "CreateSemaphoreW",        (PVOID)CreateSemaphoreW_k32,    4, CC_STDCALL },
+    { "CreateSemaphoreExA",      (PVOID)CreateSemaphoreExA_k32,  6, CC_STDCALL },
+    { "CreateSemaphoreExW",      (PVOID)CreateSemaphoreExW_k32,  6, CC_STDCALL },
+    { "OpenSemaphoreA",          (PVOID)OpenSemaphoreA_k32,      3, CC_STDCALL },
+    { "OpenSemaphoreW",          (PVOID)OpenSemaphoreW_k32,      3, CC_STDCALL },
     { "ReleaseSemaphore",        (PVOID)ReleaseSemaphore_k32,    3, CC_STDCALL },
     { "SetEvent",                (PVOID)SetEvent,                1, CC_STDCALL },
     { "ResetEvent",              (PVOID)ResetEvent,              1, CC_STDCALL },
@@ -24310,6 +25824,7 @@ static const K32_EXPORT k32_exports[] = {
     { "GetOverlappedResult", (PVOID)GetOverlappedResult_k32, 4, CC_STDCALL },
     { "CancelIo",                (PVOID)CancelIo_k32,           1, CC_STDCALL },
     { "CancelIoEx",              (PVOID)CancelIoEx_k32,         2, CC_STDCALL },
+    { "CancelSynchronousIo",     (PVOID)CancelSynchronousIo_k32, 1, CC_STDCALL },
     { "SetFileCompletionNotificationModes", (PVOID)SetFileCompletionNotificationModes, 2, CC_STDCALL },
     { "CreateWaitableTimerA",    (PVOID)CreateWaitableTimerA_k32,    3, CC_STDCALL },
     { "CreateWaitableTimerW",    (PVOID)CreateWaitableTimerW_k32,    3, CC_STDCALL },
@@ -24404,6 +25919,7 @@ static const K32_EXPORT k32_exports[] = {
     { "GetThreadLocale",         (PVOID)GetThreadLocale_k32,     0, CC_STDCALL },
     { "GetUserDefaultLangID",    (PVOID)GetUserDefaultLangID,    0, CC_STDCALL },
     { "GetUserDefaultUILanguage", (PVOID)GetUserDefaultUILanguage_k32, 0, CC_STDCALL },
+    { "GetSystemDefaultUILanguage", (PVOID)GetSystemDefaultUILanguage_k32, 0, CC_STDCALL },
     { "GetUserGeoID",            (PVOID)GetUserGeoID,            1, CC_STDCALL },
     { "GetGeoInfoW",             (PVOID)GetGeoInfoW_k32,         5, CC_STDCALL },
     { "GetUserDefaultLocaleName", (PVOID)GetUserDefaultLocaleName, 2, CC_STDCALL },
@@ -24444,6 +25960,7 @@ static const K32_EXPORT k32_exports[] = {
     { "GetFileAttributesExA",    (PVOID)GetFileAttributesExA_k32,3, CC_STDCALL },
     { "GetFileAttributesExW",    (PVOID)GetFileAttributesExW_k32,3, CC_STDCALL },
     { "FileTimeToLocalFileTime", (PVOID)FileTimeToLocalFileTime, 2, CC_STDCALL },
+    { "CompareFileTime",      (PVOID)CompareFileTime, 2, CC_STDCALL },
     { "FileTimeToSystemTime",    (PVOID)FileTimeToSystemTime,    2, CC_STDCALL },
     { "GetTimeZoneInformation",  (PVOID)GetTimeZoneInformation,  1, CC_STDCALL },
     { "GetDynamicTimeZoneInformation", (PVOID)GetDynamicTimeZoneInformation, 1, CC_STDCALL },
@@ -24475,12 +25992,15 @@ static const K32_EXPORT k32_exports[] = {
     { "GetFinalPathNameByHandleW", (PVOID)GetFinalPathNameByHandleW_k32, 4, CC_STDCALL },
     { "FindResourceA",          (PVOID)FindResourceA_k32,       3, CC_STDCALL },
     { "FindResourceW",          (PVOID)FindResourceW_k32,       3, CC_STDCALL },
+    { "FindResourceExA",        (PVOID)FindResourceExA_k32,     4, CC_STDCALL },
+    { "FindResourceExW",        (PVOID)FindResourceExW_k32,     4, CC_STDCALL },
     { "EnumResourceNamesW",     (PVOID)EnumResourceNamesW_k32,  4, CC_STDCALL },
     { "LoadResource",           (PVOID)LoadResource_k32,        2, CC_STDCALL },
     { "LockResource",           (PVOID)LockResource_k32,        1, CC_STDCALL },
     { "SizeofResource",         (PVOID)SizeofResource_k32,      2, CC_STDCALL },
     { "PeekNamedPipe",           (PVOID)PeekNamedPipe_k32,      6, CC_STDCALL },
     { "ReadConsoleInputA",       (PVOID)ReadConsoleInputA_stub,  4, CC_STDCALL },
+    { "ReadConsoleInputW",       (PVOID)ReadConsoleInputW_k32,  4, CC_STDCALL },
     { "PeekConsoleInputA",       (PVOID)PeekConsoleInputA_stub,  4, CC_STDCALL },
     { "GetNumberOfConsoleInputEvents",(PVOID)GetNumberOfConsoleInputEvents_stub,2, CC_STDCALL },
     { "LockFile",                (PVOID)LockFile_k32,            5, CC_STDCALL },
@@ -24522,8 +26042,8 @@ static const K32_EXPORT k32_exports[] = {
     { "GetTempPathA",            (PVOID)GetTempPathA_k32,        2, CC_STDCALL },
     { "GetTempPathW",            (PVOID)GetTempPathW_k32,        2, CC_STDCALL },
     { "GetTempFileNameW",        (PVOID)GetTempFileNameW_k32,    4, CC_STDCALL },
-    { "GetSystemDirectoryA",     (PVOID)GetSystemDirectoryA_k32, 2, CC_STDCALL },
-    { "GetWindowsDirectoryA",    (PVOID)GetWindowsDirectoryA_k32,2, CC_STDCALL },
+    { "GetTempFileNameA",        (PVOID)GetTempFileNameA_k32,    4, CC_STDCALL },
+    { "FreeResource",            (PVOID)FreeResource_k32,       1, CC_STDCALL },
     { NULL, NULL, 0, CC_STDCALL }
 };
 
@@ -25492,6 +27012,12 @@ done:
 PVOID kernel32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 {
     if (by_ordinal) return NULL;
+    /* These kernel32 exports forward to ntdll on Windows. Returning the
+     * existing target also preserves its ABI metadata (context capture). */
+    if (k32_strcmp(func_name, "RtlCaptureContext") == 0 ||
+        k32_strcmp(func_name, "RtlUnwindEx") == 0 ||
+        k32_strcmp(func_name, "RtlVirtualUnwind") == 0)
+        return ntdll_resolve(func_name, 0, FALSE);
     if (!g_compat32_mode &&
         k32_strcmp(func_name, "SetFilePointerEx") == 0)
         return (PVOID)SetFilePointerEx_k64;
@@ -25517,6 +27043,21 @@ PVOID kernel32_shim_init(void)
 {
     (void)win32_thread_table_ensure();
 
+    /* Provision writable installation destinations. Repeated initialization
+     * preserves installed files and retries any previously failed mkdir. */
+    static const char *const directories[] = {
+        WIN32_WINDOWS_RELATIVE, WIN32_SYSTEM32_RELATIVE,
+        WIN32_SYSWOW64_RELATIVE, WIN32_WINDOWS_RELATIVE "\\Temp", "Temp"
+    };
+    for (unsigned i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
+        DWORD error = win32_directory_create_normalized(directories[i]);
+        if (error && error != 183) {
+            serial_puts("[WIN32-PATH] mkdir failed: ");
+            serial_puts(directories[i]);
+            serial_puts(" error="); serial_putdec(error); serial_puts("\n");
+        }
+    }
+
     /* Re-exec reset: don't leak the previous run's last-error into the fresh
      * process (real NT starts a process with LastError = 0). Process heap VMAs
      * and metadata are released by the process teardown path. */
@@ -25524,7 +27065,6 @@ PVOID kernel32_shim_init(void)
     kernel32_release_process_exception_state(k32_exception_filter_owner());
     /* Named kernel objects form a global namespace shared by child processes.
      * Their entries are reclaimed when the last endpoint closes. */
-    memset(k32_jobs, 0, sizeof(k32_jobs));
     g_primary_thread_description[0] = 0;
     {
         extern void random_get_bytes(void *buf, uint32_t len);

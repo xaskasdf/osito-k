@@ -31,7 +31,10 @@ extern const char *proc_current_name(void);
 
 /* ── Constants ───────────────────────────────────────────────── */
 
-#define SHM_MAX_REGIONS  64
+/* The compositor and USER32 admit 256 simultaneous windows. Keep metadata
+ * capacity for their live surfaces, pinned resize predecessors, and other
+ * shared-memory clients. Pixel pages are still allocated only on demand. */
+#define SHM_MAX_REGIONS  1024
 #define SHM_PAGE_SIZE    4096
 
 /* Region flags */
@@ -56,8 +59,9 @@ typedef struct {
     uint32_t    surf_width;      /* nonzero for shm_create_surface() */
     uint32_t    surf_height;     /* nonzero for shm_create_surface() */
     uint32_t    owner_pid;       /* creating process */
-    int32_t     refcount;        /* number of active mappings */
+    int32_t     refcount;        /* creator reference plus active mappings */
     bool        active;          /* slot in use */
+    bool        reserved;        /* allocation in progress, not published */
     bool        pending_destroy; /* shm_destroy pending until refcount==0 */
 } shm_region_t;
 
@@ -66,9 +70,38 @@ typedef struct {
 static shm_region_t shm_table[SHM_MAX_REGIONS];
 static uint32_t shm_next_handle = 1;
 static uint32_t shm_active_count;
+static volatile uint32_t shm_lock;
+
+/* Protect table metadata only. Allocation, page release, logging and
+ * compositor callbacks must run after restoring the caller's IRQ state. */
+static uint64_t shm_lock_irqsave(void)
+{
+    uint64_t flags = 0;
+#if !defined(SHM_HOST_TEST) && !defined(__EMSCRIPTEN__)
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+    while (__sync_lock_test_and_set(&shm_lock, 1)) {
+#ifndef __EMSCRIPTEN__
+        __asm__ volatile ("pause" ::: "memory");
+#endif
+    }
+    return flags;
+}
+
+static void shm_unlock_irqrestore(uint64_t flags)
+{
+    __sync_lock_release(&shm_lock);
+#if !defined(SHM_HOST_TEST) && !defined(__EMSCRIPTEN__)
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+#else
+    (void)flags;
+#endif
+}
 
 /* ── Find region by handle ───────────────────────────────────── */
 
+/* The caller holds shm_lock while using the returned table entry. */
 static shm_region_t *shm_find(uint32_t handle)
 {
     for (int i = 0; i < SHM_MAX_REGIONS; i++) {
@@ -83,7 +116,7 @@ static shm_region_t *shm_find(uint32_t handle)
 static shm_region_t *shm_alloc_slot(void)
 {
     for (int i = 0; i < SHM_MAX_REGIONS; i++) {
-        if (!shm_table[i].active)
+        if (!shm_table[i].active && !shm_table[i].reserved)
             return &shm_table[i];
     }
     return NULL;
@@ -97,7 +130,13 @@ static shm_region_t *shm_alloc_slot(void)
 
 uint32_t shm_create(uint64_t size, uint32_t flags)
 {
+    if (!size || size > UINT64_MAX - (SHM_PAGE_SIZE - 1))
+        return 0;
+
+    uint64_t irq_flags = shm_lock_irqsave();
     shm_region_t *r = shm_alloc_slot();
+    if (r) r->reserved = true;
+    shm_unlock_irqrestore(irq_flags);
     if (!r) {
         serial_puts("[SHM] No free region slots\n");
         return 0;
@@ -116,6 +155,9 @@ uint32_t shm_create(uint64_t size, uint32_t flags)
      * VIRT_TO_PHYS for GPU scanout callers. */
     void *phys = mem_alloc_aligned(alloc_size, SHM_PAGE_SIZE);
     if (!phys) {
+        irq_flags = shm_lock_irqsave();
+        r->reserved = false;
+        shm_unlock_irqrestore(irq_flags);
         serial_puts("[SHM] Allocation failed (");
         serial_putdec(alloc_size / 1024);
         serial_puts(" KB)\n");
@@ -126,22 +168,27 @@ uint32_t shm_create(uint64_t size, uint32_t flags)
     /* Zero the memory via the upper-half mirror */
     memset(base, 0, alloc_size);
 
+    irq_flags = shm_lock_irqsave();
+    uint32_t handle;
+    do { handle = shm_next_handle++; } while (!handle || shm_find(handle));
     r->base            = base;
     r->size            = alloc_size;
     r->pages           = pages;
-    r->handle          = shm_next_handle++;
+    r->handle          = handle;
     r->flags           = flags;
     r->surf_width      = 0;
     r->surf_height     = 0;
     r->owner_pid       = 0;  /* Set by caller if needed */
     r->refcount        = 1;
     r->active          = true;
+    r->reserved        = false;
     r->pending_destroy = false;
 
     shm_active_count++;
+    shm_unlock_irqrestore(irq_flags);
 
     serial_puts("[SHM] Created region h=");
-    serial_putdec(r->handle);
+    serial_putdec(handle);
     serial_puts(" addr=0x");
     serial_puthex((uint64_t)base, 16);
     serial_puts(" size=");
@@ -150,7 +197,22 @@ uint32_t shm_create(uint64_t size, uint32_t flags)
     serial_puthex(flags, 2);
     serial_puts("\n");
 
-    return r->handle;
+    return handle;
+}
+
+/* Pin the region and copy its metadata as one operation. Raw table pointers
+ * are used only with shm_lock held (or for a privately reserved slot). */
+static bool shm_acquire_region(uint32_t handle, shm_region_t *snapshot)
+{
+    uint64_t flags = shm_lock_irqsave();
+    shm_region_t *r = shm_find(handle);
+    bool acquired = r && r->refcount < 0x7fffffff;
+    if (acquired) {
+        r->refcount++;
+        *snapshot = *r;
+    }
+    shm_unlock_irqrestore(flags);
+    return acquired;
 }
 
 /* Map a shared region (increment refcount, return pointer).
@@ -159,10 +221,8 @@ uint32_t shm_create(uint64_t size, uint32_t flags)
  * process's address space. */
 void *shm_map(uint32_t handle)
 {
-    shm_region_t *r = shm_find(handle);
-    if (!r) return NULL;
-    r->refcount++;
-    return r->base;
+    shm_region_t snapshot;
+    return shm_acquire_region(handle, &snapshot) ? snapshot.base : NULL;
 }
 
 /* Unmap a shared region (decrement refcount). If the region was already
@@ -170,26 +230,43 @@ void *shm_map(uint32_t handle)
  * last reference, free the underlying pages here so that the original
  * destroy doesn't have to wait for refcount to reach zero before it
  * answers to the caller. */
-static void shm_release_pages(shm_region_t *r)
+static void shm_release_pages(const shm_region_t *r)
 {
     if (r->base && r->pages > 0)
         mem_free_pages((void *)VIRT_TO_PHYS(r->base), r->pages);
-    r->base = NULL;
-    r->pages = 0;
-    r->active = false;
-    shm_active_count--;
+}
+
+/* Detach under the table lock; the caller frees this private snapshot after
+ * unlocking. A reused slot cannot change which physical pages are released. */
+static void shm_retire_locked(shm_region_t *r, shm_region_t *released)
+{
+    if (r && r->pending_destroy && r->refcount == 0) {
+        *released = *r;
+        memset(r, 0, sizeof(*r));
+        shm_active_count--;
+    }
+}
+
+static void shm_drop_creator_locked(shm_region_t *r, shm_region_t *released)
+{
+    if (!r || r->pending_destroy) return;
+    r->pending_destroy = true;
+    if (r->refcount > 0) r->refcount--;
+    shm_retire_locked(r, released);
 }
 
 void shm_unmap(uint32_t handle)
 {
+    shm_region_t released = {0};
+    uint64_t flags = shm_lock_irqsave();
     shm_region_t *r = shm_find(handle);
-    if (!r) return;
-    if (r->refcount > 0) r->refcount--;
+    if (r && r->refcount > 0) r->refcount--;
     /* Deferred destroy: the creator already asked us to destroy this
      * region (r->pending_destroy=true) but other holders kept a
      * reference. When the last one drops, finish the job. */
-    if (r->pending_destroy && r->refcount == 0)
-        shm_release_pages(r);
+    shm_retire_locked(r, &released);
+    shm_unlock_irqrestore(flags);
+    shm_release_pages(&released);
 }
 
 /* Destroy a shared region. Refcount-aware: if other holders still have
@@ -201,53 +278,53 @@ void shm_unmap(uint32_t handle)
  * pending_destroy and let the last shm_unmap finish the job. */
 void shm_destroy(uint32_t handle)
 {
-    shm_region_t *r = shm_find(handle);
-    if (!r) return;
-
-    /* The creator counts as one reference. Drop it now so a "destroy
-     * with no other holders" path collapses to refcount==0 below. */
-    if (r->refcount > 0) r->refcount--;
-
-    if (r->refcount > 0) {
-        /* Other holders still around — defer the page free. They will
-         * call shm_unmap() when they're done; the last one triggers
-         * shm_release_pages() via the pending_destroy flag. */
-        r->pending_destroy = true;
-        return;
-    }
-
-    shm_release_pages(r);
+    shm_region_t released = {0};
+    uint64_t flags = shm_lock_irqsave();
+    /* The creator owns exactly one reference, even when cleanup and an
+     * explicit destroy race or the caller repeats its destroy request. */
+    shm_drop_creator_locked(shm_find(handle), &released);
+    shm_unlock_irqrestore(flags);
+    shm_release_pages(&released);
 }
 
-/* Get the physical address of a shared region (for GPU scanout) */
+/* Get the physical address (for GPU scanout). The caller must retain its
+ * creator/mapping reference while using the returned address. */
 uint64_t shm_get_phys(uint32_t handle)
 {
+    uint64_t flags = shm_lock_irqsave();
     shm_region_t *r = shm_find(handle);
-    if (!r || !r->base) return 0;
-    return VIRT_TO_PHYS(r->base);
+    uint64_t phys = r && r->base ? VIRT_TO_PHYS(r->base) : 0;
+    shm_unlock_irqrestore(flags);
+    return phys;
 }
 
 /* Get region size */
 uint64_t shm_get_size(uint32_t handle)
 {
+    uint64_t flags = shm_lock_irqsave();
     shm_region_t *r = shm_find(handle);
-    if (!r) return 0;
-    return r->size;
+    uint64_t size = r ? r->size : 0;
+    shm_unlock_irqrestore(flags);
+    return size;
 }
 
 /* Get region flags */
 uint32_t shm_get_flags(uint32_t handle)
 {
+    uint64_t irq_flags = shm_lock_irqsave();
     shm_region_t *r = shm_find(handle);
-    if (!r) return 0;
-    return r->flags;
+    uint32_t flags = r ? r->flags : 0;
+    shm_unlock_irqrestore(irq_flags);
+    return flags;
 }
 
 /* Set owner PID */
 void shm_set_owner(uint32_t handle, uint32_t pid)
 {
+    uint64_t flags = shm_lock_irqsave();
     shm_region_t *r = shm_find(handle);
     if (r) r->owner_pid = pid;
+    shm_unlock_irqrestore(flags);
 }
 
 /* Destroy all regions owned by a process (called on proc_free).
@@ -255,37 +332,51 @@ void shm_set_owner(uint32_t handle, uint32_t pid)
  * Two cases:
  *   - The process never called shm_destroy on its region (crash, kill,
  *     or just left it dangling) → pending_destroy is false. We must
- *     drop the creator ref ourselves, which we do by calling
- *     shm_destroy(handle).
+ *     drop the creator reference under the same lock as shm_destroy.
  *   - The process did call shm_destroy explicitly (e.g. Q2 in
  *     SWimp_Shutdown) → pending_destroy is true. The creator ref was
- *     already decremented; calling shm_destroy again would
- *     over-decrement. compositor_cleanup_process will run shortly
+ *     already decremented; do not consume a mapping reference.
+ *     compositor_cleanup_process will run shortly
  *     after this and drop the remaining holder refs via shm_unmap,
  *     and the last one finishes the release via the pending flag.
  *     Just log and skip. */
 void shm_cleanup_process(uint32_t pid)
 {
     for (int i = 0; i < SHM_MAX_REGIONS; i++) {
-        if (!shm_table[i].active) continue;
-        if (shm_table[i].owner_pid != pid) continue;
+        shm_region_t released = {0};
+        uint64_t flags = shm_lock_irqsave();
+        shm_region_t *r = &shm_table[i];
+        if (!r->active || r->owner_pid != pid) {
+            shm_unlock_irqrestore(flags);
+            continue;
+        }
+        uint32_t handle = r->handle;
+        bool pending = r->pending_destroy;
+        shm_drop_creator_locked(r, &released);
+        shm_unlock_irqrestore(flags);
 
         serial_puts("[SHM] Cleanup pid=");
         serial_putdec(pid);
         serial_puts(" h=");
-        serial_putdec(shm_table[i].handle);
-        if (shm_table[i].pending_destroy) {
+        serial_putdec(handle);
+        if (pending) {
             serial_puts(" (already pending destroy)\n");
             continue;
         }
         serial_puts("\n");
-        shm_destroy(shm_table[i].handle);
+        shm_release_pages(&released);
     }
 }
 
 /* ── Stats ───────────────────────────────────────────────────── */
 
-uint32_t shm_get_active_count(void) { return shm_active_count; }
+uint32_t shm_get_active_count(void)
+{
+    uint64_t flags = shm_lock_irqsave();
+    uint32_t count = shm_active_count;
+    shm_unlock_irqrestore(flags);
+    return count;
+}
 
 /* ── Convenience: Create a surface (width × height × 4 bytes) ── */
 
@@ -302,11 +393,13 @@ uint32_t shm_create_surface(uint32_t width, uint32_t height, uint32_t flags)
     uint64_t size = (uint64_t)width * height * 4;
     uint32_t handle = shm_create(size, flags);
     if (handle) {
+        uint64_t irq_flags = shm_lock_irqsave();
         shm_region_t *r = shm_find(handle);
         if (r) {
             r->surf_width = width;
             r->surf_height = height;
         }
+        shm_unlock_irqrestore(irq_flags);
     }
 
     if (handle && (flags & SHM_FLAG_GPU_SCANOUT)) {
@@ -371,8 +464,9 @@ static void shm_direct_virtio_scanout(uint32_t *src, uint32_t src_pitch,
 
 void shm_flush_surface(uint32_t handle)
 {
-    shm_region_t *r = shm_find(handle);
-    if (!r || !r->base) return;
+    shm_region_t snapshot;
+    if (!shm_acquire_region(handle, &snapshot)) return;
+    const shm_region_t *r = &snapshot;
 
     /* When compositor is running it reads win->pixels (same SHM region)
      * directly each frame. Mark the matching compositor window dirty so
@@ -382,6 +476,7 @@ void shm_flush_surface(uint32_t handle)
         uint32_t wid = compositor_find_window_by_shm(handle);
         if (wid)
             compositor_signal_dirty(wid);
+        shm_unmap(handle);
         return;
     }
 
@@ -413,6 +508,7 @@ void shm_flush_surface(uint32_t handle)
             nofb_log_count++;
         }
         shm_direct_virtio_scanout(src, sw, sw, sh);
+        shm_unmap(handle);
         return;
     }
 
@@ -464,6 +560,7 @@ void shm_flush_surface(uint32_t handle)
 
     extern void fb_flush_all(void);
     fb_flush_all();
+    shm_unmap(handle);
 }
 
 /* ── Initialize ──────────────────────────────────────────────── */

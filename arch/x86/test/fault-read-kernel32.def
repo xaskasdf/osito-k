@@ -1,0 +1,8 @@
+LIBRARY kernel32.dll
+EXPORTS
+ExitProcess@4
+VirtualAlloc@16
+VirtualFree@12
+CreateProcessA@40
+GetCommandLineA@0
+WaitForSingleObject@8

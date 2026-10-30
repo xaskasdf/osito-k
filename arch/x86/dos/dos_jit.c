@@ -366,6 +366,12 @@ static bool jit_source_region(dos_vm_t *vm, uint16_t cs, uint32_t ip,
     /* Do not batch across the interpreter's 16-bit fetch boundary. */
     if (!*code32 && *limit > 0xFFFFu) *limit = 0xFFFFu;
     uint64_t linear = (uint64_t)*base + ip;
+    if (linear > UINT32_MAX) return false;
+    uint32_t physical = dos_a20_address(vm, (uint32_t)linear);
+    if (!dos_a20_enabled(vm)) {
+        uint64_t last = (uint64_t)ip + 0xFFFFFu - ((uint32_t)linear & 0xFFFFFu);
+        if (*limit > last) *limit = (uint32_t)last;
+    }
     /* Read-ahead must not load VGA latches or cross a banked EMS window.
      * These sources keep the interpreter's per-access device semantics. */
     static const uint32_t windows[][2] = {
@@ -373,14 +379,14 @@ static bool jit_source_region(dos_vm_t *vm, uint16_t cs, uint32_t ip,
         { DOS_EMS_PAGE_FRAME_BASE, DOS_EMS_FRAME_PAGES * DOS_EMS_PAGE_SIZE }
     };
     for (unsigned i = 0; i < sizeof(windows) / sizeof(windows[0]); i++) {
-        if (linear >= windows[i][0] &&
-            linear < (uint64_t)windows[i][0] + windows[i][1]) return false;
-        if (linear < windows[i][0]) {
-            uint32_t last = windows[i][0] - *base - 1u;
-            if (*limit > last) *limit = last;
+        if (physical >= windows[i][0] &&
+            physical < (uint64_t)windows[i][0] + windows[i][1]) return false;
+        if (physical < windows[i][0]) {
+            uint64_t last = (uint64_t)ip + windows[i][0] - physical - 1u;
+            if (*limit > last) *limit = (uint32_t)last;
         }
     }
-    return ip <= *limit && linear < vm->total_mem_size;
+    return ip <= *limit && dos_mem_guest_span(vm, (uint32_t)linear, 1u, NULL);
 }
 
 bool jit_block_current(dos_vm_t *vm, const jit_block_t *block)
@@ -394,7 +400,7 @@ bool jit_block_current(dos_vm_t *vm, const jit_block_t *block)
         base != block->source_base || limit != block->source_limit ||
         code32 != block->code32 || !block->source_size ||
         (uint64_t)block->ip + block->source_size - 1u > limit ||
-        (uint64_t)base + block->ip + block->source_size > vm->total_mem_size)
+        !dos_mem_guest_span(vm, base + block->ip, block->source_size, NULL))
         return false;
     for (unsigned i = 0; i < block->source_size; i++)
         if (block->source[i] != dos_mem_read8(vm, base + block->ip + i))
@@ -413,11 +419,15 @@ int jit_decode_block(dos_vm_t *vm, jit_block_t *block)
         return -1;
 
     uint64_t available = (uint64_t)limit - block->ip + 1u;
-    uint64_t backing = vm->total_mem_size - ((uint64_t)base + block->ip);
-    if (available > backing) available = backing;
     if (available > sizeof(block->source)) available = sizeof(block->source);
-    for (unsigned i = 0; i < available; i++)
+    for (unsigned i = 0; i < available; i++) {
+        if ((uint64_t)base + block->ip + i > UINT32_MAX ||
+            !dos_mem_guest_span(vm, base + block->ip + i, 1u, NULL)) {
+            available = i;
+            break;
+        }
         block->source[i] = dos_mem_read8(vm, base + block->ip + i);
+    }
     block->source_base = base;
     block->source_limit = limit;
     block->code32 = code32;
@@ -777,6 +787,10 @@ bool jit_exec_block(dos_vm_t *vm, jit_block_t *block)
         if (block->native_capacity) jit_lru_touch(block->owner, block, JIT_CODE_LRU);
     }
     uint16_t instruction_count = block->instruction_count;
+    /* Source/CS validation must succeed before RF is consumed. Translated
+     * register operations and branches cannot reload RF; IRETD, task
+     * switches and REP remain interpreted instruction boundaries. */
+    if (instruction_count) vm->cpu->eflags &= ~FLAG_RF;
     jit_func_t fn = (jit_func_t)block->native_code;
     uint32_t result = fn(vm->cpu);
 

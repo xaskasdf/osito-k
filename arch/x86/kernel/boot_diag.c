@@ -17,6 +17,9 @@ extern void serial_putdec(uint64_t val);
 extern uint64_t idt_get_ticks(void);
 
 extern bool osfs2_is_mounted(void);
+extern bool osfs3_is_mounted(void);
+extern bool osfs3_directory_exists_ci(const char *path);
+extern int osfs3_mkdir(const char *path);
 extern void *osfs2_find(const char *name);
 extern void *osfs2_create(const char *name, uint64_t size);
 extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
@@ -42,9 +45,83 @@ static uint64_t boot_diag_log_bytes;
 static uint64_t boot_diag_last_hb_ticks;
 static uint64_t boot_diag_last_auto_ticks;
 static bool boot_diag_flushing;
+static bool boot_diag_last_flush_ok;
 static void *boot_diag_log_file;
 static char boot_diag_log_name[32];
 static char boot_diag_chunk[BOOT_DIAG_CHUNK];
+
+/* Survives klog wrap and works even when no disk can be mounted. */
+#define STORAGE_DIAG_LINES 64u
+#define STORAGE_DIAG_WIDTH 128u
+static char storage_diag_lines[STORAGE_DIAG_LINES][STORAGE_DIAG_WIDTH];
+static uint32_t storage_diag_total;
+
+static void storage_diag_record(char *line)
+{
+    static const char *const prefixes[] = {
+        "[PCI] xHCI", "[xHCI]", "[USB-STOR]", "[BLKDEV]", "[GPT]",
+        "[OsitoFS", "[KERN] OsitoFS", "[KERN] scan", "[NVMe]", "[AHCI]",
+    };
+    size_t length = strlen(line);
+    for (unsigned i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+        size_t prefix_length = strlen(prefixes[i]);
+        if (length >= prefix_length && !memcmp(line, prefixes[i], prefix_length)) {
+            strcpy(storage_diag_lines[storage_diag_total % STORAGE_DIAG_LINES], line);
+            storage_diag_total++;
+            break;
+        }
+    }
+}
+
+void boot_diag_capture_storage(void)
+{
+    char chunk[512], line[STORAGE_DIAG_WIDTH];
+    uint64_t cursor = 0, end = klog_total_bytes();
+    uint32_t used = 0;
+    bool truncated = false;
+    storage_diag_total = 0;
+    while (cursor < end) {
+        uint32_t want = end - cursor < sizeof(chunk) ? (uint32_t)(end - cursor) : sizeof(chunk);
+        uint32_t count = klog_read_since(&cursor, chunk, want);
+        if (!count) break;
+        for (uint32_t i = 0; i < count; i++) {
+            char c = chunk[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
+                line[used] = 0;
+                if (truncated) memcpy(line + STORAGE_DIAG_WIDTH - 4, "...", 3);
+                storage_diag_record(line);
+                used = 0;
+                truncated = false;
+            } else if (used < sizeof(line) - 1) {
+                line[used++] = c;
+            } else {
+                truncated = true;
+            }
+        }
+    }
+    if (used) {
+        line[used] = 0;
+        if (truncated) memcpy(line + STORAGE_DIAG_WIDTH - 4, "...", 3);
+        storage_diag_record(line);
+    }
+}
+
+uint32_t boot_diag_storage_count(void)
+{
+    return storage_diag_total < STORAGE_DIAG_LINES ? storage_diag_total : STORAGE_DIAG_LINES;
+}
+
+uint32_t boot_diag_storage_dropped(void)
+{
+    return storage_diag_total - boot_diag_storage_count();
+}
+
+const char *boot_diag_storage_line(uint32_t index)
+{
+    if (index >= boot_diag_storage_count()) return NULL;
+    return storage_diag_lines[(index + boot_diag_storage_dropped()) % STORAGE_DIAG_LINES];
+}
 
 void boot_diag_flush(const char *reason);
 
@@ -219,6 +296,14 @@ void boot_diag_init(void)
     if (boot_diag_ready || !osfs2_is_mounted())
         return;
 
+    /* v2 has flat names; v3 needs the parent before creating the ring files. */
+    if (osfs3_is_mounted() && !osfs3_directory_exists_ci("diag") &&
+        osfs3_mkdir("diag") < 0) {
+        boot_diag_failed = true;
+        serial_puts("[BDIAG] cannot create diagnostic directory\n");
+        return;
+    }
+
     slot = bd_read_index();
     boot_diag_slot_id = slot;
     bd_write_index((slot + 1) & 3);
@@ -262,6 +347,7 @@ void boot_diag_flush(const char *reason)
     if (boot_diag_flushing)
         return;
     boot_diag_flushing = true;
+    boot_diag_last_flush_ok = false;
 
     if (usb_storage_write_diag_flush)
         usb_storage_write_diag_flush(reason);
@@ -280,8 +366,10 @@ void boot_diag_flush(const char *reason)
     }
 
     bd_write_latest(reason);
-    osfs2_set_size_reserved(boot_diag_log_file, boot_diag_log_bytes);
-    disk_flush();
+    bool size_ok = osfs2_set_size_reserved(boot_diag_log_file, boot_diag_log_bytes) == 0;
+    int flush_result = disk_flush();
+    boot_diag_last_flush_ok = size_ok && flush_result == 0 &&
+        !boot_diag_failed && !boot_diag_truncated && boot_diag_cursor >= target;
     boot_diag_flushing = false;
 }
 
@@ -322,6 +410,17 @@ void boot_diag_mark(const char *reason)
         serial_puts("\n");
     }
     boot_diag_flush(reason);
+}
+
+/* Success describes the boot log itself, not latest.txt or hardware cache
+ * durability beyond the block driver's flush contract. Never fake success
+ * for an unavailable/full log or a reentrant flush. */
+bool boot_diag_checkpoint(const char *reason)
+{
+    if (!reason || !boot_diag_ready || boot_diag_failed || boot_diag_truncated ||
+        boot_diag_flushing) return false;
+    boot_diag_mark(reason);
+    return boot_diag_last_flush_ok;
 }
 
 void boot_diag_heartbeat(const char *reason)

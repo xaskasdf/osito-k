@@ -118,7 +118,8 @@ typedef struct __attribute__((packed)) {
  * is the exact regime where multi-block SACK parsing earns its keep. */
 #define TCP_TX_BUF_SIZE 16384
 #define TCP_MAX_CONNS   64
-#define TCP_MSS         1460
+#define TCP_MSS         1460  /* Ethernet MTU minus fixed IPv4/TCP headers */
+#define TCP_DEFAULT_MSS 536   /* IPv4 peer omitted the MSS option */
 
 #define NET_TCP_ERROR_NONE       0
 #define NET_TCP_ERROR_RESET      1
@@ -186,6 +187,7 @@ typedef struct {
     uint8_t   keepalive_probes;
     uint8_t   close_reason;
     uint8_t   loopback;       /* connection is delivered inside net.c */
+    uint16_t  peer_mss;       /* SYN MSS; zero uses TCP_DEFAULT_MSS */
 } tcp_conn_t;
 
 /* ── Network API ─────────────────────────────────────────────── */
@@ -196,6 +198,13 @@ typedef void (*udp_handler_t)(const uint8_t *src_ip, uint16_t src_port,
 
 /* Initialize network stack with static IP */
 void net_init(const uint8_t ip[4]);
+/* Polled link identity. A new epoch invalidates addresses and pending work. */
+uint64_t net_link_epoch(void);
+bool net_link_ready(void);
+/* Commit only on the same live link. -1 also denotes a busy poll owner;
+ * callers may retry while epoch and their deadline remain unchanged. */
+int net_apply_ipv4(uint64_t epoch, const uint8_t ip[4], const uint8_t mask[4],
+                   const uint8_t gateway[4], const uint8_t dns[4]);
 
 /* Poll for incoming packets (call in main loop) */
 void net_poll(void);
@@ -303,6 +312,8 @@ int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
 
 /* Set DNS server IP (default: 10.0.2.3 for QEMU SLIRP) */
 void net_dns_set_server(const uint8_t ip[4]);
+/* Copy the configured IPv4 resolver; false means no server is configured. */
+bool net_dns_get_server(uint8_t ip_out[4]);
 
 /* ── Async Network API ───────────────────────────────────────── */
 

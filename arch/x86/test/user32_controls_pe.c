@@ -358,6 +358,60 @@ static void groupbox_contracts(void)
     DestroyWindow(group);
 }
 
+static void edit_contracts(void)
+{
+    HANDLE edit = CreateWindowExA(0, "EDIT", "License one\r\nLicense two\r\nLicense three\r\nLicense four\r\nLicense five\r\nLicense six\r\nLicense seven\r\nLicense eight\r\nLicense nine\r\nLicense ten",
+        0x50000804u, 5, 5, 180, 64, parent, (HANDLE)501, instance, 0);
+    check(edit != 0, "create read-only multiline edit");
+    if (!edit) return;
+    UINT before = colors;
+    print(edit);
+    check(colors > before && (bits[60*240+170]&0xffffff) == 0x224466,
+          "readonly edit paints with parent static-color brush");
+    UINT glyphs = 0;
+    for (UINT y = 0; y < 50; y++) for (UINT x = 0; x < 170; x++)
+        if ((bits[y*240+x]&0xffffff) == 0xAA5533) glyphs++;
+    check(glyphs > 0, "readonly edit paints text glyphs");
+    check((bits[70*240+200]&0xffffff) == 0x112233, "edit printing clips to client");
+    check(SendMessageA(edit, 0xBA, 0, 0) == 10, "edit line count");
+    check(SendMessageA(edit, 0xCE, 0, 0) == 0, "edit initial first visible line");
+    check(SendMessageA(edit, 0xB6, 0, 2) == 1 && SendMessageA(edit, 0xCE, 0, 0) == 2,
+          "edit vertical line scrolling");
+    SendMessageA(edit, 0xB6, 0, 100);
+    report("EDIT bottom-first-line=");number((unsigned)SendMessageA(edit, 0xCE, 0, 0));report("\n");
+    check(SendMessageA(edit, 0xB6, 0, -100) == 1 && SendMessageA(edit, 0xCE, 0, 0) == 0,
+          "edit scroll clamps at top");
+    char text[200]; int length = GetWindowTextA(edit, text, 200);
+    SendMessageA(edit, 0x102, 'Z', 0);
+    check(length > 0 && GetWindowTextLengthA(edit) == length,
+          "read-only edit ignores typed characters");
+    check((SendMessageA(edit, 0x87, 0, 0)&0x89) == 0x89, "edit dialog keyboard classification");
+    RECT format = {3, 4, 150, 50}, received = {0};
+    SendMessageA(edit, 0xB3, 0, (IPTR)&format);
+    SendMessageA(edit, 0xB2, 0, (IPTR)&received);
+    report("EDIT format=");number(received.left);report(",");number(received.top);report(",");
+    number(received.right);report(",");number(received.bottom);report("\n");
+    check(received.left == 3 && received.top == 4 && received.right == 150 && received.bottom == 36,
+          "edit custom formatting rectangle");
+    check(SetWindowTextA(edit, "Replacement") && GetWindowTextLengthA(edit) == 11 &&
+          SendMessageA(edit, 0xBA, 0, 0) == 1, "readonly edit accepts application text replacement");
+    DestroyWindow(edit);
+    edit = child("EDIT", "callback lifetime", 0x800, 502);
+    destroy_color = 1; print(edit);
+    check(!IsWindow(edit), "edit destruction during color callback is safe");
+    edit = child("EDIT", "secret", 0x820, 503);
+    SendMessageA(edit, 0xCC, '#', 0);
+    check(SendMessageA(edit, 0xD2, 0, 0) == '#' && GetWindowTextLengthA(edit) == 6,
+          "password display character preserves stored text");
+    print(edit); memcpy(previous, bits, sizeof(previous));
+    HANDLE reference = child("EDIT", "######", 0x800, 504);
+    print(reference);
+    BOOL masked = 1;
+    for (UINT i = 0; i < 240*80; i++) if (bits[i] != previous[i]) masked = 0;
+    check(masked, "edit paints only masked password glyphs");
+    DestroyWindow(reference); DestroyWindow(edit);
+}
+
 static DWORD CALL text_worker(void *unused)
 {
     (void)unused;
@@ -408,7 +462,7 @@ void mainCRTStartup(void)
     if (!parent || !dc || !dib) ExitProcess(2);
     HANDLE old = SelectObject(dc, dib);
     ink = CreateSolidBrush(0x0033AA55); tint = CreateSolidBrush(0x00664422);
-    text_contracts(); buttons(); ownership(); groupbox_contracts(); threaded_text();
+    text_contracts(); buttons(); ownership(); groupbox_contracts(); edit_contracts(); threaded_text();
     DestroyWindow(parent); UnregisterClassA(class_name, instance);
     SelectObject(dc, old); DeleteObject(dib); DeleteDC(dc);
     DeleteObject(ink); DeleteObject(tint);

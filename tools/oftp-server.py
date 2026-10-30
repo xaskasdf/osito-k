@@ -26,6 +26,7 @@ Usage:
     Defaults: 0.0.0.0  7781  current dir
 """
 
+import argparse
 import os
 import socket
 import struct
@@ -47,7 +48,13 @@ UPLOAD_DIR   = "uploads"  # subdir under serve-root for incoming files
 PACE_SECONDS = 0.003
 
 
-def serve(bind_host: str, port: int, root: str) -> None:
+def safe_filename(filename: str) -> bool:
+    # Reject Windows drive/UNC/ADS paths even when testing on a POSIX host.
+    return bool(filename) and ".." not in filename and not any(
+        char in filename for char in "/\\:\x00") and filename != "."
+
+
+def serve(bind_host: str, port: int, root: str, read_only: bool = False) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((bind_host, port))
     print(f"oftp listening on {bind_host}:{port}  root={os.path.abspath(root)}")
@@ -61,7 +68,8 @@ def serve(bind_host: str, port: int, root: str) -> None:
 
     # Ensure upload dir exists under root
     upload_root = os.path.join(root, UPLOAD_DIR)
-    os.makedirs(upload_root, exist_ok=True)
+    if not read_only:
+        os.makedirs(upload_root, exist_ok=True)
 
     def send_from(path: str, size: int, addr: tuple, start_offset: int) -> int:
         """Stream from start_offset to EOF. Returns bytes sent (excl. EOF marker)."""
@@ -94,11 +102,14 @@ def serve(bind_host: str, port: int, root: str) -> None:
 
         # ── Upload request: client wants to push a file to us ───────
         if magic == MAGIC_PUT and len(data) >= 8:
+            if read_only:
+                sock.sendto(MAGIC_ERR + b"read only", addr)
+                continue
             (total_size,) = struct.unpack(">I", data[4:8])
             filename = data[8:].rstrip(b"\x00").decode("utf-8", errors="ignore")
             # Sanitize filename: strip path components, refuse traversal
             base = os.path.basename(filename) or "unnamed.bin"
-            if ".." in base or total_size > 256 * 1024 * 1024:
+            if not safe_filename(base) or total_size > 256 * 1024 * 1024:
                 print(f"  {addr[0]}:{addr[1]}  PUT {filename!r} -> rejected")
                 sock.sendto(MAGIC_ERR + b"rejected", addr)
                 continue
@@ -160,8 +171,11 @@ def serve(bind_host: str, port: int, root: str) -> None:
 
         filename = data[4:].rstrip(b"\x00").decode("utf-8", errors="ignore")
         path     = os.path.join(root, filename)
-
-        if "/" in filename or ".." in filename or not os.path.isfile(path):
+        try:
+            inside = os.path.commonpath((os.path.realpath(root), os.path.realpath(path))) == os.path.realpath(root)
+        except ValueError:
+            inside = False
+        if not safe_filename(filename) or not os.path.isfile(path) or not inside:
             print(f"  {addr[0]}:{addr[1]}  REQ {filename!r} -> not-found")
             sock.sendto(MAGIC_ERR + b"not found", addr)
             continue
@@ -178,13 +192,17 @@ def serve(bind_host: str, port: int, root: str) -> None:
 
 
 def main() -> None:
-    bind_host = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
-    port      = int(sys.argv[2]) if len(sys.argv) > 2 else 7781
-    root      = sys.argv[3] if len(sys.argv) > 3 else "."
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("bind_host", nargs="?", default="0.0.0.0")
+    parser.add_argument("port", nargs="?", type=int, default=7781)
+    parser.add_argument("root", nargs="?", default=".")
+    parser.add_argument("--read-only", action="store_true")
+    args = parser.parse_args()
+    bind_host, port, root = args.bind_host, args.port, args.root
     if not os.path.isdir(root):
         print(f"error: serve root {root!r} not a directory")
         sys.exit(1)
-    serve(bind_host, port, root)
+    serve(bind_host, port, root, args.read_only)
 
 
 if __name__ == "__main__":

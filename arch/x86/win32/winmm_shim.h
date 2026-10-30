@@ -33,6 +33,7 @@ UINT  WINAPI shim_joyGetDevCapsA(UINT id, PVOID caps, UINT size);
 BOOL  WINAPI shim_PlaySoundA(const char *sound, PVOID hmod, DWORD flags);
 BOOL  WINAPI shim_PlaySoundW(PCWSTR sound, PVOID hmod, DWORD flags);
 UINT  WINAPI shim_waveOutGetNumDevs(void);
+BOOL  winmm_message_beep(UINT type);
 
 /* MCI */
 DWORD WINAPI shim_mciSendCommandA(UINT device, UINT msg, ULONG_PTR flags,

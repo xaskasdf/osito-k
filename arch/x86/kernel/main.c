@@ -7,6 +7,8 @@
 
 #include "../include/types.h"
 #include "../include/boot_info.h"
+#include "kexec.h"
+#include "../include/boot_trace.h"
 #include "../include/paging.h"
 #include "../include/tensor_arena.h"
 #include "../drivers/gpu.h"
@@ -16,6 +18,8 @@
 #include "../fs/vfs.h"
 #include "tensor.h"
 #include "inference.h"
+#include "nic.h"
+#include "../include/pci.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -98,7 +102,7 @@ uint64_t kernel_acpi_rsdp;
 
 /* Saved boot_info for kexec — preserved across kernel lifetime */
 boot_info_t saved_boot_info;
-static uint8_t saved_mmap[8192] __attribute__((aligned(16)));  /* copy of UEFI mmap */
+static uint8_t saved_mmap[65536] __attribute__((aligned(16)));  /* copy of UEFI mmap */
 
 /* PCI */
 extern void pci_scan(void);
@@ -111,7 +115,7 @@ extern void *pci_get_xhci(void); /* Returns pci_dev_t* */
 extern void *pci_get_intel_gfx(void); /* Returns pci_dev_t* */
 
 /* NVMe */
-extern int nvme_init(uint64_t bar0_phys);
+extern int nvme_init(const pci_dev_t *device);
 extern bool nvme_is_ready(void);
 
 /* I211 Ethernet */
@@ -302,6 +306,30 @@ static void prompt_handler(const uint8_t *src_ip, uint16_t src_port,
 
 /* ── Banner ──────────────────────────────────────────────────── */
 
+static void start_network_services(void)
+{
+    extern int net_start_poll_worker(void);
+    extern void agent_init(void);
+    extern int inferconnect_peer_listener_start(void);
+    extern void cluster_init(void);
+    boot_diag_mark("pre-udp7777");
+    net_udp_listen(7777, prompt_handler);
+    boot_diag_mark("post-udp7777");
+    if (net_start_poll_worker() != 0)
+        serial_puts("[KERN] Failed to start net-rx worker\n");
+    boot_diag_mark("pre-agent");
+    agent_init();
+    boot_diag_mark("post-agent");
+    /* Agent state precedes incoming RPC. Kthread-backed services still wait
+     * for the end of boot; these listeners also survive link changes. */
+    boot_diag_mark("pre-udp19999");
+    inferconnect_peer_listener_start();
+    boot_diag_mark("post-udp19999");
+    boot_diag_mark("pre-cluster-init");
+    cluster_init();
+    boot_diag_mark("post-cluster-init");
+}
+
 static void print_banner(void)
 {
     const char *banner =
@@ -426,27 +454,29 @@ static bool boot_mount_ositofs_all(void)
 
 void __initk kernel_entry(boot_info_t *info)
 {
+    boot_trace(info->fb_base ? (uint64_t)PHYS_TO_VIRT(info->fb_base) : 0, info->fb_width,
+               info->fb_height, info->fb_pitch, 0xc1, 0);
     /* Early-boot probe (kexec diagnostic).  serial_init hasn't been
      * called yet but COM1 is already configured by UEFI / prev kernel.
-     * Direct OUTB to 0x3F8 with simple ready-bit polling. */
+     * Do not let an absent or unready UART hold up real-hardware boot. */
     #define KEXEC_PROBE(s) do { \
         const char *_p = (s); \
         while (*_p) { \
-            uint8_t _st; \
-            do { __asm__ volatile ("inb %w1, %b0" : "=a"(_st) : "Nd"((uint16_t)0x3FD)); } \
-            while (!(_st & 0x20)); \
+            uint8_t _st = 0; \
+            unsigned _budget = 10000; \
+            do { \
+                __asm__ volatile ("inb %w1, %b0" : "=a"(_st) : "Nd"((uint16_t)0x3FD)); \
+                if (_st & 0x20) break; \
+            } while (--_budget); \
+            if (!_budget || _st == 0xff) break; \
             __asm__ volatile ("outb %b0, %w1" : : "a"(*_p), "Nd"((uint16_t)0x3F8)); \
             _p++; \
         } \
     } while (0)
     KEXEC_PROBE("[KEXEC-PATH] kernel_entry\n");
 
-    /* Capture the entry RSP NOW, before any deeper frames. We arrive on
-     * the firmware-provided UEFI stack (EfiBootServicesData) and never
-     * switch off it — mem_init() below marks BootServicesData free, so
-     * this exact window must be re-reserved in the phys bitmap or the
-     * top-down page-table allocator eventually hands out our live stack
-     * (see mem_reserve_boot_stack in memory.c). */
+    /* Reserve the actual entry stack, whether supplied by boot.efi or kexec.
+     * Legacy loaders may still pass a reclaimable BootServicesData stack. */
     uint64_t boot_rsp;
     __asm__ volatile ("mov %%rsp, %0" : "=r"(boot_rsp));
 
@@ -459,19 +489,25 @@ void __initk kernel_entry(boot_info_t *info)
             *p++ = 0;
     }
     KEXEC_PROBE("[KEXEC-PATH] bss-zeroed\n");
+    boot_trace(info->fb_base ? (uint64_t)PHYS_TO_VIRT(info->fb_base) : 0, info->fb_width,
+               info->fb_height, info->fb_pitch, 0xc2, 0);
 
     /* ── Save boot_info + UEFI mmap for kexec ── */
-    saved_boot_info = *info;
+    if (!boot_info_import(&saved_boot_info, info) || !info->mmap_addr || !info->mmap_size ||
+        info->mmap_desc_size < 40 || info->mmap_size > UINT64_MAX - info->mmap_addr ||
+        info->mmap_size > sizeof(saved_mmap) || info->mmap_size % info->mmap_desc_size) {
+        KEXEC_PROBE("[BOOT] invalid boot info or memory map; halted\n");
+        for (;;) __asm__ volatile ("cli; hlt");
+    }
     {
         uint64_t mmap_copy_sz = info->mmap_size;
-        if (mmap_copy_sz > sizeof(saved_mmap))
-            mmap_copy_sz = sizeof(saved_mmap);
         uint8_t *src = (uint8_t *)(uintptr_t)info->mmap_addr;
         for (uint64_t i = 0; i < mmap_copy_sz; i++)
             saved_mmap[i] = src[i];
         saved_boot_info.mmap_addr = (uint64_t)(uintptr_t)saved_mmap;
         saved_boot_info.mmap_size = mmap_copy_sz;
     }
+    info = &saved_boot_info;
 
     /* ── Step 0: Initialize serial + framebuffer (moved from boot) ── */
     serial_init();
@@ -525,7 +561,13 @@ void __initk kernel_entry(boot_info_t *info)
      * BootServicesData pages free, and both the shadow-FB bottom-up
      * alloc and pt_alloc_page's top-down cursor could otherwise land
      * on live frames. */
-    mem_reserve_boot_stack(boot_rsp);
+    if (info->version >= 3 && (info->handoff_data_size || info->handoff_stack_size))
+        kexec_boot_reserve(info, kvirt_to_phys((void *)boot_rsp));
+    else
+        mem_reserve_boot_stack(boot_rsp);
+    /* idt_init also allocates physical pages: protect live CR3 tables first. */
+    extern void paging_reserve_boot_tables(void);
+    paging_reserve_boot_tables();
 
     /* Compute system capabilities from actual hardware */
     {
@@ -538,6 +580,7 @@ void __initk kernel_entry(boot_info_t *info)
 
     /* ── Step 1.6: Kernel page tables ── */
     paging_init();
+    kexec_boot_release(info);
 
     /* ── Step 1.6b: PAT WC + shadow framebuffer ── */
     {
@@ -640,13 +683,6 @@ void __initk kernel_entry(boot_info_t *info)
     int tensor_ap = -1;
 
     /* ── Map PCI device BARs into page tables ── */
-    typedef struct {
-        uint8_t  bus, dev, func;
-        uint16_t vendor_id, device_id;
-        uint8_t  class_code, subclass;
-        uint64_t bar[6];
-    } pci_dev_t;
-
     /* Map GPU BAR0 if present */
     gpu_device_t *gpu = pci_get_gpu();
     if (gpu && gpu->bar0_base) {
@@ -783,7 +819,7 @@ void __initk kernel_entry(boot_info_t *info)
         serial_puts("[KERN] NVMe[");
         serial_putdec(i);
         serial_puts("] init...\n");
-        if (nvme_init(nd->bar[0]) != 0) {
+        if (nvme_init(nd) != 0) {
             serial_puts("[KERN] NVMe[");
             serial_putdec(i);
             serial_puts("] init failed\n");
@@ -800,6 +836,8 @@ void __initk kernel_entry(boot_info_t *info)
     }
 
     bool fs_mounted = boot_mount_ositofs_all();
+    extern void boot_diag_capture_storage(void);
+    boot_diag_capture_storage();
     if (fs_mounted) {
         boot_diag_init();
         boot_diag_mark("fs-mounted");
@@ -878,7 +916,10 @@ void __initk kernel_entry(boot_info_t *info)
             nic_ok = 0;
         }
 
-        if (nic_ok == 0) {
+        if (nic_ok == 0 && nic_boot_prefer_wlan(pci_get_wlan() != NULL)) {
+            serial_puts("[KERN] Ethernet link down; selecting WLAN before IP startup\n");
+            fb_puts(" NIC: no Ethernet link; WLAN selected\n");
+        } else if (nic_ok == 0) {
             extern void net_set_ip(const uint8_t ip[4]);
             extern void net_set_gateway(const uint8_t gw[4]);
             extern void net_dns_set_server(const uint8_t ip[4]);
@@ -944,43 +985,7 @@ void __initk kernel_entry(boot_info_t *info)
                 }
             }
 
-            boot_diag_mark("pre-udp7777");
-            net_udp_listen(7777, prompt_handler);
-            boot_diag_mark("post-udp7777");
-
-            /* Drive RX from process context. net_poll() may wake scheduler
-             * waiters and must not run while sched_tick owns an ISR frame. */
-            extern int net_start_poll_worker(void);
-            if (net_start_poll_worker() != 0)
-                serial_puts("[KERN] Failed to start net-rx worker\n");
-
-            /* Agent task queue init (single-worker, 4 slots). Must run
-             * before inferconnect_start so any incoming RPC agent_task
-             * sees agent_is_initialized() = true. */
-            extern void agent_init(void);
-            boot_diag_mark("pre-agent");
-            agent_init();
-            boot_diag_mark("post-agent");
-
-            /* Inferconnect: register the UDP peer-heartbeat listener early,
-             * but defer kthread-backed RPC/broadcast/cluster services until
-             * the end of boot. kthread_create() enables preemption on first
-             * spawn, and this network block still runs before heavy boot
-             * initialization is complete. */
-            extern int  inferconnect_peer_listener_start(void);
-            extern void cluster_init(void);
-            /* Peer listener FIRST: registers the UDP :19999 callback so we
-             * actually RECEIVE peer heartbeats. Without it this node only
-             * broadcasts into the void and never discovers anyone (the
-             * multicast-accept patch in net.c::handle_ipv4 is what lets the
-             * 239.x frames reach this callback). */
-            boot_diag_mark("pre-udp19999");
-            inferconnect_peer_listener_start();
-            boot_diag_mark("post-udp19999");
-
-            boot_diag_mark("pre-cluster-init");
-            cluster_init();
-            boot_diag_mark("post-cluster-init");
+            start_network_services();
             net_services_ready = true;
 
             /* Optional cross-node delegation probe — triggered only
@@ -1029,15 +1034,20 @@ void __initk kernel_entry(boot_info_t *info)
         fb_puts("\n NIC: not detected\n");
     }
 
+    if (!net_services_ready && pci_get_wlan()) {
+        const uint8_t zero_ip[4] = {0};
+        nic_bind_iwx();
+        net_init(zero_ip);
+        start_network_services();
+        net_services_ready = true;
+        serial_puts("[KERN] WLAN prepared; use wlan start, scan and connect\n");
+    }
     boot_diag_mark("post-net");
 
     /* HTTP + Claude API available via shell commands (curl, apikey, ask) */
 
-    /* ── Step 4.6: HDA audio init ── */
-    if (hda_pci && hda_pci->bar[0]) {
-        extern int hda_init(uint64_t, uint8_t, uint8_t, uint8_t);
-        hda_init(hda_pci->bar[0], hda_pci->bus, hda_pci->dev, hda_pci->func);
-    }
+    /* HDA BARs are mapped above; the driver worker applies its persisted
+     * enable policy and initializes audio after the shell is available. */
 
     /* ── Step 4.8: post-mount initialization (GGUF, GSP, auto-launch) ── */
     static llama_state_t llama;

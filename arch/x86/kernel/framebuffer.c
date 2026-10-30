@@ -467,6 +467,8 @@ static void term_buf_newline(void)
 
 void fb_putc(char c, uint32_t color)
 {
+    extern bool shell_remote_active(void) __attribute__((weak));
+    if (shell_remote_active && shell_remote_active()) return;
     if (!fb_base) return;
 
     /* ANSI state machine */
@@ -566,6 +568,7 @@ uint32_t *fb_get_vram(void)   { return fb_vram; }
 uint32_t  fb_get_width(void)  { return fb_width; }
 uint32_t  fb_get_height(void) { return fb_height; }
 uint32_t  fb_get_pitch(void)  { return fb_pitch; }
+bool      fb_is_redirected(void) { return redirect_active; }
 
 uint32_t fb_get_text_col(void) { return text_col; }
 uint32_t fb_get_text_row(void) { return text_row; }

@@ -8,6 +8,7 @@
 typedef LONG HRESULT;
 
 HRESULT WINAPI DirectSoundCreate(LPCGUID device, PVOID output, PVOID outer);
+HRESULT WINAPI DirectSoundCreate8(LPCGUID device, PVOID output, PVOID outer);
 HRESULT WINAPI DirectSoundEnumerateA(PVOID callback, PVOID context);
 HRESULT WINAPI DirectSoundEnumerateW(PVOID callback, PVOID context);
 HRESULT WINAPI DirectSoundCaptureCreate(LPCGUID device, PVOID output,

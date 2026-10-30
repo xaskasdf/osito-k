@@ -489,7 +489,12 @@ DRAW_C_EXCLUDE   := \
 DRAW_C_SRCS_ABS  := $(filter-out $(DRAW_C_EXCLUDE), $(DRAW_C_SRCS_ALL))
 DRAW_C_SRCS      := $(patsubst $(OPENGL_ROOT)/%,%,$(DRAW_C_SRCS_ABS))
 
-GALLIUM_SRCS := $(sort $(GALLIUM_SRCS) $(DRAW_C_SRCS))
+# CPU rasterizer for machines without a Venus-capable GPU. Keep these
+# upstream Mesa sources unchanged; presentation belongs to okgl_context.c.
+SOFTPIPE_SRCS := $(patsubst $(OPENGL_ROOT)/%,%,\
+  $(wildcard $(MESA_ROOT)/src/gallium/drivers/softpipe/*.c)) \
+  mesa/src/gallium/winsys/sw/null/null_sw_winsys.c
+GALLIUM_SRCS := $(sort $(GALLIUM_SRCS) $(DRAW_C_SRCS) $(SOFTPIPE_SRCS))
 
 GALLIUM_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(GALLIUM_SRCS))
 
@@ -624,8 +629,10 @@ COMPILER_CXX_SRCS := \
   mesa/src/compiler/glsl/propagate_invariance.cpp \
   mesa/src/compiler/glsl/serialize.cpp \
   mesa/src/compiler/glsl/shader_cache.cpp \
-  mesa/src/compiler/glsl/standalone_scaffolding.cpp \
   mesa/src/compiler/glsl/string_to_uint_map.cpp
+
+# The standalone compiler's scaffolding replaces real Mesa object lifetime
+# operations with pointer assignments. It must never enter the GL runtime.
 
 COMPILER_C_OBJS   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(COMPILER_C_SRCS))
 # W4.9 — REAL: COMPILER_CXX_OBJS now built via CXX_CROSS (ositok cross g++ +
@@ -798,6 +805,31 @@ MATH_C_SRCS        := $(patsubst $(OPENGL_ROOT)/%,%,$(MATH_C_SRCS_ABS))
 MAIN_C_SRCS_ALL_LIST := $(MAIN_C_SRCS) $(MAPI_C_SRCS) $(PROGRAM_C_SRCS) $(VBO_C_SRCS) $(ST_C_SRCS) $(MATH_C_SRCS)
 MAIN_C_OBJS        := $(patsubst %.c,$(BUILD_DIR)/%.o,$(MAIN_C_SRCS_ALL_LIST))
 
+# Legacy ARB assembly programs are used by WineD3D adapter probes too.
+# Keep generated parser files in the build tree, using Mesa's own grammar.
+BISON ?= bison
+FLEX ?= flex
+ARB_GEN_DIR := $(BUILD_DIR)/generated/program
+ARB_PROGRAM_OBJS := $(ARB_GEN_DIR)/program_parse.o $(ARB_GEN_DIR)/program_lexer.o
+MAIN_C_OBJS += $(ARB_PROGRAM_OBJS)
+
+$(ARB_GEN_DIR)/program_parse.tab.c: $(MESA_ROOT)/src/mesa/program/program_parse.y
+	@mkdir -p $(ARB_GEN_DIR)
+	$(BISON) -o $@ --defines=$(ARB_GEN_DIR)/program_parse.tab.h $<
+
+$(ARB_GEN_DIR)/program_parse.tab.h: $(ARB_GEN_DIR)/program_parse.tab.c
+	@test -f $@
+
+$(ARB_GEN_DIR)/lex.yy.c: $(MESA_ROOT)/src/mesa/program/program_lexer.l
+	@mkdir -p $(ARB_GEN_DIR)
+	$(FLEX) --never-interactive -o $@ $<
+
+$(ARB_GEN_DIR)/program_parse.o: $(ARB_GEN_DIR)/program_parse.tab.c
+	$(CC) $(CFLAGS_MAIN) -I$(BUILD_DIR)/generated -c -o $@ $<
+
+$(ARB_GEN_DIR)/program_lexer.o: $(ARB_GEN_DIR)/lex.yy.c $(ARB_GEN_DIR)/program_parse.tab.h
+	$(CC) $(CFLAGS_MAIN) -I$(BUILD_DIR)/generated -c -o $@ $<
+
 # W4.8 — C++ TUs in mesa/main + mesa/state_tracker. These define
 # _mesa_uniform, _mesa_program_resource_*, st_link_shader, st_finalize_nir,
 # astc decoder LUTs, etc. Built with CXXFLAGS_MAIN_CROSS (ositok cross g++
@@ -861,8 +893,9 @@ $(OUT_GALLIUM): $(GALLIUM_OBJS) | $(BUILD_DIR)
 	@$(AR) rcs $@ $(GALLIUM_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
-$(OUT_COMPILER): $(COMPILER_OBJS) | $(BUILD_DIR)
+$(OUT_COMPILER): $(COMPILER_OBJS) $(OPENGL_ROOT)/Makefile | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
+	@rm -f $@
 	@$(AR) rcs $@ $(COMPILER_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
@@ -949,6 +982,18 @@ $(BUILD_DIR)/mesa/src/gallium/auxiliary/%.o: \
         $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CC    aux/$*"
+	@$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/gallium/drivers/softpipe/%.o: \
+        $(MESA_ROOT)/src/gallium/drivers/softpipe/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    softpipe/$*"
+	@$(CC) $(CFLAGS_COMPILER) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/gallium/winsys/sw/null/%.o: \
+        $(MESA_ROOT)/src/gallium/winsys/sw/null/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    sw/null/$*"
 	@$(CC) $(CFLAGS) -c -o $@ $<
 
 # W4.8++ — generic fallback for util/format/ (u_format_*, etc.).
@@ -1155,40 +1200,42 @@ clean:
 module:
 	@test -d "$(MODULE_SYSROOT)/usr/include/c++/13.2.0" || \
 	  { echo "Missing OsitoK C++ sysroot: $(MODULE_SYSROOT)"; exit 1; }
-	@$(MAKE) BUILD_DIR="$(MODULE_MESA_DIR)" CODEGEN_FLAGS=-fPIC \
+	@$(MAKE) BUILD_DIR="$(MODULE_MESA_DIR)" CODEGEN_FLAGS="-fPIC -mno-red-zone" \
 	  VISIBILITY_FLAGS=-fvisibility=hidden CXX_MODE_FLAGS="$(CXX_MODE_FLAGS)" \
 	  CXX_CROSS="$(MODULE_CXX)" SYSROOT="$(MODULE_SYSROOT)" \
 	  CC="$(MODULE_CC)" AR="$(MODULE_AR)" all
 	@$(MAKE) -C "$(OSITOK_ROOT)/arch/x86/lib/vulkan" \
-	  BUILD_ROOT="$(MODULE_VULKAN_DIR)" CODEGEN_FLAGS=-fPIC \
+	  BUILD_ROOT="$(MODULE_VULKAN_DIR)" CODEGEN_FLAGS="-fPIC -mno-red-zone" \
 	  CC="$(MODULE_CC)" AR="$(MODULE_AR)" all
 	@mkdir -p "$(MODULE_RUNTIME_DIR)"
 	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
-	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  -fPIC -mno-red-zone -fvisibility=hidden -nostdinc -ffreestanding \
 	  -isystem "$(OSITOK_ROOT)/arch/x86/libc/qjs_headers" \
 	  "$(OSITOK_ROOT)/arch/x86/libc/crt.c" -o "$(MODULE_RUNTIME_DIR)/crt.o"
 	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
-	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  -fPIC -mno-red-zone -fvisibility=hidden -nostdinc -ffreestanding \
 	  -isystem "$(OSITOK_ROOT)/arch/x86/libc/qjs_headers" \
+	  -Dsbrk=okgl_heap_grow \
 	  "$(OSITOK_ROOT)/arch/x86/libc/malloc.c" -o "$(MODULE_RUNTIME_DIR)/malloc.o"
 	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
-	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  -fPIC -mno-red-zone -fvisibility=hidden -nostdinc -ffreestanding \
 	  -isystem "$(OSITOK_ROOT)/arch/x86/libc/qjs_headers" \
+	  $(MODULE_DIAGNOSTIC_FLAGS) \
 	  "$(OSITOK_ROOT)/arch/x86/libc/tcclib.c" -o "$(MODULE_RUNTIME_DIR)/tcclib.o"
 	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
-	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  -fPIC -mno-red-zone -fvisibility=hidden -nostdinc -ffreestanding \
 	  -isystem "$(OSITOK_ROOT)/arch/x86/libc/qjs_headers" \
 	  "$(OSITOK_ROOT)/arch/x86/libc/crtgl.c" -o "$(MODULE_RUNTIME_DIR)/crtgl.o"
 	@$(MODULE_MATH_CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector \
-	  -fPIC -fvisibility=hidden -nostdinc -ffreestanding \
+	  -fPIC -mno-red-zone -fvisibility=hidden -nostdinc -ffreestanding \
 	  "$(OSITOK_ROOT)/arch/x86/libc/math.c" -o "$(MODULE_RUNTIME_DIR)/math.o"
-	@$(MODULE_CC) -c -fPIC -fvisibility=hidden -DOSITO_SHARED_MODULE \
+	@$(MODULE_CC) -c -fPIC -mno-red-zone -fvisibility=hidden -DOSITO_SHARED_MODULE \
 	  "$(OSITOK_ROOT)/arch/x86/libc/syscall.S" -o "$(MODULE_RUNTIME_DIR)/syscall.o"
-	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-stack-protector -fPIC \
+	@$(MODULE_CC) -c -O2 -std=gnu11 -fno-stack-protector -fPIC -mno-red-zone \
 	  -fvisibility=hidden -ffreestanding \
 	  "$(OPENGL_ROOT)/osito_compat/module_syscall.c" \
 	  -o "$(MODULE_RUNTIME_DIR)/module_syscall.o"
-	@$(MODULE_CXX) -c $(CXX_MODE_FLAGS) -O2 -fPIC -fvisibility=hidden \
+	@$(MODULE_CXX) -c $(CXX_MODE_FLAGS) -O2 -fPIC -mno-red-zone -fvisibility=hidden \
 	  --sysroot="$(MODULE_SYSROOT)" \
 	  -isystem "$(MODULE_SYSROOT)/usr/include/c++/13.2.0" \
 	  -isystem "$(MODULE_SYSROOT)/usr/include/c++/13.2.0/x86_64-pc-ositok-musl" \
@@ -1202,7 +1249,7 @@ module:
 	  "$(MODULE_VULKAN_DIR)/libvulkan.a" --no-whole-archive \
 	  -soname libGL-osito.so -o "$(MODULE_OUT)"
 	@imports="$$($(MODULE_NM) -u "$(MODULE_OUT)" | awk '{print $$NF}' | sort -u)"; \
-	if test "$$imports" != "syscall_dispatch"; then \
+	if test "$$imports" != "$$(printf 'serial_puts\nsyscall_dispatch')"; then \
 	  echo "Unexpected imports in $(MODULE_OUT):"; \
 	  $(MODULE_NM) -u "$(MODULE_OUT)"; exit 1; \
 	fi

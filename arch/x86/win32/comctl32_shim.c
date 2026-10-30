@@ -7,6 +7,7 @@
 #include "kernel32_shim.h"
 #include "user32_shim.h"
 #include "win32_abi.h"
+#include "propertysheet.h"
 #include "../kernel/smp.h"
 
 extern void serial_puts(const char *s);
@@ -545,10 +546,12 @@ LRESULT WINAPI shim_DefSubclassProc(HWND window, UINT message,
 void comctl32_release_window(DWORD owner_pid, HWND window)
 {
     subclass_forget_window(owner_pid, window, FALSE);
+    propertysheet_release_window(owner_pid, window);
 }
 
 void comctl32_release_process(DWORD owner_pid)
 {
+    propertysheet_release_process(owner_pid);
     uint64_t flags = subclass_lock_irqsave();
     for (int i = 0; i < MAX_SUBCLASS_WINDOWS; i++) {
         if (!subclass_windows[i].used ||
@@ -628,8 +631,12 @@ typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; }
     SHIM_EXPORT;
 
 static const SHIM_EXPORT comctl32_exports[] = {
+    { "_TrackMouseEvent",     (PVOID)TrackMouseEvent,           1, CC_STDCALL },
     { "InitCommonControls",   (PVOID)shim_InitCommonControls,   0, CC_STDCALL },
     { "InitCommonControlsEx", (PVOID)shim_InitCommonControlsEx, 1, CC_STDCALL },
+    { "CreatePropertySheetPageA", (PVOID)shim_CreatePropertySheetPageA, 1, CC_STDCALL },
+    { "DestroyPropertySheetPage", (PVOID)shim_DestroyPropertySheetPage, 1, CC_STDCALL },
+    { "PropertySheetA",       (PVOID)shim_PropertySheetA,       1, CC_STDCALL },
     { "CreateStatusWindowA",  (PVOID)shim_CreateStatusWindowA,  4, CC_STDCALL },
     { "ImageList_Create",     (PVOID)shim_ImageList_Create,     5, CC_STDCALL },
     { "SetWindowSubclass",    (PVOID)shim_SetWindowSubclass,    4, CC_STDCALL },

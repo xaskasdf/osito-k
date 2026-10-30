@@ -93,6 +93,7 @@ static void check_window(int x, int y, unsigned height, int clip,
     window_t win = {
         .x = x, .y = y, .width = 353, .height = height,
         .surface_pitch = SOURCE_PITCH, .surface_height = SOURCE_HEIGHT,
+        .alpha = { .opacity = 255 },
         .pixels = source, .clip_enabled = clip,
         .clip_x = 23, .clip_y = 49, .clip_width = 257, .clip_height = 389
     };

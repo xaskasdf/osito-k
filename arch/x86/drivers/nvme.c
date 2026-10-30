@@ -9,6 +9,7 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "../include/pci.h"
 
 /* ── Declarations ────────────────────────────────────────────── */
 
@@ -525,8 +526,17 @@ uint32_t nvme_get_lba_size(void) { return nvme.initialized ? nvme.lba_size : 512
 
 /* ── Initialize NVMe controller ──────────────────────────────── */
 
-int __initk nvme_init(uint64_t bar0_phys)
+int __initk nvme_init(const pci_dev_t *device)
 {
+    if (!device || !device->bar[0]) return -1;
+    uint64_t bar0_phys = device->bar[0];
+    uint16_t pci_command = pci_cfg_read16(device->bus, device->dev, device->func, 4);
+    if (pci_command == 0xffff) return -1;
+    pci_cfg_write16(device->bus, device->dev, device->func, 4, (pci_command | 2) & ~4U);
+    if ((pci_cfg_read16(device->bus, device->dev, device->func, 4) & 6) != 2) {
+        serial_puts("[NVMe] Cannot acquire quiescent PCI endpoint\n");
+        return -1;
+    }
     memset(&nvme, 0, sizeof(nvme));
     /* Use the upper-half MMIO alias so register accesses work from
      * any CR3 (paging_map_mmio installs BAR pages at both identity
@@ -558,6 +568,10 @@ int __initk nvme_init(uint64_t bar0_phys)
         if (!(nvme_read32(NVME_REG_CSTS) & NVME_CSTS_RDY)) break;
         __asm__ volatile ("pause");
     }
+    if (nvme_read32(NVME_REG_CSTS) & NVME_CSTS_RDY) {
+        serial_puts("[NVMe] Controller did not stop\n");
+        return -1;
+    }
 
     /* Allocate admin queues (page-aligned). The struct fields hold
      * upper-half virt pointers so kernel CPU code can read/write the
@@ -582,6 +596,21 @@ int __initk nvme_init(uint64_t bar0_phys)
     nvme_write32(NVME_REG_AQA, ((ADMIN_QUEUE_SIZE - 1) << 16) | (ADMIN_QUEUE_SIZE - 1));
     nvme_write64(NVME_REG_ASQ, VIRT_TO_PHYS(nvme.asq));
     nvme_write64(NVME_REG_ACQ, VIRT_TO_PHYS(nvme.acq));
+
+    /* Firmware is not the owner after kexec. Establish the DMA path only
+     * after old queues stopped and the new admin queues are installed. */
+    pci_dma_path_t path;
+    const char *path_error = pci_prepare_dma_path(device, &path);
+    if (path_error) {
+        serial_puts("[NVMe] DMA path: "); serial_puts(path_error); serial_puts("\n");
+        return -1;
+    }
+    pci_command = pci_cfg_read16(device->bus, device->dev, device->func, 4);
+    pci_cfg_write16(device->bus, device->dev, device->func, 4, pci_command | 6);
+    if ((pci_cfg_read16(device->bus, device->dev, device->func, 4) & 6) != 6) {
+        serial_puts("[NVMe] Bus mastering did not enable\n");
+        return -1;
+    }
 
     /* Enable controller */
     uint32_t cc = NVME_CC_EN | NVME_CC_CSS_NVM | NVME_CC_MPS_4K |

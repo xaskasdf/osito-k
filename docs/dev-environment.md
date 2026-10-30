@@ -184,6 +184,284 @@ For network-attached serial logging (no serial cable needed):
 2. Smoke-test on Linux QEMU+virgl when adding Mesa runtime paths or DXVK draw calls.
 3. Bare-metal validation only at milestone points (e.g., end of each wave).
 
+## Test disk lifecycle (Linux/WSL)
+
+`qemu-test.sh` now puts its default ESP, firmware variables and QEMU temporary
+files under `~/.local/share/osito-k/test-disks/runs/`, on the native filesystem.
+Each run has a unique directory and an inherited lease. Its scratch files are
+removed after the child exits; open images or a surviving child prevent cleanup.
+Serial logs, WAVs, captures and kernel snapshots stay at their existing paths.
+An explicit `QEMU_ESP_IMG` still opts into caller-managed image lifetime.
+
+`OSITO_TEST_DISK_ROOT` overrides the root. Keep it on Linux ext4 in WSL, not
+`/mnt/c`. `bases/` is a catalog of persistent images (or symlinks to existing
+ones); cleanup never traverses it. Existing Steam/game disks are not migrated
+or copied automatically. Do not use dated run directories as new base storage.
+
+The manual cleanup on 2026-09-09 moved eight verified test baselines into
+`bases/`, retaining their old paths as symlinks. `bases/steam.img` instead links
+to the existing Steam installation disk. Use `bases/` for persistent inputs,
+`runs/` only for disposable disks, and the separate
+`~/.local/share/osito-k/test-evidence/` for logs, captures and kernel snapshots.
+The inventory and integrity records are in
+`arch/x86/build/test-disks-cleanup-20260909/`. Free space recovered inside WSL
+does not imply that its Windows VHDX file has been compacted.
+
+The 2026-09-10 follow-up removed 61 additional boot-only legacy ESP images.
+Their 244 payload files were extracted and SHA256-verified first, and remain
+under `~/.local/share/osito-k/test-evidence/legacy-boot-cleanup-20260910/`.
+This recovered about 3.48 GiB net after retaining those payloads. All 256 other
+inventoried disk/firmware files retained their metadata; data disks, Steam
+backups and per-run UEFI variables were not removed. The deletion manifest and
+payload hashes are in `arch/x86/build/test-disks-cleanup-20260910/`.
+
+Together, the two manual cleanups removed 886 images and recovered about
+96.21 GiB inside WSL, plus 320 MiB of logical image files on Windows. The eight
+migrated bases were rechecked against their recorded SHA256 hashes and all old
+paths still resolve to the centralized files. WSL's Windows VHDX was not compacted.
+
+```bash
+# Inspect leftovers, preview cleanup, then explicitly remove idle scratch runs.
+bash arch/x86/scripts/qemu-test-disks.sh list
+bash arch/x86/scripts/qemu-test-disks.sh prune
+bash arch/x86/scripts/qemu-test-disks.sh prune --apply
+
+# Reuse an existing raw base without persisting guest writes or copying it.
+QEMU_NVME_IMG="$HOME/.local/share/osito-k/test-disks/bases/ut99.img" \
+QEMU_NVME_SNAPSHOT=1 bash arch/x86/scripts/qemu-test.sh --no-build --no-gl
+
+# DOS/4GW: use a new evidence directory; fixture disk and ESP are disposable.
+mkdir -p "$HOME/.local/share/osito-k/test-evidence"
+run=$(mktemp -d "$HOME/.local/share/osito-k/test-evidence/dos-next.XXXXXXXX")
+bash arch/x86/scripts/run-dos4gw-test.sh "$run"
+
+# Host lifecycle checks, without booting QEMU.
+bash arch/x86/scripts/test-qemu-test-disks.sh
+```
+
+UART diagnostics now retain unsent bytes across bounded flush timeouts.
+`serial-stats` reports pending/dropped bytes and timeout events; `serial-test`
+runs a queue matrix and checksummed multi-CPU output. Host fault-injection
+tests are available with `make -C arch/x86 HOST_CC=clang serial-host-test`
+(optionally `SERIAL_HOST_SANITIZERS=-fsanitize=address,undefined`). After
+booting a DOS diagnostic VM, run
+`python3 arch/x86/scripts/check-serial-test.py "$run" --repeat 3`, then
+`python3 arch/x86/scripts/check-serial-test.py "$run" --suite dos --repeat 3`.
+The checker owns the same per-VM serial lease as the local DOS harness and
+saves raw received bytes without replacing prior captures. Do not start a
+second checker until the first process actually exits. QEMU's auxiliary
+`logfile` can differ from the received stream on retries; preserve both.
+See correctness section 4.119 for validation results and remaining limits.
+
+The DOS runner uses the locally built COM/PE32 probes, `dos4gw-fixtures/DOOM.EXE`
+and `DOOM.WAD`, `doom-audio.cfg`, and `dos4gw.autoload` in `arch/x86/build/`.
+Its current probe inventory includes the `dos-raw-entry-test` and
+`dos-raw-client-test`, `dos-decode-test` and `dos-native-irq-test` Makefile targets; build these along
+with `dos-fp-state-test`, `dos-x87-test` and the existing probe families before
+launching the runner. Build `dos-umb-test` as well for `umblink.com`; the guest
+command `dos-umb-test` runs the allocator/API matrix, while the COM checks
+high-memory EXEC and unlinked child cleanup. The x87 target builds real-mode, USE16 and USE32 arithmetic
+probes plus a direct-native host diagnostic. Run `dos-fpu-test` in the guest for
+the interpreter matrix; current TCG has known x87 edge failures, so a successful
+boot or ordinary arithmetic probe does not imply that matrix passes. See the
+[x87 evidence](win32-layer-correctness.md#4110-interpreter-x87-and-realprotected-mode-ownership).
+The `dos-fp-state-test` target also builds `dpfm16.com`, `dpfm32.com` and
+`dpfmi32.com` for [native ISR/x87 memory mediation](win32-layer-correctness.md#4111-native-dos-isr-floating-point-ownership-and-data-mediation).
+The first two require native execution; the third omits SSE instructions so
+`dosrun --emulate --max-steps 100000 dpfmi32.com` can check the interpreter.
+It also builds `dpcp16.com`, `dpcp32.com` and their required EXEC child
+`dpcpc32.com` for [DPMI coprocessor controls](win32-layer-correctness.md#4112-dpmi-coprocessor-controls-and-native-host-entry-policy).
+Run either parent with `dosrun` and `dosrun --emulate`; both verify MP/EM,
+protected/real-mode #NM and control-state ownership across raw switches/EXEC.
+The `dos-flags-test` target builds the existing software-CPU FLAGS COMs plus
+`dpnif16.com`/`dpnif32.com` for the [native virtual-interrupt profile](win32-layer-correctness.md#4113-native-dpmi-virtual-interrupt-contract-versus-virtual-iopl3).
+Build this target before `run-dos4gw-test.sh`; the native probes use both stack
+widths and include real IRQ0 delivery. Do not treat the two CPU FLAGS profiles
+as interchangeable or count the expected cross-profile exits as passes.
+The `dos-native-irq-test` target includes `dpirqh32.com`/`dpirqhs.com` and
+the diagnostic `dpirqd32.com`/`dpirqds.com`; run these with native `dosrun`.
+They use a BIOS-tick deadline, not a CPU-speed-dependent loop count. The
+`dpirqoff.com` negative control deliberately leaves virtual IF disabled and
+must report a stage-5/reason-4 timeout after four ticks, exit 71h, with no IRQ
+frame and intact ESP. That expected failure is not a conformance pass. See
+the [IRQ timing audit](win32-layer-correctness.md#4115-native-irq-probes-use-clock-deadlines).
+The `dos-xms-test` target builds `xmsrm.com`, `xmsp16.com`, `xmsp32.com` and
+`xmsps16.com`; build it before the DOS runner along with `dos-a20-test`.
+The shell command `dos-xms-test` runs the in-kernel matrix. Run the COMs with
+`dosrun --emulate`, and the two 32-bit variants with native `dosrun`. See the
+[XMS evidence and diagnostic limitations](win32-layer-correctness.md#4117-xms-control-entry-and-shared-extended-memory-ownership).
+Wait for the previous command's completion before connecting another serial
+checker; an overlapping reader can leave partial input. A missing serial result
+is not proof that the guest is still running: inspect the existing console and
+klog before deciding whether to repeat anything.
+
+The `dos-bios-move-test` target builds `bmovrm.com`, `bmov16.com`, `bmov32.com`
+and `bmovs32.com` for the [BIOS extended-memory copy contract](win32-layer-correctness.md#4114-bios-extended-memory-block-moves).
+Build it before the DOS runner. Run all four with `dosrun --emulate`; the last
+two also exercise native DPMI. `dos-bios-test` runs the in-kernel BIOS matrices.
+Keep those inputs; they are not disposable disks. It defaults to diagnostic
+VNC `:12` and UDP `7790`; `QEMU_VNC` and `QEMU_UDP_PORT` can override these for
+an independent run. General QEMU ports remain configurable as before.
+Set `OSITO_KEEP_TEST_DISKS=1` to inspect scratch images after a failed run, then
+prune explicitly. Persistent NVMe writes remain the default unless snapshot mode
+is requested; never point a destructive fixture builder at a persistent base.
+Legacy unmarked directories are deliberately outside the automatic prune scope.
+
+### Isolated KVM host-kernel tests
+
+`test-dos-debug-host-kernel.sh` boots a Linux bzImage and a small static
+initramfs without disks, networking, a display, or changes to the running WSL.
+It requires Linux KVM with nested virtualization, QEMU, a static C toolchain,
+binutils, cpio and gzip. The optional third argument reuses a prior run's
+SHA256-verified initramfs byte-for-byte, including its original source snapshot.
+`OSITO_KVM_TEST_KERNEL_ARGS` adds explicit guest kernel parameters.
+
+```bash
+# Both output directories must be new. Keep all results in central evidence.
+evidence="$HOME/.local/share/osito-k/test-evidence"
+bash arch/x86/scripts/test-dos-debug-host-kernel.sh "$BASELINE_BZIMAGE" "$evidence/kvm-control"
+bash arch/x86/scripts/test-dos-debug-host-kernel.sh "$CANDIDATE_BZIMAGE" \
+  "$evidence/kvm-candidate" "$evidence/kvm-control"
+
+# Tests runner status/provenance handling without booting QEMU.
+bash arch/x86/scripts/test-dos-debug-host-kernel-runner.sh
+```
+
+The script returns the diagnostic process's status, not just QEMU's poweroff
+status. In the [WSL ICEBP comparison](win32-layer-correctness.md#4133-nested-kernel-validation-of-the-svm-icebp-backport),
+the inner KVM matrix passes on the candidate, but the separate Linux userspace
+control still exposes the unpatched outer WSL. Exit 1 is therefore retained.
+Do not treat it as complete conformance or install the candidate automatically.
+
+### DOS inside a disposable Linux host
+
+`run-dos-under-host-kernel.sh` runs the real Osito-K fixture VM under the
+selected Linux kernel's KVM. It does not deploy that kernel to WSL. The outer
+VM has 10 GiB / six CPUs; the inner Osito-K VM has 8 GiB / four CPUs. Allow
+enough host memory for both virtualization levels. The current payload builder
+uses Ubuntu's QEMU 8.2 package layout, static GCC, ldd, cpio, gzip, mtools,
+OVMF and the already-built fixtures required by `run-dos4gw-test.sh`.
+
+```bash
+evidence="$HOME/.local/share/osito-k/test-evidence"
+bash arch/x86/scripts/run-dos-under-host-kernel.sh "$CANDIDATE_BZIMAGE" \
+  "$evidence/dos-candidate"
+# After closing that VM, compare the original host kernel with identical inputs:
+bash arch/x86/scripts/run-dos-under-host-kernel.sh "$BASELINE_BZIMAGE" \
+  "$evidence/dos-control" "$evidence/dos-candidate"
+
+# Harness-only tests, including actual ESP preparation without launching a VM:
+bash arch/x86/scripts/test-dos-under-host-kernel-runner.sh
+```
+
+The outer QEMU defaults to `/root/qemu-venus-build/qemu-system-x86_64`
+(10.2 in the validation environment). Override with `OSITO_OUTER_QEMU` only
+using a build with UNIX-socket user-network forwarding. `OSITO_NESTED_TIMEOUT`
+bounds the outer VM in seconds (default 7200); `OSITO_KVM_TEST_KERNEL_ARGS`
+adds explicit Linux parameters, such as `kvm_amd.nrips=0`.
+
+The ESP has explicit IDE `bootindex=1`; the fixture NVMe is not the boot
+device. USB keyboard/mouse remain the default. For an input-device control,
+add `OSITO_DOS_INPUT=ps2` to `OSITO_KVM_TEST_KERNEL_ARGS`; the disposable init
+removes only xHCI and its two input devices. Invalid profiles exit 125.
+
+Both output directories must be fresh. The managed scratch lease owns the
+NVMe/ESP images; the frozen initramfs is retained in central evidence for
+byte-identical comparisons. Reuse verifies payload hashes and preserves
+original inner-QEMU version/dependency metadata, instead of relabeling the
+old payload with the currently installed QEMU version. The new runner and
+outer host metadata are recorded separately.
+
+`QEMU_PREPARE_ONLY=1` makes `qemu-test.sh` stop after preparing the ESP. The
+nested runner uses this with `--no-build --no-gl`; it does not launch a second
+ordinary QEMU session. The inner VM uses `-snapshot`. Its only host-writable
+export is the fresh evidence directory's `output/` subdirectory over 9p.
+Restricted user networking exposes serial/HMP/QMP only through per-run local
+UNIX sockets; it opens no host TCP/VNC listener.
+
+Read `output/serial.log` (also linked as `serial.log`). Use `serial.sock`,
+`monitor.sock` and `qmp.sock` for the inner VM; `host-qmp.sock` addresses the
+outer Linux VM. Only one serial checker may own a run at a time. Screenshots
+requested through inner QMP must target `/output/name.png`. Send inner QMP
+`quit` when finished: PID 1 collects its status, syncs evidence and powers off
+the outer VM, releasing the managed disks. The runner preserves inner/outer
+failures, missing or malformed completion, and timeout statuses. QEMU exit 0
+means orderly VM shutdown, not a passing DOS test suite.
+
+The inner QEMU records UART output to local initramfs storage. PID 1 copies
+new bytes to `output/serial.log` in blocks every 100 ms and drains/fsyncs the
+last bytes after QEMU exits. This avoids synchronous per-character 9p writes
+in the UART path. Input still goes directly to QEMU; the exporter does not
+interpret, normalize or discard log records. An abrupt outer-VM kill can lose
+the last unexported bytes, so prefer the orderly inner-QMP shutdown.
+
+Nested TSC warnings and serial-heavy diagnostics make this a correctness
+environment, not a performance benchmark. Retain failed pilots and failed
+test results separately; do not count an expected old-kernel failure as PASS.
+The [real DOS follow-up](win32-layer-correctness.md#4134-real-dos-validation-under-the-candidate-kvm-host)
+records a UART overflow even with buffered export. A successful klog result
+does not make an incomplete UART capture pass its transport checks. Keep
+raw streams, counter snapshots and any independently recovered klog spans
+as separate evidence. QMP also accepts only one connected client on this
+endpoint; do not open a second monitor while a game checker owns it.
+
+Verbose DOS INT/CS and successful SetAccess traces are opt-in per VM with
+`dosrun --trace` (256 records) or `dosrun --trace=N` (positive decimal budget).
+The budget is shared across EXEC/callbacks and never limits guest instructions.
+Errors, guest output and selftest matrix results remain
+enabled without tracing. This matters for nested runs, where UART access
+can dominate small guest workloads. Do not infer performance of the DOS
+CPU backend from a run dominated by serial I/O. The
+[transport follow-up](win32-layer-correctness.md#4136-candidate-host-boot-selection-and-diagnostic-transport)
+also records inconsistent SMP klog counters: reject such memory-log
+snapshots instead of treating them as lossless recovery of dropped UART.
+
+`make -C arch/x86 CLANG=1 DOS_IRQ_TRACE=1` adds a bounded, memory-only IRQ
+timeline (512 sequence-tagged, 64-byte records). It observes PIC/PIT events
+and DPMI returns without serial printing. Read it through an explicit kernel
+address space and reject changing totals or incomplete publications. It is
+off by default; rebuild with `DOS_IRQ_TRACE=0` after diagnostic use. Run
+`bash arch/x86/scripts/test-dos-irq-trace.sh FRESH_OUTPUT_DIR` for GCC/clang
+host checks. The [IRQ/input-device control](win32-layer-correctness.md#4140-opt-in-irq-timeline-and-reproduced-dmx-nesting)
+records both a USB startup failure and a PS/2 gameplay/audio/exit control;
+the latter is not a permanent input-device workaround or a USB pass.
+
+`bash arch/x86/scripts/test-xhci-poll.sh FRESH_OUTPUT_DIR` checks the common
+USB poller under GCC/Clang with recorded MMIO and the production HID parser.
+Its idle health interval does not delay ready events. The
+[USB follow-up](win32-layer-correctness.md#4141-event-driven-xhci-polling-and-usb-doom-recovery)
+records successful software DOOM audio/input/exit with USB retained after
+the polling correction, without promoting it to full DOS qualification.
+
+The [IRQ-return follow-up](win32-layer-correctness.md#4135-atomic-software-dpmi-interrupt-return)
+keeps direct-host validation separate from candidate-host results. Some
+locally built QEMUs lack PNG support: retain that checker failure and use
+lossless PPM captures when observing the existing game, instead of blindly
+launching it again. A pre-kernel firmware timeout is not a DOS test failure,
+and an orderly QMP shutdown does not turn an incomplete suite into a pass.
+
+## Development USB Updates
+
+The owner explicitly authorized routine kernel and test-file updates to the
+development USB without requesting confirmation for each deployment. Identify
+the device by USB bus, serial `00000000CY02` (`iOS devi Y08`) and size
+125,085,155,328 bytes, not by a reusable disk number. Verify that it is neither
+the host boot nor system disk. Its current GPT has a 512-MiB ESP at byte
+1,048,576 and an OsitoFS3-containing partition at byte 537,919,488.
+
+Preserve the bootloader, GPT, existing applications/data and a verified previous
+kernel. Back up affected bytes before raw filesystem updates; use the native
+OsitoFS3 host tools to prepare changes, not an improvised filesystem writer.
+Validate the exact kernel/bundle and verify physical readback after flushing.
+Windows elevation may still require UAC. This standing authorization does not
+cover formatting, repartitioning, another device or ambiguous device identity.
+
+The [2026-09-22 AX200 deployment](x86-ax200-wlan.md#development-usb-deployment-2026-09-22)
+records the baseline, subsequent deployments, backups and evidence. Firmware needed by shell/VFS
+commands belongs in OsitoFS3; placing it only on the FAT32 ESP is insufficient.
+Continue using managed scratch disks for QEMU validation and remove them after
+the test exits, retaining manifests, logs and rollback blocks as evidence.
+
 ## Troubleshooting
 
 - `cocoa: OpenGL not supported` — macOS QEMU + `--gl`. Don't; use `--no-gl` on macOS, virgl on Linux.

@@ -85,6 +85,9 @@ if [ "$DO_KILL" = "true" ]; then
     fi
     exit 0
 fi
+if [ -z "${QEMU_ESP_IMG:-}" ] && [ "$(uname)" = Linux ]; then
+    exec bash "$SCRIPT_DIR/qemu-test-disks.sh" run -- bash "$0" "$@"
+fi
 if [ "$USE_GL" = "true" ]; then
     GPU_BLOB_OPT=""
     VENUS_OPT=""
@@ -182,18 +185,25 @@ fi
 # ── Create ESP image ─────────────────────────────────────────
 
 info "Creating ESP image..."
-dd if=/dev/zero of="$ESP_IMG" bs=1M count=64 status=none
+: > "$ESP_IMG"
+dd if=/dev/zero of="$ESP_IMG" bs=1048576 count=0 seek=64
 mformat -i "$ESP_IMG" -F ::
 mmd -i "$ESP_IMG" ::/EFI
 mmd -i "$ESP_IMG" ::/EFI/BOOT
 mcopy -i "$ESP_IMG" "$EFI_BIN" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$ESP_IMG" "$KERN_BIN" ::/EFI/BOOT/kernel.elf
 # startup.nsh: auto-boot via UEFI Shell (needed when VARS lacks boot order)
-printf 'FS0:\\EFI\\BOOT\\BOOTX64.EFI\r\n' > /tmp/startup.nsh
-mcopy -i "$ESP_IMG" /tmp/startup.nsh ::/startup.nsh
+STARTUP_TMP="$(mktemp "${TMPDIR:-/tmp}/osito-startup.XXXXXXXX")"
+printf 'FS0:\\EFI\\BOOT\\BOOTX64.EFI\r\n' > "$STARTUP_TMP"
+mcopy -i "$ESP_IMG" "$STARTUP_TMP" ::/startup.nsh || { rm -f "$STARTUP_TMP"; exit 1; }
+rm -f "$STARTUP_TMP"
 
 FSIZE() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c < "$1"; }
 info "ESP image: boot.efi=$(FSIZE "$EFI_BIN") kernel.elf=$(FSIZE "$KERN_BIN")"
+if [ "${QEMU_PREPARE_ONLY:-0}" = 1 ]; then
+    info "Images prepared; QEMU was not started."
+    exit 0
+fi
 
 # ── Launch QEMU ──────────────────────────────────────────────
 
@@ -212,12 +222,12 @@ info ""
 # Build QEMU firmware args
 if [ "${OVMF_PFLASH:-0}" = "1" ]; then
     # Copy VARS to temp (pflash needs writable vars)
-    VARS_TMP="$BUILD_DIR/ovmf_vars.fd"
+    VARS_TMP="${OSITO_TEST_DISK_DIR:-$BUILD_DIR}/ovmf_vars.fd"
     cp "$OVMF_VARS" "$VARS_TMP"
-    BIOS_ARGS="-drive if=pflash,format=raw,readonly=on,file=$OVMF \
-               -drive if=pflash,format=raw,file=$VARS_TMP"
+    BIOS_ARGS=(-drive "if=pflash,format=raw,readonly=on,file=$OVMF"
+               -drive "if=pflash,format=raw,file=$VARS_TMP")
 else
-    BIOS_ARGS="-bios $OVMF"
+    BIOS_ARGS=(-bios "$OVMF")
 fi
 
 SERIAL_LOG="${QEMU_SERIAL_LOG:-$BUILD_DIR/serial.log}"
@@ -237,10 +247,16 @@ fi
 
 # NVMe disk image (OsitoFS)
 NVME_IMG="${QEMU_NVME_IMG:-$BUILD_DIR/nvme.img}"
-NVME_ARGS=""
+NVME_ARGS=()
+case "${QEMU_NVME_SNAPSHOT:-0}" in
+    0) NVME_SNAPSHOT_OPT="" ;;
+    1) NVME_SNAPSHOT_OPT=",snapshot=on" ;;
+    *) error "QEMU_NVME_SNAPSHOT must be 0 or 1" ;;
+esac
 if [ -f "$NVME_IMG" ]; then
     info "NVMe disk: $NVME_IMG ($(FSIZE "$NVME_IMG") bytes, cache=$QEMU_NVME_CACHE)"
-    NVME_ARGS="-drive file=$NVME_IMG,format=raw,if=none,id=nvme0,cache=$QEMU_NVME_CACHE -device nvme,serial=deadbeef,drive=nvme0"
+    NVME_ARGS=(-drive "file=$NVME_IMG,format=raw,if=none,id=nvme0,cache=$QEMU_NVME_CACHE$NVME_SNAPSHOT_OPT"
+               -device nvme,serial=deadbeef,drive=nvme0)
 fi
 
 # Display: cocoa native window on macOS. On Linux/WSL, --egl-headless is the
@@ -305,9 +321,9 @@ fi
 
 "$QEMU_BIN" \
     $ACCEL_ARGS \
-    $BIOS_ARGS \
+    "${BIOS_ARGS[@]}" \
     -drive file="$ESP_IMG",format=raw,if=ide \
-    $NVME_ARGS \
+    "${NVME_ARGS[@]}" \
     -m "$QEMU_MEM" \
     -machine q35 \
     $CPU_ARGS \
@@ -339,7 +355,7 @@ info "  Stop with: bash $0 --kill"
 # background-launched script that gets SIGHUP on terminal detach will
 # also reap qemu (which is what we DON'T want for `--no-build &` flows).
 trap 'rm -f "$PID_FILE"' EXIT
-trap 'kill "$QEMU_PID" 2>/dev/null; rm -f "$PID_FILE"; exit 130' INT TERM
+trap 'kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null; rm -f "$PID_FILE"; exit 130' INT TERM
 
 wait "$QEMU_PID"
 QEMU_RC=$?

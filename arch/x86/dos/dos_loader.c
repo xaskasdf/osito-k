@@ -422,8 +422,10 @@ int dos_load_com_process(dos_vm_t *vm, const uint8_t *data, uint64_t size,
 
     /* Set CPU state */
     cpu8086_state_t *cpu = vm->cpu;
+    uint32_t stack_bytes = (uint32_t)dos_block_size(vm, psp_seg) << 4;
+    if (stack_bytes > 0x10000u) stack_bytes = 0x10000u;
     dos_initialize_process_cpu(vm, spec, psp_seg, psp_seg, 0x0100,
-                               psp_seg, 0xFFFE);
+                               psp_seg, (uint16_t)stack_bytes);
 
     /* Push a 0x0000 on stack (return to PSP:0000 = INT 20h) */
     cpu_push16(cpu, 0x0000);

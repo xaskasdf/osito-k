@@ -8,6 +8,7 @@
 
 #include "hda.h"
 #include "paging.h"
+#include "pci.h"
 
 /* ── External Declarations ─────────────────────────────────────── */
 
@@ -16,7 +17,7 @@ extern void  serial_putc(char c);
 extern void  serial_puthex(uint64_t val, int digits);
 extern void  serial_putdec(uint64_t val);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
-extern void  pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func);
+extern uint64_t idt_get_monotonic_ns(void);
 extern void *memset(void *s, int c, size_t n);
 extern void *memcpy(void *dst, const void *src, size_t n);
 
@@ -87,6 +88,7 @@ static hda_state_t hda;
 
 /* ── MMIO Accessors ────────────────────────────────────────────── */
 
+#ifndef HDA_HOST_TEST
 static inline uint8_t hda_read8(uint32_t off) {
     return *(volatile uint8_t *)((uint64_t)hda.bar0 + off);
 }
@@ -105,6 +107,7 @@ static inline void hda_write16(uint32_t off, uint16_t val) {
 static inline void hda_write32(uint32_t off, uint32_t val) {
     mmio_write32((volatile void *)((uint64_t)hda.bar0 + off), val);
 }
+#endif
 
 static uint32_t hda_stream_ctl_read(uint32_t stream)
 {
@@ -160,6 +163,79 @@ static void hda_report_stream_start_failure(uint8_t status,
 static inline void spin_delay(uint32_t iters) {
     for (volatile uint32_t i = 0; i < iters; i++)
         __asm__ volatile ("pause");
+}
+
+/* Reset and codec discovery require elapsed time, not a CPU-dependent number
+ * of PAUSE instructions. Fail closed if the boot clock cannot advance. */
+static int hda_startup_delay(uint32_t microseconds)
+{
+    uint64_t start = idt_get_monotonic_ns();
+    for (uint32_t i = 0; i < 1000000U; i++) {
+        if (idt_get_monotonic_ns() - start >= (uint64_t)microseconds * 1000U)
+            return 0;
+        __asm__ volatile ("pause");
+    }
+    serial_puts("[HDA] Startup clock did not advance\n");
+    return -1;
+}
+
+/* Bus mastering must already be disabled. Quiesce every engine, including
+ * input and bidirectional streams inherited from firmware/a previous kernel.
+ * HDA requires all RUN bits to read zero before asserting global reset. */
+static int hda_quiesce_controller(uint32_t streams)
+{
+    hda_write32(HDA_INTCTL, 0);
+    hda_write8(HDA_CORBCTL, 0);
+    hda_write8(HDA_RIRBCTL, 0);
+    for (uint32_t i = 0; i < streams; i++) {
+        uint32_t sd = HDA_SD_BASE + i * HDA_SD_SIZE;
+        hda_stream_ctl_write(sd, hda_stream_ctl_read(sd) & ~0x1EU);
+    }
+    hda_write32(HDA_DPLBASE, 0);
+    hda_write32(HDA_DPUBASE, 0);
+
+    for (uint32_t i = 0; i < 10000U; i++) {
+        uint32_t running = (hda_read8(HDA_CORBCTL) & HDA_CORBCTL_RUN) |
+                           (hda_read8(HDA_RIRBCTL) & HDA_RIRBCTL_RUN);
+        for (uint32_t stream = 0; stream < streams; stream++)
+            running |= hda_stream_ctl_read(HDA_SD_BASE + stream * HDA_SD_SIZE) &
+                       HDA_SD_CTL_RUN;
+        if (!running)
+            return 0;
+        spin_delay(100);
+    }
+    serial_puts("[HDA] Controller DMA engines failed to stop\n");
+    return -1;
+}
+
+bool hda_kexec_quiesce(void)
+{
+    /* Called only at irreversible handoff, after other CPUs/interrupts and
+     * PCI bus mastering have stopped. Leave the link in reset across the
+     * trampoline so an old output FIFO cannot play during the next boot. */
+    if (!hda.bar0)
+        return true;
+    hda.initialized = false;
+    hda.playing = false;
+    uint16_t gcap = hda_read16(HDA_GCAP);
+    if (gcap == 0xFFFFU)
+        return false;
+    uint32_t streams = ((gcap >> 8) & 0xFU) + ((gcap >> 12) & 0xFU) +
+                       ((gcap >> 3) & 0x1FU);
+    if (hda_quiesce_controller(streams) < 0)
+        return false;
+    hda_write32(HDA_GCTL, 0);
+    for (uint32_t i = 0; i < 200U; i++) {
+        if (!(hda_read32(HDA_GCTL) & HDA_GCTL_CRST)) {
+            if (hda_startup_delay(100) < 0)
+                return false;
+            serial_puts("[HDA] DMA engines stopped, link reset for handoff\n");
+            return true;
+        }
+        spin_delay(1000);
+    }
+    serial_puts("[HDA] Handoff reset assertion timed out\n");
+    return false;
 }
 
 static int hda_stream_reset(uint32_t stream)
@@ -264,6 +340,14 @@ static int hda_corb_rirb_init(void)
     hda_write16(HDA_RIRBWP, (1 << 15));
     spin_delay(200);
 
+    return 0;
+}
+
+static int hda_corb_rirb_start(void)
+{
+    /* PCI bus mastering must be enabled after installing the fresh ring
+     * addresses but before RUN: physical controllers can reject RUN while
+     * bus mastering is disabled, even when QEMU accepts the write. */
     /* Start CORB + RIRB DMA */
     hda_write8(HDA_CORBCTL, HDA_CORBCTL_RUN);
     hda_write8(HDA_RIRBCTL, HDA_RIRBCTL_RUN);
@@ -977,19 +1061,36 @@ int hda_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     memset(&hda, 0, sizeof(hda));
     hda.bar0 = (volatile void *)PHYS_TO_VIRT(bar0_phys);
 
-    /* Enable PCI bus master + memory space */
-    pci_enable_bus_master(bus, dev, func);
-
-    /* Disable all interrupts (we use polling) */
-    hda_write32(HDA_INTCTL, 0);
+    /* kexec disables PCI bus mastering, but device registers can still point
+     * into the previous kernel's DMA buffers. Enable MMIO without restarting
+     * those engines; keep DMA blocked until all replacement buffers are ready. */
+    uint16_t command = pci_cfg_read16(bus, dev, func, 4);
+    if (command == 0xFFFFU) {
+        serial_puts("[HDA] PCI configuration unavailable\n");
+        return -1;
+    }
+    uint16_t quiet_command = (command | 2U) & ~4U;
+    pci_cfg_write16(bus, dev, func, 4, quiet_command);
+    if ((pci_cfg_read16(bus, dev, func, 4) & 6U) != 2U) {
+        serial_puts("[HDA] Cannot enable MMIO with bus mastering disabled\n");
+        return -1;
+    }
 
     /* Read capabilities */
     uint16_t gcap = hda_read16(HDA_GCAP);
     uint8_t vmaj = hda_read8(HDA_VMAJ);
     uint8_t vmin = hda_read8(HDA_VMIN);
+    if (gcap == 0xFFFFU) {
+        serial_puts("[HDA] Controller MMIO unavailable\n");
+        return -1;
+    }
 
     hda.num_iss = (gcap >> 8) & 0xF;
     hda.num_oss = (gcap >> 12) & 0xF;
+    uint32_t streams = hda.num_iss + hda.num_oss + ((gcap >> 3) & 0x1FU);
+
+    if (hda_quiesce_controller(streams) < 0)
+        return -1;
 
     /* First output stream descriptor: skip input streams */
     hda.out_stream_off = HDA_SD_BASE + hda.num_iss * HDA_SD_SIZE;
@@ -1018,9 +1119,14 @@ int hda_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
         if (!(hda_read32(HDA_GCTL) & HDA_GCTL_CRST)) break;
         spin_delay(1000);
     }
+    if (hda_read32(HDA_GCTL) & HDA_GCTL_CRST) {
+        serial_puts("[HDA] Controller reset assertion timed out\n");
+        return -1;
+    }
 
-    /* Codec PLL settle time */
-    spin_delay(2000);
+    /* Keep RESET# asserted for at least 100 us. */
+    if (hda_startup_delay(100) < 0)
+        return -1;
 
     /* Set CRST → exit reset */
     hda_write32(HDA_GCTL, HDA_GCTL_CRST);
@@ -1034,7 +1140,8 @@ int hda_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     }
 
     /* Wait for codec detection (spec: 521us minimum) */
-    spin_delay(5000);
+    if (hda_startup_delay(521) < 0)
+        return -1;
 
     /* Check STATESTS for detected codecs */
     uint16_t statests = hda_read16(HDA_STATESTS);
@@ -1059,17 +1166,36 @@ int hda_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
 
     /* ── Initialize subsystems ── */
 
-    if (hda_corb_rirb_init() < 0) return -1;
-    if (hda_codec_init() < 0) return -1;
-    if (hda_stream_init() < 0) return -1;
+    if (hda_corb_rirb_init() < 0) goto fail;
+
+    /* Every inherited stream is stopped/reset and position DMA is disabled.
+     * Only the freshly zeroed command rings may now start DMA. Audio buffers
+     * are allocated below, with their stream still stopped until playback. */
+    mb();
+    pci_cfg_write16(bus, dev, func, 4, quiet_command | 4U);
+    if ((pci_cfg_read16(bus, dev, func, 4) & 6U) != 6U) {
+        serial_puts("[HDA] Failed to enable bus mastering\n");
+        goto fail;
+    }
+    if (hda_corb_rirb_start() < 0) goto fail;
+    if (hda_codec_init() < 0) goto fail;
+    if (hda_stream_init() < 0) goto fail;
     if (hda_setup_output() < 0) {
         serial_puts("[HDA] Failed to configure codec output route\n");
-        return -1;
+        goto fail;
     }
 
     hda.initialized = true;
     serial_puts("[HDA] Audio initialized OK\n");
     return 0;
+
+fail:
+    pci_cfg_write16(bus, dev, func, 4, quiet_command);
+    if (pci_cfg_read16(bus, dev, func, 4) & 4U)
+        serial_puts("[HDA] Failed to disable bus mastering after init failure\n");
+    if (hda_quiesce_controller(streams) == 0)
+        hda_write32(HDA_GCTL, 0);
+    return -1;
 }
 
 void hda_play_buffer(const int16_t *samples, uint32_t num_frames)

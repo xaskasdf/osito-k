@@ -10,6 +10,7 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "../include/pci.h"
 #include "../include/input_events.h"
 #include "xhci.h"
 
@@ -25,6 +26,7 @@ extern void fb_puthex(uint64_t val, int digits);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
 extern void  pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func);
+extern uint64_t idt_get_monotonic_ns(void);
 
 /* Input injection (input_events.c — mouse) */
 extern void input_post_mouse_move(int16_t dx, int16_t dy);
@@ -40,6 +42,7 @@ extern void kb_push_esc(const char *seq) __attribute__((weak));
 
 static xhci_hc_t hc_list[XHCI_MAX_CONTROLLERS];
 static int hc_count;
+static bool event_polling;
 
 /* ── MMIO helpers ────────────────────────────────────────────── */
 
@@ -93,6 +96,52 @@ static void spin(uint32_t iters)
 {
     for (volatile uint32_t i = 0; i < iters; i++)
         __asm__ volatile ("pause");
+}
+
+typedef struct {
+    uint64_t physical;
+    uint32_t bytes;
+} xhci_dma_segment_t;
+
+/* Synchronous callers retain the buffer and its mappings until completion.
+ * Translate before publishing any TRB: Win32 shims can run on a private stack,
+ * where neither identity nor direct-map pointer arithmetic describes DMA. */
+static int dma_segments(const void *buffer, uint32_t length,
+                        xhci_dma_segment_t *segments, unsigned capacity)
+{
+    uint64_t address = (uintptr_t)buffer;
+    if (!buffer || !length || !capacity || address > UINT64_MAX - length)
+        return -1;
+    uint64_t last = address + length - 1;
+    if ((address >> 47) != (last >> 47) ||
+        ((address >> 47) != 0 && (address >> 47) != 0x1ffff))
+        return -1;
+    uint64_t cr3;
+#ifdef XHCI_HOST_TEST
+    extern uint64_t xhci_test_cr3(void);
+    cr3 = xhci_test_cr3();
+#else
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+#endif
+    unsigned count = 0;
+    while (length) {
+        uint64_t physical = paging_translate_in_cr3(cr3, address);
+        uint32_t bytes = 4096 - (address & 4095);
+        if (bytes > length) bytes = length;
+        if (physical == UINT64_MAX || physical > UINT64_MAX - bytes)
+            return -1;
+        xhci_dma_segment_t *previous = count ? &segments[count - 1] : NULL;
+        if (previous && previous->physical + previous->bytes == physical &&
+            (previous->physical & 0xffff) + previous->bytes + bytes <= 65536) {
+            previous->bytes += bytes;
+        } else {
+            if (count == capacity) return -1;
+            segments[count++] = (xhci_dma_segment_t){physical, bytes};
+        }
+        address += bytes;
+        length -= bytes;
+    }
+    return (int)count;
 }
 
 /* ── Speed name ──────────────────────────────────────────────── */
@@ -511,6 +560,7 @@ static void hid_process_mouse(xhci_device_t *dev, const uint8_t *r)
     const hid_caps_t *caps = &dev->hid_caps;
     extern void input_post_mouse_move(int16_t dx, int16_t dy);
     extern void input_post_mouse_button(uint8_t buttons);
+    extern void input_post_mouse_wheel(int16_t delta);
     extern void input_set_mouse_abs(int32_t x, int32_t y);
     /* Win32 bridge (UT99 etc.) — weak so a kernel without the win32 layer
      * still links. The keyboard takes the same path (hid_route_to_win32). */
@@ -571,7 +621,25 @@ static void hid_process_mouse(xhci_device_t *dev, const uint8_t *r)
         /* Button-only report (no axes this frame): still deliver clicks. */
         win32_post_mouse_event(0, 0, btns, 0);
     }
-    (void)dev;
+    if (caps->mouse_wheel_field >= 0) {
+        const hid_field_t *f = &caps->fields[caps->mouse_wheel_field];
+        if (f->report_id == caps->mouse_report_id && (f->flags & HID_INPUT_REL)) {
+            uint16_t offset = f->bit_offset + (uint16_t)caps->mouse_wheel_elem * f->bit_size;
+            int32_t wheel = hid_extract_signed(r, offset, f->bit_size);
+            if (wheel > 32767) wheel = 32767;
+            if (wheel < -32768) wheel = -32768;
+            if (wheel) {
+                input_post_mouse_wheel((int16_t)wheel);
+                /* Axes/buttons above establish the cursor once. Deliver only
+                 * the wheel here, preserving absolute-device motion history. */
+                int32_t win_wheel = wheel * 120;
+                if (win_wheel > 32767) win_wheel = 32767;
+                if (win_wheel < -32768) win_wheel = -32768;
+                if (win32_post_mouse_event)
+                    win32_post_mouse_event(0, 0, btns, (short)win_wheel);
+            }
+        }
+    }
 }
 
 /*
@@ -712,40 +780,72 @@ static void cmd_submit(xhci_hc_t *hc, xhci_trb_t *trb)
     db_write(hc, 0, 0);
 }
 
+static void evt_poll_owned(xhci_hc_t *hc);
+
+/* Only evt_poll consumes DMA events. Waiters take their own completions from
+ * this bounded inbox. A full/busy inbox leaves the DMA event unconsumed. */
+static bool evt_pending_push(xhci_hc_t *hc, const volatile xhci_trb_t *event)
+{
+    if (__atomic_test_and_set(&hc->pending_lock, __ATOMIC_ACQUIRE)) return false;
+    bool saved = false;
+    for (unsigned i = 0; i < XHCI_EVT_RING_SIZE; i++) {
+        xhci_pending_event_t *p = &hc->pending[i];
+        if (p->sequence) continue;
+        p->trb.param = event->param;
+        p->trb.status = event->status;
+        p->trb.control = event->control;
+        p->sequence = ++hc->pending_sequence;
+        __atomic_add_fetch(&hc->pending_count, 1, __ATOMIC_RELEASE);
+        saved = true;
+        break;
+    }
+    __atomic_clear(&hc->pending_lock, __ATOMIC_RELEASE);
+    return saved;
+}
+
+static bool evt_pending_take(xhci_hc_t *hc, uint8_t type, uint8_t slot,
+                             uint8_t dci, uint64_t ring_phys, uint32_t first,
+                             uint32_t count, uint32_t slots, xhci_trb_t *out)
+{
+    if (!__atomic_load_n(&hc->pending_count, __ATOMIC_ACQUIRE) ||
+        __atomic_test_and_set(&hc->pending_lock, __ATOMIC_ACQUIRE)) return false;
+    xhci_pending_event_t *found = NULL;
+    for (unsigned i = 0; i < XHCI_EVT_RING_SIZE; i++) {
+        xhci_pending_event_t *p = &hc->pending[i];
+        uint32_t control = p->trb.control;
+        if (!p->sequence || XHCI_TRB_GET_TYPE(control) != type) continue;
+        if (type == TRB_TRANSFER_EVENT &&
+            (((control >> 24) & 0xff) != slot || ((control >> 16) & 31) != dci ||
+             (control & (1u << 2)))) continue;
+        uint64_t pointer = p->trb.param;
+        if (pointer < ring_phys || pointer - ring_phys >= slots * sizeof(xhci_trb_t) ||
+            (pointer - ring_phys) % sizeof(xhci_trb_t)) continue;
+        uint32_t index = (pointer - ring_phys) / sizeof(xhci_trb_t);
+        if ((index + slots - first) % slots >= count) continue;
+        if (!found || p->sequence < found->sequence) found = p;
+    }
+    if (found) {
+        *out = found->trb;
+        found->sequence = 0;
+        __atomic_sub_fetch(&hc->pending_count, 1, __ATOMIC_RELEASE);
+    }
+    __atomic_clear(&hc->pending_lock, __ATOMIC_RELEASE);
+    return found != NULL;
+}
+
 /* Wait for command completion event. Returns completion code, slot in *slot_out */
 static int cmd_wait(xhci_hc_t *hc, uint8_t *slot_out)
 {
+    uint32_t last = hc->cmd_enq ? hc->cmd_enq - 1 : XHCI_CMD_RING_SIZE - 2;
     for (int t = 0; t < 2000000; t++) {
-        uint32_t idx = hc->evt_deq;
-        xhci_trb_t *e = &hc->evt_ring[idx];
-        rmb();
-        uint8_t cycle = e->control & TRB_CYCLE;
-
-        if (cycle != hc->evt_cycle) {
-            __asm__ volatile ("pause");
-            continue;
+        xhci_trb_t event;
+        if (evt_pending_take(hc, TRB_CMD_COMPLETION, 0, 0, hc->cmd_ring_phys,
+                             last, 1, XHCI_CMD_RING_SIZE - 1, &event)) {
+            if (slot_out) *slot_out = event.control >> 24;
+            return (int)(event.status >> 24);
         }
-
-        uint8_t type = XHCI_TRB_GET_TYPE(e->control);
-        uint8_t code = (e->status >> 24) & 0xFF;
-
-        if (slot_out)
-            *slot_out = (e->control >> 24) & 0xFF;
-
-        /* Advance dequeue */
-        hc->evt_deq++;
-        if (hc->evt_deq >= XHCI_EVT_RING_SIZE) {
-            hc->evt_deq = 0;
-            hc->evt_cycle ^= 1;
-        }
-
-        /* Update ERDP */
-        uint64_t erdp = (hc->evt_ring_phys + hc->evt_deq * sizeof(xhci_trb_t)) | (1 << 3);
-        rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
-
-        if (type == TRB_CMD_COMPLETION)
-            return (int)code;
-        /* If port status change, just consume and continue */
+        evt_poll_owned(hc);
+        __asm__ volatile ("pause");
     }
 
     serial_puts("[xHCI] Command timeout\n");
@@ -756,19 +856,23 @@ static int cmd_wait(xhci_hc_t *hc, uint8_t *slot_out)
 
 static void evt_poll(xhci_hc_t *hc)
 {
-    /* Clear Interrupt Pending (IP) by writing 1 to bit 0, keep IE=1 (bit 1).
-     * This allows the controller to set IP again for new events.
-     * Required on AMD hardware where INTE+IE gate event ring generation. */
-    uint32_t iman = 0x3; /* IP=1 (W1C to clear) | IE=1 (keep enabled) */
-    rt_write(hc, XHCI_RT_IR0 + XHCI_IR_IMAN, iman);
+    /* DMA publishes events through the cycle bit, independently of IP/EHB.
+     * Check coherent RAM on every call; only idle health checks are limited
+     * to 100 ms. A ready event never waits for the status deadline. */
+    const volatile xhci_trb_t *head = &hc->evt_ring[hc->evt_deq];
+    uint32_t control = head->control;
+    uint64_t now = idt_get_monotonic_ns();
+    if ((control & TRB_CYCLE) != hc->evt_cycle && hc->poll_status_valid &&
+        now - hc->poll_status_ns < 100000000ULL)
+        return;
+    hc->poll_status_valid = true;
+    hc->poll_status_ns = now;
 
-    /* Also clear STS.EINT (Event Interrupt) by writing 1 */
-    uint32_t usbsts = op_read(hc, XHCI_OP_USBSTS);
-    if (usbsts & (1 << 3)) /* EINT bit */
-        op_write(hc, XHCI_OP_USBSTS, (1 << 3)); /* W1C */
+    uint32_t sts = op_read(hc, XHCI_OP_USBSTS);
+    /* xHCI 1.2, 5.4.2: clear EINT before IP to preserve new transitions. */
+    if (sts & XHCI_STS_EINT)
+        op_write(hc, XHCI_OP_USBSTS, XHCI_STS_EINT);
 
-    /* Safety: check controller is still running */
-    uint32_t sts = usbsts;
     if (sts & (XHCI_STS_HCH | XHCI_STS_HSE)) {
         static bool dead_printed;
         if (!dead_printed) {
@@ -781,82 +885,111 @@ static void evt_poll(xhci_hc_t *hc)
         return;
     }
 
+    /* Keep the interrupter enabled, including on AMD hardware. */
+    rt_write(hc, XHCI_RT_IR0 + XHCI_IR_IMAN, XHCI_IMAN_IP | XHCI_IMAN_IE);
+
+    uint32_t processed = 0;
+    uint32_t last = hc->evt_deq;
     for (int rounds = 0; rounds < 16; rounds++) {
         uint32_t idx = hc->evt_deq;
-        xhci_trb_t *e = &hc->evt_ring[idx];
-        rmb();
+        const volatile xhci_trb_t *e = &hc->evt_ring[idx];
+        control = e->control;
+        if ((control & TRB_CYCLE) != hc->evt_cycle)
+            break;
+        rmb(); /* Acquire the rest of the TRB and its DMA report buffer. */
 
-        if ((e->control & TRB_CYCLE) != hc->evt_cycle)
-            return;
-
-        uint8_t type = XHCI_TRB_GET_TYPE(e->control);
+        uint8_t type = XHCI_TRB_GET_TYPE(control);
+        bool synchronous = type == TRB_TRANSFER_EVENT || type == TRB_CMD_COMPLETION;
 
         if (type == TRB_TRANSFER_EVENT) {
             /* Find which slot this belongs to */
-            uint8_t slot = (e->control >> 24) & 0xFF;
-            uint8_t ep_dci = (e->control >> 16) & 0x1F;
+            uint8_t slot = (control >> 24) & 0xFF;
+            uint8_t ep_dci = (control >> 16) & 0x1F;
             uint32_t len = e->status & 0xFFFFFF;
             uint8_t code = (e->status >> 24) & 0xFF;
 
             if (slot > 0 && slot <= XHCI_MAX_SLOTS) {
                 xhci_device_t *dev = &hc->devices[slot - 1];
                 if (dev->hid_active && ep_dci == dev->int_ep_dci && dev->report_buf) {
+                    synchronous = false;
                     /* Only process successful transfers (1=Success, 13=Short Packet) */
-                    if (code != 1 && code != 13)
+                    if ((code != 1 && code != 13) || len > dev->int_max_pkt)
                         goto advance;
-
-                    uint32_t actual = dev->int_max_pkt - len;
-                    uint8_t *r = dev->report_buf;
-
-                    /* Single dispatcher — usb_kbd_handle_report uses the
-                     * device's parsed Report Descriptor caps to demux the
-                     * report into keyboard / mouse / both. The old size-
-                     * based heuristic (>=8 bytes = keyboard, 3-6 = mouse)
-                     * is gone — descriptor-driven layout is correct for
-                     * all HID devices including non-boot keyboards. */
-                    if (actual >= 1)
-                        usb_kbd_handle_report(dev, r, actual);
-
-                    /* Re-submit Normal TRB for next poll */
-                    uint32_t ei = dev->int_enq;
-                    dev->int_ring[ei].param = dev->report_buf_phys;
-                    dev->int_ring[ei].status = dev->int_max_pkt;
-                    wmb();
-                    dev->int_ring[ei].control =
-                        XHCI_TRB_TYPE(TRB_NORMAL) | TRB_IOC |
-                        (dev->int_cycle ? TRB_CYCLE : 0);
-                    wmb();
-
-                    dev->int_enq++;
-                    if (dev->int_enq >= XHCI_XFER_RING_SIZE - 1) {
-                        dev->int_ring[dev->int_enq].param = dev->int_ring_phys;
-                        dev->int_ring[dev->int_enq].status = 0;
-                        dev->int_ring[dev->int_enq].control =
-                            XHCI_TRB_TYPE(TRB_LINK) | TRB_TC |
-                            (dev->int_cycle ? TRB_CYCLE : 0);
-                        wmb();
-                        dev->int_enq = 0;
-                        dev->int_cycle ^= 1;
-                    }
-
-                    /* Ring endpoint doorbell */
-                    db_write(hc, slot, dev->int_ep_dci);
+                    dev->hid_pending_len = dev->int_max_pkt - len;
+                    __atomic_store_n(&dev->hid_pending, 1, __ATOMIC_RELEASE);
                 }
             }
         }
-        /* PORT_STATUS_CHANGE and other events — just consume */
+        if (synchronous && !evt_pending_push(hc, e)) break;
+        /* PORT_STATUS_CHANGE and other events are not waiter completions. */
 
 advance:
         /* Advance event dequeue */
+        processed++;
+        last = idx;
         hc->evt_deq++;
         if (hc->evt_deq >= XHCI_EVT_RING_SIZE) {
             hc->evt_deq = 0;
             hc->evt_cycle ^= 1;
         }
-
-        uint64_t erdp = (hc->evt_ring_phys + hc->evt_deq * sizeof(xhci_trb_t)) | (1 << 3);
-        rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
     }
+
+    /* Return entries once per batch (4.9.4). ERDP names the last evaluated
+     * TRB, including a cycle mismatch, never an unconsumed valid entry.
+     * An idle health check must not rewrite the same dequeue pointer. */
+    if (processed) {
+        head = &hc->evt_ring[hc->evt_deq];
+        if ((head->control & TRB_CYCLE) != hc->evt_cycle)
+            last = hc->evt_deq;
+        uint64_t erdp = hc->evt_ring_phys + last * sizeof(xhci_trb_t);
+        rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp | XHCI_ERDP_EHB);
+    }
+}
+
+static void hid_dispatch_pending(xhci_hc_t *hc)
+{
+    for (unsigned i = 0; i < XHCI_MAX_SLOTS; i++) {
+        xhci_device_t *dev = &hc->devices[i];
+        if (__atomic_load_n(&dev->hid_pending, __ATOMIC_ACQUIRE) != 1) continue;
+        uint8_t expected = 1;
+        if (!__atomic_compare_exchange_n(&dev->hid_pending, &expected, 2, false,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) continue;
+        /* The endpoint is not rearmed until callbacks finish. Its DMA report
+         * stays stable, and nested disk I/O may still drain the event ring. */
+        if (dev->hid_pending_len)
+            usb_kbd_handle_report(dev, dev->report_buf, dev->hid_pending_len);
+        uint32_t ei = dev->int_enq;
+        dev->int_ring[ei].param = dev->report_buf_phys;
+        dev->int_ring[ei].status = dev->int_max_pkt;
+        uint32_t control = XHCI_TRB_TYPE(TRB_NORMAL) | TRB_IOC |
+                           (dev->int_cycle ? TRB_CYCLE : 0);
+        if (++dev->int_enq == XHCI_XFER_RING_SIZE - 1) {
+            xhci_trb_t *link = &dev->int_ring[dev->int_enq];
+            link->param = dev->int_ring_phys;
+            link->status = 0;
+            link->control = XHCI_TRB_TYPE(TRB_LINK) | TRB_TC |
+                            (dev->int_cycle ? TRB_CYCLE : 0);
+            wmb();
+            dev->int_enq = 0;
+            dev->int_cycle ^= 1;
+        }
+        /* The xHC may consume a published TRB before its doorbell write.
+         * Clear dispatch ownership first, so a new completion cannot be
+         * overwritten by the preceding dispatcher. */
+        __atomic_store_n(&dev->hid_pending, 0, __ATOMIC_RELEASE);
+        wmb();
+        dev->int_ring[ei].control = control;
+        wmb();
+        db_write(hc, dev->slot_id, dev->int_ep_dci);
+    }
+}
+
+static void evt_poll_owned(xhci_hc_t *hc)
+{
+    if (__atomic_test_and_set(&event_polling, __ATOMIC_ACQUIRE)) return;
+    evt_poll(hc);
+    __atomic_clear(&event_polling, __ATOMIC_RELEASE);
+    hid_dispatch_pending(hc);
 }
 
 /* ── Control Transfer on EP0 ─────────────────────────────────── */
@@ -865,6 +998,11 @@ static int ctrl_transfer(xhci_hc_t *hc, xhci_device_t *dev,
                           usb_setup_t *setup, void *data, uint16_t len,
                           bool dir_in)
 {
+    /* EP0 currently emits one Data TRB. Reject ranges it cannot describe. */
+    xhci_dma_segment_t segment;
+    if (len && dma_segments(data, len, &segment, 1) != 1) return -1;
+    uint32_t first = dev->ep0_enq;
+    uint32_t count = len > 0 && data ? 3 : 2;
     /* Setup TRB */
     uint32_t ei = dev->ep0_enq;
     uint64_t setup_param;
@@ -882,11 +1020,9 @@ static int ctrl_transfer(xhci_hc_t *hc, xhci_device_t *dev,
     ei++;
     if (ei >= XHCI_XFER_RING_SIZE - 1) { ei = 0; dev->ep0_cycle ^= 1; }
 
-    /* Data TRB (if any). data is a kernel virt pointer — could be
-     * either upper-half direct-map (Phase C migrations) or lower-half
-     * identity (UEFI-loaded stacks). kvirt_to_phys handles both. */
+    /* Data TRB uses the validated physical span, not the caller's VA. */
     if (len > 0 && data) {
-        dev->ep0_ring[ei].param = kvirt_to_phys(data);
+        dev->ep0_ring[ei].param = segment.physical;
         dev->ep0_ring[ei].status = len;
         dev->ep0_ring[ei].control =
             XHCI_TRB_TYPE(TRB_DATA) |
@@ -918,28 +1054,16 @@ static int ctrl_transfer(xhci_hc_t *hc, xhci_device_t *dev,
     /* Wait for transfer completion — Full Speed needs 50-500ms for retries.
      * 20M iters ≈ 340ms at 3.8GHz. */
     for (int t = 0; t < 20000000; t++) {
-        uint32_t eidx = hc->evt_deq;
-        xhci_trb_t *ev = &hc->evt_ring[eidx];
-        rmb();
-        if ((ev->control & TRB_CYCLE) != hc->evt_cycle) {
-            __asm__ volatile ("pause");
-            continue;
+        xhci_trb_t event;
+        if (evt_pending_take(hc, TRB_TRANSFER_EVENT, dev->slot_id, 1,
+                             dev->ep0_ring_phys, first, count, XHCI_XFER_RING_SIZE - 1, &event)) {
+            uint8_t code = event.status >> 24;
+            if (code != 1 && code != 13) return -(int)code;
+            uint32_t last = (first + count - 1) % (XHCI_XFER_RING_SIZE - 1);
+            if (event.param == dev->ep0_ring_phys + last * sizeof(xhci_trb_t)) return 0;
         }
-
-        uint8_t etype = XHCI_TRB_GET_TYPE(ev->control);
-        uint8_t ecode = (ev->status >> 24) & 0xFF;
-
-        hc->evt_deq++;
-        if (hc->evt_deq >= XHCI_EVT_RING_SIZE) {
-            hc->evt_deq = 0;
-            hc->evt_cycle ^= 1;
-        }
-        uint64_t erdp = (hc->evt_ring_phys + hc->evt_deq * sizeof(xhci_trb_t)) | (1 << 3);
-        rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
-
-        if (etype == TRB_TRANSFER_EVENT)
-            return (ecode == 1 || ecode == 13) ? 0 : -(int)ecode;
-        /* Consume other events */
+        evt_poll_owned(hc);
+        __asm__ volatile ("pause");
     }
 
     serial_puts("[xHCI] Control transfer timeout\n");
@@ -1880,8 +2004,11 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
         return -1;
     }
 
-    /* Enable PCI bus mastering + memory space */
-    pci_enable_bus_master(bus, dev, func);
+    /* Keep stale firmware/previous-kernel rings unable to DMA during reset. */
+    uint16_t pci_command = pci_cfg_read16(bus, dev, func, 4);
+    if (pci_command == 0xffff) return -1;
+    pci_cfg_write16(bus, dev, func, 4, (pci_command | 2) & ~4U);
+    if ((pci_cfg_read16(bus, dev, func, 4) & 6) != 2) return -1;
 
     /* Disable MSI/MSI-X at PCI level — prevents unhandled interrupts */
     pci_disable_msi(bus, dev, func);
@@ -1993,6 +2120,14 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     }
 
     serial_puts("[xHCI] Controller reset OK\n");
+
+    /* Reset removed all old ring addresses. ERSTBA programming may already
+     * fetch the new event table, even before RUN, so enable DMA here. */
+    pci_enable_bus_master(bus, dev, func);
+    if ((pci_cfg_read16(bus, dev, func, 4) & 6) != 6) {
+        serial_puts("[xHCI] Bus mastering did not enable\n");
+        return -1;
+    }
 
     /* ── Configure MaxSlots ── */
     op_write(hc, XHCI_OP_CONFIG, hc->max_slots);
@@ -2213,17 +2348,11 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
  * MSC driver (drivers/usb_storage.c) to talk to a SCSI-over-USB device.
  * dev_idx is the host-controller-relative slot index (slot_id - 1).
  *
- * Implementation: a single Normal TRB is queued on the appropriate Bulk
- * transfer ring with TRB_IOC, the endpoint doorbell is rung, and we
- * synchronously poll the event ring for a TRANSFER_EVENT addressed to
- * this slot+DCI. On completion we return 0 (success) or -1 (HC error,
- * timeout, or short-packet on a write). Short-packet on a read is
- * counted as success but `*actual_in` is updated so the caller can
- * tell.
- *
- * The synchronous-wait pattern here mirrors ctrl_transfer; long term we
- * may want async + completion callbacks but synchronous is correct and
- * matches the BBB protocol's CBW→Data→CSW lockstep semantics anyway.
+ * Buffers must remain mapped for the synchronous request. Split each TD at
+ * physical discontinuities and 64-KiB boundaries (xHCI 6.4.1), and publish its first
+ * cycle bit only after the complete chain, including Link TRBs, is ready.
+ * Short IN transfers finish at the final IOC event, not the earlier ISP
+ * event (4.10.1.1.2). Completion pointers must belong to the submitted TD.
  */
 
 static int bulk_xfer(xhci_hc_t *hc, xhci_device_t *dev,
@@ -2233,79 +2362,100 @@ static int bulk_xfer(xhci_hc_t *hc, xhci_device_t *dev,
                      void *buf, uint32_t len, bool dir_in,
                      uint32_t *actual_out)
 {
-    if (!hc || !dev || !ring || ep_dci == 0) return -1;
+    if (actual_out) *actual_out = 0;
+    if (!hc || !hc->initialized || !dev || !ring || !enq_io || !cycle_io || ep_dci == 0)
+        return -1;
     if (len == 0) { if (actual_out) *actual_out = 0; return 0; }
 
+    uint16_t mps = dir_in ? dev->bulk_in_max_pkt : dev->bulk_out_max_pkt;
+    if (!mps || *enq_io >= XHCI_XFER_RING_SIZE - 1)
+        return -1;
+    xhci_dma_segment_t segments[XHCI_XFER_RING_SIZE - 1];
+    int mapped = dma_segments(buf, len, segments, XHCI_XFER_RING_SIZE - 1);
+    if (mapped < 0) {
+        serial_puts("[xHCI] Bulk DMA range invalid or too fragmented; not submitted\n");
+        return -1;
+    }
+    uint32_t count = (uint32_t)mapped;
+
+    uint32_t first = *enq_io;
     uint32_t ei = *enq_io;
     uint8_t  cyc = *cycle_io;
-    (void)dir_in; /* DCI encodes direction; param/IOC are the same. */
-
-    /* Build a single Normal TRB.  buf is a kernel virt pointer in the
-     * upper-half direct-map alias; the controller needs the phys. */
-    /* buf may be either upper-half (Phase C migrated) or lower-half
-     * identity (UEFI-loaded stack). Use kvirt_to_phys for safety —
-     * a plain VIRT_TO_PHYS underflow on a lower-half pointer hands
-     * the controller a garbage phys, the device receives junk in the
-     * CBW, and STALLs the next IN. */
-    ring[ei].param   = (uint64_t)kvirt_to_phys(buf);
-    ring[ei].status  = len;
-    wmb();
-    ring[ei].control = XHCI_TRB_TYPE(TRB_NORMAL) | TRB_IOC |
-                       (cyc ? TRB_CYCLE : 0);
-    wmb();
-
-    ei++;
-    if (ei >= XHCI_XFER_RING_SIZE - 1) {
-        /* Link TRB back to head — flip cycle when we cross. */
-        ring[ei].param   = ring_phys;
-        ring[ei].status  = 0;
-        ring[ei].control = XHCI_TRB_TYPE(TRB_LINK) | TRB_TC |
-                           (cyc ? TRB_CYCLE : 0);
-        wmb();
-        ei = 0;
-        cyc ^= 1;
+    uint32_t first_control = 0, last = first, used = 0;
+    uint32_t packets = (len + (uint64_t)mps - 1) / mps;
+    for (uint32_t n = 0; n < count; n++) {
+        uint32_t bytes = segments[n].bytes;
+        used += bytes;
+        bool tail = n + 1 == count;
+        uint32_t remaining_packets = tail ? 0 : packets - used / mps;
+        if (remaining_packets > 31) remaining_packets = 31;
+        uint32_t control = XHCI_TRB_TYPE(TRB_NORMAL) |
+            (tail ? TRB_IOC : TRB_CH) | (dir_in ? TRB_ISP : 0) |
+            (cyc ? TRB_CYCLE : 0);
+        ring[ei].param = segments[n].physical;
+        ring[ei].status = bytes | (remaining_packets << 17);
+        if (!n) first_control = control;
+        ring[ei].control = n ? control : control ^ TRB_CYCLE;
+        last = ei;
+        if (++ei == XHCI_XFER_RING_SIZE - 1) {
+            ring[ei].param = ring_phys;
+            ring[ei].status = 0;
+            ring[ei].control = XHCI_TRB_TYPE(TRB_LINK) | TRB_TC |
+                (tail ? 0 : TRB_CH) | (cyc ? TRB_CYCLE : 0);
+            ei = 0;
+            cyc ^= 1;
+        }
     }
-    *enq_io   = ei;
+    wmb();
+    ring[first].control = first_control;
+    wmb();
+    *enq_io = ei;
     *cycle_io = cyc;
 
-    /* Ring the endpoint doorbell. */
     db_write(hc, dev->slot_id, ep_dci);
+    bool short_seen = false;
+    uint32_t received = len;
 
-    /* Wait for the matching Transfer Event. The same iteration limit as
-     * ctrl_transfer (~340ms at 3.8 GHz) — bulk reads of 64 sectors are
-     * safely under that. */
+    /* The synchronous waiter is bounded even before a clock is available. */
     for (int t = 0; t < 20000000; t++) {
-        uint32_t eidx = hc->evt_deq;
-        xhci_trb_t *ev = &hc->evt_ring[eidx];
-        rmb();
-        if ((ev->control & TRB_CYCLE) != hc->evt_cycle) {
+        xhci_trb_t event;
+        if (!evt_pending_take(hc, TRB_TRANSFER_EVENT, dev->slot_id, ep_dci,
+                              ring_phys, first, count, XHCI_XFER_RING_SIZE - 1, &event)) {
+            evt_poll_owned(hc);
+            if (!hc->initialized) return -1;
             __asm__ volatile ("pause");
             continue;
         }
+        uint64_t pointer = event.param;
+        uint32_t status = event.status;
+        uint8_t ecode = (status >> 24) & 0xff;
+        uint32_t eres = status & 0xffffff;
 
-        uint8_t  etype = XHCI_TRB_GET_TYPE(ev->control);
-        uint8_t  ecode = (ev->status >> 24) & 0xFF;
-        uint8_t  eslot = (ev->control >> 24) & 0xFF;
-        uint8_t  edci  = (ev->control >> 16) & 0x1F;
-        uint32_t eres  = ev->status & 0xFFFFFF;  /* TRB Transfer Length residual. */
+        uint32_t completed = (pointer - ring_phys) / sizeof(xhci_trb_t);
+        uint32_t ordinal = (completed + XHCI_XFER_RING_SIZE - 1 - first) %
+                           (XHCI_XFER_RING_SIZE - 1);
+        if (ordinal >= count) continue;
 
-        /* Always advance and acknowledge — we mustn't get stuck on
-         * an unrelated event. */
-        hc->evt_deq++;
-        if (hc->evt_deq >= XHCI_EVT_RING_SIZE) {
-            hc->evt_deq = 0;
-            hc->evt_cycle ^= 1;
+        if (ecode != 1 && ecode != 13) {
+            serial_puts("[xHCI] Bulk error code="); serial_putdec(ecode);
+            serial_puts(" slot="); serial_putdec(dev->slot_id);
+            serial_puts(" dci="); serial_putdec(ep_dci);
+            serial_puts(" bytes="); serial_putdec(len); serial_puts("\n");
+            return ecode == 6 ? -6 : -1;
         }
-        uint64_t erdp = (hc->evt_ring_phys + hc->evt_deq * sizeof(xhci_trb_t)) | (1 << 3);
-        rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
-
-        if (etype != TRB_TRANSFER_EVENT) continue;
-        if (eslot != dev->slot_id) continue;
-        if (edci  != ep_dci) continue;
-
-        if (actual_out) *actual_out = (eres > len) ? 0 : (len - eres);
-        /* 1 = Success, 13 = Short Packet (still useful for IN). */
-        return (ecode == 1 || ecode == 13) ? 0 : -1;
+        if (ecode == 13 && !short_seen) {
+            if (!dir_in || eres > (ring[completed].status & 0x1ffff)) return -1;
+            received = 0;
+            for (uint32_t n = 0; n <= ordinal; n++)
+                received += ring[(first + n) % (XHCI_XFER_RING_SIZE - 1)].status & 0x1ffff;
+            received -= eres;
+            short_seen = true;
+        } else if (ecode == 1 && eres) {
+            return -1;
+        }
+        if (completed != last) continue;
+        if (actual_out) *actual_out = received;
+        return 0;
     }
 
     serial_puts("[xHCI] Bulk transfer timeout\n");
@@ -2347,25 +2497,52 @@ int xhci_bulk_in(int dev_idx, void *data, uint32_t len, uint32_t *actual)
     return -1;
 }
 
+/* A failed optional SCSI command may STALL its data pipe. Reset the halted
+ * endpoint, clear the device halt, then skip the failed TD. Only the next
+ * caller rings the doorbell, after publishing its replacement transfer. */
+int xhci_bulk_clear_halt(int dev_idx, bool data_in)
+{
+    for (int h = 0; h < hc_count; h++) {
+        xhci_hc_t *hc = &hc_list[h];
+        if (dev_idx < 0 || dev_idx >= XHCI_MAX_SLOTS) continue;
+        xhci_device_t *dev = &hc->devices[dev_idx];
+        if (!dev->msc_active) continue;
+        uint8_t dci = data_in ? dev->bulk_in_dci : dev->bulk_out_dci;
+        uint64_t ring = data_in ? dev->bulk_in_ring_phys : dev->bulk_out_ring_phys;
+        uint32_t enq = data_in ? dev->bulk_in_enq : dev->bulk_out_enq;
+        uint8_t cycle = data_in ? dev->bulk_in_cycle : dev->bulk_out_cycle;
+        if (dci < 2 || !ring || enq >= XHCI_XFER_RING_SIZE - 1) return -1;
+        xhci_trb_t cmd = {0};
+        cmd.control = XHCI_TRB_TYPE(TRB_RESET_ENDPOINT) |
+                      ((uint32_t)dev->slot_id << 24) | ((uint32_t)dci << 16);
+        cmd_submit(hc, &cmd);
+        uint8_t slot;
+        if (cmd_wait(hc, &slot) != 1) return -1;
+
+        usb_setup_t setup = {0};
+        setup.bmRequestType = 0x02; /* Standard endpoint recipient */
+        setup.bRequest = 1;        /* CLEAR_FEATURE(ENDPOINT_HALT=0) */
+        setup.wIndex = (dci / 2) | (data_in ? 0x80 : 0);
+        if (ctrl_transfer(hc, dev, &setup, NULL, 0, false) < 0) return -1;
+
+        cmd.param = ring + (uint64_t)enq * sizeof(xhci_trb_t);
+        cmd.param |= cycle;
+        cmd.control = XHCI_TRB_TYPE(TRB_SET_TR_DEQUEUE) |
+                      ((uint32_t)dev->slot_id << 24) | ((uint32_t)dci << 16);
+        cmd_submit(hc, &cmd);
+        return cmd_wait(hc, &slot) == 1 ? 0 : -1;
+    }
+    return -1;
+}
+
 /* ── Poll all controllers ────────────────────────────────────── */
 
 void xhci_poll(void)
 {
-    /* Re-entrancy / concurrency guard. evt_poll mutates shared ring state
-     * (evt_deq/evt_cycle and per-device int_enq/int_cycle). If two callers
-     * overlap — e.g. the compositor kthread and a win32 game's PeekMessage
-     * loop, which can interleave via sched_yield — they corrupt the event
-     * and transfer rings and the keyboard silently stops delivering. Only
-     * one drain runs at a time; the loser returns (its events are picked up
-     * by the in-flight drain or the next call). */
-    static volatile int polling = 0;
-    if (__atomic_test_and_set(&polling, __ATOMIC_ACQUIRE))
-        return;
     for (int i = 0; i < hc_count; i++) {
         if (hc_list[i].initialized)
-            evt_poll(&hc_list[i]);
+            evt_poll_owned(&hc_list[i]);
     }
-    __atomic_clear(&polling, __ATOMIC_RELEASE);
 }
 
 bool xhci_is_ready(void)

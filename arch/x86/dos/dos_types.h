@@ -26,11 +26,11 @@
 #define DOS_CONV_TOP      0xA0000   /* 640KB boundary */
 #define DOS_VRAM_BASE     0xB8000   /* VGA text buffer */
 #define DOS_VRAM_SIZE     0x08000   /* 32KB video RAM */
+#define DOS_TRANSFER_BASE 0xC0000u  /* Host-owned real-mode transfer window */
+#define DOS_TRANSFER_SIZE 0x10000u  /* Not conventional RAM, UMB or EMS */
 #define DOS_ROM_BASE      0xF0000   /* ROM area for IRET stubs */
 
-/* INT 21h/AH=58h memory allocation strategies. The upper-memory bits are
- * retained even when no UMB chain is installed so callers can round-trip the
- * DOS contract without changing the conventional-memory fit policy. */
+/* INT 21h/AH=58h: unlinked upper-memory strategies search conventional RAM. */
 #define DOS_ALLOC_FIRST_FIT       0x00
 #define DOS_ALLOC_BEST_FIT        0x01
 #define DOS_ALLOC_LAST_FIT        0x02
@@ -45,6 +45,7 @@ enum {
     DOS_ERR_PATH_NOT_FOUND = 3,
     DOS_ERR_TOO_MANY_OPEN_FILES = 4,
     DOS_ERR_ACCESS_DENIED = 5,
+    DOS_ERR_ARENA_TRASHED = 7,
     DOS_ERR_INVALID_HANDLE = 6,
     DOS_ERR_NOT_ENOUGH_MEMORY = 8,
     DOS_ERR_INVALID_BLOCK = 9,
@@ -142,6 +143,7 @@ enum {
 typedef struct {
     bool     used;
     uint16_t ref_count;
+    uint16_t exec_pins;     /* suspended PSPs keep the slot/object stable */
     void    *osfs_file;     /* OsitoFS file handle */
     uint32_t position;      /* current seek position */
     uint32_t file_size;     /* cached file size */
@@ -162,6 +164,8 @@ struct cpu8086_state;
 struct dos_exec_context;
 struct dos_exec_parent_state;
 struct dos_vcpi_state;
+struct dos_xms_state;
+struct dos_transfer_reservation;
 
 #define DOS_EMS_PAGE_FRAME_BASE 0x000E0000u
 #define DOS_EMS_PAGE_SIZE       0x00004000u
@@ -205,6 +209,8 @@ typedef struct dos_vm {
     uint8_t         *mem;               /* kernel direct-map view of guest RAM */
     uint32_t         total_mem_size;    /* actual allocated size */
     uint32_t         system_mem_size;   /* RAM visible to DOS/DPMI clients */
+    struct dos_transfer_reservation *transfers;
+    uint64_t         transfer_generation;
 
     /* DOS state */
     uint16_t         current_psp;       /* segment of current PSP */
@@ -213,7 +219,7 @@ typedef struct dos_vm {
     uint16_t         dta_seg;           /* Disk Transfer Area segment */
     uint16_t         dta_off;           /* Disk Transfer Area offset */
     uint8_t          allocation_strategy; /* INT 21h/AH=58h policy */
-    uint8_t          uppermem_link;     /* zero until a UMB arena exists */
+    uint8_t          uppermem_link;
     uint8_t          indos_count;       /* published through INT 21h/AH=34h */
     bool             critical_error_active;
     const struct cpu8086_state *int21_request;
@@ -226,7 +232,7 @@ typedef struct dos_vm {
     uint16_t         extended_error_offset;
     uint32_t         temp_file_serial;
     uint8_t          last_return_code;  /* INT 21h/AH=4Dh low byte */
-    uint8_t          last_return_type;  /* 0 normal, 1 Ctrl+Break, 2 critical error */
+    uint8_t          last_return_type;  /* 0 normal, 1 break, 2 critical, 3 resident */
     uint8_t          termination_type;
     bool             process_terminated;
     uint16_t         exec_depth;        /* nested INT 21h/AH=4Bh calls */
@@ -248,6 +254,8 @@ typedef struct dos_vm {
 
     /* Memory control blocks */
     uint16_t         first_mcb;         /* segment of first MCB */
+    uint16_t         uppermem_root;     /* UMB bridge MCB, or FFFFh */
+    uint16_t         uppermem_end;      /* end of DOS-owned upper RAM */
 
     /* VGA text mode state */
     uint8_t          vga_mode;          /* current video mode (0x03) */
@@ -333,6 +341,12 @@ typedef struct dos_vm {
 
     /* DPMI host state */
     dpmi_state_t     dpmi;
+    uint64_t        dpmi_client_serial, dpmi_primary_id;
+    dpmi_client_scope_t *dpmi_client_scope;
+    bool            dpmi_host_reported; /* VM-lifetime diagnostic, not client state. */
+    /* Physical reservations belong to the VM, not an EXEC/client snapshot. */
+    uint8_t         ext_page_bitmap[DPMI_EXT_BITMAP_SIZE];
+    struct dos_xms_state *xms;          /* VM-wide, shared across EXEC clients */
 
     /* EMS/VCPI owns extended pages through the shared DPMI page allocator.
      * A zero frame base means that the corresponding 16 KB window is
@@ -348,6 +362,7 @@ typedef struct dos_vm {
 
     /* Per-VM ISA chipset state (PIT, PIC, keyboard controller, and VGA I/O). */
     void            *io;
+    bool             a20_masked;       /* combined 8042/port 92h latch, not client state */
 
     /* Native protected-mode session ownership. Every run gets its own CR3
      * and restores the host descriptor tables before releasing guest RAM. */
@@ -356,8 +371,11 @@ typedef struct dos_vm {
     uint64_t         native_vga_faults;
     void            *native_gdt;
     void            *native_ldt;
+    struct dos_native_fp_state *native_fp;
     dos_host_tls_t   native_host_tls;
-    uint8_t          native_saved_idt[13][16];
+    uint64_t        native_host_dr6;
+    bool            native_dr6_saved;
+    uint8_t          native_saved_idt[256][16];
     uint64_t         native_resume_jmpbuf[9];
     bool             native_idt_saved;
     bool             native_ready;
@@ -367,22 +385,37 @@ typedef struct dos_vm {
     /* Session policy, inherited by EXEC children. All guest instructions
      * stay mediated; virtual IOPL never grants access to host ports. */
     bool             emulate_cpu;
+    /* Optional diagnostic record budget, shared across EXEC and callbacks. */
+    uint64_t         trace_limit;
+    uint64_t         trace_remaining;
     /* Optional diagnostic interpreter quota, shared across EXEC/callbacks.
      * Zero disables metering; a stop remains latched while frames unwind. */
     uint64_t         step_limit;
     uint64_t         step_count;
     bool             step_limit_reached;
 
+    /* Not part of a saved CPU image: nested delivery must cancel retirement
+     * of the interrupted instruction even when a host restores that image. */
+    uint64_t         cpu_event_serial;
+
     /* A DPMI real-mode service can temporarily re-enter the interpreter.
      * The nested run stops before fetching the host-owned return address. */
     uint16_t         interpreter_stop_cs;
     uint32_t         interpreter_stop_ip;
     uint16_t         interpreter_stop_psp;
+    uint64_t         interpreter_stop_client_id;
     bool             interpreter_stop_protected;
     bool             interpreter_stop_active;
     bool             interpreter_stop_reached;
     const bool      *interpreter_stop_signal;
 } dos_vm_t;
+
+static inline bool dos_trace_record(dos_vm_t *vm)
+{
+    if (!vm->trace_remaining) return false;
+    vm->trace_remaining--;
+    return true;
+}
 
 /* ── CGA color palette ──────────────────────────────────────────── */
 

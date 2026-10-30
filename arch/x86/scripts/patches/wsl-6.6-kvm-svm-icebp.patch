@@ -1,0 +1,56 @@
+Subject: [PATCH] KVM: SVM: intercept ICEBP before injecting its debug trap
+
+Backport of David Woodhouse's upstream fix, committed by Sean Christopherson:
+https://github.com/kvm-x86/linux/commit/ec9a16c6aeba8e19ce98c58a1ac255681a4dd0ac
+
+Target: WSL2-Linux-Kernel 427645e3db3a8896714f22a3d3fe0c3f7b317ad4
+(6.6.87.2). Unlike a general #DB RIP adjustment, the instruction intercept
+identifies ICEBP without confusing single-step or instruction breakpoints.
+Keep the 6.6 instruction-skip failure result instead of injecting a second
+exception when decoding/emulation has already failed.
+
+Runtime-validated in a disposable nested Linux/KVM guest; not deployed to WSL.
+See docs/win32-layer-correctness.md section 4.133 for evidence and limitations.
+The direct KVM reproducer is arch/x86/scripts/test-dos-debug-native-host.sh.
+
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1302,6 +1302,7 @@ static void init_vmcb(struct kvm_vcpu *vcpu)
+ 	svm_set_intercept(svm, INTERCEPT_SKINIT);
+ 	svm_set_intercept(svm, INTERCEPT_WBINVD);
+ 	svm_set_intercept(svm, INTERCEPT_XSETBV);
++	svm_set_intercept(svm, INTERCEPT_ICEBP);
+ 	svm_set_intercept(svm, INTERCEPT_RDPRU);
+ 	svm_set_intercept(svm, INTERCEPT_RSM);
+ 
+@@ -2131,6 +2132,21 @@ static int bp_interception(struct kvm_vcpu *vcpu)
+ 	return 0;
+ }
+ 
++static int icebp_interception(struct kvm_vcpu *vcpu)
++{
++	/*
++	 * Intercept and emulate ICEBP (INT1, opcode 0xF1) instead of allowing
++	 * the guest to natively take the #DB trap, so that RIP is advanced
++	 * past the instruction before #DB is injected. SVM's exception exit
++	 * does not distinguish ICEBP from other #DB causes. The instruction
++	 * intercept supplies the boundary needed for fault-to-trap conversion.
++	 */
++	if (!svm_skip_emulated_instruction(vcpu))
++		return 0;
++	kvm_queue_exception(vcpu, DB_VECTOR);
++	return 1;
++}
++
+ static int ud_interception(struct kvm_vcpu *vcpu)
+ {
+ 	return handle_ud(vcpu);
+@@ -3357,6 +3373,7 @@ static int (*const svm_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[SVM_EXIT_MONITOR]			= kvm_emulate_monitor,
+ 	[SVM_EXIT_MWAIT]			= kvm_emulate_mwait,
+ 	[SVM_EXIT_XSETBV]			= kvm_emulate_xsetbv,
++	[SVM_EXIT_ICEBP]			= icebp_interception,
+ 	[SVM_EXIT_RDPRU]			= kvm_handle_invalid_op,
+ 	[SVM_EXIT_EFER_WRITE_TRAP]		= efer_trap,
+ 	[SVM_EXIT_CR0_WRITE_TRAP]		= cr_trap,

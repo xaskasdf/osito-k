@@ -49,7 +49,7 @@ typedef struct {
  * thunk generator reads `argc`/`cc` from the SAME row, so they cannot drift
  * from the prototype.
  */
-typedef struct {
+typedef struct _WIN32_EXPORT {
     const char *name;
     void       *func;
     uint8_t     argc;
@@ -69,6 +69,8 @@ typedef struct {
  * DLL alongside dll_register_shim(). `count` = number of rows. */
 void win32_abi_reset(void);
 void win32_abi_register(const char *dll_name, const WIN32_EXPORT *table, int count);
+void win32_abi_register_provider(const char *dll_name,
+                                 const WIN32_EXPORT *(*provider)(int *));
 
 /*
  * Resolve {argc, cc} for an import. Order:

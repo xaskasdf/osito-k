@@ -18,13 +18,13 @@ extern void  kfree(void *ptr);
 #define OLE2_FREESECT   0xFFFFFFFFu
 #define OLE2_FATSECT    0xFFFFFFFDu
 #define OLE2_DIFSECT    0xFFFFFFFCu
-#define OLE2_MAX_CHAIN  1048576u   /* loop guard */
 
 struct ole2_file {
     const uint8_t *data;
     uint32_t len;
     uint32_t sector_shift;     /* 9 (512) or 12 (4096) */
     uint32_t sector_size;
+    uint32_t sector_count;     /* Physical sectors after the header. */
     uint32_t mini_sector_size; /* usually 64 */
     uint32_t mini_cutoff;      /* usually 4096 */
     uint32_t *fat;             /* sector chain table */
@@ -52,7 +52,9 @@ static uint32_t rd32(const uint8_t *p)
 
 static uint32_t sect_off(ole2_file_t *f, uint32_t sect)
 {
-    return (sect + 1) << f->sector_shift;  /* header occupies sector "-1" */
+    /* Special FAT values must never wrap around to a valid offset. */
+    if (sect >= f->sector_count) return f->len;
+    return (sect + 1) << f->sector_shift;
 }
 
 /* Follow a regular-FAT chain into a fresh buffer.
@@ -61,31 +63,30 @@ static uint8_t *read_chain(ole2_file_t *f, uint32_t start,
                            uint32_t want, uint32_t *out_size)
 {
     uint32_t ss = f->sector_size;
-    uint32_t nsect = 0, s = start, guard = 0;
-
-    while (s != OLE2_ENDOFCHAIN && s < f->fat_entries) {
-        nsect++;
-        if (++guard > OLE2_MAX_CHAIN) return 0;
+    uint32_t nsect = 0, s = start;
+    if (out_size) *out_size = 0;
+    while (s != OLE2_ENDOFCHAIN) {
+        if (s >= f->fat_entries || s >= f->sector_count ||
+            ++nsect > f->sector_count) return 0;
         s = f->fat[s];
     }
 
     uint32_t avail = nsect * ss;
-    uint32_t total = (want && want < avail) ? want : avail;
-    if (!total) { if (out_size) *out_size = 0; return 0; }
+    if (want > avail) return 0;
+    uint32_t total = want ? want : avail;
+    if (!total) return 0;
 
     uint8_t *buf = (uint8_t *)kmalloc(total);
     if (!buf) return 0;
 
     uint32_t copied = 0;
-    s = start; guard = 0;
-    while (s != OLE2_ENDOFCHAIN && s < f->fat_entries && copied < total) {
+    s = start;
+    while (copied < total) {
         uint32_t off = sect_off(f, s);
-        if (off + ss > f->len) break;
         uint32_t n = ss;
-        if (copied + n > total) n = total - copied;
+        if (n > total - copied) n = total - copied;
         memcpy(buf + copied, f->data + off, n);
         copied += n;
-        if (++guard > OLE2_MAX_CHAIN) break;
         s = f->fat[s];
     }
     if (out_size) *out_size = copied;
@@ -96,33 +97,32 @@ static uint8_t *read_chain(ole2_file_t *f, uint32_t start,
 static uint8_t *read_mini_chain(ole2_file_t *f, uint32_t start,
                                 uint32_t want, uint32_t *out_size)
 {
+    if (out_size) *out_size = 0;
     if (!f->ministream || !f->minifat) return 0;
     uint32_t ms = f->mini_sector_size;
-    uint32_t nsect = 0, s = start, guard = 0;
-
-    while (s != OLE2_ENDOFCHAIN && s < f->minifat_entries) {
-        nsect++;
-        if (++guard > OLE2_MAX_CHAIN) return 0;
+    uint32_t physical = f->ministream_size / ms;
+    uint32_t nsect = 0, s = start;
+    while (s != OLE2_ENDOFCHAIN) {
+        if (s >= f->minifat_entries || s >= physical || ++nsect > physical) return 0;
         s = f->minifat[s];
     }
 
     uint32_t avail = nsect * ms;
-    uint32_t total = (want && want < avail) ? want : avail;
-    if (!total) { if (out_size) *out_size = 0; return 0; }
+    if (want > avail) return 0;
+    uint32_t total = want ? want : avail;
+    if (!total) return 0;
 
     uint8_t *buf = (uint8_t *)kmalloc(total);
     if (!buf) return 0;
 
     uint32_t copied = 0;
-    s = start; guard = 0;
-    while (s != OLE2_ENDOFCHAIN && s < f->minifat_entries && copied < total) {
+    s = start;
+    while (copied < total) {
         uint32_t off = s * ms;
-        if (off + ms > f->ministream_size) break;
         uint32_t n = ms;
-        if (copied + n > total) n = total - copied;
+        if (n > total - copied) n = total - copied;
         memcpy(buf + copied, f->ministream + off, n);
         copied += n;
-        if (++guard > OLE2_MAX_CHAIN) break;
         s = f->minifat[s];
     }
     if (out_size) *out_size = copied;
@@ -138,21 +138,26 @@ ole2_file_t *ole2_open(const uint8_t *data, uint32_t len)
     for (int i = 0; i < 8; i++)
         if (data[i] != sig[i]) return 0;
 
+    uint16_t version = rd16(data + 0x1A);
+    uint16_t sshift = rd16(data + 0x1E);
+    uint16_t mshift = rd16(data + 0x20);
+    if (rd16(data + 0x1C) != 0xFFFE || mshift != 6 ||
+        !((version == 3 && sshift == 9) || (version == 4 && sshift == 12)) ||
+        rd32(data + 0x38) != 4096) return 0;
+    uint32_t sector_size = 1U << sshift;
+    if (len < 3U * sector_size || len % sector_size) return 0;
+
     ole2_file_t *f = (ole2_file_t *)kmalloc(sizeof(*f));
     if (!f) return 0;
     memset(f, 0, sizeof(*f));
     f->data = data;
     f->len  = len;
 
-    uint16_t sshift = rd16(data + 0x1E);
-    uint16_t mshift = rd16(data + 0x20);
-    if (sshift < 7 || sshift > 20) { kfree(f); return 0; }
     f->sector_shift     = sshift;
-    f->sector_size      = 1u << sshift;
+    f->sector_size      = sector_size;
+    f->sector_count     = len / sector_size - 1;
     f->mini_sector_size = 1u << mshift;
     f->mini_cutoff      = rd32(data + 0x38);
-    if (f->mini_cutoff == 0) f->mini_cutoff = 4096;
-    if (f->mini_sector_size == 0) f->mini_sector_size = 64;
 
     uint32_t num_fat_sect    = rd32(data + 0x2C);
     uint32_t dir_start       = rd32(data + 0x30);
@@ -161,7 +166,8 @@ ole2_file_t *ole2_open(const uint8_t *data, uint32_t len)
     uint32_t difat_start     = rd32(data + 0x44);
     uint32_t num_difat_sect  = rd32(data + 0x48);
 
-    if (num_fat_sect == 0 || num_fat_sect > (len / f->sector_size) + 1) {
+    if (!num_fat_sect || num_fat_sect > f->sector_count ||
+        num_minifat > f->sector_count || num_difat_sect > f->sector_count) {
         kfree(f); return 0;
     }
 
@@ -174,42 +180,38 @@ ole2_file_t *ole2_open(const uint8_t *data, uint32_t len)
     uint32_t fi = 0;
     for (uint32_t i = 0; i < 109 && fi < num_fat_sect; i++) {
         uint32_t loc = rd32(data + 0x4C + i * 4);
-        if (loc == OLE2_FREESECT || loc == OLE2_ENDOFCHAIN) break;
+        if (loc >= f->sector_count) goto invalid;
         uint32_t off = sect_off(f, loc);
-        if (off + f->sector_size > len) break;
         for (uint32_t j = 0; j < per; j++)
             f->fat[fi * per + j] = rd32(data + off + j * 4);
         fi++;
     }
 
     /* DIFAT chain for any remaining FAT sectors (large files). */
-    uint32_t ds = difat_start, dguard = 0;
-    while (fi < num_fat_sect && num_difat_sect > 0 &&
-           ds != OLE2_ENDOFCHAIN && ds != OLE2_FREESECT) {
+    uint32_t ds = difat_start;
+    for (uint32_t d = 0; d < num_difat_sect; d++) {
+        if (ds >= f->sector_count) goto invalid;
         uint32_t off = sect_off(f, ds);
-        if (off + f->sector_size > len) break;
         uint32_t slots = per - 1;   /* last 4 bytes = next DIFAT sector */
         for (uint32_t i = 0; i < slots && fi < num_fat_sect; i++) {
             uint32_t loc = rd32(data + off + i * 4);
-            if (loc == OLE2_FREESECT || loc == OLE2_ENDOFCHAIN) break;
+            if (loc >= f->sector_count) goto invalid;
             uint32_t foff = sect_off(f, loc);
-            if (foff + f->sector_size > len) break;
             for (uint32_t j = 0; j < per; j++)
                 f->fat[fi * per + j] = rd32(data + foff + j * 4);
             fi++;
         }
         ds = rd32(data + off + slots * 4);
-        if (++dguard > OLE2_MAX_CHAIN) break;
     }
+    if (fi != num_fat_sect || (num_difat_sect && ds != OLE2_ENDOFCHAIN)) goto invalid;
 
     /* mini-FAT (chain through the regular FAT; values reread as uint32). */
-    if (num_minifat > 0 && minifat_start != OLE2_ENDOFCHAIN) {
+    if (num_minifat > 0) {
         uint32_t mfsize = 0;
-        uint8_t *mf = read_chain(f, minifat_start, 0, &mfsize);
-        if (mf) {
-            f->minifat = (uint32_t *)mf;       /* LE buffer == uint32 on x86 */
-            f->minifat_entries = mfsize / 4;
-        }
+        uint8_t *mf = read_chain(f, minifat_start, num_minifat * sector_size, &mfsize);
+        if (!mf) goto invalid;
+        f->minifat = (uint32_t *)mf;       /* LE buffer == uint32 on x86 */
+        f->minifat_entries = mfsize / 4;
     }
 
     /* Directory. */
@@ -218,17 +220,35 @@ ole2_file_t *ole2_open(const uint8_t *data, uint32_t len)
     if (!f->dirbuf) { ole2_close(f); return 0; }
     f->dir_count = dirsize / 128;
 
+    /* A name occupies 64 bytes, regardless of the enumeration buffer size. */
+    if (!f->dir_count || f->dirbuf[0x42] != 5) goto invalid;
+    for (uint32_t i = 0; i < f->dir_count; i++) {
+        const uint8_t *entry = f->dirbuf + i * 128;
+        uint8_t type = entry[0x42];
+        if (!type) continue;
+        uint16_t length = rd16(entry + 0x40);
+        if ((type != 1 && type != 2 && type != 5) || (i && type == 5) ||
+            length < 2 || length > 64 || (length & 1) || rd16(entry + length - 2)) goto invalid;
+        /* Public lengths are 32-bit; do not truncate version-4 stream sizes. */
+        if (version == 4 && (type == 2 || type == 5) && rd32(entry + 0x7C)) goto invalid;
+    }
+
     /* Materialize the mini stream container from the root entry (index 0). */
     if (f->dir_count > 0) {
         const uint8_t *root = f->dirbuf;
         uint32_t root_start = rd32(root + 0x74);
         uint32_t root_size  = rd32(root + 0x78);
-        if (root_size > 0 && root_start != OLE2_ENDOFCHAIN)
+        if (root_size > 0) {
             f->ministream = read_chain(f, root_start, root_size,
                                        &f->ministream_size);
+            if (!f->ministream) goto invalid;
+        }
     }
 
     return f;
+invalid:
+    ole2_close(f);
+    return 0;
 }
 
 void ole2_close(ole2_file_t *f)
@@ -275,6 +295,7 @@ int ole2_enum(ole2_file_t *f, int index,
 
 uint8_t *ole2_read_index(ole2_file_t *f, int index, uint32_t *out_size)
 {
+    if (out_size) *out_size = 0;
     if (!f || index < 0 || (uint32_t)index >= f->dir_count) return 0;
     const uint8_t *e = f->dirbuf + (uint32_t)index * 128;
     if (e[0x42] != 2) return 0;   /* not a stream */
@@ -295,6 +316,7 @@ uint8_t *ole2_read_index(ole2_file_t *f, int index, uint32_t *out_size)
 
 uint8_t *ole2_read_stream(ole2_file_t *f, const char *name, uint32_t *out_size)
 {
+    if (out_size) *out_size = 0;
     if (!f || !name) return 0;
     for (uint32_t i = 0; i < f->dir_count; i++) {
         const uint8_t *e = f->dirbuf + i * 128;

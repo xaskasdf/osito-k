@@ -1,0 +1,179 @@
+{
+  "version": "1.2.5",
+  "url": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+  "archive_sha256": "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+  "files": {
+    "src/math/sin.c": {
+      "upstream_sha256": "24e53a9d85f196f66919cc19247be5480bb607ef38844b1a24bc47c4fe4974ef",
+      "local_sha256": "24e53a9d85f196f66919cc19247be5480bb607ef38844b1a24bc47c4fe4974ef"
+    },
+    "src/math/cos.c": {
+      "upstream_sha256": "3a74e054057d636fa494bdd76a53a40db5cee618264f6ab31cb0538ba63c6bda",
+      "local_sha256": "3a74e054057d636fa494bdd76a53a40db5cee618264f6ab31cb0538ba63c6bda"
+    },
+    "src/math/tan.c": {
+      "upstream_sha256": "422d411bac962a1077ae394d14e54313012a6faa3476c20b2a66d3fb3f7a923f",
+      "local_sha256": "422d411bac962a1077ae394d14e54313012a6faa3476c20b2a66d3fb3f7a923f"
+    },
+    "src/math/asin.c": {
+      "upstream_sha256": "9302dd0b2f302f7b7decce82e737ed250bae1bcc65c19eaf3d7ec19010892e63",
+      "local_sha256": "9302dd0b2f302f7b7decce82e737ed250bae1bcc65c19eaf3d7ec19010892e63"
+    },
+    "src/math/atan.c": {
+      "upstream_sha256": "1cffb67a65456ae0bc5f07a94df04a4f18ebc1ac0bffe3219250c4e0555ee01d",
+      "local_sha256": "1cffb67a65456ae0bc5f07a94df04a4f18ebc1ac0bffe3219250c4e0555ee01d"
+    },
+    "src/math/atan2.c": {
+      "upstream_sha256": "a5f94b09b10b4e72bb15d94ae403c9dfd27d7ad881ecd729000004429acfca63",
+      "local_sha256": "a5f94b09b10b4e72bb15d94ae403c9dfd27d7ad881ecd729000004429acfca63"
+    },
+    "src/math/sinh.c": {
+      "upstream_sha256": "ab082814c4b1bbad8ea7dcfde1e36167cd72be5ef0e8b3ef3def0e052dd74261",
+      "local_sha256": "ab082814c4b1bbad8ea7dcfde1e36167cd72be5ef0e8b3ef3def0e052dd74261"
+    },
+    "src/math/cosh.c": {
+      "upstream_sha256": "5e5ed87e1a80e68734f4c87a4907a55f50a54df58261698aa94d5cb3276a3d43",
+      "local_sha256": "5e5ed87e1a80e68734f4c87a4907a55f50a54df58261698aa94d5cb3276a3d43"
+    },
+    "src/math/tanh.c": {
+      "upstream_sha256": "7e290e86729cba6ccc8eb1f7db2452736daf1a2a8ce01b210db5787fee5cb762",
+      "local_sha256": "7e290e86729cba6ccc8eb1f7db2452736daf1a2a8ce01b210db5787fee5cb762"
+    },
+    "src/math/log.c": {
+      "upstream_sha256": "a0694d8587a0d145d0f8ae87cbffba014d7988bc2ebcbfad94cea73b394c9ecc",
+      "local_sha256": "b3f43f491be71abb2dc871fd9c8f82ca41b3043cb45ad9aa0916b7d41f29b320"
+    },
+    "src/math/exp.c": {
+      "upstream_sha256": "7db56f21ca9b8915d36dd5099b707aafeb6a736eae798e19b76b074764e75f34",
+      "local_sha256": "c7348f505806c1e60f1b263abac7d1ed82769fdbf5098a2d14fca6c6d79a92e0"
+    },
+    "src/math/expm1.c": {
+      "upstream_sha256": "c4764166cea03420f2dfc1840a6a7615934192d851b96d5d2dcc321cc1e39460",
+      "local_sha256": "c4764166cea03420f2dfc1840a6a7615934192d851b96d5d2dcc321cc1e39460"
+    },
+    "src/math/frexp.c": {
+      "upstream_sha256": "58a2973f80f9def7940708850e97f8080da38be2496cd473f7cb9023e9d59e94",
+      "local_sha256": "e8969bf308685c160c5dd448f5edc5e83ed5f42d8e2ac91c3bdb5c9644388723"
+    },
+    "src/math/modf.c": {
+      "upstream_sha256": "9681ec8b49299a6fc2b2592241232535a1bc8e785f149efadfbb7637d006ca00",
+      "local_sha256": "9681ec8b49299a6fc2b2592241232535a1bc8e785f149efadfbb7637d006ca00"
+    },
+    "src/math/ldexp.c": {
+      "upstream_sha256": "702b608d3a5cf9c5d26c26ef2c528a3003555ee48ececec3b817c817d297bfe8",
+      "local_sha256": "8d913af432ee069c0159599ab737c759f24371b507ba5133037b66ef0a7531cd"
+    },
+    "src/math/scalbn.c": {
+      "upstream_sha256": "a2e766283ed30c2b30c71e01dbdabef58faf92cc9aa84a01c1ce1069b6625696",
+      "local_sha256": "7ae7a87861af7ecd29d02da4f3de86cedd47b6b3f18af40d0d73558886f832df"
+    },
+    "src/math/floor.c": {
+      "upstream_sha256": "b9ccb9363719a84be218d60c56717f4fb0234e170c305e36ce21c30e1f42f8e1",
+      "local_sha256": "b9ccb9363719a84be218d60c56717f4fb0234e170c305e36ce21c30e1f42f8e1"
+    },
+    "src/math/fabs.c": {
+      "upstream_sha256": "99880a7802d67077fa54a2bbb5d3388cf42b00c96d3e2b1c16d63f2918157754",
+      "local_sha256": "56eb211a81d52fd38e37d6ee9e57f1635a75abd75e32c47c3831f7b19ced215c"
+    },
+    "src/math/sqrt.c": {
+      "upstream_sha256": "688908f94c3edf7a439cb64094034a596a1fbff08445b9158a22874cb52ead4f",
+      "local_sha256": "6581604bca8c7c521e9c1e9989a2ef2737fd87aba8fbab4ad4c22541e44dbf1d"
+    },
+    "src/math/__sin.c": {
+      "upstream_sha256": "f3a37ef9bcfb8a2f9c809d8c7f1aa2c17c8c3319ad7fb2fe7c0a6284ea8859d2",
+      "local_sha256": "f3a37ef9bcfb8a2f9c809d8c7f1aa2c17c8c3319ad7fb2fe7c0a6284ea8859d2"
+    },
+    "src/math/__cos.c": {
+      "upstream_sha256": "3f0f774aab60a18d7ef935ffdf121bcda17cbadabff14096c614da22e31a42c1",
+      "local_sha256": "3f0f774aab60a18d7ef935ffdf121bcda17cbadabff14096c614da22e31a42c1"
+    },
+    "src/math/__tan.c": {
+      "upstream_sha256": "e18b65b69fced8dbb2d3ed1a3dc6daea0e9f857f2762f274380bd89a6f89d2c4",
+      "local_sha256": "e18b65b69fced8dbb2d3ed1a3dc6daea0e9f857f2762f274380bd89a6f89d2c4"
+    },
+    "src/math/__rem_pio2.c": {
+      "upstream_sha256": "938329e0939cd83ee2185a52154b41242f618d4a6df1b08395f344da33d4f1e6",
+      "local_sha256": "938329e0939cd83ee2185a52154b41242f618d4a6df1b08395f344da33d4f1e6"
+    },
+    "src/math/__rem_pio2_large.c": {
+      "upstream_sha256": "b97f19fb5951c83a0c10506fab35646caefde13bd03100ad2af55ef00af0b9fb",
+      "local_sha256": "b97f19fb5951c83a0c10506fab35646caefde13bd03100ad2af55ef00af0b9fb"
+    },
+    "src/math/__expo2.c": {
+      "upstream_sha256": "29cc9dd6d656cd0fbf921a8a1aeee81b430558d880194832a8d44d82c8d37d94",
+      "local_sha256": "29cc9dd6d656cd0fbf921a8a1aeee81b430558d880194832a8d44d82c8d37d94"
+    },
+    "src/math/__math_divzero.c": {
+      "upstream_sha256": "84aa910bdc5e7ccfed42098c37c44e278aa942d46e5a51d5ee8273336c79e719",
+      "local_sha256": "84aa910bdc5e7ccfed42098c37c44e278aa942d46e5a51d5ee8273336c79e719"
+    },
+    "src/math/__math_invalid.c": {
+      "upstream_sha256": "b56440ed59fa1e1aaaf6bf8b672c8bb71eaf844457906f7773da1d67d7ef013b",
+      "local_sha256": "b56440ed59fa1e1aaaf6bf8b672c8bb71eaf844457906f7773da1d67d7ef013b"
+    },
+    "src/math/__math_oflow.c": {
+      "upstream_sha256": "74669de53bc4b250183cfa262a8a03ee8106f33a83e3aca6b217bafc7363b83c",
+      "local_sha256": "74669de53bc4b250183cfa262a8a03ee8106f33a83e3aca6b217bafc7363b83c"
+    },
+    "src/math/__math_uflow.c": {
+      "upstream_sha256": "9a841197bbe9ade9bbd684f8bc65424a97c481d37dabb9fa1790bafe7959034a",
+      "local_sha256": "9a841197bbe9ade9bbd684f8bc65424a97c481d37dabb9fa1790bafe7959034a"
+    },
+    "src/math/__math_xflow.c": {
+      "upstream_sha256": "5feafe10347636884a071a5096f912d5ca4a0939844804ca09b88241405648ad",
+      "local_sha256": "5feafe10347636884a071a5096f912d5ca4a0939844804ca09b88241405648ad"
+    },
+    "src/math/exp_data.c": {
+      "upstream_sha256": "c55dff64e369fe816cd8ce367064989bb119f85783599680d1a329031c660689",
+      "local_sha256": "c55dff64e369fe816cd8ce367064989bb119f85783599680d1a329031c660689"
+    },
+    "src/math/log_data.c": {
+      "upstream_sha256": "e96bcd99d88fc57e0f3686299014f4b949a6212603ce237f39e16cedc155617a",
+      "local_sha256": "e96bcd99d88fc57e0f3686299014f4b949a6212603ce237f39e16cedc155617a"
+    },
+    "src/math/sqrt_data.c": {
+      "upstream_sha256": "590aaadff964dcfc36ef9e5302423a779cda4f1608e15dbeee8e43e6e5f1c6fe",
+      "local_sha256": "590aaadff964dcfc36ef9e5302423a779cda4f1608e15dbeee8e43e6e5f1c6fe"
+    },
+    "src/internal/libm.h": {
+      "upstream_sha256": "d5a11757541471030d8f4bf7a39a29de35732ecbb291b2f45bf03296be4f25a2",
+      "local_sha256": "b03d5558d80cf2833888e1e7d2050c56035b4d81b0457ad3eaf6ad74743433f1"
+    },
+    "src/math/exp_data.h": {
+      "upstream_sha256": "df77fca837edd02b260dd09a2914202775909ae67a059218ae38cfab104e6d16",
+      "local_sha256": "5e80e37b573f815501d96195f611c42a734badc1692d115cf0919f1b717a57af"
+    },
+    "src/math/log_data.h": {
+      "upstream_sha256": "a8dced6f0821f30cad040ba326b03e419fbe0a750ed8f3b0d7145992bee4bccc",
+      "local_sha256": "a6a676c9d39c30d1d4e9930ca6ece0c844dcbcda35a233f86173bb8b6b30522f"
+    },
+    "src/math/sqrt_data.h": {
+      "upstream_sha256": "5fa47a8b8c1afbee4dcd10f71d2f6c433a24f9aa5ce7a90924cd1db236cbc03c",
+      "local_sha256": "41fc058e38e189e06c1944abbfb73cc1db5d1fac6001df04036ba1688dab0c15"
+    },
+    "COPYRIGHT": {
+      "upstream_sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af",
+      "local_sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+    },
+    "src/math/acos.c": {
+      "upstream_sha256": "cc6f9017e7e2e0ef01516fa12c68aa63865e6415c90dc039dfce9abffae09a4c",
+      "local_sha256": "cc6f9017e7e2e0ef01516fa12c68aa63865e6415c90dc039dfce9abffae09a4c"
+    },
+    "src/math/log10.c": {
+      "upstream_sha256": "ef9b4b1f0918cf1fcb797f9fa4d4ffe177bfa27f668d74a41d613bfbcd83850a",
+      "local_sha256": "acbfde8b3b5ff3243c009c94116cc8167f1a69c488c40353e400dfc4602f69db"
+    },
+    "src/math/pow.c": {
+      "upstream_sha256": "b06f0a08d74fcff8cced7afa2c0e47e301e3e8a19c0de5becdec28cd7b014027",
+      "local_sha256": "07e5d26369252fb84534839bd66e26a0d97bacfe724c396eb7484cc0957c9494"
+    },
+    "src/math/pow_data.c": {
+      "upstream_sha256": "2052ec913f9b4a2170a98a6fcbcd7694f5dec220036b00c36106a2b4b65a4c55",
+      "local_sha256": "2052ec913f9b4a2170a98a6fcbcd7694f5dec220036b00c36106a2b4b65a4c55"
+    },
+    "src/math/pow_data.h": {
+      "upstream_sha256": "5014345a7958adcf6ff835b5e96afa99dd5a98c40dfe968442288e002b8e01a3",
+      "local_sha256": "e8b1a23d852f8e8eff93e07af6e7c4f04e733fcaf39a8724cbc0dc4c1ce01252"
+    }
+  }
+}

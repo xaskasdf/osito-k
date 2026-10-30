@@ -247,8 +247,10 @@ repair_handler:
     incb faults
     cmpb $3, faults
     jae fail
-    testl $0x20000, %ss:0x34(%ebp)
-    jz fail
+    movl %ss:0x34(%ebp), %eax
+    andl $0x30000, %eax           /* Real-mode fault: both VM and RF. */
+    cmpl $0x30000, %eax
+    jne fail
     cmpw $1, %ss:0x32(%ebp)
     jne fail
     cmpw $0xf000, %ss:0x30(%ebp)

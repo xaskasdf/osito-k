@@ -8,18 +8,19 @@
  * (VIRTIO_F_VERSION_1 + VIRTIO_NET_F_MAC), and brings up RX/TX split
  * virtqueues using virtio.c's virtqueue_t primitive.
  *
- * Wire format on send/recv: each frame is prefixed with a 10-byte
- * virtio_net_hdr (no MRG_RXBUF, num_buffers field elided per spec).
+ * Wire format on send/recv: each frame is prefixed with the 12-byte
+ * modern virtio_net_hdr, including num_buffers without MRG_RXBUF.
  */
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "../kernel/smp.h"
 
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
 extern void serial_puthex(uint64_t val, int digits);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
-extern void  paging_map_mmio(uint64_t phys, uint64_t size);
+extern int  paging_map_mmio(uint64_t phys, uint64_t size);
 extern uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offset);
 
 /* Reuse virtqueue_t + helpers from virtio.c */
@@ -65,6 +66,7 @@ static inline uint64_t kv2p(const void *v) { return kvirt_to_phys(v); }
 #define VIRTIO_STATUS_DRIVER       0x02
 #define VIRTIO_STATUS_DRIVER_OK    0x04
 #define VIRTIO_STATUS_FEATURES_OK  0x08
+#define VIRTIO_STATUS_NEEDS_RESET  0x40
 #define VIRTIO_STATUS_FAILED       0x80
 
 /* Features we care about */
@@ -111,9 +113,35 @@ static struct {
     uint16_t          tx_notify_off;
     uint8_t           mac[6];
     uint8_t          *rx_bufs[VNET_RX_BUFS];
-    /* TX scratch buffer (header + frame) — single in-flight at a time. */
+    /* One persistent buffer per TX descriptor, owned until used completion. */
     uint8_t          *tx_buf;
 } vnet;
+static spinlock_t tx_lock = SPINLOCK_INIT;
+
+static uint64_t tx_lock_irqsave(void)
+{
+#ifdef VNET_HOST_TEST
+    extern uint64_t vnet_test_irq_save(void);
+    uint64_t flags = vnet_test_irq_save();
+#else
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+    spin_lock(&tx_lock);
+    return flags;
+}
+
+static void tx_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&tx_lock);
+#ifdef VNET_HOST_TEST
+    extern void vnet_test_irq_restore(uint64_t);
+    vnet_test_irq_restore(flags);
+#else
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+#endif
+}
 
 /* ── MMIO accessors (volatile, native size) ────────────────────── */
 static inline void w8 (volatile uint8_t  *p, uint32_t off, uint8_t  v) { p[off] = v; }
@@ -156,8 +184,11 @@ static int walk_caps(uint8_t bus, uint8_t dev, uint8_t func,
             uint64_t bar_phys = bars[bar_idx];
             if (!bar_phys)   { cap_ptr = cap_next; continue; }
 
-            paging_map_mmio(bar_phys + off, length ? length : 0x1000);
-            volatile uint8_t *region = (volatile uint8_t *)(bar_phys + off);
+            if (paging_map_mmio(bar_phys + off, length ? length : 0x1000) < 0)
+                return -1;
+            /* Notifications also run while a process's private CR3 is active. */
+            volatile uint8_t *region =
+                (volatile uint8_t *)PHYS_TO_VIRT(bar_phys + off);
 
             switch (cfg_type) {
             case VIRTIO_PCI_CAP_COMMON_CFG:
@@ -233,6 +264,7 @@ static int setup_queue(virtqueue_t *vq, uint16_t qsel, uint16_t *notify_off_out)
      * with size > pool, indices past `pool size` would point at unused
      * descriptors and confuse the device. */
     if (qsize > VNET_RX_BUFS) qsize = VNET_RX_BUFS;
+    w16(c, CFG_QUEUE_SIZE, qsize);
 
     if (virtqueue_init(vq, qsize) < 0) return -1;
 
@@ -249,6 +281,7 @@ static void notify_queue(uint16_t qsel, uint16_t notify_off)
 {
     volatile uint16_t *p = (volatile uint16_t *)
         (vnet.notify_base + (uint64_t)notify_off * vnet.notify_off_multiplier);
+    __asm__ volatile ("sfence" ::: "memory");
     *p = qsel;
 }
 
@@ -256,8 +289,10 @@ static void fill_rx(void)
 {
     for (int i = 0; i < VNET_RX_BUFS; i++) {
         if (!vnet.rx_bufs[i]) {
-            vnet.rx_bufs[i] = (uint8_t *)mem_alloc_aligned(VNET_BUF_SIZE, 16);
-            if (!vnet.rx_bufs[i]) break;
+            void *physical = mem_alloc_aligned(VNET_BUF_SIZE, 16);
+            if (!physical) break;
+            /* net_poll may run from a Win32 process's private CR3. */
+            vnet.rx_bufs[i] = (uint8_t *)PHYS_TO_VIRT(physical);
         }
         /* WRITE flag: device writes incoming packet into this buffer. */
         virtqueue_add_buf(&vnet.rxq, kv2p(vnet.rx_bufs[i]),
@@ -308,9 +343,11 @@ int virtio_net_init(uint8_t bus, uint8_t dev, uint8_t func,
        VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER |
        VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
 
-    /* Allocate the persistent TX buffer (header + max frame) */
-    vnet.tx_buf = (uint8_t *)mem_alloc_aligned(VNET_BUF_SIZE, 16);
-    if (!vnet.tx_buf) return -1;
+    /* Keep every published frame intact until its descriptor is returned. */
+    void *tx_physical = mem_alloc_aligned(
+        (uint64_t)vnet.txq.size * VNET_BUF_SIZE, 16);
+    if (!tx_physical) return -1;
+    vnet.tx_buf = (uint8_t *)PHYS_TO_VIRT(tx_physical);
 
     /* Fill RX ring + notify */
     for (int i = 0; i < VNET_RX_BUFS; i++) vnet.rx_bufs[i] = NULL;
@@ -333,7 +370,18 @@ int virtio_net_init(uint8_t bus, uint8_t dev, uint8_t func,
     return 0;
 }
 
-bool virtio_net_is_ready(void) { return vnet.ready; }
+bool virtio_net_is_ready(void)
+{
+    if (!__atomic_load_n(&vnet.ready, __ATOMIC_ACQUIRE)) return false;
+    uint8_t status = r8(vnet.common_cfg, CFG_DEVICE_STATUS);
+    if (!(status & VIRTIO_STATUS_DRIVER_OK) ||
+        (status & (VIRTIO_STATUS_NEEDS_RESET | VIRTIO_STATUS_FAILED))) {
+        if (__atomic_exchange_n(&vnet.ready, false, __ATOMIC_ACQ_REL))
+            serial_puts("[VNET] device stopped; reset/reinitialization required\n");
+        return false;
+    }
+    return true;
+}
 
 void virtio_net_get_mac(uint8_t mac_out[6])
 {
@@ -342,43 +390,32 @@ void virtio_net_get_mac(uint8_t mac_out[6])
 
 int virtio_net_send(const void *data, uint32_t len)
 {
-    if (!vnet.ready || len > 1514) return -1;
+    if (!data || !len || len > 1514 || !virtio_net_is_ready()) return -1;
 
-    /* Drain any prior TX completions before queueing this one — keeps
-     * the txq from accumulating used entries we never consumed and
-     * helps surface device-side issues early. */
+    /* Multiple TCP owners may send between net_poll calls. Serialize the
+     * free list and publication, but never wait for the device with IRQs off. */
+    uint64_t flags = tx_lock_irqsave();
     while (virtqueue_has_used(&vnet.txq))
         virtqueue_get_used(&vnet.txq, NULL);
 
-    /* Header is zero (no GSO/CSUM offload) followed by the frame. */
-    memset(vnet.tx_buf, 0, VNET_HDR_SIZE);
-    memcpy(vnet.tx_buf + VNET_HDR_SIZE, data, len);
-
-    /* READ flag — device pulls from this buffer. */
-    virtqueue_add_buf(&vnet.txq, kv2p(vnet.tx_buf),
-                      VNET_HDR_SIZE + len, 0);
-    notify_queue(1, vnet.tx_notify_off);
-
-    /* Poll for completion. Shorter loop than before — we don't want
-     * to hold the CPU for >100 ms if the device's TX completion is
-     * lost (modern QEMU virtio-net sometimes does this in poll mode). */
-    for (int i = 0; i < 100000; i++) {
-        if (virtqueue_has_used(&vnet.txq)) {
-            virtqueue_get_used(&vnet.txq, NULL);
-            return 0;
-        }
-        __asm__ volatile ("pause");
+    uint16_t id = vnet.txq.free_head;
+    if (id >= vnet.txq.size) {
+        tx_unlock_irqrestore(flags);
+        return -1;
     }
-    /* TX consumption lost. The packet was likely sent by QEMU but the
-     * used-ring update isn't visible. Return success on best-effort —
-     * caller can't do anything about it and the next send will drain
-     * the stale used entry above. */
-    return 0;
+    uint8_t *buf = vnet.tx_buf + (uint32_t)id * VNET_BUF_SIZE;
+    memset(buf, 0, VNET_HDR_SIZE);
+    memcpy(buf + VNET_HDR_SIZE, data, len);
+    int submitted = virtqueue_add_buf(&vnet.txq, kv2p(buf),
+                                      VNET_HDR_SIZE + len, 0);
+    if (submitted >= 0) notify_queue(1, vnet.tx_notify_off);
+    tx_unlock_irqrestore(flags);
+    return submitted >= 0 ? 0 : -1;
 }
 
 int virtio_net_recv(void *buf, uint32_t *len_out)
 {
-    if (!vnet.ready) return -1;
+    if (!virtio_net_is_ready()) return -1;
 
     if (!virtqueue_has_used(&vnet.rxq)) return 0;
 

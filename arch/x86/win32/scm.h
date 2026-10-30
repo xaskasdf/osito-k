@@ -7,9 +7,13 @@
 
 #include "nttypes.h"
 
+HANDLE WINAPI OpenSCManagerA(PCSTR machine_name, PCSTR database_name,
+                             DWORD desired_access);
 HANDLE WINAPI OpenSCManagerW(PCWSTR machine_name, PCWSTR database_name,
                              DWORD desired_access);
 HANDLE WINAPI OpenServiceW(HANDLE manager, PCWSTR service_name,
+                           DWORD desired_access);
+HANDLE WINAPI OpenServiceA(HANDLE manager, PCSTR service_name,
                            DWORD desired_access);
 HANDLE WINAPI CreateServiceW(HANDLE manager, PCWSTR service_name,
                              PCWSTR display_name, DWORD desired_access,
@@ -34,6 +38,8 @@ BOOL WINAPI QueryServiceStatusEx(HANDLE service, DWORD info_level,
                                  BYTE *buffer, DWORD buffer_size,
                                  DWORD *bytes_needed);
 BOOL WINAPI QueryServiceConfigW(HANDLE service, BYTE *buffer,
+                                DWORD buffer_size, DWORD *bytes_needed);
+BOOL WINAPI QueryServiceConfigA(HANDLE service, BYTE *buffer,
                                 DWORD buffer_size, DWORD *bytes_needed);
 BOOL WINAPI CloseServiceHandle(HANDLE object);
 BOOL WINAPI StartServiceCtrlDispatcherW(PVOID service_table);

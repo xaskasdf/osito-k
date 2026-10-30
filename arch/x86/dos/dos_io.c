@@ -10,7 +10,11 @@
 #include "dos_audio.h"
 #include "dos_io.h"
 #include "dos_hostmem.h"
+#include "dos_fpu.h"
 #include "../include/input_events.h"
+#ifdef DOS_IRQ_DIAGNOSTICS
+#include "cpu8086.h"
+#endif
 
 extern void serial_puts(const char *text);
 extern void serial_puthex(uint64_t value, int digits);
@@ -110,6 +114,7 @@ typedef struct {
     uint8_t dac_write_component;
     bool dac_read_mode;
 
+    uint8_t system_control_a;
     uint8_t system_control_b;
     uint32_t diagnostic_flags;
     DOS_IO_DIAGNOSTIC diagnostics[DOS_IO_DIAGNOSTIC_PORTS];
@@ -118,12 +123,55 @@ typedef struct {
     bool test_mode;
 } DOS_IO_STATE;
 
+#ifdef DOS_IRQ_DIAGNOSTICS
+typedef struct {
+    uint64_t sequence, ns, owner, instructions, irq_period;
+    uint32_t eip, value;
+    uint16_t cs, reload;
+    uint8_t kind, irq, depth, control_depth, virtual_if, pending, isr, mask;
+    uint32_t reserved;
+} DOS_IRQ_RECORD;
+
+_Static_assert(sizeof(DOS_IRQ_RECORD) == 64, "DOS IRQ observation record");
+static volatile DOS_IRQ_RECORD dos_irq_trace_records[512];
+static uint64_t dos_irq_trace_total;
+
+void dos_io_irq_trace(dos_vm_t *vm, uint8_t kind, uint8_t irq, uint32_t value)
+{
+    if (!vm || !vm->cpu || !vm->io) return;
+    const cpu8086_state_t *cpu = vm->cpu;
+    const DOS_IO_STATE *state = vm->io;
+    uint64_t index = __atomic_fetch_add(&dos_irq_trace_total, 1, __ATOMIC_RELAXED);
+    volatile DOS_IRQ_RECORD *record = &dos_irq_trace_records[index % 512u];
+    __atomic_store_n(&record->sequence, 0, __ATOMIC_RELEASE);
+    record->ns = idt_get_monotonic_ns();
+    record->owner = (uintptr_t)vm;
+    record->instructions = cpu->insn_count;
+    record->irq_period = state->pit[0].irq_period;
+    record->eip = cpu->eip;
+    record->value = value;
+    record->cs = cpu->cs;
+    record->reload = state->pit[0].reload;
+    record->kind = kind;
+    record->irq = irq;
+    record->depth = vm->dpmi.interrupt_depth;
+    record->control_depth = vm->dpmi.control_depth;
+    record->virtual_if = vm->dpmi.virtual_interrupts_enabled;
+    record->pending = vm->timer_irq_pending;
+    record->isr = state->pic[0].isr;
+    record->mask = state->pic[0].mask;
+    record->reserved = 0;
+    __atomic_store_n(&record->sequence, index + 1u, __ATOMIC_RELEASE);
+}
+#endif
+
 enum {
     DOS_IO_DIAG_READ = 1U,
     DOS_IO_DIAG_WRITE = 2U,
     DOS_IO_DIAG_SPEAKER = 1U << 0,
     DOS_IO_DIAG_KBD_COMMAND = 1U << 1,
     DOS_IO_DIAG_PIT_BCD = 1U << 2,
+    DOS_IO_DIAG_RESET = 1U << 3,
 };
 
 static DOS_IO_STATE *dos_io_state(dos_vm_t *vm)
@@ -436,7 +484,9 @@ bool dos_io_keyboard_poll(dos_vm_t *vm)
         uint64_t now = idt_get_monotonic_ns();
         if (!keyboard->poll_ns || now - keyboard->poll_ns >= 1000000ULL) {
             extern void xhci_poll(void) __attribute__((weak));
+            extern void ps2_poll(void) __attribute__((weak));
             keyboard->poll_ns = now;
+            if (ps2_poll) ps2_poll();
             if (xhci_poll) xhci_poll();
         }
         uint8_t byte;
@@ -502,6 +552,12 @@ static void dos_keyboard_write_command(DOS_IO_STATE *state, uint8_t value)
         break;
     case 0xD2:
         keyboard->expect = 4U;
+        break;
+    case 0xDD:
+        keyboard->output_port &= (uint8_t)~2u;
+        break;
+    case 0xDF:
+        keyboard->output_port |= 2u;
         break;
     default:
         if (!(state->diagnostic_flags & DOS_IO_DIAG_KBD_COMMAND)) {
@@ -927,6 +983,31 @@ report:
                     : " ignored\n");
 }
 
+static void dos_io_update_a20(dos_vm_t *vm, DOS_IO_STATE *state)
+{
+    vm->a20_masked = ((state->keyboard.output_port | state->system_control_a) & 2u) == 0;
+}
+
+bool dos_io_set_a20(dos_vm_t *vm, bool enabled)
+{
+    DOS_IO_STATE *state = dos_io_state(vm);
+    if (!state) return false;
+    /* BIOS controls both sources: clearing only one cannot close an OR gate. */
+    state->keyboard.output_port = (state->keyboard.output_port & (uint8_t)~2u) |
+                                  (enabled ? 2u : 0u);
+    state->system_control_a &= (uint8_t)~2u;
+    dos_io_update_a20(vm, state);
+    return true;
+}
+
+static void dos_io_report_reset(DOS_IO_STATE *state)
+{
+    if (state->diagnostic_flags & DOS_IO_DIAG_RESET) return;
+    state->diagnostic_flags |= DOS_IO_DIAG_RESET;
+    if (!state->test_mode)
+        serial_puts("[DOS-IO] guest CPU reset requested; guest reset is not implemented\n");
+}
+
 bool dos_io_init(struct dos_vm *vm)
 {
     if (!vm || vm->io)
@@ -965,6 +1046,7 @@ bool dos_io_init(struct dos_vm *vm)
     state->crtc[1][0x0B] = vm->cursor_end;
     dos_vga_default_palette(state);
     vm->io = state;
+    dos_io_update_a20(vm, state);
     return true;
 }
 
@@ -1017,6 +1099,8 @@ uint8_t dos_io_read8(dos_vm_t *vm, uint16_t port)
     case 0x64:
         (void)dos_io_keyboard_poll(vm);
         return dos_keyboard_status(state);
+    case 0x92:
+        return state->system_control_a;
     case 0x61:
         now_ns = idt_get_monotonic_ns();
         return (state->system_control_b & 0x0FU) |
@@ -1067,6 +1151,10 @@ uint32_t dos_io_read32(dos_vm_t *vm, uint16_t port)
 
 void dos_io_write8(dos_vm_t *vm, uint16_t port, uint8_t value)
 {
+    if (port == 0xf0) {
+        dos_fpu_ack_irq(vm);
+        return;
+    }
     if (dos_audio_port_write8(vm, port, value))
         return;
 
@@ -1075,7 +1163,11 @@ void dos_io_write8(dos_vm_t *vm, uint16_t port, uint8_t value)
         return;
 
     switch (port) {
-    case 0x20: dos_pic_write_command(&state->pic[0], value); return;
+    case 0x20:
+        dos_io_irq_trace(vm, DOS_IRQ_TRACE_PIC_BEFORE, 0, value);
+        dos_pic_write_command(&state->pic[0], value);
+        dos_io_irq_trace(vm, DOS_IRQ_TRACE_PIC_AFTER, 0, value);
+        return;
     case 0x21: dos_pic_write_data(&state->pic[0], value); return;
     case 0xA0: dos_pic_write_command(&state->pic[1], value); return;
     case 0xA1: dos_pic_write_data(&state->pic[1], value); return;
@@ -1085,18 +1177,28 @@ void dos_io_write8(dos_vm_t *vm, uint16_t port, uint8_t value)
     case 0x42:
         dos_pit_write(&state->pit[port - 0x40U], value,
                       idt_get_monotonic_ns());
+        dos_io_irq_trace(vm, DOS_IRQ_TRACE_PIT, port - 0x40U, value);
         return;
     case 0x43:
         dos_pit_control(state, value, idt_get_monotonic_ns());
+        dos_io_irq_trace(vm, DOS_IRQ_TRACE_PIT, 3, value);
         return;
 
     case 0x60:
         dos_keyboard_write_data(state, value);
+        dos_io_update_a20(vm, state);
+        if (!(state->keyboard.output_port & 1u)) dos_io_report_reset(state);
         dos_keyboard_update_irq(state);
         return;
     case 0x64:
         dos_keyboard_write_command(state, value);
+        dos_io_update_a20(vm, state);
         dos_keyboard_update_irq(state);
+        return;
+    case 0x92:
+        if ((value & 1u) && !(state->system_control_a & 1u)) dos_io_report_reset(state);
+        state->system_control_a = value & 3u;
+        dos_io_update_a20(vm, state);
         return;
     case 0x61: {
         bool old_gate = state->pit[2].gate;
@@ -1181,6 +1283,18 @@ void dos_io_write32(dos_vm_t *vm, uint16_t port, uint32_t value)
     dos_io_write16(vm, port + 2U, (uint16_t)(value >> 16));
 }
 
+void dos_io_raise_irq(struct dos_vm *vm, uint8_t irq)
+{
+    DOS_IO_STATE *state = dos_io_state(vm);
+    if (state && irq < 16) state->pic[irq >> 3].irr |= 1u << (irq & 7u);
+}
+
+void dos_io_clear_irq(struct dos_vm *vm, uint8_t irq)
+{
+    DOS_IO_STATE *state = dos_io_state(vm);
+    if (state && irq < 16) state->pic[irq >> 3].irr &= ~(1u << (irq & 7u));
+}
+
 bool dos_io_irq_begin(struct dos_vm *vm, uint8_t irq, uint8_t *vector)
 {
     if (!vector || irq >= 16U)
@@ -1211,6 +1325,7 @@ bool dos_io_irq_begin(struct dos_vm *vm, uint8_t irq, uint8_t *vector)
         state->pic[0].isr |= 1U << 2;
     *vector = (uint8_t)(pic->vector_base + line);
     if (irq == 1U) state->keyboard.irqs++;
+    dos_io_irq_trace(vm, DOS_IRQ_TRACE_ACCEPT, irq, *vector);
     return true;
 }
 

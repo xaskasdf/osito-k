@@ -1,6 +1,9 @@
 /* Win32 private-profile (INI) manager. */
 
 #include "kernel32_shim.h"
+#include "wow64.h"
+#include "ntsyscall.h"
+#include "ntdll_shim.h"
 #include "../kernel/smp.h"
 
 extern void *kmalloc(uint64_t size);
@@ -25,7 +28,8 @@ extern uint64_t osfs2_file_revision(void *file);
 typedef enum {
     INI_RECORD_RAW = 0,
     INI_RECORD_SECTION,
-    INI_RECORD_KEY
+    INI_RECORD_KEY,
+    INI_RECORD_BARE
 } INI_RECORD_TYPE;
 
 typedef struct {
@@ -224,7 +228,7 @@ static INI_DOCUMENT *ini_document_lookup_locked(PCSTR file_name,
 {
     char path[260];
     if (!file_name || !*file_name ||
-        !win32_normalize_path(file_name, path)) {
+        !win32_resolve_file_path(file_name, path)) {
         SetLastError(file_name ? PROFILE_ERROR_FILENAME_EXCED_RANGE
                                : PROFILE_ERROR_INVALID_PARAMETER);
         return NULL;
@@ -288,7 +292,7 @@ static BOOL ini_parse(const char *buffer, uint64_t size,
         }
 
         const char *equals = NULL;
-        if (start < end && *start != ';' && *start != '#') {
+        if (start < end && *start != ';') {
             for (const char *cursor = start; cursor < end; cursor++) {
                 if (*cursor == '=') {
                     equals = cursor;
@@ -316,6 +320,15 @@ static BOOL ini_parse(const char *buffer, uint64_t size,
                                      (uint64_t)(value_end - value_start)))
                 return FALSE;
             if (key_start < key_end) continue;
+        }
+
+        /* Section reads include non-comment lines without '='. Named-key
+         * enumeration, lookup and updates must continue to ignore them. */
+        if (!equals && start < end && *start != ';') {
+            if (!ini_document_append(parsed, INI_RECORD_BARE, start,
+                                     (uint64_t)(end - start), NULL, 0))
+                return FALSE;
+            continue;
         }
 
         if (!ini_document_append(parsed, INI_RECORD_RAW, raw_start,
@@ -475,6 +488,11 @@ static uint64_t ini_list_emit(const INI_DOCUMENT *document,
             }
             continue;
         }
+        if (record->type == INI_RECORD_BARE && in_section && mode == INI_LIST_SECTION) {
+            ini_list_append(destination, copy_limit, &logical, record->name);
+            ini_list_terminate_item(destination, copy_limit, &logical);
+            continue;
+        }
         if (!ini_record_is_in_section(record, in_section)) continue;
         if (mode == INI_LIST_KEYS) {
             ini_list_append(destination, copy_limit, &logical, record->name);
@@ -501,7 +519,7 @@ static DWORD ini_write_multisz(const INI_DOCUMENT *document,
         if (size > 1) buffer[1] = 0;
         return 0;
     }
-    if (logical + 1 <= size) {
+    if (logical + 1 < size) {
         (void)ini_list_emit(document, mode, section, buffer, logical);
         buffer[logical] = 0;
         return (DWORD)logical;
@@ -661,14 +679,26 @@ static BOOL ini_document_persist_locked(INI_DOCUMENT *document)
         SetLastError(PROFILE_ERROR_FILENAME_EXCED_RANGE);
         return FALSE;
     }
-    char absolute[260] = "C:\\";
-    memcpy(absolute + 3, document->path, path_length + 1);
-    HANDLE file = CreateFileA(absolute, GENERIC_WRITE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE,
-                              NULL, 2 /* CREATE_ALWAYS */,
-                              FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) {
+    WCHAR name_buffer[260];
+    for (uint64_t i = 0; i <= path_length; i++)
+        name_buffer[i] = (WCHAR)(BYTE)document->path[i];
+    UNICODE_STRING name = {(USHORT)(path_length * 2),
+                            (USHORT)((path_length + 1) * 2), name_buffer};
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    IO_STATUS_BLOCK iosb = {0};
+    HANDLE file = NULL;
+    ULONG_PTR args[11] = {
+        (ULONG_PTR)&file, GENERIC_WRITE | SYNCHRONIZE, (ULONG_PTR)&oa,
+        (ULONG_PTR)&iosb, 0, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OVERWRITE_IF,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, 0, 0
+    };
+    /* Cache identity is a physical path, including Sysnative/disabled callers. */
+    NTSTATUS status = nt_create_file_resolved(args, document->path);
+    if (!NT_SUCCESS(status)) {
         if (buffer) kfree(buffer);
+        SetLastError(RtlNtStatusToDosError(status));
         return FALSE;
     }
     DWORD written = 0;
@@ -1002,7 +1032,7 @@ BOOL WINAPI WritePrivateProfileSectionA(PCSTR app_name, PCSTR strings,
             uint64_t key_length = (uint64_t)(equals - item);
             const char *value = *equals ? equals + 1 : equals;
             if (key_length &&
-                !ini_document_append(document, INI_RECORD_KEY,
+                !ini_document_append(document, *equals ? INI_RECORD_KEY : INI_RECORD_BARE,
                                      item, key_length, value, strlen(value))) {
                 SetLastError(PROFILE_ERROR_NOT_ENOUGH_MEMORY);
                 ini_document_invalidate(document);

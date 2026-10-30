@@ -6,14 +6,22 @@
  */
 
 #include "dllloader.h"
+#include "system_paths.h"
+#include "wow64.h"
 #include "compat32.h"
 #include "win32_abi.h"
+#include "nt64_service.h"
 #include "../include/paging.h"
 extern void serial_puts(const char *s);
 extern void serial_putchar(char c);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void WINAPI SetLastError(DWORD error);
+extern DWORD WINAPI GetLastError(void);
+extern DWORD WINAPI GetEnvironmentVariableA(PCSTR name, PSTR buffer, DWORD size);
+extern HANDLE WINAPI LocalAlloc(UINT flags, SIZE_T bytes);
+extern HANDLE WINAPI LocalFree(HANDLE memory);
+extern ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status);
 extern DWORD WINAPI GetCurrentThreadId(void);
 extern ULONG_PTR win32_current_image_base(void);
 extern NTSTATUS win32_publish_loader_image(PPE_IMAGE_INFO info,
@@ -151,6 +159,12 @@ static LOADED_MODULE modules[MAX_LOADED_MODULES];
 #define SHIM64_THUNK_PATCH_SIZE  16UL
 #define SHIM64_THUNK_SIZE        32UL
 #define SHIM64_THUNK_MAX         1024
+#define SHIM_EXPORT_RVA (SHIM64_THUNK_RVA + \
+                         SHIM64_THUNK_SIZE * SHIM64_THUNK_MAX)
+/* Core image addresses are ABI-wide, not tied to the parent's import order.
+ * Each process still owns its physical pages and protection state. */
+#define NTDLL32_IMAGE_BASE 0x7FFB0000ULL
+#define NTDLL64_IMAGE_BASE 0x00006FFFFFFF0000ULL
 _Static_assert(SHIM64_THUNK_RVA +
                    SHIM64_THUNK_SIZE * SHIM64_THUNK_MAX <=
                DLL_SYNTHETIC_SHIM_IMAGE_SIZE,
@@ -158,6 +172,7 @@ _Static_assert(SHIM64_THUNK_RVA +
 static USHORT shim64_thunk_count[MAX_LOADED_MODULES];
 static ULONG_PTR shim64_thunk_targets[MAX_LOADED_MODULES][SHIM64_THUNK_MAX];
 static ULONG next_init_order = 1;
+static uint64_t next_attach_order = 1;
 static volatile uint64_t export_hint_hits;
 static volatile uint64_t export_binary_hits;
 static volatile uint64_t export_ordinal_hits;
@@ -175,7 +190,10 @@ typedef struct {
     unsigned depth;
     volatile int module_head;
     unsigned load_depth;
+    volatile unsigned shutdown;
+    unsigned internal_shutdown_depth;
     char load_directory[260];
+    BOOL altered_search_path; /* Valid only while load_directory is nonempty. */
     DWORD default_search_flags;
     int user_directory_head;
     BOOL current_directory_disabled;
@@ -238,6 +256,8 @@ restart:
             __atomic_store_n(&state->depth, 0, __ATOMIC_RELAXED);
             __atomic_store_n(&state->module_head, -1, __ATOMIC_RELAXED);
             __atomic_store_n(&state->load_depth, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&state->shutdown, 0, __ATOMIC_RELAXED);
+            state->internal_shutdown_depth=0;
             state->load_directory[0] = 0;
             state->default_search_flags = 0;
             state->user_directory_head = -1;
@@ -266,6 +286,7 @@ static void loader_lock_publish_state(ULONG owner_pid, unsigned depth)
 static void loader_lock_reset(DLL_PROCESS_STATE *state)
 {
     __atomic_store_n(&state->depth, 0, __ATOMIC_RELAXED);
+    state->internal_shutdown_depth = 0;
     __atomic_store_n(&state->kernel_pid, -1, __ATOMIC_RELAXED);
 }
 
@@ -325,6 +346,8 @@ static void loader_lock_acquire_for(ULONG owner_pid)
             break;
         if (expected == 1)
             loader_lock_recover_stale(state, owner_pid);
+        extern void win32_main_termination_checkpoint(void);
+        win32_main_termination_checkpoint();
         sched_yield();
     }
 
@@ -427,6 +450,22 @@ BOOL dll_loader_lock_owned_by_current_thread(void)
            __atomic_load_n(&state->depth, __ATOMIC_ACQUIRE) != 0 &&
            __atomic_load_n(&state->kernel_pid, __ATOMIC_RELAXED) ==
                proc_current_pid();
+}
+
+BOOL dll_shutdown_in_progress(void)
+{
+    DLL_PROCESS_STATE *state=loader_process_state(dll_current_owner_pid(),FALSE);
+    return state && __atomic_load_n(&state->shutdown,__ATOMIC_ACQUIRE)!=0;
+}
+
+BOOL dll_within_loader_callout(void)
+{
+    if (!dll_loader_lock_owned_by_current_thread()) return FALSE;
+    DLL_PROCESS_STATE *state=loader_lock_state(dll_current_owner_pid(),FALSE);
+    /* LdrShutdownProcess does not acquire the Windows-visible loader lock.
+     * Our metadata still needs serialization. A lock already held by its
+     * caller, or a nested explicit acquisition, remains observable. */
+    return state->depth>state->internal_shutdown_depth;
 }
 
 BOOL dll_loader_lock_leave(void)
@@ -662,7 +701,9 @@ static LOADED_MODULE *module_reserve(const char *dll_name, ULONG owner_pid)
         mod->ref_count = 1;
         mod->pinned = FALSE;
         mod->synthetic_shim = FALSE;
+        mod->published_exports = FALSE;
         mod->initialized = FALSE;
+        mod->pending_attach_order = 0;
         mod->thread_notifications_disabled = FALSE;
         mod->init_order = 0;
         mod->dll_main = NULL;
@@ -738,7 +779,9 @@ static void module_release_record(LOADED_MODULE *mod)
     mod->path[0] = 0;
     mod->dll_main = NULL;
     mod->synthetic_shim = FALSE;
+    mod->published_exports = FALSE;
     mod->initialized = FALSE;
+    mod->pending_attach_order = 0;
     mod->thread_notifications_disabled = FALSE;
     mod->init_order = 0;
     mod->ref_count = 0;
@@ -790,6 +833,8 @@ typedef struct {
     char            name[64];
     shim_resolver_fn resolver;
     shim_lifecycle_fn lifecycle;
+    const WIN32_EXPORT *image_exports;
+    int image_export_count;
 } SHIM_ENTRY;
 
 static SHIM_ENTRY shims[MAX_SHIMS];
@@ -807,6 +852,8 @@ void dll_register_shim_ex(const char *dll_name, shim_resolver_fn resolver,
     dl_strcpy_lower(shims[shim_count].name, strip_path(dll_name), 64);
     shims[shim_count].resolver = resolver;
     shims[shim_count].lifecycle = lifecycle;
+    shims[shim_count].image_exports = NULL;
+    shims[shim_count].image_export_count = 0;
     shim_count++;
 }
 
@@ -830,6 +877,9 @@ static const char *dll_shim_provider_name(const char *dll_name,
     else if (dl_has_prefix(provider, "api-ms-win-crt-") ||
              dl_has_prefix(provider, "ext-ms-win-crt-"))
         dl_strcpy_lower(provider, "ucrtbase.dll", 64);
+    else if (dl_stricmp(provider, "api-ms-win-service-winsvc-l1-1-0.dll") == 0 ||
+             dl_stricmp(provider, "api-ms-win-service-winsvc-l1-1-0") == 0)
+        dl_strcpy_lower(provider, "advapi32.dll", 64);
     return provider;
 }
 
@@ -877,6 +927,16 @@ shim_resolver_fn find_shim(const char *dll_name)
     return entry ? entry->resolver : NULL;
 }
 
+void dll_register_shim_named_exports(const char *dll_name,
+                                      const WIN32_EXPORT *table, int count)
+{
+    SHIM_ENTRY *entry = find_shim_entry(dll_name);
+    if (!entry || !table || count <= 0) return;
+    if (!table[count - 1].name) count--;
+    entry->image_exports = table;
+    entry->image_export_count = count;
+}
+
 /* ── Initialize DLL loader ─────────────────────────────────── */
 
 BOOL dll_is_shim(const char *dll_name)
@@ -902,6 +962,8 @@ void dll_loader_init(void)
         loader_processes[i].depth = 0;
         loader_processes[i].module_head = -1;
         loader_processes[i].load_depth = 0;
+        loader_processes[i].shutdown = 0;
+        loader_processes[i].internal_shutdown_depth = 0;
         loader_processes[i].load_directory[0] = 0;
         loader_processes[i].default_search_flags = 0;
         loader_processes[i].user_directory_head = -1;
@@ -914,6 +976,8 @@ void dll_loader_init(void)
     loader_overflow.depth = 0;
     loader_overflow.module_head = -1;
     loader_overflow.load_depth = 0;
+    loader_overflow.shutdown = 0;
+    loader_overflow.internal_shutdown_depth = 0;
     loader_overflow.load_directory[0] = 0;
     loader_overflow.default_search_flags = 0;
     loader_overflow.user_directory_head = -1;
@@ -1282,6 +1346,9 @@ static void module_take_reference_locked(LOADED_MODULE *mod,
         (ULONG)(mod->ref_count > 0 ? mod->ref_count : 0), mod->pinned);
 }
 
+static BOOL dl_build_shim_exports(LOADED_MODULE *mod,
+                                  const SHIM_ENTRY *provider);
+
 PVOID dll_get_module_handle_ex(const char *name, BOOL add_reference, BOOL pin)
 {
     PVOID image_base = NULL;
@@ -1341,6 +1408,7 @@ PVOID dll_get_shim_module_handle_ex(const char *name, BOOL add_reference,
     mod = module_reserve(name, owner_pid);
     if (!mod) {
         loader_lock_release();
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;
     }
 
@@ -1349,16 +1417,41 @@ PVOID dll_get_shim_module_handle_ex(const char *name, BOOL add_reference,
      * both lookup and facade creation from the published image bitness so the
      * first import cannot create an unreachable PE64 facade for a PE32 app. */
     BOOL is_32bit = dll_caller_is_32bit();
-    PVOID image_base = pe_alloc(NULL, DLL_SYNTHETIC_SHIM_IMAGE_SIZE,
+    PVOID preferred = dl_stricmp(name, "ntdll.dll") == 0
+        ? (PVOID)(ULONG_PTR)(is_32bit ? NTDLL32_IMAGE_BASE
+                                    : NTDLL64_IMAGE_BASE) : NULL;
+    PVOID image_base = pe_alloc(preferred, DLL_SYNTHETIC_SHIM_IMAGE_SIZE,
                                 is_32bit);
     if (!image_base) {
         module_release_record(mod);
         loader_lock_release();
+        SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+        return NULL;
+    }
+    if (preferred && image_base != preferred) {
+        /* pe_alloc may relocate on conflict. A core image cannot silently
+         * move away from its ABI-wide address in only one process. */
+        pe_free_for_owner(image_base, DLL_SYNTHETIC_SHIM_IMAGE_SIZE, owner_pid);
+        module_release_record(mod);
+        loader_lock_release();
+        serial_puts("[DLL] core image address conflict: ntdll.dll\n");
+        SetLastError(487); /* ERROR_INVALID_ADDRESS */
         return NULL;
     }
 
     dl_build_synthetic_shim_image(image_base, is_32bit, &mod->image);
     mod->synthetic_shim = TRUE;
+    if (shim_entry->image_exports &&
+        !dl_build_shim_exports(mod, shim_entry)) {
+        serial_puts("[DLL] cannot publish named exports for ");
+        serial_puts(mod->name);
+        serial_puts("\n");
+        pe_free_for_owner(image_base, mod->image.SizeOfImage, owner_pid);
+        module_release_record(mod);
+        loader_lock_release();
+        SetLastError(193); /* ERROR_BAD_EXE_FORMAT */
+        return NULL;
+    }
     NTSTATUS loader_status = win32_publish_loader_image(
         &mod->image, mod->name, TRUE);
     if (!NT_SUCCESS(loader_status)) {
@@ -1407,6 +1500,23 @@ PVOID dll_get_shim_module_handle(const char *name, BOOL add_reference)
     return dll_get_shim_module_handle_ex(name, add_reference, FALSE);
 }
 
+NTSTATUS dll_prepare_process(void)
+{
+    /* Process creation maps NTDLL before releasing the suspended primary
+     * thread. This phase must never run guest imports, TLS or DllMain. */
+    SHIM_ENTRY *provider = find_shim_entry("ntdll.dll");
+    if (!dll_current_process_bitness() || !provider || provider->lifecycle ||
+        !provider->image_exports)
+        return STATUS_INVALID_IMAGE_FORMAT;
+    if (dll_get_shim_module_handle_ex("ntdll.dll", FALSE, TRUE))
+        return STATUS_SUCCESS;
+    switch (GetLastError()) {
+    case 487: return STATUS_CONFLICTING_ADDRESSES;
+    case 193: return STATUS_INVALID_IMAGE_FORMAT;
+    default: return STATUS_NO_MEMORY;
+    }
+}
+
 /* ── Resolve export from PE export directory ───────────────── */
 
 static BYTE *dl_shim64_writable_alias(PVOID address)
@@ -1420,44 +1530,18 @@ static BYTE *dl_shim64_writable_alias(PVOID address)
     return (BYTE *)(ULONG_PTR)(KERNEL_VBASE + phys);
 }
 
-PVOID dll_get_shim_export_thunk(const char *dll_name, PVOID target)
+/* The per-process loader lock covers both eager EAT and lazy thunk creation. */
+static PVOID dl_make_shim_thunk(LOADED_MODULE *mod, PVOID target,
+                                const char *export_name, uint8_t argc,
+                                uint8_t callconv)
 {
-    if (!dll_name || !target || g_compat32_mode ||
-        (ULONG_PTR)target < KERNEL_VBASE)
-        return target;
-
-    char provider[64];
-    dll_name = dll_shim_provider_name(dll_name, provider);
-
-    const char *export_name = NULL;
-    uint8_t argc = 0;
-    uint8_t callconv = 0;
-    if (win32_abi_resolved_is_data(dll_name, NULL, target))
-        return target;
-    if (!win32_abi_lookup_target(dll_name, target, &export_name, &argc,
-                                 &callconv))
-        return target;
-    (void)argc;
-    (void)callconv;
-
-    PVOID module = dll_get_shim_module_handle(dll_name, FALSE);
-    if (!module)
-        return target;
-
-    loader_lock_acquire();
-    LOADED_MODULE *mod = dll_find_module_by_base(module);
-    if (!mod || !mod->synthetic_shim || mod->image.Is32Bit) {
-        loader_lock_release();
-        return target;
-    }
-
+    BYTE *module = mod->image.ImageBase;
     int module_index = (int)(mod - modules);
     USHORT count = shim64_thunk_count[module_index];
     for (USHORT i = 0; i < count; i++) {
         if (shim64_thunk_targets[module_index][i] == (ULONG_PTR)target) {
             PVOID thunk = (BYTE *)module + SHIM64_THUNK_RVA +
                           (SIZE_T)i * SHIM64_THUNK_SIZE;
-            loader_lock_release();
             return thunk;
         }
     }
@@ -1466,40 +1550,66 @@ PVOID dll_get_shim_export_thunk(const char *dll_name, PVOID target)
         serial_puts("[SHIM64] thunk table full for ");
         serial_puts(mod->name);
         serial_puts("\n");
-        loader_lock_release();
-        return target;
+        return NULL;
     }
 
     PVOID thunk = (BYTE *)module + SHIM64_THUNK_RVA +
                   (SIZE_T)count * SHIM64_THUNK_SIZE;
     BYTE *code = dl_shim64_writable_alias(thunk);
-    if (!code) {
-        loader_lock_release();
-        return target;
+    if (!code) return NULL;
+
+    uint32_t target32 = 0;
+    if (mod->image.Is32Bit) {
+        target32 = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)target,
+                                          export_name, argc, callconv);
+        if (!target32) return NULL;
     }
 
-    /* Leave a conventional patch window for Steam's overlay hooker. It may
-     * replace the first instructions and resume through a trampoline, so the
-     * import-boundary body must begin after the complete patch window. */
-    for (SIZE_T i = 0; i < SHIM64_THUNK_PATCH_SIZE; i++) code[i] = 0x90;
+    ULONG service = !mod->image.Is32Bit &&
+                    dl_stricmp(mod->name, "ntdll.dll") == 0
+        ? nt64_service_number(target) : 0;
+    if (service) {
+        /* Position-independent system service: copied originals and broker
+         * trampolines still execute the same dispatch, at any guest VA. */
+        code[0] = 0x4C; code[1] = 0x8B; code[2] = 0xD1; /* mov r10, rcx */
+        code[3] = 0xB8; /* mov eax, service */
+        for (int i = 0; i < 4; i++) code[4 + i] = (BYTE)(service >> (i * 8));
+        code[8] = 0x0F; code[9] = 0x05; /* syscall */
+        code[10] = 0xC3;
+        for (SIZE_T i = 11; i < SHIM64_THUNK_SIZE; i++) code[i] = 0x90;
+    } else {
+        /* Leave a patch window for API hookers. An original-code trampoline
+         * must resume before the import-boundary body. */
+        for (SIZE_T i = 0; i < SHIM64_THUNK_PATCH_SIZE; i++) code[i] = 0x90;
 
-    /* PE64 currently runs at CPL0. On Windows, user-mode POPF cannot change
-     * IF, but at CPL0 a PE library can accidentally leave interrupts masked.
-     * Re-establish the user-mode invariant at every kernel import boundary so
-     * blocking shims can yield and timer preemption keeps making progress.
-     * STI preserves the Win64 argument registers and caller return address. */
-    SIZE_T body = SHIM64_THUNK_PATCH_SIZE;
-    code[body++] = 0xFB; /* sti */
-    code[body++] = 0x48; /* movabs rax, target */
-    code[body++] = 0xB8;
-    uint64_t target_value = (uint64_t)(ULONG_PTR)target;
-    for (int i = 0; i < 8; i++) {
-        code[body++] = (BYTE)target_value;
-        target_value >>= 8;
+        /* PE64 currently runs at CPL0, where guest POPF can mask IF. Restore
+         * the user-mode invariant at each import boundary so waits can yield
+         * and timer preemption continues. STI preserves argument registers. */
+        SIZE_T body = SHIM64_THUNK_PATCH_SIZE;
+        if (mod->image.Is32Bit) {
+            /* JMP preserves the caller's stack and context-capture contract.
+             * In 32-bit mode rel32 arithmetic wraps over the whole VA space. */
+            uint32_t displacement = target32 -
+                (uint32_t)((ULONG_PTR)thunk + body + 5);
+            code[body++] = 0xE9;
+            for (int i = 0; i < 4; i++) {
+                code[body++] = (BYTE)displacement;
+                displacement >>= 8;
+            }
+        } else {
+            code[body++] = 0xFB; /* sti */
+            code[body++] = 0x48; /* movabs rax, target */
+            code[body++] = 0xB8;
+            uint64_t target_value = (uint64_t)(ULONG_PTR)target;
+            for (int i = 0; i < 8; i++) {
+                code[body++] = (BYTE)target_value;
+                target_value >>= 8;
+            }
+            code[body++] = 0xFF; /* jmp rax */
+            code[body++] = 0xE0;
+        }
+        while (body < SHIM64_THUNK_SIZE) code[body++] = 0xCC;
     }
-    code[body++] = 0xFF; /* jmp rax */
-    code[body++] = 0xE0;
-    while (body < SHIM64_THUNK_SIZE) code[body++] = 0xCC;
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
     shim64_thunk_targets[module_index][count] = (ULONG_PTR)target;
@@ -1507,7 +1617,7 @@ PVOID dll_get_shim_export_thunk(const char *dll_name, PVOID target)
 
     static uint32_t thunk_logs;
     if (__atomic_fetch_add(&thunk_logs, 1, __ATOMIC_RELAXED) < 32) {
-        serial_puts("[SHIM64] ");
+        serial_puts(mod->image.Is32Bit ? "[SHIM32] " : "[SHIM64] ");
         serial_puts(mod->name);
         serial_puts("!");
         serial_puts(export_name ? export_name : "<ordinal>");
@@ -1518,8 +1628,139 @@ PVOID dll_get_shim_export_thunk(const char *dll_name, PVOID target)
         serial_puts("\n");
     }
 
-    loader_lock_release();
     return thunk;
+}
+
+static BOOL dl_export_string(BYTE *base, ULONG *cursor, const char *text,
+                              ULONG *rva)
+{
+    ULONG start = *cursor;
+    if (!text || !*text) return FALSE;
+    do {
+        if (*cursor >= DLL_SYNTHETIC_SHIM_IMAGE_SIZE) return FALSE;
+        base[(*cursor)++] = (BYTE)*text;
+    } while (*text++);
+    *rva = start;
+    return TRUE;
+}
+
+static BOOL dl_build_shim_exports(LOADED_MODULE *mod,
+                                  const SHIM_ENTRY *provider)
+{
+    const WIN32_EXPORT *table = provider->image_exports;
+    int count = provider->image_export_count;
+    if (count <= 0 || count > SHIM64_THUNK_MAX) return FALSE;
+
+    /* Reject unsupported contracts, never publish a truncated data address or
+     * a function pointer with an inferred calling convention. */
+    for (int i = 0; i < count; i++) {
+        const WIN32_EXPORT *e = &table[i];
+        if (!e->name || !e->func || (e->cc & WIN32_EXPORT_DATA_FLAG) ||
+            provider->resolver(e->name, 0, FALSE) != e->func)
+            return FALSE;
+        for (int j = 0; j < i; j++) {
+            if (!dl_strcmp(e->name, table[j].name)) return FALSE;
+            if (e->func == table[j].func &&
+                (e->argc != table[j].argc || e->cc != table[j].cc))
+                return FALSE;
+        }
+    }
+
+    BYTE *base = mod->image.ImageBase;
+    PIMAGE_EXPORT_DIRECTORY exports = (void *)(base + SHIM_EXPORT_RVA);
+    ULONG cursor = SHIM_EXPORT_RVA + sizeof(*exports);
+    exports->Base = 1;
+    exports->NumberOfFunctions = (ULONG)count;
+    exports->NumberOfNames = (ULONG)count;
+    exports->AddressOfFunctions = cursor;
+    cursor += (ULONG)count * sizeof(ULONG);
+    exports->AddressOfNames = cursor;
+    cursor += (ULONG)count * sizeof(ULONG);
+    exports->AddressOfNameOrdinals = cursor;
+    cursor += (ULONG)count * sizeof(USHORT);
+    if (cursor >= DLL_SYNTHETIC_SHIM_IMAGE_SIZE ||
+        !dl_export_string(base, &cursor, provider->name, &exports->Name))
+        return FALSE;
+
+    ULONG *functions = (void *)(base + exports->AddressOfFunctions);
+    ULONG *names = (void *)(base + exports->AddressOfNames);
+    USHORT *ordinals = (void *)(base + exports->AddressOfNameOrdinals);
+    for (int i = 0; i < count; i++) {
+        ULONG name_rva;
+        if (!dl_export_string(base, &cursor, table[i].name, &name_rva))
+            return FALSE;
+        PVOID fn = dl_make_shim_thunk(mod, table[i].func, table[i].name,
+                                      table[i].argc, table[i].cc);
+        if (!fn) return FALSE;
+        functions[i] = (ULONG)((BYTE *)fn - base);
+
+        /* PE name pointers are case-sensitive lexical order; ordinals retain
+         * descriptor order, including separate names for aliased targets. */
+        int j = i;
+        while (j > 0 && dl_strcmp(table[i].name,
+                                   (char *)base + names[j - 1]) < 0) {
+            names[j] = names[j - 1];
+            ordinals[j] = ordinals[j - 1];
+            j--;
+        }
+        names[j] = name_rva;
+        ordinals[j] = (USHORT)i;
+    }
+
+    PIMAGE_DOS_HEADER dos = (void *)base;
+    IMAGE_DATA_DIRECTORY *directory;
+    PIMAGE_SECTION_HEADER sections;
+    if (mod->image.Is32Bit) {
+        PIMAGE_NT_HEADERS32 nt = (void *)(base + dos->e_lfanew);
+        nt->FileHeader.NumberOfSections = 2;
+        nt->OptionalHeader.SizeOfCode = SHIM_EXPORT_RVA - SHIM64_THUNK_RVA;
+        nt->OptionalHeader.SizeOfInitializedData =
+            DLL_SYNTHETIC_SHIM_IMAGE_SIZE - SHIM_EXPORT_RVA;
+        directory = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        sections = IMAGE_FIRST_SECTION(nt);
+    } else {
+        PIMAGE_NT_HEADERS64 nt = (void *)(base + dos->e_lfanew);
+        nt->FileHeader.NumberOfSections = 2;
+        nt->OptionalHeader.SizeOfCode = SHIM_EXPORT_RVA - SHIM64_THUNK_RVA;
+        nt->OptionalHeader.SizeOfInitializedData =
+            DLL_SYNTHETIC_SHIM_IMAGE_SIZE - SHIM_EXPORT_RVA;
+        directory = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        sections = IMAGE_FIRST_SECTION(nt);
+    }
+    directory->VirtualAddress = SHIM_EXPORT_RVA;
+    directory->Size = cursor - SHIM_EXPORT_RVA;
+    sections[0].Misc.VirtualSize = SHIM_EXPORT_RVA - SHIM64_THUNK_RVA;
+    sections[0].Characteristics = IMAGE_SCN_CNT_CODE |
+        IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    dl_strcpy((char *)sections[1].Name, ".edata", sizeof(sections[1].Name));
+    sections[1].VirtualAddress = SHIM_EXPORT_RVA;
+    sections[1].Misc.VirtualSize = DLL_SYNTHETIC_SHIM_IMAGE_SIZE - SHIM_EXPORT_RVA;
+    sections[1].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    if (!NT_SUCCESS(pe_finalize_image_protections(&mod->image))) return FALSE;
+    mod->published_exports = TRUE;
+    return TRUE;
+}
+
+PVOID dll_get_shim_export_thunk(const char *dll_name, PVOID target)
+{
+    if (!dll_name || !target || g_compat32_mode ||
+        (ULONG_PTR)target < KERNEL_VBASE)
+        return target;
+    char provider[64];
+    dll_name = dll_shim_provider_name(dll_name, provider);
+    const char *name = NULL;
+    uint8_t argc = 0, callconv = 0;
+    if (win32_abi_resolved_is_data(dll_name, NULL, target) ||
+        !win32_abi_lookup_target(dll_name, target, &name, &argc, &callconv))
+        return target;
+    PVOID module = dll_get_shim_module_handle(dll_name, FALSE);
+    if (!module) return target;
+    loader_lock_acquire();
+    LOADED_MODULE *mod = dll_find_module_by_base(module);
+    PVOID thunk = mod && mod->synthetic_shim && !mod->image.Is32Bit
+        ? dl_make_shim_thunk(mod, target, name, argc, callconv) : NULL;
+    loader_lock_release();
+    return thunk ? thunk : target;
 }
 
 static LONG dll_export_name_index(BYTE *base,
@@ -1583,9 +1824,12 @@ static BOOL dll_parse_forwarded_ordinal(const char *name, USHORT *ordinal)
     return TRUE;
 }
 
-PVOID dll_resolve_export(LOADED_MODULE *mod, const char *func_name,
-                         USHORT ordinal, BOOL by_ordinal)
+static PVOID dll_resolve_export_status(LOADED_MODULE *mod,
+                                        const char *func_name,
+                                        USHORT ordinal, BOOL by_ordinal,
+                                        NTSTATUS *status)
 {
+    *status = STATUS_PROCEDURE_NOT_FOUND;
     if (!mod || !mod->image.ImageBase) return NULL;
 
     BYTE *base = (BYTE *)mod->image.ImageBase;
@@ -1652,7 +1896,10 @@ PVOID dll_resolve_export(LOADED_MODULE *mod, const char *func_name,
             j++;
         }
         fwd_dll[j] = 0;
-        if (fwd[j] == '.') j++;
+        if (!j || fwd[j] != '.' || j + 4 >= (int)sizeof(fwd_dll))
+            return NULL;
+        dl_strcpy(fwd_dll + j, ".dll", sizeof(fwd_dll) - (unsigned)j);
+        j++;
         int k = 0;
         while (fwd[j] && k < 127)
             fwd_func[k++] = fwd[j++];
@@ -1660,12 +1907,23 @@ PVOID dll_resolve_export(LOADED_MODULE *mod, const char *func_name,
 
         USHORT forwarded_ordinal = 0;
         if (dll_parse_forwarded_ordinal(fwd_func, &forwarded_ordinal))
-            return dll_resolve_import(fwd_dll, NULL, forwarded_ordinal,
-                                      TRUE);
-        return dll_resolve_import(fwd_dll, fwd_func, 0, FALSE);
+            return dll_resolve_import_status(fwd_dll, NULL,
+                                              forwarded_ordinal, TRUE,
+                                              status);
+        return dll_resolve_import_status(fwd_dll, fwd_func, 0, FALSE,
+                                          status);
     }
 
+    *status = STATUS_SUCCESS;
     return (PVOID)(base + func_rva);
+}
+
+PVOID dll_resolve_export(LOADED_MODULE *mod, const char *func_name,
+                         USHORT ordinal, BOOL by_ordinal)
+{
+    NTSTATUS status;
+    return dll_resolve_export_status(mod, func_name, ordinal, by_ordinal,
+                                      &status);
 }
 
 void dll_export_lookup_dump(void)
@@ -1726,8 +1984,10 @@ int dll_export_lookup_selftest(void)
 /* ── IAT auto-recovery: resolve original function for corrupted IAT entry ── */
 
 static PVOID dll_resolve_export_any(ULONG owner_pid, const char *func_name,
-                                    USHORT ordinal, BOOL by_ordinal)
+                                    USHORT ordinal, BOOL by_ordinal,
+                                    NTSTATUS *status)
 {
+    *status = STATUS_PROCEDURE_NOT_FOUND;
     DLL_PROCESS_STATE *state = loader_process_state(owner_pid, FALSE);
     if (state) {
         int current =
@@ -1739,9 +1999,12 @@ static PVOID dll_resolve_export_any(ULONG owner_pid, const char *func_name,
             LOADED_MODULE *mod = &modules[current];
             int next = mod->next_owner_index;
             if (module_visible(mod, owner_pid)) {
-                PVOID result = dll_resolve_export(
-                    mod, func_name, ordinal, by_ordinal);
+                PVOID result = dll_resolve_export_status(
+                    mod, func_name, ordinal, by_ordinal, status);
                 if (result) return result;
+                if (*status != STATUS_PROCEDURE_NOT_FOUND &&
+                    *status != STATUS_DLL_NOT_FOUND)
+                    return NULL;
             }
             current = next;
         }
@@ -1750,9 +2013,12 @@ static PVOID dll_resolve_export_any(ULONG owner_pid, const char *func_name,
 
     for (int i = 0; i < MAX_LOADED_MODULES; i++) {
         if (!module_visible(&modules[i], owner_pid)) continue;
-        PVOID result = dll_resolve_export(
-            &modules[i], func_name, ordinal, by_ordinal);
+        PVOID result = dll_resolve_export_status(
+            &modules[i], func_name, ordinal, by_ordinal, status);
         if (result) return result;
+        if (*status != STATUS_PROCEDURE_NOT_FOUND &&
+            *status != STATUS_DLL_NOT_FOUND)
+            return NULL;
     }
     return NULL;
 }
@@ -1835,9 +2101,10 @@ void iat_guard_check(void)
 
 /* ── Load a PE DLL ─────────────────────────────────────────── */
 
-static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
-                           SIZE_T file_size)
+static PVOID dll_map_impl(const char *dll_name, const BYTE *file_data,
+                           SIZE_T file_size, NTSTATUS *load_status)
 {
+    *load_status = STATUS_SUCCESS;
     /* Check if already loaded */
     LOADED_MODULE *existing = dll_find_module(dll_name);
     if (existing) {
@@ -1848,6 +2115,7 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
     int image_bits = dll_pe_bitness(file_data, file_size);
     int process_bits = dll_current_process_bitness();
     if (!image_bits || (process_bits && image_bits != process_bits)) {
+        *load_status = STATUS_INVALID_IMAGE_FORMAT;
         serial_puts("[DLL] rejected ");
         serial_puts(dll_name ? dll_name : "<unnamed>");
         if (!image_bits) {
@@ -1872,6 +2140,7 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
         module_reserve(dll_name, dll_current_owner_pid());
     if (!mod) {
         serial_puts("[DLL] max modules reached\n");
+        *load_status = STATUS_NO_MEMORY;
         return NULL;
     }
 
@@ -1880,6 +2149,7 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
                                     dll_name);
 
     if (!NT_SUCCESS(status)) {
+        *load_status = status;
         serial_puts("[DLL] pe_load failed: ");
         serial_puthex((uint64_t)status, 8);
         serial_puts("\n");
@@ -1911,6 +2181,7 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
          * on every INT 0x2E call. See the IAT guard block in compat32.c. */
 
         if (!NT_SUCCESS(compat_st)) {
+            *load_status = compat_st;
             serial_puts("[DLL] compat32 IAT patch failed for ");
             serial_puts(dll_name);
             serial_puts(": 0x");
@@ -1923,6 +2194,7 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
             NTSTATUS protect_st =
                 pe_finalize_image_protections(&mod->image);
             if (!NT_SUCCESS(protect_st)) {
+                *load_status = protect_st;
                 serial_puts("[DLL] final protection setup failed for ");
                 serial_puts(dll_name);
                 serial_puts(": 0x");
@@ -1933,21 +2205,12 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
                 return NULL;
             }
 
-            NTSTATUS tls_st = compat32_attach_tls(&mod->image);
-            if (!NT_SUCCESS(tls_st)) {
-                serial_puts("[DLL] compat32 TLS setup failed for ");
-                serial_puts(dll_name);
-                serial_puts(": 0x");
-                serial_puthex((uint32_t)tls_st, 8);
-                serial_puts("\n");
-                pe_unload(&mod->image);
-                module_release_record(mod);
-                return NULL;
-            }
+
         }
     } else {
         NTSTATUS protect_st = pe_finalize_image_protections(&mod->image);
         if (!NT_SUCCESS(protect_st)) {
+            *load_status = protect_st;
             serial_puts("[DLL] final protection setup failed for ");
             serial_puts(dll_name);
             serial_puts(": 0x");
@@ -1958,17 +2221,26 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
             return NULL;
         }
 
-        NTSTATUS tls_st = win64_attach_tls(&mod->image);
-        if (!NT_SUCCESS(tls_st)) {
-            serial_puts("[DLL] PE64 TLS setup failed for ");
-            serial_puts(dll_name);
-            serial_puts(": 0x");
-            serial_puthex((uint32_t)tls_st, 8);
-            serial_puts("\n");
-            pe_unload(&mod->image);
-            module_release_record(mod);
-            return NULL;
-        }
+    }
+
+    /* Complete the entire import graph before running any guest code.
+     * A dependency's initializer may call back into an importing DLL. */
+    mod->pending_attach_order = __atomic_fetch_add(&next_attach_order, 1,
+                                                   __ATOMIC_RELAXED);
+    __atomic_store_n(&mod->state, 2, __ATOMIC_RELEASE);
+    return mod->image.ImageBase;
+}
+
+static PVOID dll_attach_module(LOADED_MODULE *mod, NTSTATUS *load_status)
+{
+    mod->pending_attach_order = 0;
+    NTSTATUS tls_st = mod->image.Is32Bit ? compat32_attach_tls(&mod->image)
+                                        : win64_attach_tls(&mod->image);
+    if (!NT_SUCCESS(tls_st)) {
+        *load_status = tls_st;
+        pe_unload(&mod->image);
+        module_release_record(mod);
+        return NULL;
     }
 
     /* Call DllMain(DLL_PROCESS_ATTACH) if it has one.
@@ -1994,6 +2266,20 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
             serial_puts("[DLL] DllMain returned ");
             serial_puthex((uint64_t)ok, 8);
             serial_puts("\n");
+            if (!ok) {
+                *load_status = STATUS_DLL_INIT_FAILED;
+                /* A normal FALSE return still requires PROCESS_DETACH.
+                 * Keep the image and its TLS alive until cleanup returns. */
+                args[1] = DLL_PROCESS_DETACH;
+                win32_tls_process_detach_image(mod->image.ImageBase,TRUE);
+                compat32_callback_args(entry32, 3, args);
+                extern void win32_tls_unregister_image(PVOID image_base);
+                win32_tls_unregister_image(mod->image.ImageBase);
+                pe_unload(&mod->image);
+                module_release_record(mod);
+                SetLastError(1114); /* ERROR_DLL_INIT_FAILED */
+                return NULL;
+            }
             mod->initialized = TRUE;
         } else {
             serial_puts("[DLL] calling DllMain(ATTACH)\n");
@@ -2003,11 +2289,15 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
             BOOL ok = entry(mod->image.ImageBase, DLL_PROCESS_ATTACH, NULL);
 
             if (!ok) {
+                *load_status = STATUS_DLL_INIT_FAILED;
                 serial_puts("[DLL] DllMain returned FALSE\n");
+                win32_tls_process_detach_image(mod->image.ImageBase,FALSE);
+                entry(mod->image.ImageBase, DLL_PROCESS_DETACH, NULL);
                 extern void win64_tls_unregister_image(PVOID image_base);
                 win64_tls_unregister_image(mod->image.ImageBase);
                 pe_unload(&mod->image);
                 module_release_record(mod);
+                SetLastError(1114); /* ERROR_DLL_INIT_FAILED */
                 return NULL;
             }
 
@@ -2015,6 +2305,8 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
         }
     }
 
+    /* A DLL without an entry point receives its initial TLS callback but
+     * does not join thread/shutdown notification order. */
     if (mod->initialized)
         mod->init_order = __atomic_fetch_add(&next_init_order, 1,
                                              __ATOMIC_RELAXED);
@@ -2022,11 +2314,73 @@ static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
     return mod->image.ImageBase;
 }
 
+
+static void dll_discard_pending(ULONG owner_pid, uint64_t first_order)
+{
+    for (int i = 0; i < MAX_LOADED_MODULES; i++) {
+        LOADED_MODULE *mod = &modules[i];
+        if (mod->state != 2 || mod->owner_pid != owner_pid ||
+            !mod->pending_attach_order ||
+            mod->pending_attach_order < first_order)
+            continue;
+        pe_unload(&mod->image);
+        module_release_record(mod);
+    }
+}
+
+static BOOL dll_attach_pending(ULONG owner_pid, uint64_t first_order,
+                                NTSTATUS *status)
+{
+    for (;;) {
+        LOADED_MODULE *next = NULL;
+        for (int i = 0; i < MAX_LOADED_MODULES; i++) {
+            LOADED_MODULE *mod = &modules[i];
+            if (mod->state != 2 || mod->owner_pid != owner_pid ||
+                !mod->pending_attach_order ||
+                mod->pending_attach_order < first_order)
+                continue;
+            if (!next || mod->pending_attach_order < next->pending_attach_order)
+                next = mod;
+        }
+        if (!next) return TRUE;
+        if (!dll_attach_module(next, status)) {
+            dll_discard_pending(owner_pid, first_order);
+            return FALSE;
+        }
+    }
+}
+
+static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
+                            SIZE_T file_size, NTSTATUS *load_status)
+{
+    ULONG owner_pid = dll_current_owner_pid();
+    uint64_t first_order = __atomic_load_n(&next_attach_order, __ATOMIC_RELAXED);
+    PVOID base = dll_map_impl(dll_name, file_data, file_size, load_status);
+
+    /* Recursive imports leave their parent in state 1. Its outermost load
+     * drains completed mappings in dependency completion order. */
+    for (int i = 0; i < MAX_LOADED_MODULES; i++)
+        if (modules[i].state == 1 && modules[i].owner_pid == owner_pid &&
+            !modules[i].synthetic_shim)
+            return base;
+
+    if (!base) {
+        dll_discard_pending(owner_pid, first_order);
+        return NULL;
+    }
+    /* A LoadLibrary issued by DllMain drains only the newly mapped graph.
+     * Do not recursively initialize its caller's pending siblings. */
+    if (!dll_attach_pending(owner_pid, first_order, load_status)) return NULL;
+    return base;
+}
+
 PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
 {
     loader_lock_acquire();
-    PVOID base = dll_load_impl(dll_name, file_data, file_size);
+    NTSTATUS status;
+    PVOID base = dll_load_impl(dll_name, file_data, file_size, &status);
     loader_lock_release();
+    if (!base) SetLastError(RtlNtStatusToDosError(status));
     return base;
 }
 
@@ -2130,6 +2484,10 @@ void dll_notify_thread(DWORD reason)
             mod->thread_notifications_disabled)
             continue;
 
+        /* TLS precedes this DLL's entry point. The caller keeps all thread
+         * TLS blocks alive until this entire notification sequence returns. */
+        win32_tls_notify_image(mod->image.ImageBase, mod->image.Is32Bit,
+                               reason);
         if (mod->image.Is32Bit) {
             uint32_t args[3] = {
                 (uint32_t)(ULONG_PTR)mod->image.ImageBase,
@@ -2144,6 +2502,9 @@ void dll_notify_thread(DWORD reason)
         }
     }
 
+    PVOID main_image = (PVOID)win32_current_image_base();
+    if (main_image)
+        win32_tls_notify_image(main_image, is32bit, reason);
     loader_lock_release();
 }
 
@@ -2183,6 +2544,8 @@ BOOL dll_release_module(PVOID requested_base)
     SIZE_T image_size = mod->image.SizeOfImage;
     ULONG owner_pid = mod->owner_pid;
     BOOL synthetic_shim = mod->synthetic_shim;
+    if (!synthetic_shim && mod->initialized)
+        win32_tls_process_detach_image(image_base,mod->image.Is32Bit);
 
     if (synthetic_shim && mod->initialized) {
         SHIM_ENTRY *shim_entry = find_shim_entry(mod->name);
@@ -2192,16 +2555,30 @@ BOOL dll_release_module(PVOID requested_base)
         mod->initialized = FALSE;
     }
 
-    /* Call DllMain(DLL_PROCESS_DETACH) — skip for PE32 DLLs */
-    if (mod->dll_main && mod->initialized && !mod->image.Is32Bit) {
-        typedef BOOL (WINAPI *dll_main_fn)(PVOID, DWORD, PVOID);
-        dll_main_fn entry = (dll_main_fn)mod->dll_main;
-        entry(mod->image.ImageBase, DLL_PROCESS_DETACH, NULL);
+    /* DisableThreadLibraryCalls suppresses thread notifications only.
+     * Both bitnesses still receive PROCESS_DETACH on their final release. */
+    if (mod->dll_main && mod->initialized) {
+        mod->initialized = FALSE;
+        if (mod->image.Is32Bit) {
+            uint32_t args[3] = {
+                (uint32_t)(ULONG_PTR)image_base, DLL_PROCESS_DETACH, 0
+            };
+            compat32_callback_args((uint32_t)(ULONG_PTR)mod->dll_main,
+                                   3, args);
+        } else {
+            typedef BOOL (WINAPI *dll_main_fn)(PVOID, DWORD, PVOID);
+            ((dll_main_fn)mod->dll_main)(image_base, DLL_PROCESS_DETACH,
+                                       NULL);
+        }
     }
 
-    if (!synthetic_shim && !mod->image.Is32Bit) {
+    if (!synthetic_shim) {
+        extern void win32_tls_unregister_image(PVOID image_base);
         extern void win64_tls_unregister_image(PVOID image_base);
-        win64_tls_unregister_image(image_base);
+        if (mod->image.Is32Bit)
+            win32_tls_unregister_image(image_base);
+        else
+            win64_tls_unregister_image(image_base);
     }
 
     if (synthetic_shim) {
@@ -2213,6 +2590,52 @@ BOOL dll_release_module(PVOID requested_base)
     module_release_record(mod);
     loader_lock_release();
     return TRUE;
+}
+
+/* A normal loader shutdown runs in the calling process while its images,
+ * heaps and TLS remain valid. Forced kernel teardown uses release_process and
+ * never calls guest code. The process-exit coordinator must stop peers first. */
+void dll_shutdown_process(void)
+{
+    ULONG owner=dll_current_owner_pid();
+    BOOL already_owned=dll_loader_lock_owned_by_current_thread();
+    loader_lock_acquire();
+    DLL_PROCESS_STATE *state=loader_process_state(owner,FALSE);
+    if (!state || __atomic_exchange_n(&state->shutdown,1,__ATOMIC_ACQ_REL)) {
+        loader_lock_release();return;
+    }
+    if (!already_owned) state->internal_shutdown_depth=state->depth;
+    for (unsigned n=0;n<MAX_LOADED_MODULES;n++) {
+        LOADED_MODULE *selected=NULL;
+        for (unsigned i=0;i<MAX_LOADED_MODULES;i++) {
+            LOADED_MODULE *mod=&modules[i];
+            if (mod->state==2 && mod->owner_pid==owner && mod->initialized &&
+                (!selected || mod->init_order>selected->init_order)) selected=mod;
+        }
+        if (!selected) break;
+        selected->initialized=FALSE; /* recursive shutdown cannot notify twice */
+        if (selected->synthetic_shim) {
+            SHIM_ENTRY *shim=find_shim_entry(selected->name);
+            if (shim && shim->lifecycle)
+                shim->lifecycle(shim->name,selected->image.ImageBase,DLL_PROCESS_DETACH,(PVOID)1);
+            continue;
+        }
+        PVOID image=selected->image.ImageBase,entry=selected->dll_main;
+        BOOL narrow=selected->image.Is32Bit;
+        win32_tls_process_detach_image(image,narrow);
+        if (!entry) continue;
+        if (narrow) {
+            uint32_t args[3]={(uint32_t)(ULONG_PTR)image,DLL_PROCESS_DETACH,1};
+            compat32_callback_args((uint32_t)(ULONG_PTR)entry,3,args);
+        } else {
+            typedef BOOL (WINAPI *dll_main_fn)(PVOID,DWORD,PVOID);
+            ((dll_main_fn)entry)(image,DLL_PROCESS_DETACH,(PVOID)1);
+        }
+    }
+    PVOID main_image=(PVOID)win32_current_image_base();
+    if (main_image) win32_tls_process_detach_image(main_image,g_compat32_mode!=0);
+    state->internal_shutdown_depth=0;
+    loader_lock_release();
 }
 
 void dll_release_process(ULONG owner_pid)
@@ -2630,8 +3053,10 @@ int dll_file_cache_flush_unused(void)
 #define MAX_LOAD_DEPTH 16
 
 #define DLL_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR 0x00000100U
+#define DLL_LOAD_WITH_ALTERED_SEARCH_PATH 0x00000008U
 #define DLL_LOAD_LIBRARY_SEARCH_APPLICATION_DIR 0x00000200U
 #define DLL_LOAD_LIBRARY_SEARCH_USER_DIRS 0x00000400U
+#define DLL_LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800U
 #define DLL_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS 0x00001000U
 
 static BOOL dll_name_has_extension(const char *name)
@@ -2641,8 +3066,35 @@ static BOOL dll_name_has_extension(const char *name)
     return FALSE;
 }
 
+/* LoadLibrary adds the default suffix before searching, unless the caller
+ * supplied an extension or a final dot. Never try an extensionless executable
+ * first: that would select a different file from Windows. */
+static BOOL dll_prepare_file_name(const char *name, BOOL append_dll,
+                                  char prepared[260])
+{
+    unsigned length = 0, basename = 0;
+    if (!name || !*name) return FALSE;
+    while (name[length] && length < 259) {
+        prepared[length] = name[length];
+        if (name[length] == '/' || name[length] == '\\' || name[length] == ':')
+            basename = length + 1;
+        length++;
+    }
+    if (name[length] || length == basename) return FALSE;
+    prepared[length] = 0;
+    if (append_dll && !dll_name_has_extension(prepared + basename)) {
+        if (length > 255) return FALSE;
+        dl_strcpy(prepared + length, ".dll", 5);
+    } else {
+        while (length > basename && prepared[length - 1] == '.') length--;
+        prepared[length] = 0;
+        if (length == basename) return FALSE;
+    }
+    return TRUE;
+}
+
 static void *dll_find_in_directory(const char *directory,
-                                   const char *basename, BOOL append_dll,
+                                   const char *basename, BOOL redirect,
                                    char fs_path[260])
 {
     int length = 0;
@@ -2659,25 +3111,58 @@ static void *dll_find_in_directory(const char *directory,
     if (*source) return NULL;
     fs_path[length] = 0;
 
-    void *file = osfs2_find_ci(fs_path);
-    if (!file && append_dll && !dll_name_has_extension(basename) &&
-        length <= 255) {
-        fs_path[length++] = '.';
-        fs_path[length++] = 'd';
-        fs_path[length++] = 'l';
-        fs_path[length++] = 'l';
-        fs_path[length] = 0;
-        file = osfs2_find_ci(fs_path);
+    if (redirect && !win32_redirect_path(fs_path)) return NULL;
+    return osfs2_find_ci(fs_path);
+}
+
+static void *dll_find_in_environment(const char *basename, char fs_path[260])
+{
+    /* Snapshot the process PATH outside the environment spinlock. It can be
+     * larger than a kernel stack, and another thread may resize it. */
+    char *environment = NULL;
+    for (unsigned attempt = 0; attempt < 3; attempt++) {
+        DWORD capacity = GetEnvironmentVariableA("PATH", NULL, 0);
+        if (capacity < 2 || capacity > 32768) return NULL;
+        environment = LocalAlloc(0, capacity);
+        if (!environment) return NULL;
+        DWORD length = GetEnvironmentVariableA("PATH", environment, capacity);
+        if (length && length < capacity) break;
+        LocalFree(environment); environment = NULL;
     }
+    if (!environment) return NULL;
+    void *file = NULL;
+    const char *entry = environment;
+    while (*entry) {
+        const char *end = entry;
+        while (*end && *end != ';') end++;
+        unsigned length = (unsigned)(end - entry);
+        if (length && length < 260) {
+            char directory[260], normalized[260];
+            for (unsigned i = 0; i < length; i++) directory[i] = entry[i];
+            directory[length] = 0;
+            if (win32_resolve_file_path(directory, normalized))
+                file = dll_find_in_directory(normalized, basename, FALSE, fs_path);
+            if (file) break;
+        }
+        entry = *end ? end + 1 : end;
+    }
+    LocalFree(environment);
     return file;
 }
 
 static void *dll_find_file(const char *dll_name, BOOL append_dll,
                            DWORD search_flags, char fs_path[260])
 {
+    char prepared[260];
+    if (!dll_prepare_file_name(dll_name, append_dll, prepared)) return NULL;
+    dll_name = prepared;
+    /* The legacy alternate-search bit does not select a restricted set of
+     * directories. For a bare module name Windows still uses normal search. */
+    BOOL legacy_search =
+        (search_flags & ~DLL_LOAD_WITH_ALTERED_SEARCH_PATH) == 0;
     const char *basename = dll_name;
     for (const char *p = dll_name; *p; p++) {
-        if (*p == '\\' || *p == '/') basename = p + 1;
+        if (*p == '\\' || *p == '/' || *p == ':') basename = p + 1;
     }
 
     void *fsfile = NULL;
@@ -2691,14 +3176,17 @@ static void *dll_find_file(const char *dll_name, BOOL append_dll,
     if (basename == dll_name && process_state &&
         process_state->load_directory[0]) {
         fsfile = dll_find_in_directory(process_state->load_directory,
-                                       basename, append_dll, fs_path);
+                                       basename, FALSE, fs_path);
     }
 
     const char *image_path = win32_current_image_path();
     const char *image_sep = NULL;
-    BOOL search_application = search_flags == 0 ||
+    BOOL search_application = legacy_search ||
         (search_flags & (DLL_LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
                          DLL_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS));
+    if (process_state && process_state->load_directory[0] &&
+        process_state->altered_search_path)
+        search_application = FALSE;
     if (!fsfile && image_path && basename == dll_name && search_application) {
         for (const char *p = image_path; *p; p++)
             if (*p == '\\' || *p == '/') image_sep = p;
@@ -2711,14 +3199,16 @@ static void *dll_find_file(const char *dll_name, BOOL append_dll,
             }
             image_directory[length] = 0;
             fsfile = dll_find_in_directory(image_directory, basename,
-                                           append_dll, fs_path);
+                                           FALSE, fs_path);
+        } else {
+            fsfile = dll_find_in_directory("", basename, FALSE, fs_path);
         }
     }
 
     if (!fsfile && basename == dll_name && process_state &&
-        search_flags == 0 && process_state->search_directory[0]) {
+        legacy_search && process_state->search_directory[0]) {
         fsfile = dll_find_in_directory(process_state->search_directory,
-                                       basename, append_dll, fs_path);
+                                       basename, TRUE, fs_path);
     }
 
     BOOL search_user_directories =
@@ -2737,46 +3227,32 @@ static void *dll_find_file(const char *dll_name, BOOL append_dll,
             if (__atomic_load_n(&entry->owner_key, __ATOMIC_ACQUIRE) ==
                 owner_key) {
                 fsfile = dll_find_in_directory(entry->path, basename,
-                                               append_dll, fs_path);
+                                               TRUE, fs_path);
                 if (fsfile) break;
             }
             slot = next;
         }
     }
 
-    BOOL have_normalized_path = FALSE;
-    BOOL search_current_directory = search_flags == 0 &&
+    BOOL search_system = legacy_search ||
+        (search_flags & (DLL_LOAD_LIBRARY_SEARCH_SYSTEM32 |
+                         DLL_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS));
+    if (!fsfile && basename == dll_name && search_system) {
+        const char *directory = WIN32_SYSTEM32_RELATIVE;
+        fsfile = dll_find_in_directory(directory, basename, TRUE, fs_path);
+    }
+    if (!fsfile && basename == dll_name && legacy_search)
+        fsfile = dll_find_in_directory(WIN32_WINDOWS_RELATIVE, basename,
+                                       FALSE, fs_path);
+
+    BOOL search_current_directory = legacy_search &&
         (!process_state || !process_state->current_directory_disabled);
     if (!fsfile && (basename != dll_name || search_current_directory)) {
-        have_normalized_path = win32_normalize_path(dll_name, fs_path);
-        if (have_normalized_path)
+        if (win32_resolve_file_path(dll_name, fs_path))
             fsfile = osfs2_find_ci(fs_path);
     }
-    if (!fsfile)
-        fsfile = osfs2_find_ci(basename);
-    if (!fsfile && basename != dll_name)
-        fsfile = osfs2_find_ci(dll_name);
-
-    if (!fsfile && append_dll) {
-        char with_dll[260];
-        const char *stem = have_normalized_path ? fs_path : basename;
-        int length = 0;
-        int has_dot = 0;
-        for (const char *p = basename; *p; p++)
-            if (*p == '.') has_dot = 1;
-        while (stem[length] && length < 255) {
-            with_dll[length] = stem[length];
-            length++;
-        }
-        if (!has_dot) {
-            with_dll[length++] = '.';
-            with_dll[length++] = 'd';
-            with_dll[length++] = 'l';
-            with_dll[length++] = 'l';
-        }
-        with_dll[length] = 0;
-        fsfile = osfs2_find_ci(with_dll);
-    }
+    if (!fsfile && basename == dll_name && legacy_search)
+        fsfile = dll_find_in_environment(basename, fs_path);
 
     if (fsfile) {
         const char *stored_path = osfs2_file_name(fsfile);
@@ -2787,9 +3263,42 @@ static void *dll_find_file(const char *dll_name, BOOL append_dll,
     return fsfile;
 }
 
-PVOID dll_load_from_fs_ex(const char *dll_name, BOOL append_dll,
-                          DWORD search_flags)
+BOOL dll_resolve_data_path(const char *name, char fs_path[260])
 {
+    char prepared[260];
+    fs_path[0] = 0;
+    if (!dll_prepare_file_name(name, TRUE, prepared)) {
+        SetLastError(206); return FALSE;
+    }
+    BOOL bare = TRUE, found = FALSE;
+    for (const char *p = name; *p; p++)
+        if (*p == '/' || *p == '\\' || *p == ':') bare = FALSE;
+    loader_lock_acquire();
+    DLL_PROCESS_STATE *state = loader_process_state(dll_current_owner_pid(), FALSE);
+    /* Explicit version-resource paths may designate extensionless files.
+     * Bare names honor the already-loaded module before directory search. */
+    if (!bare && win32_resolve_file_path(name, fs_path))
+        found = osfs2_find_ci(fs_path) != NULL;
+    if (bare) {
+        LOADED_MODULE *module = dll_find_module(prepared);
+        if (module && module->path[0]) {
+            dl_strcpy(fs_path, module->path, 260);
+            found = TRUE;
+        }
+    }
+    if (!found)
+        found = dll_find_file(name, TRUE, state ? state->default_search_flags : 0,
+                              fs_path) != NULL;
+    loader_lock_release();
+    SetLastError(found ? 0 : 2);
+    return found;
+}
+
+static PVOID dll_load_from_fs_status(const char *dll_name, BOOL append_dll,
+                                      DWORD search_flags,
+                                      NTSTATUS *load_status)
+{
+    *load_status = STATUS_DLL_NOT_FOUND;
     if (!dll_name || !dll_name[0]) return NULL;
 
     loader_lock_acquire();
@@ -2798,6 +3307,7 @@ PVOID dll_load_from_fs_ex(const char *dll_name, BOOL append_dll,
      * from reading the same DLL concurrently before either publishes it. */
     LOADED_MODULE *existing = dll_find_module(dll_name);
     if (existing) {
+        *load_status = STATUS_SUCCESS;
         __atomic_add_fetch(&existing->ref_count, 1, __ATOMIC_RELAXED);
         PVOID base = existing->image.ImageBase;
         loader_lock_release();
@@ -2813,6 +3323,7 @@ PVOID dll_load_from_fs_ex(const char *dll_name, BOOL append_dll,
         ? __atomic_load_n(&process_state->load_depth, __ATOMIC_RELAXED)
         : 0;
     if (load_depth >= MAX_LOAD_DEPTH) {
+        *load_status = STATUS_DLL_INIT_FAILED;
         serial_puts("[DLL] max dependency depth reached: ");
         serial_puts(dll_name);
         serial_puts("\n");
@@ -2831,6 +3342,7 @@ PVOID dll_load_from_fs_ex(const char *dll_name, BOOL append_dll,
 
     uint64_t fsize = osfs2_file_size(fsfile);
     if (fsize == 0) {
+        *load_status = STATUS_INVALID_IMAGE_FORMAT;
         loader_lock_release();
         return NULL;
     }
@@ -2844,12 +3356,14 @@ PVOID dll_load_from_fs_ex(const char *dll_name, BOOL append_dll,
 
     DLL_FILE_VIEW file_view;
     if (!dll_file_cache_acquire(fsfile, fsize, basename, &file_view)) {
+        *load_status = STATUS_UNSUCCESSFUL;
         loader_lock_release();
         return NULL;
     }
 
     char previous_directory[260];
     previous_directory[0] = 0;
+    BOOL previous_altered_search = FALSE;
     if (process_state) {
         int i = 0;
         while (process_state->load_directory[i] && i < 259) {
@@ -2857,10 +3371,15 @@ PVOID dll_load_from_fs_ex(const char *dll_name, BOOL append_dll,
             i++;
         }
         previous_directory[i] = 0;
+        previous_altered_search = previous_directory[0] &&
+            process_state->altered_search_path;
 
         if ((effective_search_flags &
-             DLL_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR) ||
+             (DLL_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+              DLL_LOAD_WITH_ALTERED_SEARCH_PATH)) ||
             previous_directory[0]) {
+            process_state->altered_search_path = previous_altered_search ||
+                (effective_search_flags & DLL_LOAD_WITH_ALTERED_SEARCH_PATH);
             const char *last_separator = NULL;
             for (const char *p = fs_path; *p; p++)
                 if (*p == '\\' || *p == '/') last_separator = p;
@@ -2879,7 +3398,7 @@ PVOID dll_load_from_fs_ex(const char *dll_name, BOOL append_dll,
     }
     PVOID base = dll_load_impl(fs_path[0] ? fs_path : dll_name,
                                file_view.data,
-                               (SIZE_T)file_view.size);
+                               (SIZE_T)file_view.size, load_status);
     if (process_state) {
         __atomic_sub_fetch(&process_state->load_depth, 1,
                            __ATOMIC_RELAXED);
@@ -2889,10 +3408,21 @@ PVOID dll_load_from_fs_ex(const char *dll_name, BOOL append_dll,
             i++;
         }
         process_state->load_directory[i] = 0;
+        process_state->altered_search_path = previous_altered_search;
     }
 
     dll_file_cache_release(&file_view);
     loader_lock_release();
+    return base;
+}
+
+PVOID dll_load_from_fs_ex(const char *dll_name, BOOL append_dll,
+                          DWORD search_flags)
+{
+    NTSTATUS status;
+    PVOID base = dll_load_from_fs_status(dll_name, append_dll,
+                                         search_flags, &status);
+    if (!base) SetLastError(RtlNtStatusToDosError(status));
     return base;
 }
 
@@ -2902,42 +3432,71 @@ PVOID dll_load_from_fs(const char *dll_name, BOOL append_dll)
 }
 
 /* Called when an import references a DLL that is neither shimmed nor loaded. */
-static LOADED_MODULE *dll_try_load_from_fs(const char *dll_name)
+static LOADED_MODULE *dll_try_load_from_fs(const char *dll_name,
+                                           NTSTATUS *status)
 {
-    PVOID base = dll_load_from_fs(dll_name, FALSE);
+    PVOID base = dll_load_from_fs_status(dll_name, FALSE, 0, status);
 
-    if (base)
-        return dll_find_module(dll_name);
+    if (base) {
+        LOADED_MODULE *mod = dll_find_module(dll_name);
+        if (!mod) *status = STATUS_UNSUCCESSFUL;
+        return mod;
+    }
 
     return NULL;
 }
 
 /* ── Master import resolver ────────────────────────────────── */
 
-PVOID dll_resolve_import(const char *dll_name, const char *func_name,
-                         USHORT ordinal, BOOL by_ordinal)
+PVOID dll_resolve_import_status(const char *dll_name, const char *func_name,
+                                USHORT ordinal, BOOL by_ordinal,
+                                NTSTATUS *status)
 {
+    NTSTATUS local_status;
+    if (!status) status = &local_status;
+    *status = STATUS_PROCEDURE_NOT_FOUND;
     /* 1. Try built-in shims first (ntdll, kernel32, msvcrt, etc.) */
     char provider[64];
     const char *shim_name = dll_shim_provider_name(dll_name, provider);
-    shim_resolver_fn shim = find_shim(shim_name);
+    SHIM_ENTRY *entry = find_shim_entry(shim_name);
+    shim_resolver_fn shim = entry ? entry->resolver : NULL;
+    if (entry && entry->image_exports) {
+        PVOID base = dll_get_shim_module_handle(shim_name, FALSE);
+        if (!base) {
+            *status = STATUS_NO_MEMORY;
+            return NULL;
+        }
+        LOADED_MODULE *image = base ? dll_find_module_by_base(base) : NULL;
+        return dll_resolve_export_status(image, func_name, ordinal,
+                                          by_ordinal, status);
+    }
     if (shim) {
         PVOID fn = shim(func_name, ordinal, by_ordinal);
-        if (fn) return dll_get_shim_export_thunk(shim_name, fn);
+        if (fn) {
+            *status = STATUS_SUCCESS;
+            return dll_get_shim_export_thunk(shim_name, fn);
+        }
     }
 
     /* 2. Try loaded PE modules */
     LOADED_MODULE *mod = dll_find_module(dll_name);
     if (mod) {
-        PVOID fn = dll_resolve_export(mod, func_name, ordinal, by_ordinal);
+        PVOID fn = dll_resolve_export_status(mod, func_name, ordinal,
+                                              by_ordinal, status);
         if (fn) return fn;
+        if (*status != STATUS_PROCEDURE_NOT_FOUND &&
+            *status != STATUS_DLL_NOT_FOUND)
+            return NULL;
     }
 
     /* 3. Fallback: search all shims (for api-ms-win-crt-* redirections) */
     if (func_name) {
         for (int i = 0; i < shim_count; i++) {
             PVOID fn = shims[i].resolver(func_name, ordinal, by_ordinal);
-            if (fn) return dll_get_shim_export_thunk(shims[i].name, fn);
+            if (fn) {
+                *status = STATUS_SUCCESS;
+                return dll_get_shim_export_thunk(shims[i].name, fn);
+            }
         }
     }
 
@@ -2955,11 +3514,16 @@ PVOID dll_resolve_import(const char *dll_name, const char *func_name,
             (dll_name[nlen-3] == 'd' || dll_name[nlen-3] == 'D') &&
             (dll_name[nlen-2] == 'l' || dll_name[nlen-2] == 'L') &&
             (dll_name[nlen-1] == 'l' || dll_name[nlen-1] == 'L'));
-        LOADED_MODULE *auto_mod = is_dll ? dll_try_load_from_fs(dll_name) : NULL;
+        LOADED_MODULE *auto_mod = is_dll
+            ? dll_try_load_from_fs(dll_name, status) : NULL;
         if (auto_mod) {
-            PVOID fn = dll_resolve_export(auto_mod, func_name, ordinal, by_ordinal);
+            PVOID fn = dll_resolve_export_status(auto_mod, func_name, ordinal,
+                                                  by_ordinal, status);
             if (fn) return fn;
         }
+        if (*status != STATUS_PROCEDURE_NOT_FOUND &&
+            *status != STATUS_DLL_NOT_FOUND)
+            return NULL;
     }
 
     /* 5. Compatibility fallback: search unrelated loaded modules only after
@@ -2967,7 +3531,7 @@ PVOID dll_resolve_import(const char *dll_name, const char *func_name,
     if (func_name) {
         ULONG owner_pid = dll_current_owner_pid();
         PVOID fn = dll_resolve_export_any(
-            owner_pid, func_name, ordinal, by_ordinal);
+            owner_pid, func_name, ordinal, by_ordinal, status);
         if (fn) return fn;
     }
 
@@ -2980,4 +3544,12 @@ PVOID dll_resolve_import(const char *dll_name, const char *func_name,
 #endif
 
     return NULL;
+}
+
+PVOID dll_resolve_import(const char *dll_name, const char *func_name,
+                         USHORT ordinal, BOOL by_ordinal)
+{
+    NTSTATUS status;
+    return dll_resolve_import_status(dll_name, func_name, ordinal,
+                                      by_ordinal, &status);
 }

@@ -4,6 +4,10 @@
 
 #include "handle.h"
 #include "ntsyscall.h"
+#include "advapi32_shim.h"
+#include "ntprocess.h"
+#include "ntjob.h"
+#include "nt_event.h"
 #include "../kernel/smp.h"
 
 extern DWORD win32_current_process_id(void);
@@ -28,17 +32,27 @@ static ULONG handle_owner_cursor;
 
 static inline uint64_t handle_lock_irqsave(void)
 {
+#ifdef HANDLE_HOST_TEST
+    extern uint64_t handle_host_lock(void);
+    return handle_host_lock();
+#else
     uint64_t flags;
     __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     spin_lock(&handle_table_lock);
     return flags;
+#endif
 }
 
 static inline void handle_unlock_irqrestore(uint64_t flags)
 {
+#ifdef HANDLE_HOST_TEST
+    extern void handle_host_unlock(uint64_t);
+    handle_host_unlock(flags);
+#else
     spin_unlock(&handle_table_lock);
     if (flags & (1ULL << 9))
         __asm__ volatile ("sti" ::: "memory");
+#endif
 }
 
 static inline void *nt_memset(void *s, int c, SIZE_T n)
@@ -66,6 +80,10 @@ void handle_table_init(PHANDLE_TABLE table)
         }
     }
     nt_memset(table, 0, sizeof(HANDLE_TABLE));
+    /* Zero is a valid owner-record index, not an empty list. Unallocated
+     * slots must be safe to query before they have ever held an object. */
+    for (ULONG i = 0; i < MAX_HANDLES; i++)
+        table->entries[i].owner_head = HANDLE_OWNER_NONE;
     table->count = 0;
     handle_unlock_irqrestore(flags);
 }
@@ -164,6 +182,14 @@ static NTSTATUS handle_alloc_locked(PHANDLE_TABLE table,
             entry->owner_head = HANDLE_OWNER_NONE;
             if (!owner_add_locked(entry, owner_pid, handle_flags))
                 return STATUS_INSUFFICIENT_RESOURCES;
+            if (type == OBJ_TYPE_EVENT && !ntsync_event_retain(object)) {
+                (void)owner_remove_locked(entry, owner_pid);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            if (type == OBJ_TYPE_TOKEN)
+                advapi32_token_retain(object);
+            if (type == OBJ_TYPE_JOB)
+                nt_job_handle_retain(object);
             entry->type   = type;
             entry->access = access;
             entry->object = object;
@@ -337,6 +363,53 @@ NTSTATUS handle_lookup_access_for_process(PHANDLE_TABLE table,
     return status;
 }
 
+NTSTATUS handle_reference_event_for_process(PHANDLE_TABLE table,HANDLE handle,
+                                            ULONG owner_pid,PVOID *object)
+{
+    if (!table || !owner_pid || !object) return STATUS_INVALID_PARAMETER;
+    ULONG_PTR value=(ULONG_PTR)handle;
+    if ((value&3) || value/4>=MAX_HANDLES) return STATUS_INVALID_HANDLE;
+    uint64_t flags=handle_lock_irqsave();
+    ULONG idx=HANDLE_TO_INDEX(handle);
+    NTSTATUS status=STATUS_INVALID_HANDLE;
+    if (idx) {
+        HANDLE_ENTRY *entry=&table->entries[idx];
+        if (entry->type==OBJ_TYPE_EVENT && entry->object && owner_find_locked(entry,owner_pid)) {
+            status=STATUS_ACCESS_DENIED;
+            if ((entry->access&2u) || (entry->access&GENERIC_ALL)) {
+                status=STATUS_INSUFFICIENT_RESOURCES;
+                if (ntsync_event_retain(entry->object)) { *object=entry->object; status=STATUS_SUCCESS; }
+            }
+        }
+    }
+    handle_unlock_irqrestore(flags); return status;
+}
+
+NTSTATUS handle_reference_token_for_process(PHANDLE_TABLE table, HANDLE handle,
+                                            ULONG owner_pid, ACCESS_MASK required,
+                                            PVOID *object, ACCESS_MASK *access)
+{
+    if (!table || !owner_pid || !object) return STATUS_INVALID_PARAMETER;
+    uint64_t flags = handle_lock_irqsave();
+    ULONG idx = HANDLE_TO_INDEX(handle);
+    NTSTATUS status = STATUS_INVALID_HANDLE;
+    if (idx && idx < MAX_HANDLES) {
+        HANDLE_ENTRY *entry = &table->entries[idx];
+        if (entry->type == OBJ_TYPE_TOKEN && entry->object &&
+            owner_find_locked(entry, owner_pid)) {
+            status = STATUS_ACCESS_DENIED;
+            if ((entry->access & required) == required) {
+                advapi32_token_retain(entry->object);
+                *object = entry->object;
+                if (access) *access = entry->access;
+                status = STATUS_SUCCESS;
+            }
+        }
+    }
+    handle_unlock_irqrestore(flags);
+    return status;
+}
+
 /* ── Get entry (no type check) ──────────────────────────────── */
 
 HANDLE_ENTRY *handle_get_entry(PHANDLE_TABLE table, HANDLE handle)
@@ -483,6 +556,64 @@ NTSTATUS handle_snapshot_for_process(PHANDLE_TABLE table, HANDLE handle,
     return status;
 }
 
+ULONG handle_enumerate_for_process(PHANDLE_TABLE table, ULONG owner_pid,
+                                    ULONG *values, ULONG capacity)
+{
+    ULONG count = 0;
+    uint64_t flags = handle_lock_irqsave();
+    for (ULONG i = 1; i < MAX_HANDLES; i++) {
+        HANDLE_ENTRY *entry = &table->entries[i];
+        if (entry->type == OBJ_TYPE_NONE || !entry->refs ||
+            (i > 3 && !owner_find_locked(entry, owner_pid)))
+            continue;
+        /* Standard console handles are shared, as in handle_lookup. Other
+         * subsystem handles must never appear in a user process snapshot. */
+        if (values && count < capacity) values[count] = i << 2;
+        count++;
+    }
+    handle_unlock_irqrestore(flags);
+    return count;
+}
+
+NTSTATUS handle_inherit_all_for_process(PHANDLE_TABLE table, ULONG source_pid,
+                                         ULONG target_pid)
+{
+    if (!table || !source_pid || !target_pid || source_pid == target_pid)
+        return STATUS_INVALID_PARAMETER;
+    uint64_t flags = handle_lock_irqsave();
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG end = 1;
+    for (; end < MAX_HANDLES; end++) {
+        HANDLE_ENTRY *entry = &table->entries[end];
+        if (entry->type == OBJ_TYPE_NONE)
+            continue;
+        HANDLE_OWNER_RECORD *source = owner_find_locked(entry, source_pid);
+        if (!source ||
+            !(source->flags & HANDLE_USER_FLAG_INHERIT)) continue;
+        if (entry->refs == 0xffffffffU ||
+            !owner_add_locked(entry, target_pid, source->flags)) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        entry->refs++;
+        entry->owner_pid = owner_sole_pid_locked(entry);
+    }
+    if (!NT_SUCCESS(status)) {
+        /* Target is a newly created process; no handles preceded this copy. */
+        for (ULONG i = 1; i < end; i++) {
+            HANDLE_ENTRY *entry = &table->entries[i];
+            if (entry->type == OBJ_TYPE_NONE)
+                continue;
+            if (owner_remove_locked(entry, target_pid)) {
+                entry->refs--;
+                entry->owner_pid = owner_sole_pid_locked(entry);
+            }
+        }
+    }
+    handle_unlock_irqrestore(flags);
+    return status;
+}
+
 BOOL handle_object_referenced(PHANDLE_TABLE table,
                               OBJECT_TYPE_ID type,
                               PVOID object)
@@ -599,10 +730,27 @@ NTSTATUS handle_close_entry_for_process(PHANDLE_TABLE table, HANDLE handle,
     if (!table || !owner_pid)
         return STATUS_INVALID_PARAMETER;
 
+    HANDLE_ENTRY closed = {0};
     uint64_t flags = handle_lock_irqsave();
     NTSTATUS status = handle_close_locked(table, handle, owner_pid,
-                                          closed_entry);
+                                          &closed);
     handle_unlock_irqrestore(flags);
+    if (NT_SUCCESS(status) && closed.type == OBJ_TYPE_TOKEN) {
+        if (closed.refs == 1) advapi32_token_release(closed.object);
+        closed.object = NULL;
+    }
+    if (NT_SUCCESS(status) && closed.type == OBJ_TYPE_JOB) {
+        if (closed.refs == 1) nt_job_handle_release(closed.object);
+        closed.object = NULL;
+    }
+    if (NT_SUCCESS(status) && closed.type == OBJ_TYPE_EVENT) {
+        if (closed.refs == 1) ntsync_event_release(closed.object);
+        closed.object = NULL;
+    }
+    if (NT_SUCCESS(status) &&
+        (closed.type == OBJ_TYPE_PROCESS || closed.type == OBJ_TYPE_THREAD))
+        nt_process_token_handle_closed(closed.type, closed.object);
+    if (closed_entry) *closed_entry = closed;
     return status;
 }
 

@@ -20,6 +20,7 @@ DEFAULT_MODULE = (
     REPO / "arch/x86/build/lib/opengl-module/libGL-osito.so"
 )
 DEFAULT_OUTPUT = Path(__file__).with_name("opengl32_generated.inc")
+DEFAULT_DISPATCH = REPO / "arch/x86/lib/opengl/mesa/src/mapi/shared-glapi/glapi_mapi_tmp.h"
 
 FLOAT_TYPES = {"GLfloat", "GLclampf"}
 DOUBLE_TYPES = {"GLdouble", "GLclampd"}
@@ -144,6 +145,15 @@ def module_symbols(path: Path, nm: str) -> set[str]:
     return symbols
 
 
+def dispatch_symbols(path: Path) -> set[str]:
+    # Modern Mesa entry points often have hidden shared_dispatch_stub_N ELF
+    # names. Their public GL names are resolved by Mesa's proc-address table.
+    header = path.read_text()
+    pool = header.split("static const char public_string_pool[] =", 1)[1]
+    pool = pool.split(";", 1)[0]
+    return {"gl" + name for name in re.findall(r'"(\w+)\\0"', pool)}
+
+
 def is_pointer(param: Param) -> bool:
     return (
         "*" in param.declaration
@@ -240,7 +250,15 @@ def emit_command(command: Command, symbol_index: int) -> str:
         "{",
     ])
     call = f"ogl_wrap_{command.name}({decoded_args})" if decoded_args else f"ogl_wrap_{command.name}()"
-    if command.return_type == "void":
+    if command.name in {"glShaderSource", "glShaderSourceARB"}:
+        lines.extend([
+            "    opengl_compat_shader_source((GLuint)(uint32_t)s0,",
+            "        (GLsizei)(int32_t)(uint32_t)s1,",
+            "        (const uint32_t *)(ULONG_PTR)(uint32_t)s2,",
+            "        (const GLint *)(ULONG_PTR)(uint32_t)s3);",
+            "    return 0;",
+        ])
+    elif command.return_type == "void":
         lines.extend([f"    {call};", "    return 0;"])
     else:
         lines.append(f"    {command.return_type} result = {call};")
@@ -296,6 +314,7 @@ def main() -> int:
     parser.add_argument("--xml", type=Path, default=DEFAULT_XML)
     parser.add_argument("--module", type=Path, default=DEFAULT_MODULE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--dispatch", type=Path, default=DEFAULT_DISPATCH)
     parser.add_argument("--nm", default="nm")
     args = parser.parse_args()
 
@@ -306,6 +325,9 @@ def main() -> int:
         print("Mesa exports absent from gl.xml:", ", ".join(missing), file=sys.stderr)
         return 1
 
+    # Mesa's dispatch pool also contains private entry points absent from the
+    # public Khronos registry; they have no public Win32 API contract.
+    exported |= dispatch_symbols(args.dispatch) & registry.keys()
     selected = [registry[name] for name in sorted(exported)]
     output = generate(selected)
     args.output.write_text(output, encoding="ascii", newline="\n")

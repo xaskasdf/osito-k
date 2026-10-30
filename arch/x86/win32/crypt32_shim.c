@@ -3,6 +3,7 @@
 #include "crypt32_shim.h"
 #include "authenticode.h"
 #include "kernel32_shim.h"
+#include "advapi32_shim.h"
 #include "../include/paging.h"
 #include "../kernel/certmgr.h"
 #include "../kernel/crypto.h"
@@ -31,7 +32,7 @@ static void cert_free_pages(void *addr, uint64_t pages)
 #define CERT_OBJECT_MAGIC  0x43455254U
 #define CERT_CHAIN_MAGIC   0x43484E31U
 #define CERT_STORE_MAX     8
-#define CERT_CHAIN_MAX     (CERT_STORE_MAX + 2U)
+#define CERT_CHAIN_MAX     AUTHENTICODE_CHAIN_MAX
 
 #define X509_ASN_ENCODING  0x00000001U
 #define CERT_STORE_PROV_MEMORY 2U
@@ -53,8 +54,6 @@ static void cert_free_pages(void *addr, uint64_t pages)
 #define CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY         0x80000000U
 #define CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL             0x00000004U
 
-#define ERROR_INVALID_PARAMETER 87U
-#define ERROR_NOT_ENOUGH_MEMORY 8U
 #define CRYPT_E_NOT_FOUND       0x80092004U
 #define TRUST_E_PROVIDER_UNKNOWN    ((LONG)0x800B0001U)
 #define TRUST_E_ACTION_UNKNOWN      ((LONG)0x800B0002U)
@@ -870,6 +869,99 @@ static void WINAPI shim_CertFreeCertificateChain(PVOID context)
     cert_free_pages(obj, 1);
 }
 
+/* CERT_CHAIN_POLICY_MICROSOFT_ROOT identifies public keys, independently of
+ * trust, expiry and the certificate's subject string. These SHA-256 values
+ * cover the subjectPublicKey BIT STRING (without its unused-bits octet).
+ * Policy verification still requires a separately authenticated chain. */
+static const BYTE cert_microsoft_root_keys[][32] = {
+    /* Microsoft Root Authority (1997). */
+    {0xee,0x09,0xb0,0x7a,0x85,0xe8,0xf2,0x4a,0x01,0xef,0x63,0x1a,0xe6,0x71,0xfe,0xf8,0xde,0xa8,0x01,0x5a,0x09,0xa7,0x15,0xe6,0xa6,0x73,0x90,0x11,0x90,0x92,0xb8,0x16},
+    /* Microsoft Root Certificate Authority (2001). */
+    {0x60,0xbd,0xed,0x75,0xc5,0xfd,0x11,0x90,0x10,0xd6,0x83,0x2f,0x76,0xde,0xfc,0x39,0x34,0x73,0xd7,0xa0,0xce,0x64,0xfb,0xd6,0x8d,0xab,0xa2,0x9b,0xfd,0x0b,0x2f,0x7c},
+    /* Microsoft Root Certificate Authority 2010. */
+    {0x12,0xeb,0x31,0xfd,0xc8,0x92,0x49,0xa0,0xeb,0x67,0xeb,0x65,0xc2,0x97,0x7d,0xbe,0x2a,0xd9,0x6a,0x90,0x9c,0xcb,0xd1,0x80,0xf7,0xe2,0xe1,0x6b,0x27,0x82,0xca,0xee},
+    /* Microsoft Time Stamp Root Certificate Authority 2014. */
+    {0x29,0x94,0x70,0xb8,0xbb,0x26,0x78,0x78,0x0c,0xf0,0x20,0xa3,0x32,0x2f,0x69,0xb4,0x0a,0x11,0x62,0x24,0x05,0x71,0xaf,0xd5,0x3a,0x80,0x5b,0x9b,0x03,0xf2,0xeb,0x5d},
+    /* Microsoft ECC Product Root Certificate Authority 2018. */
+    {0x9a,0xb5,0xe4,0xc6,0x11,0x55,0xa9,0x39,0x6e,0xa1,0xc8,0xbf,0x48,0x29,0xd3,0xe1,0x08,0x53,0x52,0x57,0xb7,0x1b,0xe3,0x80,0x97,0x21,0x62,0x32,0x0f,0xfb,0x13,0x3b},
+    /* Microsoft ECC TS Root Certificate Authority 2018. */
+    {0x8b,0x24,0xff,0x56,0x20,0xc8,0x19,0x1f,0xd9,0x6d,0x52,0xec,0xb6,0xb6,0x0c,0x55,0xe8,0x2b,0xa8,0x49,0x04,0x3f,0xea,0x27,0x39,0x27,0xdb,0xf4,0x35,0x53,0xe6,0x59},
+};
+static const BYTE cert_microsoft_application_key[32] = {
+    /* Microsoft Root Certificate Authority 2011. */
+    0x4a,0xbb,0x05,0x94,0xd3,0x03,0xef,0x70,0x77,0x13,0x88,0x34,0xab,0x31,0x5e,0x94,0x1e,0x96,0x30,0x93,0xe0,0x5b,0x4b,0x14,0xaf,0x5d,0xcb,0x52,0x77,0x12,0xc0,0x0a
+};
+
+static ULONG_PTR cert_policy_pointer(PCVOID data, DWORD offset)
+{
+    ULONG_PTR value = 0;
+    memcpy(&value, (const BYTE *)data + offset, g_compat32_mode ? 4 : 8);
+    return value;
+}
+
+static BOOL cert_policy_root_key(PCVOID context, DWORD flags)
+{
+    const BYTE *der = (const BYTE *)cert_policy_pointer(
+        context, g_compat32_mode ? 4 : 8);
+    DWORD length = *(const DWORD *)((const BYTE *)context +
+                                    (g_compat32_mode ? 8 : 16));
+    const BYTE *key;
+    DWORD key_length;
+    BYTE digest[32];
+    if (!der || !length || length > 1024U * 1024U ||
+        x509_get_subject_pubkey_bits(der, length, &key, &key_length) != 0)
+        return FALSE;
+    sha256(key, key_length, digest);
+    if (flags & 0x00020000U)
+        return memcmp(digest, cert_microsoft_application_key, 32) == 0;
+    for (DWORD i = 0; i < sizeof(cert_microsoft_root_keys) / 32; i++)
+        if (memcmp(digest, cert_microsoft_root_keys[i], 32) == 0)
+            return TRUE;
+    /* No unrecognized test or flight key is accepted. */
+    return FALSE;
+}
+
+static BOOL WINAPI shim_CertVerifyCertificateChainPolicy(
+    PCSTR policy, PCVOID context, PCVOID parameters, PVOID status)
+{
+    DWORD *output = (DWORD *)status;
+    if (!output || output[0] < (g_compat32_mode ? 20U : 24U) ||
+        !context || *(const DWORD *)context <
+            (g_compat32_mode ? 56U : 72U) ||
+        (parameters && *(const DWORD *)parameters <
+            (g_compat32_mode ? 12U : 16U))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if ((ULONG_PTR)policy != 7) {
+        SetLastError(120); /* Unsupported policies must never report success. */
+        return FALSE;
+    }
+    DWORD flags = parameters ? ((const DWORD *)parameters)[1] : 0;
+    output[1] = 0x800B0109U; /* CERT_E_UNTRUSTEDROOT */
+    output[2] = output[3] = 0;
+    if ((flags & 0x00030000U) == 0x00030000U) {
+        output[1] = 0x80070057U; /* Application and test roots are exclusive. */
+        return TRUE;
+    }
+    if (!((const DWORD *)context)[3]) return TRUE;
+    PCVOID chains = (PCVOID)cert_policy_pointer(context, 16);
+    PCVOID simple = chains ? (PCVOID)cert_policy_pointer(chains, 0) : NULL;
+    if (!simple || *(const DWORD *)simple <
+            (g_compat32_mode ? 32U : 40U)) return TRUE;
+    DWORD count = ((const DWORD *)simple)[3];
+    if (!count || count > 1024U) return TRUE;
+    output[3] = count - 1;
+    PCVOID elements = (PCVOID)cert_policy_pointer(simple, 16);
+    PCVOID last = elements ? (PCVOID)cert_policy_pointer(
+        elements, (count - 1) * (g_compat32_mode ? 4U : 8U)) : NULL;
+    if (!last || *(const DWORD *)last <
+            (g_compat32_mode ? 32U : 56U)) return TRUE;
+    PCVOID root = (PCVOID)cert_policy_pointer(last, g_compat32_mode ? 4 : 8);
+    if (root && cert_policy_root_key(root, flags)) output[1] = 0;
+    return TRUE;
+}
+
 typedef struct __attribute__((packed)) {
     uint32_t size;
     uint32_t data;
@@ -1182,6 +1274,254 @@ static int wintrust_guid_equal(const GUID *left, const GUID *right)
     return 1;
 }
 
+/* Fixed-width provider layouts are shared by WinVerifyTrust and its helpers.
+ * Returned certificate contexts belong to the retained provider state. */
+#define WINTRUST_PROVIDER_FIELDS(P) \
+    DWORD cbStruct; P pWintrustData; BOOL fOpenedFile; P hWndParent, pgActionID, hProv; \
+    DWORD dwError, dwRegSecuritySettings, dwRegPolicySettings; P psPfns; \
+    DWORD cdwTrustStepErrors; P padwTrustStepErrors; DWORD chStores; P pahStores; \
+    DWORD dwEncoding; P hMsg; DWORD csSigners; P pasSigners; \
+    DWORD csProvPrivData; P pasProvPrivData; DWORD dwSubjectChoice; P pPDSip, pszUsageOID; \
+    BOOL fRecallWithState; cert_filetime_t sftSystemTime; P pszCTLSignerUsageOID; \
+    DWORD dwProvFlags, dwFinalError; P pRequestUsage; DWORD dwTrustPubSettings, dwUIStateFlags; \
+    P pSigState, pSigSettings
+#define WINTRUST_SIGNER_FIELDS(P) \
+    DWORD cbStruct; cert_filetime_t sftVerifyAsOf; DWORD csCertChain; P pasCertChain; \
+    DWORD dwSignerType; P psSigner; DWORD dwError, csCounterSigners; P pasCounterSigners, pChainContext
+#define WINTRUST_CERT_FIELDS(P) \
+    DWORD cbStruct; P pCert; BOOL fCommercial, fTrustedRoot, fSelfSigned, fTestCert; \
+    DWORD dwRevokedReason, dwConfidence, dwError; P pTrustListContext; BOOL fTrustListSignerCert; \
+    P pCtlContext; DWORD dwCtlError; BOOL fIsCyclic; P pChainElement
+typedef struct { WINTRUST_PROVIDER_FIELDS(uint32_t); } wintrust_provider32_t;
+typedef struct { WINTRUST_PROVIDER_FIELDS(uint64_t); } wintrust_provider64_t;
+typedef struct { WINTRUST_SIGNER_FIELDS(uint32_t); } wintrust_signer32_t;
+typedef struct { WINTRUST_SIGNER_FIELDS(uint64_t); } wintrust_signer64_t;
+typedef struct { WINTRUST_CERT_FIELDS(uint32_t); } wintrust_cert32_t;
+typedef struct { WINTRUST_CERT_FIELDS(uint64_t); } wintrust_cert64_t;
+#undef WINTRUST_PROVIDER_FIELDS
+#undef WINTRUST_SIGNER_FIELDS
+#undef WINTRUST_CERT_FIELDS
+typedef union { wintrust_provider32_t v32; wintrust_provider64_t v64; } wintrust_provider_t;
+typedef union { wintrust_signer32_t v32; wintrust_signer64_t v64; } wintrust_signer_t;
+typedef union {
+    wintrust_cert32_t v32[CERT_CHAIN_MAX];
+    wintrust_cert64_t v64[CERT_CHAIN_MAX];
+} wintrust_certs_t;
+typedef struct {
+    wintrust_provider_t provider;
+    wintrust_signer_t signer[2];
+    wintrust_certs_t certificates[2];
+    GUID action;
+    DWORD steps[38];
+} wintrust_public_t;
+typedef struct {
+    volatile int used;
+    DWORD owner;
+    BOOL compat;
+    HANDLE handle;
+    wintrust_public_t *data;
+    cert_chain_object_t *chains[2];
+} wintrust_state_t;
+#define WINTRUST_STATE_LIMIT 64
+static wintrust_state_t wintrust_states[WINTRUST_STATE_LIMIT];
+static volatile DWORD wintrust_generation;
+_Static_assert(sizeof(wintrust_provider32_t) == 136, "CRYPT_PROVIDER_DATA32");
+_Static_assert(sizeof(wintrust_provider64_t) == 240, "CRYPT_PROVIDER_DATA64");
+_Static_assert(sizeof(wintrust_signer32_t) == 44, "CRYPT_PROVIDER_SGNR32");
+_Static_assert(sizeof(wintrust_signer64_t) == 64, "CRYPT_PROVIDER_SGNR64");
+_Static_assert(sizeof(wintrust_cert32_t) == 60, "CRYPT_PROVIDER_CERT32");
+_Static_assert(sizeof(wintrust_cert64_t) == 88, "CRYPT_PROVIDER_CERT64");
+_Static_assert(sizeof(wintrust_public_t) <= 4096, "provider state fits one page");
+
+static DWORD wintrust_policy_settings(void)
+{
+    DWORD policy = 0x00023c00U;
+    HKEY key = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Windows\\CurrentVersion\\WinTrust\\Trust Providers\\Software Publishing",
+        0, KEY_QUERY_VALUE, &key) == 0) {
+        DWORD value = 0, size = sizeof(value), type = 0;
+        if (RegQueryValueExA(key, "State", NULL, &type, (BYTE *)&value, &size) == 0 &&
+            type == REG_DWORD && size == sizeof(value)) policy = value;
+        RegCloseKey(key);
+    }
+    return policy;
+}
+
+static wintrust_state_t *wintrust_state_find(HANDLE handle, PCVOID provider)
+{
+    DWORD owner = GetCurrentProcessId();
+    for (int i = 0; i < WINTRUST_STATE_LIMIT; i++) {
+        wintrust_state_t *state = &wintrust_states[i];
+        if (state->used == 1 && state->owner == owner &&
+            ((handle && state->handle == handle) ||
+             (provider && provider == (PCVOID)&state->data->provider)))
+            return state;
+    }
+    return NULL;
+}
+
+static void wintrust_state_release(wintrust_state_t *state)
+{
+    if (!state || !__sync_bool_compare_and_swap(&state->used, 1, -1)) return;
+    for (int i = 0; i < 2; i++) {
+        if (state->chains[i]) {
+            state->chains[i]->magic = 0;
+            chain_release_elements(state->chains[i]);
+            cert_free_pages(state->chains[i], 1);
+            state->chains[i] = NULL;
+        }
+    }
+    cert_free_pages(state->data, 1);
+    state->data = NULL;
+    state->handle = NULL;
+    state->owner = 0;
+    __sync_lock_release(&state->used);
+}
+
+void crypt32_release_process(DWORD owner)
+{
+    for (int i = 0; i < WINTRUST_STATE_LIMIT; i++)
+        if (wintrust_states[i].used == 1 && wintrust_states[i].owner == owner)
+            wintrust_state_release(&wintrust_states[i]);
+}
+
+static wintrust_state_t *wintrust_state_create(HANDLE window, const GUID *action,
+                                              PVOID trust_data, DWORD flags,
+                                              DWORD software_policy)
+{
+    for (int i = 0; i < WINTRUST_STATE_LIMIT; i++) {
+        wintrust_state_t *state = &wintrust_states[i];
+        if (!__sync_bool_compare_and_swap(&state->used, 0, -1)) continue;
+        wintrust_public_t *data = cert_alloc_pages(1);
+        if (!data) { __sync_lock_release(&state->used); return NULL; }
+        memset(data, 0, 4096);
+        data->action = *action;
+        state->owner = GetCurrentProcessId();
+        state->compat = g_compat32_mode;
+        state->data = data;
+        DWORD generation = __sync_add_and_fetch(&wintrust_generation, 1);
+        state->handle = (HANDLE)(ULONG_PTR)(0x78000000U | ((generation & 0xffffU) << 8) | (DWORD)i);
+        if (state->compat) {
+            wintrust_provider32_t *p = &data->provider.v32;
+            p->cbStruct = sizeof(*p);
+            p->pWintrustData = (uint32_t)(ULONG_PTR)trust_data;
+            p->hWndParent = (uint32_t)(ULONG_PTR)window;
+            p->pgActionID = (uint32_t)(ULONG_PTR)&data->action;
+            p->dwProvFlags = flags;
+            p->dwRegPolicySettings = software_policy;
+            p->cdwTrustStepErrors = 38;
+            p->padwTrustStepErrors = (uint32_t)(ULONG_PTR)data->steps;
+        } else {
+            wintrust_provider64_t *p = &data->provider.v64;
+            p->cbStruct = sizeof(*p);
+            p->pWintrustData = (ULONG_PTR)trust_data;
+            p->hWndParent = (ULONG_PTR)window;
+            p->pgActionID = (ULONG_PTR)&data->action;
+            p->dwProvFlags = flags;
+            p->dwRegPolicySettings = software_policy;
+            p->cdwTrustStepErrors = 38;
+            p->padwTrustStepErrors = (ULONG_PTR)data->steps;
+        }
+        __sync_synchronize();
+        state->used = 1;
+        return state;
+    }
+    return NULL;
+}
+
+static BOOL wintrust_chain_capture(const authenticode_report_t *report, PVOID opaque)
+{
+    wintrust_state_t *state = (wintrust_state_t *)opaque;
+    wintrust_public_t *data = state->data;
+    for (int index = 0; index < 2; index++) {
+        const authenticode_chain_t *input = index ? &report->timestamp : &report->signer;
+        if (!input->count) continue;
+        cert_object_t *objects[CERT_CHAIN_MAX] = {0};
+        DWORD errors = 0;
+        for (DWORD i = 0; i < input->count && i < CERT_CHAIN_MAX; i++)
+            errors |= input->errors[i];
+        cert_chain_object_t *chain = chain_alloc(errors, 0, input->certificates,
+            input->lengths, objects, input->errors, input->count);
+        if (!chain) return FALSE;
+        state->chains[index] = chain;
+        uint64_t time = ((uint64_t)input->validation_time + 11644473600ULL) * 10000000ULL;
+        cert_filetime_t verify_time = {(DWORD)time, (DWORD)(time >> 32)};
+        if (state->compat) {
+            wintrust_signer32_t *signer = &data->signer[index].v32;
+            signer->cbStruct = sizeof(*signer);
+            signer->sftVerifyAsOf = verify_time;
+            signer->csCertChain = input->count;
+            signer->pasCertChain = (uint32_t)(ULONG_PTR)data->certificates[index].v32;
+            signer->pChainContext = (uint32_t)(ULONG_PTR)&chain->context;
+            signer->dwSignerType = index ? 0x10U : 0;
+        } else {
+            wintrust_signer64_t *signer = &data->signer[index].v64;
+            signer->cbStruct = sizeof(*signer);
+            signer->sftVerifyAsOf = verify_time;
+            signer->csCertChain = input->count;
+            signer->pasCertChain = (ULONG_PTR)data->certificates[index].v64;
+            signer->pChainContext = (ULONG_PTR)&chain->context;
+            signer->dwSignerType = index ? 0x10U : 0;
+        }
+        for (DWORD i = 0; i < input->count; i++) {
+            BOOL self_signed = x509_issuer_matches_subject(input->certificates[i],
+                input->lengths[i], input->certificates[i], input->lengths[i]) == 1;
+            if (state->compat) {
+                wintrust_cert32_t *cert = &data->certificates[index].v32[i];
+                cert->cbStruct = sizeof(*cert);
+                cert->pCert = (uint32_t)(ULONG_PTR)cert_public_context(chain->element_certs[i]);
+                cert->fTrustedRoot = i + 1 == input->count;
+                cert->fSelfSigned = self_signed;
+                cert->dwConfidence = 0x11000000U;
+                cert->pChainElement = (uint32_t)(ULONG_PTR)&chain->elements[i].v32;
+            } else {
+                wintrust_cert64_t *cert = &data->certificates[index].v64[i];
+                cert->cbStruct = sizeof(*cert);
+                cert->pCert = (ULONG_PTR)cert_public_context(chain->element_certs[i]);
+                cert->fTrustedRoot = i + 1 == input->count;
+                cert->fSelfSigned = self_signed;
+                cert->dwConfidence = 0x11000000U;
+                cert->pChainElement = (ULONG_PTR)&chain->elements[i].v64;
+            }
+        }
+    }
+    if (state->compat) {
+        data->provider.v32.csSigners = 1;
+        data->provider.v32.pasSigners = (uint32_t)(ULONG_PTR)&data->signer[0].v32;
+        data->provider.v32.dwEncoding = 0x10001U;
+        if (state->chains[1]) {
+            data->signer[0].v32.csCounterSigners = 1;
+            data->signer[0].v32.pasCounterSigners = (uint32_t)(ULONG_PTR)&data->signer[1].v32;
+        }
+    } else {
+        data->provider.v64.csSigners = 1;
+        data->provider.v64.pasSigners = (ULONG_PTR)&data->signer[0].v64;
+        data->provider.v64.dwEncoding = 0x10001U;
+        if (state->chains[1]) {
+            data->signer[0].v64.csCounterSigners = 1;
+            data->signer[0].v64.pasCounterSigners = (ULONG_PTR)&data->signer[1].v64;
+        }
+    }
+    return TRUE;
+}
+
+static PVOID WINAPI shim_WTHelperProvDataFromStateData(HANDLE handle)
+{
+    wintrust_state_t *state = wintrust_state_find(handle, NULL);
+    return state ? &state->data->provider : NULL;
+}
+
+static PVOID WINAPI shim_WTHelperGetProvSignerFromChain(
+    PVOID provider, DWORD signer, BOOL counter, DWORD counter_index)
+{
+    wintrust_state_t *state = wintrust_state_find(NULL, provider);
+    if (!state || signer || (counter && counter_index)) return NULL;
+    int index = counter ? 1 : 0;
+    if (!state->chains[index]) return NULL;
+    return &state->data->signer[index];
+}
+
 static LONG WINAPI shim_WinVerifyTrust(HANDLE window, const GUID *action,
                                         PVOID trust_data)
 {
@@ -1198,6 +1538,8 @@ static LONG WINAPI shim_WinVerifyTrust(HANDLE window, const GUID *action,
     DWORD revocation_checks;
     DWORD provider_flags;
     PVOID file_data;
+    HANDLE previous_state;
+    PVOID output_state;
     if (g_compat32_mode) {
         const wintrust_data32_t *data =
             (const wintrust_data32_t *)trust_data;
@@ -1208,6 +1550,8 @@ static LONG WINAPI shim_WinVerifyTrust(HANDLE window, const GUID *action,
         revocation_checks = data->fdwRevocationChecks;
         provider_flags = data->dwProvFlags;
         file_data = (PVOID)(ULONG_PTR)data->pFile;
+        previous_state = (HANDLE)(ULONG_PTR)data->hWVTStateData;
+        output_state = (BYTE *)trust_data + 32;
     } else {
         const wintrust_data64_t *data =
             (const wintrust_data64_t *)trust_data;
@@ -1218,15 +1562,20 @@ static LONG WINAPI shim_WinVerifyTrust(HANDLE window, const GUID *action,
         revocation_checks = data->fdwRevocationChecks;
         provider_flags = data->dwProvFlags;
         file_data = data->pFile;
+        previous_state = data->hWVTStateData;
+        output_state = &((wintrust_data64_t *)trust_data)->hWVTStateData;
     }
 
-    /* CLOSE only releases provider state. This implementation never retains
-     * state, so cleanup is complete even when verification previously failed. */
-    if (state_action == WTD_STATEACTION_CLOSE) return 0;
+    if (state_action == WTD_STATEACTION_CLOSE) {
+        wintrust_state_release(wintrust_state_find(previous_state, NULL));
+        cert_write_pointer(output_state, NULL);
+        return 0;
+    }
     if (!wintrust_guid_equal(action, &action_generic_verify_v2))
         return action ? TRUST_E_ACTION_UNKNOWN : TRUST_E_PROVIDER_UNKNOWN;
     if (union_choice != WTD_CHOICE_FILE || !file_data)
         return TRUST_E_SUBJECT_FORM_UNKNOWN;
+    if (state_action > 1) return TRUST_E_SUBJECT_FORM_UNKNOWN;
 
     PCWSTR path;
     HANDLE file;
@@ -1247,22 +1596,40 @@ static LONG WINAPI shim_WinVerifyTrust(HANDLE window, const GUID *action,
     }
     if (!path && (!file || file == INVALID_HANDLE_VALUE))
         return TRUST_E_SUBJECT_FORM_UNKNOWN;
-    if (path && GetFileAttributesW(path) == 0xFFFFFFFFU)
-        return TRUST_E_NOSIGNATURE;
-
-    authenticode_result_t result = authenticode_verify_file(
-        path, file, revocation_checks, provider_flags);
-    if (result == AUTHENTICODE_VERIFY_OK) return 0;
-    if (result == AUTHENTICODE_VERIFY_NO_SIGNATURE)
-        return TRUST_E_NOSIGNATURE;
+    wintrust_state_t *state = NULL;
+    DWORD software_policy = wintrust_policy_settings();
+    if (state_action == 1) {
+        wintrust_state_release(wintrust_state_find(previous_state, NULL));
+        cert_write_pointer(output_state, NULL);
+        state = wintrust_state_create(window, action, trust_data, provider_flags, software_policy);
+        if (!state) return (LONG)0x8007000EU;
+        cert_write_pointer(output_state, state->handle);
+    }
+    authenticode_result_t result = path && GetFileAttributesW(path) == 0xFFFFFFFFU
+        ? AUTHENTICODE_VERIFY_IO_ERROR : authenticode_verify_file_report(
+            path, file, revocation_checks, provider_flags,
+            software_policy,
+            state ? wintrust_chain_capture : NULL, state);
+    LONG status = result == AUTHENTICODE_VERIFY_OK ? 0 :
+        result == AUTHENTICODE_VERIFY_NO_SIGNATURE ? TRUST_E_NOSIGNATURE :
+        result == AUTHENTICODE_VERIFY_IO_ERROR ? (LONG)0x80092003U :
+        result == AUTHENTICODE_VERIFY_BAD_DIGEST ? (LONG)0x80096010U :
+        TRUST_E_SUBJECT_NOT_TRUSTED;
+    if (state) {
+        if (state->compat) state->data->provider.v32.dwFinalError = (DWORD)status;
+        else state->data->provider.v64.dwFinalError = (DWORD)status;
+        state->data->steps[35] = (DWORD)status;
+    }
+    if (!status) return 0;
 
     serial_puts("[WINTRUST] Authenticode rejected, reason=");
     serial_putdec((uint32_t)result);
     serial_puts("\n");
-    return TRUST_E_SUBJECT_NOT_TRUSTED;
+    return status;
 }
 
 static const WIN32_EXPORT crypt32_exports[] = {
+    WX_STD("CertVerifyCertificateChainPolicy",    shim_CertVerifyCertificateChainPolicy,    4),
     WX_STD("CertGetCertificateChain",             shim_CertGetCertificateChain,             8),
     WX_STD("CertOpenStore",                       shim_CertOpenStore,                       5),
     WX_STD("CertCloseStore",                      shim_CertCloseStore,                      2),
@@ -1292,6 +1659,9 @@ static const WIN32_EXPORT ncrypt_exports[] = {
 
 static const WIN32_EXPORT wintrust_exports[] = {
     WX_STD("WinVerifyTrust", shim_WinVerifyTrust, 3),
+    WX_STD("WinVerifyTrustEx", shim_WinVerifyTrust, 3),
+    WX_STD("WTHelperProvDataFromStateData", shim_WTHelperProvDataFromStateData, 1),
+    WX_STD("WTHelperGetProvSignerFromChain", shim_WTHelperGetProvSignerFromChain, 4),
     { NULL, NULL, 0, CC_STDCALL }
 };
 

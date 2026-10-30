@@ -6,14 +6,8 @@
 #include "handle.h"
 
 typedef struct _NT_FILE_IO_GUARD {
-    struct _NT_FILE_IO_GUARD *next;
-    PVOID identity;
-    PFILE_OBJECT owner_file;
-    ULONG owner_pid;
-    ULONGLONG offset;
-    ULONGLONG length;
-    BOOL write;
-    BOOL active;
+    /* Only this token lives on the caller's possibly process-private stack. */
+    ULONGLONG cookie;
 } NT_FILE_IO_GUARD;
 
 typedef void (*NT_FILE_LOCK_COMPLETION)(PVOID context, NTSTATUS status);
@@ -36,6 +30,8 @@ NTSTATUS nt_file_io_guard_begin(PFILE_OBJECT file, ULONG owner_pid,
                                 ULONGLONG offset, ULONGLONG length,
                                 BOOL write, NT_FILE_IO_GUARD *guard);
 void nt_file_io_guard_end(NT_FILE_IO_GUARD *guard);
+/* The owner's threads must have stopped before retiring abandoned I/O. */
+void nt_file_io_guards_release_process(ULONG owner_pid);
 
 void nt_file_locks_release_owner(PFILE_OBJECT file, ULONG owner_pid);
 void nt_file_locks_release_object(PFILE_OBJECT file);

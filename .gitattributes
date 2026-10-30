@@ -16,6 +16,7 @@
 *.java     text eol=lf
 *.inc      text eol=lf
 *.patch    text eol=lf
+arch/x86/scripts/patches/*.patch -whitespace
 *.ld       text eol=lf
 *.autoload text eol=lf
 *.def      text eol=lf

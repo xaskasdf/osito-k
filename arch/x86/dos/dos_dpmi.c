@@ -15,6 +15,7 @@
 #include "dos_io.h"
 #include "dos_mem.h"
 #include "dos_paging.h"
+#include "dos_xms.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -35,10 +36,72 @@ static dpmi_paging_t dpmi_current_paging(const cpu8086_state_t *cpu)
     return (dpmi_paging_t){ cpu->cr0, cpu->cr3 };
 }
 
+void dpmi_apply_coprocessor(cpu8086_state_t *cpu)
+{
+    if (!cpu || !cpu->vm || cpu8086_uses_guest_idt(cpu)) return;
+    const dpmi_state_t *client = &cpu->vm->dpmi;
+    if (client->active && client->coprocessor_requested)
+        cpu->cr0 = (cpu->cr0 & ~6u) | ((client->coprocessor_control & 3u) << 1);
+}
+
 static void dpmi_apply_paging(cpu8086_state_t *cpu, dpmi_paging_t paging)
 {
     cpu->cr3 = paging.cr3;
     cpu->cr0 = paging.cr0;
+    dpmi_apply_coprocessor(cpu);
+}
+
+dpmi_host_activation_t dpmi_host_activation_save(const dpmi_state_t *client)
+{
+    return (dpmi_host_activation_t){ .client_id = client->client_id,
+        .suspended_stack = client->suspended_stack, .real_stack = client->real_mode_stack,
+        .suspended_paging = client->suspended_paging, .real_paging = client->real_mode_paging,
+        .host_wait = client->host_wait, .callback_wait = client->callback_wait,
+        .exception_depth = client->exception_depth, .callback_depth = client->callback_depth,
+        .control_depth = client->control_depth, .interrupt_depth = client->interrupt_depth,
+        .virtual_if = client->virtual_interrupts_enabled };
+}
+
+void dpmi_host_activation_restore(dos_vm_t *vm, const dpmi_host_activation_t *saved)
+{
+    dpmi_state_t *client = (dpmi_state_t *)dos_exec_find_dpmi(vm, saved->client_id);
+    if (!client) return;
+    /* Do not roll back guest edits to descriptors, vectors or allocated
+     * resources. Only retire frames owned by this finished host activation. */
+    for (unsigned i = saved->exception_depth; i < DPMI_MAX_EXCEPTION_DEPTH; i++) {
+        client->exception_context[i] = (dpmi_exception_context_t){0};
+        client->exception_software_entries[i] = (dpmi_software_entry_t){0};
+        client->exception_esp_high[i] = 0;
+        client->exception_virtual_interrupts[i] = false;
+    }
+    for (unsigned i = saved->callback_depth; i < DPMI_MAX_CALLBACKS; i++) {
+        client->callback_slots[i] = 0;
+        client->callback_virtual_interrupts[i] = false;
+        client->callback_real_stacks[i] = (dpmi_stack_t){0};
+        client->callback_real_paging[i] = (dpmi_paging_t){0};
+    }
+    for (unsigned i = saved->interrupt_depth; i < DPMI_MAX_INTERRUPT_DEPTH; i++)
+        client->interrupt_frames[i] = (dpmi_interrupt_frame_t){0};
+    client->host_wait = saved->host_wait;
+    client->callback_wait = saved->callback_wait;
+    client->exception_depth = saved->exception_depth;
+    client->callback_depth = saved->callback_depth;
+    client->control_depth = saved->control_depth;
+    client->interrupt_depth = saved->interrupt_depth;
+    client->suspended_stack = saved->suspended_stack;
+    client->real_mode_stack = saved->real_stack;
+    client->suspended_paging = saved->suspended_paging;
+    client->real_mode_paging = saved->real_paging;
+    client->virtual_interrupts_enabled = saved->virtual_if;
+}
+
+bool dpmi_host_resume_client(dos_vm_t *vm, uint64_t client_id)
+{
+    if (dos_exec_select_dpmi(vm, dos_exec_find_dpmi(vm, client_id))) return true;
+    serial_puts("[DPMI] Host continuation owner no longer exists\n");
+    if (vm->cpu->running) vm->cpu->exit_code = -1;
+    vm->cpu->running = false;
+    return false;
 }
 
 static void dpmi_zero(void *dst, uint64_t len)
@@ -66,19 +129,19 @@ static uint32_t dpmi_ext_limit(const dos_vm_t *vm)
     return total - DPMI_HOST_STACK_AREA;
 }
 
-static bool dpmi_ext_page_used(const dpmi_state_t *dpmi, uint32_t page)
+static bool dpmi_ext_page_used(const dos_vm_t *vm, uint32_t page)
 {
-    return (dpmi->ext_page_bitmap[page >> 3] &
+    return (vm->ext_page_bitmap[page >> 3] &
             (uint8_t)(1u << (page & 7u))) != 0;
 }
 
-static void dpmi_ext_page_set(dpmi_state_t *dpmi, uint32_t page, bool used)
+static void dpmi_ext_page_set(dos_vm_t *vm, uint32_t page, bool used)
 {
     uint8_t mask = (uint8_t)(1u << (page & 7u));
     if (used)
-        dpmi->ext_page_bitmap[page >> 3] |= mask;
+        vm->ext_page_bitmap[page >> 3] |= mask;
     else
-        dpmi->ext_page_bitmap[page >> 3] &= (uint8_t)~mask;
+        vm->ext_page_bitmap[page >> 3] &= (uint8_t)~mask;
 }
 
 uint32_t dpmi_ext_total_pages(const dos_vm_t *vm)
@@ -95,7 +158,7 @@ uint32_t dpmi_ext_free_page_count(const dos_vm_t *vm)
     uint32_t total = dpmi_ext_total_pages(vm);
     uint32_t free_pages = 0;
     for (uint32_t page = 0; page < total; page++)
-        if (!dpmi_ext_page_used(&vm->dpmi, page)) free_pages++;
+        if (!dpmi_ext_page_used(vm, page)) free_pages++;
     return free_pages;
 }
 
@@ -106,7 +169,7 @@ uint32_t dpmi_ext_largest_free_page_count(const dos_vm_t *vm)
     uint32_t largest = 0;
     uint32_t run = 0;
     for (uint32_t page = 0; page < total; page++) {
-        if (dpmi_ext_page_used(&vm->dpmi, page)) {
+        if (dpmi_ext_page_used(vm, page)) {
             run = 0;
         } else {
             run++;
@@ -123,9 +186,9 @@ static bool dpmi_ext_claim_pages(dos_vm_t *vm, uint32_t first,
     uint32_t total = dpmi_ext_total_pages(vm);
     if (first >= total || count > total - first) return false;
     for (uint32_t page = 0; page < count; page++)
-        if (dpmi_ext_page_used(&vm->dpmi, first + page)) return false;
+        if (dpmi_ext_page_used(vm, first + page)) return false;
     for (uint32_t page = 0; page < count; page++)
-        dpmi_ext_page_set(&vm->dpmi, first + page, true);
+        dpmi_ext_page_set(vm, first + page, true);
 
     uint32_t base = DPMI_EXT_BASE + first * DPMI_EXT_PAGE_SIZE;
     dpmi_zero(vm->mem + base, (uint64_t)count * DPMI_EXT_PAGE_SIZE);
@@ -152,6 +215,32 @@ uint32_t dpmi_ext_alloc_pages(dos_vm_t *vm, uint32_t count, bool high)
     return 0;
 }
 
+bool dpmi_ext_reserve_pages(dos_vm_t *vm, uint32_t base, uint32_t count)
+{
+    if (!vm || !vm->mem || base < DPMI_EXT_BASE ||
+        (base & (DPMI_EXT_PAGE_SIZE - 1u))) return false;
+    return dpmi_ext_claim_pages(vm, (base - DPMI_EXT_BASE) / DPMI_EXT_PAGE_SIZE, count);
+}
+
+bool dpmi_ext_resize_pages(dos_vm_t *vm, uint32_t base, uint32_t old_count,
+                            uint32_t new_count)
+{
+    if (!vm || !vm->mem || !old_count || base < DPMI_EXT_BASE ||
+        (base & (DPMI_EXT_PAGE_SIZE - 1u))) return false;
+    uint32_t first = (base - DPMI_EXT_BASE) / DPMI_EXT_PAGE_SIZE;
+    uint32_t total = dpmi_ext_total_pages(vm);
+    if (first >= total || old_count > total - first || new_count > total - first)
+        return false;
+    for (uint32_t i = 0; i < old_count; i++)
+        if (!dpmi_ext_page_used(vm, first + i)) return false;
+    if (new_count > old_count)
+        return dpmi_ext_claim_pages(vm, first + old_count, new_count - old_count);
+    if (new_count < old_count)
+        return dpmi_ext_free_pages(vm, base + new_count * DPMI_EXT_PAGE_SIZE,
+                                   old_count - new_count);
+    return true;
+}
+
 bool dpmi_ext_free_pages(dos_vm_t *vm, uint32_t base, uint32_t count)
 {
     if (!vm || !vm->mem || !count || base < DPMI_EXT_BASE ||
@@ -162,11 +251,11 @@ bool dpmi_ext_free_pages(dos_vm_t *vm, uint32_t base, uint32_t count)
     uint32_t total = dpmi_ext_total_pages(vm);
     if (first >= total || count > total - first) return false;
     for (uint32_t page = 0; page < count; page++)
-        if (!dpmi_ext_page_used(&vm->dpmi, first + page)) return false;
+        if (!dpmi_ext_page_used(vm, first + page)) return false;
 
     dpmi_zero(vm->mem + base, (uint64_t)count * DPMI_EXT_PAGE_SIZE);
     for (uint32_t page = 0; page < count; page++)
-        dpmi_ext_page_set(&vm->dpmi, first + page, false);
+        dpmi_ext_page_set(vm, first + page, false);
     return true;
 }
 
@@ -187,16 +276,82 @@ static bool dpmi_limit_is_representable(uint32_t limit)
     return limit <= 0xFFFFFU || (limit & 0xFFFU) == 0xFFFU;
 }
 
+static bool dpmi_reserve_real_stack(dos_vm_t *vm)
+{
+    dpmi_state_t *dpmi = &vm->dpmi;
+    if (dpmi->real_stack_base) return true;
+    if (!vm->mem) return false;
+    const uint32_t first = dos_linear(DPMI_ENTRY_SEG, DPMI_RM_STACK_BASE_OFF);
+    uint8_t used[(DPMI_RM_STACK_COUNT + 7u) / 8u] = {0};
+    const dpmi_state_t *parent = NULL;
+    while ((parent = dos_exec_suspended_dpmi(vm, parent)) != NULL) {
+        uint32_t base = parent->real_stack_base;
+        if (base < first || base - first >= DPMI_RM_STACK_COUNT * DPMI_RM_STACK_SIZE)
+            continue;
+        unsigned slot = (base - first) / DPMI_RM_STACK_SIZE;
+        used[slot >> 3] |= (uint8_t)(1u << (slot & 7u));
+    }
+    uint32_t limit = dpmi_memory_limit(vm);
+    for (unsigned slot = DPMI_RM_STACK_COUNT; slot-- > 0;) {
+        uint32_t base = first + slot * DPMI_RM_STACK_SIZE;
+        if (used[slot >> 3] & (uint8_t)(1u << (slot & 7u))) continue;
+        if (base > limit || DPMI_RM_STACK_SIZE > limit - base) continue;
+        dpmi_zero(vm->mem + base, DPMI_RM_STACK_SIZE);
+        dpmi->real_stack_base = base;
+        dpmi->real_mode_stack = (dpmi_stack_t){ base >> 4, DPMI_RM_STACK_SIZE };
+        return true;
+    }
+    return false;
+}
+
+static void dpmi_release_real_stack(dos_vm_t *vm)
+{
+    uint32_t base = vm->dpmi.real_stack_base;
+    if (base && vm->mem && base <= vm->total_mem_size &&
+        DPMI_RM_STACK_SIZE <= vm->total_mem_size - base)
+        dpmi_zero(vm->mem + base, DPMI_RM_STACK_SIZE);
+    vm->dpmi.real_stack_base = 0;
+    vm->dpmi.real_mode_stack = (dpmi_stack_t){0};
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * 1. dpmi_init -- Initialize DPMI host state
  * ══════════════════════════════════════════════════════════════════ */
 
 void dpmi_init(dos_vm_t *vm)
 {
+    if (!vm) return;
+    vm->dpmi_client_serial = vm->dpmi_primary_id = 0;
+    vm->dpmi_client_scope = NULL;
+    dpmi_zero(vm->ext_page_bitmap, sizeof(vm->ext_page_bitmap));
+    dpmi_init_client(vm);
+}
+
+static uint16_t dpmi_free_raw_segment(const dos_vm_t *vm)
+{
+    uint8_t used[(DPMI_RAW_ALIAS_COUNT + 7u) / 8u] = {0};
+    const dpmi_state_t *client = &vm->dpmi;
+    do {
+        unsigned slot = DPMI_ENTRY_SEG - client->raw_real_segment;
+        if (client->active && slot < DPMI_RAW_ALIAS_COUNT)
+            used[slot >> 3] |= (uint8_t)(1u << (slot & 7u));
+        client = dos_exec_suspended_dpmi(vm, client == &vm->dpmi ? NULL : client);
+    } while (client);
+    for (unsigned slot = 0; slot < DPMI_RAW_ALIAS_COUNT; slot++)
+        if (!(used[slot >> 3] & (uint8_t)(1u << (slot & 7u))))
+            return DPMI_ENTRY_SEG - slot;
+    return 0;
+}
+
+void dpmi_init_client(dos_vm_t *vm)
+{
+    if (!vm) return;
     dpmi_state_t *dpmi = &vm->dpmi;
 
-    /* Zero entire DPMI state */
+    /* A new client must not reset the VM's physical page reservations. */
     dpmi_zero(dpmi, sizeof(*dpmi));
+    dpmi->client_id = ++vm->dpmi_client_serial;
+    dpmi->raw_real_segment = dpmi_free_raw_segment(vm);
 
     dpmi->next_free_index = DPMI_SPECIFIC_DESCRIPTOR_COUNT;
     dpmi->next_handle = 1;
@@ -205,7 +360,7 @@ void dpmi_init(dos_vm_t *vm)
                                     : (dpmi_paging_t){0};
     dpmi->real_mode_paging.cr0 &= ~(1u | DOS_CR0_PG);
     dpmi->suspended_paging = dpmi->real_mode_paging;
-    dpmi->suspended_paging.cr0 |= 1u;
+    dpmi->suspended_paging.cr0 |= 0x21u; /* Protected clients receive #MF. */
 
     /* Write DPMI entry stub in ROM area at F000:0100
      * CD FE   INT 0xFE
@@ -218,7 +373,7 @@ void dpmi_init(dos_vm_t *vm)
         vm->mem[stub_addr + 2] = 0xCB;  /* RETF */
     }
 
-    vm->dpmi.real_mode_stack = (dpmi_stack_t){ DPMI_ENTRY_SEG, DPMI_RM_STACK_TOP };
+    (void)dpmi_reserve_real_stack(vm);
 
     /* 0305h is a FAR-call target; the private gate preserves all registers.
      * 0306h is a FAR-jump target; INT FC consumes its register contract and
@@ -323,10 +478,13 @@ void dpmi_init(dos_vm_t *vm)
         }
     }
 
-    serial_puts("[DPMI] Host initialized, entry at F000:0100,"
-                " save F000:0110, mode-switch F000:0118,"
-                " exception-return F000:0120, callback-return F000:0140,"
-                " reflectors F000:1000/1400\n");
+    if (!vm->dpmi_host_reported) {
+        vm->dpmi_host_reported = true;
+        serial_puts("[DPMI] Host initialized, entry at F000:0100,"
+                    " save F000:0110, mode-switch F000:0118,"
+                    " exception-return F000:0120, callback-return F000:0140,"
+                    " reflectors F000:1000/1400\n");
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -488,6 +646,7 @@ uint32_t dpmi_translate(dos_vm_t *vm, uint16_t selector, uint32_t offset)
 void dos_int2f_dispatch(dos_vm_t *vm)
 {
     cpu8086_state_t *cpu = vm->cpu;
+    if (dos_xms_multiplex(vm)) return;
 
     switch (cpu->ax) {
     case 0x1687:
@@ -549,25 +708,6 @@ static bool dpmi_selector_is_code(const dpmi_state_t *dpmi, uint16_t sel)
     uint8_t required = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
                        DESC_CODE | DESC_READABLE;
     return (access & required) == required && !(access & 0x04);
-}
-
-static bool dpmi_selector_is_data(const dpmi_state_t *dpmi, uint16_t sel,
-                                  bool require_writable)
-{
-    if ((sel & ~3u) == 0)
-        return !require_writable;
-
-    uint16_t idx;
-    if (!dpmi_selector_allocated(dpmi, sel, &idx))
-        return false;
-
-    uint8_t access = dpmi->ldt[idx].access;
-    uint8_t required = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT;
-    if ((access & required) != required)
-        return false;
-    if (access & DESC_CODE)
-        return !require_writable && (access & DESC_READABLE);
-    return !require_writable || (access & DESC_WRITABLE);
 }
 
 static bool dpmi_rights_valid(uint8_t access, uint8_t flags)
@@ -854,6 +994,33 @@ uint16_t dpmi_get_host_code_selector(dos_vm_t *vm)
     return vm ? dpmi_host_code_selector(&vm->dpmi) : 0;
 }
 
+bool dpmi_native_interrupt_return_selector(const dos_vm_t *vm, uint16_t selector)
+{
+    uint16_t index;
+    return vm && vm->dpmi.sel_interrupt_return &&
+           (selector & ~3u) == (vm->dpmi.sel_interrupt_return & ~3u) &&
+           dpmi_selector_allocated(&vm->dpmi, selector, &index) &&
+           vm->dpmi.descriptor_state[index] == DPMI_DESC_HOST;
+}
+
+uint16_t dpmi_get_interrupt_return_selector(dos_vm_t *vm)
+{
+    uint16_t host = dpmi_get_host_code_selector(vm);
+    if (!host || !vm->native_active) return host;
+    dpmi_state_t *dpmi = &vm->dpmi;
+    uint16_t selector = dpmi->sel_interrupt_return;
+    if (dpmi_native_interrupt_return_selector(vm, selector)) return selector;
+    selector = dpmi_alloc_descriptor(dpmi);
+    if (!selector) return 0;
+    uint16_t index = dpmi_sel_to_index(selector);
+    dpmi->ldt[index] = dpmi->ldt[dpmi_sel_to_index(host)];
+    dpmi->descriptor_state[index] = DPMI_DESC_HOST;
+    dpmi->sel_interrupt_return = selector;
+    /* Only the backend shadow is absent: trap IRET before it pops FLAGS. */
+    dos_native_sync_ldt(vm);
+    return selector;
+}
+
 uint16_t dpmi_get_exception_stack_selector(dos_vm_t *vm)
 {
     if (!vm || !vm->mem ||
@@ -863,91 +1030,191 @@ uint16_t dpmi_get_exception_stack_selector(dos_vm_t *vm)
     dpmi_state_t *dpmi = &vm->dpmi;
     uint16_t index;
     uint16_t selector = dpmi->sel_exception_stack;
+    uint16_t next_free = dpmi->next_free_index;
+    bool created = false;
     if (!dpmi_selector_allocated(dpmi, selector, &index) ||
         dpmi->descriptor_state[index] != DPMI_DESC_HOST) {
         selector = dpmi_alloc_descriptor(dpmi);
         if (!selector) return 0;
         index = dpmi_sel_to_index(selector);
-        dpmi->sel_exception_stack = selector;
-        dpmi->descriptor_state[index] = DPMI_DESC_HOST;
+        created = true;
     }
+    if (!dpmi->locked_stack_base) {
+        uint32_t base = dpmi_ext_limit(vm);
+        bool reserved_used = false;
+        const dpmi_state_t *parent = NULL;
+        while ((parent = dos_exec_suspended_dpmi(vm, parent)) != NULL)
+            if (parent->locked_stack_base == base) reserved_used = true;
+        if (reserved_used) {
+            base = dpmi_ext_alloc_pages(vm, 1, true);
+            if (!base) {
+                if (created) dpmi_release_descriptor(dpmi, index);
+                dpmi->next_free_index = next_free;
+                return 0;
+            }
+            dpmi->locked_stack_allocated = true;
+        }
+        dpmi->locked_stack_base = base;
+    }
+    dpmi->sel_exception_stack = selector;
+    dpmi->descriptor_state[index] = DPMI_DESC_HOST;
     dpmi_build_desc(&dpmi->ldt[index],
-                    dpmi_ext_limit(vm),
+                    dpmi->locked_stack_base,
                     DPMI_EXCEPTION_STACK_SIZE - 1u,
                     DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT | DESC_WRITABLE,
                     dpmi->is_32bit ? DESC_32BIT : 0);
     return selector;
 }
 
-bool dpmi_raw_mode_switch(dos_vm_t *vm, uint8_t private_frame_bytes)
+static void dpmi_release_locked_stack(dos_vm_t *vm)
 {
-    if (!vm || !vm->cpu)
-        return false;
+    dpmi_state_t *dpmi = &vm->dpmi;
+    if (dpmi->locked_stack_allocated)
+        (void)dpmi_ext_free_pages(vm, dpmi->locked_stack_base, 1);
+    dpmi->locked_stack_base = 0;
+    dpmi->locked_stack_allocated = false;
+    uint16_t index;
+    if (dpmi_selector_allocated(dpmi, dpmi->sel_exception_stack, &index) &&
+        dpmi->descriptor_state[index] == DPMI_DESC_HOST)
+        dpmi_release_descriptor(dpmi, index);
+    dpmi->sel_exception_stack = 0;
+}
+
+static uint16_t dpmi_free_callback_address(const dos_vm_t *vm)
+{
+    uint8_t used[(DPMI_CALLBACK_ADDRESS_COUNT + 7u) / 8u] = {0};
+    const dpmi_state_t *client = &vm->dpmi;
+    do {
+        for (unsigned i = 0; i < DPMI_MAX_CALLBACKS; i++) {
+            const dpmi_callback_t *cb = &client->callbacks[i];
+            if (!cb->active || cb->rm_seg != DPMI_ENTRY_SEG ||
+                cb->rm_off < DPMI_CALLBACK_BASE_OFF ||
+                cb->rm_off >= DPMI_PM_REFLECT_BASE_OFF) continue;
+            unsigned slot = (cb->rm_off - DPMI_CALLBACK_BASE_OFF) / DPMI_CALLBACK_STUB_SIZE;
+            used[slot >> 3] |= (uint8_t)(1u << (slot & 7u));
+        }
+        client = dos_exec_suspended_dpmi(vm, client == &vm->dpmi ? NULL : client);
+    } while (client);
+    for (unsigned slot = 0; slot < DPMI_CALLBACK_ADDRESS_COUNT; slot++)
+        if (!(used[slot >> 3] & (uint8_t)(1u << (slot & 7u))))
+            return DPMI_CALLBACK_BASE_OFF + slot * DPMI_CALLBACK_STUB_SIZE;
+    return 0;
+}
+
+void dpmi_release_host_resources(dos_vm_t *vm)
+{
+    if (!vm) return;
+    vm->dpmi.raw_real_segment = 0;
+    for (unsigned i = 0; i < DPMI_MAX_MEM_BLOCKS; i++) {
+        dpmi_mem_block_t *block = &vm->dpmi.mem_blocks[i];
+        if (!block->allocated) continue;
+        (void)dpmi_ext_free_pages(vm, block->base,
+                                  block->size / DPMI_EXT_PAGE_SIZE);
+        dpmi_zero(block, sizeof(*block));
+    }
+    for (unsigned i = 0; i < DPMI_MAX_CALLBACKS; i++) {
+        dpmi_callback_t *cb = &vm->dpmi.callbacks[i];
+        if (!cb->active) continue;
+        uint32_t address = dos_linear(cb->rm_seg, cb->rm_off);
+        if (vm->mem && address <= vm->total_mem_size &&
+            DPMI_CALLBACK_STUB_SIZE <= vm->total_mem_size - address)
+            for (unsigned byte = 0; byte < DPMI_CALLBACK_STUB_SIZE; byte++)
+                vm->mem[address + byte] = 0xF4;
+        dpmi_zero(cb, sizeof(*cb));
+    }
+    dpmi_release_locked_stack(vm);
+    dpmi_release_real_stack(vm);
+}
+
+const dpmi_state_t *dpmi_raw_real_owner(const dos_vm_t *vm)
+{
+    const cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    if (!cpu || cpu->protected_mode || cpu->eip > 0xFFFFu ||
+        dpmi_desc_get_base(&cpu->cs_cache.descriptor) != ((uint32_t)cpu->cs << 4) ||
+        ((uint32_t)cpu->cs << 4) + cpu->eip !=
+            ((uint32_t)DPMI_ENTRY_SEG << 4) + DPMI_RAW_SWITCH_OFF + 2u)
+        return NULL;
+    const dpmi_state_t *client = &vm->dpmi;
+    do {
+        if (client->active && client->raw_real_segment == cpu->cs) return client;
+        client = dos_exec_suspended_dpmi(vm, client == &vm->dpmi ? NULL : client);
+    } while (client);
+    return NULL;
+}
+
+dpmi_service_result_t dpmi_raw_mode_switch(dos_vm_t *vm, uint8_t private_frame_bytes)
+{
+    if (!vm || !vm->cpu || !vm->dpmi.active || vm->cpu->delivery_fault)
+        return DPMI_SERVICE_INVALID;
 
     cpu8086_state_t *cpu = vm->cpu;
-    uint16_t next_ds = cpu->ax;
-    uint16_t next_es = cpu->cx;
-    uint16_t next_ss = cpu->dx;
-    uint16_t next_cs = cpu->si;
-    dpmi_stack_t outgoing = { cpu->ss, cpu->esp };
-    if (cpu_stack_addr32(cpu))
-        outgoing.esp += private_frame_bytes;
-    else
-        outgoing.esp = (outgoing.esp & 0xFFFF0000u) |
-                       (uint16_t)(cpu->sp + private_frame_bytes);
+    uint64_t caller_id = vm->dpmi.client_id;
+    const dpmi_state_t *owner = dpmi_raw_real_owner(vm);
+    if (owner && !dos_exec_select_dpmi(vm, owner)) return DPMI_SERVICE_INVALID;
+    /* This is a FAR JMP service. Its private INT frame is not a client
+     * return address, including when admission invokes a repair handler. */
     uint32_t flags = private_frame_bytes ? vm->software_int_return_flags
                                          : cpu8086_flags_image(cpu);
-    if (cpu->protected_mode && vm->dpmi.active)
+    if (private_frame_bytes) {
+        cpu_stack_adjust(cpu, private_frame_bytes);
+        cpu->eflags = flags | FLAGS_FIXED;
+        vm->software_int_frame_bytes = 0;
+    }
+    if (cpu->protected_mode)
         flags = (flags & ~FLAG_IF) |
                 (vm->dpmi.virtual_interrupts_enabled ? FLAG_IF : 0);
 
     if (!cpu->protected_mode) {
-        uint32_t next_sp = vm->dpmi.is_32bit ? cpu->ebx : cpu->bx;
-        uint32_t next_ip = vm->dpmi.is_32bit ? cpu->edi : cpu->di;
-        uint16_t code_idx;
+        for (;;) {
+            cpu8086_state_t real = *cpu;
+            flags = cpu8086_flags_image(cpu);
+            cpu->ds = cpu->ax;
+            cpu->es = cpu->cx;
+            cpu->ss = cpu->dx;
+            cpu->esp = vm->dpmi.is_32bit ? cpu->ebx : cpu->bx;
+            cpu->cs = cpu->si;
+            cpu->eip = vm->dpmi.is_32bit ? cpu->edi : cpu->di;
+            cpu->fs = cpu->gs = 0;
+            cpu->eflags = (flags & ~FLAG_VM) | FLAGS_FIXED | FLAG_IF;
+            cpu->protected_mode = true;
+            cpu->cpl = 3;
+            cpu8086_use_host_ldt(cpu);
+            dpmi_apply_paging(cpu, vm->dpmi.suspended_paging);
+            cpu->cr0 |= 1u;
 
-        if (!dpmi_selector_is_code(&vm->dpmi, next_cs) ||
-            !dpmi_selector_is_data(&vm->dpmi, next_ss, true) ||
-            !dpmi_selector_is_data(&vm->dpmi, next_ds, false) ||
-            !dpmi_selector_is_data(&vm->dpmi, next_es, false) ||
-            !dpmi_selector_allocated(&vm->dpmi, next_cs, &code_idx) ||
-            next_ip > dpmi_desc_get_limit(&vm->dpmi.ldt[code_idx])) {
-            serial_puts("[DPMI] Raw RM->PM switch rejected invalid selectors\n");
-            return false;
+            cpu_system_segment_t loaded[6];
+            cpu_event_fault_t fault;
+            if (cpu8086_probe_native_segments(cpu, loaded, &fault)) {
+                uint16_t selectors[] = { cpu->es, cpu->cs, cpu->ss, cpu->ds, cpu->fs, cpu->gs };
+                for (unsigned i = 0; i < 6; i++)
+                    cpu8086_cache_segment(cpu, i, selectors[i], loaded[i].valid ? &loaded[i].descriptor : NULL);
+                vm->dpmi.real_mode_stack = (dpmi_stack_t){ real.ss, real.sp };
+                vm->dpmi.real_mode_paging = dpmi_current_paging(&real);
+                vm->dpmi.virtual_interrupts_enabled = (flags & FLAG_IF) != 0;
+                cpu->halted = false;
+                serial_puts("[DPMI] Raw switch RM->PM\n");
+                return DPMI_SERVICE_COMPLETE;
+            }
+            uint32_t linear = cpu->cr2;
+            *cpu = real;
+            if (!fault.raised || !dpmi_real_service_exception(vm, fault.vector, fault.error, linear)) {
+                (void)dos_exec_select_dpmi(vm, dos_exec_find_dpmi(vm, caller_id));
+                return fault.raised ? DPMI_SERVICE_INTERRUPTED : DPMI_SERVICE_INVALID;
+            }
+            /* The handler can repair descriptors, paging or argument registers.
+             * Revalidate its complete result without replaying the private INT. */
+            cpu = vm->cpu;
         }
-
-        vm->dpmi.real_mode_stack = (dpmi_stack_t){ outgoing.ss,
-                                                   (uint16_t)outgoing.esp };
-        vm->dpmi.real_mode_paging = dpmi_current_paging(cpu);
-        vm->dpmi.virtual_interrupts_enabled = (flags & FLAG_IF) != 0;
-        cpu->eflags = flags | FLAGS_FIXED | FLAG_IF;
-        cpu->ds = next_ds;
-        cpu->es = next_es;
-        cpu->ss = next_ss;
-        cpu->esp = next_sp;
-        cpu->cs = next_cs;
-        cpu->eip = next_ip;
-        cpu->fs = 0;
-        cpu->gs = 0;
-        cpu->protected_mode = true;
-        cpu->pm_cs_loaded = true;
-        cpu8086_use_host_ldt(cpu);
-        dpmi_apply_paging(cpu, vm->dpmi.suspended_paging);
-        cpu8086_sync_cs(cpu);
-        cpu8086_sync_data(cpu);
-        cpu->halted = false;
-        serial_puts("[DPMI] Raw switch RM->PM\n");
-        return true;
     }
 
-    vm->dpmi.suspended_stack = outgoing;
+    vm->dpmi.suspended_stack = (dpmi_stack_t){ cpu->ss, cpu->esp };
     vm->dpmi.suspended_paging = dpmi_current_paging(cpu);
     cpu->eflags = flags | FLAGS_FIXED;
-    cpu->ds = next_ds;
-    cpu->es = next_es;
-    cpu->ss = next_ss;
+    cpu->ds = cpu->ax;
+    cpu->es = cpu->cx;
+    cpu->ss = cpu->dx;
     cpu->esp = cpu->bx;
-    cpu->cs = next_cs;
+    cpu->cs = cpu->si;
     cpu->eip = cpu->di;
     cpu->fs = 0;
     cpu->gs = 0;
@@ -960,7 +1227,7 @@ bool dpmi_raw_mode_switch(dos_vm_t *vm, uint8_t private_frame_bytes)
     cpu8086_sync_data(cpu);
     cpu->halted = false;
     serial_puts("[DPMI] Raw switch PM->RM\n");
-    return true;
+    return DPMI_SERVICE_COMPLETE;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -992,6 +1259,11 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
     }
 
     bool is_32bit = (cpu->ax & 1u) != 0;
+
+    if (!dpmi->raw_real_segment || !dpmi_reserve_real_stack(vm)) {
+        error = 0x8011;
+        goto fail;
+    }
 
     /* Per DPMI spec, initial selectors map the client's real-mode segments.
      * cpu->cs is F000 (the stub), so read the CALLER's CS from the stack.
@@ -1087,6 +1359,7 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
     dpmi->saved_es = cpu->es;
     dpmi->active = true;
     dpmi->owner_psp = vm->current_psp;
+    vm->dpmi_primary_id = dpmi->client_id;
     dpmi->is_32bit = is_32bit;
     dpmi->virtual_interrupts_enabled = (return_flags & FLAG_IF) != 0;
 
@@ -1101,7 +1374,7 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
     cpu->pm_cs_loaded   = true;
     cpu->op_size_32     = false;
     cpu->addr_size_32   = false;
-    cpu->cr0           |= 1;
+    cpu->cr0           |= 0x21u;
     dpmi->suspended_paging = dpmi_current_paging(cpu);
 
     /* Set segment registers to PM selectors */
@@ -1161,13 +1434,8 @@ fail:
             dpmi_release_descriptor(dpmi, host_index);
         dpmi->sel_host_code = 0;
     }
-    if (dpmi->sel_exception_stack) {
-        uint16_t index = dpmi_sel_to_index(dpmi->sel_exception_stack);
-        if (index < DPMI_MAX_DESCRIPTORS &&
-            dpmi->descriptor_state[index] == DPMI_DESC_HOST)
-            dpmi_release_descriptor(dpmi, index);
-        dpmi->sel_exception_stack = 0;
-    }
+    dpmi_release_locked_stack(vm);
+    dpmi_release_real_stack(vm);
     dpmi->active = false;
     dpmi->is_32bit = false;
     if (exec_client) dos_exec_abort_dpmi_client(vm);
@@ -1369,6 +1637,16 @@ static bool dpmi_buffer_transfer(dos_vm_t *vm, dpmi_client_buffer_t *buffer,
     return size == 0;
 }
 
+bool dpmi_read_service_record(dos_vm_t *vm, uint16_t selector, uint32_t offset,
+                               void *data, uint32_t size)
+{
+    dpmi_client_buffer_t buffer;
+    if (!vm || !vm->cpu || !vm->dpmi.active || !data || !size || size > 64u)
+        return false;
+    return dpmi_service_buffer(vm, selector, offset, size, false, &buffer) &&
+           dpmi_buffer_transfer(vm, &buffer, 0, data, size, false);
+}
+
 static uint32_t dpmi_buffer_load(dos_vm_t *vm, dpmi_client_buffer_t *buffer,
                                   uint32_t offset, unsigned width)
 {
@@ -1564,8 +1842,8 @@ bool dpmi_locked_stack_top(dos_vm_t *vm, uint32_t size, dpmi_stack_t *stack)
 
 bool dpmi_has_real_timer_handler(const dos_vm_t *vm)
 {
-    if (!vm || !vm->dpmi.active) return false;
-    const dpmi_state_t *dpmi = &vm->dpmi;
+    const dpmi_state_t *dpmi = dos_exec_primary_dpmi(vm);
+    if (!dpmi) return false;
     return dpmi->pm_vectors[0x1C].sel &&
            !(dpmi->pm_vectors[0x1C].sel == dpmi->sel_host_code &&
              dpmi->pm_vectors[0x1C].off == DPMI_PM_REFLECT_BASE_OFF +
@@ -1597,21 +1875,32 @@ static bool dpmi_prepare_control_frame(dos_vm_t *vm, const dpmi_stack_t *stack,
     return true;
 }
 
-bool dpmi_reflect_timer(dos_vm_t *vm)
+static bool dpmi_invoke_primary_interrupt(dos_vm_t *vm, uint8_t vector,
+                                           bool hardware)
 {
     cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
-    if (!cpu || cpu->protected_mode || !dpmi_has_real_timer_handler(vm))
-        return false;
+    const dpmi_state_t *primary = dos_exec_primary_dpmi(vm);
+    dpmi_client_scope_t scope;
+    if (!cpu || !dos_exec_enter_dpmi(vm, primary, &scope)) return false;
     dpmi_state_t *dpmi = &vm->dpmi;
-    uint16_t selector = dpmi->pm_vectors[0x1C].sel;
-    uint32_t offset = dpmi->pm_vectors[0x1C].off;
+    dpmi_host_activation_t activation = dpmi_host_activation_save(dpmi);
+    uint16_t selector = dpmi->pm_vectors[vector].sel;
+    uint32_t offset = dpmi->pm_vectors[vector].off;
     cpu8086_state_t saved = *cpu;
+    /* A foreign client's selectors and hidden caches do not name primary
+     * segments. Select the primary's dormant locked stack before entering. */
+    cpu->protected_mode = false;
+    cpu8086_use_host_ldt(cpu);
     dpmi_apply_paging(cpu, dpmi->suspended_paging);
     uint16_t host_cs = dpmi_get_host_code_selector(vm);
+    if (!selector && hardware) {
+        selector = host_cs;
+        offset = DPMI_PM_HW_REFLECT_BASE_OFF + vector * DPMI_PM_REFLECT_STUB_SIZE;
+    }
     dpmi_stack_t stack;
     dpmi_stack_frame_t frame;
-    uint32_t flags = vm->software_int_frame_bytes
-                   ? vm->software_int_return_flags : cpu->eflags;
+    uint32_t flags = !hardware && vm->software_int_frame_bytes
+                   ? vm->software_int_return_flags : cpu8086_flags_image(&saved);
     if (!host_cs || !dpmi_code_target(vm, selector, offset) ||
         dpmi->control_depth >= DPMI_MAX_CALLBACKS ||
         !dpmi_locked_stack_top(vm, dpmi->is_32bit ? 12u : 6u, &stack) ||
@@ -1619,16 +1908,16 @@ bool dpmi_reflect_timer(dos_vm_t *vm)
                                      flags, NULL, &frame) ||
         !dpmi_store_stack_frame(vm, &frame)) {
         *cpu = saved;
+        dos_exec_leave_dpmi(vm, &scope);
         return false;
     }
 
-    dpmi_stack_t saved_real_stack = dpmi->real_mode_stack;
-    dpmi_paging_t saved_real_paging = dpmi->real_mode_paging;
-    bool saved_virtual_if = dpmi->virtual_interrupts_enabled;
-    dpmi->real_mode_stack = (dpmi_stack_t){ cpu->ss, cpu->sp };
-    dpmi->real_mode_paging = dpmi_current_paging(&saved);
+    if (!saved.protected_mode) {
+        dpmi->real_mode_stack = (dpmi_stack_t){ saved.ss, saved.sp };
+        dpmi->real_mode_paging = dpmi_current_paging(&saved);
+    }
     dpmi->control_depth++;
-    dpmi->virtual_interrupts_enabled = (flags & FLAG_IF) != 0;
+    dpmi->virtual_interrupts_enabled = !hardware && (flags & FLAG_IF) != 0;
     cpu->protected_mode = true;
     cpu->pm_cs_loaded = true;
     cpu->cpl = 3;
@@ -1645,6 +1934,10 @@ bool dpmi_reflect_timer(dos_vm_t *vm)
     bool returned = cpu8086_run_until(vm, true, host_cs,
                                       DPMI_CONTROL_RETURN_OFF);
     vm->native_dispatch_depth--;
+    if (!dpmi_host_resume_client(vm, activation.client_id)) {
+        dos_exec_leave_dpmi(vm, &scope);
+        return false;
+    }
     bool valid = returned && cpu->ss == stack.ss && cpu->esp == stack.esp;
     saved.eax = cpu->eax; saved.ebx = cpu->ebx;
     saved.ecx = cpu->ecx; saved.edx = cpu->edx;
@@ -1655,16 +1948,31 @@ bool dpmi_reflect_timer(dos_vm_t *vm)
         saved.exit_code = cpu->exit_code;
     }
     *cpu = saved;
-    dpmi->control_depth--;
-    dpmi->real_mode_stack = saved_real_stack;
-    dpmi->real_mode_paging = saved_real_paging;
-    dpmi->virtual_interrupts_enabled = saved_virtual_if;
+    dpmi_host_activation_restore(vm, &activation);
+    dos_exec_leave_dpmi(vm, &scope);
     return valid;
+}
+
+bool dpmi_reflect_timer(dos_vm_t *vm)
+{
+    return vm && vm->cpu && !vm->cpu->protected_mode &&
+           dpmi_has_real_timer_handler(vm) && dpmi_invoke_primary_interrupt(vm, 0x1C, false);
+}
+
+bool dpmi_primary_hardware_interrupt(dos_vm_t *vm, uint8_t vector)
+{
+    if (!dpmi_invoke_primary_interrupt(vm, vector, true)) {
+        serial_puts("[DPMI] Cannot return from primary-client interrupt\n");
+        if (vm->cpu->running) vm->cpu->exit_code = -1;
+        vm->cpu->running = false;
+    }
+    return true;
 }
 
 static bool dpmi_invoke_control_break(dos_vm_t *vm, bool reflected)
 {
     dpmi_state_t *dpmi = &vm->dpmi;
+    dpmi_host_activation_t activation = dpmi_host_activation_save(dpmi);
     cpu8086_state_t *cpu = vm->cpu;
     uint16_t selector = dpmi->pm_vectors[0x23].sel;
     uint32_t offset = dpmi->pm_vectors[0x23].off;
@@ -1689,13 +1997,10 @@ static bool dpmi_invoke_control_break(dos_vm_t *vm, bool reflected)
         return false;
     }
 
-    dpmi_stack_t saved_real_stack = dpmi->real_mode_stack;
-    dpmi_paging_t saved_real_paging = dpmi->real_mode_paging;
     if (!cpu->protected_mode) {
         dpmi->real_mode_stack = (dpmi_stack_t){ cpu->ss, cpu->sp };
         dpmi->real_mode_paging = dpmi_current_paging(&saved);
     }
-    bool saved_virtual_if = dpmi->virtual_interrupts_enabled;
     dpmi->control_depth++;
     cpu->protected_mode = true;
     cpu->pm_cs_loaded = true;
@@ -1716,6 +2021,7 @@ static bool dpmi_invoke_control_break(dos_vm_t *vm, bool reflected)
     bool returned = cpu8086_run_until(vm, true, host_cs,
                                       DPMI_CONTROL_RETURN_OFF);
     vm->native_dispatch_depth--;
+    if (!dpmi_host_resume_client(vm, activation.client_id)) return false;
     /* DOS permits RETF as well as IRET for Ctrl+C. DPMI ignores CF in
      * either case; the leftover FLAGS word/dword is host-owned. */
     uint32_t far_sp = stack.esp;
@@ -1738,10 +2044,7 @@ static bool dpmi_invoke_control_break(dos_vm_t *vm, bool reflected)
         cpu->running = false;
         cpu->exit_code = exit_code;
     }
-    dpmi->control_depth--;
-    dpmi->real_mode_stack = saved_real_stack;
-    dpmi->real_mode_paging = saved_real_paging;
-    dpmi->virtual_interrupts_enabled = saved_virtual_if;
+    dpmi_host_activation_restore(vm, &activation);
     return valid;
 }
 
@@ -1753,6 +2056,7 @@ bool dpmi_control_break(dos_vm_t *vm)
 static uint8_t dpmi_invoke_critical_error(dos_vm_t *vm, bool reflected)
 {
     dpmi_state_t *dpmi = &vm->dpmi;
+    dpmi_host_activation_t activation = dpmi_host_activation_save(dpmi);
     cpu8086_state_t *cpu = vm->cpu;
     uint16_t selector = dpmi->pm_vectors[0x24].sel;
     uint32_t offset = dpmi->pm_vectors[0x24].off;
@@ -1785,11 +2089,8 @@ static uint8_t dpmi_invoke_critical_error(dos_vm_t *vm, bool reflected)
         return 3u;
     }
 
-    dpmi_stack_t saved_real_stack = dpmi->real_mode_stack;
-    dpmi_paging_t saved_real_paging = dpmi->real_mode_paging;
     dpmi->real_mode_stack = (dpmi_stack_t){ cpu->ss, cpu->sp };
     dpmi->real_mode_paging = dpmi_current_paging(&saved);
-    bool saved_virtual_if = dpmi->virtual_interrupts_enabled;
     dpmi->control_depth++;
     /* Only the handler IRET expands for a 32-bit client. The nine saved
      * DOS registers and caller IRET remain words with real-mode segments. */
@@ -1814,6 +2115,7 @@ static uint8_t dpmi_invoke_critical_error(dos_vm_t *vm, bool reflected)
     bool returned = cpu8086_run_until(vm, true, host_cs,
                                       DPMI_CONTROL_RETURN_OFF);
     vm->native_dispatch_depth--;
+    if (!dpmi_host_resume_client(vm, activation.client_id)) return 3u;
     bool valid = returned && cpu->ss == stack.ss && cpu->esp == return_sp;
     uint8_t action = cpu->al;
     bool running = cpu->running;
@@ -1825,10 +2127,7 @@ static uint8_t dpmi_invoke_critical_error(dos_vm_t *vm, bool reflected)
         cpu->running = false;
         cpu->exit_code = exit_code;
     }
-    dpmi->control_depth--;
-    dpmi->real_mode_stack = saved_real_stack;
-    dpmi->real_mode_paging = saved_real_paging;
-    dpmi->virtual_interrupts_enabled = saved_virtual_if;
+    dpmi_host_activation_restore(vm, &activation);
     if (!valid) {
         serial_puts("[DPMI] Invalid INT 24h return; failing device request\n");
         return 3u;
@@ -1869,7 +2168,7 @@ static void dpmi_write_rm_regs(dos_vm_t *vm, uint32_t address,
         dos_mem_write8(vm, address + (uint32_t)i, bytes[i]);
 }
 
-dpmi_service_result_t dpmi_callback_enter(dos_vm_t *vm)
+static dpmi_service_result_t dpmi_callback_enter_current(dos_vm_t *vm)
 {
     cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
     dpmi_state_t *dpmi = vm ? &vm->dpmi : NULL;
@@ -2014,6 +2313,58 @@ invalid:
     return DPMI_SERVICE_INVALID;
 }
 
+dpmi_service_result_t dpmi_callback_enter(dos_vm_t *vm)
+{
+    cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
+    if (!cpu || cpu->protected_mode || cpu->cs != DPMI_ENTRY_SEG ||
+        cpu->eip < DPMI_CALLBACK_BASE_OFF + 2u ||
+        cpu->eip >= DPMI_PM_REFLECT_BASE_OFF)
+        return DPMI_SERVICE_INVALID;
+    uint8_t slot = dos_mem_read8(vm, dos_linear(cpu->cs, cpu->ip));
+    if (slot >= DPMI_MAX_CALLBACKS) return DPMI_SERVICE_INVALID;
+    const dpmi_state_t *owner = &vm->dpmi;
+    for (;;) {
+        const dpmi_callback_t *callback = &owner->callbacks[slot];
+        if (owner->active && callback->active && callback->rm_seg == cpu->cs &&
+            callback->rm_off + 2u == cpu->eip) break;
+        owner = dos_exec_suspended_dpmi(vm, owner == &vm->dpmi ? NULL : owner);
+        if (!owner) return DPMI_SERVICE_INVALID;
+    }
+    if (owner == &vm->dpmi) return dpmi_callback_enter_current(vm);
+
+    cpu8086_state_t caller = *cpu;
+    dpmi_client_scope_t scope;
+    if (!dos_exec_enter_dpmi(vm, owner, &scope)) return DPMI_SERVICE_INVALID;
+    dpmi_state_t *dpmi = &vm->dpmi;
+    dpmi_host_activation_t activation = dpmi_host_activation_save(dpmi);
+    dpmi_host_wait_t wait = { .previous = dpmi->callback_wait,
+        .depth = dpmi->callback_depth, .psp = vm->current_psp };
+    dpmi->callback_wait = &wait;
+    dpmi_service_result_t result = dpmi_callback_enter_current(vm);
+    if (result == DPMI_SERVICE_COMPLETE) {
+        /* This private INT belongs to the borrowed callback, not to the
+         * real host dispatcher that will resume after its final IRET. */
+        vm->software_int_frame_bytes = 0;
+        vm->native_dispatch_depth++;
+        bool returned = cpu8086_run_until_signal(vm, &wait.returned);
+        vm->native_dispatch_depth--;
+        if (!returned || !vm->cpu->running) result = DPMI_SERVICE_INTERRUPTED;
+    }
+    if (result != DPMI_SERVICE_COMPLETE) {
+        /* Admission may have returned to a handler-selected real address.
+         * Only a stopped protected activation needs its caller restored. */
+        if (vm->cpu->protected_mode) {
+            caller.insn_count = vm->cpu->insn_count;
+            caller.running = vm->cpu->running;
+            caller.exit_code = vm->cpu->exit_code;
+            *vm->cpu = caller;
+        }
+    }
+    dpmi_host_activation_restore(vm, &activation);
+    dos_exec_leave_dpmi(vm, &scope);
+    return result;
+}
+
 dpmi_service_result_t dpmi_callback_return(dos_vm_t *vm, bool discard_private_int_frame)
 {
     cpu8086_state_t *cpu = vm ? vm->cpu : NULL;
@@ -2089,6 +2440,8 @@ dpmi_service_result_t dpmi_callback_return(dos_vm_t *vm, bool discard_private_in
     cpu8086_reset_real_cs(cpu, cpu->cs);
     cpu8086_sync_data(cpu);
     cpu->halted = false;
+    if (dpmi->callback_wait && dpmi->callback_wait->depth == dpmi->callback_depth)
+        dpmi->callback_wait->returned = true;
     return DPMI_SERVICE_COMPLETE;
 }
 
@@ -2172,6 +2525,7 @@ static uint16_t dpmi_simulate_rm_call(dos_vm_t *vm, dpmi_rm_regs_t *regs,
                                   uint8_t interrupt_number)
 {
     cpu8086_state_t *cpu = vm->cpu;
+    dpmi_host_activation_t activation = dpmi_host_activation_save(&vm->dpmi);
     cpu8086_state_t protected_state = *cpu;
     uint32_t source_stack = cpu_stack_offset(cpu);
     /* Native gates keep their frame on the host stack; interpreted INT 31h
@@ -2187,6 +2541,14 @@ static uint16_t dpmi_simulate_rm_call(dos_vm_t *vm, dpmi_rm_regs_t *regs,
     if (!real_ss && !real_sp) {
         real_ss = vm->dpmi.real_mode_stack.ss;
         real_sp = (uint16_t)vm->dpmi.real_mode_stack.esp;
+        if (!real_ss && !real_sp) return 0x8012;
+        /* A callback/raw switch may supply a different dormant stack. Only
+         * bound the host-owned range; explicit caller stacks keep their ABI. */
+        uint32_t base = vm->dpmi.real_stack_base;
+        uint32_t cursor = dos_linear(real_ss, real_sp);
+        if (base && cursor >= base && cursor - base <= DPMI_RM_STACK_SIZE &&
+            copied_bytes + frame_bytes > cursor - base)
+            return 0x8021;
     }
 
     if (copied_bytes + frame_bytes > real_sp)
@@ -2266,11 +2628,6 @@ admission_done:
     dpmi_page_span_transfer(vm, &destination, image, true);
     if (copied_bytes) dos_host_free_pages(image, pages);
 
-    dpmi_stack_t previous_stack = vm->dpmi.suspended_stack;
-    dpmi_stack_t previous_real_stack = vm->dpmi.real_mode_stack;
-    dpmi_paging_t previous_paging = vm->dpmi.suspended_paging;
-    dpmi_paging_t previous_real_paging = vm->dpmi.real_mode_paging;
-    bool previous_virtual_if = vm->dpmi.virtual_interrupts_enabled;
     vm->dpmi.suspended_stack = (dpmi_stack_t){ cpu->ss, cpu->esp };
     vm->dpmi.suspended_paging = dpmi_current_paging(cpu);
     cpu->eax = regs->eax;
@@ -2301,7 +2658,7 @@ admission_done:
     if (kind != DPMI_RM_CALL_FAR) cpu->flags &= ~(FLAG_IF | FLAG_TF);
     if (host_service) cpu8086_real_host_interrupt(cpu, interrupt_number, regs->flags | FLAGS_FIXED);
 
-    bool reached = cpu8086_run_until_real(vm, DPMI_ENTRY_SEG,
+    bool reached = cpu->running && cpu8086_run_until_real(vm, DPMI_ENTRY_SEG,
                                           DPMI_RM_RETURN_OFF);
     reached = reached && cpu->ss == real_ss && cpu_stack_offset(cpu) == arguments_sp;
     bool nested_running = cpu->running;
@@ -2321,12 +2678,9 @@ admission_done:
     regs->fs = cpu->fs;
     regs->gs = cpu->gs;
 
+    if (!dpmi_host_resume_client(vm, activation.client_id)) return 0x8021;
     *cpu = protected_state;
-    vm->dpmi.suspended_stack = previous_stack;
-    vm->dpmi.real_mode_stack = previous_real_stack;
-    vm->dpmi.suspended_paging = previous_paging;
-    vm->dpmi.real_mode_paging = previous_real_paging;
-    vm->dpmi.virtual_interrupts_enabled = previous_virtual_if;
+    dpmi_host_activation_restore(vm, &activation);
     cpu->insn_count = instruction_count;
     if (!nested_running) {
         cpu->running = false;
@@ -2467,7 +2821,6 @@ static bool dpmi_copy_io_buffer(dos_vm_t *vm, uint16_t selector,
 
 uint16_t dpmi_dos_file_io(dos_vm_t *vm, uint8_t read_terminator)
 {
-    enum { IO_BUFFER_MAX = 0xFFF0u, IO_STACK_PARAGRAPHS = 0x100u };
     cpu8086_state_t *cpu = vm->cpu;
     cpu8086_state_t request = *cpu;
     bool read = request.ah == 0x3Fu;
@@ -2475,30 +2828,19 @@ uint16_t dpmi_dos_file_io(dos_vm_t *vm, uint8_t read_terminator)
     uint32_t offset = vm->dpmi.is_32bit ? request.edx : request.dx;
     if (!dpmi_service_io_buffer(vm, request.ds, offset, count, read)) return 0;
 
-    uint32_t capacity = count < IO_BUFFER_MAX ? count : IO_BUFFER_MAX;
-    uint16_t paragraphs = (uint16_t)((capacity + 15u) / 16u);
-    uint16_t largest = 0;
-    uint16_t segment = dos_mem_alloc(vm, paragraphs + IO_STACK_PARAGRAPHS,
-                                     &largest);
-    if (!segment && largest > IO_STACK_PARAGRAPHS) {
-        paragraphs = largest - IO_STACK_PARAGRAPHS;
-        segment = dos_mem_alloc(vm, largest, NULL);
-    }
-    if (!segment) return DOS_ERR_NOT_ENOUGH_MEMORY;
-    capacity = (uint32_t)paragraphs * 16u;
-    unsigned scratch_pages = (capacity + 4095u) / 4096u;
-    uint8_t *scratch = scratch_pages ? dos_host_alloc_pages(scratch_pages) : NULL;
-    if (scratch_pages && !scratch) {
-        dos_mem_free(vm, segment);
+    dos_transfer_buffer_t transfer;
+    if (!dos_transfer_acquire(vm, count, count ? 1u : 0u, &transfer))
         return DOS_ERR_NOT_ENOUGH_MEMORY;
-    }
+    uint32_t capacity = transfer.capacity;
+    uint16_t segment = transfer.segment;
+    uint8_t *scratch = transfer.scratch;
     uint32_t real_address = dos_linear(segment, 0);
     dpmi_rm_regs_t regs = {
         .edi = request.edi, .esi = request.esi, .ebp = request.ebp,
         .ebx = request.ebx, .edx = request.edx, .ecx = request.ecx,
         .eax = request.eax, .flags = request.flags,
-        .ds = segment, .ss = (uint16_t)(segment + paragraphs),
-        .sp = IO_STACK_PARAGRAPHS * 16u - 2u
+        .ds = segment, .ss = transfer.stack_segment,
+        .sp = DOS_TRANSFER_STACK_SIZE - 2u
     };
     uint32_t transferred = 0;
     uint16_t error = 0;
@@ -2553,9 +2895,7 @@ uint16_t dpmi_dos_file_io(dos_vm_t *vm, uint8_t read_terminator)
         }
     } while (transferred < count && cpu->running);
 
-    if (scratch) dos_host_free_pages(scratch, scratch_pages);
-    if (dos_mem_free(vm, segment) != DOS_MEM_OK && !error)
-        error = DOS_ERR_INVALID_BLOCK;
+    (void)dos_transfer_release(vm, transfer.generation);
     if (cancelled || !cpu->running) return 0;
     if (error) return error;
 
@@ -2620,7 +2960,6 @@ static bool dpmi_dos_string_size(dos_vm_t *vm, uint16_t selector,
 
 uint16_t dpmi_dos_console(dos_vm_t *vm)
 {
-    enum { CONSOLE_BUFFER_MAX = 0xFFF0u, CONSOLE_STACK_PARAGRAPHS = 0x100u };
     cpu8086_state_t *cpu = vm->cpu;
     cpu8086_state_t request = *cpu;
     bool string = request.ah == 9u;
@@ -2645,32 +2984,21 @@ uint16_t dpmi_dos_console(dos_vm_t *vm)
         }
     }
 
-    uint32_t capacity = size < CONSOLE_BUFFER_MAX ? size : CONSOLE_BUFFER_MAX;
-    uint16_t paragraphs = (uint16_t)((capacity + 15u) / 16u);
-    uint16_t largest = 0;
-    uint16_t segment = dos_mem_alloc(vm, paragraphs + CONSOLE_STACK_PARAGRAPHS,
-                                     &largest);
     /* Strings can be split; an input line must fit in a single call so that
      * editing, flushing, and Ctrl-C retain the real DOS service contract. */
-    if (!segment && string && largest > CONSOLE_STACK_PARAGRAPHS) {
-        paragraphs = largest - CONSOLE_STACK_PARAGRAPHS;
-        segment = dos_mem_alloc(vm, largest, NULL);
-    }
-    if (!segment) return DOS_ERR_NOT_ENOUGH_MEMORY;
-    capacity = (uint32_t)paragraphs * 16u;
-    unsigned scratch_pages = (capacity + 4095u) / 4096u;
-    uint8_t *scratch = scratch_pages ? dos_host_alloc_pages(scratch_pages) : NULL;
-    if (scratch_pages && !scratch) {
-        dos_mem_free(vm, segment);
-        return DOS_ERR_NOT_ENOUGH_MEMORY;
-    }
+    dos_transfer_buffer_t transfer;
+    uint32_t minimum = string && size > 1u ? 2u : size;
+    if (!dos_transfer_acquire(vm, size, minimum, &transfer)) return DOS_ERR_NOT_ENOUGH_MEMORY;
+    uint32_t capacity = transfer.capacity;
+    uint16_t segment = transfer.segment;
+    uint8_t *scratch = transfer.scratch;
     uint32_t real_address = dos_linear(segment, 0);
     dpmi_rm_regs_t regs = {
         .edi = request.edi, .esi = request.esi, .ebp = request.ebp,
         .ebx = request.ebx, .edx = request.edx, .ecx = request.ecx,
         .eax = request.eax, .flags = request.flags,
-        .ss = (uint16_t)(segment + paragraphs),
-        .sp = CONSOLE_STACK_PARAGRAPHS * 16u - 2u
+        .ss = transfer.stack_segment,
+        .sp = DOS_TRANSFER_STACK_SIZE - 2u
     };
     uint32_t consumed = 0;
     uint16_t error = 0;
@@ -2715,9 +3043,7 @@ uint16_t dpmi_dos_console(dos_vm_t *vm)
         if (!string || (regs.eax & 0xFFFFu) != 0x0924u) break;
     } while (consumed < size - 1u && cpu->running);
 
-    if (scratch) dos_host_free_pages(scratch, scratch_pages);
-    if (dos_mem_free(vm, segment) != DOS_MEM_OK && !error)
-        error = DOS_ERR_INVALID_BLOCK;
+    (void)dos_transfer_release(vm, transfer.generation);
     if (cancelled || !cpu->running) return 0;
     if (error) return error;
     cpu->eax = regs.eax;
@@ -3025,12 +3351,14 @@ void dos_int31_dpmi(dos_vm_t *vm)
             d->access = new_acc;
             /* Preserve limit bits and replace only AVL/L/D/G. */
             d->flags_lim = (d->flags_lim & 0x0F) | (cpu->ch & 0xF0);
-            serial_puts("[DPMI] SetAccess sel=0x");
-            serial_puthex(sel, 4);
-            serial_puts(" acc=0x"); serial_puthex(new_acc, 2);
-            serial_puts(" flags=0x"); serial_puthex(cpu->ch, 2);
-            serial_puts((new_acc & DESC_CODE) ? " CODE" : " DATA");
-            serial_puts("\n");
+            if (dos_trace_record(vm)) {
+                serial_puts("[DPMI] SetAccess sel=0x");
+                serial_puthex(sel, 4);
+                serial_puts(" acc=0x"); serial_puthex(new_acc, 2);
+                serial_puts(" flags=0x"); serial_puthex(cpu->ch, 2);
+                serial_puts((new_acc & DESC_CODE) ? " CODE" : " DATA");
+                serial_puts("\n");
+            }
             cpu->eflags &= ~FLAG_CF;
         } else {
             cpu->ax = dpmi_selector_mutable(dpmi, sel, NULL) ? 0x8021 : 0x8022;
@@ -3198,14 +3526,14 @@ void dos_int31_dpmi(dos_vm_t *vm)
     /* ── AX=0306h: Get Raw Mode Switch Addresses ─────────────────── */
     case 0x0306: {
         uint16_t host_sel = dpmi_host_code_selector(dpmi);
-        if (!host_sel) {
+        if (!host_sel || !dpmi->raw_real_segment) {
             cpu->ax = 0x8011;
             cpu->eflags |= FLAG_CF;
             break;
         }
 
-        cpu->bx  = DPMI_ENTRY_SEG;      /* RM→PM seg */
-        cpu->cx  = DPMI_RAW_SWITCH_OFF;  /* RM->PM off */
+        cpu->bx  = dpmi->raw_real_segment;
+        cpu->cx  = DPMI_RAW_SWITCH_OFF + 16u * (DPMI_ENTRY_SEG - cpu->bx);
         cpu->esi = host_sel;            /* PM→RM selector */
         cpu->edi = DPMI_RAW_SWITCH_OFF;  /* PM->RM off */
         cpu->eflags &= ~FLAG_CF;
@@ -3587,10 +3915,9 @@ void dos_int31_dpmi(dos_vm_t *vm)
 
         /* Nothing client-visible is reserved until admission completes.
          * Do not retain newly created host descriptors on resource failure. */
-        uint16_t cb_off = DPMI_CALLBACK_BASE_OFF +
-                          (uint16_t)(slot * DPMI_CALLBACK_STUB_SIZE);
+        uint16_t cb_off = dpmi_free_callback_address(vm);
         uint32_t cb_addr = dos_linear(DPMI_ENTRY_SEG, cb_off);
-        if (!dpmi_range_valid(vm, cb_addr, DPMI_CALLBACK_STUB_SIZE)) {
+        if (!cb_off || !dpmi_range_valid(vm, cb_addr, DPMI_CALLBACK_STUB_SIZE)) {
             cpu->ax = 0x8015;
             cpu->eflags |= FLAG_CF;
             break;
@@ -3610,7 +3937,7 @@ void dos_int31_dpmi(dos_vm_t *vm)
         uint16_t rm_stack_sel = host_code ? dpmi_alloc_descriptor(dpmi) : 0;
         if (!rm_stack_sel) {
             if (had_stack) dpmi->ldt[stack_index] = stack_before;
-            else if (host_stack) dpmi_release_descriptor(dpmi, dpmi_sel_to_index(host_stack));
+            else if (host_stack) dpmi_release_locked_stack(vm);
             if (had_code) dpmi->ldt[code_index] = code_before;
             else if (host_code) dpmi_release_descriptor(dpmi, dpmi_sel_to_index(host_code));
             dpmi->sel_exception_stack = old_stack;
@@ -3963,6 +4290,20 @@ void dos_int31_dpmi(dos_vm_t *vm)
         }
         break;
     }
+
+    case 0x0E00:
+        dpmi_apply_coprocessor(cpu);
+        /* Both backends use the physical integrated x87, not a host emulator. */
+        cpu->ax = 0x44u | ((cpu->cr0 >> 1) & 3u);
+        cpu->eflags &= ~FLAG_CF;
+        break;
+
+    case 0x0E01:
+        dpmi->coprocessor_control = cpu->bx & 3u;
+        dpmi->coprocessor_requested = true;
+        dpmi_apply_coprocessor(cpu);
+        cpu->eflags &= ~FLAG_CF;
+        break;
 
     /* AX=0900h-0902h: Virtual Interrupt State. AH is deliberately left
      * unchanged so the returned AX can be invoked to restore the old state. */
@@ -4457,6 +4798,261 @@ static dpmi_paging_fixture_t dpmi_paging_test_prepare(dos_vm_t *vm, unsigned wid
     return fixture;
 }
 
+static int dpmi_raw_switch_selftest(void)
+{
+    enum { OK, NULL_DATA, READ_ONLY_DATA, EXECUTE_ONLY, CONFORMING, DS_NP, ES_NP, SS_NP, CS_NP,
+           DS_TYPE, SS_TYPE, CS_TYPE, CS_LIMIT, SS_NULL, CS_NULL, SS_RPL, CS_RPL,
+           GDT_PAGE, GDT_WRITE, REVALIDATE, REPEATED, EDITED, REDIRECT_SAME,
+           REDIRECT_OTHER, QUOTA, UNHANDLED, NESTED, CODE_UNMAPPED, STACK_UNMAPPED, POLICIES };
+    const unsigned memory_pages = 512;
+    unsigned vm_pages = (sizeof(dos_vm_t) + 4095u) / 4096u;
+    dos_vm_t *vm = dos_host_alloc_pages(vm_pages);
+    uint8_t *memory = dos_host_alloc_pages(memory_pages);
+    if (!vm || !memory) {
+        if (vm) dos_host_free_pages(vm, vm_pages);
+        if (memory) dos_host_free_pages(memory, memory_pages);
+        return 1;
+    }
+    dpmi_zero(vm, vm_pages * 4096u);
+    cpu8086_state_t cpu;
+    vm->cpu = &cpu; vm->mem = memory; vm->total_mem_size = memory_pages * 4096u;
+    unsigned checks = 0, recovered = 0;
+    int failures = 0;
+#define RAW_CHECK(condition) do { \
+    if (!(condition)) { \
+        if (failures < 24) { serial_puts("[DPMI-RAW-ENTRY] failed line="); serial_putdec(__LINE__); \
+            serial_puts(" policy/abi/code/stack/path="); serial_putdec(policy); serial_puts("/"); \
+            serial_putdec(width32); serial_putdec(code32); serial_putdec(stack32); serial_putdec(path); serial_puts("\n"); } \
+        failures++; \
+    } \
+    checks++; \
+} while (0)
+    for (unsigned width32 = 0; width32 < 2; width32++)
+    for (unsigned code32 = 0; code32 < 2; code32++)
+    for (unsigned stack32 = 0; stack32 < 2; stack32++)
+    for (unsigned path = 0; path < 3; path++)
+    for (unsigned policy = 0; policy < POLICIES; policy++) {
+        dpmi_paging_fixture_t f = dpmi_paging_test_prepare(vm, width32);
+        vm->step_limit = policy == QUOTA ? 128 : 4096;
+        vm->software_int_frame_bytes = 0;
+        dpmi_desc_set_limit(&vm->dpmi.ldt[dpmi_sel_to_index(f.data)], UINT32_MAX);
+        vm->dpmi.ldt[dpmi_sel_to_index(f.stack)].flags_lim = stack32 ? DESC_32BIT : 0;
+        uint16_t es = dpmi_alloc_descriptor(&vm->dpmi);
+        uint16_t ss = dpmi_alloc_descriptor(&vm->dpmi);
+        uint16_t cs = dpmi_alloc_descriptor(&vm->dpmi);
+        dpmi_descriptor_t *dsd = &vm->dpmi.ldt[dpmi_sel_to_index(f.buffer)];
+        dpmi_descriptor_t *esd = &vm->dpmi.ldt[dpmi_sel_to_index(es)];
+        dpmi_descriptor_t *ssd = &vm->dpmi.ldt[dpmi_sel_to_index(ss)];
+        dpmi_descriptor_t *csd = &vm->dpmi.ldt[dpmi_sel_to_index(cs)];
+        dpmi_build_desc(esd, 0x7000, 0xFFFF, 0xF2, 0);
+        dpmi_build_desc(ssd, 0, 0xFFFF, 0xF2, stack32 ? DESC_32BIT : 0);
+        dpmi_build_desc(csd, 0x40002000, UINT32_MAX, 0xFA, code32 ? DESC_32BIT : 0);
+        dpmi_get_host_code_selector(vm);
+        dpmi_get_exception_stack_selector(vm);
+        vm->dpmi.exception_depth = 1;
+        vm->dpmi.suspended_stack = (dpmi_stack_t){ f.stack, stack32 ? 0x9000 : 0xBEEF9000 };
+        cpu8086_load_real_cs(&cpu, DPMI_ENTRY_SEG);
+        cpu.eip = DPMI_RAW_SWITCH_OFF + (path == 2 ? 0 : 2);
+        cpu.esp = 0xCAFE8006u - (path == 1 ? 6u : 0u);
+        cpu.eax = f.buffer; cpu.ecx = es; cpu.edx = ss; cpu.esi = cs;
+        cpu.ebx = 0xBEEF9010; cpu.edi = 0x10020; cpu.ebp = 0x76543210;
+        cpu8086_load_real_segment(&cpu, 3, 0x2222);
+        cpu8086_load_real_segment(&cpu, 0, 0x3333);
+        cpu8086_load_real_segment(&cpu, 4, 0x4444);
+        cpu8086_load_real_segment(&cpu, 5, 0x5555);
+        bool vif = (code32 ^ stack32) != 0;
+        cpu.eflags = FLAGS_FIXED | FLAG_CF | FLAG_DF | (vif ? FLAG_IF : 0);
+        uint32_t real_flags = cpu.eflags;
+        vm->dpmi.virtual_interrupts_enabled = !vif;
+        uint32_t stub = dos_linear(DPMI_ENTRY_SEG, DPMI_RAW_SWITCH_OFF);
+        memory[stub] = 0xCD; memory[stub + 1] = DPMI_RAW_SWITCH_INT;
+        memory[stub + 2] = 0xF4;
+        dos_mem_write16(vm, 0x8000, DPMI_RAW_SWITCH_OFF + 2);
+        dos_mem_write16(vm, 0x8002, DPMI_ENTRY_SEG);
+        dos_mem_write16(vm, 0x8004, real_flags);
+        uint16_t repair = f.buffer;
+        unsigned vector = 11, error = f.buffer & ~3u;
+        switch (policy) {
+        case NULL_DATA: cpu.ax = 0; cpu.cx = 3; break;
+        case READ_ONLY_DATA: dsd->access = 0xF0; break;
+        case EXECUTE_ONLY: csd->access = 0xF8; break;
+        case CONFORMING: csd->access = 0x9E; break;
+        case ES_NP: esd->access &= ~DESC_PRESENT; repair = es; break;
+        case SS_NP: ssd->access &= ~DESC_PRESENT; repair = ss; vector = 12; break;
+        case CS_NP: csd->access &= ~DESC_PRESENT; repair = cs; break;
+        case DS_TYPE: dsd->access = 0xE2; vector = 13; break;
+        case SS_TYPE: ssd->access = 0xFA; repair = ss; vector = 13; break;
+        case CS_TYPE: csd->access = 0xF2; repair = cs; vector = 13; break;
+        case CS_LIMIT: dpmi_desc_set_limit(csd, 0x1F); repair = cs; vector = 13; break;
+        case SS_NULL: cpu.dx = 0; vector = 13; break;
+        case CS_NULL: cpu.si = 0; vector = 13; break;
+        case SS_RPL: cpu.dx = ss & ~3u; repair = ss; vector = 13; break;
+        case CS_RPL: cpu.si = cs & ~3u; repair = cs; vector = 13; break;
+        case GDT_PAGE: case GDT_WRITE:
+            cpu.ax = 0x13; cpu.gdtr.base = 0x5000; cpu.gdtr.limit = 23;
+            for (unsigned i = 0; i < 8; i++) memory[0x5010 + i] = ((uint8_t *)dsd)[i];
+            dos_mem_write32(vm, 0x11014, policy == GDT_PAGE ? 0x5006 : 0x5005);
+            vector = 14; break;
+        case CODE_UNMAPPED: dos_mem_write32(vm, 0x12008, 0); break;
+        case STACK_UNMAPPED: dos_mem_write32(vm, 0x11024, 0); break;
+        case OK: break;
+        default: dsd->access &= ~DESC_PRESENT; break;
+        }
+        error = vector == 14 ? (policy == GDT_PAGE ? 0 : 3) :
+            policy == SS_NULL || policy == CS_NULL || policy == CS_LIMIT ? 0 : repair & ~3u;
+        bool faulted = policy >= DS_NP && policy < CODE_UNMAPPED;
+        for (unsigned v = 11; v <= 14; v++) if (policy != UNHANDLED) {
+            vm->dpmi.real_exception_vectors[v].sel = f.code;
+            vm->dpmi.real_exception_vectors[v].off = 0x100;
+        }
+        uint8_t *out = memory + 0x20100;
+#define RW_BYTE(value) (*out++ = (uint8_t)(value))
+#define RW_WORD(value) do { uint16_t x_ = (value); RW_BYTE(x_); RW_BYTE(x_ >> 8); } while (0)
+#define RW_DWORD(value) do { uint32_t x_ = (value); for (unsigned b_ = 0; b_ < 4; b_++) RW_BYTE(x_ >> (b_ * 8u)); } while (0)
+#define RW_OP32() do { if (!width32) RW_BYTE(0x66); } while (0)
+#define RW_OP16() do { if (width32) RW_BYTE(0x66); } while (0)
+#define RW_ADDR32() do { if (!width32) RW_BYTE(0x67); } while (0)
+#define RW_FRAME(offset, value) do { RW_BYTE(0x36); RW_OP32(); RW_ADDR32(); RW_BYTE(0xC7); RW_BYTE(0x45); RW_BYTE(offset); RW_DWORD(value); } while (0)
+        RW_OP32(); RW_BYTE(0x60); RW_OP32(); RW_BYTE(0x89); RW_BYTE(0xE5);
+        if (!stack32) { RW_OP32(); RW_BYTE(0x81); RW_BYTE(0xE5); RW_DWORD(0xFFFF); }
+        RW_OP16(); RW_BYTE(0xB8); RW_WORD(f.data); RW_BYTE(0x8E); RW_BYTE(0xD8);
+        RW_OP32(); RW_ADDR32(); RW_BYTE(0xFF); RW_BYTE(0x05); RW_DWORD(0xA000);
+        for (unsigned i = 0; i < DPMI_EXCEPTION_EXT_FRAME_SIZE; i += 4) {
+            RW_BYTE(0x36); RW_OP32(); RW_ADDR32(); RW_BYTE(0x8B); RW_BYTE(0x45); RW_BYTE(32u + i);
+            RW_OP32(); RW_ADDR32(); RW_BYTE(0xA3); RW_DWORD(0xA040 + i);
+        }
+        if (policy == QUOTA) { RW_BYTE(0xEB); RW_BYTE(0xFE); }
+        if (policy == NESTED) RW_BYTE(0xCC);
+        uint8_t *retry_skip = NULL;
+        if (policy == REPEATED) {
+            RW_OP32(); RW_ADDR32(); RW_BYTE(0x83); RW_BYTE(0x3D); RW_DWORD(0xA000); RW_BYTE(1);
+            RW_BYTE(0x0F); RW_BYTE(0x84); retry_skip = out;
+            if (width32) RW_DWORD(0); else RW_WORD(0);
+        }
+        RW_OP16(); RW_BYTE(0xBB); RW_WORD(repair);
+        RW_OP16(); RW_BYTE(0xB8); RW_WORD(9);
+        RW_OP16(); RW_BYTE(0xB9); RW_WORD(repair == cs ? 0xFA | (code32 * 0x4000) :
+            0xF2 | ((repair == ss ? stack32 : repair == f.buffer ? width32 : 0) * 0x4000));
+        RW_BYTE(0xCD); RW_BYTE(0x31);
+        if (policy == CS_LIMIT) {
+            RW_OP16(); RW_BYTE(0xB8); RW_WORD(8);
+            RW_OP16(); RW_BYTE(0xB9); RW_WORD(0xFFFF);
+            RW_OP16(); RW_BYTE(0xBA); RW_WORD(0xFFFF); RW_BYTE(0xCD); RW_BYTE(0x31);
+        }
+        if (policy == GDT_PAGE || policy == GDT_WRITE) {
+            RW_OP32(); RW_ADDR32(); RW_BYTE(0xC7); RW_BYTE(0x05); RW_DWORD(0x11014); RW_DWORD(0x5007);
+        }
+        if (policy == SS_NULL || policy == SS_RPL) RW_FRAME(20, ss);
+        if (policy == CS_NULL || policy == CS_RPL) RW_FRAME(4, cs);
+        if (policy == EDITED) {
+            RW_FRAME(16, 0x12349020); RW_FRAME(0, 0x20030);
+            RW_FRAME(32 + 0x38, 0xAABB8010); RW_FRAME(32 + 0x3C, 0x1111);
+            RW_FRAME(32 + 0x34, FLAG_VM | FLAG_DF | FLAGS_FIXED | (vif ? 0 : FLAG_IF));
+        }
+        if (policy == REVALIDATE) {
+            RW_OP32(); RW_ADDR32(); RW_BYTE(0x83); RW_BYTE(0x3D); RW_DWORD(0xA000); RW_BYTE(1);
+            RW_BYTE(0x75); uint8_t *skip = out++;
+            RW_OP16(); RW_BYTE(0xB8); RW_WORD(9);
+            RW_OP16(); RW_BYTE(0xBB); RW_WORD(cs);
+            RW_OP16(); RW_BYTE(0xB9); RW_WORD(0x7A | (code32 * 0x4000)); RW_BYTE(0xCD); RW_BYTE(0x31);
+            RW_BYTE(0xEB); uint8_t *done = out++;
+            *skip = out - skip - 1u;
+            RW_OP16(); RW_BYTE(0xB8); RW_WORD(9);
+            RW_OP16(); RW_BYTE(0xBB); RW_WORD(cs);
+            RW_OP16(); RW_BYTE(0xB9); RW_WORD(0xFA | (code32 * 0x4000)); RW_BYTE(0xCD); RW_BYTE(0x31);
+            *done = out - done - 1u;
+        }
+        if (policy == REDIRECT_SAME || policy == REDIRECT_OTHER) {
+            RW_FRAME(32 + 0x30, ((DPMI_EXCEPTION_HOST | DPMI_EXCEPTION_REDIRECT) << 16) |
+                (policy == REDIRECT_SAME ? DPMI_ENTRY_SEG : 0x1234));
+            if (policy == REDIRECT_OTHER) RW_FRAME(32 + 0x2C, 0x5678);
+            RW_FRAME(32 + 0x34, FLAG_VM | FLAG_DF | FLAGS_FIXED);
+        }
+        if (retry_skip) {
+            uint32_t distance = out - retry_skip - (width32 ? 4u : 2u);
+            for (unsigned i = 0; i < (width32 ? 4u : 2u); i++) retry_skip[i] = distance >> (8u * i);
+        }
+        RW_OP32(); RW_BYTE(0x61);
+        if (stack32 != width32) RW_BYTE(0x66);
+        RW_BYTE(0x83); RW_BYTE(0xC4); RW_BYTE(32); RW_BYTE(0xCB);
+        RAW_CHECK(out < memory + 0x20700);
+        vm->dpmi.exception_vectors[3].sel = f.code;
+        vm->dpmi.exception_vectors[3].off = 0x700;
+        vm->dpmi.exception_extended[3] = true;
+        out = memory + 0x20700;
+        RW_OP32(); RW_ADDR32(); RW_BYTE(0xFF); RW_BYTE(0x05); RW_DWORD(0xA004);
+        if (stack32 != width32) RW_BYTE(0x66);
+        RW_BYTE(0x83); RW_BYTE(0xC4); RW_BYTE(32); RW_BYTE(0xCB);
+#undef RW_FRAME
+#undef RW_ADDR32
+#undef RW_OP16
+#undef RW_OP32
+#undef RW_DWORD
+#undef RW_WORD
+#undef RW_BYTE
+        cpu8086_state_t before = cpu;
+        dpmi_stack_t old_real = vm->dpmi.real_mode_stack;
+        dpmi_paging_t old_paging = vm->dpmi.real_mode_paging;
+        dpmi_service_result_t result = DPMI_SERVICE_INVALID;
+        if (!path) result = dpmi_raw_mode_switch(vm, 0);
+        else if (path == 1) cpu8086_real_host_interrupt(&cpu, DPMI_RAW_SWITCH_INT, real_flags);
+        else (void)cpu8086_run_one(vm);
+        bool cancelled = policy == REDIRECT_SAME || policy == REDIRECT_OTHER;
+        bool stopped = policy == QUOTA || policy == UNHANDLED;
+        bool completed = !cancelled && !stopped;
+        if (!path) RAW_CHECK(result == (completed ? DPMI_SERVICE_COMPLETE : DPMI_SERVICE_INTERRUPTED));
+        RAW_CHECK(!vm->dpmi.host_wait && !vm->native_dispatch_depth && !vm->interpreter_stop_signal &&
+                   !vm->software_int_frame_bytes && !cpu.delivery_fault && vm->dpmi.exception_depth == 1);
+        RAW_CHECK(dos_mem_read32(vm, 0xA000) == (!faulted || policy == UNHANDLED ? 0 :
+                   policy == REPEATED || policy == REVALIDATE ? 2 : 1));
+        RAW_CHECK(dos_mem_read32(vm, 0xA004) == (policy == NESTED));
+        if (faulted && policy != UNHANDLED) {
+            if (policy == REVALIDATE) error = cs & ~3u;
+            RAW_CHECK(dos_mem_read32(vm, 0xA068) == error &&
+                       dos_mem_read32(vm, 0xA06C) == DPMI_RAW_SWITCH_OFF + 2 &&
+                       dos_mem_read32(vm, 0xA070) == (DPMI_ENTRY_SEG | (DPMI_EXCEPTION_HOST << 16)));
+            RAW_CHECK(dos_mem_read32(vm, 0xA078) == 0xCAFE8006 &&
+                       dos_mem_read32(vm, 0xA074) == (real_flags | FLAG_VM | FLAG_RF));
+            if (vector == 14) RAW_CHECK(dos_mem_read32(vm, 0xA090) == (policy == GDT_PAGE ? 0x5010 : 0x5015));
+        }
+        if (completed) {
+            bool edited = policy == EDITED;
+            RAW_CHECK(cpu.running && cpu.protected_mode && cpu.pm_cs_loaded && cpu.cpl == 3 &&
+                       cpu.cs == cs && cpu.ss == ss && cpu.eip == (edited ? width32 ? 0x20030 : 0x30 :
+                       width32 ? 0x10020 : 0x20) && cpu.esp == (edited ? width32 ? 0x12349020 : 0x9020 :
+                       width32 ? 0xBEEF9010 : 0x9010));
+            RAW_CHECK(cpu.ebp == before.ebp && !cpu.fs && !cpu.gs && !cpu.fs_cache.valid && !cpu.gs_cache.valid);
+            RAW_CHECK(cpu.op_size_32 == (code32 != 0) && cpu_stack_addr32(&cpu) == (stack32 != 0));
+            RAW_CHECK(cpu.cs_cache.valid && cpu.ss_cache.valid && (cpu.cs_cache.descriptor.access & 1u) &&
+                       (cpu.ss_cache.descriptor.access & 1u));
+            RAW_CHECK(cpu.ds == before.ax && cpu.es == before.cx &&
+                       cpu.ds_cache.valid == (policy != NULL_DATA) && cpu.es_cache.valid == (policy != NULL_DATA));
+            RAW_CHECK(cpu.cr3 == 0x10018 && cpu.cr0 == (DOS_CR0_PG | DOS_CR0_WP | 0x11u) &&
+                       vm->dpmi.real_mode_paging.cr0 == before.cr0 && vm->dpmi.real_mode_paging.cr3 == before.cr3);
+            RAW_CHECK(vm->dpmi.real_mode_stack.ss == (edited ? 0x1111 : 0) &&
+                       vm->dpmi.real_mode_stack.esp == (edited ? 0x8010 : 0x8006));
+            RAW_CHECK(vm->dpmi.virtual_interrupts_enabled == (edited ? !vif : vif));
+            if (faulted) recovered++;
+        } else {
+            RAW_CHECK(vm->dpmi.real_mode_stack.ss == old_real.ss && vm->dpmi.real_mode_stack.esp == old_real.esp &&
+                       vm->dpmi.real_mode_paging.cr0 == old_paging.cr0 && vm->dpmi.real_mode_paging.cr3 == old_paging.cr3);
+            if (stopped) RAW_CHECK(!cpu.running && (policy == QUOTA ? vm->step_limit_reached : cpu.exit_code == -1));
+            else {
+                RAW_CHECK(cpu.running && !cpu.protected_mode && cpu.ss == 0 && cpu.esp == 0xCAFE8006);
+                RAW_CHECK(cpu.cs == (policy == REDIRECT_OTHER ? 0x1234 : DPMI_ENTRY_SEG) &&
+                           cpu.eip == (policy == REDIRECT_OTHER ? 0x5678 : DPMI_RAW_SWITCH_OFF + 2) &&
+                           cpu.flags == (FLAGS_FIXED | FLAG_DF));
+            }
+        }
+    }
+    serial_puts("[DPMI-RAW-ENTRY] checks="); serial_putdec(checks);
+    serial_puts(" recovered="); serial_putdec(recovered);
+    serial_puts(" failures="); serial_putdec(failures); serial_puts("\n");
+#undef RAW_CHECK
+    dos_host_free_pages(memory, memory_pages); dos_host_free_pages(vm, vm_pages);
+    return failures;
+}
+
 static int dpmi_callback_entry_recovery_selftest(void)
 {
     enum { OK, REG_NP, REG_TYPE, REG_LIMIT, REG_PAGE, REG_RO, REG_SUP,
@@ -4682,7 +5278,8 @@ static int dpmi_callback_entry_recovery_selftest(void)
                            dos_mem_read32(vm, 0xA040 + 0x2C) == DPMI_CALLBACK_BASE_OFF + 2 &&
                            dos_mem_read32(vm, 0xA040 + 0x30) == (DPMI_ENTRY_SEG | (DPMI_EXCEPTION_HOST << 16)));
             CB_ENTRY_CHECK(dos_mem_read32(vm, 0xA040 + 0x38) == 0xCAFE8006 &&
-                           dos_mem_read32(vm, 0xA040 + 0x34) == (FLAG_VM | FLAGS_FIXED | FLAG_CF | FLAG_IF));
+                           dos_mem_read32(vm, 0xA040 + 0x34) ==
+                           (FLAG_VM | FLAG_RF | FLAGS_FIXED | FLAG_CF | FLAG_IF));
             if (vector == 14) {
                 uint32_t expected_pte = code_fault ? policy == CODE_SUP ? 3 : 6 :
                     policy == REG_RO ? 5 : policy == REG_SUP ? 3 : 6;
@@ -5606,6 +6203,7 @@ static int dpmi_service_buffer_selftest(void)
     for (unsigned high = 0; high < 2; high++)
     for (unsigned interpreted = 0; interpreted < 2; interpreted++)
     for (unsigned kind = 0; kind < 3; kind++)
+    for (unsigned returned_rf = 0; returned_rf < (width32 ? 2u : 1u); returned_rf++)
     for (unsigned policy = 0; policy < 17; policy++) {
         dpmi_paging_fixture_t f = dpmi_paging_test_prepare(vm, width32);
         vm->software_int_frame_bytes = 0;
@@ -5734,6 +6332,16 @@ static int dpmi_service_buffer_selftest(void)
                 if (width32) { SERVICE_DWORD(alternate); } else { SERVICE_WORD(alternate); }
             }
         }
+        /* A service repair returns the selected client's FLAGS, even when
+         * the real-mode operation already ran and only its output retries. */
+        if (width32) {
+            SERVICE_BYTE(0x36); SERVICE_BYTE(0x81); SERVICE_BYTE(0x65);
+            SERVICE_BYTE(32u + 5u * width); SERVICE_DWORD(~FLAG_RF);
+            if (returned_rf) {
+                SERVICE_BYTE(0x36); SERVICE_BYTE(0x81); SERVICE_BYTE(0x4D);
+                SERVICE_BYTE(32u + 5u * width); SERVICE_DWORD(FLAG_RF);
+            }
+        }
         SERVICE_OP32(); SERVICE_BYTE(0x61); SERVICE_BYTE(0xCB);
         SERVICE_CHECK(out < memory + 0x20400);
         out = memory + 0x20400;
@@ -5768,6 +6376,7 @@ static int dpmi_service_buffer_selftest(void)
                           cpu.edx == before.edx && cpu.esi == before.esi && cpu.edi == before.edi && cpu.ebp == before.ebp);
             SERVICE_CHECK((cpu.flags & FLAG_CF) == (cancelled ? FLAG_CF : 0) &&
                           (cpu.flags & FLAG_DF) && vm->dpmi.virtual_interrupts_enabled);
+            SERVICE_CHECK((cpu.eflags & FLAG_RF) == (policy && returned_rf ? FLAG_RF : 0));
             if (!cancelled && policy != 0) recovered++;
         }
         dpmi_rm_regs_t output;
@@ -6638,7 +7247,7 @@ static int dpmi_io_service_selftest(void)
         IO_SERVICE_CHECK(dos_mem_alloc(vm, large ? 0x9700 : 0x7000, NULL) != 0);
         uint16_t before_free = 0, after_free = 0;
         IO_SERVICE_CHECK(!dos_mem_alloc(vm, 0xFFFF, &before_free) && before_free);
-        uint32_t capacity = large ? ((uint32_t)before_free - 0x100u) * 16u : 32u;
+        uint32_t capacity = large ? DOS_TRANSFER_BUFFER_MAX : 32u;
         uint32_t count = large ? capacity + 32u : 32u;
         vm->sft[0].open_mode = 2; /* read/write handle for the real INT hook */
         vm->sft[0].device_kind = DOS_DEVICE_NUL;
@@ -6841,7 +7450,7 @@ static int dpmi_io_service_selftest(void)
         IO_SERVICE_CHECK(dos_mem_read16(vm, 0x90200) == (policy == 17 || policy == 18 || policy == 19 ? 2 : 1) &&
                          dos_mem_read32(vm, 0x8000) == (policy == 6 ? 2u : 1u));
         IO_SERVICE_CHECK(!vm->dpmi.host_wait && !vm->interpreter_stop_signal &&
-                         !vm->software_int_frame_bytes && !vm->native_dispatch_depth);
+                         !vm->software_int_frame_bytes && !vm->native_dispatch_depth && !vm->transfers);
         if (stopped) {
             IO_SERVICE_CHECK(!cpu.running && (policy == 10 ? vm->step_limit_reached : cpu.exit_code == 42));
         } else {
@@ -7366,7 +7975,7 @@ static int dpmi_paging_reentry_selftest(void)
             if (trip) dpmi_apply_paging(&cpu, (dpmi_paging_t){ DOS_CR0_PG | 0x11u, 0x14008 });
             cpu.ax = cpu.cx = cpu.dx = 0;
             cpu.bx = 0x8000; cpu.si = 0x3000; cpu.di = 0x100;
-            REENTRY_CHECK(dpmi_raw_mode_switch(vm, 0) && !cpu.protected_mode &&
+            REENTRY_CHECK(dpmi_raw_mode_switch(vm, 0) == DPMI_SERVICE_COMPLETE && !cpu.protected_mode &&
                           cpu.cr0 == real.cr0 && cpu.cr3 == real.cr3);
             memory[0x30100] = 0x90;
             REENTRY_CHECK(cpu8086_run_one(vm) && cpu.eip == 0x101);
@@ -7377,7 +7986,7 @@ static int dpmi_paging_reentry_selftest(void)
                           vm->dpmi.suspended_paging.cr0 == first.cr0 && vm->dpmi.suspended_paging.cr3 == first.cr3);
             cpu.ax = cpu.cx = fixture.data; cpu.dx = fixture.stack;
             cpu.ebx = 0x9000; cpu.si = fixture.code; cpu.edi = 0;
-            REENTRY_CHECK(dpmi_raw_mode_switch(vm, 0) && cpu.protected_mode &&
+            REENTRY_CHECK(dpmi_raw_mode_switch(vm, 0) == DPMI_SERVICE_COMPLETE && cpu.protected_mode &&
                           cpu.cr0 == first.cr0 && cpu.cr3 == first.cr3);
             REENTRY_CHECK(cpu8086_run_one(vm) && cpu.eip == 1);
         }
@@ -7562,6 +8171,51 @@ static int dpmi_rm_arguments_selftest(void)
         ARG_CHECK(dos_mem_read16(vm, arguments) == 0xBEEF &&
                   dos_mem_read16(vm, arguments + 30u) == 0xCAFE);
         ARG_CHECK(cpu.running && cpu.protected_mode && cpu.esp == 0x6FF0 && cpu.cr3 == 0x10018);
+    }
+
+    /* Default stacks are bounded, including a cursor suspended inside them.
+     * Explicit and borrowed caller stacks are not limited to the host size. */
+    for (unsigned width = 0; width < 2; width++)
+    for (unsigned kind = 0; kind < 3; kind++)
+    for (unsigned policy = 0; policy < 4; policy++)
+    for (unsigned overflow = 0; overflow < 2; overflow++) {
+        dpmi_paging_fixture_t fixture = dpmi_paging_test_prepare(vm, width);
+        cpu.protected_mode = cpu.pm_cs_loaded = true; cpu.cpl = 3;
+        cpu.cs = fixture.code; cpu.ss = fixture.stack; cpu.esp = 0x6FF0;
+        cpu8086_sync_cs(&cpu); cpu8086_sync_data(&cpu);
+        dpmi_apply_paging(&cpu, vm->dpmi.suspended_paging);
+        vm->dpmi.real_mode_paging = (dpmi_paging_t){ DOS_CR0_PG | DOS_CR0_WP | 0x10u, 0x14018 };
+        unsigned frame = kind == DPMI_RM_CALL_FAR ? 4u : 6u;
+        unsigned capacity = policy == 1 ? DPMI_RM_STACK_SIZE / 2u : DPMI_RM_STACK_SIZE;
+        uint16_t words = (capacity - frame) / 2u + overflow;
+        dpmi_rm_regs_t regs = { .flags = FLAGS_FIXED, .cs = 0x9000, .ip = 0x100 };
+        if (policy == 1) vm->dpmi.real_mode_stack.esp = capacity;
+        if (policy == 2) { regs.ss = 0x8000; regs.sp = 0x1000; }
+        if (policy == 3) vm->dpmi.real_mode_stack = (dpmi_stack_t){ 0x8000, 0x1000 };
+        memory[0x90100] = kind == DPMI_RM_CALL_FAR ? 0xCB : 0xCF;
+        dos_mem_write32(vm, 0x60 * 4u, 0x90000100);
+        cpu8086_state_t before = cpu;
+        dpmi_rm_regs_t record_before = regs;
+        dpmi_stack_t cursor_before = vm->dpmi.real_mode_stack;
+        uint8_t canary[DPMI_RM_STACK_SIZE];
+        for (unsigned byte = 0; byte < sizeof(canary); byte++)
+            canary[byte] = memory[vm->dpmi.real_stack_base + byte];
+        bool rejected = policy < 2 && overflow;
+        ARG_CHECK(dpmi_simulate_rm_call(vm, &regs, words, kind, 0x60) == (rejected ? 0x8021 : 0));
+        ARG_CHECK(cpu.running && cpu.protected_mode && cpu.esp == before.esp &&
+                  cpu.cr0 == before.cr0 && cpu.cr3 == before.cr3 &&
+                  vm->dpmi.real_mode_stack.ss == cursor_before.ss &&
+                  vm->dpmi.real_mode_stack.esp == cursor_before.esp);
+        if (rejected) {
+            bool unchanged = true;
+            for (unsigned byte = 0; byte < sizeof(canary); byte++)
+                if (canary[byte] != memory[vm->dpmi.real_stack_base + byte]) unchanged = false;
+            for (unsigned byte = 0; byte < sizeof(cpu); byte++)
+                if (((uint8_t *)&cpu)[byte] != ((uint8_t *)&before)[byte]) unchanged = false;
+            for (unsigned byte = 0; byte < sizeof(regs); byte++)
+                if (((uint8_t *)&regs)[byte] != ((uint8_t *)&record_before)[byte]) unchanged = false;
+            ARG_CHECK(unchanged);
+        }
     }
 
     /* All admission failures leave the CPU, stack payload and A/D bits alone. */
@@ -7836,8 +8490,8 @@ static int dpmi_rm_call_selftest(void)
     if ((cpu.eflags & FLAG_CF) || (uint16_t)regs.eax != 0xCAFE ||
         callback_regs.cs != DPMI_ENTRY_SEG ||
         callback_regs.ip != DPMI_RM_RETURN_OFF ||
-        callback_regs.ss != DPMI_ENTRY_SEG ||
-        callback_regs.sp != DPMI_RM_STACK_TOP ||
+        callback_regs.ss != vm->dpmi.real_mode_stack.ss ||
+        callback_regs.sp != vm->dpmi.real_mode_stack.esp ||
         vm->dpmi.callback_depth != 0 || !cpu.protected_mode) {
         serial_puts("[DPMI-TEST] callback round-trip mismatch\n");
         failures++;
@@ -8596,6 +9250,7 @@ int dpmi_selftest(void)
     rm_call_failures += dpmi_rm_arguments_selftest();
     rm_call_failures += dpmi_paging_reentry_selftest();
     rm_call_failures += dpmi_host_entry_frame_selftest();
+    rm_call_failures += dpmi_raw_switch_selftest();
     rm_call_failures += dpmi_callback_entry_recovery_selftest();
     int dos_memory_failures = dpmi_dos_memory_selftest();
     dos_memory_failures += dpmi_record_buffer_selftest();
@@ -9004,9 +9659,18 @@ int dpmi_selftest(void)
 
     uint16_t raw_data_sel = dpmi_alloc_descriptor(&vm->dpmi);
     uint16_t raw_stack_sel = dpmi_alloc_descriptor(&vm->dpmi);
-    if (!raw_data_sel || !raw_stack_sel) {
+    uint8_t *raw_memory = dos_host_alloc_pages(16);
+    uint32_t original_memory_size = vm->total_mem_size;
+    vm->dpmi.active = true;
+    if (!raw_data_sel || !raw_stack_sel || !raw_memory) {
         failures++;
     } else {
+        /* Raw admission uses the checked CPU descriptor path, which requires
+         * an actual VM aperture even when the selectors reside in the host. */
+        vm->mem = raw_memory;
+        vm->total_mem_size = 16u * 4096u;
+        dpmi_zero(raw_memory, vm->total_mem_size);
+        cpu8086_init(&cpu, vm);
         uint8_t data_access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
                               DESC_WRITABLE;
         dpmi_build_desc(&vm->dpmi.ldt[dpmi_sel_to_index(raw_data_sel)],
@@ -9028,7 +9692,7 @@ int dpmi_selftest(void)
         cpu.edi = 0x5678;
         cpu.fs = 0x1111;
         cpu.gs = 0x2222;
-        if (!dpmi_raw_mode_switch(vm, 0) || !cpu.protected_mode ||
+        if (dpmi_raw_mode_switch(vm, 0) != DPMI_SERVICE_COMPLETE || !cpu.protected_mode ||
             !cpu.pm_cs_loaded || !(cpu.cr0 & 1u) ||
             cpu.ds != raw_data_sel || cpu.es != raw_data_sel ||
             cpu.ss != raw_stack_sel || cpu.esp != 0x1234 ||
@@ -9044,7 +9708,7 @@ int dpmi_selftest(void)
         cpu.edi = 0x6666;
         cpu.op_size_32 = true;
         cpu.addr_size_32 = true;
-        if (!dpmi_raw_mode_switch(vm, 0) || cpu.protected_mode ||
+        if (dpmi_raw_mode_switch(vm, 0) != DPMI_SERVICE_COMPLETE || cpu.protected_mode ||
             cpu.pm_cs_loaded || (cpu.cr0 & 1u) || cpu.ds != 0x1111 ||
             cpu.es != 0x2222 || cpu.ss != 0x3333 || cpu.sp != 0x4444 ||
             cpu.cs != 0x5555 || cpu.ip != 0x6666 || cpu.op_size_32 ||
@@ -9057,9 +9721,12 @@ int dpmi_selftest(void)
         cpu.dx = raw_stack_sel;
         cpu.esi = 0xFFF7;
         cpu.edi = 0;
-        if (dpmi_raw_mode_switch(vm, 0) || cpu.protected_mode)
+        if (dpmi_raw_mode_switch(vm, 0) != DPMI_SERVICE_INTERRUPTED || cpu.protected_mode || cpu.running)
             failures++;
     }
+    vm->mem = NULL;
+    vm->total_mem_size = original_memory_size;
+    if (raw_memory) dos_host_free_pages(raw_memory, 16);
 
     for (unsigned i = 0; i < DPMI_MAX_DESCRIPTORS; i++)
         vm->dpmi.descriptor_state[i] = DPMI_DESC_MUTABLE;

@@ -7,12 +7,16 @@
 
 #include "msvcrt_shim.h"
 #include "kernel32_shim.h"
+#include "wow64.h"
 #include "ntdll_shim.h"
 #include "compat32.h"
 #include "unwind64.h"
 #include "win32_abi.h"
 #include "wintime.h"
 #include "crt_float.h"
+#include "crt_math.h"
+#include "crt_startup.h"
+#include "crt_exit.h"
 #include "../fs/vfs.h"
 #include "../fs/ositofs_metadata.h"
 #include "../include/paging.h"
@@ -193,36 +197,16 @@ int WINAPI _initterm_e(_PIFV *pfbegin, _PIFV *pfend)
 #endif
 }
 
-static char *g_argv0 = "program.exe";
-static char *g_argv[] = { NULL, NULL };
-static char *g_envp[] = { NULL };
-
 int WINAPI __getmainargs(int *argc, char ***argv, char ***env,
                           int do_wildcard, void *startinfo)
 {
-    (void)do_wildcard;
-    (void)startinfo;
-    g_argv[0] = g_argv0;
-    *argc = 1;
-    *argv = g_argv;
-    *env  = g_envp;
-    return 0;
+    return crt_startup_args(argc, argv, env, do_wildcard, startinfo, 1);
 }
-
-static WCHAR *g_wargv0 = (WCHAR[]){'p','r','o','g','r','a','m','.','e','x','e',0};
-static WCHAR *g_wargv[] = { NULL, NULL };
-static WCHAR *g_wenvp[] = { NULL };
 
 int WINAPI __wgetmainargs(int *argc, WCHAR ***argv, WCHAR ***env,
                            int do_wildcard, void *startinfo)
 {
-    (void)do_wildcard;
-    (void)startinfo;
-    g_wargv[0] = g_wargv0;
-    *argc = 1;
-    *argv = g_wargv;
-    *env  = g_wenvp;
-    return 0;
+    return crt_startup_args(argc, argv, env, do_wildcard, startinfo, 2);
 }
 
 int WINAPI __crtGetShowWindowMode(void) { return 10; /* SW_SHOWDEFAULT */ }
@@ -511,6 +495,8 @@ typedef struct {
     char pending[256];
     BOOL ucrt;
     uint64_t float_options;
+    BOOL secure;
+    BOOL invalid_format;
 } FMT_CTX;
 
 static BOOL crt_format_stream_valid(CRT_FILE *stream);
@@ -878,6 +864,10 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
             break;
 
         case 'n':
+            if (ctx->secure) {
+                ctx->invalid_format = ctx->failed = TRUE;
+                break;
+            }
             /* Store chars written */
             if (len_mod == 2 || len_mod == 3)
                 *ms_va_arg(ap, long long *) = (long long)ctx->pos;
@@ -887,9 +877,14 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
             break;
 
         case 0:
+            if (ctx->secure) ctx->invalid_format = ctx->failed = TRUE;
             goto done;
 
         default:
+            if (ctx->secure) {
+                ctx->invalid_format = ctx->failed = TRUE;
+                break;
+            }
             /* Unknown specifier — print literally */
             fmt_putc(ctx, '%');
             fmt_putc(ctx, *fmt);
@@ -1103,6 +1098,10 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             break;
 
         case 'n':
+            if (ctx->secure) {
+                ctx->invalid_format = ctx->failed = TRUE;
+                break;
+            }
             if (len_mod == 2) {
                 uint32_t addr32 = *vp++;
                 long long *p = (long long *)(uintptr_t)addr32;
@@ -1117,9 +1116,14 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             break;
 
         case 0:
+            if (ctx->secure) ctx->invalid_format = ctx->failed = TRUE;
             goto done32;
 
         default:
+            if (ctx->secure) {
+                ctx->invalid_format = ctx->failed = TRUE;
+                break;
+            }
             fmt_putc(ctx, '%');
             fmt_putc(ctx, *fmt);
             break;
@@ -1595,8 +1599,19 @@ typedef struct {
 _Static_assert(sizeof(CRT_FILE32) == 32, "PE32 _iobuf layout changed");
 
 typedef struct {
+    uint64_t ptr;
+    int32_t cnt, padding;
+    uint64_t base;
+    int32_t flag, file, charbuf, bufsiz;
+    uint64_t tmpfname;
+} CRT_FILE64;
+_Static_assert(sizeof(CRT_FILE64) == 48, "PE64 legacy _iobuf layout changed");
+_Static_assert(__builtin_offsetof(CRT_FILE64, flag) == 24, "PE64 _flag offset");
+
+typedef struct {
     DWORD owner_pid;
-    CRT_FILE32 *files;
+    PVOID files;
+    BOOL compat32;
 } CRT_FILE_PROXY_SLOT;
 
 #define CRT_O_WRONLY   0x0001
@@ -1620,6 +1635,24 @@ static CRT_FILE crt_files[CRT_FILE_MAX];
 static int crt_files_init = 0;
 static CRT_FILE_PROXY_SLOT crt_file_proxies[CRT_FILE_PROXY_PROCESS_SLOTS];
 static volatile uint32_t crt_file_proxy_lock;
+/* Legacy msvcrt low-I/O data ABI, used directly by the June 2010 D3DX DLLs.
+ * The i386 descriptor stride is 36, the amd64 stride is 56; osfile follows
+ * the pointer-sized OS handle. Keep these guest data exports out of the
+ * function-thunk path and out of other processes' virtual address spaces. */
+#define CRT_LOWIO_ARRAYS 64U
+#define CRT_LOWIO32_STRIDE 36U
+#define CRT_LOWIO64_STRIDE 56U
+typedef struct {
+    DWORD owner_pid;
+    BOOL compat32;
+    BYTE *page;
+} CRT_LOWIO_SLOT;
+static CRT_LOWIO_SLOT crt_lowio_slots[CRT_FILE_PROXY_PROCESS_SLOTS];
+static volatile uint32_t crt_lowio_live_slots;
+_Static_assert(CRT_LOWIO_ARRAYS * 8U +
+               (CRT_FILE_MAX + 1U) * CRT_LOWIO64_STRIDE <= 4096U,
+               "legacy CRT low-I/O data must fit its guest page");
+static void crt_lowio_sync_fd(int fd);
 static volatile uint32_t crt_open_trace_count;
 static volatile uint32_t crt_close_trace_count;
 static volatile uint32_t crt_read_trace_count;
@@ -1677,25 +1710,32 @@ static int crt_file_proxy_flags(const CRT_FILE *file)
     return flags;
 }
 
-static void crt_file_proxy_init(CRT_FILE32 *files)
+static void crt_file_proxy_init(PVOID files, BOOL compat32)
 {
     ensure_stdio_init();
     for (int fd = 0; fd < CRT_FILE_MAX; fd++) {
-        files[fd].flag = crt_file_proxy_flags(&crt_files[fd]);
-        files[fd].file = fd;
+        if (compat32) {
+            ((CRT_FILE32 *)files)[fd].flag = crt_file_proxy_flags(&crt_files[fd]);
+            ((CRT_FILE32 *)files)[fd].file = fd;
+        } else {
+            ((CRT_FILE64 *)files)[fd].flag = crt_file_proxy_flags(&crt_files[fd]);
+            ((CRT_FILE64 *)files)[fd].file = fd;
+        }
     }
 }
 
-static CRT_FILE32 *crt_file_proxy_array(BOOL create)
+static PVOID crt_file_proxy_array(BOOL create)
 {
     DWORD owner_pid = win32_current_process_id();
     if (!owner_pid) owner_pid = 1;
 
-    CRT_FILE32 *files = NULL;
+    BOOL compat32 = !!g_compat32_mode;
+    PVOID files = NULL;
     BOOL have_free_slot = FALSE;
     crt_file_proxy_lock_acquire();
     for (uint32_t i = 0; i < CRT_FILE_PROXY_PROCESS_SLOTS; i++) {
-        if (crt_file_proxies[i].owner_pid == owner_pid) {
+        if (crt_file_proxies[i].owner_pid == owner_pid &&
+            crt_file_proxies[i].compat32 == compat32) {
             files = crt_file_proxies[i].files;
             break;
         }
@@ -1707,25 +1747,26 @@ static CRT_FILE32 *crt_file_proxy_array(BOOL create)
     if (files || !create || !have_free_slot)
         return files;
 
-    CRT_FILE32 *candidate = (CRT_FILE32 *)VirtualAlloc(
-        NULL, sizeof(CRT_FILE32) * CRT_FILE_MAX,
+    SIZE_T bytes = (compat32 ? sizeof(CRT_FILE32) : sizeof(CRT_FILE64)) * CRT_FILE_MAX;
+    PVOID candidate = VirtualAlloc(
+        NULL, bytes,
         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     ULONG_PTR candidate_end = (ULONG_PTR)candidate +
-                              sizeof(CRT_FILE32) * CRT_FILE_MAX - 1;
-    if (!candidate || (ULONG_PTR)candidate > (ULONG_PTR)UINT32_MAX ||
-        candidate_end > (ULONG_PTR)UINT32_MAX) {
+                              bytes - 1;
+    if (!candidate || (compat32 && ((ULONG_PTR)candidate > (ULONG_PTR)UINT32_MAX ||
+        candidate_end > (ULONG_PTR)UINT32_MAX))) {
         if (candidate)
             VirtualFree(candidate, 0, MEM_RELEASE);
         return NULL;
     }
-    crt_file_proxy_init(candidate);
+    crt_file_proxy_init(candidate, compat32);
 
-    CRT_FILE32 *unused = candidate;
+    PVOID unused = candidate;
     crt_file_proxy_lock_acquire();
     CRT_FILE_PROXY_SLOT *free_slot = NULL;
     for (uint32_t i = 0; i < CRT_FILE_PROXY_PROCESS_SLOTS; i++) {
         CRT_FILE_PROXY_SLOT *slot = &crt_file_proxies[i];
-        if (slot->owner_pid == owner_pid) {
+        if (slot->owner_pid == owner_pid && slot->compat32 == compat32) {
             files = slot->files;
             break;
         }
@@ -1735,6 +1776,7 @@ static CRT_FILE32 *crt_file_proxy_array(BOOL create)
     if (!files && free_slot) {
         free_slot->owner_pid = owner_pid;
         free_slot->files = candidate;
+        free_slot->compat32 = compat32;
         files = candidate;
         unused = NULL;
     }
@@ -1743,10 +1785,10 @@ static CRT_FILE32 *crt_file_proxy_array(BOOL create)
     if (unused)
         VirtualFree(unused, 0, MEM_RELEASE);
     if (files == candidate) {
-        serial_puts("[CRT] PE32 stdio proxy pid=");
+        serial_puts(compat32 ? "[CRT] PE32 stdio proxy pid=" : "[CRT] PE64 stdio proxy pid=");
         serial_putdec(owner_pid);
         serial_puts(" va=0x");
-        serial_puthex((ULONG_PTR)files, 8);
+        serial_puthex((ULONG_PTR)files, compat32 ? 8 : 16);
         serial_puts("\n");
     }
     return files;
@@ -1755,10 +1797,16 @@ static CRT_FILE32 *crt_file_proxy_array(BOOL create)
 static void crt_file_proxy_sync(int fd)
 {
     if (fd < 0 || fd >= CRT_FILE_MAX) return;
-    CRT_FILE32 *files = crt_file_proxy_array(FALSE);
+    crt_lowio_sync_fd(fd);
+    PVOID files = crt_file_proxy_array(FALSE);
     if (!files) return;
-    files[fd].flag = crt_file_proxy_flags(&crt_files[fd]);
-    files[fd].file = fd;
+    if (g_compat32_mode) {
+        ((CRT_FILE32 *)files)[fd].flag = crt_file_proxy_flags(&crt_files[fd]);
+        ((CRT_FILE32 *)files)[fd].file = fd;
+    } else {
+        ((CRT_FILE64 *)files)[fd].flag = crt_file_proxy_flags(&crt_files[fd]);
+        ((CRT_FILE64 *)files)[fd].file = fd;
+    }
 }
 
 static void crt_file_proxy_release_process(DWORD process_id)
@@ -1769,8 +1817,137 @@ static void crt_file_proxy_release_process(DWORD process_id)
             crt_file_proxies[i].owner_pid = 0;
             crt_file_proxies[i].files = NULL;
         }
+        if (crt_lowio_slots[i].owner_pid == process_id) {
+            crt_lowio_slots[i].owner_pid = 0;
+            crt_lowio_slots[i].page = NULL;
+            __atomic_sub_fetch(&crt_lowio_live_slots, 1, __ATOMIC_RELAXED);
+        }
     }
     crt_file_proxy_lock_release();
+}
+
+static BYTE *crt_lowio_entry(BYTE *page, BOOL compat32, unsigned fd)
+{
+    unsigned pointer_size = compat32 ? 4U : 8U;
+    unsigned stride = compat32 ? CRT_LOWIO32_STRIDE : CRT_LOWIO64_STRIDE;
+    return page + CRT_LOWIO_ARRAYS * pointer_size + fd * stride;
+}
+
+static void crt_lowio_update_entry(BYTE *entry, BOOL compat32, int fd)
+{
+    CRT_FILE *file = &crt_files[fd];
+    ULONG_PTR handle = file->nt_handle ? (ULONG_PTR)file->nt_handle
+                                     : ~(ULONG_PTR)0;
+    BYTE flags = 0;
+    if (file->nt_handle) {
+        flags = 0x01; /* FOPEN */
+        if (file->flags & 4) flags |= 0x02; /* FEOFLAG */
+        if (file->open_flags & CRT_O_APPEND) flags |= 0x20;
+        if (file->open_flags & CRT_O_TEXT) flags |= 0x80;
+        DWORD type = GetFileType(file->nt_handle);
+        if (type == 2) flags |= 0x40; /* FDEV */
+        if (type == 3) flags |= 0x08; /* FPIPE */
+    }
+    if (compat32) *(uint32_t *)(void *)entry = (uint32_t)handle;
+    else *(uint64_t *)(void *)entry = (uint64_t)handle;
+    entry[compat32 ? 4U : 8U] = flags;
+}
+
+static void crt_lowio_sync_fd(int fd)
+{
+    if (!__atomic_load_n(&crt_lowio_live_slots, __ATOMIC_RELAXED)) return;
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    BYTE *page = NULL;
+    BOOL compat32 = FALSE;
+    crt_file_proxy_lock_acquire();
+    for (unsigned i = 0; i < CRT_FILE_PROXY_PROCESS_SLOTS; i++) {
+        if (crt_lowio_slots[i].owner_pid == owner_pid) {
+            page = crt_lowio_slots[i].page;
+            compat32 = crt_lowio_slots[i].compat32;
+            break;
+        }
+    }
+    crt_file_proxy_lock_release();
+    if (page)
+        crt_lowio_update_entry(crt_lowio_entry(page, compat32, (unsigned)fd),
+                               compat32, fd);
+}
+
+static PVOID crt_lowio_data(BOOL bad_descriptor)
+{
+    ensure_stdio_init();
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+    BOOL compat32 = g_compat32_mode;
+    BYTE *page = NULL;
+    crt_file_proxy_lock_acquire();
+    for (unsigned i = 0; i < CRT_FILE_PROXY_PROCESS_SLOTS; i++) {
+        if (crt_lowio_slots[i].owner_pid == owner_pid) {
+            page = crt_lowio_slots[i].page;
+            break;
+        }
+    }
+    crt_file_proxy_lock_release();
+    if (!page) {
+        BYTE *candidate = VirtualAlloc(NULL, 4096,
+            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!candidate) return NULL;
+        if (compat32 && (ULONG_PTR)candidate > UINT32_MAX - 4095U) {
+            VirtualFree(candidate, 0, MEM_RELEASE);
+            return NULL;
+        }
+        memset(candidate, 0, 4096);
+        PVOID first = crt_lowio_entry(candidate, compat32, 0);
+        if (compat32) *(uint32_t *)(void *)candidate = (uint32_t)(ULONG_PTR)first;
+        else *(uint64_t *)(void *)candidate = (uint64_t)(ULONG_PTR)first;
+        for (unsigned fd = 0; fd < CRT_FILE_MAX; fd++) {
+            BYTE *entry = crt_lowio_entry(candidate, compat32, fd);
+            crt_lowio_update_entry(entry, compat32, (int)fd);
+            unsigned flag_offset = compat32 ? 4U : 8U;
+            entry[flag_offset + 1] = entry[flag_offset + 2] =
+                entry[flag_offset + 3] = 0x0A; /* empty pipe lookahead */
+            unsigned lock_offset = compat32 ? 12U : 16U;
+            InitializeCriticalSectionAndSpinCount(
+                (LPCRITICAL_SECTION)(void *)(entry + lock_offset), 4000);
+            *(uint32_t *)(void *)(entry + flag_offset + 4) = 4;
+        }
+        BYTE *bad = crt_lowio_entry(candidate, compat32, CRT_FILE_MAX);
+        memset(bad, 0xFF, compat32 ? 4U : 8U);
+        bad[compat32 ? 4U : 8U] = 0x80; /* FTEXT, not FOPEN */
+        bad[(compat32 ? 4U : 8U) + 1] = 0x0A;
+
+        BYTE *unused = candidate;
+        crt_file_proxy_lock_acquire();
+        CRT_LOWIO_SLOT *free_slot = NULL;
+        for (unsigned i = 0; i < CRT_FILE_PROXY_PROCESS_SLOTS; i++) {
+            CRT_LOWIO_SLOT *slot = &crt_lowio_slots[i];
+            if (slot->owner_pid == owner_pid) {
+                page = slot->page;
+                break;
+            }
+            if (!slot->owner_pid && !free_slot) free_slot = slot;
+        }
+        if (!page && free_slot) {
+            free_slot->owner_pid = owner_pid;
+            free_slot->compat32 = compat32;
+            free_slot->page = candidate;
+            __atomic_add_fetch(&crt_lowio_live_slots, 1, __ATOMIC_RELAXED);
+            page = candidate;
+            unused = NULL;
+        }
+        crt_file_proxy_lock_release();
+        if (unused) {
+            for (unsigned fd = 0; fd < CRT_FILE_MAX; fd++)
+                DeleteCriticalSection((LPCRITICAL_SECTION)(void *)(
+                    crt_lowio_entry(unused, compat32, fd) +
+                    (compat32 ? 12U : 16U)));
+            VirtualFree(unused, 0, MEM_RELEASE);
+        }
+    }
+    if (!page) return NULL;
+    return bad_descriptor ? crt_lowio_entry(page, compat32, CRT_FILE_MAX)
+                          : page;
 }
 
 static int crt_file_index(CRT_FILE *file)
@@ -1786,14 +1963,15 @@ static int crt_file_index(CRT_FILE *file)
         return crt_files[fd].nt_handle ? fd : -1;
     }
 
-    CRT_FILE32 *files = crt_file_proxy_array(FALSE);
+    PVOID files = crt_file_proxy_array(FALSE);
+    SIZE_T stride = g_compat32_mode ? sizeof(CRT_FILE32) : sizeof(CRT_FILE64);
     first = (uintptr_t)files;
-    end = first + sizeof(CRT_FILE32) * CRT_FILE_MAX;
+    end = first + stride * CRT_FILE_MAX;
     if (!files || address < first || address >= end ||
-        ((address - first) % sizeof(CRT_FILE32)) != 0)
+        ((address - first) % stride) != 0)
         return -1;
 
-    int fd = (int)((address - first) / sizeof(CRT_FILE32));
+    int fd = (int)((address - first) / stride);
     return crt_files[fd].nt_handle ? fd : -1;
 }
 
@@ -1832,16 +2010,16 @@ static CRT_FILE *crt_file_from_fd(int fd)
 static CRT_FILE *crt_file_for_caller(int fd)
 {
     CRT_FILE *file = crt_file_from_fd(fd);
-    if (!file || !g_compat32_mode)
-        return file;
+    if (!file) return NULL;
 
-    CRT_FILE32 *files = crt_file_proxy_array(TRUE);
+    PVOID files = crt_file_proxy_array(TRUE);
     if (!files) {
         *crt_errno() = CRT_ENOMEM;
         return NULL;
     }
     crt_file_proxy_sync(fd);
-    return (CRT_FILE *)(ULONG_PTR)&files[fd];
+    SIZE_T stride = g_compat32_mode ? sizeof(CRT_FILE32) : sizeof(CRT_FILE64);
+    return (CRT_FILE *)((BYTE *)files + fd * stride);
 }
 
 static int crt_file_attach(HANDLE handle, int open_flags)
@@ -1871,10 +2049,7 @@ static int crt_file_attach(HANDLE handle, int open_flags)
 CRT_FILE* WINAPI crt_iob_func(void)
 {
     ensure_stdio_init();
-    if (!g_compat32_mode)
-        return &crt_files[0];
-
-    CRT_FILE32 *files = crt_file_proxy_array(TRUE);
+    PVOID files = crt_file_proxy_array(TRUE);
     return (CRT_FILE *)(ULONG_PTR)files;
 }
 
@@ -2011,19 +2186,47 @@ SIZE_T WINAPI crt_fread(PVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f)
     CRT_FILE *file = crt_file_resolve(f, &fd);
     if (!size || !count) return 0;
     if (!buf || !file || !(file->flags & 1)) {
+        *crt_errno() = !buf ? CRT_EINVAL : CRT_EBADF;
         if (file) {
             file->flags |= 8;
             crt_file_proxy_sync(fd);
         }
         return 0;
     }
-    DWORD total = (DWORD)(size * count);
-    DWORD bytes_read = 0;
-    BOOL ok = ReadFile(file->nt_handle, buf, total, &bytes_read, NULL);
-    if (!ok) file->flags |= 8;
-    else if (bytes_read == 0) file->flags |= 4;
+    SIZE_T limit = g_compat32_mode ? UINT32_MAX : UINT64_MAX;
+    if (size > limit || count > limit / size) {
+        *crt_errno() = CRT_EINVAL;
+        file->flags |= 8;
+        crt_file_proxy_sync(fd);
+        return 0;
+    }
+    SIZE_T total = size * count, consumed = 0;
+    if (file->flags & 16) {
+        ((unsigned char *)buf)[consumed++] = (unsigned char)file->ungetc_ch;
+        file->flags &= ~16;
+    }
+    /* A short NT read is not necessarily EOF (pipes can supply more data).
+     * fread must continue until the requested elements, error, or actual EOF.
+     * Keep the aggregate in SIZE_T; each individual ReadFile uses a DWORD. */
+    while (consumed < total && !(file->flags & 4)) {
+        SIZE_T remaining = total - consumed;
+        DWORD chunk = remaining > UINT32_MAX ? UINT32_MAX : (DWORD)remaining;
+        DWORD bytes_read = 0;
+        BOOL ok = ReadFile(file->nt_handle, (unsigned char *)buf + consumed,
+                           chunk, &bytes_read, NULL);
+        if (!ok || bytes_read > chunk) {
+            if (!ok && GetLastError() == 109) file->flags |= 4; /* Pipe EOF. */
+            else {
+                file->flags |= 8;
+                *crt_errno() = ok ? CRT_EIO : crt_errno_from_last_error();
+            }
+            break;
+        }
+        if (!bytes_read) { file->flags |= 4; break; }
+        consumed += bytes_read;
+    }
     crt_file_proxy_sync(fd);
-    return bytes_read / size;
+    return consumed / size;
 }
 
 SIZE_T WINAPI crt_fwrite(PCVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f)
@@ -2747,6 +2950,7 @@ int WINAPI crt_setmode(int fd, int mode)
     int previous = file->open_flags & mode_mask;
     if (!previous) previous = CRT_O_TEXT;
     file->open_flags = (file->open_flags & ~mode_mask) | mode;
+    crt_file_proxy_sync(fd);
     *crt_errno() = 0;
     return previous;
 }
@@ -3168,21 +3372,133 @@ SIZE_T WINAPI crt_wcstombs(char *destination, const WCHAR *source,
 
 /* ── Process ───────────────────────────────────────────────── */
 
-#define ATEXIT_MAX 32
-static void (*atexit_funcs[ATEXIT_MAX])(void);
-static int atexit_count = 0;
+/* The locale provider currently accepts only the single-byte C locale. */
+static int WINAPI crt_wctomb(char *output, WCHAR value)
+{
+    if (!output) return 0;
+    if (value > 0xFF) {
+        *output = 0;
+        *crt_errno() = CRT_EILSEQ;
+        return -1;
+    }
+    *output = (char)value;
+    return 1;
+}
+
+static SIZE_T WINAPI crt_mbstrlen(const char *text)
+{
+    if (!text) {
+        *crt_errno() = CRT_EINVAL;
+        return (SIZE_T)-1;
+    }
+    return crt_strlen(text);
+}
+
+static int WINAPI crt_isleadbyte(int value)
+{
+    (void)value;
+    return 0; /* No lead bytes in the C locale. */
+}
+
+static int WINAPI crt_isxdigit(int value)
+{
+    return (value >= '0' && value <= '9') ||
+           (value >= 'a' && value <= 'f') ||
+           (value >= 'A' && value <= 'F');
+}
+
+static char *crt_integer_text(uint32_t value, BOOL negative, char *output,
+                              int radix)
+{
+    if (!output || radix < 2 || radix > 36) {
+        if (output) output[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+    static const char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char reversed[32];
+    unsigned count = 0;
+    do {
+        reversed[count++] = digits[value % (unsigned)radix];
+        value /= (unsigned)radix;
+    } while (value);
+    char *next = output;
+    if (negative) *next++ = '-';
+    while (count) *next++ = reversed[--count];
+    *next = 0;
+    return output;
+}
+
+static char *WINAPI crt_itoa(int32_t value, char *output, int radix)
+{
+    BOOL negative = value < 0 && radix == 10;
+    uint32_t magnitude = negative ? 0U - (uint32_t)value : (uint32_t)value;
+    return crt_integer_text(magnitude, negative, output, radix);
+}
+
+static char *WINAPI crt_ultoa(uint32_t value, char *output, int radix)
+{
+    return crt_integer_text(value, FALSE, output, radix);
+}
+
+static char *WINAPI crt_tempnam(const char *directory, const char *prefix)
+{
+    const char *candidates[] = { crt_getenv("TMP"), directory, "." };
+    const char *selected = NULL;
+    for (unsigned i = 0; i < 3; i++) {
+        if (!candidates[i] || !candidates[i][0]) continue;
+        DWORD attributes = GetFileAttributesA(candidates[i]);
+        if (attributes != 0xFFFFFFFFU && (attributes & 0x10U)) {
+            selected = candidates[i];
+            break;
+        }
+    }
+    if (!selected) { *crt_errno() = CRT_ENOENT; return NULL; }
+    SIZE_T length = crt_strlen(selected);
+    SIZE_T prefix_length = prefix ? crt_strlen(prefix) : 0;
+    if (length > 240 || prefix_length > 240 || length + prefix_length > 240) {
+        *crt_errno() = CRT_ENAMETOOLONG;
+        return NULL;
+    }
+    char *result = crt_malloc(length + prefix_length + 22);
+    if (!result) return NULL;
+    static uint32_t sequence;
+    static const char hex[] = "0123456789abcdef";
+    for (unsigned attempt = 0; attempt < 256; attempt++) {
+        SIZE_T pos = 0;
+        while (pos < length) { result[pos] = selected[pos]; pos++; }
+        if (pos && result[pos-1] != '/' && result[pos-1] != '\\')
+            result[pos++] = '\\';
+        for (SIZE_T i = 0; i < prefix_length; i++) result[pos++] = prefix[i];
+        uint32_t value = __atomic_add_fetch(&sequence, 1, __ATOMIC_RELAXED);
+        uint64_t unique = ((uint64_t)GetCurrentProcessId() << 32) | value;
+        for (int shift = 60; shift >= 0; shift -= 4)
+            result[pos++] = hex[(unique >> shift) & 15U];
+        result[pos++] = '.'; result[pos++] = 't'; result[pos++] = 'm';
+        result[pos++] = 'p'; result[pos] = 0;
+        if (GetFileAttributesA(result) == 0xFFFFFFFFU &&
+            (GetLastError() == 2 || GetLastError() == 3))
+            return result;
+    }
+    crt_free(result);
+    *crt_errno() = CRT_EACCES;
+    return NULL;
+}
 
 void WINAPI crt_exit(int code)
 {
-
-    /* In compat32 mode, skip atexit handlers — PE32 cleanup code
-     * tends to crash (NULL vtable calls, uninitialized subsystems).
-     * Just terminate cleanly. */
-    if (!g_compat32_mode) {
-        for (int i = atexit_count - 1; i >= 0; i--)
-            atexit_funcs[i]();
-    }
+    crt_exit_callbacks_run();
     ExitProcess((DWORD)code);
+}
+
+static void WINAPI crt_cexit(void)
+{
+    crt_exit_callbacks_run();
+}
+
+static void WINAPI crt_c_exit(void)
+{
+    /* Quick cleanup returns without callbacks. Streams are unbuffered. */
 }
 
 void WINAPI crt_abort(void)
@@ -3221,9 +3537,9 @@ void WINAPI __attribute__((noreturn)) crt_endthreadex(unsigned exit_code)
 
 int WINAPI crt_atexit(void (*func)(void))
 {
-    if (atexit_count >= ATEXIT_MAX) return -1;
-    atexit_funcs[atexit_count++] = func;
-    return 0;
+    int status = crt_exit_callbacks_register((PVOID)func);
+    if (status) *crt_errno() = func ? CRT_ENOMEM : CRT_EINVAL;
+    return status;
 }
 
 /* Universal CRT startup uses a caller-owned descriptor containing three
@@ -3277,12 +3593,17 @@ typedef struct {
     int daylight;
     int adjust_fdiv;
     int mb_cur_max;
+    unsigned int lc_codepage;
     ULONG_PTR acmdln_value;
     ULONG_PTR initenv_value;
     ULONG_PTR initenv_entries[1];
     ULONG_PTR signal_handlers[7];
     char command_line[4096];
     PVOID invalid_parameter_handler;
+    /* User-addressable legacy exception vtables, RTTI and default message.
+     * The process VMA teardown owns this storage, just like the CRT cells. */
+    uint64_t exception_metadata[32];
+    BOOL exception_metadata_ready;
 } UCRT_PROCESS_MODE_VALUES;
 
 typedef struct {
@@ -3295,6 +3616,8 @@ typedef struct {
     ULONG doserrno_value;
     WCHAR wcserror_buffer[64];
     char *strtok_context;
+    int fpecode;
+    ULONG_PTR exception_info;
 } UCRT_THREAD_VALUES;
 
 typedef struct _UCRT_THREAD_STATE {
@@ -3358,6 +3681,8 @@ static UCRT_THREAD_VALUES *ucrt_thread_state(BOOL create)
             values->errno_value = 0;
             values->doserrno_value = 0;
             values->strtok_context = NULL;
+            values->fpecode = 0;
+            values->exception_info = 0;
             state->owner_pid = owner_pid;
             state->owner_tid = owner_tid;
             state->values = values;
@@ -3510,6 +3835,8 @@ void msvcrt_release_process(DWORD process_id)
     }
 
     crt_locale_release_process(process_id);
+    crt_startup_release_process(process_id);
+    crt_exit_callbacks_release(process_id);
     crt_env_release_process(process_id);
     crt_file_proxy_release_process(process_id);
 }
@@ -3762,7 +4089,7 @@ PVOID WINAPI crt_get_invalid_parameter_handler(void)
                                      __ATOMIC_ACQUIRE) : NULL;
 }
 
-static void crt_report_invalid_parameter(void)
+void crt_report_invalid_parameter(void)
 {
     PVOID handler = crt_get_thread_local_invalid_parameter_handler();
     if (!handler) handler = crt_get_invalid_parameter_handler();
@@ -3780,6 +4107,51 @@ static void crt_report_invalid_parameter(void)
                                                 ULONG_PTR);
         ((INVALID_HANDLER)handler)(NULL, NULL, NULL, 0, 0);
     }
+}
+
+/* Legacy MSVCRT accepts zero size/alignment, unlike the newer UCRT contract.
+ * The hidden base pointer has guest width and belongs to the process heap,
+ * so normal process cleanup also reclaims outstanding aligned allocations. */
+PVOID WINAPI crt_aligned_malloc(SIZE_T size, SIZE_T alignment)
+{
+    if (alignment & (alignment - 1)) {
+        *crt_errno() = 22; /* EINVAL */
+        crt_report_invalid_parameter();
+        return NULL;
+    }
+    SIZE_T pointer_size = g_compat32_mode ? 4 : 8;
+    SIZE_T max_request = g_compat32_mode ? 0xffffffe0ULL
+                                        : 0xffffffffffffffe0ULL;
+    if (alignment < pointer_size) alignment = pointer_size;
+    SIZE_T padding = alignment - 1 + pointer_size;
+    if (size > max_request || padding > max_request - size) {
+        *crt_errno() = 12; /* ENOMEM */
+        return NULL;
+    }
+    DWORD previous_error = GetLastError();
+    PVOID base = crt_malloc(size + padding);
+    SetLastError(previous_error);
+    if (!base) {
+        *crt_errno() = 12;
+        return NULL;
+    }
+    ULONG_PTR aligned = ((ULONG_PTR)base + padding) & ~(alignment - 1);
+    if (g_compat32_mode)
+        *(uint32_t *)(aligned - 4) = (uint32_t)(ULONG_PTR)base;
+    else
+        *(uint64_t *)(aligned - 8) = (uint64_t)(ULONG_PTR)base;
+    return (PVOID)aligned;
+}
+
+void WINAPI crt_aligned_free(PVOID pointer)
+{
+    if (!pointer) return;
+    ULONG_PTR aligned = (ULONG_PTR)pointer;
+    ULONG_PTR base = g_compat32_mode ? *(uint32_t *)(aligned - 4)
+                                    : *(uint64_t *)(aligned - 8);
+    DWORD previous_error = GetLastError();
+    crt_free((PVOID)base);
+    SetLastError(previous_error);
 }
 
 /* Locale. The CRT starts in C and OsitoK currently has no configurable
@@ -4085,6 +4457,13 @@ PVOID WINAPI crt_localeconv(void)
     return &crt_c_lconv;
 }
 
+static int WINAPI crt_ismbblead(unsigned int c)
+{
+    /* setlocale currently accepts only the single-byte C/POSIX locale. */
+    (void)c;
+    return 0;
+}
+
 /* ── ctype ─────────────────────────────────────────────────── */
 
 int WINAPI crt_isalpha(int c)  { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
@@ -4184,6 +4563,11 @@ int WINAPI crt_iswdigit(int c)
 int WINAPI crt_iswspace(int c)
 {
     return (crt_wide_ctype_mask(c) & 0x0008) != 0;
+}
+
+static int WINAPI crt_iswpunct(int c)
+{
+    return (crt_wide_ctype_mask(c) & 0x0010) != 0;
 }
 
 int WINAPI crt_iswupper(int c)
@@ -5069,6 +5453,185 @@ void WINAPI crt_type_info_dtor_internal(PVOID _this)
     crt_type_info_dtor(_this);
 }
 
+/* Legacy msvcrt exception has {vptr, message, int owns_message}. PE32 methods
+ * use thiscall; the shared providers below receive the bridged Microsoft ABI.
+ * Windows oracle: crt_exception_pe.c, in both native Windows architectures. */
+typedef struct { uint32_t vtable, message; int owned; } CRT_EXCEPTION32;
+typedef struct { PVOID vtable; char *message; int owned; } CRT_EXCEPTION64;
+
+static PVOID WINAPI crt_exception_delete(PVOID object, UINT flags);
+static PCSTR WINAPI crt_exception_what(PVOID object);
+
+static void crt_exception_store_pointer(BYTE *address, ULONG_PTR value)
+{
+    if (g_compat32_mode) *(uint32_t *)address = (uint32_t)value;
+    else *(ULONG_PTR *)address = value;
+}
+
+static BYTE *crt_exception_metadata(void)
+{
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) return NULL;
+    BYTE *data = (BYTE *)values->exception_metadata;
+    ucrt_state_lock_acquire();
+    if (!values->exception_metadata_ready) {
+        ULONG_PTR destroy = (ULONG_PTR)crt_exception_delete;
+        ULONG_PTR what = (ULONG_PTR)crt_exception_what;
+        ULONG_PTR type_destroy = (ULONG_PTR)crt_type_info_dtor;
+        unsigned pointer_size = g_compat32_mode ? 4 : 8;
+        if (g_compat32_mode) {
+            destroy = compat32_make_thunk_ex(destroy,
+                "exception_vector_deleting_destructor", 1, CC_THISCALL);
+            what = compat32_make_thunk_ex(what,
+                "?what@exception@@UBEPBDXZ", 0, CC_THISCALL);
+            type_destroy = compat32_make_thunk_ex(type_destroy,
+                "??1type_info@@UAE@XZ", 0, CC_THISCALL);
+        }
+        if (!destroy || !what || !type_destroy) {
+            ucrt_state_lock_release();
+            return NULL;
+        }
+        crt_exception_store_pointer(data, (ULONG_PTR)(data + 0x20));
+        crt_exception_store_pointer(data + pointer_size, destroy);
+        crt_exception_store_pointer(data + 2 * pointer_size, what);
+        /* x86 RTTI uses absolute pointers; x64 uses image-relative DWORDs.
+         * The latter's complete-object locator identifies this metadata base. */
+        uint32_t base = g_compat32_mode ? (uint32_t)(ULONG_PTR)data : 0;
+        uint32_t *locator = (uint32_t *)(data + 0x20);
+        locator[0] = g_compat32_mode ? 0 : 1;
+        locator[3] = base + 0x80; locator[4] = base + 0x40;
+        locator[5] = 0x20;
+        uint32_t *hierarchy = (uint32_t *)(data + 0x40);
+        hierarchy[2] = 1; hierarchy[3] = base + 0x50;
+        *(uint32_t *)(data + 0x50) = base + 0x60;
+        uint32_t *descriptor = (uint32_t *)(data + 0x60);
+        descriptor[0] = base + 0x80;
+        descriptor[3] = UINT32_MAX; /* PMD: no virtual base */
+        descriptor[5] = 0x40;      /* has class hierarchy descriptor */
+        descriptor[6] = base + 0x40;
+        crt_exception_store_pointer(data + 0x80, (ULONG_PTR)(data + 0xb0));
+        crt_exception_store_pointer(data + 0xb0, type_destroy);
+        static const char type_name[] = ".?AVexception@@";
+        static const char unknown[] = "Unknown exception";
+        crt_memcpy(data + 0x80 + 2 * pointer_size, type_name, sizeof(type_name));
+        crt_memcpy(data + 0xc0, unknown, sizeof(unknown));
+        values->exception_metadata_ready = TRUE;
+    }
+    ucrt_state_lock_release();
+    return data;
+}
+
+static char *crt_exception_message(PVOID object, int *owned)
+{
+    if (g_compat32_mode) {
+        CRT_EXCEPTION32 *value = object;
+        *owned = value->owned;
+        return (char *)(ULONG_PTR)value->message;
+    }
+    CRT_EXCEPTION64 *value = object;
+    *owned = value->owned;
+    return value->message;
+}
+
+static PVOID crt_exception_construct(PVOID object, const char *message,
+                                      BOOL copy_message)
+{
+    BYTE *metadata = crt_exception_metadata();
+    if (!metadata) return NULL;
+    char *stored = (char *)message;
+    int owned = 0;
+    if (message && copy_message) {
+        SIZE_T length = 0;
+        while (message[length]) length++;
+        stored = crt_malloc(length + 1);
+        if (stored) {
+            crt_memcpy(stored, message, length + 1);
+            owned = 1;
+        }
+    }
+    if (g_compat32_mode) {
+        CRT_EXCEPTION32 *value = object;
+        value->vtable = (uint32_t)(ULONG_PTR)(metadata + 4);
+        value->message = (uint32_t)(ULONG_PTR)stored;
+        value->owned = owned;
+    } else {
+        CRT_EXCEPTION64 *value = object;
+        value->vtable = metadata + 8;
+        value->message = stored;
+        value->owned = owned;
+    }
+    return object;
+}
+
+static const char *crt_exception_message_argument(PCVOID argument)
+{
+    return g_compat32_mode ? (const char *)(ULONG_PTR)*(const uint32_t *)argument
+                           : *(const char *const *)argument;
+}
+
+static PVOID WINAPI crt_exception_ctor(PVOID object)
+{
+    return crt_exception_construct(object, NULL, FALSE);
+}
+
+static PVOID WINAPI crt_exception_ctor_message(PVOID object, PCVOID argument)
+{
+    return crt_exception_construct(object,
+        crt_exception_message_argument(argument), TRUE);
+}
+
+static PVOID WINAPI crt_exception_ctor_borrow(PVOID object, PCVOID argument,
+                                              int unused)
+{
+    (void)unused;
+    return crt_exception_construct(object,
+        crt_exception_message_argument(argument), FALSE);
+}
+
+static PVOID WINAPI crt_exception_copy(PVOID object, PVOID source)
+{
+    int owned;
+    char *message = crt_exception_message(source, &owned);
+    return crt_exception_construct(object, message, owned != 0);
+}
+
+static void WINAPI crt_exception_dtor(PVOID object)
+{
+    int owned;
+    char *message = crt_exception_message(object, &owned);
+    BYTE *metadata = crt_exception_metadata();
+    if (metadata) crt_exception_store_pointer(object,
+        (ULONG_PTR)(metadata + (g_compat32_mode ? 4 : 8)));
+    if (owned) crt_free(message);
+}
+
+static PCSTR WINAPI crt_exception_what(PVOID object)
+{
+    int owned;
+    char *message = crt_exception_message(object, &owned);
+    if (message) return message;
+    BYTE *metadata = crt_exception_metadata();
+    return metadata ? (PCSTR)(metadata + 0xc0) : NULL;
+}
+
+static PVOID WINAPI crt_exception_delete(PVOID object, UINT flags)
+{
+    if (flags & 2) {
+        SIZE_T width = g_compat32_mode ? 4 : 8;
+        SIZE_T stride = g_compat32_mode ? sizeof(CRT_EXCEPTION32)
+                                      : sizeof(CRT_EXCEPTION64);
+        BYTE *cookie = (BYTE *)object - width;
+        SIZE_T count = g_compat32_mode ? *(uint32_t *)cookie
+                                     : *(SIZE_T *)cookie;
+        while (count) crt_exception_dtor((BYTE *)object + --count * stride);
+        crt_free(cookie);
+        return cookie;
+    }
+    crt_exception_dtor(object);
+    if (flags & 1) crt_free(object);
+    return object;
+}
+
 /*
  * MSVCR80+ keeps one __type_info_node root in each image that asks for a
  * demangled RTTI name. Each heap node owns both its mem_ptr and itself.
@@ -5596,6 +6159,21 @@ static unsigned crt_fp_exceptions_to_hw(unsigned bits)
            ((bits & 2) ? 16U : 0) | ((bits & 1) ? 32U : 0);
 }
 
+static unsigned int WINAPI crt_clearfp(void)
+{
+    unsigned short status;
+    unsigned csr;
+    __asm__ volatile ("fnstsw %0; stmxcsr %1"
+                      : "=m"(status), "=m"(csr));
+    /* Legacy msvcrt's x86 export reports x87 status, while its x64 export
+     * reports SSE status. Both clear the SSE exception flags. */
+    unsigned result = crt_fp_exceptions_from_hw(
+        (g_compat32_mode ? status : csr) & 0x3F);
+    unsigned cleared = csr & ~0x3FU;
+    __asm__ volatile ("fnclex; ldmxcsr %0" : : "m"(cleared) : "memory");
+    return result;
+}
+
 static unsigned crt_fp_x87_control(unsigned short word)
 {
     unsigned value = crt_fp_exceptions_from_hw(word & 0x3F) |
@@ -5698,8 +6276,7 @@ long WINAPI crt_ftol(double val)
 /* _onexit — register exit callback */
 _onexit_t WINAPI crt_onexit(_onexit_t func)
 {
-    if (func) crt_atexit((void (*)(void))func);
-    return func;
+    return func && !crt_atexit((void (*)(void))func) ? func : NULL;
 }
 
 /* _purecall — pure virtual call handler */
@@ -5731,6 +6308,62 @@ static int WINAPI crt_vsnprintf(char *buf, SIZE_T size, const char *fmt, ms_va_l
     if (!fmt_buffer_valid(buf, size, fmt, TRUE)) return -1;
     FMT_CTX ctx = { .buf = buf, .size = size, .legacy_count = TRUE };
     return fmt_legacy_result(fmt_caller_args(&ctx, fmt, ap), buf, size);
+}
+
+static BOOL crt_sprintf_s_valid(char *buf, SIZE_T size, const char *fmt)
+{
+    if (buf && size && fmt) return TRUE;
+    if (buf && size) buf[0] = 0;
+    *crt_errno() = CRT_EINVAL;
+    crt_report_invalid_parameter();
+    return FALSE;
+}
+
+static int crt_sprintf_s_result(FMT_CTX *ctx, int required)
+{
+    /* Legacy MSVCRT terminates the declared buffer as well as the text. */
+    ctx->buf[ctx->size - 1] = 0;
+    if (required >= 0 && (SIZE_T)required < ctx->size) return required;
+    ctx->buf[0] = 0;
+    if (ctx->invalid_format || required >= 0) {
+        *crt_errno() = ctx->invalid_format ? CRT_EINVAL : CRT_ERANGE;
+        crt_report_invalid_parameter();
+    }
+    return -1;
+}
+
+static int WINAPI crt_sprintf_s_compat32(char *buf, SIZE_T size,
+                                       const char *fmt, uint32_t *args)
+{
+    if (!crt_sprintf_s_valid(buf, size, fmt)) return -1;
+    FMT_CTX ctx = { .buf = buf, .size = size, .secure = TRUE };
+    int required = do_vformat32(&ctx, fmt, args);
+    return crt_sprintf_s_result(&ctx, required);
+}
+
+static int WINAPI crt_sprintf_s(char *buf, SIZE_T size, const char *fmt, ...)
+{
+    if (!crt_sprintf_s_valid(buf, size, fmt)) return -1;
+    ms_va_list args;
+    ms_va_start(args, fmt);
+    FMT_CTX ctx = { .buf = buf, .size = size, .secure = TRUE };
+    int required = do_vformat(&ctx, fmt, args);
+    ms_va_end(args);
+    return crt_sprintf_s_result(&ctx, required);
+}
+
+static int WINAPI crt_vsprintf_s(char *buf, SIZE_T size, const char *fmt,
+                                ms_va_list args)
+{
+    if (!crt_sprintf_s_valid(buf, size, fmt)) return -1;
+    FMT_CTX ctx = { .buf = buf, .size = size, .secure = TRUE };
+    int required = fmt_caller_args(&ctx, fmt, args);
+    return crt_sprintf_s_result(&ctx, required);
+}
+
+static int WINAPI crt_iscsym(int c)
+{
+    return crt_isalnum(c) || c == '_';
 }
 
 static BOOL crt_secure_truncate_count(SIZE_T count)
@@ -7027,6 +7660,34 @@ static uint64_t WINAPI crt_isnan_compat32(uint64_t low, uint64_t high)
     return (uint64_t)crt_double_bits_nan(bits);
 }
 
+static int crt_fpclass_bits(uint64_t bits)
+{
+    unsigned exponent = (unsigned)((bits >> 52) & 0x7FF);
+    uint64_t fraction = bits & 0x000FFFFFFFFFFFFFULL;
+    BOOL negative = (bits >> 63) != 0;
+    if (exponent == 0x7FF) {
+        if (fraction) return (fraction & (1ULL << 51)) ? 2 : 1;
+        return negative ? 4 : 0x200;
+    }
+    if (!exponent) {
+        if (fraction) return negative ? 0x10 : 0x80;
+        return negative ? 0x20 : 0x40;
+    }
+    return negative ? 8 : 0x100;
+}
+
+static int WINAPI crt_fpclass(double value)
+{
+    union { double value; uint64_t bits; } number = { value };
+    return crt_fpclass_bits(number.bits);
+}
+
+static uint64_t WINAPI crt_fpclass_compat32(uint64_t low, uint64_t high)
+{
+    return (uint64_t)crt_fpclass_bits((uint32_t)low |
+                                     ((uint64_t)(uint32_t)high << 32));
+}
+
 static short crt_fpclass_from_parts(uint64_t exponent, uint64_t fraction,
                                     uint64_t exponent_mask)
 {
@@ -7152,7 +7813,7 @@ int WINAPI crt_chmod(const char *path, int mode)
     }
 
     char normalized[260];
-    if (!win32_normalize_path(path, normalized)) {
+    if (!win32_resolve_file_path(path, normalized)) {
         *crt_errno() = CRT_ENAMETOOLONG;
         return -1;
     }
@@ -7228,7 +7889,7 @@ static int crt_stat_query(const char *path, CRT_STAT_META *meta)
     }
 
     char normalized[260];
-    if (!win32_normalize_path(path, normalized)) {
+    if (!win32_resolve_file_path(path, normalized)) {
         *crt_errno() = CRT_ENAMETOOLONG;
         return -1;
     }
@@ -9284,7 +9945,273 @@ typedef struct {
     uint8_t     cc;
 } MSVCRT_EXPORT;
 
+/* Legacy CRT accessors used by MinGW runtimes. Storage must belong to the
+ * caller: Wine's PE32 libraries write through these returned pointers. */
+static unsigned int WINAPI crt_lc_codepage_func(void)
+{
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    return values ? values->lc_codepage : 0;
+}
+
+static int *WINAPI crt_p_mb_cur_max(void)
+{
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    return values ? &values->mb_cur_max : NULL;
+}
+
+static int WINAPI crt_mb_cur_max_func(void)
+{
+    int *value = crt_p_mb_cur_max();
+    return value ? *value : 1;
+}
+
+static int *WINAPI crt_fpecode(void)
+{
+    UCRT_THREAD_VALUES *values = ucrt_thread_state(TRUE);
+    return values ? &values->fpecode : NULL;
+}
+
+static PVOID WINAPI crt_pxcptinfoptrs(void)
+{
+    UCRT_THREAD_VALUES *values = ucrt_thread_state(TRUE);
+    return values ? &values->exception_info : NULL;
+}
+
+static void WINAPI crt_assert(const char *expression, const char *file,
+                               unsigned int line)
+{
+    serial_puts("[MSVCRT] assertion failed: ");
+    serial_puts(expression ? expression : "<null>");
+    serial_puts(" at ");
+    serial_puts(file ? file : "<null>");
+    serial_puts(":");
+    serial_putdec(line);
+    serial_puts("\n");
+    crt_abort();
+}
+
+static intptr_t WINAPI crt_execv(const char *path, const void *argv)
+{
+    /* Win32 process-image replacement is not implemented. Never report a
+     * successful exec while continuing to execute the original program. */
+    (void)path;
+    (void)argv;
+    *crt_errno() = 40; /* ENOSYS */
+    return -1;
+}
+
+static void WINAPI crt_perror(const char *prefix)
+{
+    int saved_errno = *crt_errno();
+    CRT_FILE *stream = crt_acrt_iob_func(2);
+    if (prefix && *prefix) {
+        crt_fputs(prefix, stream);
+        crt_fputs(": ", stream);
+    }
+    crt_fputs(crt_strerror(saved_errno), stream);
+    crt_fputs("\n", stream);
+    *crt_errno() = saved_errno;
+}
+
+static int WINAPI crt_isctype(int c, int mask)
+{
+    /* setlocale accepts the C locale only. Bits are the MSVCRT _ctype
+     * table flags, not boolean results of the public is* wrappers. */
+    unsigned int flags = 0;
+    if (c < 0 || c > 255) return 0;
+    if (c >= 'A' && c <= 'Z') flags |= 0x01;
+    if (c >= 'a' && c <= 'z') flags |= 0x02;
+    if (c >= '0' && c <= '9') flags |= 0x04;
+    if (crt_isspace(c)) flags |= 0x08;
+    if (c < 0x20 || c == 0x7f) flags |= 0x20;
+    if (c == ' ') flags |= 0x40;
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
+        (c >= 'a' && c <= 'f')) flags |= 0x80;
+    if (c > 0x20 && c < 0x7f && !crt_isalnum(c)) flags |= 0x10;
+    return (int)(flags & (unsigned int)mask);
+}
+
+static uint64_t crt_parse_int64(const char *text, PVOID endptr, int base,
+                                BOOL signed_result)
+{
+    const char *cursor = text;
+    uint64_t value = 0;
+    BOOL negative = FALSE, overflow = FALSE, converted = FALSE;
+    if (!text || (base != 0 && (base < 2 || base > 36))) {
+        *crt_errno() = CRT_EINVAL;
+        goto done;
+    }
+    while (crt_isspace((unsigned char)*cursor)) cursor++;
+    if (*cursor == '-' || *cursor == '+') negative = *cursor++ == '-';
+    if ((!base || base == 16) && cursor[0] == '0' &&
+        (cursor[1] == 'x' || cursor[1] == 'X')) {
+        base = 16;
+        cursor += 2;
+    }
+    if (!base) base = *cursor == '0' ? 8 : 10;
+    uint64_t limit = signed_result
+        ? (negative ? 0x8000000000000000ULL : 0x7FFFFFFFFFFFFFFFULL)
+        : UINT64_MAX;
+    for (;;) {
+        unsigned char c = (unsigned char)*cursor;
+        int digit = c >= '0' && c <= '9' ? c - '0' :
+                    c >= 'a' && c <= 'z' ? c - 'a' + 10 :
+                    c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 36;
+        if (digit >= base) break;
+        if (value > (limit - (unsigned)digit) / (unsigned)base)
+            overflow = TRUE;
+        else if (!overflow)
+            value = value * (unsigned)base + (unsigned)digit;
+        converted = TRUE;
+        cursor++;
+    }
+    if (!converted) cursor = text;
+    if (overflow) {
+        value = limit;
+        *crt_errno() = CRT_ERANGE;
+    }
+    if (negative && (signed_result || !overflow)) value = 0 - value;
+done:
+    if (endptr) {
+        if (g_compat32_mode)
+            *(uint32_t *)endptr = (uint32_t)(ULONG_PTR)cursor;
+        else
+            *(const char **)endptr = cursor;
+    }
+    return value;
+}
+
+static int64_t WINAPI crt_strtoi64(const char *text, PVOID endptr, int base)
+{
+    return (int64_t)crt_parse_int64(text, endptr, base, TRUE);
+}
+
+static uint64_t WINAPI crt_strtoui64(const char *text, PVOID endptr, int base)
+{
+    return crt_parse_int64(text, endptr, base, FALSE);
+}
+
+static int WINAPI crt_vscprintf(const char *format, ms_va_list arguments)
+{
+    if (!format) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    FMT_CTX ctx = {0};
+    return fmt_caller_args(&ctx, format, arguments);
+}
+
+/* Explicit variants name the time and file-size widths, independently of
+ * the caller's pointer width. Legacy msvcrt _fstat follows its PE ABI. */
+static int crt_fstat_layout(int fd, PVOID buffer, unsigned layout)
+{
+    if (!buffer) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    CRT_STAT64 wide;
+    int result = crt_fstat64(fd, &wide);
+    if (result) return result;
+    if (layout != 1 && wide.st_size > 0x7FFFFFFFLL) {
+        *crt_errno() = CRT_EOVERFLOW;
+        return -1;
+    }
+    if (layout == 0) {
+        CRT_STAT32 *stat = buffer;
+        crt_memset(stat, 0, sizeof(*stat));
+        crt_memcpy(stat, &wide, 20);
+        stat->st_size = (int32_t)wide.st_size;
+        stat->st_atime = (int32_t)wide.st_atime;
+        stat->st_mtime = (int32_t)wide.st_mtime;
+        stat->st_ctime = (int32_t)wide.st_ctime;
+    } else if (layout == 1) {
+        CRT_STAT32I64 *stat = buffer;
+        crt_memset(stat, 0, sizeof(*stat));
+        crt_memcpy(stat, &wide, 32);
+        stat->st_atime = (int32_t)wide.st_atime;
+        stat->st_mtime = (int32_t)wide.st_mtime;
+        stat->st_ctime = (int32_t)wide.st_ctime;
+    } else {
+        CRT_STAT64I32 *stat = buffer;
+        crt_memset(stat, 0, sizeof(*stat));
+        crt_memcpy(stat, &wide, 20);
+        stat->st_size = (int32_t)wide.st_size;
+        stat->st_atime = wide.st_atime;
+        stat->st_mtime = wide.st_mtime;
+        stat->st_ctime = wide.st_ctime;
+    }
+    return 0;
+}
+
+static int WINAPI crt_fstat(int fd, PVOID buffer)
+{
+    return crt_fstat_layout(fd, buffer, g_compat32_mode ? 0 : 2);
+}
+
+static int WINAPI crt_fstat32(int fd, PVOID buffer)
+{
+    return crt_fstat_layout(fd, buffer, 0);
+}
+
+static int WINAPI crt_fstat32i64(int fd, PVOID buffer)
+{
+    return crt_fstat_layout(fd, buffer, 1);
+}
+
+static int WINAPI crt_fstat64i32(int fd, PVOID buffer)
+{
+    return crt_fstat_layout(fd, buffer, 2);
+}
+
+static int WINAPI crt_stati64(const char *path, PVOID buffer)
+{
+    return g_compat32_mode ? crt_stat32i64(path, buffer)
+                          : crt_stat64(path, buffer);
+}
+
+static int WINAPI crt_fstati64(int fd, PVOID buffer)
+{
+    if (!g_compat32_mode) return crt_fstat64(fd, buffer);
+    if (!buffer) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    CRT_STAT64 wide;
+    int result = crt_fstat64(fd, &wide);
+    if (result) return result;
+    CRT_STAT32I64 *narrow = buffer;
+    crt_memset(narrow, 0, sizeof(*narrow));
+    /* The leading identity, mode and 64-bit size fields have identical
+     * offsets. Only the three legacy PE32 time_t fields are narrower. */
+    crt_memcpy(narrow, &wide, 32);
+    narrow->st_atime = (int32_t)wide.st_atime;
+    narrow->st_mtime = (int32_t)wide.st_mtime;
+    narrow->st_ctime = (int32_t)wide.st_ctime;
+    return 0;
+}
+
 static const MSVCRT_EXPORT msvcrt_exports[] = {
+    /* No stack operands: compat32 registers direct XMM argument adapters. */
+#define SSE2_ABI(name) { "_libm_sse2_" #name "_precise", (PVOID)crt_sse2_##name, 0, CC_CDECL }
+    SSE2_ABI(pow), SSE2_ABI(sqrt), SSE2_ABI(log), SSE2_ABI(sin),
+    SSE2_ABI(log10), SSE2_ABI(cos), SSE2_ABI(exp),
+#undef SSE2_ABI
+    { "___lc_codepage_func", (PVOID)crt_lc_codepage_func, 0, CC_CDECL },
+    { "___mb_cur_max_func", (PVOID)crt_mb_cur_max_func, 0, CC_CDECL },
+    { "__p___mb_cur_max", (PVOID)crt_p_mb_cur_max, 0, CC_CDECL },
+    { "__fpecode", (PVOID)crt_fpecode, 0, CC_CDECL },
+    { "__pxcptinfoptrs", (PVOID)crt_pxcptinfoptrs, 0, CC_CDECL },
+    { "__p__iob", (PVOID)crt_iob_func, 0, CC_CDECL },
+    { "_assert", (PVOID)crt_assert, 3, CC_CDECL },
+    { "_execv", (PVOID)crt_execv, 2, CC_CDECL },
+    { "perror", (PVOID)crt_perror, 1, CC_CDECL },
+    { "_isctype", (PVOID)crt_isctype, 2, CC_CDECL },
+    { "_strtoi64", (PVOID)crt_strtoi64, 3, CC_CDECL },
+    { "_strtoui64", (PVOID)crt_strtoui64, 3, CC_CDECL },
+    { "_vscprintf", (PVOID)crt_vscprintf, 2, CC_CDECL },
+    { "_stati64", (PVOID)crt_stati64, 2, CC_CDECL },
+    { "_fstati64", (PVOID)crt_fstati64, 2, CC_CDECL },
+    WX_DATA_DYNAMIC("__lc_codepage"),
     /* CRT init */
     { "_initterm",           (PVOID)_initterm,        2, CC_CDECL },
     { "_initterm_e",         (PVOID)_initterm_e,      2, CC_CDECL },
@@ -9305,6 +10232,8 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     /* Memory */
     { "malloc",              (PVOID)crt_malloc,       1, CC_CDECL },
     { "_malloc_crt",         (PVOID)crt_malloc,       1, CC_CDECL },
+    { "_aligned_malloc",     (PVOID)crt_aligned_malloc, 2, CC_CDECL },
+    { "_aligned_free",       (PVOID)crt_aligned_free,   1, CC_CDECL },
     { "calloc",              (PVOID)crt_calloc,       2, CC_CDECL },
     { "realloc",             (PVOID)crt_realloc,      2, CC_CDECL },
     { "free",                (PVOID)crt_free,         1, CC_CDECL },
@@ -9319,12 +10248,24 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
 
     /* String */
     { "strlen",              (PVOID)crt_strlen,       1, CC_CDECL },
+    { "_mbstrlen",           (PVOID)crt_mbstrlen,     1, CC_CDECL },
+    { "_itoa",               (PVOID)crt_itoa,         3, CC_CDECL },
+    { "_ultoa",              (PVOID)crt_ultoa,        3, CC_CDECL },
+    { "_tempnam",            (PVOID)crt_tempnam,      2, CC_CDECL },
+    { "wctomb",              (PVOID)crt_wctomb,       2, CC_CDECL },
+    { "isleadbyte",          (PVOID)crt_isleadbyte,   1, CC_CDECL },
+    { "isxdigit",            (PVOID)crt_isxdigit,     1, CC_CDECL },
+    { "iswpunct",            (PVOID)crt_iswpunct,     1, CC_CDECL },
+    { "_clearfp",            (PVOID)crt_clearfp,      0, CC_CDECL },
+    { "_fpclass",            (PVOID)crt_fpclass,      2, CC_CDECL },
     { "strcmp",              (PVOID)crt_strcmp,       2, CC_CDECL },
     { "strncmp",             (PVOID)crt_strncmp,      3, CC_CDECL },
     { "_stricmp",            (PVOID)crt_stricmp,      2, CC_CDECL },
     { "_strnicmp",           (PVOID)crt_strnicmp,     3, CC_CDECL },
     { "_strcmpi",            (PVOID)crt_stricmp,      2, CC_CDECL },
     { "strcpy",              (PVOID)crt_strcpy,       2, CC_CDECL },
+    { "strcpy_s",            (PVOID)crt_strcpy_s,     3, CC_CDECL },
+    { "strcat_s",            (PVOID)crt_strcat_s,     3, CC_CDECL },
     { "strncpy",             (PVOID)crt_strncpy,      3, CC_CDECL },
     { "strncpy_s",           (PVOID)crt_strncpy_s,    4, CC_CDECL },
     { "strcat",              (PVOID)crt_strcat,       2, CC_CDECL },
@@ -9339,6 +10280,8 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
 
     /* Memory ops */
     { "memcpy",              (PVOID)crt_memcpy,       3, CC_CDECL },
+    { "memcpy_s",            (PVOID)crt_memcpy_s,     4, CC_CDECL },
+    { "memmove_s",           (PVOID)crt_memmove_s,    4, CC_CDECL },
     { "memset",              (PVOID)crt_memset,       3, CC_CDECL },
     { "memmove",             (PVOID)crt_memmove,      3, CC_CDECL },
     { "memcmp",              (PVOID)crt_memcmp,       3, CC_CDECL },
@@ -9347,6 +10290,8 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     /* Format I/O (variadic → fixed-param count) */
     { "printf",              (PVOID)crt_printf,       1, CC_CDECL | CC_VARIADIC },
     { "sprintf",             (PVOID)crt_sprintf,      2, CC_CDECL | CC_VARIADIC },
+    { "sprintf_s",           (PVOID)crt_sprintf_s,    3, CC_CDECL | CC_VARIADIC },
+    { "vsprintf_s",          (PVOID)crt_vsprintf_s,   4, CC_CDECL },
     { "_snprintf",           (PVOID)crt_snprintf,     3, CC_CDECL | CC_VARIADIC },
     { "_snwprintf",          (PVOID)crt_snwprintf,    3, CC_CDECL | CC_VARIADIC },
     { "_snprintf_s",         (PVOID)crt_snprintf_s,   4, CC_CDECL | CC_VARIADIC },
@@ -9380,6 +10325,7 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "fgetc",               (PVOID)crt_fgetc,        1, CC_CDECL },
     { "getc",                (PVOID)crt_fgetc,        1, CC_CDECL },
     { "fputc",               (PVOID)crt_fputc,        2, CC_CDECL },
+    { "putc",                (PVOID)crt_fputc,        2, CC_CDECL },
     { "fgets",               (PVOID)crt_fgets,        3, CC_CDECL },
     { "fputs",               (PVOID)crt_fputs,        2, CC_CDECL },
     { "ungetc",              (PVOID)crt_ungetc,       2, CC_CDECL },
@@ -9391,6 +10337,8 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "__iob_func",          (PVOID)crt_iob_func,     0, CC_CDECL },
     { "__acrt_iob_func",     (PVOID)crt_acrt_iob_func, 1, CC_CDECL },
     WX_DATA_DYNAMIC("_iob"),
+    WX_DATA_DYNAMIC("__pioinfo"),
+    WX_DATA_DYNAMIC("__badioinfo"),
 
     /* Low-level UCRT descriptors. */
     { "_get_osfhandle",      (PVOID)crt_get_osfhandle, 1, CC_CDECL },
@@ -9433,8 +10381,8 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "exit",                (PVOID)crt_exit,         1, CC_CDECL },
     { "abort",               (PVOID)crt_abort,        0, CC_CDECL },
     { "_exit",               (PVOID)crt__exit,        1, CC_CDECL },
-    { "_cexit",              (PVOID)crt_exit,         1, CC_CDECL },
-    { "_c_exit",             (PVOID)crt__exit,        1, CC_CDECL },
+    { "_cexit",              (PVOID)crt_cexit,        0, CC_CDECL },
+    { "_c_exit",             (PVOID)crt_c_exit,       0, CC_CDECL },
     { "_getpid",             (PVOID)crt_getpid,       0, CC_CDECL },
     { "_beginthreadex",      (PVOID)crt_beginthreadex, 6, CC_CDECL },
     { "_endthreadex",        (PVOID)crt_endthreadex,   1, CC_CDECL },
@@ -9478,11 +10426,13 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "setlocale",           (PVOID)crt_setlocale,    2, CC_CDECL },
     { "_wsetlocale",         (PVOID)crt_wsetlocale,   2, CC_CDECL },
     { "localeconv",          (PVOID)crt_localeconv,   0, CC_CDECL },
+    { "_ismbblead",          (PVOID)crt_ismbblead,     1, CC_CDECL },
 
     /* ctype */
     { "isalpha",             (PVOID)crt_isalpha,      1, CC_CDECL },
     { "isdigit",             (PVOID)crt_isdigit,      1, CC_CDECL },
     { "isalnum",             (PVOID)crt_isalnum,      1, CC_CDECL },
+    { "__iscsym",            (PVOID)crt_iscsym,       1, CC_CDECL },
     { "isspace",             (PVOID)crt_isspace,      1, CC_CDECL },
     { "isupper",             (PVOID)crt_isupper,      1, CC_CDECL },
     { "islower",             (PVOID)crt_islower,      1, CC_CDECL },
@@ -9563,6 +10513,12 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_amsg_exit",          (PVOID)crt_amsg_exit,    1, CC_CDECL },
 
     /* C++ EH / UT99 required stubs */
+    WX_THIS("??0exception@@QAE@XZ", crt_exception_ctor, 0),
+    WX_THIS("??0exception@@QAE@ABQBD@Z", crt_exception_ctor_message, 1),
+    WX_THIS("??0exception@@QAE@ABQBDH@Z", crt_exception_ctor_borrow, 2),
+    WX_THIS("??0exception@@QAE@ABV0@@Z", crt_exception_copy, 1),
+    WX_THIS("??1exception@@UAE@XZ", crt_exception_dtor, 0),
+    WX_THIS("?what@exception@@UBEPBDXZ", crt_exception_what, 0),
     { "??1type_info@@UAE@XZ", (PVOID)crt_type_info_dtor, 0, CC_THISCALL },
     { "?_type_info_dtor_internal_method@type_info@@QAEXXZ",
                               (PVOID)crt_type_info_dtor_internal, 0, CC_THISCALL },
@@ -9600,6 +10556,16 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_CIexp",              (PVOID)crt_CIexp,        0, CC_CDECL },  /* x87 ST(0), direct PE32 target */
     { "_CIlog10",            (PVOID)crt_CIlog10,      0, CC_CDECL },  /* x87 ST(0), direct PE32 target */
     { "_CIsqrt",             (PVOID)crt_CIsqrt,       0, CC_CDECL },  /* x87 ST(0), direct PE32 target */
+    { "_CIasin",             (PVOID)crt_CIasin,       0, CC_CDECL },
+    { "_CIatan",             (PVOID)crt_CIatan,       0, CC_CDECL },
+    { "_CIatan2",            (PVOID)crt_CIatan2,      0, CC_CDECL },
+    { "_CIcos",              (PVOID)crt_CIcos,        0, CC_CDECL },
+    { "_CIcosh",             (PVOID)crt_CIcosh,       0, CC_CDECL },
+    { "_CIlog",              (PVOID)crt_CIlog,        0, CC_CDECL },
+    { "_CIsin",              (PVOID)crt_CIsin,        0, CC_CDECL },
+    { "_CIsinh",             (PVOID)crt_CIsinh,       0, CC_CDECL },
+    { "_CItan",              (PVOID)crt_CItan,        0, CC_CDECL },
+    { "_CItanh",             (PVOID)crt_CItanh,       0, CC_CDECL },
     { "_CIfmod",             (PVOID)crt_CIfmod,       4, CC_CDECL },  /* 2 doubles = 4 DWORDs */
     { "_CIpow",              (PVOID)crt_CIpow,        4, CC_CDECL },  /* 2 doubles = 4 DWORDs */
     { "_finite",             (PVOID)crt_finite,       2, CC_CDECL },  /* double = 2 DWORDs */
@@ -9612,6 +10578,10 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_stat64i32",          (PVOID)crt_stat64i32,    2, CC_CDECL },
     { "_stat64",             (PVOID)crt_stat64,       2, CC_CDECL },
     { "_fstat64",            (PVOID)crt_fstat64,      2, CC_CDECL },
+    { "_fstat",              (PVOID)crt_fstat,        2, CC_CDECL },
+    { "_fstat32",            (PVOID)crt_fstat32,      2, CC_CDECL },
+    { "_fstat32i64",         (PVOID)crt_fstat32i64,   2, CC_CDECL },
+    { "_fstat64i32",         (PVOID)crt_fstat64i32,   2, CC_CDECL },
     { "_chmod",              (PVOID)crt_chmod,        2, CC_CDECL },
     { "_wchmod",             (PVOID)crt_wchmod,       2, CC_CDECL },
     { "_wstat",              (PVOID)crt_wstat,        2, CC_CDECL },
@@ -9631,8 +10601,22 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_wtoi",               (PVOID)crt_wtoi,         1, CC_CDECL },
     { "ceil",                (PVOID)crt_ceil,         2, CC_CDECL },  /* double = 2 DWORDs */
     { "floor",               (PVOID)crt_floor,        2, CC_CDECL },  /* double = 2 DWORDs */
+    { "frexp",               (PVOID)crt_frexp,        3, CC_CDECL },
+    { "ldexp",               (PVOID)crt_ldexp,        3, CC_CDECL },
+    { "modf",                (PVOID)crt_modf,         3, CC_CDECL },
     { "fabs",                (PVOID)crt_fabs,         2, CC_CDECL },  /* double = 2 DWORDs */
     { "sqrt",                (PVOID)crt_sqrt,         2, CC_CDECL },  /* double = 2 DWORDs */
+    { "cos",                 (PVOID)crt_cos,          2, CC_CDECL },
+    { "sin",                 (PVOID)crt_sin,          2, CC_CDECL },
+    { "acos",                (PVOID)crt_acos,         2, CC_CDECL },
+    { "log10",               (PVOID)crt_log10,        2, CC_CDECL },
+    { "pow",                 (PVOID)crt_pow,          4, CC_CDECL },
+    { "log",                 (PVOID)crt_log,          2, CC_CDECL },
+    { "exp",                 (PVOID)crt_exp,          2, CC_CDECL },
+    { "asin",                (PVOID)crt_asin,         2, CC_CDECL },
+    { "atan",                (PVOID)crt_atan,         2, CC_CDECL },
+    { "atan2",               (PVOID)crt_atan2,        4, CC_CDECL },
+    { "fmod",                (PVOID)crt_fmod,         4, CC_CDECL },
     { "difftime",            (PVOID)crt_difftime,     2, CC_CDECL },  /* 2× long (time_t) */
     { "gmtime",              (PVOID)crt_gmtime,       1, CC_CDECL },
     { "mktime",              (PVOID)crt_mktime,       1, CC_CDECL },
@@ -9701,11 +10685,16 @@ static PVOID msvcrt_resolve_data_export(const char *func_name)
         return (PVOID)crt_p_wenviron();
     if (msvcrt_strcmp(func_name, "_iob") == 0)
         return (PVOID)crt_iob_func();
+    if (msvcrt_strcmp(func_name, "__pioinfo") == 0)
+        return crt_lowio_data(FALSE);
+    if (msvcrt_strcmp(func_name, "__badioinfo") == 0)
+        return crt_lowio_data(TRUE);
 
     enum {
         CRT_DATA_NONE,
         CRT_DATA_INITENV,
         CRT_DATA_MB_CUR_MAX,
+        CRT_DATA_LC_CODEPAGE,
         CRT_DATA_ACMDLN,
         CRT_DATA_ADJUST_FDIV,
         CRT_DATA_COMMODE,
@@ -9718,6 +10707,8 @@ static PVOID msvcrt_resolve_data_export(const char *func_name)
         data = CRT_DATA_INITENV;
     else if (msvcrt_strcmp(func_name, "__mb_cur_max") == 0)
         data = CRT_DATA_MB_CUR_MAX;
+    else if (msvcrt_strcmp(func_name, "__lc_codepage") == 0)
+        data = CRT_DATA_LC_CODEPAGE;
     else if (msvcrt_strcmp(func_name, "_acmdln") == 0)
         data = CRT_DATA_ACMDLN;
     else if (msvcrt_strcmp(func_name, "_adjust_fdiv") == 0)
@@ -9738,6 +10729,7 @@ static PVOID msvcrt_resolve_data_export(const char *func_name)
     switch (data) {
         case CRT_DATA_INITENV:     return &values->initenv_value;
         case CRT_DATA_MB_CUR_MAX:  return &values->mb_cur_max;
+        case CRT_DATA_LC_CODEPAGE:  return &values->lc_codepage;
         case CRT_DATA_ACMDLN:      return &values->acmdln_value;
         case CRT_DATA_ADJUST_FDIV: return &values->adjust_fdiv;
         case CRT_DATA_COMMODE:     return &values->commode;
@@ -9752,7 +10744,50 @@ PVOID msvcrt_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 {
     if (by_ordinal) return NULL;
 
+    /* Legacy msvcrt has float exports and these C++ decorated spellings only
+     * in its x64 image. Float calls must not get integer PE32 thunks. */
+    if (!g_compat32_mode) {
+        static const struct { const char *name; PVOID func; } native64_exports[] = {
+            { "sqrtf", (PVOID)crt_sqrtf }, { "sinf", (PVOID)crt_sinf },
+            { "cosf", (PVOID)crt_cosf }, { "asinf", (PVOID)crt_asinf },
+            { "acosf", (PVOID)crt_acosf }, { "logf", (PVOID)crt_logf },
+            { "log10f", (PVOID)crt_log10f }, { "expf", (PVOID)crt_expf },
+            { "floorf", (PVOID)crt_floorf }, { "ceilf", (PVOID)crt_ceilf },
+            { "powf", (PVOID)crt_powf }, { "atan2f", (PVOID)crt_atan2f },
+            { "fmodf", (PVOID)crt_fmodf }, { "modff", (PVOID)crt_modff },
+            /* Match the existing PE32 allocation providers. Throwing new's
+             * bad_alloc/new-handler behavior is still a separate CRT gap. */
+            { "??2@YAPEAX_K@Z", (PVOID)crt_malloc },
+            { "??3@YAXPEAX@Z", (PVOID)crt_free },
+            { "??_U@YAPEAX_K@Z", (PVOID)crt_malloc },
+            { "??_V@YAXPEAX@Z", (PVOID)crt_free },
+            { "??1type_info@@UEAA@XZ", (PVOID)crt_type_info_dtor },
+            { "??0exception@@QEAA@XZ", (PVOID)crt_exception_ctor },
+            { "??0exception@@QEAA@AEBQEBD@Z", (PVOID)crt_exception_ctor_message },
+            { "??0exception@@QEAA@AEBQEBDH@Z", (PVOID)crt_exception_ctor_borrow },
+            { "??0exception@@QEAA@AEBV0@@Z", (PVOID)crt_exception_copy },
+            { "??1exception@@UEAA@XZ", (PVOID)crt_exception_dtor },
+            { "?what@exception@@UEBAPEBDXZ", (PVOID)crt_exception_what },
+        };
+        for (unsigned i = 0; i < sizeof(native64_exports) / sizeof(native64_exports[0]); i++) {
+            if (msvcrt_strcmp(func_name, native64_exports[i].name) == 0)
+                return native64_exports[i].func;
+        }
+    }
+
     /* CRT data exports are process-local writable variables, not functions. */
+    {
+        static const struct { const char *name; PVOID func; } sse2_exports[] = {
+#define SSE2_EXPORT(name) { "_libm_sse2_" #name "_precise", (PVOID)crt_sse2_##name }
+            SSE2_EXPORT(pow), SSE2_EXPORT(sqrt), SSE2_EXPORT(log),
+            SSE2_EXPORT(sin), SSE2_EXPORT(log10), SSE2_EXPORT(cos), SSE2_EXPORT(exp),
+#undef SSE2_EXPORT
+        };
+        for (unsigned i = 0; i < sizeof(sse2_exports) / sizeof(sse2_exports[0]); i++)
+            if (msvcrt_strcmp(func_name, sse2_exports[i].name) == 0)
+                return g_compat32_mode ? sse2_exports[i].func : NULL;
+    }
+
     PVOID data_export = msvcrt_resolve_data_export(func_name);
     if (data_export) return data_export;
 
@@ -9771,6 +10806,8 @@ PVOID msvcrt_shim_init(void)
                                         (PVOID)crt_printf_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_sprintf,
                                         (PVOID)crt_sprintf_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_sprintf_s,
+                                        (PVOID)crt_sprintf_s_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_snprintf,
                                         (PVOID)crt_snprintf_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_snwprintf,
@@ -9789,6 +10826,8 @@ PVOID msvcrt_shim_init(void)
                                         (PVOID)crt_finite_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_isnan,
                                         (PVOID)crt_isnan_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_fpclass,
+                                        (PVOID)crt_fpclass_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_stdio_common_vsprintf,
                                       (PVOID)crt_stdio_common_vsprintf_compat32);
     win32_abi_register_compat32_bridge((PVOID)crt_stdio_common_vswprintf,

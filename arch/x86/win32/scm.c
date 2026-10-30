@@ -205,7 +205,8 @@ typedef struct {
     DWORD padding;
     PWSTR binary_path;
     PWSTR load_order_group;
-    DWORD *tag_id;
+    DWORD tag_id;
+    DWORD tag_padding;
     PWSTR dependencies;
     PWSTR account;
     PWSTR display_name;
@@ -346,6 +347,44 @@ static SIZE_T scm_ascii_to_wide(PWSTR destination, SIZE_T capacity,
         destination[copy] = 0;
     }
     return length;
+}
+
+/* Stored dependency lists include both terminators. All unused bytes are zero
+ * so older SCM1 single-dependency records remain valid without a migration. */
+static SIZE_T scm_multisz_bytes(const char *text, SIZE_T capacity)
+{
+    if (capacity < 2) return 0;
+    if (!text[0]) return text[1] ? 0 : 2;
+    for (SIZE_T i = 1; i < capacity; i++)
+        if (!text[i - 1] && !text[i]) return i + 1;
+    /* SCM1 originally stored one ordinary string. Its maximum-length
+     * record has only one terminator; supply the second on query without
+     * rejecting or truncating the existing service database. */
+    for (SIZE_T i = 0; i < capacity; i++)
+        if (!text[i]) return i == capacity - 1 ? capacity + 1 : 0;
+    return 0;
+}
+
+static BOOL scm_copy_multisz(char *destination, SIZE_T capacity,
+                             const char *source)
+{
+    SIZE_T length = scm_multisz_bytes(source, capacity);
+    if (!length) return FALSE;
+    for (SIZE_T i = 0; i < capacity; i++)
+        destination[i] = i < length ? source[i] : 0;
+    return TRUE;
+}
+
+static BOOL scm_wide_multisz(char *destination, SIZE_T capacity, PCWSTR source)
+{
+    scm_zero(destination, capacity);
+    if (!source || !source[0]) return capacity >= 2;
+    for (SIZE_T i = 0; i < capacity; i++) {
+        WCHAR value = source[i];
+        destination[i] = value <= 0x7fU ? (char)value : '?';
+        if (i && !value && !source[i - 1]) return TRUE;
+    }
+    return FALSE;
 }
 
 static uint64_t scm_lock_irqsave(void)
@@ -527,7 +566,7 @@ static void scm_store_record_from_service(SCM_STORE_RECORD *record,
              service->binary_path);
     scm_copy(record->load_order_group, sizeof(record->load_order_group),
              service->load_order_group);
-    scm_copy(record->dependencies, sizeof(record->dependencies),
+    scm_copy_multisz(record->dependencies, sizeof(record->dependencies),
              service->dependencies);
     scm_copy(record->account, sizeof(record->account), service->account);
     scm_copy(record->description, sizeof(record->description),
@@ -553,7 +592,7 @@ static void scm_store_apply_config(SCM_SERVICE *service,
              record->binary_path);
     scm_copy(service->load_order_group, sizeof(service->load_order_group),
              record->load_order_group);
-    scm_copy(service->dependencies, sizeof(service->dependencies),
+    scm_copy_multisz(service->dependencies, sizeof(service->dependencies),
              record->dependencies);
     scm_copy(service->account, sizeof(service->account), record->account);
     scm_copy(service->description, sizeof(service->description),
@@ -597,7 +636,7 @@ static BOOL scm_store_record_valid(const SCM_STORE_RECORD *record)
                                sizeof(record->binary_path)) &&
         scm_store_string_valid(record->load_order_group,
                                sizeof(record->load_order_group)) &&
-        scm_store_string_valid(record->dependencies,
+        scm_multisz_bytes(record->dependencies,
                                sizeof(record->dependencies)) &&
         scm_store_string_valid(record->account, sizeof(record->account)) &&
         scm_store_string_valid(record->description,
@@ -790,8 +829,13 @@ HANDLE WINAPI OpenServiceW(HANDLE manager, PCWSTR service_name,
     scm_ensure_initialized();
     uint64_t flags = scm_lock_irqsave();
     SCM_HANDLE_ENTRY *manager_entry = scm_lookup_handle_locked(
-        manager, SCM_KIND_MANAGER, SC_MANAGER_CONNECT);
+        manager, SCM_KIND_MANAGER, 0);
     if (!manager_entry) {
+        scm_unlock_irqrestore(flags);
+        SetLastError(ERROR_INVALID_HANDLE);
+        return NULL;
+    }
+    if (!(manager_entry->access & SC_MANAGER_CONNECT)) {
         scm_unlock_irqrestore(flags);
         SetLastError(ERROR_ACCESS_DENIED);
         return NULL;
@@ -818,6 +862,27 @@ HANDLE WINAPI OpenServiceW(HANDLE manager, PCWSTR service_name,
     return handle;
 }
 
+HANDLE WINAPI OpenSCManagerA(PCSTR machine_name, PCSTR database_name,
+                             DWORD desired_access)
+{
+    WCHAR machine[64], database[64];
+    if (machine_name && !MultiByteToWideChar(0, 0, machine_name, -1,
+                                            machine, 64)) return NULL;
+    if (database_name && !MultiByteToWideChar(0, 0, database_name, -1,
+                                             database, 64)) return NULL;
+    return OpenSCManagerW(machine_name ? machine : NULL,
+                          database_name ? database : NULL, desired_access);
+}
+
+HANDLE WINAPI OpenServiceA(HANDLE manager, PCSTR service_name,
+                           DWORD desired_access)
+{
+    WCHAR name[SCM_MAX_NAME];
+    if (service_name && !MultiByteToWideChar(0, 0, service_name, -1,
+                                            name, SCM_MAX_NAME)) return NULL;
+    return OpenServiceW(manager, service_name ? name : NULL, desired_access);
+}
+
 HANDLE WINAPI CreateServiceW(HANDLE manager, PCWSTR service_name,
                              PCWSTR display_name, DWORD desired_access,
                              DWORD service_type, DWORD start_type,
@@ -840,7 +905,7 @@ HANDLE WINAPI CreateServiceW(HANDLE manager, PCWSTR service_name,
         !scm_wide_to_ascii(display, sizeof(display),
                            display_name ? display_name : service_name) ||
         !scm_wide_to_ascii(group, sizeof(group), load_order_group) ||
-        !scm_wide_to_ascii(deps, sizeof(deps), dependencies) ||
+        !scm_wide_multisz(deps, sizeof(deps), dependencies) ||
         !scm_wide_to_ascii(account, sizeof(account), service_start_name)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return NULL;
@@ -885,7 +950,7 @@ HANDLE WINAPI CreateServiceW(HANDLE manager, PCWSTR service_name,
     scm_copy(service->display_name, sizeof(service->display_name), display);
     scm_copy(service->binary_path, sizeof(service->binary_path), path);
     scm_copy(service->load_order_group, sizeof(service->load_order_group), group);
-    scm_copy(service->dependencies, sizeof(service->dependencies), deps);
+    scm_copy_multisz(service->dependencies, sizeof(service->dependencies), deps);
     scm_copy(service->account, sizeof(service->account), account);
     HANDLE handle = scm_allocate_handle_locked(
         SCM_KIND_SERVICE, scm_map_service_access(desired_access), index);
@@ -945,7 +1010,7 @@ BOOL WINAPI ChangeServiceConfigW(HANDLE service_handle, DWORD service_type,
     if ((binary_path && !scm_wide_to_ascii(path, sizeof(path), binary_path)) ||
         (load_order_group &&
          !scm_wide_to_ascii(group, sizeof(group), load_order_group)) ||
-        (dependencies && !scm_wide_to_ascii(deps, sizeof(deps), dependencies)) ||
+        (dependencies && !scm_wide_multisz(deps, sizeof(deps), dependencies)) ||
         (service_start_name &&
          !scm_wide_to_ascii(account, sizeof(account), service_start_name)) ||
         (display_name &&
@@ -983,7 +1048,7 @@ BOOL WINAPI ChangeServiceConfigW(HANDLE service_handle, DWORD service_type,
                               sizeof(service->binary_path), path);
     if (load_order_group) scm_copy(service->load_order_group,
                                    sizeof(service->load_order_group), group);
-    if (dependencies) scm_copy(service->dependencies,
+    if (dependencies) scm_copy_multisz(service->dependencies,
                                sizeof(service->dependencies), deps);
     if (service_start_name) scm_copy(service->account,
                                      sizeof(service->account), account);
@@ -1358,28 +1423,32 @@ BOOL WINAPI QueryServiceStatusEx(HANDLE service_handle, DWORD info_level,
     return TRUE;
 }
 
-static DWORD scm_config_string_bytes(const char *text, BOOL multi_string)
+static DWORD scm_config_string_bytes(const char *text, BOOL multi_string,
+                                      BOOL wide)
 {
-    DWORD chars = (DWORD)scm_strlen(text) + 1;
-    if (multi_string) chars++;
-    return chars * sizeof(WCHAR);
+    DWORD chars = multi_string
+        ? (DWORD)scm_multisz_bytes(text, SCM_MAX_DEPENDENCIES)
+        : (DWORD)scm_strlen(text) + 1;
+    return chars * (wide ? sizeof(WCHAR) : 1);
 }
 
-static PWSTR scm_config_write_string(BYTE *buffer, DWORD *offset,
-                                     const char *text, BOOL multi_string)
+static PVOID scm_config_write_string(BYTE *buffer, DWORD *offset,
+                                     const char *text, BOOL multi_string,
+                                     BOOL wide)
 {
-    PWSTR destination = (PWSTR)(void *)(buffer + *offset);
-    DWORD length = (DWORD)scm_strlen(text);
-    for (DWORD i = 0; i < length; i++)
-        destination[i] = (WCHAR)(BYTE)text[i];
-    destination[length] = 0;
-    if (multi_string) destination[length + 1] = 0;
-    *offset += (length + 1 + (multi_string ? 1 : 0)) * sizeof(WCHAR);
+    BYTE *destination = buffer + *offset;
+    DWORD length = scm_config_string_bytes(text, multi_string, FALSE);
+    for (DWORD i = 0; i < length; i++) {
+        BYTE value = multi_string && i == SCM_MAX_DEPENDENCIES ? 0 : (BYTE)text[i];
+        if (wide) ((PWSTR)(void *)destination)[i] = (WCHAR)value;
+        else destination[i] = value;
+    }
+    *offset += length * (wide ? sizeof(WCHAR) : 1);
     return destination;
 }
 
-BOOL WINAPI QueryServiceConfigW(HANDLE service_handle, BYTE *buffer,
-                                DWORD buffer_size, DWORD *bytes_needed)
+static BOOL scm_query_config(HANDLE service_handle, BYTE *buffer,
+                              DWORD buffer_size, DWORD *bytes_needed, BOOL wide)
 {
     if (!bytes_needed) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -1387,11 +1456,16 @@ BOOL WINAPI QueryServiceConfigW(HANDLE service_handle, BYTE *buffer,
     }
     uint64_t flags = scm_lock_irqsave();
     SCM_HANDLE_ENTRY *entry = scm_lookup_handle_locked(
-        service_handle, SCM_KIND_SERVICE, SERVICE_QUERY_CONFIG);
+        service_handle, SCM_KIND_SERVICE, 0);
     SCM_SERVICE *service = scm_service_from_handle_locked(entry);
     if (!service) {
         scm_unlock_irqrestore(flags);
         SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (!(entry->access & SERVICE_QUERY_CONFIG)) {
+        scm_unlock_irqrestore(flags);
+        SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
     SCM_SERVICE snapshot = *service;
@@ -1399,12 +1473,12 @@ BOOL WINAPI QueryServiceConfigW(HANDLE service_handle, BYTE *buffer,
 
     DWORD header_size = g_compat32_mode ? sizeof(SCM_QUERY_CONFIG32)
                                         : sizeof(SCM_QUERY_CONFIG64);
-    DWORD required = header_size + sizeof(DWORD) +
-        scm_config_string_bytes(snapshot.binary_path, FALSE) +
-        scm_config_string_bytes(snapshot.load_order_group, FALSE) +
-        scm_config_string_bytes(snapshot.dependencies, TRUE) +
-        scm_config_string_bytes(snapshot.account, FALSE) +
-        scm_config_string_bytes(snapshot.display_name, FALSE);
+    DWORD required = header_size +
+        scm_config_string_bytes(snapshot.binary_path, FALSE, wide) +
+        scm_config_string_bytes(snapshot.load_order_group, FALSE, wide) +
+        scm_config_string_bytes(snapshot.dependencies, TRUE, wide) +
+        scm_config_string_bytes(snapshot.account, FALSE, wide) +
+        scm_config_string_bytes(snapshot.display_name, FALSE, wide);
     *bytes_needed = required;
     if (!buffer || buffer_size < required) {
         SetLastError(ERROR_INSUFFICIENT_BUFFER);
@@ -1412,19 +1486,16 @@ BOOL WINAPI QueryServiceConfigW(HANDLE service_handle, BYTE *buffer,
     }
     scm_zero(buffer, required);
     DWORD offset = header_size;
-    DWORD *tag = (DWORD *)(void *)(buffer + offset);
-    *tag = snapshot.tag_id;
-    offset += sizeof(DWORD);
-    PWSTR binary = scm_config_write_string(buffer, &offset,
-                                           snapshot.binary_path, FALSE);
-    PWSTR group = scm_config_write_string(buffer, &offset,
-                                          snapshot.load_order_group, FALSE);
-    PWSTR dependencies = scm_config_write_string(buffer, &offset,
-                                                 snapshot.dependencies, TRUE);
-    PWSTR account = scm_config_write_string(buffer, &offset,
-                                            snapshot.account, FALSE);
-    PWSTR display = scm_config_write_string(buffer, &offset,
-                                            snapshot.display_name, FALSE);
+    PVOID binary = scm_config_write_string(buffer, &offset,
+                                           snapshot.binary_path, FALSE, wide);
+    PVOID group = scm_config_write_string(buffer, &offset,
+                                          snapshot.load_order_group, FALSE, wide);
+    PVOID dependencies = scm_config_write_string(buffer, &offset,
+                                                 snapshot.dependencies, TRUE, wide);
+    PVOID account = scm_config_write_string(buffer, &offset,
+                                            snapshot.account, FALSE, wide);
+    PVOID display = scm_config_write_string(buffer, &offset,
+                                            snapshot.display_name, FALSE, wide);
     if (g_compat32_mode) {
         SCM_QUERY_CONFIG32 *config = (SCM_QUERY_CONFIG32 *)buffer;
         config->service_type = snapshot.service_type;
@@ -1432,7 +1503,7 @@ BOOL WINAPI QueryServiceConfigW(HANDLE service_handle, BYTE *buffer,
         config->error_control = snapshot.error_control;
         config->binary_path = (uint32_t)(ULONG_PTR)binary;
         config->load_order_group = (uint32_t)(ULONG_PTR)group;
-        config->tag_id = (uint32_t)(ULONG_PTR)tag;
+        config->tag_id = snapshot.tag_id;
         config->dependencies = (uint32_t)(ULONG_PTR)dependencies;
         config->account = (uint32_t)(ULONG_PTR)account;
         config->display_name = (uint32_t)(ULONG_PTR)display;
@@ -1443,13 +1514,25 @@ BOOL WINAPI QueryServiceConfigW(HANDLE service_handle, BYTE *buffer,
         config->error_control = snapshot.error_control;
         config->binary_path = binary;
         config->load_order_group = group;
-        config->tag_id = tag;
+        config->tag_id = snapshot.tag_id;
         config->dependencies = dependencies;
         config->account = account;
         config->display_name = display;
     }
     SetLastError(0);
     return TRUE;
+}
+
+BOOL WINAPI QueryServiceConfigW(HANDLE service_handle, BYTE *buffer,
+                                DWORD buffer_size, DWORD *bytes_needed)
+{
+    return scm_query_config(service_handle, buffer, buffer_size, bytes_needed, TRUE);
+}
+
+BOOL WINAPI QueryServiceConfigA(HANDLE service_handle, BYTE *buffer,
+                                DWORD buffer_size, DWORD *bytes_needed)
+{
+    return scm_query_config(service_handle, buffer, buffer_size, bytes_needed, FALSE);
 }
 
 BOOL WINAPI CloseServiceHandle(HANDLE object)

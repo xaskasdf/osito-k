@@ -4,6 +4,7 @@
  */
 
 #include "winmm_shim.h"
+#include "mmio_shim.h"
 #include "advapi32_shim.h"
 #include "compat32.h"
 #include "kernel32_shim.h"
@@ -376,6 +377,20 @@ typedef struct __attribute__((packed)) {
     WORD manufacturer_id;
     WORD product_id;
     DWORD driver_version;
+    WCHAR product_name[32];
+    DWORD formats;
+    WORD channels;
+    WORD reserved;
+    DWORD support;
+} WINMM_WAVEOUTCAPSW;
+
+_Static_assert(sizeof(WINMM_WAVEOUTCAPSA) == 52, "WAVEOUTCAPSA ABI");
+_Static_assert(sizeof(WINMM_WAVEOUTCAPSW) == 84, "WAVEOUTCAPSW ABI");
+
+typedef struct __attribute__((packed)) {
+    WORD manufacturer_id;
+    WORD product_id;
+    DWORD driver_version;
     char product_name[32];
     WORD technology;
     WORD reserved;
@@ -570,6 +585,7 @@ typedef struct {
     BOOL asynchronous;
     BOOL looping;
     BOOL completed;
+    BOOL message_alert;
     DWORD owner_pid;
     uint32_t token;
     BYTE *data;
@@ -2312,7 +2328,8 @@ static void winmm_stop_play_sounds(DWORD owner_pid)
     uint64_t irq_flags = winmm_timer_lock_irqsave();
     for (int i = 0; i < WINMM_PLAY_SOUND_SLOTS; i++) {
         WINMM_PLAY_SOUND *sound = &winmm_play_sounds[i];
-        if (!sound->in_use || sound->owner_pid != owner_pid)
+        if (!sound->in_use || sound->owner_pid != owner_pid ||
+            sound->message_alert)
             continue;
         released[released_count++] = sound->data;
         memset(sound, 0, sizeof(*sound));
@@ -2337,7 +2354,8 @@ static uint32_t winmm_allocate_play_token(void)
 
 static BOOL winmm_start_play_sound(BYTE *data, DWORD bytes,
                                    const pcm_format_t *format, DWORD flags,
-                                   DWORD owner_pid, BOOL compat32)
+                                   DWORD owner_pid, BOOL compat32,
+                                   BOOL message_alert)
 {
     BOOL asynchronous = (flags & SND_ASYNC) != 0;
     if (asynchronous && !winmm_get_dispatcher(owner_pid, compat32)) {
@@ -2355,7 +2373,8 @@ static BOOL winmm_start_play_sound(BYTE *data, DWORD bytes,
 
     for (int i = 0; i < WINMM_PLAY_SOUND_SLOTS; i++) {
         WINMM_PLAY_SOUND *sound = &winmm_play_sounds[i];
-        if (sound->in_use && sound->owner_pid == owner_pid) {
+        if (sound->in_use && sound->owner_pid == owner_pid &&
+            sound->message_alert == message_alert) {
             if (!sound->completed)
                 current_active = TRUE;
             if (target < 0)
@@ -2384,7 +2403,8 @@ static BOOL winmm_start_play_sound(BYTE *data, DWORD bytes,
 
     for (int i = 0; i < WINMM_PLAY_SOUND_SLOTS; i++) {
         WINMM_PLAY_SOUND *sound = &winmm_play_sounds[i];
-        if (!sound->in_use || sound->owner_pid != owner_pid)
+        if (!sound->in_use || sound->owner_pid != owner_pid ||
+            sound->message_alert != message_alert)
             continue;
         released[released_count++] = sound->data;
         memset(sound, 0, sizeof(*sound));
@@ -2395,6 +2415,7 @@ static BOOL winmm_start_play_sound(BYTE *data, DWORD bytes,
     slot->in_use = TRUE;
     slot->asynchronous = asynchronous;
     slot->looping = (flags & SND_LOOP) != 0;
+    slot->message_alert = message_alert;
     slot->owner_pid = owner_pid;
     slot->token = token;
     slot->data = data;
@@ -2501,7 +2522,98 @@ static BOOL winmm_play_sound_common(PCVOID sound, PVOID module, DWORD flags,
         return FALSE;
     }
     return winmm_start_play_sound(data, bytes, &format, flags, owner_pid,
-                                  g_compat32_mode ? TRUE : FALSE);
+                                  g_compat32_mode ? TRUE : FALSE, FALSE);
+}
+
+/* An explicitly empty current event is the user's "no sound" choice. Do not
+ * let the alias resolver's template/default fallback turn it back on. */
+static BOOL winmm_alert_alias_disabled(const char *alias)
+{
+    char path[128];
+    UINT length = 0;
+    path[0] = 0;
+    if (!winmm_append_path(path, sizeof(path), &length,
+                           "AppEvents\\Schemes\\Apps\\.Default\\") ||
+        !winmm_append_path(path, sizeof(path), &length, alias) ||
+        !winmm_append_path(path, sizeof(path), &length, "\\.Current"))
+        return FALSE;
+    HKEY key = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, path, 0, KEY_QUERY_VALUE, &key) !=
+        ERROR_SUCCESS)
+        return FALSE;
+    BYTE value = 0xff;
+    DWORD type = REG_NONE, size = sizeof(value);
+    LONG status = RegQueryValueExA(key, NULL, NULL, &type, &value, &size);
+    RegCloseKey(key);
+    return status == ERROR_SUCCESS &&
+           (type == REG_SZ || type == REG_EXPAND_SZ) &&
+           (!size || !value);
+}
+
+BOOL winmm_message_beep(UINT type)
+{
+    const char *alias;
+    switch (type & 0xf0U) {
+    case 0x10U: alias = "SystemHand"; break;
+    case 0x20U: alias = "SystemQuestion"; break;
+    case 0x30U: alias = "SystemExclamation"; break;
+    case 0x40U: alias = "SystemAsterisk"; break;
+    default: alias = ".Default"; break;
+    }
+
+    BOOL simple = type == 0xffffffffU;
+    if (!simple && winmm_alert_alias_disabled(alias))
+        return TRUE;
+    if (!audio_output_is_ready()) {
+        SetLastError(50); /* ERROR_NOT_SUPPORTED: no PCM output backend. */
+        return FALSE;
+    }
+
+    BYTE *data = NULL;
+    DWORD bytes = 0;
+    pcm_format_t format;
+    BOOL prepared = !simple &&
+        winmm_prepare_alias_wave(alias, FALSE, &data, &bytes, &format);
+    if (!simple && !prepared && !winmm_ascii_equal_insensitive(alias, ".Default")) {
+        if (winmm_alert_alias_disabled(".Default"))
+            return TRUE;
+        prepared = winmm_prepare_default_wave(&data, &bytes, &format);
+    }
+    if (!prepared) {
+        /* A quiet 1 kHz, 200 ms PCM fallback. Use the shared mixer so an alert
+         * never takes over the hardware stream from waveOut/DirectSound. */
+        const UINT frames = AUDIO_OUTPUT_RATE_HZ / 5U;
+        const UINT period = AUDIO_OUTPUT_RATE_HZ / 1000U;
+        const UINT ramp = AUDIO_OUTPUT_RATE_HZ / 200U;
+        bytes = frames * sizeof(int16_t);
+        data = kmalloc(bytes);
+        if (!data) {
+            SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
+            return FALSE;
+        }
+        int16_t *samples = (int16_t *)data;
+        for (UINT i = 0; i < frames; i++) {
+            UINT phase = i % period;
+            int value = phase < period / 2U
+                ? -4096 + (int)(phase * 16384U / period)
+                : 12288 - (int)(phase * 16384U / period);
+            UINT envelope = i < ramp ? i : frames - 1U - i;
+            if (envelope < ramp)
+                value = value * (int)envelope / (int)ramp;
+            samples[i] = (int16_t)value;
+        }
+        format.sample_rate = AUDIO_OUTPUT_RATE_HZ;
+        format.channels = 1;
+        format.sample_format = PCM_SAMPLE_S16_LE;
+    }
+
+    if (!winmm_start_play_sound(data, bytes, &format, SND_ASYNC,
+                                GetCurrentProcessId(),
+                                g_compat32_mode ? TRUE : FALSE, TRUE)) {
+        SetLastError(31); /* ERROR_GEN_FAILURE: the mixer could not queue it. */
+        return FALSE;
+    }
+    return TRUE;
 }
 
 BOOL WINAPI shim_PlaySoundA(const char *sound, PVOID hmod, DWORD flags)
@@ -4016,14 +4128,26 @@ static UINT WINAPI shim_waveOutGetPosition(PVOID handle, PVOID time,
     return MMSYSERR_NOERROR;
 }
 
-static UINT WINAPI shim_waveOutGetDevCapsA(UINT device, PVOID capabilities,
-                                           UINT size)
+static UINT winmm_wave_caps_device(ULONG_PTR device)
 {
     if (!audio_output_is_ready())
         return MMSYSERR_NODRIVER;
-    if (device != 0 && device != WAVE_MAPPER)
-        return MMSYSERR_BADDEVICEID;
-    if (!capabilities || !size)
+    if (device == 0 || device == WAVE_MAPPER || device == (ULONG_PTR)-1)
+        return MMSYSERR_NOERROR;
+    DWORD owner_pid = GetCurrentProcessId();
+    uint64_t flags = winmm_timer_lock_irqsave();
+    BOOL present = winmm_wave_find_locked((PVOID)device, owner_pid) != NULL;
+    winmm_timer_unlock_irqrestore(flags);
+    return present ? MMSYSERR_NOERROR : MMSYSERR_BADDEVICEID;
+}
+
+static UINT WINAPI shim_waveOutGetDevCapsA(ULONG_PTR device, PVOID capabilities,
+                                           UINT size)
+{
+    if (!size) return MMSYSERR_NOERROR;
+    UINT status = winmm_wave_caps_device(device);
+    if (status) return status;
+    if (!capabilities)
         return MMSYSERR_INVALPARAM;
 
     WINMM_WAVEOUTCAPSA caps = {
@@ -4039,6 +4163,33 @@ static UINT WINAPI shim_waveOutGetDevCapsA(UINT device, PVOID capabilities,
     UINT copied = size < sizeof(caps) ? size : sizeof(caps);
     BOOL compat32 = g_compat32_mode ? TRUE : FALSE;
     if (!win32_user_range_writable(capabilities, copied, compat32))
+        return MMSYSERR_INVALPARAM;
+    memcpy(capabilities, &caps, copied);
+    return MMSYSERR_NOERROR;
+}
+
+static UINT WINAPI shim_waveOutGetDevCapsW(ULONG_PTR device, PVOID capabilities,
+                                           UINT size)
+{
+    if (!size) return MMSYSERR_NOERROR;
+    UINT status = winmm_wave_caps_device(device);
+    if (status) return status;
+    if (!capabilities) return MMSYSERR_INVALPARAM;
+
+    static const char name[] = "OsitoK PCM Output";
+    WINMM_WAVEOUTCAPSW caps = {
+        .manufacturer_id = 1,
+        .product_id = 1,
+        .driver_version = 0x00010000U,
+        .formats = 0x0000FFFFU,
+        .channels = 2,
+        .support = WAVECAPS_VOLUME | WAVECAPS_LRVOLUME,
+    };
+    for (UINT i = 0; i < sizeof(name); i++)
+        caps.product_name[i] = (WCHAR)name[i];
+    UINT copied = size < sizeof(caps) ? size : sizeof(caps);
+    if (!win32_user_range_writable(capabilities, copied,
+                                    g_compat32_mode ? TRUE : FALSE))
         return MMSYSERR_INVALPARAM;
     memcpy(capabilities, &caps, copied);
     return MMSYSERR_NOERROR;
@@ -5140,6 +5291,13 @@ static UINT WINAPI shim_joyGetPosEx(UINT id, PVOID info)
 typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT winmm_exports[] = {
+    { "mmioOpenA", (PVOID)shim_mmioOpenA, 3, CC_STDCALL },
+    { "mmioOpenW", (PVOID)shim_mmioOpenW, 3, CC_STDCALL },
+    { "mmioClose", (PVOID)shim_mmioClose, 2, CC_STDCALL },
+    { "mmioRead", (PVOID)shim_mmioRead, 3, CC_STDCALL },
+    { "mmioSeek", (PVOID)shim_mmioSeek, 3, CC_STDCALL },
+    { "mmioDescend", (PVOID)shim_mmioDescend, 4, CC_STDCALL },
+    { "mmioAscend", (PVOID)shim_mmioAscend, 3, CC_STDCALL },
     { "timeGetTime",              (PVOID)shim_timeGetTime,             0, CC_STDCALL },
     { "timeBeginPeriod",          (PVOID)shim_timeBeginPeriod,         1, CC_STDCALL },
     { "timeEndPeriod",            (PVOID)shim_timeEndPeriod,           1, CC_STDCALL },
@@ -5158,6 +5316,7 @@ static const SHIM_EXPORT winmm_exports[] = {
     { "waveOutUnprepareHeader",   (PVOID)shim_waveOutUnprepareHeader,  3, CC_STDCALL },
     { "waveOutGetPosition",       (PVOID)shim_waveOutGetPosition,      3, CC_STDCALL },
     { "waveOutGetDevCapsA",       (PVOID)shim_waveOutGetDevCapsA,      3, CC_STDCALL },
+    { "waveOutGetDevCapsW",       (PVOID)shim_waveOutGetDevCapsW,      3, CC_STDCALL },
     { "waveOutGetErrorTextA",     (PVOID)shim_waveOutGetErrorTextA,    3, CC_STDCALL },
     { "waveOutGetErrorTextW",     (PVOID)shim_waveOutGetErrorTextW,    3, CC_STDCALL },
     { "waveOutOpen",              (PVOID)shim_waveOutOpen,             6, CC_STDCALL },

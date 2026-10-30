@@ -15,6 +15,7 @@
  */
 
 #include "pe.h"
+#include "../include/paging.h"
 
 /* ── External dependencies (provided by kernel) ─────────────── */
 
@@ -36,7 +37,8 @@ extern void  sched_yield(void);
 /* Import resolution: look up a function by DLL name + function name.
  * Returns function pointer, or NULL if not found. */
 extern PVOID pe_resolve_import(const char *dll_name, const char *func_name,
-                               USHORT ordinal, BOOL by_ordinal);
+                               USHORT ordinal, BOOL by_ordinal,
+                               NTSTATUS *status);
 extern NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args);
 extern DWORD win32_current_process_id(void);
 extern void nt_vm_configure_process_dep(ULONG owner_pid, BOOL enabled);
@@ -493,6 +495,40 @@ no_reloc:
 
 /* ── Resolve imports (PE32+ / 64-bit thunks) ───────────────── */
 
+/* A suspended process already exposes final section permissions. Temporarily
+ * unprotect only the loader-owned pointer being fixed, then restore it before
+ * another import resolver can execute guest code or yield. */
+NTSTATUS pe_write_image_pointer(PVOID slot, ULONGLONG value, BOOL is32)
+{
+    extern uint64_t proc_current_cr3(void);
+    SIZE_T bytes = is32 ? sizeof(ULONG) : sizeof(ULONGLONG);
+    ULONG_PTR address = (ULONG_PTR)slot;
+    if (address & (bytes - 1)) return STATUS_INVALID_IMAGE_FORMAT;
+    if (!pe_va_range_contains(address, bytes)) return STATUS_ACCESS_VIOLATION;
+    uint64_t *pte = paging_get_pte_in_cr3(proc_current_cr3(), address);
+    if (!pte || !(*pte & 1)) return STATUS_ACCESS_VIOLATION;
+    BOOL writable = (*pte & 2) != 0;
+    PVOID base = slot;
+    SIZE_T size = bytes;
+    ULONG old = 0, ignored = 0;
+    ULONG_PTR args[5] = {
+        (ULONG_PTR)NT_CURRENT_PROCESS, (ULONG_PTR)&base,
+        (ULONG_PTR)&size, PAGE_EXECUTE_READWRITE, (ULONG_PTR)&old
+    };
+    if (!writable) {
+        NTSTATUS status = sys_NtProtectVirtualMemory(args);
+        if (!NT_SUCCESS(status)) return status;
+    }
+    if (is32) *(ULONG *)slot = (ULONG)value;
+    else *(ULONGLONG *)slot = value;
+    if (!writable) {
+        args[3] = old;
+        args[4] = (ULONG_PTR)&ignored;
+        return sys_NtProtectVirtualMemory(args);
+    }
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS pe_resolve_imports64(BYTE *image_base,
                                      IMAGE_DATA_DIRECTORY *import_dir,
                                      const char *image_name,
@@ -518,19 +554,27 @@ static NTSTATUS pe_resolve_imports64(BYTE *image_base,
 
         for (; int_entry->u1.AddressOfData != 0; int_entry++, iat_entry++) {
             PVOID resolved = NULL;
+            NTSTATUS import_status = STATUS_SUCCESS;
 
             if (IMAGE_SNAP_BY_ORDINAL64(int_entry->u1.Ordinal)) {
                 USHORT ordinal = (USHORT)IMAGE_ORDINAL64(int_entry->u1.Ordinal);
-                resolved = pe_resolve_import(dll_name, NULL, ordinal, TRUE);
+                resolved = pe_resolve_import(dll_name, NULL, ordinal, TRUE,
+                                             &import_status);
                 pe_trace_hex("PE:   ordinal ", ordinal);
             } else {
                 PIMAGE_IMPORT_BY_NAME name_entry =
                     (PIMAGE_IMPORT_BY_NAME)(image_base + (ULONG)int_entry->u1.AddressOfData);
                 resolved = pe_resolve_import(dll_name, name_entry->Name,
-                                             name_entry->Hint, FALSE);
+                                             name_entry->Hint, FALSE,
+                                             &import_status);
                 pe_trace("PE:   ");
                 pe_trace(name_entry->Name);
             }
+
+            if (!NT_SUCCESS(import_status) &&
+                import_status != STATUS_PROCEDURE_NOT_FOUND &&
+                import_status != STATUS_DLL_NOT_FOUND)
+                return import_status;
 
             if (!resolved) {
                 BOOL by_ordinal =
@@ -564,7 +608,9 @@ static NTSTATUS pe_resolve_imports64(BYTE *image_base,
                 resolved = NULL;
             }
 
-            iat_entry->u1.Function = (ULONGLONG)resolved;
+            NTSTATUS status = pe_write_image_pointer(
+                &iat_entry->u1.Function, (ULONGLONG)resolved, FALSE);
+            if (!NT_SUCCESS(status)) return status;
             if ((++import_count & 63U) == 0)
                 pe_import_yield();
         }
@@ -636,19 +682,27 @@ static NTSTATUS pe_resolve_imports32(BYTE *image_base,
 
         for (; int_entry->u1.AddressOfData != 0; int_entry++, iat_entry++) {
             PVOID resolved = NULL;
+            NTSTATUS import_status = STATUS_SUCCESS;
 
             if (IMAGE_SNAP_BY_ORDINAL32(int_entry->u1.Ordinal)) {
                 USHORT ordinal = (USHORT)IMAGE_ORDINAL32(int_entry->u1.Ordinal);
-                resolved = pe_resolve_import(dll_name, NULL, ordinal, TRUE);
+                resolved = pe_resolve_import(dll_name, NULL, ordinal, TRUE,
+                                             &import_status);
                 pe_trace_hex("PE:   ordinal ", ordinal);
             } else {
                 PIMAGE_IMPORT_BY_NAME name_entry =
                     (PIMAGE_IMPORT_BY_NAME)(image_base + int_entry->u1.AddressOfData);
                 resolved = pe_resolve_import(dll_name, name_entry->Name,
-                                             name_entry->Hint, FALSE);
+                                             name_entry->Hint, FALSE,
+                                             &import_status);
                 pe_trace("PE:   ");
                 pe_trace(name_entry->Name);
             }
+
+            if (!NT_SUCCESS(import_status) &&
+                import_status != STATUS_PROCEDURE_NOT_FOUND &&
+                import_status != STATUS_DLL_NOT_FOUND)
+                return import_status;
 
             if (!resolved) {
                 BOOL by_ordinal =
@@ -683,7 +737,9 @@ static NTSTATUS pe_resolve_imports32(BYTE *image_base,
              * For PE32 running in 64-bit host, the shim thunks are 64-bit
              * addresses — we store the low 32 bits. The PE32 code will
              * call through these 32-bit pointers via our thunk wrappers. */
-            iat_entry->u1.Function = (ULONG)(ULONG_PTR)resolved;
+            NTSTATUS status = pe_write_image_pointer(
+                &iat_entry->u1.Function, (ULONG_PTR)resolved, TRUE);
+            if (!NT_SUCCESS(status)) return status;
             if ((++import_count & 63U) == 0)
                 pe_import_yield();
         }
@@ -729,7 +785,9 @@ static NTSTATUS pe_initialize_cfg64(BYTE *image_base,
         if (!slots[i]) continue;
         if (slots[i] < image_start || slots[i] > image_end - sizeof(PVOID))
             return STATUS_INVALID_PARAMETER;
-        *(PVOID *)(ULONG_PTR)slots[i] = targets[i];
+        NTSTATUS status = pe_write_image_pointer(
+            (PVOID)(ULONG_PTR)slots[i], (ULONG_PTR)targets[i], FALSE);
+        if (!NT_SUCCESS(status)) return status;
     }
 
     /* ponytail: pass-through CFG until process-wide GFIDS are tracked. */
@@ -1012,7 +1070,7 @@ static void pe_abort_load(PPE_IMAGE_INFO info, BYTE *image_base,
     if (info) pe_memset(info, 0, sizeof(*info));
 }
 
-NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
+NTSTATUS pe_map_named(const BYTE *file_data, SIZE_T file_size,
                        PPE_IMAGE_INFO info, const char *image_name)
 {
     NTSTATUS status;
@@ -1103,12 +1161,21 @@ NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
         return status;
     }
 
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS pe_bind_mapped_image(PPE_IMAGE_INFO info, const char *image_name)
+{
+    if (!info || !info->ImageBase) return STATUS_INVALID_PARAMETER;
+    BYTE *image_base = info->ImageBase;
+    ULONG size_of_image = info->SizeOfImage;
+    NTSTATUS status;
+
     /* Step 6: Resolve imports (from mapped image's data directories) */
     /* Re-parse mapped image headers to get relocated data directory */
     PE_PARSED_HEADERS mph;
     status = pe_parse_headers(image_base, size_of_image, &mph);
     if (!NT_SUCCESS(status)) {
-        pe_abort_load(info, image_base, size_of_image, published_executable);
         return status;
     }
 
@@ -1118,7 +1185,7 @@ NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
 
     ULONG unresolved_count = 0;
     if (import_dir) {
-        if (ph.Is32Bit)
+        if (info->Is32Bit)
             status = pe_resolve_imports32(image_base, import_dir, image_name,
                                           &unresolved_count);
         else
@@ -1126,8 +1193,6 @@ NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
                                           &unresolved_count);
 
         if (!NT_SUCCESS(status)) {
-            pe_abort_load(info, image_base, size_of_image,
-                          published_executable);
             return status;
         }
     }
@@ -1140,15 +1205,12 @@ NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
         serial_puts(pe_import_get_strict()
             ? " policy=strict\n" : " policy=compat\n");
         if (pe_import_get_strict()) {
-            pe_abort_load(info, image_base, size_of_image,
-                          published_executable);
             return STATUS_PROCEDURE_NOT_FOUND;
         }
     }
 
     status = pe_initialize_cfg64(image_base, &mph);
     if (!NT_SUCCESS(status)) {
-        pe_abort_load(info, image_base, size_of_image, published_executable);
         return status;
     }
 
@@ -1156,6 +1218,17 @@ NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
     pe_trace("PE: load complete");
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
+                       PPE_IMAGE_INFO info, const char *image_name)
+{
+    NTSTATUS status = pe_map_named(file_data, file_size, info, image_name);
+    if (!NT_SUCCESS(status)) return status;
+    status = pe_bind_mapped_image(info, image_name);
+    if (!NT_SUCCESS(status))
+        pe_abort_load(info, info->ImageBase, info->SizeOfImage, !info->IsDLL);
+    return status;
 }
 
 NTSTATUS pe_load(const BYTE *file_data, SIZE_T file_size,

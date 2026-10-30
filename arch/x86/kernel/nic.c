@@ -5,6 +5,7 @@
 #include "nic.h"
 #include "../drivers/i211.h"
 #include "../drivers/rtl8111.h"
+#include "../drivers/iwx.h"
 
 extern void serial_puts(const char *s);
 
@@ -27,6 +28,7 @@ void nic_bind_i211(void)
     nic_ops.link_up     = i211_link_up;
     nic_ops.irq_pending = &i211_irq_pending;
     nic_ops.name        = "Intel I211";
+    nic_ops.read_link   = NULL;
     serial_puts("[NIC] backend: Intel I211\n");
 }
 
@@ -39,6 +41,7 @@ void nic_bind_rtl8111(void)
     nic_ops.link_up     = rtl8111_link_up;
     nic_ops.irq_pending = &rtl8111_irq_pending;
     nic_ops.name        = "Realtek RTL8111";
+    nic_ops.read_link   = NULL;
     serial_puts("[NIC] backend: Realtek RTL8111\n");
 }
 
@@ -61,5 +64,24 @@ void nic_bind_virtio_net(void)
     nic_ops.link_up     = vnet_link_up;
     nic_ops.irq_pending = NULL;          /* polled, no IRQ */
     nic_ops.name        = "virtio-net";
+    nic_ops.read_link   = NULL;
     serial_puts("[NIC] backend: virtio-net\n");
+}
+
+void nic_bind_iwx(void)
+{
+    nic_ops = (nic_ops_t){.send = iwx_send, .recv = iwx_recv,
+        .get_mac = iwx_get_mac, .link_up = iwx_link_up,
+        .read_link = iwx_read_link, .name = "Intel AX200"};
+    serial_puts("[NIC] backend: Intel AX200 (link down until connected)\n");
+}
+
+bool nic_is_iwx(void)
+{
+    return nic_ops.read_link == iwx_read_link;
+}
+
+bool nic_boot_prefer_wlan(bool wlan_present)
+{
+    return wlan_present && !nic_link_up();
 }

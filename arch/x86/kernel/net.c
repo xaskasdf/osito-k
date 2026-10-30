@@ -12,6 +12,8 @@
 #include "nic.h"
 #include "smp.h"
 
+nic_traffic_t nic_traffic[2];
+
 /* ── External Functions ──────────────────────────────────────── */
 
 extern void serial_puts(const char *s);
@@ -129,15 +131,29 @@ static void net_waiter_trace(const char *event, int slot, int pidx,
 
 static inline uint64_t net_irq_save(void)
 {
+#ifdef NET_HOST_TEST_IRQ
+    extern uint64_t net_test_irq_save(void);
+    return net_test_irq_save();
+#elif defined(NET_HOST_TEST)
+    return 0;
+#else
     uint64_t flags;
     __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     return flags;
+#endif
 }
 
 static inline void net_irq_restore(uint64_t flags)
 {
+#ifdef NET_HOST_TEST_IRQ
+    extern void net_test_irq_restore(uint64_t);
+    net_test_irq_restore(flags);
+#elif defined(NET_HOST_TEST)
+    (void)flags;
+#else
     if (flags & (1ULL << 9))
         __asm__ volatile ("sti" ::: "memory");
+#endif
 }
 
 static int net_waiter_register(netwait_type_t type, int target,
@@ -281,6 +297,9 @@ void net_tcp_release(int conn_idx)
 #define TCP_LISTENER_BACKLOG    16
 #define TCP_LISTENER_SLOT_FREE  (-1)
 #define TCP_LISTENER_SLOT_HELD  (-2)
+#define TCP_PASSIVE_INITIAL_RTO 100
+#define TCP_PASSIVE_MAX_RTO     6000
+#define TCP_PASSIVE_RETRIES     7
 
 typedef struct {
     uint16_t  port;
@@ -412,6 +431,9 @@ static uint8_t our_mac[ETH_ALEN];
 static uint8_t gateway_ip[4] = {10, 0, 2, 2};    /* Default: QEMU SLIRP */
 static uint8_t netmask[4]    = {255, 255, 255, 0};
 static uint16_t ip_id_counter;
+static nic_link_state_t observed_link;
+static bool observed_link_valid, link_ready;
+static uint64_t link_epoch;
 
 /* Packet buffer for receive */
 static uint8_t rx_pkt[2048];
@@ -474,8 +496,11 @@ static inline uint64_t net_rdtsc(void)
 static const uint8_t bcast_mac[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 /* Forward declarations */
-static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len);
+static void handle_tcp(const uint8_t *src_ip, const uint8_t *dst_ip,
+                         const uint8_t *pkt, uint32_t len);
 static void dns_reset(void);
+static void dns_link_changed(void);
+static bool net_sync_link(void);
 static void dns_handler(const uint8_t *src_ip, uint16_t src_port,
                         const void *data, uint32_t len);
 static uint32_t tcp_isn_counter = 0x12345678;
@@ -824,7 +849,7 @@ static void handle_ipv4(const uint8_t *pkt, uint32_t len)
     bool is_for_us   = ip_eq(ip->dst, our_ip);
     bool log_this    = (is_icmp || is_for_us) && (ipv4_dbg++ < 64);
 
-    /* Only IPv4, no options (IHL=5) */
+    /* Validate the complete header before inspecting transport ports. */
     if ((ip->ver_ihl & 0xF0) != 0x40) {
         if (log_this) { serial_puts("[IPv4] drop ver_ihl="); serial_puthex(ip->ver_ihl, 2); serial_puts("\n"); }
         return;
@@ -833,10 +858,23 @@ static void handle_ipv4(const uint8_t *pkt, uint32_t len)
     uint32_t ihl = (ip->ver_ihl & 0x0F) * 4;
     uint32_t total = ntohs(ip->total_len);
 
-    if (total > len || ihl > total) {
+    if (total > len || ihl < sizeof(*ip) || ihl > total) {
         if (log_this) { serial_puts("[IPv4] drop bad-len total="); serial_putdec(total); serial_puts(" ihl="); serial_putdec(ihl); serial_puts(" len="); serial_putdec(len); serial_puts("\n"); }
         return;
     }
+
+    /* Reassembly is not implemented: never treat fragment bytes as UDP. */
+    if (ntohs(ip->frag) & 0x3FFF) return;
+
+    const uint8_t *payload = pkt + ihl;
+    uint32_t payload_len = total - ihl;
+    bool dhcp_reply = false;
+    if (ip->proto == IP_PROTO_UDP && payload_len >= sizeof(udp_hdr_t)) {
+        const udp_hdr_t *udp = (const udp_hdr_t *)payload;
+        dhcp_reply = ntohs(udp->src_port) == 67 && ntohs(udp->dst_port) == 68;
+    }
+    static unsigned dhcp_ipv4_logs;
+    if (dhcp_reply && dhcp_ipv4_logs++ < 64) log_this = true;
 
     if (log_this) {
         serial_puts("[IPv4] rx src=");
@@ -861,7 +899,8 @@ static void handle_ipv4(const uint8_t *pkt, uint32_t len)
     bool is_bcast = (ip->dst[0] == 0xFF && ip->dst[1] == 0xFF &&
                      ip->dst[2] == 0xFF && ip->dst[3] == 0xFF);
     bool is_mcast = ((ip->dst[0] & 0xF0) == 0xE0);   /* 224.0.0.0/4 */
-    if (!ip_eq(ip->dst, our_ip) && !is_bcast && !is_mcast) {
+    bool bootstrap = !is_for_us && !is_bcast && !is_mcast;
+    if (bootstrap && !dhcp_reply) {
         if (log_this) serial_puts("[IPv4] drop: dst != our_ip\n");
         return;
     }
@@ -875,16 +914,13 @@ static void handle_ipv4(const uint8_t *pkt, uint32_t len)
     /* Learn sender's MAC from Ethernet frame (already in ARP table via ARP,
      * but for cases where we get IP without prior ARP) */
 
-    const uint8_t *payload = pkt + ihl;
-    uint32_t payload_len = total - ihl;
-
     if (ip->proto == IP_PROTO_ICMP) {
         handle_icmp(ip->src, payload, payload_len);
         return;
     }
 
     if (ip->proto == IP_PROTO_TCP) {
-        handle_tcp(ip->src, payload, payload_len);
+        handle_tcp(ip->src, ip->dst, payload, payload_len);
         return;
     }
 
@@ -914,7 +950,11 @@ static void handle_ipv4(const uint8_t *pkt, uint32_t len)
                 break;
             }
         }
-        if (!handler) {
+        /* RFC 2131: an OFFER/ACK may be unicast to yiaddr before it is
+         * configured. Only the explicit DHCP listener may consume it; that
+         * listener validates the active transaction and client identity.
+         * Never expose foreign-address traffic to the BSD port-0 fallback. */
+        if (!handler && !bootstrap) {
             for (int i = 0; i < udp_listener_count; i++) {
                 if (udp_listeners[i].port == 0 &&
                     udp_listeners[i].handler) {
@@ -950,6 +990,10 @@ void net_init(const uint8_t ip[4])
     udp_listener_lock = 0;
     ip_id_counter = 1;
     dns_reset();
+    observed_link_valid = false;
+    __atomic_store_n(&link_epoch, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&link_ready, !nic_ops.read_link, __ATOMIC_RELEASE);
+    if (nic_ops.read_link) net_sync_link();
 
     serial_puts("[NET] IP: ");
     serial_putdec(our_ip[0]); serial_puts(".");
@@ -1097,10 +1141,72 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
 static int tcp_retransmit_segment(tcp_conn_t *conn, const void *data,
                                   uint32_t len);
 static int tcp_send_keepalive_probe(tcp_conn_t *conn);
+static void tcp_passive_open_poll(uint64_t now);
 
 /* ── Poll for Incoming Packets ───────────────────────────────── */
 
 static volatile bool in_net_poll;
+
+uint64_t net_link_epoch(void)
+{
+    return __atomic_load_n(&link_epoch, __ATOMIC_ACQUIRE);
+}
+
+bool net_link_ready(void)
+{
+    return __atomic_load_n(&link_ready, __ATOMIC_ACQUIRE) && nic_link_up();
+}
+
+/* Only the net_poll owner (or boot before workers) mutates the observation. */
+static bool net_sync_link(void)
+{
+    if (!nic_ops.read_link) return true;
+    nic_link_state_t next;
+    if (nic_ops.read_link(&next)) return false;
+    if (observed_link_valid && next.generation == observed_link.generation &&
+        next.up == observed_link.up && !memcmp(next.mac, observed_link.mac, 6)) return true;
+    __atomic_store_n(&link_ready, false, __ATOMIC_RELEASE);
+    observed_link = next;
+    observed_link_valid = true;
+    memcpy(our_mac, next.mac, sizeof(our_mac));
+    memset(our_ip, 0, sizeof(our_ip));
+    memset(gateway_ip, 0, sizeof(gateway_ip));
+    memset(netmask, 0, sizeof(netmask));
+    memset(arp_table, 0, sizeof(arp_table));
+    dns_link_changed();
+    for (unsigned i = 0; i < TCP_MAX_CONNS; i++) {
+        tcp_conn_t *c = &tcp_conns[i];
+        if (c->state == TCP_CLOSED) continue;
+        c->close_reason = NET_TCP_ERROR_RESET;
+        c->tx_len = c->rx_len = 0;
+        __atomic_store_n(&c->state, TCP_CLOSED, __ATOMIC_RELEASE);
+        /* Keep the handle claimed until its owner observes the closure. */
+        net_waiter_wake(NETWAIT_TCP_ESTABLISHED, i);
+        net_waiter_wake(NETWAIT_TCP_RX, i);
+        net_waiter_wake(NETWAIT_TCP_CLOSED, i);
+    }
+    net_waiter_wake(NETWAIT_ARP, -1);
+    __atomic_add_fetch(&link_epoch, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&link_ready, next.up, __ATOMIC_RELEASE);
+    serial_puts(next.up ? "[NET] Link ready; IPv4 configuration required\n" : "[NET] Link down; IPv4 configuration cleared\n");
+    return true;
+}
+
+int net_apply_ipv4(uint64_t epoch, const uint8_t ip[4], const uint8_t mask[4],
+                   const uint8_t gateway[4], const uint8_t dns[4])
+{
+    if (!ip || !mask || !gateway || !dns || __sync_lock_test_and_set(&in_net_poll, 1)) return -1;
+    int result = -1;
+    if (net_sync_link() && net_link_epoch() == epoch && net_link_ready()) {
+        net_set_ip(ip);
+        net_set_netmask(mask);
+        net_set_gateway(gateway);
+        net_dns_set_server(dns);
+        result = 0;
+    }
+    __sync_lock_release(&in_net_poll);
+    return result;
+}
 
 void __hot net_poll(void)
 {
@@ -1108,7 +1214,7 @@ void __hot net_poll(void)
      * is already inside it.  Skip if we're already polling. */
     if (__sync_lock_test_and_set(&in_net_poll, 1)) return;
 
-    if (!nic_ops.recv) {
+    if (!nic_ops.recv || !net_sync_link()) {
         __sync_lock_release(&in_net_poll);
         return;
     }
@@ -1174,15 +1280,18 @@ void __hot net_poll(void)
 
     /* TCP retransmit check — process all connections with unACKed data */
     uint64_t now = idt_get_ticks();
+    tcp_passive_open_poll(now);
     for (int ci = 0; ci < TCP_MAX_CONNS; ci++) {
         tcp_conn_t *tc = &tcp_conns[ci];
-        if (tc->state != TCP_ESTABLISHED || tc->tx_len == 0) continue;
+        if ((tc->state != TCP_ESTABLISHED && tc->state != TCP_CLOSE_WAIT) ||
+            tc->tx_len == 0) continue;
         if (now < tc->rto_tick) continue;
 
         /* Timeout — retransmit oldest unACKed segment */
-        uint32_t chunk = tc->tx_len;
-        if (chunk > TCP_MSS) chunk = TCP_MSS;
-        tcp_retransmit_segment(tc, tc->tx_buf, chunk);
+        uint32_t sequence = tc->tx_seq;
+        tcp_retransmit_segment(tc, tc->tx_buf, tc->tx_len);
+        if ((tc->state != TCP_ESTABLISHED && tc->state != TCP_CLOSE_WAIT) ||
+            !tc->tx_len || tc->tx_seq != sequence) continue;
         tc->rto_count++;
 
         /* Exponential backoff (RFC 6298 §5.5). Start from the
@@ -1422,26 +1531,29 @@ static uint16_t tcp_checksum(const uint8_t src_ip[4], const uint8_t dst_ip[4],
     uint32_t sum = 0;
 
     /* IP addresses — read as native 16-bit words (same as TCP data) */
-    const uint16_t *sip = (const uint16_t *)src_ip;
-    const uint16_t *dip = (const uint16_t *)dst_ip;
-    sum += sip[0];
-    sum += sip[1];
-    sum += dip[0];
-    sum += dip[1];
+    uint16_t word;
+    for (uint32_t i = 0; i < 4; i += 2) {
+        memcpy(&word, src_ip + i, sizeof(word));
+        sum += word;
+        memcpy(&word, dst_ip + i, sizeof(word));
+        sum += word;
+    }
 
     /* Protocol + TCP length — in network byte order for consistency */
     sum += htons((uint16_t)IP_PROTO_TCP);
     sum += htons((uint16_t)tcp_len);
 
     /* TCP segment */
-    const uint16_t *p = (const uint16_t *)tcp_seg;
+    const uint8_t *p = (const uint8_t *)tcp_seg;
     uint32_t remaining = tcp_len;
     while (remaining > 1) {
-        sum += *p++;
+        memcpy(&word, p, sizeof(word));
+        sum += word;
+        p += 2;
         remaining -= 2;
     }
     if (remaining == 1)
-        sum += *(const uint8_t *)p;
+        sum += *p;
 
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
@@ -1449,8 +1561,6 @@ static uint16_t tcp_checksum(const uint8_t src_ip[4], const uint8_t dst_ip[4],
 }
 
 /* ── TCP: Send Segment ───────────────────────────────────────── */
-
-#define TCP_MSS 1460  /* Ethernet MTU 1500 - 20 IP - 20 TCP */
 
 /* Sequence-number comparators (32-bit modular arithmetic, RFC 1323). */
 static inline int seq_ge(uint32_t a, uint32_t b) { return (int32_t)(a - b) >= 0; }
@@ -1504,6 +1614,34 @@ static void tcp_sack_drain(tcp_conn_t *conn)
     conn->n_sack_blocks = w;
 }
 
+static uint32_t tcp_header_size(const tcp_conn_t *conn, uint8_t flags,
+                                uint8_t *sack_blocks)
+{
+    uint8_t blocks = 0;
+    uint32_t size = 40;
+    if (!(flags & TCP_SYN)) {
+        size = 20 + (conn->tsopt_ok ? 12 : 0);
+        if (conn->sack_ok) {
+            blocks = conn->n_sack_blocks;
+            uint8_t limit = conn->tsopt_ok ? 3 : 4;
+            if (blocks > limit) blocks = limit;
+            if (blocks) size += 4 + 8 * blocks;
+        }
+    }
+    if (sack_blocks) *sack_blocks = blocks;
+    return size;
+}
+
+static uint32_t tcp_payload_limit(const tcp_conn_t *conn, uint32_t header_size)
+{
+    /* MSS excludes options on the wire, but data must leave room for them
+     * within both the peer's MSS and our MTU (RFC 9293 section 3.7.1). */
+    uint32_t limit = conn->peer_mss ? conn->peer_mss : TCP_DEFAULT_MSS;
+    if (limit > TCP_MSS) limit = TCP_MSS;
+    uint32_t options = header_size - 20;
+    return limit > options ? limit - options : 0;
+}
+
 static int tcp_send_segment_at(tcp_conn_t *conn, uint8_t flags,
                                const void *data, uint32_t data_len,
                                uint32_t sequence, bool advance_sequence)
@@ -1541,26 +1679,11 @@ static int tcp_send_segment_at(tcp_conn_t *conn, uint8_t flags,
      * header never overflows 60 bytes.
      *
      * Plain ACKs without TS or SACK stay at the bare 20-byte header. */
-    bool emit_sack = (!(flags & TCP_SYN)) && conn->sack_ok &&
-                     conn->n_sack_blocks > 0;
     bool emit_ts   = (!(flags & TCP_SYN)) && conn->tsopt_ok;
-    /* Number of SACK blocks we'll actually serialize (0 if !emit_sack).
-     * Cap at 4 (RFC 2018), and at 3 when TS coexists (data-offset 60B
-     * ceiling). conn->n_sack_blocks is already 0..4. */
-    uint8_t n_emit_sack = 0;
-    if (emit_sack) {
-        n_emit_sack = conn->n_sack_blocks;
-        if (n_emit_sack > 4) n_emit_sack = 4;
-        if (emit_ts && n_emit_sack > 3) n_emit_sack = 3;
-    }
-    uint32_t tcp_hdr_len;
-    if (flags & TCP_SYN) {
-        tcp_hdr_len = 40;
-    } else {
-        tcp_hdr_len = 20;
-        if (emit_ts)     tcp_hdr_len += 12;             /* 2 NOPs + TS(10) */
-        if (n_emit_sack) tcp_hdr_len += 4 + 8 * n_emit_sack; /* 2 NOPs + kind/len + 8*N */
-    }
+    uint8_t n_emit_sack;
+    uint32_t tcp_hdr_len = tcp_header_size(conn, flags, &n_emit_sack);
+    if (data_len > tcp_payload_limit(conn, tcp_hdr_len))
+        return -1;
     uint32_t tcp_total = tcp_hdr_len + data_len;
     uint32_t ip_total  = sizeof(ipv4_hdr_t) + tcp_total;
 
@@ -1638,7 +1761,7 @@ static int tcp_send_segment_at(tcp_conn_t *conn, uint8_t flags,
         uint32_t tsecr = htonl((flags & TCP_ACK) ? conn->ts_recent : 0);
         memcpy(opt + 12, &tsval, 4);
         memcpy(opt + 16, &tsecr, 4);
-    } else if (emit_ts || emit_sack) {
+    } else if (emit_ts || n_emit_sack) {
         uint32_t off = 0;
         if (emit_ts) {
             /* Two leading NOPs to 4-byte-align the TS option */
@@ -1690,7 +1813,9 @@ static int tcp_send_segment_at(tcp_conn_t *conn, uint8_t flags,
     }
 
     if (conn->loopback) {
-        handle_tcp(src_ip, (const uint8_t *)tcp, tcp_total);
+        nic_account_packet(&nic_traffic[1].tx, ip_total, 0);
+        nic_account_packet(&nic_traffic[1].rx, ip_total, 0);
+        handle_tcp(src_ip, conn->remote_ip, (const uint8_t *)tcp, tcp_total);
         return 0;
     }
     int result = nic_send(packet, frame_len);
@@ -1709,6 +1834,10 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
 static int tcp_retransmit_segment(tcp_conn_t *conn, const void *data,
                                   uint32_t data_len)
 {
+    uint32_t limit = tcp_payload_limit(conn,
+        tcp_header_size(conn, TCP_ACK | TCP_PSH, NULL));
+    if (data_len > limit) data_len = limit;
+    if (!data_len) return -1;
     return tcp_send_segment_at(conn, TCP_ACK | TCP_PSH, data, data_len,
                                conn->tx_seq, false);
 }
@@ -1723,12 +1852,78 @@ static int tcp_send_keepalive_probe(tcp_conn_t *conn)
                                conn->snd_nxt - 1, false);
 }
 
-static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
+static int tcp_send_synack(tcp_conn_t *conn)
 {
-    if (len < 20)
+    /* SYN occupies sequence space even while ARP/TX is pending. A failed
+     * retry must not invalidate an ACK for an earlier successful send. */
+    conn->snd_nxt = conn->snd_una + 1;
+    return tcp_send_segment_at(conn, TCP_SYN | TCP_ACK, NULL, 0,
+                               conn->snd_una, false);
+}
+
+static void tcp_passive_open_poll(uint64_t now)
+{
+    for (int ci = 0; ci < TCP_MAX_CONNS; ci++) {
+        tcp_conn_t *tc = &tcp_conns[ci];
+        if (tc->state != TCP_SYN_RCVD || !tc->rto_tick || now < tc->rto_tick)
+            continue;
+        if (tc->rto_count >= TCP_PASSIVE_RETRIES) {
+            /* A half-open socket still belongs to its listener. Unpublish
+             * before releasing it; a future accept must not see a reused ID. */
+            uint64_t irq = net_irq_save();
+            tc->close_reason = NET_TCP_ERROR_TIMED_OUT;
+            tc->state = TCP_CLOSED;
+            tc->rto_tick = 0;
+            bool owned = false;
+            for (int li = 0; li < TCP_MAX_LISTENERS; li++) {
+                for (int si = 0; si < TCP_LISTENER_BACKLOG; si++) {
+                    int expected = ci;
+                    if (__atomic_compare_exchange_n(
+                            &tcp_listeners[li].pending_conns[si], &expected,
+                            TCP_LISTENER_SLOT_FREE, false,
+                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                        owned = true;
+                }
+            }
+            if (owned) net_tcp_release(ci);
+            net_irq_restore(irq);
+            net_waiter_wake(NETWAIT_TCP_ACCEPT, -1);
+            continue;
+        }
+        tc->rto_count++;
+        uint32_t backoff = TCP_PASSIVE_INITIAL_RTO;
+        for (uint32_t n = 0; n < tc->rto_count && backoff < TCP_PASSIVE_MAX_RTO; n++)
+            backoff *= 2;
+        if (backoff > TCP_PASSIVE_MAX_RTO) backoff = TCP_PASSIVE_MAX_RTO;
+        tc->rto_tick = now + backoff;
+        tcp_send_synack(tc);
+    }
+}
+
+static void handle_tcp(const uint8_t *src_ip, const uint8_t *dst_ip,
+                         const uint8_t *pkt, uint32_t len)
+{
+    if (len < 20 || len > 0xFFFFU)
         return;
 
     const tcp_hdr_t *tcp = (const tcp_hdr_t *)pkt;
+    /* TCP's checksum is mandatory, including control-only segments. Check
+     * the actual IP destination before changing state or acknowledging data. */
+    if (tcp_checksum(src_ip, dst_ip, pkt, len) != 0) {
+        static uint32_t checksum_drop_logs;
+        uint32_t count = __atomic_fetch_add(&checksum_drop_logs, 1,
+                                            __ATOMIC_RELAXED);
+        if (count < 16) {
+            serial_puts("[TCP] drop: bad checksum src_port=");
+            serial_putdec(ntohs(tcp->src_port));
+            serial_puts(" dst_port=");
+            serial_putdec(ntohs(tcp->dst_port));
+            serial_puts(" bytes=");
+            serial_putdec(len);
+            serial_puts("\n");
+        }
+        return;
+    }
     uint16_t src_port = ntohs(tcp->src_port);
     uint16_t dst_port = ntohs(tcp->dst_port);
     uint32_t seq  = ntohl(tcp->seq);
@@ -1745,6 +1940,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
      * segment — we parse them on every packet so ts_recent stays
      * current for PAWS + RTT echo. SACK blocks on non-SYN ACKs
      * (kind=5) are ignored on the sender side for now. */
+    uint16_t peer_mss = TCP_DEFAULT_MSS;
     uint8_t peer_wscale = 0;
     bool    peer_has_ws = false;
     bool    peer_has_ts = false;
@@ -1764,7 +1960,10 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             if (i + 1 >= opt_len) break;
             uint8_t l = opt[i + 1];
             if (l < 2 || i + l > opt_len) break;
-            if (kind == 3 && l == 3 && (flags & TCP_SYN)) {
+            if (kind == 2 && l == 4 && (flags & TCP_SYN)) {
+                uint16_t mss = ((uint16_t)opt[i + 2] << 8) | opt[i + 3];
+                if (mss) peer_mss = mss;
+            } else if (kind == 3 && l == 3 && (flags & TCP_SYN)) {
                 peer_wscale = opt[i + 2];
                 if (peer_wscale > 14) peer_wscale = 14; /* RFC 7323 cap */
                 peer_has_ws = true;
@@ -1860,6 +2059,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         conn->snd_wscale  = peer_has_ws ? peer_wscale : 0;
         conn->rcv_wscale  = peer_has_ws ? TCP_RX_WSCALE : 0;
         conn->snd_wnd     = ntohs(tcp->window);
+        conn->peer_mss    = peer_mss;
         conn->sack_ok     = 0;
         conn->tsopt_ok    = peer_has_ts ? 1 : 0;
         if (peer_has_ts) conn->ts_recent = peer_tsval;
@@ -1871,12 +2071,9 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             return;
         }
 
-        /* Send SYN+ACK. If ARP isn't resolved this returns -1 and
-         * tcp_send_segment fires an ARP request as a side effect.
-         * The connection still sits in SYN_RCVD; the host's RTO
-         * SYN retransmit will hit the SYN_RCVD case and retry the
-         * SYN+ACK with ARP now warm. */
-        int snd_rc = tcp_send_segment(conn, TCP_SYN | TCP_ACK, NULL, 0);
+        /* Retry independently of the peer when ARP/TX or the SYN+ACK is lost. */
+        conn->rto_tick = idt_get_ticks() + TCP_PASSIVE_INITIAL_RTO;
+        int snd_rc = tcp_send_synack(conn);
 
         serial_puts(snd_rc == 0
                     ? "[TCP] SYN received, sent SYN+ACK (conn "
@@ -1885,6 +2082,14 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         serial_puts(" port ");
         serial_putdec(dst_port);
         serial_puts(")\n");
+        return;
+    }
+
+    /* Do not let an ACK for unsent sequence space discard queued bytes or
+     * publish new receive credit. Sequence comparisons must tolerate wrap. */
+    if ((conn->state == TCP_ESTABLISHED || conn->state == TCP_CLOSE_WAIT) &&
+        (flags & TCP_ACK) && !(flags & TCP_RST) && seq_gt(ack, conn->snd_nxt)) {
+        tcp_send_segment(conn, TCP_ACK, NULL, 0);
         return;
     }
 
@@ -1921,30 +2126,17 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         if ((flags & TCP_ACK) && ack == conn->snd_nxt) {
             conn->snd_una = ack;
             conn->state = TCP_ESTABLISHED;
+            conn->rto_tick = 0;
+            conn->rto_count = 0;
+            conn->rto = 300; /* No unambiguous RTT sample from the handshake. */
             net_waiter_wake(NETWAIT_TCP_ESTABLISHED, conn_idx);
             net_waiter_wake(NETWAIT_TCP_ACCEPT, -1);  /* wake all accept waiters */
             serial_puts("[TCP] Accepted (conn ");
             serial_putdec(conn_idx);
             serial_puts(")\n");
-        } else if ((flags & TCP_SYN) && !(flags & TCP_ACK)) {
-            /* Duplicate SYN — host's RTO retransmit. Our original
-             * SYN+ACK was likely dropped (e.g. ARP miss on first
-             * try). Reset snd_nxt back to the ISN (snd_una still
-             * holds it) and re-send. tcp_send_segment will bump
-             * snd_nxt by 1 again for the SYN flag.
-             *
-             * Without this, the listener stays stuck in SYN_RCVD
-             * forever — silent SYN+ACK drops on the cold path
-             * (ARP cache miss, transient TX failure) become
-             * permanent connection failures. */
-            conn->snd_nxt = conn->snd_una;
-            int rc = tcp_send_segment(conn, TCP_SYN | TCP_ACK, NULL, 0);
-            if (rc == 0) {
-                serial_puts("[TCP] SYN+ACK re-sent (conn ");
-                serial_putdec(conn_idx);
-                serial_puts(")\n");
-            }
         }
+        /* Duplicate SYNs neither consume sequence space nor reset the RTO.
+         * net_poll owns retries, including when this peer sends no duplicate. */
         break;
 
     case TCP_SYN_SENT:
@@ -1953,6 +2145,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             if (ack == conn->snd_nxt) {
                 conn->rcv_nxt = seq + 1;
                 conn->snd_una = ack;
+                conn->peer_mss = peer_mss;
                 /* RFC 7323 §2.2: both sides must advertise WS on SYN
                  * for scaling to apply.  If the peer omitted it (some
                  * legacy boxes), neither side scales — leave
@@ -1994,6 +2187,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         break;
 
     case TCP_ESTABLISHED:
+    case TCP_CLOSE_WAIT:
         /* ACK processing with retransmit tracking */
         if (flags & TCP_ACK) {
             /* RTT measurement (RFC 6298 Jacobson). The peer's TSecr
@@ -2026,13 +2220,14 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 }
             }
 
-            if (ack > conn->snd_una) {
+            if (seq_gt(ack, conn->snd_una)) {
                 /* New data ACKed — advance tx_buf, reset dup count */
-                uint32_t acked = ack - conn->snd_una;
+                uint64_t irq = net_irq_save();
                 conn->snd_una = ack;
                 conn->dup_ack_count = 0;
                 /* Shift retransmit buffer */
-                if (conn->tx_len > 0) {
+                if (conn->tx_len > 0 && seq_gt(ack, conn->tx_seq)) {
+                    uint32_t acked = ack - conn->tx_seq;
                     if (acked >= conn->tx_len) {
                         conn->tx_len = 0;  /* all ACKed */
                     } else {
@@ -2040,12 +2235,13 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                         for (uint32_t bi = 0; bi < remain; bi++)
                             conn->tx_buf[bi] = conn->tx_buf[bi + acked];
                         conn->tx_len = remain;
-                        conn->tx_seq += acked;
                     }
-                    conn->rto_tick = idt_get_ticks() +
-                                     (conn->rto ? conn->rto : 300);
-                    conn->rto_count = 0;
+                    conn->tx_seq = ack;
                 }
+                conn->rto_tick = conn->tx_len ? idt_get_ticks() +
+                                 (conn->rto ? conn->rto : 300) : 0;
+                conn->rto_count = 0;
+                net_irq_restore(irq);
             } else if (ack == conn->snd_una && conn->tx_len > 0) {
                 /* Duplicate ACK — fast retransmit at 3 dups (RFC 5681).
                  * RFC 6675 SACK-aware refinement: if the peer's SACK
@@ -2103,12 +2299,10 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 }
                 conn->dup_ack_count++;
                 if (conn->dup_ack_count >= 3 && !tx_sacked) {
-                    uint32_t chunk = conn->tx_len;
-                    if (chunk > TCP_MSS) chunk = TCP_MSS;
-                    tcp_retransmit_segment(conn, conn->tx_buf, chunk);
+                    tcp_retransmit_segment(conn, conn->tx_buf, conn->tx_len);
                     conn->dup_ack_count = 0;
-                    conn->rto_tick = idt_get_ticks() +
-                                     (conn->rto ? conn->rto : 300);
+                    conn->rto_tick = conn->tx_len ? idt_get_ticks() +
+                                     (conn->rto ? conn->rto : 300) : 0;
                 } else if (tx_sacked) {
                     /* SACK proves the receiver has our data. Slide the
                      * timer forward so we don't fire a spurious RTO
@@ -2117,6 +2311,21 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                     conn->rto_tick = idt_get_ticks() +
                                      (conn->rto ? conn->rto : 300);
                 }
+            }
+        }
+
+        if (conn->state == TCP_CLOSE_WAIT)
+            break;
+
+        /* A retransmission may overlap acknowledged bytes and still carry
+         * new data. Preserve its new suffix and the original FIN position.
+         * Fully duplicate segments retain the duplicate-ACK path below. */
+        if (data_len > 0 && seq_lt(seq, conn->rcv_nxt)) {
+            uint32_t duplicate = conn->rcv_nxt - seq;
+            if (duplicate < data_len) {
+                data += duplicate;
+                data_len -= duplicate;
+                seq += duplicate;
             }
         }
 
@@ -2141,11 +2350,15 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
              * (per §5.3 "an old duplicate" handling) and drop the data. */
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
         } else if (data_len > 0 && seq == conn->rcv_nxt) {
+            /* A consumer can preempt packet dispatch and compact rx_buf.
+             * Publish bytes, length and sequence as one BSP operation. */
+            uint64_t irq = net_irq_save();
             uint32_t space = TCP_RX_BUF_SIZE - conn->rx_len;
             if (data_len <= space) {
                 memcpy(conn->rx_buf + conn->rx_len, data, data_len);
                 conn->rx_len  += data_len;
                 conn->rcv_nxt += data_len;
+                net_irq_restore(irq);
                 tcp_sack_drain(conn);
                 /* RFC 7323 §3.4: only update ts_recent on in-order data
                  * (the segment's TS Value is the freshest the peer has
@@ -2157,6 +2370,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 /* Wake any process blocked on recv */
                 net_waiter_wake(NETWAIT_TCP_RX, conn_idx);
             } else {
+                net_irq_restore(irq);
                 /* Receive window full — the segment (e.g. a zero-window
                  * probe sent beyond the window) does NOT fit. Drop it WHOLE
                  * and send a dup-ACK carrying our current window; do NOT
@@ -2210,6 +2424,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
 
         /* Receive remaining data */
         if (data_len > 0 && seq == conn->rcv_nxt) {
+            uint64_t irq = net_irq_save();
             uint32_t space = TCP_RX_BUF_SIZE - conn->rx_len;
             uint32_t copy = data_len < space ? data_len : space;
             if (copy > 0) {
@@ -2217,6 +2432,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 conn->rx_len += copy;
             }
             conn->rcv_nxt += data_len;
+            net_irq_restore(irq);
         }
 
         if ((flags & TCP_FIN) && (flags & TCP_ACK)) {
@@ -2238,6 +2454,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
     case TCP_FIN_WAIT_2:
         /* Receive remaining data */
         if (data_len > 0 && seq == conn->rcv_nxt) {
+            uint64_t irq = net_irq_save();
             uint32_t space = TCP_RX_BUF_SIZE - conn->rx_len;
             uint32_t copy = data_len < space ? data_len : space;
             if (copy > 0) {
@@ -2245,6 +2462,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 conn->rx_len += copy;
             }
             conn->rcv_nxt += data_len;
+            net_irq_restore(irq);
         }
 
         if (flags & TCP_FIN) {
@@ -2263,12 +2481,6 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             serial_putdec(conn_idx);
             serial_puts(")\n");
         }
-        break;
-
-    case TCP_CLOSE_WAIT:
-        /* Waiting for our close() call — just ACK data */
-        if (flags & TCP_ACK)
-            conn->snd_una = ack;
         break;
 
     case TCP_TIME_WAIT:
@@ -2429,6 +2641,9 @@ static uint32_t tcp_send_capacity(const tcp_conn_t *conn)
     uint32_t in_flight = conn->snd_nxt - conn->snd_una;
     uint32_t peer_credit = conn->snd_wnd > in_flight
                          ? conn->snd_wnd - in_flight : 0;
+    uint32_t limit = tcp_payload_limit(conn,
+        tcp_header_size(conn, TCP_ACK | TCP_PSH, NULL));
+    if (peer_credit > limit) peer_credit = limit;
     if (conn->loopback)
         return peer_credit;
 
@@ -2450,36 +2665,46 @@ int net_tcp_send(int conn_idx, const void *data, uint32_t len)
     uint32_t sent = 0;
 
     while (sent < len) {
+        /* BSP packet dispatch and senders can preempt one another. Commit
+         * the bounded queue append before publishing the packet to the NIC;
+         * never keep interrupts masked while calling a driver or net_poll. */
+        uint64_t irq = net_irq_save();
         uint32_t capacity = tcp_send_capacity(conn);
-        if (!capacity)
+        if (!capacity) {
+            net_irq_restore(irq);
             break;
+        }
 
         uint32_t chunk = len - sent;
-        if (chunk > TCP_MSS)
-            chunk = TCP_MSS;
         if (chunk > capacity)
             chunk = capacity;
 
-        uint8_t flags = TCP_ACK | TCP_PSH;
-        if (tcp_send_segment(conn, flags, ptr + sent, chunk) < 0) {
-            net_poll();
-            if (tcp_send_segment(conn, flags, ptr + sent, chunk) < 0)
-                return sent > 0 ? (int)sent : -1;
-        }
-
-        /* Every externally accepted byte must remain retransmittable. The
-         * capacity check above guarantees this append cannot overflow. */
-        if (!conn->loopback) {
+        bool loopback = conn->loopback != 0;
+        uint32_t sequence = conn->snd_nxt;
+        if (!loopback) {
             bool queue_was_empty = conn->tx_len == 0;
             memcpy(conn->tx_buf + conn->tx_len, ptr + sent, chunk);
             if (queue_was_empty)
-                conn->tx_seq = conn->snd_nxt - chunk;
+                conn->tx_seq = sequence;
             conn->tx_len += chunk;
+            conn->snd_nxt += chunk;
             if (queue_was_empty) {
                 conn->rto_tick = idt_get_ticks() +
                                  (conn->rto ? conn->rto : 300);
                 conn->rto_count = 0;
             }
+        }
+        net_irq_restore(irq);
+
+        if (loopback) {
+            if (tcp_send_segment(conn, TCP_ACK | TCP_PSH, ptr + sent, chunk) < 0)
+                return sent > 0 ? (int)sent : -1;
+        } else {
+            /* TCP owns these bytes now. A busy NIC/ARP path is packet loss,
+             * not a broken stream: the retransmit timer retains the data.
+             * Use the reserved sequence even if another sender ran first. */
+            tcp_send_segment_at(conn, TCP_ACK | TCP_PSH, ptr + sent, chunk,
+                                sequence, false);
         }
 
         sent += chunk;
@@ -2495,6 +2720,7 @@ int net_tcp_recv(int conn_idx, void *buf, uint32_t buf_size)
         return -1;
 
     tcp_conn_t *conn = &tcp_conns[conn_idx];
+    uint64_t irq = net_irq_save();
 
     /* If data available, return it */
     if (conn->rx_len > 0) {
@@ -2508,6 +2734,10 @@ int net_tcp_recv(int conn_idx, void *buf, uint32_t buf_size)
                 conn->rx_buf[i] = conn->rx_buf[copy + i];
         }
         conn->rx_len -= copy;
+        bool update_window = conn->state == TCP_ESTABLISHED &&
+            ((conn->loopback && copy > 0) ||
+             (pre_len > (TCP_RX_BUF_SIZE / 4) && copy >= TCP_MSS));
+        net_irq_restore(irq);
 
         /* Window-update ACK: if the buffer was near-full before the
          * drain and is now substantially free, send a pure-ACK so the
@@ -2518,21 +2748,17 @@ int net_tcp_recv(int conn_idx, void *buf, uint32_t buf_size)
          * peer keeps treating our window as the value from the last
          * ACK we sent (often near zero), and never resumes sending
          * even though we just freed thousands of bytes. */
-        if (conn->state == TCP_ESTABLISHED &&
-            ((conn->loopback && copy > 0) ||
-             (pre_len > (TCP_RX_BUF_SIZE / 4) &&
-              (pre_len - conn->rx_len) >= TCP_MSS))) {
+        if (update_window) {
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
         }
         return (int)copy;
     }
 
     /* No data — check if connection is gone */
-    if (conn->state == TCP_CLOSE_WAIT || conn->state == TCP_TIME_WAIT ||
-        conn->state == TCP_CLOSED || conn->state == TCP_LAST_ACK)
-        return -1;
-
-    return 0;  /* No data yet */
+    int result = (conn->state == TCP_CLOSE_WAIT || conn->state == TCP_TIME_WAIT ||
+                  conn->state == TCP_CLOSED || conn->state == TCP_LAST_ACK) ? -1 : 0;
+    net_irq_restore(irq);
+    return result;
 }
 
 int net_tcp_peek(int conn_idx, void *buf, uint32_t buf_size)
@@ -2541,15 +2767,17 @@ int net_tcp_peek(int conn_idx, void *buf, uint32_t buf_size)
         return -1;
 
     tcp_conn_t *conn = &tcp_conns[conn_idx];
+    uint64_t irq = net_irq_save();
     if (conn->rx_len > 0) {
         uint32_t copy = conn->rx_len < buf_size ? conn->rx_len : buf_size;
         memcpy(buf, conn->rx_buf, copy);
+        net_irq_restore(irq);
         return (int)copy;
     }
-    if (conn->state == TCP_CLOSE_WAIT || conn->state == TCP_TIME_WAIT ||
-        conn->state == TCP_CLOSED || conn->state == TCP_LAST_ACK)
-        return -1;
-    return 0;
+    int result = (conn->state == TCP_CLOSE_WAIT || conn->state == TCP_TIME_WAIT ||
+                  conn->state == TCP_CLOSED || conn->state == TCP_LAST_ACK) ? -1 : 0;
+    net_irq_restore(irq);
+    return result;
 }
 
 int net_tcp_recv_timeout(int conn_idx, void *buf, uint32_t buf_size,
@@ -3029,12 +3257,33 @@ static void dns_reset(void)
     net_udp_listen(DNS_SOURCE_PORT, dns_handler);
 }
 
+static void dns_link_changed(void)
+{
+    uint64_t flags = dns_lock_irqsave();
+    memset(dns_server, 0, sizeof(dns_server));
+    for (unsigned i = 0; i < DNS_MAX_REQUESTS; i++) {
+        if (dns_requests[i].state == DNS_REQ_FREE) continue;
+        memset(dns_requests[i].result_ip, 0, sizeof(dns_requests[i].result_ip));
+        __atomic_store_n(&dns_requests[i].state, DNS_REQ_NEGATIVE, __ATOMIC_RELEASE);
+    }
+    dns_unlock_irqrestore(flags);
+}
+
 void net_dns_set_server(const uint8_t ip[4])
 {
     if (!ip) return;
     uint64_t flags = dns_lock_irqsave();
     memcpy(dns_server, ip, 4);
     dns_unlock_irqrestore(flags);
+}
+
+bool net_dns_get_server(uint8_t ip_out[4])
+{
+    if (!ip_out) return false;
+    uint64_t flags = dns_lock_irqsave();
+    memcpy(ip_out, dns_server, 4);
+    dns_unlock_irqrestore(flags);
+    return (ip_out[0] | ip_out[1] | ip_out[2] | ip_out[3]) != 0;
 }
 
 static void dns_request_release(int slot)
@@ -3343,6 +3592,7 @@ typedef enum {
 
 typedef struct {
     netop_type_t    type;
+    uint64_t        link_epoch;
     uint64_t        deadline;       /* absolute tick timeout */
     net_async_cb_t  callback;
     void           *ctx;
@@ -3371,8 +3621,10 @@ static int async_alloc(void)
         if (__atomic_compare_exchange_n(&async_ops[i].type, &expected,
                                         NETOP_RESERVED, false,
                                         __ATOMIC_ACQ_REL,
-                                        __ATOMIC_ACQUIRE))
+                                        __ATOMIC_ACQUIRE)) {
+            async_ops[i].link_epoch = net_link_epoch();
             return i;
+        }
     }
     return -1;
 }
@@ -3406,7 +3658,7 @@ static void net_async_check(
         if (type == NETOP_IDLE || type == NETOP_RESERVED) continue;
 
         /* Timeout check */
-        if (now >= op->deadline) {
+        if (now >= op->deadline || op->link_epoch != net_link_epoch()) {
             if (type == NETOP_DNS_WAIT)
                 dns_request_release(op->dns.request_slot);
             else if (type == NETOP_TCP_SYN_WAIT && op->tcp.conn_idx >= 0) {
@@ -3502,6 +3754,8 @@ static void net_async_check(
 
     /* ── Check net waiter deadlines ─────────────────────────────── */
     if (net_waiter_count > 0) {
+        /* Do not let a woken task reuse its slot before expiry retires it. */
+        uint64_t flags = net_irq_save();
         for (int i = 0; i < NET_MAX_WAITERS; i++) {
             if (net_waiters[i].type == NETWAIT_NONE) continue;
             if (now >= net_waiters[i].deadline) {
@@ -3510,6 +3764,7 @@ static void net_async_check(
                 __sync_fetch_and_sub(&net_waiter_count, 1);
             }
         }
+        net_irq_restore(flags);
     }
 }
 

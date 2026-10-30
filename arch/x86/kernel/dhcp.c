@@ -6,6 +6,7 @@
  */
 
 #include "../include/types.h"
+#include "net.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -19,7 +20,6 @@ extern void     net_set_ip(const uint8_t ip[4]);
 extern void     net_set_gateway(const uint8_t gw[4]);
 extern void     net_set_netmask(const uint8_t mask[4]);
 extern void     net_dns_set_server(const uint8_t ip[4]);
-extern int      net_udp_listen(uint16_t port, void *handler);
 extern int      net_udp_send_broadcast(uint16_t dst_port, uint16_t src_port,
                                        const void *data, uint32_t len);
 extern void     net_poll(void);
@@ -73,6 +73,61 @@ static uint32_t offered_lease;
 static volatile bool dhcp_got_reply;
 static uint64_t dhcp_lease_start;   /* tick when lease was acquired */
 static uint64_t dhcp_lease_ticks;   /* lease duration in 100Hz ticks */
+static uint64_t dhcp_epoch, dhcp_lease_epoch;
+static uint8_t dhcp_mac[6], dhcp_phase, dhcp_state_lock, dhcp_operation_lock;
+static bool dhcp_renewing;
+static unsigned dhcp_rx_logs;
+static uint64_t dhcp_retry_seed;
+static struct {
+    uint8_t ip[4], server[4], mask[4], gateway[4], dns[4];
+    uint32_t seconds;
+} dhcp_bound;
+
+static void dhcp_save_bound(void)
+{
+    memcpy(dhcp_bound.ip, offered_ip, 4);
+    memcpy(dhcp_bound.server, server_ip, 4);
+    memcpy(dhcp_bound.mask, offered_mask, 4);
+    memcpy(dhcp_bound.gateway, offered_gw, 4);
+    memcpy(dhcp_bound.dns, offered_dns, 4);
+    dhcp_bound.seconds = offered_lease;
+}
+
+static void dhcp_restore_bound(void)
+{
+    memcpy(offered_ip, dhcp_bound.ip, 4);
+    memcpy(server_ip, dhcp_bound.server, 4);
+    memcpy(offered_mask, dhcp_bound.mask, 4);
+    memcpy(offered_gw, dhcp_bound.gateway, 4);
+    memcpy(offered_dns, dhcp_bound.dns, 4);
+    offered_lease = dhcp_bound.seconds;
+}
+
+static void dhcp_lock(void)
+{
+    while (__atomic_test_and_set(&dhcp_state_lock, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+}
+
+static void dhcp_unlock(void) { __atomic_clear(&dhcp_state_lock, __ATOMIC_RELEASE); }
+
+static void dhcp_wait_phase(uint8_t phase)
+{
+    dhcp_lock();
+    dhcp_phase = phase;
+    if (phase) __atomic_store_n(&dhcp_got_reply, false, __ATOMIC_RELEASE);
+    dhcp_unlock();
+}
+
+static bool dhcp_link_valid(void)
+{
+    return dhcp_epoch == net_link_epoch() && net_link_ready();
+}
+
+typedef struct {
+    uint8_t type, overload, mask[4], gateway[4], dns[4], server[4];
+    uint32_t lease, seen;
+} dhcp_options_t;
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -80,6 +135,16 @@ static inline uint32_t be32(uint32_t v)
 {
     return ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
            ((v << 8) & 0xFF0000) | ((v << 24) & 0xFF000000U);
+}
+
+static uint64_t dhcp_retry_ticks(unsigned attempt)
+{
+    /* RFC 2131 4.1: 4s, 8s, ... with +/-1s jitter, bounded at 64s.
+     * This MAC/tick-seeded PRNG is only for scheduling, not cryptography. */
+    dhcp_retry_seed = dhcp_retry_seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    uint64_t ticks = (400ULL << (attempt < 4 ? attempt : 4)) - 100 +
+                     ((dhcp_retry_seed >> 32) % 201);
+    return ticks < 6400 ? ticks : 6400;
 }
 
 static void print_ip(const uint8_t ip[4])
@@ -91,74 +156,138 @@ static void print_ip(const uint8_t ip[4])
 }
 
 /* Parse DHCP options from received packet */
-static void parse_options(const uint8_t *opts, uint32_t len)
+static bool parse_options(dhcp_options_t *out, const uint8_t *opts, uint32_t len, bool primary)
 {
-    dhcp_msg_type = 0;
-    offered_lease = 0;
-    memset(offered_mask, 0, 4);
-    memset(offered_gw, 0, 4);
-    memset(offered_dns, 0, 4);
-
     uint32_t i = 0;
     while (i < len) {
         uint8_t opt = opts[i++];
         if (opt == 0) continue;       /* Pad */
-        if (opt == 255) break;         /* End */
-        if (i >= len) break;
+        if (opt == 255) return true;
+        if (i >= len) return false;
         uint8_t olen = opts[i++];
-        if (i + olen > len) break;
+        if (olen > len - i) return false;
+        unsigned bit = opt == 1 ? 1 : opt == 51 ? 2 : opt == 53 ? 4 : opt == 54 ? 8 : opt == 52 ? 16 : 0;
+        if (out->seen & bit) return false;
+        out->seen |= bit;
 
         switch (opt) {
         case 1:  /* Subnet Mask */
-            if (olen >= 4) memcpy(offered_mask, &opts[i], 4);
+            if (olen != 4) return false;
+            memcpy(out->mask, &opts[i], 4);
             break;
         case 3:  /* Router */
-            if (olen >= 4) memcpy(offered_gw, &opts[i], 4);
+            if (!olen || (olen & 3)) return false;
+            if (!(out->seen & 32)) memcpy(out->gateway, &opts[i], 4);
+            out->seen |= 32;
             break;
         case 6:  /* DNS Server */
-            if (olen >= 4) memcpy(offered_dns, &opts[i], 4);
+            if (!olen || (olen & 3)) return false;
+            if (!(out->seen & 64)) memcpy(out->dns, &opts[i], 4);
+            out->seen |= 64;
             break;
         case 51: /* Lease Time */
-            if (olen >= 4) {
-                offered_lease = ((uint32_t)opts[i] << 24) |
+            if (olen != 4) return false;
+            {
+                out->lease = ((uint32_t)opts[i] << 24) |
                                 ((uint32_t)opts[i+1] << 16) |
                                 ((uint32_t)opts[i+2] << 8) |
                                 opts[i+3];
             }
             break;
         case 53: /* DHCP Message Type */
-            if (olen >= 1) dhcp_msg_type = opts[i];
+            if (olen != 1) return false;
+            out->type = opts[i];
             break;
         case 54: /* Server Identifier */
-            if (olen >= 4) memcpy(server_ip, &opts[i], 4);
+            if (olen != 4) return false;
+            memcpy(out->server, &opts[i], 4);
+            break;
+        case 52:
+            if (!primary || olen != 1 || !opts[i] || opts[i] > 3) return false;
+            out->overload = opts[i];
             break;
         }
         i += olen;
     }
+    return false;
+}
+
+static bool dhcp_unicast(const uint8_t ip[4])
+{
+    return ip[0] && ip[0] != 127 && ip[0] < 224;
+}
+
+static void dhcp_rx_log(const uint8_t *src, uint32_t len, const char *result)
+{
+    unsigned logged = __atomic_load_n(&dhcp_rx_logs, __ATOMIC_RELAXED);
+    do {
+        if (logged >= 16) return;
+    } while (!__atomic_compare_exchange_n(&dhcp_rx_logs, &logged, logged + 1,
+                                          false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    serial_puts("[DHCP] RX src="); print_ip(src);
+    serial_puts(" bytes="); serial_putdec(len);
+    serial_puts(" result="); serial_puts(result); serial_puts("\n");
 }
 
 /* ── UDP handler (port 68) ───────────────────────────────────── */
 
 static void dhcp_handler(const uint8_t *src_ip, uint16_t src_port,
-                         const uint8_t *data, uint32_t len)
+                         const void *data, uint32_t len)
 {
-    (void)src_ip; (void)src_port;
-    if (len < sizeof(dhcp_packet_t) - 312) return;
+    /* A relay's source need not equal option 54. */
+    if (src_port != 67) return;
+    if (!data || len < 240 || len > 1472) { dhcp_rx_log(src_ip, len, "length"); return; }
+    if (__atomic_test_and_set(&dhcp_state_lock, __ATOMIC_ACQUIRE)) {
+        dhcp_rx_log(src_ip, len, "busy"); return;
+    }
 
     const dhcp_packet_t *pkt = (const dhcp_packet_t *)data;
-    if (pkt->op != DHCP_OP_REPLY) return;
-    if (pkt->xid != dhcp_xid) return;
-    if (pkt->cookie != be32(DHCP_MAGIC)) return;
-
-    /* Extract offered IP */
+    const char *result = "inactive";
+    if (!dhcp_phase || dhcp_got_reply || !dhcp_link_valid()) goto out;
+    result = "identity/xid/cookie";
+    if (pkt->op != DHCP_OP_REPLY || pkt->htype != 1 || pkt->hlen != 6 ||
+        memcmp(pkt->chaddr, dhcp_mac, 6) || pkt->xid != dhcp_xid || pkt->cookie != be32(DHCP_MAGIC)) goto out;
+    dhcp_options_t options = {0};
+    result = "options";
+    if (!parse_options(&options, (const uint8_t *)data + 240, len - 240, true)) goto out;
+    if ((options.overload & 1) && !parse_options(&options, pkt->file, sizeof(pkt->file), false)) goto out;
+    if ((options.overload & 2) && !parse_options(&options, pkt->sname, sizeof(pkt->sname), false)) goto out;
+    result = "server/message-type";
+    if ((options.seen & 12) != 12 || !dhcp_unicast(options.server)) goto out;
+    if (dhcp_phase == DHCP_OFFER) {
+        if (options.type != DHCP_OFFER) goto out;
+    } else {
+        if ((options.type != DHCP_ACK && options.type != DHCP_NAK) ||
+            memcmp(options.server, server_ip, 4)) goto out;
+        if (options.type == DHCP_NAK) {
+            dhcp_msg_type = DHCP_NAK;
+            result = "NAK";
+            __atomic_store_n(&dhcp_got_reply, true, __ATOMIC_RELEASE);
+            goto out;
+        }
+        result = "address";
+        if (memcmp(pkt->yiaddr, offered_ip, 4)) goto out;
+    }
+    result = "lease/address";
+    if (!(options.seen & 2) || !options.lease || !dhcp_unicast(pkt->yiaddr)) goto out;
+    if (!(options.seen & 1) && dhcp_phase != DHCP_OFFER) memcpy(options.mask, offered_mask, 4);
+    uint32_t mask = ((uint32_t)options.mask[0] << 24) | ((uint32_t)options.mask[1] << 16) |
+                    ((uint32_t)options.mask[2] << 8) | options.mask[3];
+    uint32_t inverse = ~mask;
+    result = "netmask";
+    if (!mask || (inverse & (inverse + 1))) goto out;
     memcpy(offered_ip, pkt->yiaddr, 4);
-    memcpy(server_ip, pkt->siaddr, 4);
-
-    /* Parse options */
-    uint32_t opts_len = len - (uint32_t)((const uint8_t *)pkt->options - data);
-    parse_options(pkt->options, opts_len);
-
-    dhcp_got_reply = true;
+    memcpy(server_ip, options.server, 4);
+    memcpy(offered_mask, options.mask, 4);
+    memcpy(offered_gw, options.gateway, 4);
+    memcpy(offered_dns, options.dns, 4);
+    offered_lease = options.lease;
+    dhcp_msg_type = options.type;
+    __atomic_store_n(&dhcp_got_reply, true, __ATOMIC_RELEASE);
+    result = options.type == DHCP_OFFER ? "OFFER accepted" : "ACK accepted";
+out:
+    dhcp_unlock();
+    dhcp_rx_log(src_ip, len, result);
 }
 
 /* ── Build and send DHCP packet ──────────────────────────────── */
@@ -176,6 +305,10 @@ static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip)
     pkt.cookie = be32(DHCP_MAGIC);
 
     net_get_mac(pkt.chaddr);
+    if (dhcp_renewing) {
+        memcpy(pkt.ciaddr, offered_ip, 4);
+        pkt.flags = 0;
+    }
 
     /* Build options */
     int p = 0;
@@ -183,7 +316,7 @@ static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip)
     pkt.options[p++] = 53; pkt.options[p++] = 1;
     pkt.options[p++] = msg_type;
 
-    if (msg_type == DHCP_REQUEST && req_ip) {
+    if (msg_type == DHCP_REQUEST && req_ip && !dhcp_renewing) {
         /* Option 50: Requested IP Address */
         pkt.options[p++] = 50; pkt.options[p++] = 4;
         memcpy(&pkt.options[p], req_ip, 4); p += 4;
@@ -202,35 +335,57 @@ static int dhcp_send(uint8_t msg_type, const uint8_t *req_ip)
     /* End */
     pkt.options[p++] = 255;
 
-    return net_udp_send_broadcast(67, 68, &pkt, sizeof(pkt));
+    if (!dhcp_link_valid()) return -1;
+    int rc = dhcp_renewing ? net_udp_send(server_ip, 67, 68, &pkt, sizeof(pkt)) :
+                            net_udp_send_broadcast(67, 68, &pkt, sizeof(pkt));
+    serial_puts("[DHCP] TX "); serial_puts(msg_type == DHCP_DISCOVER ? "DISCOVER" : "REQUEST");
+    serial_puts(" xid="); serial_puthex(dhcp_xid, 8);
+    serial_puts(rc < 0 ? " send-failed\n" : " queued\n");
+    return rc;
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
 
 int dhcp_discover(void)
 {
+    if (__atomic_test_and_set(&dhcp_operation_lock, __ATOMIC_ACQUIRE)) return -1;
+    __atomic_store_n(&dhcp_rx_logs, 0, __ATOMIC_RELAXED);
+    net_poll();
+    dhcp_epoch = net_link_epoch();
+    dhcp_renewing = false;
+    net_get_mac(dhcp_mac);
+    if (!net_link_ready() || (dhcp_mac[0] & 1) ||
+        !(dhcp_mac[0] | dhcp_mac[1] | dhcp_mac[2] | dhcp_mac[3] | dhcp_mac[4] | dhcp_mac[5])) goto failed;
     serial_puts("[DHCP] Starting discovery...\n");
     fb_puts(" DHCP: discovering...\n");
     boot_diag_mark("dhcp-start");
 
     /* Generate transaction ID from tick counter */
     dhcp_xid = (uint32_t)(idt_get_ticks() * 0x5DEECE66DULL + 0xB);
+    dhcp_retry_seed = ((uint64_t)dhcp_mac[0] << 40) | ((uint64_t)dhcp_mac[1] << 32) |
+                      ((uint64_t)dhcp_mac[2] << 24) | ((uint64_t)dhcp_mac[3] << 16) |
+                      ((uint64_t)dhcp_mac[4] << 8) | dhcp_mac[5];
+    dhcp_retry_seed ^= (uint64_t)dhcp_xid * 0x9E3779B97F4A7C15ULL;
 
     /* Register UDP listener on port 68 */
-    net_udp_listen(68, (void *)dhcp_handler);
+    if (net_udp_listen(68, dhcp_handler) != 0) goto failed;
 
     /* Send DISCOVER — retry up to 4 times */
     for (int attempt = 0; attempt < 4; attempt++) {
-        dhcp_got_reply = false;
+        uint64_t timeout = dhcp_retry_ticks((unsigned)attempt);
+        dhcp_wait_phase(DHCP_OFFER);
         dhcp_send(DHCP_DISCOVER, NULL);
 
-        /* Wait for OFFER (3s timeout = 300 ticks at 100Hz) */
+        /* Keep polling while waiting; a link change cancels the transaction. */
         uint64_t start = idt_get_ticks();
-        while (!dhcp_got_reply && (idt_get_ticks() - start) < 300) {
+        while (!__atomic_load_n(&dhcp_got_reply, __ATOMIC_ACQUIRE) &&
+               dhcp_link_valid() && (idt_get_ticks() - start) < timeout) {
             extern void net_poll_wait(void);
             boot_diag_heartbeat("dhcp-wait-offer");
             net_poll_wait();
         }
+        dhcp_wait_phase(0);
+        if (!dhcp_link_valid()) goto failed;
 
         if (dhcp_got_reply && dhcp_msg_type == DHCP_OFFER) {
             serial_puts("[DHCP] OFFER received: ");
@@ -250,36 +405,40 @@ int dhcp_discover(void)
         serial_puts("[DHCP] No OFFER received, giving up\n");
         fb_puts(" DHCP: failed\n");
         boot_diag_mark("dhcp-failed");
-        return -1;
+        goto failed;
     }
 
     /* Send REQUEST for the offered IP */
-    dhcp_got_reply = false;
-    dhcp_send(DHCP_REQUEST, offered_ip);
-
-    /* Wait for ACK (3s timeout) */
-    uint64_t start = idt_get_ticks();
-    while (!dhcp_got_reply && (idt_get_ticks() - start) < 300) {
-        extern void net_poll_wait(void);
-        boot_diag_heartbeat("dhcp-wait-ack");
-        net_poll_wait();
+    uint64_t start;
+    for (unsigned attempt = 0; attempt < 3; attempt++) {
+        uint64_t timeout = dhcp_retry_ticks(attempt);
+        dhcp_wait_phase(DHCP_ACK);
+        dhcp_send(DHCP_REQUEST, offered_ip);
+        start = idt_get_ticks();
+        while (!__atomic_load_n(&dhcp_got_reply, __ATOMIC_ACQUIRE) &&
+               dhcp_link_valid() && (idt_get_ticks() - start) < timeout) {
+            extern void net_poll_wait(void);
+            boot_diag_heartbeat("dhcp-wait-ack");
+            net_poll_wait();
+        }
+        dhcp_wait_phase(0);
+        if (dhcp_got_reply || !dhcp_link_valid()) break;
     }
 
     if (!dhcp_got_reply || dhcp_msg_type != DHCP_ACK) {
         serial_puts("[DHCP] No ACK received\n");
         fb_puts(" DHCP: no ACK\n");
         boot_diag_mark("dhcp-failed");
-        return -1;
+        goto failed;
     }
 
     /* Apply configuration */
-    net_set_ip(offered_ip);
-    if (offered_mask[0] || offered_mask[1] || offered_mask[2] || offered_mask[3])
-        net_set_netmask(offered_mask);
-    if (offered_gw[0] || offered_gw[1] || offered_gw[2] || offered_gw[3])
-        net_set_gateway(offered_gw);
-    if (offered_dns[0] || offered_dns[1] || offered_dns[2] || offered_dns[3])
-        net_dns_set_server(offered_dns);
+    start = idt_get_ticks();
+    while (net_apply_ipv4(dhcp_epoch, offered_ip, offered_mask, offered_gw, offered_dns)) {
+        if (!dhcp_link_valid() || idt_get_ticks() - start >= 100) goto failed;
+        extern void net_poll_wait(void);
+        net_poll_wait();
+    }
 
     serial_puts("[DHCP] Configured: IP=");
     print_ip(offered_ip);
@@ -308,40 +467,73 @@ int dhcp_discover(void)
 
     /* Store lease timing for renewal */
     dhcp_lease_start = idt_get_ticks();
+    dhcp_lease_epoch = dhcp_epoch;
     dhcp_lease_ticks = (uint64_t)offered_lease * 100;  /* convert to 100Hz ticks */
+    dhcp_save_bound();
 
     boot_diag_mark("dhcp-done");
+    __atomic_clear(&dhcp_operation_lock, __ATOMIC_RELEASE);
     return 0;
+failed:
+    dhcp_wait_phase(0);
+    if (dhcp_lease_epoch != net_link_epoch() || !net_link_ready()) dhcp_lease_ticks = 0;
+    dhcp_restore_bound();
+    __atomic_clear(&dhcp_operation_lock, __ATOMIC_RELEASE);
+    return -1;
 }
 
 /* Check if lease needs renewal. Call periodically from main loop.
  * Renews at T1 = 50% of lease (RFC 2131 recommendation). */
 void dhcp_check_renewal(void)
 {
-    if (!dhcp_lease_ticks) return;
+    if (__atomic_test_and_set(&dhcp_operation_lock, __ATOMIC_ACQUIRE)) return;
+    net_poll();
+    if (dhcp_lease_epoch != net_link_epoch() || !net_link_ready()) dhcp_lease_ticks = 0;
+    if (!dhcp_lease_ticks) goto out;
     uint64_t elapsed = idt_get_ticks() - dhcp_lease_start;
+    if (elapsed >= dhcp_lease_ticks) {
+        const uint8_t zero[4] = {0};
+        if (!net_apply_ipv4(dhcp_lease_epoch, zero, zero, zero, zero)) dhcp_lease_ticks = 0;
+        goto out;
+    }
     uint64_t t1 = dhcp_lease_ticks / 2;  /* Renew at 50% of lease */
 
-    if (elapsed < t1) return;
+    if (elapsed < t1) goto out;
+    dhcp_epoch = dhcp_lease_epoch;
+    dhcp_renewing = true;
+    __atomic_store_n(&dhcp_rx_logs, 0, __ATOMIC_RELAXED);
+    dhcp_xid = (uint32_t)(idt_get_ticks() * 0x5DEECE66DULL + 0xB);
 
     serial_puts("[DHCP] Lease renewal...\n");
-    dhcp_got_reply = false;
+    dhcp_wait_phase(DHCP_ACK);
     dhcp_send(DHCP_REQUEST, offered_ip);
 
     /* Brief wait for ACK (1s) */
     uint64_t start = idt_get_ticks();
-    while (!dhcp_got_reply && (idt_get_ticks() - start) < 100) {
+    while (!__atomic_load_n(&dhcp_got_reply, __ATOMIC_ACQUIRE) &&
+           dhcp_link_valid() && (idt_get_ticks() - start) < 100) {
         extern void net_poll_wait(void);
         net_poll_wait();
     }
+    dhcp_wait_phase(0);
 
-    if (dhcp_got_reply && dhcp_msg_type == DHCP_ACK) {
+    if (dhcp_link_valid() && dhcp_got_reply && dhcp_msg_type == DHCP_ACK &&
+        !net_apply_ipv4(dhcp_epoch, offered_ip, offered_mask, offered_gw, offered_dns)) {
         dhcp_lease_start = idt_get_ticks();
         dhcp_lease_ticks = (uint64_t)offered_lease * 100;
+        dhcp_save_bound();
         serial_puts("[DHCP] Lease renewed (");
         serial_putdec(offered_lease);
         serial_puts("s)\n");
     } else {
+        if (dhcp_link_valid() && dhcp_got_reply && dhcp_msg_type == DHCP_NAK) {
+            const uint8_t zero[4] = {0};
+            if (!net_apply_ipv4(dhcp_epoch, zero, zero, zero, zero)) dhcp_lease_ticks = 0;
+        }
+        dhcp_restore_bound();
         serial_puts("[DHCP] Renewal failed, will retry\n");
     }
+out:
+    dhcp_renewing = false;
+    __atomic_clear(&dhcp_operation_lock, __ATOMIC_RELEASE);
 }

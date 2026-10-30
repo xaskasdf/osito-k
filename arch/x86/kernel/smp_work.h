@@ -72,6 +72,12 @@ extern int       ap_worker_count;     /* ws_cpu_count - 1 (compat) */
 /* Initialize work-stealing system (after APs are up) */
 void smp_work_init(void);
 
+/* Notify every AP after publishing a system-wide worker/idle policy. */
+void smp_wake_all(void);
+/* Request a normal BSP scheduler interrupt after publishing kernel-service
+ * work. APs never inspect or mutate the BSP process table. */
+void smp_wake_bsp(void);
+
 /* Submit work to a specific AP's deque.
  * Returns task_id (>= 0) on success, -1 on failure. */
 int smp_submit(int ap_idx, smp_work_func_t func, void *arg, void *result);

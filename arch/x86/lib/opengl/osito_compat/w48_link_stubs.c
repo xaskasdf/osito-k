@@ -277,23 +277,8 @@ void *trace_context_create_threaded(void *screen, void *pipe, void **replace_pip
  * Real impls now provided by mesa/src/gallium/auxiliary/nir/nir_draw_helpers.c
  * (compiled into libmesa_gallium.a). */
 
-/* ============================================================
- * (10) _mesa_parse_arb_program — INTENTIONAL NO-OP
- * ============================================================
- * Upstream:  mesa/src/mesa/program/arbprogparse.c
- *
- * Parses ARB_vertex_program / ARB_fragment_program assembly text.
- * Zink does not use ARB programs — they're a legacy classic-Mesa path.
- * Smoke test NEVER REACHES this (no glProgramStringARB calls).
- *
- * Returns 0 ("not parsed") so caller's _mesa_error() path triggers and
- * the application gets GL_INVALID_OPERATION for any ARB-program API.
- */
-int _mesa_parse_arb_program(void *ctx, unsigned target, const unsigned char *str,
-                            unsigned len, void *prog) {
-    (void)ctx;(void)target;(void)str;(void)len;(void)prog;
-    return 0;  /* parse failed: GL spec error path engages in caller */
-}
+/* ARB program parsing is provided by Mesa's program_parse.y/program_lexer.l.
+ * WineD3D uses this path while probing the adapter and compiling shaders. */
 
 /* ============================================================
  * (11) driParseConfigFiles / driQueryOptionb — INTENTIONAL defaults

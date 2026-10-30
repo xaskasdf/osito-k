@@ -7,12 +7,16 @@
 
 #include "cpu8086.h"
 #include "dos_hostmem.h"
+#include "dos_native_fp.h"
+#include "dos_fpu.h"
 #include "dos_audio.h"
 #include "dos_io.h"
 #include "dos_jit.h"
 #include "dos_loader.h"
+#include "dos_mem.h"
 #include "dos_mouse.h"
 #include "dos_vbe.h"
+#include "dos_xms.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -62,7 +66,7 @@ void dos_init_ivt(dos_vm_t *vm)
         dos_mem_write16(vm, i * 4 + 2, rom_seg);
     }
     static const uint8_t service_vectors[] = {
-        0x08, 0x09, 0x10, 0x15, 0x16, 0x1A, 0x20, 0x21, 0x2F, 0x31, 0x33, 0x67
+        0x08, 0x09, 0x10, 0x11, 0x15, 0x16, 0x1A, 0x20, 0x21, 0x27, 0x2F, 0x31, 0x33, 0x67
     };
     for (unsigned i = 0; i < sizeof(service_vectors); i++) {
         uint8_t vector = service_vectors[i];
@@ -84,6 +88,14 @@ void dos_init_ivt(dos_vm_t *vm)
         0x50, 0xCD, 0x1C, 0xB0, 0x60, 0xE6, 0x20, 0x58, 0xCF
     };
     memcpy(vm->mem + DOS_ROM_BASE + 8, timer_handler, sizeof(timer_handler));
+    /* The AT BIOS acknowledges FERR/PIC and chains the application's INT 02h. */
+    static const uint8_t coprocessor_handler[] = {
+        0x50, 0x30, 0xC0, 0xE6, 0xF0, 0xB0, 0x20, 0xE6, 0xA0,
+        0xE6, 0x20, 0x58, 0xCD, 0x02, 0xCF
+    };
+    memcpy(vm->mem + DOS_ROM_BASE + DOS_IRQ13_HANDLER_OFF,
+           coprocessor_handler, sizeof(coprocessor_handler));
+    dos_mem_write16(vm, 0x75u * 4u, DOS_IRQ13_HANDLER_OFF);
 
     /* The shell's default Ctrl-C action is an abort, including when a
      * program chains to the saved real-mode vector. */
@@ -120,7 +132,7 @@ void dos_init_ivt(dos_vm_t *vm)
 static void dos_init_bda(dos_vm_t *vm)
 {
     /* Equipment word at 0040:0010 */
-    dos_mem_write16(vm, 0x410, 0x0021);  /* color 80x25 display */
+    dos_mem_write16(vm, 0x410, 0x0023);  /* color 80x25 display, x87 present */
 
     /* Memory size in KB at 0040:0013 */
     dos_mem_write16(vm, 0x413, 640);
@@ -181,6 +193,7 @@ typedef struct {
     int argc;
     const char **argv;
     bool emulate_cpu;
+    uint64_t trace_limit;
     uint64_t step_limit;
 } dos_run_options_t;
 
@@ -215,6 +228,10 @@ static bool dos_parse_run_options(const char *filename, int argc,
         }
         if (strcmp(token, "--emulate") == 0) {
             options->emulate_cpu = true;
+        } else if (strcmp(token, "--trace") == 0) {
+            if (!options->trace_limit) options->trace_limit = 256;
+        } else if (strlen(token) >= 8u && memcmp(token, "--trace=", 8u) == 0) {
+            if (!dos_parse_step_limit(token + 8u, &options->trace_limit)) return false;
         } else if (strcmp(token, "--max-steps") == 0) {
             if (options->step_limit || ++index >= argc ||
                 !dos_parse_step_limit(argv[index], &options->step_limit)) return false;
@@ -254,38 +271,59 @@ int dos_run_options_selftest(void)
         int file_index; /* -1 expects a rejected launch. */
         bool emulate;
         uint64_t limit;
+        uint64_t trace;
     } launches[] = {
-        { { "test.com" }, 1, 0, false, 0 },
-        { { "test.com", "--emulate", "--max-steps", "5" }, 4, 0, false, 0 },
-        { { "--emulate", "test.com", "-guest" }, 3, 1, true, 0 },
-        { { "--emulate", "--emulate", "test.com" }, 3, 2, true, 0 },
-        { { "--emulate", "--max-steps", "42", "test.com", "arg" }, 5, 3, true, 42 },
-        { { "--max-steps", "42", "--emulate", "test.com" }, 4, 3, true, 42 },
-        { { "--max-steps=42", "--emulate", "test.com" }, 3, 2, true, 42 },
+        { { "test.com" }, 1, 0, false, 0, false },
+        { { "test.com", "--emulate", "--max-steps", "5" }, 4, 0, false, 0, false },
+        { { "--emulate", "test.com", "-guest" }, 3, 1, true, 0, false },
+        { { "--emulate", "--emulate", "test.com" }, 3, 2, true, 0, false },
+        { { "--emulate", "--max-steps", "42", "test.com", "arg" }, 5, 3, true, 42, false },
+        { { "--max-steps", "42", "--emulate", "test.com" }, 4, 3, true, 42, false },
+        { { "--max-steps=42", "--emulate", "test.com" }, 3, 2, true, 42, false },
         { { "--emulate", "--max-steps=18446744073709551615", "test.com" },
-          3, 2, true, UINT64_MAX },
-        { { "--", "--emulate", "arg" }, 3, 1, false, 0 },
-        { { "--emulate", "--", "--max-steps", "5" }, 4, 2, true, 0 },
-        { { "--emulate", "--max-steps", "1", "--", "--test.com" }, 5, 4, true, 1 },
-        { { "--emulate" }, 1, -1, false, 0 },
-        { { "--max-steps" }, 1, -1, false, 0 },
-        { { "--max-steps", "5" }, 2, -1, false, 0 },
-        { { "--max-steps", "5", "test.com" }, 3, -1, false, 0 },
-        { { "--max-steps=5", "test.com" }, 2, -1, false, 0 },
-        { { "--emulate", "--max-steps=", "test.com" }, 3, -1, false, 0 },
-        { { "--emulate", "--max-steps", "0", "test.com" }, 4, -1, false, 0 },
-        { { "--emulate", "--max-steps", "-1", "test.com" }, 4, -1, false, 0 },
+          3, 2, true, UINT64_MAX, false },
+        { { "--", "--emulate", "arg" }, 3, 1, false, 0, false },
+        { { "--emulate", "--", "--max-steps", "5" }, 4, 2, true, 0, false },
+        { { "--emulate", "--max-steps", "1", "--", "--test.com" }, 5, 4, true, 1, false },
+        { { "--emulate" }, 1, -1, false, 0, false },
+        { { "--max-steps" }, 1, -1, false, 0, false },
+        { { "--max-steps", "5" }, 2, -1, false, 0, false },
+        { { "--max-steps", "5", "test.com" }, 3, -1, false, 0, false },
+        { { "--max-steps=5", "test.com" }, 2, -1, false, 0, false },
+        { { "--emulate", "--max-steps=", "test.com" }, 3, -1, false, 0, false },
+        { { "--emulate", "--max-steps", "0", "test.com" }, 4, -1, false, 0, false },
+        { { "--emulate", "--max-steps", "-1", "test.com" }, 4, -1, false, 0, false },
         { { "--emulate", "--max-steps=18446744073709551616", "test.com" },
-          3, -1, false, 0 },
+          3, -1, false, 0, false },
         { { "--emulate", "--max-steps=1", "--max-steps", "2", "test.com" },
-          5, -1, false, 0 },
+          5, -1, false, 0, false },
         { { "--emulate", "--max-steps", "1", "--max-steps=2", "test.com" },
-          5, -1, false, 0 },
-        { { "--unknown", "test.com" }, 2, -1, false, 0 },
-        { { "--" }, 1, -1, false, 0 },
-        { { "" }, 1, -1, false, 0 },
-        { { "--emulate", "" }, 2, -1, false, 0 },
-        { { "test.com", NULL }, 2, -1, false, 0 }
+          5, -1, false, 0, false },
+        { { "--unknown", "test.com" }, 2, -1, false, 0, false },
+        { { "--" }, 1, -1, false, 0, false },
+        { { "" }, 1, -1, false, 0, false },
+        { { "--emulate", "" }, 2, -1, false, 0, false },
+        { { "test.com", NULL }, 2, -1, false, 0, false },
+        { { "--trace", "test.com" }, 2, 1, false, 0, 256 },
+        { { "--trace", "--trace", "test.com" }, 3, 2, false, 0, 256 },
+        { { "--trace", "--emulate", "test.com" }, 3, 2, true, 0, 256 },
+        { { "--emulate", "--max-steps", "42", "--trace", "test.com" }, 5, 4, true, 42, 256 },
+        { { "--trace", "--max-steps=42", "--emulate", "test.com" }, 4, 3, true, 42, 256 },
+        { { "--trace", "--", "--trace", "arg" }, 4, 2, false, 0, 256 },
+        { { "test.com", "--trace" }, 2, 0, false, 0, false },
+        { { "--", "--trace", "arg" }, 3, 1, false, 0, false },
+        { { "--trace" }, 1, -1, false, 0, false },
+        { { "--trace=on", "test.com" }, 2, -1, false, 0, 0 },
+        { { "--trace=1", "test.com" }, 2, 1, false, 0, 1 },
+        { { "--trace", "--trace=7", "test.com" }, 3, 2, false, 0, 7 },
+        { { "--trace=7", "--trace", "test.com" }, 3, 2, false, 0, 7 },
+        { { "--trace=7", "--trace=9", "test.com" }, 3, 2, false, 0, 9 },
+        { { "--trace=18446744073709551615", "test.com" }, 2, 1, false, 0, UINT64_MAX },
+        { { "--trace=18446744073709551616", "test.com" }, 2, -1, false, 0, 0 },
+        { { "--trace=0", "test.com" }, 2, -1, false, 0, 0 },
+        { { "--trace=-1", "test.com" }, 2, -1, false, 0, 0 },
+        { { "--trace=", "test.com" }, 2, -1, false, 0, 0 },
+        { { "test.com", "--trace=7" }, 2, 0, false, 0, 0 }
     };
     int failures = 0;
     unsigned checks = 0;
@@ -307,6 +345,7 @@ int dos_run_options_selftest(void)
             (options.filename != argv[index] ||
              options.argc != launches[i].argc - index || options.argv != argv + index ||
              options.emulate_cpu != launches[i].emulate ||
+             options.trace_limit != launches[i].trace ||
              options.step_limit != launches[i].limit)) ok = false;
         for (unsigned j = 0; j < 8; j++)
             if (argv[j] != launches[i].argv[j]) ok = false;
@@ -321,13 +360,22 @@ int dos_run_options_selftest(void)
     const char *filename = "test.com";
     if (!dos_parse_run_options(filename, 0, NULL, &options) ||
         options.filename != filename || options.argc || options.argv ||
-        options.emulate_cpu || options.step_limit) failures++;
+        options.emulate_cpu || options.trace_limit || options.step_limit) failures++;
     checks++;
     if (dos_parse_run_options(filename, -1, NULL, &options)) failures++;
     checks++;
     if (dos_parse_run_options(filename, 1, NULL, &options)) failures++;
     checks++;
     if (dos_parse_run_options(NULL, 0, NULL, &options)) failures++;
+    checks++;
+    dos_vm_t trace_vm = {0};
+    if (dos_trace_record(&trace_vm) || trace_vm.trace_remaining) failures++;
+    checks++;
+    trace_vm.trace_limit = trace_vm.trace_remaining = 2;
+    if (!dos_trace_record(&trace_vm) || trace_vm.trace_remaining != 1 ||
+        !dos_trace_record(&trace_vm) || trace_vm.trace_remaining ||
+        dos_trace_record(&trace_vm) || trace_vm.trace_remaining ||
+        trace_vm.trace_limit != 2) failures++;
     checks++;
     serial_puts("[DOS-OPTIONS] checks="); serial_putdec(checks);
     serial_puts(" failures="); serial_putdec((uint64_t)failures);
@@ -339,7 +387,7 @@ int dos_run(const char *filename, int argc, const char **argv)
 {
     dos_run_options_t options;
     if (!dos_parse_run_options(filename, argc, argv, &options)) {
-        serial_puts("Usage: dosrun [--emulate [--max-steps N]] [--] <file.com|file.exe> [args]\n"
+        serial_puts("Usage: dosrun [--trace[=N]] [--emulate [--max-steps N]] [--] <file.com|file.exe> [args]\n"
                     "[DOS] --max-steps requires --emulate and a positive decimal limit\n");
         return -1;
     }
@@ -401,6 +449,7 @@ int dos_run(const char *filename, int argc, const char **argv)
     vm.cpu = &cpu;
     cpu.vm = &vm;
     vm.emulate_cpu = options.emulate_cpu;
+    vm.trace_limit = vm.trace_remaining = options.trace_limit;
     vm.step_limit = options.step_limit;
     if (vm.emulate_cpu)
         serial_puts("[DOS] Software CPU, virtual IOPL3\n");
@@ -455,6 +504,8 @@ int dos_run(const char *filename, int argc, const char **argv)
         return -1;
     }
     dos_audio_init(&vm);
+    if (!dos_xms_init(&vm))
+        serial_puts("[DOS-XMS] Memory manager unavailable\n");
 
     /* DTA defaults to PSP:0080 */
     vm.dta_off = 0x0080;
@@ -530,6 +581,12 @@ int dos_run(const char *filename, int argc, const char **argv)
     serial_puts(" (");
     serial_putdec(cpu.insn_count);
     serial_puts(" instructions)\n");
+    if (vm.trace_limit) {
+        serial_puts("[DOS] Trace records: ");
+        serial_putdec(vm.trace_limit - vm.trace_remaining);
+        serial_puts("/"); serial_putdec(vm.trace_limit);
+        serial_puts("\n");
+    }
     if (vm.jit) jit_print_stats((jit_state_t *)vm.jit);
 
     dos_native_cleanup(&vm);
@@ -683,16 +740,36 @@ typedef struct __attribute__((packed)) {
 
 extern dos_nt_idt_entry_t idt[];
 
-static const uint8_t dos_nt_idt_vectors[] = {
-    0x01, 0x10, 0x16, 0x1A, 0x21, 0x2F, 0x31, 0x33,
-    0x67,
-    DPMI_DEFAULT_REFLECT_INT, DPMI_CALLBACK_RETURN_INT,
-    DPMI_EXCEPTION_RETURN_INT,
-    DPMI_RAW_SWITCH_INT
-};
-_Static_assert(sizeof(dos_nt_idt_vectors) ==
-               sizeof(((dos_vm_t *)0)->native_saved_idt) / 16,
-               "native IDT backup must cover every installed gate");
+_Static_assert(sizeof(((dos_vm_t *)0)->native_saved_idt) == 256u * sizeof(idt[0]),
+               "native IDT backup must cover all host ABI gates");
+
+#define DOS_MSR_EFER 0xC0000080u
+#define DOS_MSR_SYSENTER_CS 0x174u
+
+static uint64_t dos_nt_rdmsr(uint32_t msr)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void dos_nt_wrmsr(uint32_t msr, uint64_t value)
+{
+    __asm__ volatile ("wrmsr" :: "c"(msr), "a"((uint32_t)value),
+                       "d"((uint32_t)(value >> 32)) : "memory");
+}
+
+void dos_native_fp_return(dos_vm_t *vm, void *image)
+{
+    dpmi_apply_coprocessor(vm->cpu);
+    uint64_t cr0;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    *(uint64_t *)((uint8_t *)image + DOS_NATIVE_FP_CR0_OFFSET) =
+        (cr0 & ~0xeULL) | (vm->cpu->cr0 & 0xeu);
+    *(uint32_t *)((uint8_t *)image + DOS_NATIVE_FP_COMPAT_OFFSET) = 1;
+    dos_fpu_export_environment(image, vm->native_fp->fcs, vm->native_fp->fds,
+                                (uint8_t *)image + DOS_NATIVE_FP_BYTES);
+}
 
 typedef struct __attribute__((packed)) {
     uint16_t limit;
@@ -710,6 +787,7 @@ typedef struct {
     uint32_t reserved;
     uint64_t cr3, cs, ds, es, fs, gs, ss, ip, sp, rflags, kernel_sp;
     uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
+    dos_native_fp_state_t *fp;
 } dos_nt_enter_state_t;
 
 static dos_nt_enter_state_t dos_nt_enter_state;
@@ -1035,6 +1113,15 @@ cleanup:
     return failures;
 }
 
+static uint64_t dos_nt_ldt_descriptor(dos_vm_t *vm, uint16_t selector,
+                                      const dpmi_descriptor_t *descriptor)
+{
+    uint64_t raw = dos_nt_backend_descriptor(dos_nt_descriptor_raw(descriptor));
+    if (dpmi_native_interrupt_return_selector(vm, selector))
+        raw &= ~DOS_NT_DESC_PRESENT_RAW;
+    return raw;
+}
+
 void dos_native_sync_ldt(dos_vm_t *vm)
 {
     if (!vm || !vm->native_ldt) return;
@@ -1043,8 +1130,7 @@ void dos_native_sync_ldt(dos_vm_t *vm)
         dpmi_descriptor_t descriptor;
         uint16_t selector = (uint16_t)((i << 3) | 0x07u);
         native[i] = dpmi_guest_descriptor(vm, selector, &descriptor)
-                  ? dos_nt_backend_descriptor(
-                        dos_nt_descriptor_raw(&descriptor))
+                  ? dos_nt_ldt_descriptor(vm, selector, &descriptor)
                   : 0;
     }
     __asm__ volatile ("mfence" ::: "memory");
@@ -1172,8 +1258,7 @@ int dos_native_refresh_guest_selector(dos_vm_t *vm, uint16_t error_code)
                                    &descriptor))
             goto unchanged;
         table = (uint64_t *)vm->native_ldt;
-        next = dos_nt_backend_descriptor(
-            dos_nt_descriptor_raw(&descriptor));
+        next = dos_nt_ldt_descriptor(vm, error_code, &descriptor);
     } else {
         uint64_t raw;
         if (!dos_nt_guest_gdt_read(vm, index, &raw) ||
@@ -1215,7 +1300,7 @@ static void dos_native_leave_backend(dos_vm_t *vm)
 
     bool had_native_state = vm->native_cr3 || vm->native_gdt ||
                             vm->native_ldt || vm->native_idt_saved ||
-                            vm->native_active || vm->native_host_tls.saved;
+                            vm->native_active || vm->native_host_tls.saved || vm->native_dr6_saved;
     if (had_native_state) {
         __asm__ volatile ("cli" ::: "memory");
 
@@ -1231,16 +1316,27 @@ static void dos_native_leave_backend(dos_vm_t *vm)
             : : "r"(host_data), "r"(null_ldt) : "memory");
 
         if (vm->native_idt_saved) {
-            for (unsigned i = 0; i < sizeof(dos_nt_idt_vectors); i++) {
-                uint8_t *dst = (uint8_t *)&idt[dos_nt_idt_vectors[i]];
+            for (unsigned i = 0; i < 256u; i++) {
+                uint8_t *dst = (uint8_t *)&idt[i];
                 for (unsigned j = 0; j < 16; j++)
                     dst[j] = vm->native_saved_idt[i][j];
             }
             vm->native_idt_saved = false;
         }
 
+        if (vm->native_fp && vm->native_fp->host_saved) {
+            dos_nt_wrmsr(DOS_MSR_EFER,
+                (dos_nt_rdmsr(DOS_MSR_EFER) & ~1ULL) | (vm->native_fp->host_efer & 1u));
+            if (vm->native_fp->host_sep)
+                dos_nt_wrmsr(DOS_MSR_SYSENTER_CS, vm->native_fp->host_sysenter_cs);
+        }
+
         __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr) : "memory");
         dos_host_tls_restore(&vm->native_host_tls);
+        if (vm->native_dr6_saved) {
+            __asm__ volatile ("mov %0, %%dr6" :: "r"(vm->native_host_dr6) : "memory");
+            vm->native_dr6_saved = false;
+        }
 
         dos_set_native_vm(NULL);
         vm->native_active = false;
@@ -1254,6 +1350,18 @@ static void dos_native_leave_backend(dos_vm_t *vm)
         dos_nt_free_table_page(&vm->native_ldt);
     }
 
+    if (vm->native_fp && vm->native_fp->host_saved) {
+        /* Non-local returns do not execute the service gate's FP epilogue.
+         * SysV preserves the x87 control word and MXCSR control bits. */
+        __asm__ volatile ("fninit; fldcw %0; ldmxcsr %1"
+            :: "m"(vm->native_fp->host_control), "m"(vm->native_fp->host_mxcsr)
+            : "memory");
+        uint64_t cr0;
+        __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+        cr0 = (cr0 & ~0xeULL) | (vm->native_fp->host_cr0 & 0xeu);
+        __asm__ volatile ("mov %0, %%cr0" :: "r"(cr0) : "memory");
+        vm->native_fp->host_saved = false;
+    }
 }
 
 void dos_native_release_backend(dos_vm_t *vm)
@@ -1271,7 +1379,10 @@ void dos_native_cleanup(dos_vm_t *vm)
     /* Fault recovery can enter here while the DOS process CR3 is active. */
     dos_native_switch_to_kernel_cr3();
     dos_exec_cleanup(vm);
+    dos_transfer_release_after(vm, 0);
     dos_native_leave_backend(vm);
+    dos_host_free_pages(vm->native_fp, 1);
+    vm->native_fp = NULL;
     vm->native_resume_armed = false;
     dos_vga_unbind_vm(vm);
 
@@ -1286,6 +1397,7 @@ void dos_native_cleanup(dos_vm_t *vm)
     dos_api_close_all(vm);
     dos_jit_release(vm);
     dos_vcpi_cleanup(vm);
+    dos_xms_cleanup(vm);
     if (vm->mem && vm->mem_pages) {
         dos_host_free_pages(vm->mem, vm->mem_pages);
         vm->mem = NULL;
@@ -1318,6 +1430,14 @@ void dos_transfer_to_native(dos_vm_t *vm)
 {
     cpu8086_state_t *cpu = vm->cpu;
     if (vm->emulate_cpu || vm->step_limit || cpu8086_uses_guest_idt(cpu)) return;
+    /* A locked IRQ entered while interpreting must finish its private gate
+     * there. Native IRQ aliases instead complete inside the checked IRET. */
+    if (dpmi_native_interrupt_return_selector(vm, cpu->cs) ||
+        (vm->dpmi.interrupt_depth && cpu->cs == vm->dpmi.sel_host_code &&
+         cpu->eip == DPMI_INTERRUPT_RETURN_OFF)) return;
+    /* A far transfer must retire before its destination's first instruction.
+     * Keep tracing here until its handler clears TF and permits a handoff. */
+    if (cpu->eflags & FLAG_TF) return;
 
     /* A translated real-mode service may invoke a callback while its outer
      * native INT frame is still live. Interpret that nested protected-mode
@@ -1332,6 +1452,8 @@ void dos_transfer_to_native(dos_vm_t *vm)
 
     if (!dos_native_prepare_return(vm)) return;
     cpu = vm->cpu;
+
+    if (!dos_fpu_ensure(vm)) return;
 
     serial_puts("[DOS-NT] enter cs=0x");  serial_puthex(cpu->cs, 4);
     serial_puts(" eip=0x");                serial_puthex(cpu->eip, 8);
@@ -1397,11 +1519,12 @@ void dos_transfer_to_native(dos_vm_t *vm)
 
         dos_native_sync_tables(vm);
         serial_puts("[DOS-NT] private GDT/LDT prepared from guest tables\n");
-        /* Install DOS INT handlers in the IDT with DPL=3 so ring-3 DOS
-         * code can invoke them via the INT instruction. Without DPL=3
-         * the CPU raises #GP on INT 21h etc. */
+        /* DOS services allow ring-3 INT instructions. The #DB gate instead
+         * stays DPL0: CD 01 must reach software-vector mediation through
+         * #GP, while processor #DB (including ICEBP) ignores gate DPL.
+         * Keep the kernel's DPL0 #MF gate: CD 10 is also mediated via #GP,
+         * but a hardware x87 fault belongs to the client exception chain. */
         extern void dos_int08_stub(void);
-        extern void dos_int10_stub(void);
         extern void dos_int16_stub(void);
         extern void dos_int1a_stub(void);
         extern void dos_int20_stub(void);
@@ -1422,7 +1545,6 @@ void dos_transfer_to_native(dos_vm_t *vm)
          * legacy PIC IRQ0 (also timer); skip it too for safety. */
         struct { uint8_t vec; void (*h)(void); } dos_gates[] = {
             { 0x01, dos_exc01_stub },
-            { 0x10, dos_int10_stub },
             { 0x16, dos_int16_stub },
             { 0x1A, dos_int1a_stub },
             { 0x21, dos_int21_stub }, { 0x2F, dos_int2f_stub },
@@ -1434,14 +1556,20 @@ void dos_transfer_to_native(dos_vm_t *vm)
             { DPMI_RAW_SWITCH_INT, dos_intfc_stub },
         };
         (void)dos_int08_stub; (void)dos_int20_stub;
+        /* Table ownership is global on the BSP until the native backend
+         * detaches. Do not schedule another ABI halfway through installation. */
+        __asm__ volatile ("cli" ::: "memory");
         if (!vm->native_idt_saved) {
-            for (unsigned i = 0; i < sizeof(dos_nt_idt_vectors); i++) {
-                const uint8_t *src = (const uint8_t *)&idt[dos_nt_idt_vectors[i]];
+            for (unsigned i = 0; i < 256u; i++) {
+                const uint8_t *src = (const uint8_t *)&idt[i];
                 for (unsigned j = 0; j < 16; j++)
                     vm->native_saved_idt[i][j] = src[j];
             }
             vm->native_idt_saved = true;
         }
+        /* INT 2Eh/80h and other host ABIs must go through DOS #GP reflection,
+         * not enter foreign C handlers with the client's CR0.EM still set. */
+        for (unsigned i = 0; i < 256u; i++) idt[i].type_attr &= (uint8_t)~0x60u;
         for (unsigned i = 0; i < sizeof(dos_gates)/sizeof(dos_gates[0]); i++) {
             uint64_t addr = (uint64_t)dos_gates[i].h;
             uint8_t v = dos_gates[i].vec;
@@ -1450,21 +1578,43 @@ void dos_transfer_to_native(dos_vm_t *vm)
             idt[v].offset_high = (uint32_t)((addr >> 32) & 0xFFFFFFFF);
             idt[v].selector    = cs;
             idt[v].ist         = 2;    /* IST2 for DOS */
-            idt[v].type_attr   = 0xEF; /* P=1, DPL=3, 64-bit trap gate */
+            idt[v].type_attr   = v == 0x01 ? 0x8F : 0xEF; /* trap gate, DPL0/3 */
             idt[v].reserved    = 0;
         }
-        serial_puts("[DOS-NT] DOS IDT gates installed (DPL=3) on IST2\n");
+        serial_puts("[DOS-NT] DOS IDT gates installed (services DPL3, #DB DPL0) on IST2\n");
 
         vm->native_ready = true;
     }
 
     if (!vm->native_ready) return;
 
+    __asm__ volatile ("cli" ::: "memory");
     dos_native_sync_tables(vm);
 
     /* Native guests own FS/GS until exit or a raw-mode suspension. */
+    if (!vm->native_fp->host_saved) {
+        uint32_t eax, ebx, ecx, edx;
+        __asm__ volatile ("mov %%cr0, %0" : "=r"(vm->native_fp->host_cr0));
+        __asm__ volatile ("fnstcw %0; stmxcsr %1"
+            : "=m"(vm->native_fp->host_control), "=m"(vm->native_fp->host_mxcsr));
+        vm->native_fp->host_efer = dos_nt_rdmsr(DOS_MSR_EFER);
+        __asm__ volatile ("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
+        vm->native_fp->host_sep = (edx & (1u << 11)) != 0;
+        if (vm->native_fp->host_sep) {
+            vm->native_fp->host_sysenter_cs = dos_nt_rdmsr(DOS_MSR_SYSENTER_CS);
+            dos_nt_wrmsr(DOS_MSR_SYSENTER_CS, 0);
+        }
+        dos_nt_wrmsr(DOS_MSR_EFER, vm->native_fp->host_efer & ~1ULL);
+        vm->native_fp->host_saved = true;
+    }
+    dos_native_fp_return(vm, vm->native_fp->image);
     if (!vm->native_host_tls.saved)
         dos_host_tls_save(&vm->native_host_tls);
+    if (!vm->native_dr6_saved) {
+        __asm__ volatile ("mov %%dr6, %0" : "=r"(vm->native_host_dr6));
+        vm->native_dr6_saved = true;
+        __asm__ volatile ("mov %0, %%dr6" :: "r"((uint64_t)0xFFFF0FF0u) : "memory");
+    }
 
     /* Record the VM pointer so native INT handlers can find it. */
     dos_vga_set_direct_writes(vm, true);
@@ -1507,6 +1657,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
     enter->rsi = cpu->esi;
     enter->rdi = cpu->edi;
     enter->rbp = cpu->ebp;
+    enter->fp = vm->native_fp;
 
     serial_puts("[DOS-NT] IRETQ cs:eip=0x");
     serial_puthex(enter->cs, 4); serial_puts(":0x");
@@ -1533,6 +1684,8 @@ void dos_transfer_to_native(dos_vm_t *vm)
         "lgdt %c[gdtr](%%r11)\n"
         "lldt %c[ldt](%%r11)\n"
         "movq %c[kernel_sp](%%r11), %%rsp\n"
+        "movq %c[fp](%%r11), %%rdi\n"
+        "call dos_native_fp_restore\n"
         "mov %c[cr3](%%r11), %%rax\n"
         "mov %%rax, %%cr3\n"
         "movw %c[ds](%%r11), %%ax\n  mov %%ax, %%ds\n"
@@ -1567,6 +1720,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
           [sp]   "i"(__builtin_offsetof(dos_nt_enter_state_t, sp)),
           [rflags] "i"(__builtin_offsetof(dos_nt_enter_state_t, rflags)),
           [kernel_sp] "i"(__builtin_offsetof(dos_nt_enter_state_t, kernel_sp)),
+          [fp] "i"(__builtin_offsetof(dos_nt_enter_state_t, fp)),
           [rax]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rax)),
           [rbx]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rbx)),
           [rcx]  "i"(__builtin_offsetof(dos_nt_enter_state_t, rcx)),

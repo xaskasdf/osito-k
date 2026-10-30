@@ -1,0 +1,12 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+ExitProcess@4
+Sleep@4
+GetCommandLineA@0
+GetModuleFileNameA@12
+GetStdHandle@4
+WriteFile@20
+CreateProcessA@40
+WaitForSingleObject@8
+GetExitCodeProcess@8
+CloseHandle@4

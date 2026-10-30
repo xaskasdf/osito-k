@@ -243,6 +243,21 @@ static const uint8_t sha384_di_prefix[19] = {
     0x01,0x65,0x03,0x04,0x02,0x02,0x05,0x00,0x04,0x30
 };
 
+/* Legacy Authenticode uses SHA-1. Callers select that policy explicitly. */
+int rsa_pkcs1_v15_sha1_verify(const uint8_t *sig, uint32_t sig_len,
+                             const uint8_t *n, uint32_t n_len,
+                             const uint8_t *e, uint32_t e_len,
+                             const uint8_t hash[20])
+{
+    static const uint8_t prefix[] = {
+        0x30,0x21,0x30,0x09,0x06,0x05,0x2b,0x0e,0x03,0x02,0x1a,
+        0x05,0x00,0x04,0x14
+    };
+    if (n_len < 256 || n_len > 512) return -1;
+    return rsa_verify_inner(sig, sig_len, n, n_len, e, e_len,
+                            hash, 20, prefix, sizeof(prefix));
+}
+
 int rsa_pkcs1_v15_sha256_verify(const uint8_t *sig, uint32_t sig_len,
                                  const uint8_t *n, uint32_t n_len,
                                  const uint8_t *e, uint32_t e_len,

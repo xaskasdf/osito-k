@@ -1,0 +1,22 @@
+LIBRARY kernel32.dll
+EXPORTS
+ExitProcess@4
+GetStdHandle@4
+WriteFile@20
+GetLastError@0
+GetCurrentProcessId@0
+GetCurrentThreadId@0
+QueryProcessCycleTime@8
+QueryThreadCycleTime@8
+GetTickCount@0
+Sleep@4
+OpenProcess@12
+OpenThread@12
+DuplicateHandle@28
+CloseHandle@4
+CreateThread@24
+ResumeThread@4
+WaitForSingleObject@8
+CreateProcessA@40
+GetExitCodeProcess@8
+TerminateThread@8

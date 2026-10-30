@@ -52,6 +52,8 @@ typedef struct {
     DWORD owner_pid;
     PRUNTIME_FUNCTION table;
     DWORD count;
+    DWORD maximum_count;
+    ULONG_PTR growable_handle;
     ULONGLONG base;
     ULONGLONG range_start;
     ULONGLONG range_end;
@@ -68,6 +70,29 @@ _Static_assert(__builtin_offsetof(UNWIND64_DISPATCH_STATE, Dispatch) == 0,
                "private dispatcher prefix changed");
 
 static UNWIND64_DYNAMIC_TABLE dynamic_tables[UNWIND64_DYNAMIC_TABLES];
+static ULONG_PTR next_growable_handle;
+static unsigned growable_registration_busy;
+
+static uint64_t unwind64_lock_growable_registration(void)
+{
+    uint64_t flags = 0;
+#ifndef TEST_HARNESS
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+    while (__atomic_exchange_n(&growable_registration_busy, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+    return flags;
+}
+
+static void unwind64_unlock_growable_registration(uint64_t flags)
+{
+    __atomic_store_n(&growable_registration_busy, 0, __ATOMIC_RELEASE);
+#ifndef TEST_HARNESS
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+#else
+    (void)flags;
+#endif
+}
 
 static NTSTATUS unwind64_invalid_target(const char *stage, ULONGLONG current,
                                         ULONGLONG frame,
@@ -478,7 +503,8 @@ static PRUNTIME_FUNCTION unwind64_lookup_dynamic(ULONGLONG control_pc,
             continue;
 
         PRUNTIME_FUNCTION table = record->table;
-        DWORD count = record->count;
+        /* Publishing a larger count also publishes the newly filled entries. */
+        DWORD count = __atomic_load_n(&record->count, __ATOMIC_ACQUIRE);
         ULONGLONG base = record->base;
         if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) !=
                 UNWIND64_TABLE_ACTIVE ||
@@ -540,6 +566,8 @@ BOOL win32_unwind64_add_function_table(PRUNTIME_FUNCTION function_table,
         record->owner_pid = owner;
         record->table = function_table;
         record->count = entry_count;
+        record->maximum_count = entry_count;
+        record->growable_handle = 0;
         record->base = base_address;
         (void)unwind64_add(base_address, function_table[0].BeginAddress,
                            &record->range_start);
@@ -561,7 +589,8 @@ BOOL win32_unwind64_delete_function_table(PRUNTIME_FUNCTION function_table)
         UNWIND64_DYNAMIC_TABLE *record = &dynamic_tables[i];
         if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) !=
                 UNWIND64_TABLE_ACTIVE ||
-            record->owner_pid != owner || record->table != function_table)
+            record->owner_pid != owner || record->table != function_table ||
+            record->growable_handle)
             continue;
         DWORD expected = UNWIND64_TABLE_ACTIVE;
         if (!__atomic_compare_exchange_n(
@@ -571,6 +600,8 @@ BOOL win32_unwind64_delete_function_table(PRUNTIME_FUNCTION function_table)
         record->owner_pid = 0;
         record->table = NULL;
         record->count = 0;
+        record->maximum_count = 0;
+        record->growable_handle = 0;
         record->base = 0;
         record->range_start = 0;
         record->range_end = 0;
@@ -579,6 +610,134 @@ BOOL win32_unwind64_delete_function_table(PRUNTIME_FUNCTION function_table)
         return TRUE;
     }
     return FALSE;
+}
+
+static BOOL unwind64_growable_entries_valid(PRUNTIME_FUNCTION table,
+                                            DWORD count, ULONGLONG base,
+                                            ULONGLONG range_end)
+{
+    if (!table || ((ULONG_PTR)table & 3U) || range_end <= base)
+        return FALSE;
+    if (!count) return TRUE;
+    if (!win32_user_range_readable(table,
+            (SIZE_T)count * sizeof(RUNTIME_FUNCTION), FALSE))
+        return FALSE;
+    DWORD previous_end = 0;
+    for (DWORD i = 0; i < count; i++) {
+        RUNTIME_FUNCTION entry = table[i];
+        ULONGLONG end;
+        if (entry.BeginAddress >= entry.EndAddress ||
+            (i && entry.BeginAddress < previous_end) ||
+            !unwind64_add(base, entry.EndAddress, &end) || end > range_end)
+            return FALSE;
+        previous_end = entry.EndAddress;
+    }
+    return TRUE;
+}
+
+NTSTATUS win32_unwind64_add_growable_table(PVOID *dynamic_table,
+    PRUNTIME_FUNCTION function_table, DWORD entry_count, DWORD maximum_count,
+    ULONG_PTR range_base, ULONG_PTR range_end)
+{
+    if (g_compat32_mode || entry_count > maximum_count ||
+        !win32_user_range_writable(dynamic_table, sizeof(*dynamic_table), FALSE) ||
+        !unwind64_growable_entries_valid(function_table, entry_count,
+                                         range_base, range_end))
+        return STATUS_INVALID_PARAMETER;
+
+    DWORD owner = unwind64_owner();
+    uint64_t flags = unwind64_lock_growable_registration();
+    for (DWORD i = 0; i < UNWIND64_DYNAMIC_TABLES; i++) {
+        UNWIND64_DYNAMIC_TABLE *record = &dynamic_tables[i];
+        if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+                UNWIND64_TABLE_ACTIVE && record->owner_pid == owner &&
+            range_base < record->range_end && range_end > record->range_start) {
+            unwind64_unlock_growable_registration(flags);
+            return STATUS_CONFLICTING_ADDRESSES;
+        }
+    }
+    for (DWORD i = 0; i < UNWIND64_DYNAMIC_TABLES; i++) {
+        UNWIND64_DYNAMIC_TABLE *record = &dynamic_tables[i];
+        DWORD expected = UNWIND64_TABLE_FREE;
+        if (!__atomic_compare_exchange_n(&record->state, &expected,
+                UNWIND64_TABLE_RESERVED, FALSE, __ATOMIC_ACQ_REL,
+                __ATOMIC_ACQUIRE))
+            continue;
+        ULONG_PTR handle = __atomic_add_fetch(&next_growable_handle, 1,
+                                               __ATOMIC_RELAXED);
+        if (!handle)
+            handle = __atomic_add_fetch(&next_growable_handle, 1,
+                                         __ATOMIC_RELAXED);
+        record->owner_pid = owner;
+        record->table = function_table;
+        record->count = entry_count;
+        record->maximum_count = maximum_count;
+        record->growable_handle = handle;
+        record->base = range_base;
+        record->range_start = range_base;
+        record->range_end = range_end;
+        __atomic_store_n(&record->state, UNWIND64_TABLE_ACTIVE, __ATOMIC_RELEASE);
+        unwind64_unlock_growable_registration(flags);
+        *dynamic_table = (PVOID)handle;
+        return STATUS_SUCCESS;
+    }
+    unwind64_unlock_growable_registration(flags);
+    return STATUS_NO_MEMORY;
+}
+
+void win32_unwind64_grow_function_table(PVOID dynamic_table, DWORD new_count)
+{
+    ULONG_PTR handle = (ULONG_PTR)dynamic_table;
+    if (!handle || g_compat32_mode) return;
+    DWORD owner = unwind64_owner();
+    for (DWORD i = 0; i < UNWIND64_DYNAMIC_TABLES; i++) {
+        UNWIND64_DYNAMIC_TABLE *record = &dynamic_tables[i];
+        if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) !=
+                UNWIND64_TABLE_ACTIVE || record->owner_pid != owner ||
+            record->growable_handle != handle)
+            continue;
+        DWORD count = __atomic_load_n(&record->count, __ATOMIC_ACQUIRE);
+        if (new_count <= count || new_count > record->maximum_count ||
+            !unwind64_growable_entries_valid(record->table, new_count,
+                                             record->base, record->range_end))
+            return;
+        /* The caller fills entries before growing, and keeps the registration
+         * alive for all concurrent lookups/grows. Never temporarily hide it
+         * from exception dispatch while publishing the larger prefix. */
+        while (count < new_count &&
+               !__atomic_compare_exchange_n(&record->count, &count, new_count,
+                   FALSE, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+        return;
+    }
+}
+
+void win32_unwind64_delete_growable_table(PVOID dynamic_table)
+{
+    ULONG_PTR handle = (ULONG_PTR)dynamic_table;
+    if (!handle || g_compat32_mode) return;
+    DWORD owner = unwind64_owner();
+    for (DWORD i = 0; i < UNWIND64_DYNAMIC_TABLES; i++) {
+        UNWIND64_DYNAMIC_TABLE *record = &dynamic_tables[i];
+        if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) !=
+                UNWIND64_TABLE_ACTIVE || record->owner_pid != owner ||
+            record->growable_handle != handle)
+            continue;
+        DWORD expected = UNWIND64_TABLE_ACTIVE;
+        if (!__atomic_compare_exchange_n(&record->state, &expected,
+                UNWIND64_TABLE_RESERVED, FALSE, __ATOMIC_ACQ_REL,
+                __ATOMIC_ACQUIRE))
+            continue;
+        record->owner_pid = 0;
+        record->table = NULL;
+        record->count = 0;
+        record->maximum_count = 0;
+        record->growable_handle = 0;
+        record->base = 0;
+        record->range_start = 0;
+        record->range_end = 0;
+        __atomic_store_n(&record->state, UNWIND64_TABLE_FREE, __ATOMIC_RELEASE);
+        return;
+    }
 }
 
 PRUNTIME_FUNCTION win32_unwind64_lookup_function_entry(
@@ -1708,6 +1867,8 @@ void win32_unwind64_release_process(DWORD process_id)
         record->owner_pid = 0;
         record->table = NULL;
         record->count = 0;
+        record->maximum_count = 0;
+        record->growable_handle = 0;
         record->base = 0;
         record->range_start = 0;
         record->range_end = 0;

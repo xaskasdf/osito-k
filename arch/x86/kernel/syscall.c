@@ -48,17 +48,6 @@ extern void fb_putc(char c, uint32_t color);
 extern void fb_putdec(uint64_t val);
 extern void fb_flush(void);
 
-/* Direct serial I/O (no relocation, no FB noise) */
-static inline void dbg_serial_char(char c) {
-    while (!(inb(0x3FD) & 0x20)) {}
-    outb(0x3F8, c);
-}
-static inline void dbg_serial_hex8(uint8_t v) {
-    const char *h = "0123456789ABCDEF";
-    dbg_serial_char(h[v >> 4]);
-    dbg_serial_char(h[v & 0xF]);
-}
-
 /* OsitoFS */
 extern void *osfs2_find(const char *name);
 extern void *osfs2_find_ci(const char *name);      /* case-insensitive lookup */
@@ -180,6 +169,31 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_MREMAP      25
 #define SYS_IOCTL       16
 #define SYS_WRITEV      20
+#define SYS_READV       19
+#define SYS_SOCKETPAIR  53
+#define SYS_SENDMSG     46
+#define SYS_RECVMSG     47
+#define SYS_MINCORE     27
+#define SYS_MLOCK       149
+#define SYS_MUNLOCK     150
+#define SYS_SCHED_SETAFFINITY 203
+#define SYS_CLOCK_GETRES 229
+#define SYS_CLOCK_NANOSLEEP 230
+#define SYS_EPOLL_WAIT  232
+#define SYS_EPOLL_CTL   233
+#define SYS_EPOLL_PWAIT 281
+#define SYS_TIMERFD_CREATE 283
+#define SYS_FALLOCATE   285
+#define SYS_TIMERFD_SETTIME 286
+#define SYS_TIMERFD_GETTIME 287
+#define SYS_SIGNALFD4   289
+#define SYS_EVENTFD2    290
+#define SYS_EPOLL_CREATE1 291
+#define SYS_GETCPU      309
+#define SYS_MEMFD_CREATE 319
+#define SYS_MEMBARRIER  324
+#define SYS_MLOCK2      325
+#define SYS_POSIX_FADVISE 221
 #define SYS_ACCESS      21
 #define SYS_PIPE        22
 #define SYS_DUP2        33
@@ -211,6 +225,12 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_SENDTO      44
 #define SYS_RECVFROM    45
 #define SYS_SHUTDOWN    48
+#define SHUT_RD         0
+#define SOL_SOCKET_K    1
+#define SO_PASSCRED_K   16
+#define SO_PEERCRED_K   17
+#define SHUT_WR         1
+#define SHUT_RDWR       2
 #define SYS_BIND        49
 #define SYS_LISTEN      50
 #define SYS_GETSOCKNAME 51
@@ -341,6 +361,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define ENOSPC  28
 #define ERANGE  34
 #define ENOTSUP 95
+#define ENOTSOCK 88
 #define EAFNOSUPPORT 97
 #define EINTR    4
 #define ENAMETOOLONG 36
@@ -368,6 +389,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 /* ── File descriptor table ───────────────────────────────────── */
 
 #include "../include/fd.h"
+#include "../include/pollobj.h"
 #include "../include/oss_audio.h"
 
 /* osfs2_file_t is opaque here — we get size via osfs2_file_size() */
@@ -748,6 +770,27 @@ uint64_t syscall_vma_range_conflict_end(uint64_t base, uint64_t size)
             conflict_end = vma_end;
     }
 
+    return conflict_end;
+}
+
+/* Explicit address-space query for remote Win32 memory allocation. Unfaulted
+ * mmap reservations must remain occupied even when they have no PTE yet. */
+uint64_t syscall_vma_range_conflict_end_in_cr3(uint64_t cr3, uint64_t base,
+                                               uint64_t size)
+{
+    extern uint64_t proc_get_cr3_pid(int pid);
+    if (!size || base + size < base) return UINT64_MAX;
+    uint64_t end = base + size, conflict_end = 0;
+    for (int i = 0; i < MAX_VMAS; i++) {
+        const vma_t *v = &vma_table[i];
+        if (!v->in_use || v->magic != VMA_MAGIC) continue;
+        if (v->owner && (!v->owner_tgid ||
+            proc_get_cr3_pid((int)v->owner_tgid) != cr3)) continue;
+        uint64_t vma_end = v->base + v->pages * 4096ULL;
+        if (vma_end < v->base) return UINT64_MAX;
+        if (base < vma_end && end > v->base && vma_end > conflict_end)
+            conflict_end = vma_end;
+    }
     return conflict_end;
 }
 
@@ -1146,6 +1189,33 @@ int vma_register_file(uint64_t base, uint64_t pages, uint32_t prot,
     return -1;
 }
 
+/* Registra una VMA anonima (sin archivo). La usa el ELF loader para el stack
+ * del proceso: musl mide el stack con mremap en pthread_getattr_np, y sin VMA
+ * mremap devuelve EFAULT en la primera sonda y musl reporta un stack de 4KB
+ * (eso rompe el chequeo IsOnCentralStack() de V8). */
+int vma_register_anon(uint64_t base, uint64_t pages, uint32_t prot)
+{
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) {
+            vma_table[i].base        = base;
+            vma_table[i].pages       = pages;
+            vma_table[i].prot        = prot;
+            vma_table[i].in_use      = true;
+            vma_table[i].type        = VMA_ANON;
+            vma_table[i].file_offset = 0;
+            vma_table[i].file_size   = 0;
+            memset(&vma_table[i].file_node, 0, sizeof(vma_table[i].file_node));
+            {
+                extern void *proc_exec_target(void);
+                void *et = proc_exec_target();
+                vma_set_owner(&vma_table[i], et ? et : proc_current());
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* ── VFS device/proc forward declarations (X-VFS) ─────────────── */
 
 /* Device IDs for virtual /dev entries */
@@ -1193,6 +1263,11 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
     if (count == 0) return 0;
 
     fd_entry_t *f = &fd_table[fd];
+
+    if (f->type == FD_TYPE_EVENTFD || f->type == FD_TYPE_TIMERFD ||
+        f->type == FD_TYPE_SOCKPAIR)
+        return opoll_write((ositok_poll_obj_t *)f->poll_obj, (const void *)buf,
+                           (size_t)count, f->oflags);
 
     if (f->type == FD_TYPE_SOCKET)
         return sock_send(f->socket_idx, (const void *)buf, (uint32_t)count, 0);
@@ -1270,6 +1345,11 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
     if (!buf && count > 0) return -EFAULT;
     if (count == 0) return 0;
     fd_entry_t *f = &fd_table[fd];
+
+    if (f->type == FD_TYPE_EVENTFD || f->type == FD_TYPE_TIMERFD ||
+        f->type == FD_TYPE_SOCKPAIR)
+        return opoll_read((ositok_poll_obj_t *)f->poll_obj, (void *)buf,
+                          (size_t)count, f->oflags);
 
     if (f->type == FD_TYPE_SOCKET)
         return sock_recv(f->socket_idx, (void *)buf, (uint32_t)count, 0);
@@ -1727,6 +1807,14 @@ static int64_t sys_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
 static int64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t optname,
                               uint64_t optval, uint64_t optlen)
 {
+    /* OsitoK: SO_PASSCRED sobre socketpair (lo usa el zygote de Chromium).
+     * No hace falta hacer nada: recvmsg ya puede devolver credenciales. */
+    if (fd < MAX_FDS && fd_table[fd].open &&
+        fd_table[fd].type == FD_TYPE_SOCKPAIR) {
+        if (level == 1 /* SOL_SOCKET */ && optname == SO_PASSCRED_K)
+            return 0;
+        return 0;   /* el resto: aceptar sin efecto */
+    }
     int idx = socket_index_from_fd(fd);
     if (idx < 0) return idx;
     return sock_setsockopt(idx, (int)level, (int)optname,
@@ -2097,6 +2185,11 @@ static int64_t close_fd_in_table(fd_entry_t *table, uint64_t fd)
     if (f->type == FD_TYPE_DEV)
         fd_device_release(f);
 
+    if (f->poll_obj) {
+        opoll_release((ositok_poll_obj_t *)f->poll_obj);
+        f->poll_obj = NULL;
+    }
+
     f->open = false;
     return 0;
 }
@@ -2227,6 +2320,13 @@ static int64_t sys_fsync(uint64_t fd)
 
 static int64_t sys_ftruncate(uint64_t fd, uint64_t length)
 {
+    if (fd < MAX_FDS && fd_table[fd].open &&
+        fd_table[fd].type == FD_TYPE_MEMFD) {
+        fd_table[fd].offset = 0;
+        fd_table[fd].node.size = length;
+        return 0;
+    }
+
     if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
     fd_entry_t *f = &fd_table[fd];
     if (f->type != FD_TYPE_FILE) return -EINVAL;
@@ -2481,6 +2581,13 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     }
 
     /* File-backed mmap: demand-paged (pages loaded on first access) */
+    /* memfd: memoria anonima con API de archivo -> se mapea como anonima
+     * (OsitoK no comparte el backing entre procesos, pero en --single-process
+     * alcanza). */
+    if (fd < MAX_FDS && fd_table[fd].open &&
+        fd_table[fd].type == FD_TYPE_MEMFD)
+        flags |= MAP_ANONYMOUS;
+
     if (!(flags & MAP_ANONYMOUS)) {
         if (offset & 0xFFF) return -EINVAL;
         if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
@@ -2781,21 +2888,36 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     uint64_t old_pages = (old_size + 4095) / 4096;
     uint64_t new_pages = (new_size + 4095) / 4096;
 
-    /* Find matching VMA owned by current process */
+    /* Find matching VMA owned by current process.
+     *
+     * Linux busca la VMA que *contiene* old_addr, no la que empieza exacto en
+     * old_addr. musl depende de eso: pthread_getattr_np mide el stack del hilo
+     * principal con mremap(p-l-PAGE, PAGE, 2*PAGE, 0) y sigue bajando mientras
+     * devuelva ENOMEM ("la pagina esta mapeada pero no puede crecer en el
+     * lugar"); recien para en EFAULT (pagina no mapeada). Con el match exacto
+     * devolviamos EFAULT en la primera iteracion y musl reportaba un stack de
+     * 4KB, lo que rompia el chequeo IsOnCentralStack() de V8. */
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
         if (!vma_owned_by_current(&vma_table[i])) continue;
-        if (vma_table[i].base != old_addr) continue;
-        /* Allow approximate match (old_size may differ from VMA pages) */
-        if (new_pages <= vma_table[i].pages) {
-            /* Shrink: release tail pages, update VMA */
+        uint64_t vma_base = vma_table[i].base;
+        uint64_t vma_end = vma_base + (uint64_t)vma_table[i].pages * 4096;
+        if (old_addr < vma_base || old_addr >= vma_end) continue;
+        if (old_addr == vma_base && old_pages <= vma_table[i].pages &&
+            new_pages <= old_pages) {
+            /* Shrink in place: solo si el llamador realmente encoge su region
+             * (new_size <= old_size). OJO: musl sondea el stack con
+             * mremap(base, PAGE_SIZE, 2*PAGE_SIZE, 0) buscando ENOMEM; sin el
+             * chequeo new<=old eso se interpretaba como shrink y destruia la
+             * VMA del stack (dejando pthread_getattr_np reportando 4KB). */
             uint64_t free_start = old_addr + new_pages * 4096;
             for (uint64_t p = new_pages; p < vma_table[i].pages; p++)
                 paging_unmap_page(free_start + (p - new_pages) * 4096);
             vma_table[i].pages = new_pages;
             return (int64_t)old_addr;
         }
-        /* Grow: not supported without MREMAP_MAYMOVE + free space */
+        /* Grow (o shrink desde el medio): no soportado sin MREMAP_MAYMOVE.
+         * ENOMEM es lo que espera musl para "mapeada, no puede crecer". */
         return -ENOMEM;
     }
     return -EFAULT;
@@ -3029,6 +3151,29 @@ static int64_t sys_writev(uint64_t fd, uint64_t iov_addr, uint64_t iovcnt)
     return total;
 }
 
+/* sys_readv — lectura dispersa. Simetrico de sys_writev; lo usa musl/glibc y
+ * cualquier lector por iovecs (Chromium/V8 entre ellos). */
+static int64_t sys_readv(uint64_t fd, uint64_t iov_addr, uint64_t iovcnt)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    if (!iov_addr || iovcnt == 0) return 0;
+    if (iovcnt > 1024) return -EINVAL;
+
+    const iovec_t *iov = (const iovec_t *)iov_addr;
+    int64_t total = 0;
+
+    for (uint64_t i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len == 0) continue;
+        int64_t ret = sys_read(fd, iov[i].iov_base, iov[i].iov_len);
+        if (ret < 0) return (total > 0) ? total : ret;
+        total += ret;
+        /* Short read: no seguir consumiendo del fd. */
+        if ((uint64_t)ret < iov[i].iov_len) break;
+    }
+
+    return total;
+}
+
 /* ioctl — terminal control */
 #define TIOCGWINSZ  0x5413
 #define TIOCSWINSZ  0x5414
@@ -3170,6 +3315,53 @@ struct pollfd {
     short revents;
 };
 
+/* Revents de un fd para un set de events dado. Compartido por poll/select y
+ * epoll_wait. */
+static short fd_poll_events(int fd, short events)
+{
+    if (fd < 0 || (uint64_t)fd >= MAX_FDS || !fd_table[fd].open)
+        return POLLNVAL;
+    short revents = 0;
+    fd_entry_t *f = &fd_table[fd];
+    {
+        if (f->type == FD_TYPE_CONSOLE && f->read) {
+            if ((events & POLLIN) && kb_has_input())
+                revents |= POLLIN;
+        }
+        if (f->type == FD_TYPE_CONSOLE && f->write) {
+            if (events & POLLOUT)
+                revents |= POLLOUT;
+        }
+        if (f->type == FD_TYPE_FILE || f->type == FD_TYPE_PIPE)
+            revents |= (events & (POLLIN | POLLOUT));
+        if (f->type == FD_TYPE_SOCKET) {
+            int pending = sock_pending_bytes(f->socket_idx);
+            if ((events & POLLIN) && pending > 0)
+                revents |= POLLIN;
+            if (events & POLLOUT)
+                revents |= POLLOUT;
+            if (pending < 0)
+                revents |= POLLERR;
+        }
+        if (f->poll_obj) {
+            ositok_poll_obj_t *po = (ositok_poll_obj_t *)f->poll_obj;
+            if ((events & POLLIN) && opoll_read_ready(po))
+                revents |= POLLIN;
+            if ((events & POLLOUT) && opoll_write_ready(po))
+                revents |= POLLOUT;
+        }
+        if (f->type == FD_TYPE_DEV && f->device_ops) {
+            if ((events & POLLIN) && f->device_ops->read_ready &&
+                f->device_ops->read_ready(f->device_data))
+                revents |= POLLIN;
+            if ((events & POLLOUT) && f->device_ops->write_ready &&
+                f->device_ops->write_ready(f->device_data))
+                revents |= POLLOUT;
+        }
+    }
+    return revents;
+}
+
 static int poll_check(struct pollfd *fds, uint64_t nfds)
 {
     int ready = 0;
@@ -3181,36 +3373,8 @@ static int poll_check(struct pollfd *fds, uint64_t nfds)
             continue;
         }
         fd_entry_t *f = &fd_table[fds[i].fd];
-        /* Console stdin: POLLIN if keyboard has data */
-        if (f->type == FD_TYPE_CONSOLE && f->read) {
-            if ((fds[i].events & POLLIN) && kb_has_input())
-                fds[i].revents |= POLLIN;
-        }
-        /* Console stdout/stderr: always writable */
-        if (f->type == FD_TYPE_CONSOLE && f->write) {
-            if (fds[i].events & POLLOUT)
-                fds[i].revents |= POLLOUT;
-        }
-        /* Files/pipes: always ready */
-        if (f->type == FD_TYPE_FILE || f->type == FD_TYPE_PIPE)
-            fds[i].revents |= (fds[i].events & (POLLIN | POLLOUT));
-        if (f->type == FD_TYPE_SOCKET) {
-            int pending = sock_pending_bytes(f->socket_idx);
-            if ((fds[i].events & POLLIN) && pending > 0)
-                fds[i].revents |= POLLIN;
-            if (fds[i].events & POLLOUT)
-                fds[i].revents |= POLLOUT;
-            if (pending < 0)
-                fds[i].revents |= POLLERR;
-        }
-        if (f->type == FD_TYPE_DEV && f->device_ops) {
-            if ((fds[i].events & POLLIN) && f->device_ops->read_ready &&
-                f->device_ops->read_ready(f->device_data))
-                fds[i].revents |= POLLIN;
-            if ((fds[i].events & POLLOUT) && f->device_ops->write_ready &&
-                f->device_ops->write_ready(f->device_data))
-                fds[i].revents |= POLLOUT;
-        }
+        (void)f;
+        fds[i].revents = fd_poll_events((int)fds[i].fd, fds[i].events);
         if (fds[i].revents) ready++;
     }
     return ready;
@@ -3318,6 +3482,483 @@ static int64_t sys_select(uint64_t nfds, uint64_t readfds_addr,
 }
 
 extern uint64_t idt_get_ticks(void);
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Objetos pollables para Chromium: eventfd / timerfd / epoll / socketpair /
+ * memfd. Estado en kernel/pollobj.c.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+#define EFD_SEMAPHORE   1
+#define EFD_NONBLOCK    04000
+#define EFD_CLOEXEC     02000000
+#define TFD_TIMER_ABSTIME 1
+#define EPOLL_CTL_ADD   1
+#define EPOLL_CTL_DEL   2
+#define EPOLL_CTL_MOD   3
+#define EPOLLIN         0x001
+#define EPOLLOUT        0x004
+#define EPOLLERR        0x008
+#define EPOLLHUP        0x010
+#define EPOLLRDHUP      0x2000
+
+typedef struct { uint32_t events; uint64_t data; } __attribute__((packed))
+        epoll_event_t;
+/* timespec local: el typedef global aparece mas abajo en el archivo */
+typedef struct { int64_t tv_sec; int64_t tv_nsec; } ots_t;
+typedef struct { ots_t interval; ots_t value; } itimerspec_t;
+
+/* Forward decls: estas funciones se definen mas abajo en el archivo. */
+static int64_t sys_nanosleep(uint64_t req_addr, uint64_t rem_addr);
+static int64_t sys_dup(uint64_t oldfd);
+
+static int fd_alloc_slot(void)
+{
+    for (int i = 0; i < MAX_FDS; i++)
+        if (!fd_table[i].open) return i;
+    return -1;
+}
+
+static int fd_new_pollobj(uint8_t type, ositok_poll_obj_t *o, uint32_t oflags)
+{
+    int fd = fd_alloc_slot();
+    if (fd < 0) return -EMFILE;
+    memset(&fd_table[fd], 0, sizeof(fd_table[fd]));
+    fd_table[fd].open = true;
+    fd_table[fd].type = type;
+    fd_table[fd].poll_obj = o;
+    fd_table[fd].oflags = oflags;
+    return fd;
+}
+
+/* eventfd2(unsigned initval, int flags) */
+static int64_t sys_eventfd2(uint64_t initval, uint64_t flags)
+{
+    ositok_poll_obj_t *o = opoll_alloc(OPOLL_EVENTFD);
+    if (!o) return -ENOMEM;
+    o->counter = initval;
+    o->semaphore = (flags & EFD_SEMAPHORE) != 0;
+    uint32_t oflags = O_RDWR;
+    if (flags & EFD_NONBLOCK) oflags |= 04000;
+    if (flags & EFD_CLOEXEC)  oflags |= 02000000;
+    int fd = fd_new_pollobj(FD_TYPE_EVENTFD, o, oflags);
+    if (fd < 0) { opoll_release(o); return fd; }
+    return fd;
+}
+
+/* timerfd_create(int clockid, int flags) */
+static int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags)
+{
+    ositok_poll_obj_t *o = opoll_alloc(OPOLL_TIMERFD);
+    if (!o) return -ENOMEM;
+    o->clockid = (int)clockid;
+    uint32_t oflags = O_RDWR;
+    if (flags & EFD_NONBLOCK) oflags |= 04000;
+    if (flags & EFD_CLOEXEC)  oflags |= 02000000;
+    int fd = fd_new_pollobj(FD_TYPE_TIMERFD, o, oflags);
+    if (fd < 0) { opoll_release(o); return fd; }
+    return fd;
+}
+
+static uint64_t ts_to_ns(const ots_t *ts)
+{
+    if (!ts || ts->tv_sec < 0 || ts->tv_nsec < 0) return 0;
+    return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+}
+
+/* timerfd_settime(int fd, int flags, const itimerspec*, itimerspec*) */
+static int64_t sys_timerfd_settime(uint64_t fd, uint64_t flags,
+                                   uint64_t new_addr, uint64_t old_addr)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open ||
+        fd_table[fd].type != FD_TYPE_TIMERFD)
+        return -EINVAL;
+    if (!new_addr) return -EFAULT;
+    ositok_poll_obj_t *o = (ositok_poll_obj_t *)fd_table[fd].poll_obj;
+    const itimerspec_t *nw = (const itimerspec_t *)new_addr;
+
+    if (old_addr) {
+        itimerspec_t *old = (itimerspec_t *)old_addr;
+        uint64_t now = opoll_now_ns();
+        uint64_t remain = (o->next_ns > now) ? o->next_ns - now : 0;
+        old->value.tv_sec = (int64_t)(remain / 1000000000ULL);
+        old->value.tv_nsec = (int64_t)(remain % 1000000000ULL);
+        old->interval.tv_sec = (int64_t)(o->interval_ns / 1000000000ULL);
+        old->interval.tv_nsec = (int64_t)(o->interval_ns % 1000000000ULL);
+    }
+
+    uint64_t value_ns = ts_to_ns(&nw->value);
+    o->interval_ns = ts_to_ns(&nw->interval);
+    if (value_ns == 0) {
+        o->next_ns = 0;
+    } else if (flags & TFD_TIMER_ABSTIME) {
+        o->next_ns = value_ns;
+    } else {
+        o->next_ns = opoll_now_ns() + value_ns;
+    }
+    o->expirations = 0;
+    return 0;
+}
+
+static int64_t sys_timerfd_gettime(uint64_t fd, uint64_t cur_addr)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open ||
+        fd_table[fd].type != FD_TYPE_TIMERFD)
+        return -EINVAL;
+    if (!cur_addr) return -EFAULT;
+    ositok_poll_obj_t *o = (ositok_poll_obj_t *)fd_table[fd].poll_obj;
+    itimerspec_t *cur = (itimerspec_t *)cur_addr;
+    uint64_t now = opoll_now_ns();
+    uint64_t remain = (o->next_ns > now) ? o->next_ns - now : 0;
+    cur->value.tv_sec = (int64_t)(remain / 1000000000ULL);
+    cur->value.tv_nsec = (int64_t)(remain % 1000000000ULL);
+    cur->interval.tv_sec = (int64_t)(o->interval_ns / 1000000000ULL);
+    cur->interval.tv_nsec = (int64_t)(o->interval_ns % 1000000000ULL);
+    return 0;
+}
+
+/* epoll_create1(int flags) */
+static int64_t sys_epoll_create1(uint64_t flags)
+{
+    ositok_poll_obj_t *o = opoll_alloc(OPOLL_EPOLL);
+    if (!o) return -ENOMEM;
+    uint32_t oflags = O_RDWR;
+    if (flags & EFD_CLOEXEC) oflags |= 02000000;
+    int fd = fd_new_pollobj(FD_TYPE_EPOLL, o, oflags);
+    if (fd < 0) { opoll_release(o); return fd; }
+    return fd;
+}
+
+/* epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev) */
+static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
+                             uint64_t ev_addr)
+{
+    if (epfd >= MAX_FDS || !fd_table[epfd].open ||
+        fd_table[epfd].type != FD_TYPE_EPOLL)
+        return -EBADF;
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    if (fd == epfd) return -EINVAL;
+    ositok_poll_obj_t *o = (ositok_poll_obj_t *)fd_table[epfd].poll_obj;
+    const epoll_event_t *ev = (const epoll_event_t *)ev_addr;
+
+    int idx = -1;
+    for (int i = 0; i < o->ep_count; i++)
+        if (o->ep[i].fd == (int)fd) { idx = i; break; }
+
+    switch (op) {
+    case EPOLL_CTL_ADD:
+        if (idx >= 0) return -EEXIST;
+        if (o->ep_count >= OPOLL_MAX_EPOLL) return -ENOSPC;
+        o->ep[o->ep_count].fd = (int)fd;
+        o->ep[o->ep_count].events = ev ? ev->events : 0;
+        o->ep[o->ep_count].data = ev ? ev->data : 0;
+        o->ep_count++;
+        return 0;
+    case EPOLL_CTL_MOD:
+        if (idx < 0) return -ENOENT;
+        o->ep[idx].events = ev ? ev->events : 0;
+        o->ep[idx].data = ev ? ev->data : 0;
+        return 0;
+    case EPOLL_CTL_DEL:
+        if (idx < 0) return -ENOENT;
+        for (int i = idx; i < o->ep_count - 1; i++) o->ep[i] = o->ep[i + 1];
+        o->ep_count--;
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+
+/* epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) */
+static int64_t sys_epoll_wait(uint64_t epfd, uint64_t events_addr,
+                              uint64_t maxevents, uint64_t timeout_ms)
+{
+    if (epfd >= MAX_FDS || !fd_table[epfd].open ||
+        fd_table[epfd].type != FD_TYPE_EPOLL)
+        return -EBADF;
+    if (!events_addr || maxevents == 0) return -EINVAL;
+    ositok_poll_obj_t *o = (ositok_poll_obj_t *)fd_table[epfd].poll_obj;
+    epoll_event_t *out = (epoll_event_t *)events_addr;
+    int64_t tmo = (int64_t)timeout_ms;
+    uint64_t start = idt_get_ticks();
+    uint64_t max_ticks = (tmo < 0) ? 0xFFFFFFFFFFFFFFFFULL
+                                   : (uint64_t)tmo / 10;
+
+    for (;;) {
+        int n = 0;
+        for (int i = 0; i < o->ep_count && n < (int)maxevents; i++) {
+            short rev = fd_poll_events(o->ep[i].fd, (short)o->ep[i].events);
+            if (rev & (EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                out[n].events = (uint32_t)rev;
+                out[n].data = o->ep[i].data;
+                n++;
+            }
+        }
+        if (n > 0) return n;
+        if (tmo == 0) return 0;
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+        if (tmo > 0 && (idt_get_ticks() - start) >= max_ticks) return 0;
+    }
+}
+
+/* socketpair(int domain, int type, int protocol, int sv[2]) */
+static int64_t sys_socketpair(uint64_t domain, uint64_t type,
+                              uint64_t protocol, uint64_t sv_addr)
+{
+    (void)protocol;
+    if (domain != 1 /* AF_UNIX */) return -EAFNOSUPPORT;
+    if (!sv_addr) return -EFAULT;
+    int *sv = (int *)sv_addr;
+
+    ositok_poll_obj_t *a = opoll_alloc(OPOLL_SOCKPAIR);
+    if (!a) return -ENOMEM;
+    ositok_poll_obj_t *b = opoll_alloc(OPOLL_SOCKPAIR);
+    if (!b) { opoll_release(a); return -ENOMEM; }
+    a->peer = b;
+    b->peer = a;
+    a->sotype = (int)type;
+    b->sotype = (int)type;
+    opoll_ref(b);   /* referencia del peer */
+    opoll_ref(a);
+
+    uint32_t oflags = O_RDWR;
+    if (type & 04000 /* SOCK_NONBLOCK */) oflags |= 04000;
+    if (type & 02000000 /* SOCK_CLOEXEC */) oflags |= 02000000;
+
+    int fa = fd_new_pollobj(FD_TYPE_SOCKPAIR, a, oflags);
+    if (fa < 0) { opoll_release(a); opoll_release(b); return fa; }
+    int fb = fd_new_pollobj(FD_TYPE_SOCKPAIR, b, oflags);
+    if (fb < 0) {
+        close_fd_in_table(fd_table, fa);
+        opoll_release(b);
+        return fb;
+    }
+    sv[0] = fa;
+    sv[1] = fb;
+    return 0;
+}
+
+/* sendmsg/recvmsg sobre socketpair: datos + SCM_RIGHTS (fds duplicados). */
+typedef struct {
+    void    *msg_name;
+    uint32_t msg_namelen;
+    void    *msg_iov;
+    uint64_t msg_iovlen;
+    void    *msg_control;
+    uint64_t msg_controllen;
+    int      msg_flags;
+} msghdr_t;
+typedef struct { void *iov_base; uint64_t iov_len; } iovec64_t;
+typedef struct { uint64_t cmsg_len; int cmsg_level; int cmsg_type; } cmsghdr_t;
+
+#define SOL_SOCKET   1
+#define SCM_RIGHTS   1
+
+static int64_t sys_sendmsg(uint64_t fd, uint64_t msg_addr, uint64_t flags)
+{
+    (void)flags;
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    if (!msg_addr) return -EFAULT;
+    fd_entry_t *f = &fd_table[fd];
+    if (f->type != FD_TYPE_SOCKPAIR) return -ENOTSOCK;
+    const msghdr_t *msg = (const msghdr_t *)msg_addr;
+    ositok_poll_obj_t *o = (ositok_poll_obj_t *)f->poll_obj;
+    if (!o->peer || o->sclosed) return -EPIPE;
+
+    const iovec64_t *iov = (const iovec64_t *)msg->msg_iov;
+    int64_t total = 0;
+    for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+        if (!iov[i].iov_len) continue;
+        int64_t r = opoll_write(o, iov[i].iov_base, (size_t)iov[i].iov_len,
+                                f->oflags);
+        if (r < 0) return total > 0 ? total : r;
+        total += r;
+    }
+
+    /* SCM_RIGHTS: duplicar los fds y encolarlos en el peer. */
+    if (msg->msg_control && msg->msg_controllen >= sizeof(cmsghdr_t)) {
+        const cmsghdr_t *cm = (const cmsghdr_t *)msg->msg_control;
+        if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
+            cm->cmsg_len > sizeof(cmsghdr_t)) {
+            int nfds = (int)((cm->cmsg_len - sizeof(cmsghdr_t)) / sizeof(int));
+            const int *fds = (const int *)((const char *)cm + sizeof(cmsghdr_t));
+            ositok_poll_obj_t *dst = o->peer;
+            int slot = -1;
+            for (int i = 0; i < nfds && i < 4; i++) {
+                int64_t nfd = sys_dup((uint64_t)fds[i]);
+                if (nfd < 0) continue;
+                if (slot < 0) {
+                    if (dst->fdq_count >= OPOLL_MAX_FDQ) {
+                        sys_close((uint64_t)nfd);
+                        continue;
+                    }
+                    slot = dst->fdq_count;
+                    dst->fdq_len[slot] = 0;
+                    dst->fdq_count++;
+                }
+                if (dst->fdq_len[slot] < 4) {
+                    dst->fdq[slot][dst->fdq_len[slot]] = (int)nfd;
+                    dst->fdq_len[slot]++;
+                } else {
+                    sys_close((uint64_t)nfd);
+                }
+            }
+        }
+    }
+    return total;
+}
+
+static int64_t sys_recvmsg(uint64_t fd, uint64_t msg_addr, uint64_t flags)
+{
+    (void)flags;
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    if (!msg_addr) return -EFAULT;
+    fd_entry_t *f = &fd_table[fd];
+    if (f->type != FD_TYPE_SOCKPAIR) return -ENOTSOCK;
+    msghdr_t *msg = (msghdr_t *)msg_addr;
+    ositok_poll_obj_t *o = (ositok_poll_obj_t *)f->poll_obj;
+
+    iovec64_t *iov = (iovec64_t *)msg->msg_iov;
+    int64_t total = 0;
+    for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
+        if (!iov[i].iov_len) continue;
+        int64_t r = opoll_read(o, iov[i].iov_base, (size_t)iov[i].iov_len,
+                               f->oflags);
+        if (r < 0) return total > 0 ? total : r;
+        total += r;
+        if (r == 0) break;   /* EOF */
+        if ((uint64_t)r < iov[i].iov_len) break;
+    }
+
+    /* SCM_RIGHTS encolados por el peer */
+    if (msg->msg_control && msg->msg_controllen >= sizeof(cmsghdr_t)) {
+        if (o->fdq_count > 0) {
+            /* FIFO: el mensaje mas viejo primero */
+            int n = o->fdq_len[0];
+            cmsghdr_t *cm = (cmsghdr_t *)msg->msg_control;
+            cm->cmsg_level = SOL_SOCKET;
+            cm->cmsg_type = SCM_RIGHTS;
+            cm->cmsg_len = sizeof(cmsghdr_t) + (uint64_t)n * sizeof(int);
+            memcpy((char *)cm + sizeof(cmsghdr_t), o->fdq[0],
+                   (size_t)n * sizeof(int));
+            msg->msg_controllen = cm->cmsg_len;
+            for (int i = 0; i < o->fdq_count - 1; i++) {
+                memcpy(o->fdq[i], o->fdq[i + 1], sizeof(o->fdq[0]));
+                o->fdq_len[i] = o->fdq_len[i + 1];
+            }
+            o->fdq_count--;
+        } else {
+            msg->msg_controllen = 0;
+        }
+    }
+    return total;
+}
+
+/* memfd_create(const char *name, unsigned flags): memoria anonima con API de
+ * archivo. OsitoK no tiene backing compartido entre procesos, pero en
+ * --single-process alcanza con un objeto anonimo. */
+static int64_t sys_memfd_create(uint64_t name_addr, uint64_t flags)
+{
+    (void)name_addr;
+    ositok_poll_obj_t *o = opoll_alloc(OPOLL_MEMFD);
+    if (!o) return -ENOMEM;
+    uint32_t oflags = O_RDWR;
+    if (flags & 1 /* MFD_CLOEXEC */) oflags |= 02000000;
+    if (flags & 4 /* MFD_ALLOW_SEALING */) { }
+    int fd = fd_new_pollobj(FD_TYPE_MEMFD, o, oflags);
+    if (fd < 0) { opoll_release(o); return fd; }
+    return fd;
+}
+
+/* ── stubs y syscalls triviales que Chromium necesita ─────────────────────── */
+
+static int64_t sys_sched_setaffinity(uint64_t pid, uint64_t len, uint64_t mask)
+{
+    (void)pid; (void)len; (void)mask;
+    return 0;   /* single-CPU: aceptar y seguir */
+}
+
+static int64_t sys_getcpu(uint64_t cpu_addr, uint64_t node_addr, uint64_t tcache)
+{
+    (void)tcache;
+    if (cpu_addr) *(uint32_t *)cpu_addr = 0;
+    if (node_addr) *(uint32_t *)node_addr = 0;
+    return 0;
+}
+
+static int64_t sys_membarrier(uint64_t cmd, uint64_t flags, uint64_t cpu_id)
+{
+    (void)cmd; (void)flags; (void)cpu_id;
+    return 0;   /* single-core: barrera trivial */
+}
+
+static int64_t sys_mlock(uint64_t addr, uint64_t len)
+{
+    (void)addr; (void)len;
+    return 0;   /* todo residente: aceptar */
+}
+
+static int64_t sys_clock_getres(uint64_t clk_id, uint64_t res_addr)
+{
+    (void)clk_id;
+    if (res_addr) {
+        ots_t *res = (ots_t *)res_addr;
+        res->tv_sec = 0;
+        res->tv_nsec = 1000000;   /* 1 ms (tick del scheduler) */
+    }
+    return 0;
+}
+
+static int64_t sys_clock_nanosleep(uint64_t clk_id, uint64_t flags,
+                                   uint64_t req_addr, uint64_t rem_addr)
+{
+    (void)clk_id;
+    /* TIMER_ABSTIME (1): convertir a relativo */
+    if ((flags & 1) && req_addr) {
+        ots_t rel;
+        const ots_t *req = (const ots_t *)req_addr;
+        uint64_t want = ts_to_ns(req);
+        uint64_t now = opoll_now_ns();
+        uint64_t delta = (want > now) ? want - now : 0;
+        rel.tv_sec = (int64_t)(delta / 1000000000ULL);
+        rel.tv_nsec = (int64_t)(delta % 1000000000ULL);
+        return sys_nanosleep((uint64_t)&rel, rem_addr);
+    }
+    return sys_nanosleep(req_addr, rem_addr);
+}
+
+static int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t off,
+                             uint64_t len)
+{
+    (void)fd; (void)mode; (void)off; (void)len;
+    return 0;   /* sin bloques reservados: aceptar */
+}
+
+static int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vec_addr)
+{
+    (void)addr;
+    if (vec_addr && length) {
+        uint64_t pages = (length + 4095) / 4096;
+        memset((void *)vec_addr, 1, (size_t)pages);   /* todo residente */
+    }
+    return 0;
+}
+
+static int64_t sys_posix_fadvise(uint64_t fd, uint64_t off, uint64_t len,
+                                 uint64_t advice)
+{
+    (void)fd; (void)off; (void)len; (void)advice;
+    return 0;
+}
+
+static int64_t sys_signalfd4(uint64_t fd, uint64_t mask_addr, uint64_t sizemask,
+                             uint64_t flags)
+{
+    (void)fd; (void)mask_addr; (void)sizemask; (void)flags;
+    /* Sin señales pendientes que reportar: el fd nunca es legible. Se
+     * implementa cuando haga falta (SIGCHLD de procesos hijos). */
+    return -ENOSYS;
+}
 
 static int64_t sys_poll(uint64_t fds_addr, uint64_t nfds, uint64_t timeout_ms)
 {
@@ -5194,6 +5835,31 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_PREAD64:    return sys_pread64(a1, a2, a3, a4);
     case SYS_PWRITE64:   return sys_pwrite64(a1, a2, a3, a4);
     case SYS_WRITEV:     return sys_writev(a1, a2, a3);
+    case SYS_READV:      return sys_readv(a1, a2, a3);
+    case SYS_EVENTFD2:   return sys_eventfd2(a1, a2);
+    case SYS_TIMERFD_CREATE: return sys_timerfd_create(a1, a2);
+    case SYS_TIMERFD_SETTIME: return sys_timerfd_settime(a1, a2, a3, a4);
+    case SYS_TIMERFD_GETTIME: return sys_timerfd_gettime(a1, a2);
+    case SYS_EPOLL_CREATE1: return sys_epoll_create1(a1);
+    case SYS_EPOLL_CTL:  return sys_epoll_ctl(a1, a2, a3, a4);
+    case SYS_EPOLL_WAIT: return sys_epoll_wait(a1, a2, a3, a4);
+    case SYS_EPOLL_PWAIT: return sys_epoll_wait(a1, a2, a3, a4);
+    case SYS_SOCKETPAIR: return sys_socketpair(a1, a2, a3, a4);
+    case SYS_SENDMSG:    return sys_sendmsg(a1, a2, a3);
+    case SYS_RECVMSG:    return sys_recvmsg(a1, a2, a3);
+    case SYS_MEMFD_CREATE: return sys_memfd_create(a1, a2);
+    case SYS_SCHED_SETAFFINITY: return sys_sched_setaffinity(a1, a2, a3);
+    case SYS_GETCPU:     return sys_getcpu(a1, a2, a3);
+    case SYS_MEMBARRIER: return sys_membarrier(a1, a2, a3);
+    case SYS_MLOCK:      return sys_mlock(a1, a2);
+    case SYS_MLOCK2:     return sys_mlock(a1, a2);
+    case SYS_MUNLOCK:    return 0;
+    case SYS_CLOCK_GETRES: return sys_clock_getres(a1, a2);
+    case SYS_CLOCK_NANOSLEEP: return sys_clock_nanosleep(a1, a2, a3, a4);
+    case SYS_FALLOCATE:  return sys_fallocate(a1, a2, a3, a4);
+    case SYS_MINCORE:    return sys_mincore(a1, a2, a3);
+    case SYS_POSIX_FADVISE: return sys_posix_fadvise(a1, a2, a3, a4);
+    case SYS_SIGNALFD4:  return sys_signalfd4(a1, a2, a3, a4);
     case SYS_ACCESS:     return sys_access(a1, a2);
     case SYS_SCHED_YIELD: return sys_sched_yield();
     case SYS_SCHED_SETPARAM: return 0;  /* keep default SCHED_OTHER */
@@ -5231,6 +5897,20 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_SENDTO:     return sys_sendto(a1, a2, a3, a4, a5, a6);
     case SYS_RECVFROM:   return sys_recvfrom(a1, a2, a3, a4, a5, a6);
     case SYS_SHUTDOWN: {
+        /* OsitoK: socketpair (pollobj) tambien soporta shutdown */
+        if (a1 < MAX_FDS && fd_table[a1].open &&
+            fd_table[a1].type == FD_TYPE_SOCKPAIR) {
+            ositok_poll_obj_t *o = (ositok_poll_obj_t *)fd_table[a1].poll_obj;
+            if (!o) return -EBADF;
+            if (a2 == SHUT_RD || a2 == SHUT_RDWR) {
+                /* deja de leer: cerramos el buffer propio */
+                o->stail = o->shead;
+                o->scount = 0;
+            }
+            if ((a2 == SHUT_WR || a2 == SHUT_RDWR) && o->peer)
+                o->peer->sclosed = true;
+            return 0;
+        }
         int idx = socket_index_from_fd(a1);
         return idx < 0 ? idx : 0;
     }
@@ -5382,6 +6062,8 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_GET_INPUT_EVENT:
         {
             extern void xhci_poll(void) __attribute__((weak));
+            extern void ps2_poll(void) __attribute__((weak));
+            if (ps2_poll) ps2_poll();
             if (xhci_poll) xhci_poll();
             if (input_pop_event && a1) {
                 return input_pop_event((void *)a1) ? 1 : 0;

@@ -7,6 +7,7 @@ struct dos_vm;
 
 bool dos_io_init(struct dos_vm *vm);
 void dos_io_shutdown(struct dos_vm *vm);
+bool dos_io_set_a20(struct dos_vm *vm, bool enabled);
 
 uint8_t dos_io_read8(struct dos_vm *vm, uint16_t port);
 uint16_t dos_io_read16(struct dos_vm *vm, uint16_t port);
@@ -16,11 +17,23 @@ void dos_io_write16(struct dos_vm *vm, uint16_t port, uint16_t value);
 void dos_io_write32(struct dos_vm *vm, uint16_t port, uint32_t value);
 
 bool dos_io_irq_begin(struct dos_vm *vm, uint8_t irq, uint8_t *vector);
+void dos_io_raise_irq(struct dos_vm *vm, uint8_t irq);
+void dos_io_clear_irq(struct dos_vm *vm, uint8_t irq);
 bool dos_io_timer_poll(struct dos_vm *vm);
 bool dos_io_keyboard_acquire(struct dos_vm *vm);
 bool dos_io_keyboard_poll(struct dos_vm *vm);
 void dos_io_get_pic_bases(const struct dos_vm *vm, uint8_t *master,
                           uint8_t *slave);
+
+enum {
+    DOS_IRQ_TRACE_ACCEPT = 1, DOS_IRQ_TRACE_PIC_BEFORE,
+    DOS_IRQ_TRACE_PIC_AFTER, DOS_IRQ_TRACE_PIT, DOS_IRQ_TRACE_RETURN
+};
+#ifdef DOS_IRQ_DIAGNOSTICS
+void dos_io_irq_trace(struct dos_vm *vm, uint8_t kind, uint8_t irq, uint32_t value);
+#else
+#define dos_io_irq_trace(vm, kind, irq, value) ((void)0)
+#endif
 bool dos_io_copy_dac(const struct dos_vm *vm, uint8_t palette[256][3]);
 
 #define DOS_VGA_APERTURE_BASE 0x000A0000u

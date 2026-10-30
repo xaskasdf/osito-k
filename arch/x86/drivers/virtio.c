@@ -113,7 +113,8 @@ int virtqueue_init(virtqueue_t *vq, uint16_t size)
         vq->desc[i].next = i + 1;
         vq->desc[i].flags = VRING_DESC_F_NEXT;
     }
-    vq->desc[size - 1].next = 0;
+    /* Exhaustion must not wrap back to a descriptor still owned by DMA. */
+    vq->desc[size - 1].next = size;
     vq->desc[size - 1].flags = 0;
 
     serial_puts("[VIRTIO] Queue init: size=");

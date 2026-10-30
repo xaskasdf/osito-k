@@ -41,6 +41,12 @@ extern "C" {
  * / pipe_screen / pipe_context / st_context tuple. */
 typedef struct OK_GLContext OK_GLContext;
 
+/* Optional host-owned heap. Configure once before the first GL allocation.
+ * grow must return 16-byte-aligned storage or (void *)-1 on failure. The host
+ * owns the arenas until all module threads stop and the module is discarded. */
+OKGL_PUBLIC int okGLConfigureHeap(void *owner,
+                                  void *(*grow)(void *, long));
+
 /* Create a new GL context bound to the given OsitoK compositor window.
  *
  * - window_id : 0 for off-screen, otherwise a compositor surface id
@@ -55,9 +61,23 @@ typedef struct OK_GLContext OK_GLContext;
 OKGL_PUBLIC OK_GLContext *okGLCreateContext(uint32_t window_id, int width,
                                             int height);
 
+/* Mesa softpipe context; executes shaders and rasterization on the CPU.
+ * Uses the same drawable/readback API without requiring a Vulkan device. */
+OKGL_PUBLIC OK_GLContext *okGLCreateSoftwareContext(uint32_t window_id,
+                                                    int width, int height);
+
 /* Bind ctx to the calling thread.  Pass NULL to unbind.  After this
  * returns, GL calls on the calling thread route through ctx. */
 OKGL_PUBLIC int okGLMakeCurrent(OK_GLContext *ctx);
+
+/* Share GL object namespaces without replacing either context's state.
+ * Both contexts must use the same Gallium device. */
+OKGL_PUBLIC int okGLShareContexts(OK_GLContext *source, OK_GLContext *target);
+
+/* PE32 shader text arrays contain 32-bit addresses even in a 64-bit module. */
+OKGL_PUBLIC void okGLShaderSource32(uint32_t shader, int32_t count,
+                                    const uint32_t *strings,
+                                    const int32_t *lengths);
 
 /* Rebind an existing context to a resized/recreated compositor window.
  * This invalidates the state-tracker drawable so its color attachment is

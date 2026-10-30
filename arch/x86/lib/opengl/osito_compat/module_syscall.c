@@ -3,32 +3,46 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Native applications retain brk. A Win32 module configures process-owned
+ * arenas before its first allocation, so discarding the module cannot orphan
+ * a native heap in the shell's TGID. malloc.c serializes calls to this hook. */
+typedef void *(*okgl_heap_grow_fn)(void *, long);
+static okgl_heap_grow_fn module_heap_grow;
+static void *module_heap_owner;
+static int module_heap_started;
+extern void *sbrk(long);
+
+__attribute__((visibility("default")))
+int okGLConfigureHeap(void *owner, okgl_heap_grow_fn grow)
+{
+    if (module_heap_started || module_heap_grow || !grow) return -1;
+    module_heap_owner = owner;
+    module_heap_grow = grow;
+    return 0;
+}
+
+void *okgl_heap_grow(long increment)
+{
+    module_heap_started = 1;
+    if (module_heap_grow)
+        return module_heap_grow(module_heap_owner, increment);
+    return sbrk(increment);
+}
+
+extern void serial_puts(const char *message)
+    __attribute__((visibility("default")));
+
 static void okgl_serial_putc(char c)
 {
-    const uint16_t data_port = 0x3F8;
-    const uint16_t status_port = 0x3FD;
-
-    for (unsigned spin = 0; spin < 4096; spin++) {
-        uint8_t ready;
-        __asm__ volatile ("inb %1, %0" : "=a"(ready) : "Nd"(status_port));
-        if (ready & 0x20) {
-            __asm__ volatile ("outb %0, %1" :: "a"((uint8_t)c),
-                              "Nd"(data_port));
-            return;
-        }
-        __asm__ volatile ("pause" ::: "memory");
-    }
+    char message[2] = {c, 0};
+    serial_puts(message);
 }
 
 static void okgl_serial_puts(const char *message)
 {
     if (!message)
         return;
-    while (*message) {
-        if (*message == '\n')
-            okgl_serial_putc('\r');
-        okgl_serial_putc(*message++);
-    }
+    serial_puts(message);
 }
 
 static void okgl_serial_puthex64(uint64_t value)
@@ -47,8 +61,7 @@ void okgl_diag3(const char *message, uint64_t a, uint64_t b, uint64_t c)
     okgl_serial_puthex64(b);
     okgl_serial_puts(" c=0x");
     okgl_serial_puthex64(c);
-    okgl_serial_putc('\r');
-    okgl_serial_putc('\n');
+    okgl_serial_puts("\n");
 }
 
 void okgl_trace(const char *message)

@@ -54,17 +54,11 @@ static inline uint64_t rdtsc(void)
 #define MOUSE_BTN_RIGHT  (1 << 1)
 #define MOUSE_BTN_MIDDLE (1 << 2)
 
-/* Key event flags */
-#define KEY_FLAG_EXTENDED (1 << 0)  /* 0xE0 prefix scancode */
-#define KEY_FLAG_SHIFT    (1 << 1)
-#define KEY_FLAG_CTRL     (1 << 2)
-#define KEY_FLAG_ALT      (1 << 3)
-
 /* ── Input Event Structure ───────────────────────────────────── */
 
 typedef struct {
     uint8_t  type;           /* INPUT_KEY_DOWN, INPUT_MOUSE_MOVE, etc. */
-    uint8_t  scancode;       /* PS/2 scancode (for key events) */
+    uint8_t  scancode;       /* HID keyboard-page usage (all transports) */
     uint8_t  buttons;        /* current mouse button state */
     uint8_t  flags;          /* KEY_FLAG_* modifiers */
     int16_t  dx, dy;         /* mouse delta (for MOUSE_MOVE) */
@@ -108,6 +102,8 @@ static int32_t  mouse_release_y[INPUT_MOUSE_BUTTON_COUNT];
 /* ── Keyboard Modifier State ─────────────────────────────────── */
 
 static uint8_t kb_modifiers;  /* current KEY_FLAG_* state */
+static uint8_t kb_modifier_keys; /* one bit per HID modifier, left and right */
+static bool kb_caps_down;
 
 #define INPUT_KEYBOARD_BYTES 256U
 static const void *keyboard_owner;
@@ -119,7 +115,7 @@ static uint8_t keyboard_lock;
 static uint64_t input_keyboard_lock(void)
 {
     uint64_t flags = 0;
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(INPUT_HOST_TEST)
     __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
 #endif
     while (__atomic_test_and_set(&keyboard_lock, __ATOMIC_ACQUIRE)) { }
@@ -129,7 +125,7 @@ static uint64_t input_keyboard_lock(void)
 static void input_keyboard_unlock(uint64_t flags)
 {
     __atomic_clear(&keyboard_lock, __ATOMIC_RELEASE);
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(INPUT_HOST_TEST)
     if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
 #else
     (void)flags;
@@ -223,32 +219,30 @@ static void input_enqueue(input_event_t *evt)
 
 /* ── Keyboard Events (called from keyboard IRQ handler) ──────── */
 
-void input_post_key(uint8_t scancode, bool pressed, bool extended)
+void input_post_key(uint8_t usage, bool pressed, bool extended)
 {
+    if (usage <= 3) return; /* HID empty/error usages are not key transitions. */
+    if (usage >= 0xE0 && usage <= 0xE7) {
+        uint8_t bit = 1U << (usage - 0xE0);
+        if (pressed) kb_modifier_keys |= bit;
+        else         kb_modifier_keys &= ~bit;
+        kb_modifiers &= KEY_FLAG_CAPS;
+        if (kb_modifier_keys & 0x22) kb_modifiers |= KEY_FLAG_SHIFT;
+        if (kb_modifier_keys & 0x11) kb_modifiers |= KEY_FLAG_CTRL;
+        if (kb_modifier_keys & 0x44) kb_modifiers |= KEY_FLAG_ALT;
+    } else if (usage == 0x39) {
+        if (pressed && !kb_caps_down) kb_modifiers ^= KEY_FLAG_CAPS;
+        kb_caps_down = pressed;
+    }
+
     input_event_t evt;
     memset(&evt, 0, sizeof(evt));
     evt.type = pressed ? INPUT_KEY_DOWN : INPUT_KEY_UP;
-    evt.scancode = scancode;
+    evt.scancode = usage;
     evt.flags = kb_modifiers;
     if (extended) evt.flags |= KEY_FLAG_EXTENDED;
     evt.timestamp = rdtsc();
     input_enqueue(&evt);
-
-    /* Update modifier tracking */
-    switch (scancode) {
-    case 0x2A: case 0x36:  /* L/R Shift */
-        if (pressed) kb_modifiers |= KEY_FLAG_SHIFT;
-        else         kb_modifiers &= ~KEY_FLAG_SHIFT;
-        break;
-    case 0x1D:              /* Ctrl */
-        if (pressed) kb_modifiers |= KEY_FLAG_CTRL;
-        else         kb_modifiers &= ~KEY_FLAG_CTRL;
-        break;
-    case 0x38:              /* Alt */
-        if (pressed) kb_modifiers |= KEY_FLAG_ALT;
-        else         kb_modifiers &= ~KEY_FLAG_ALT;
-        break;
-    }
 }
 
 /* ── Mouse Events (called from mouse IRQ handler or PS/2 aux) ── */
@@ -552,6 +546,8 @@ void input_events_init(uint32_t scr_width, uint32_t scr_height)
     memset(mouse_release_x, 0, sizeof(mouse_release_x));
     memset(mouse_release_y, 0, sizeof(mouse_release_y));
     kb_modifiers = 0;
+    kb_modifier_keys = 0;
+    kb_caps_down = false;
     prev_mouse_x = mouse_x;
     prev_mouse_y = mouse_y;
     prev_prediction_tsc = 0;

@@ -12,6 +12,8 @@
  */
 
 #include "smp_work.h"
+#include "smp.h"
+#include "cpu_idle.h"
 
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
@@ -155,6 +157,8 @@ static void send_ipi(uint32_t lapic_id, uint8_t vector)
     volatile uint32_t *apic = idt_get_apic_base();
     if (!apic) return;
 
+    extern uint8_t apic_to_cpu_lut[256];
+    cpu_idle_notify(apic_to_cpu_lut[lapic_id & 255]);
     uint64_t flags = ws_irq_save();
     apic[APIC_ICR_HIGH / 4] = lapic_id << 24;
     apic[APIC_ICR_LOW / 4] = (uint32_t)vector;
@@ -175,6 +179,22 @@ static void wake_one_ap(void)
             return;
         }
     }
+}
+
+void smp_wake_all(void)
+{
+    if (!__atomic_load_n(&ws_ready, __ATOMIC_ACQUIRE)) return;
+    for (int i = 1; i < ws_cpu_count; i++)
+        send_ipi(ws_cpus[i].lapic_id, SMP_IPI_VECTOR);
+}
+
+void smp_wake_bsp(void)
+{
+    if (!__atomic_load_n(&ws_ready,__ATOMIC_ACQUIRE)) return;
+    /* Vector 32 uses the normal full-register/IST scheduler path. Its clock
+     * derives time from elapsed TSC, so this IPI does not invent a 10ms tick.
+     * The AP work vector intentionally cannot switch a BSP task. */
+    send_ipi(ws_cpus[0].lapic_id,0x20);
 }
 
 /* ── Fast CPU identification ────────────────────────────────── */
@@ -347,6 +367,8 @@ void smp_work_init(void)
     uint32_t total = smp_get_cpu_count();
     uint32_t bsp_id = smp_get_bsp_apic_id();
 
+    cpu_idle_init_cpu(smp_current_cpu());
+
     memset(ws_cpus, 0, sizeof(ws_cpus));
     memset(task_pool, 0, sizeof(task_pool));
     memset((void *)task_bitmap, 0, sizeof(task_bitmap));
@@ -458,9 +480,11 @@ void ap_worker_loop(uint32_t cpu_idx)
     }
 
     ws_cpu_t *me = &ws_cpus[my_slot];
+    cpu_idle_init_cpu(cpu_idx);
     __atomic_fetch_or(&ws_online_mask, 1U << my_slot, __ATOMIC_RELEASE);
 
     for (;;) {
+        cpu_idle_poll(cpu_idx);
         /* Try to find and execute work */
         if (try_execute_one(me))
             continue;
@@ -486,7 +510,7 @@ void ap_worker_loop(uint32_t cpu_idx)
             }
         }
 
-        __asm__ volatile ("sti; hlt" ::: "memory");
+        cpu_idle_wait(cpu_idx, (const volatile uint32_t *)&me->sleeping, 1);
         __atomic_store_n(&me->sleeping, 0, __ATOMIC_RELEASE);
     }
 }

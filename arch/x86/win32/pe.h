@@ -336,6 +336,11 @@ NTSTATUS pe_load(const BYTE *file_data, SIZE_T file_size,
                  PPE_IMAGE_INFO info);
 NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
                        PPE_IMAGE_INFO info, const char *image_name);
+/* Mapping publishes an image without running imports or guest callbacks. */
+NTSTATUS pe_map_named(const BYTE *file_data, SIZE_T file_size,
+                      PPE_IMAGE_INFO info, const char *image_name);
+NTSTATUS pe_bind_mapped_image(PPE_IMAGE_INFO info, const char *image_name);
+NTSTATUS pe_write_image_pointer(PVOID slot, ULONGLONG value, BOOL is32);
 void     pe_unload(PPE_IMAGE_INFO info);
 void     pe_unload_for_owner(PPE_IMAGE_INFO info, ULONG owner_pid);
 NTSTATUS compat32_attach_tls(PPE_IMAGE_INFO info);
@@ -366,6 +371,9 @@ ULONGLONG pe_va_range_conflict_end(ULONGLONG base, ULONGLONG size);
 BOOL pe_va_range_contains(ULONGLONG base, ULONGLONG size);
 BOOL pe_va_query_range(ULONGLONG address, ULONGLONG *base,
                        ULONGLONG *size, ULONGLONG *next_base);
+BOOL pe_va_query_range_for_owner(ULONG owner_pid, ULONGLONG address,
+                                  ULONGLONG *base, ULONGLONG *size,
+                                  ULONGLONG *next_base);
 
 /* ── Helper macros ──────────────────────────────────────────── */
 

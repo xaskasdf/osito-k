@@ -19,6 +19,8 @@
  * then restore everything.
  */
 
+#include "../win32/nt64_service.h"
+
 .code64
 .text
 
@@ -27,6 +29,13 @@
 .globl syscall_kernel_rsp
 .globl syscall_entry
 syscall_entry:
+    /* NTDLL's relocatable service stubs carry an explicit ABI namespace.
+     * Do not modify registers, stack selectors or the ELF dispatch frame. */
+    cmp $NT64_SERVICE_BASE, %rax
+    jb .Lelf_syscall
+    cmp $NT64_SERVICE_LIMIT, %rax
+    jb nt64_service_entry
+.Lelf_syscall:
     /*
      * We're now in kernel mode with interrupts disabled.
      * RCX = user RIP, R11 = user RFLAGS.

@@ -19,6 +19,8 @@
 #include "../win32/kernel32_shim.h"
 #include "../win32/unwind64.h"
 #include "smp.h"
+#include "timer_deadline.h"
+#include "../include/msr_safe.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -55,6 +57,8 @@ extern void mem_debug_dump_page(uint64_t phys);
 static bool debug_read_u64_in_cr3(uint64_t cr3, uint64_t virt,
                                   uint64_t *value, uint64_t *phys_out)
 {
+    if (virt >= 0x0000800000000000ULL && virt < KERNEL_VBASE)
+        return false;
     uint64_t phys = paging_translate_in_cr3(cr3, virt);
     if (phys == UINT64_MAX || (phys & 0xFFFULL) > 0xFF8ULL)
         return false;
@@ -63,6 +67,36 @@ static bool debug_read_u64_in_cr3(uint64_t cr3, uint64_t virt,
     if (phys_out)
         *phys_out = phys;
     return true;
+}
+
+static bool debug_read_u32_in_cr3(uint64_t cr3, uint64_t virt,
+                                  uint32_t *value)
+{
+    if (virt >= 0x0000800000000000ULL && virt < KERNEL_VBASE)
+        return false;
+    uint64_t phys = paging_translate_in_cr3(cr3, virt);
+    if (phys == UINT64_MAX || (phys & 0xFFFULL) > 0xFFCULL)
+        return false;
+    *value = *(volatile uint32_t *)PHYS_TO_VIRT(phys);
+    return true;
+}
+
+static void debug_dump_code_in_cr3(uint64_t cr3, uint64_t virt)
+{
+    for (unsigned i = 0; i < 16; i++) {
+        uint64_t address = virt + i;
+        bool canonical = address < 0x0000800000000000ULL ||
+                         address >= KERNEL_VBASE;
+        uint64_t phys = address >= virt && canonical
+            ? paging_translate_in_cr3(cr3, address) : UINT64_MAX;
+        if (phys == UINT64_MAX) {
+            serial_puts("<unmapped>");
+            break;
+        }
+        serial_puthex(*(volatile uint8_t *)PHYS_TO_VIRT(phys), 2);
+        serial_puts(" ");
+    }
+    serial_puts("\n");
 }
 
 /* A continuable write fault can be part of cross-thread synchronization: one
@@ -365,6 +399,17 @@ static void win64_apply_cpu_context(interrupt_frame_t *frame,
                     ((uint64_t)context->EFlags & mutable_rflags);
 }
 
+static bool win64_guest_exception_segment(uint64_t selector)
+{
+    extern int win32_execution_owned(void);
+    uint16_t cs = (uint16_t)selector;
+    /* The native NTDLL gateway returns with JMP, retaining SYSCALL's 0x90
+     * code segment. Native ELF syscalls use that segment too: require a
+     * Win32 owner before admitting this additional exception context. */
+    return cs == GDT_SEL_CODE64 ||
+           (cs == 0x90 && win32_execution_owned());
+}
+
 /* PE64 exceptions follow NT ordering: VEH first, frame handlers second, and
  * the process-level unhandled filter only after both searches decline. */
 static int win64_dispatch_cpu_exception(interrupt_frame_t *frame,
@@ -372,7 +417,7 @@ static int win64_dispatch_cpu_exception(interrupt_frame_t *frame,
                                         NTSTATUS *status_out)
 {
     NTSTATUS status = win32_exception_code_for_vector(vector);
-    if ((frame->cs & 0xFFFF) != GDT_SEL_CODE64 ||
+    if (!win64_guest_exception_segment(frame->cs) ||
         status == STATUS_SUCCESS)
         return -1;
 
@@ -383,8 +428,18 @@ static int win64_dispatch_cpu_exception(interrupt_frame_t *frame,
         exception_address--;
     }
     if (!win32_user_range_executable(
-            (const void *)(ULONG_PTR)exception_address, 1, FALSE))
-        return -1;
+            (const void *)(ULONG_PTR)exception_address, 1, FALSE)) {
+        extern int win32_execution_owned(void);
+        /* An instruction-fetch violation can itself mean the destination is
+         * not executable (including a NULL function pointer). Keep such a
+         * guest fault in Win32 exception/exit handling; the native process
+         * group also contains the synchronous shell owner. Kernel addresses
+         * and unrelated service tasks retain the kernel fault path. */
+        if (vector != 14 || !(frame->error_code & 16) ||
+            exception_address >= 0x0000800000000000ULL ||
+            !win32_execution_owned())
+            return -1;
+    }
 
     if (status_out)
         *status_out = status;
@@ -482,6 +537,8 @@ extern void isr_stub_33(void);   /* Keyboard IRQ */
 extern void isr_stub_40(void);   /* I211 NIC MSI */
 extern void isr_stub_41(void);   /* Win32 __fastfail (INT 0x29) */
 extern void isr_stub_42(void);   /* RTL8111 NIC MSI */
+extern void isr_stub_43(void);   /* Intel native graphics MSI */
+extern void isr_stub_124(void);  /* PS/2 AUX IRQ12 at PIC vector 0x7C */
 extern void isr_stub_default(void);  /* vectors 34-255 */
 
 /* Keyboard handler */
@@ -936,6 +993,12 @@ void isr_handler(interrupt_frame_t *frame)
     uint64_t vec = frame->vector;
     NTSTATUS win32_exception_status = STATUS_SUCCESS;
 
+    uint64_t msr_resume = frame->rip;
+    if (x86_msr_fixup(vec, frame->cs, frame->error_code, &msr_resume)) {
+        frame->rip = msr_resume;
+        return;
+    }
+
     /* Report fpu_state_ptr corruption (detected by isr_common guard) */
     {
         extern uint64_t fpu_corrupt_val;
@@ -1183,6 +1246,10 @@ void isr_handler(interrupt_frame_t *frame)
         extern void vdso_update(void);
         vdso_update();
 
+        /* Retry queued debug bytes without waiting inside the timer ISR. */
+        extern void serial_poll_irq(void);
+        serial_poll_irq();
+
 #ifdef COMPAT32_TIMER_DEBUG
         /* Watchdog: log PE32 execution state (enable with -DCOMPAT32_TIMER_DEBUG) */
         {
@@ -1206,7 +1273,7 @@ void isr_handler(interrupt_frame_t *frame)
          * writable and NX-protects the guard page. */
         if (g_null_page_dirty) null_page_clean();
 
-        /* Always-on profiling: record RIP at each timer tick (~3 cycles) */
+        /* Opt-in profiler filters software yields and duplicate 100 Hz ticks. */
         {
             extern void kprof_record(uint64_t rip);
             kprof_record(frame->rip);
@@ -1233,6 +1300,10 @@ void isr_handler(interrupt_frame_t *frame)
 
         /* X-SCHED: preemptive scheduler — check quantum, switch if expired.
          * frame points to saved GPRs on the BSP's IRQ IST. */
+        if (!dos_native_active) {
+            extern void win32_force_console_frame(x86_interrupt_frame_t *);
+            win32_force_console_frame(frame);
+        }
         uint64_t interrupted_rip = frame->rip;
         /* Native DPMI temporarily owns process-global GDT/LDT and DOS IDT
          * gates. Keep timer/audio IRQs live, but do not switch tasks until
@@ -1257,14 +1328,10 @@ void isr_handler(interrupt_frame_t *frame)
             }
         }
 
-        /* TSC-deadline: reprogram next deadline based on current process's QoS.
-         * In periodic mode, the APIC timer auto-reloads — nothing to do. */
+        /* Only runnable service owners contribute a TSC deadline. In periodic
+         * mode the APIC timer auto-reloads without consulting the scheduler. */
         if (tsc_deadline_mode) {
-            extern uint64_t sched_get_next_deadline_us(void);
-            uint64_t next_us = sched_get_next_deadline_us();
-            uint64_t audio_us = audio_get_next_deadline_us();
-            if (audio_us && (!next_us || audio_us < next_us))
-                next_us = audio_us;
+            uint64_t next_us = idt_next_deadline_us(dos_native_active);
             if (next_us > 0) {
                 uint64_t deadline = idt_rdtsc() + (tsc_freq * next_us / 1000000);
                 wrmsr(MSR_IA32_TSC_DEADLINE, deadline);
@@ -1324,7 +1391,22 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
+    if (vec == 43) {
+        extern void intel_gfx_irq(void);
+        intel_gfx_irq();
+        apic_write(APIC_EOI, 0);
+        return;
+    }
+
     /* Other PIC IRQs (just EOI and ignore) */
+    if (vec == 0x7c) {
+        extern void ps2_aux_irq(void);
+        ps2_aux_irq();
+        outb(0xa0, 0x20);
+        outb(0x20, 0x20);
+        return;
+    }
+
     if (vec >= 0x70 && vec < 0x80) {
         if (vec >= 0x78) outb(0xA0, 0x20);  /* Slave EOI */
         outb(0x20, 0x20);  /* Master EOI */
@@ -1505,15 +1587,21 @@ void isr_handler(interrupt_frame_t *frame)
         if ((frame->cs & 0xFFFF) == 0x38 &&
             frame->rsp >= 0xFFFF800000000000ULL &&
             frame->rsp < 0xFFFF900000000000ULL) {
-            uint64_t *sp64 = (uint64_t *)frame->rsp;
+            uint64_t active_cr3, word;
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
             extern void dll_debug_log_address(void *address);
-            if (sp64[0] >= 0x10000ULL &&
-                sp64[0] < 0x0000800000000000ULL)
-                dll_debug_log_address((void *)sp64[0]);
+            if (debug_read_u64_in_cr3(active_cr3, frame->rsp, &word, NULL) &&
+                word >= 0x10000ULL && word < 0x0000800000000000ULL)
+                dll_debug_log_address((void *)word);
             serial_puts("  [PE64-STACK]");
             for (int i = 0; i < 48; i++) {
+                if (!debug_read_u64_in_cr3(active_cr3, frame->rsp + i * 8ULL,
+                                           &word, NULL)) {
+                    serial_puts(" <unmapped>");
+                    break;
+                }
                 serial_puts(" ");
-                serial_puthex(sp64[i], 16);
+                serial_puthex(word, 16);
             }
             serial_puts("\n");
 
@@ -1523,12 +1611,17 @@ void isr_handler(interrupt_frame_t *frame)
                 if ((fp & 7) != 0 || fp < frame->rsp ||
                     fp + 16 < fp || fp + 16 > frame->rsp + 0x100000ULL)
                     break;
-                uint64_t *frame64 = (uint64_t *)fp;
-                serial_puts(" ");
-                serial_puthex(frame64[1], 16);
-                if (frame64[0] <= fp)
+                uint64_t prev_fp, ret;
+                if (!debug_read_u64_in_cr3(active_cr3, fp, &prev_fp, NULL) ||
+                    !debug_read_u64_in_cr3(active_cr3, fp + 8, &ret, NULL)) {
+                    serial_puts(" <unmapped>");
                     break;
-                fp = frame64[0];
+                }
+                serial_puts(" ");
+                serial_puthex(ret, 16);
+                if (prev_fp <= fp)
+                    break;
+                fp = prev_fp;
             }
             serial_puts("\n");
         }
@@ -1543,7 +1636,8 @@ void isr_handler(interrupt_frame_t *frame)
             __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
             have_ret = debug_read_u64_in_cr3(active_cr3, frame->rsp,
                                               &retaddr, NULL);
-            have_next = debug_read_u64_in_cr3(active_cr3, frame->rsp + 8,
+            have_next = frame->rsp <= UINT64_MAX - 8 &&
+                debug_read_u64_in_cr3(active_cr3, frame->rsp + 8,
                                                &next, NULL);
 
             serial_puts("  [NULL64] stack=0x");
@@ -1564,8 +1658,9 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts("  [NULL64-STACK]");
             for (int i = 0; i < 12; i++) {
                 uint64_t word = 0;
-                if (!debug_read_u64_in_cr3(active_cr3,
-                                           frame->rsp + (uint64_t)i * 8,
+                uint64_t address = frame->rsp + (uint64_t)i * 8;
+                if (address < frame->rsp ||
+                    !debug_read_u64_in_cr3(active_cr3, address,
                                            &word, NULL)) {
                     serial_puts(" <unmapped>");
                     break;
@@ -1589,14 +1684,18 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts("  SS  = 0x");
             serial_puthex(frame->ss, 4);
             serial_puts("\n");
-            /* Dump 4 quadwords at top of stack — kernel stacks live in
-             * the upper-half mirror so this is safe even pre-paging. */
-            uint64_t *kp = (uint64_t *)frame->rsp;
+            /* Even a saved kernel RSP may be corrupt or unmapped. */
             for (int i = 0; i < 4; i++) {
+                uint64_t word, address = frame->rsp + i * 8ULL;
+                if (address < frame->rsp ||
+                    !debug_read_u64_in_cr3(cr3, address, &word, NULL)) {
+                    serial_puts("    <unmapped stack>\n");
+                    break;
+                }
                 serial_puts("    [RSP+");
                 serial_puthex((uint64_t)(i * 8), 2);
                 serial_puts("] = 0x");
-                serial_puthex(kp[i], 16);
+                serial_puthex(word, 16);
                 serial_puts("\n");
             }
         }
@@ -1611,9 +1710,8 @@ void isr_handler(interrupt_frame_t *frame)
          * instruction right after the corrupt call IN THE CALLER. Stack
          * values in the user-ELF range (0x20000000..0x20200000) are the
          * call sites; objdump the binary there to read the `call *reg/mem`
-         * and identify the corrupted operand. Reads are guarded: stack
-         * only if RSP is in the mirror (always mapped), code only if the
-         * RIP page executed (it did — we faulted there). */
+         * and identify the corrupted operand. An instruction-fetch fault or
+         * a trap at a page boundary can leave RIP completely unmapped. */
         {
             uint64_t wrip = frame->rip;
             uint16_t wcs  = frame->cs & 0xFFFF;
@@ -1646,25 +1744,25 @@ void isr_handler(interrupt_frame_t *frame)
                 }
 
                 if (frame->rsp >= 0xFFFF800000000000ULL) {
-                    uint64_t *sp = (uint64_t *)frame->rsp;
                     for (int i = 0; i < 24; i++) {
+                        uint64_t word, address = frame->rsp + i * 8ULL;
+                        if (address < frame->rsp ||
+                            !debug_read_u64_in_cr3(cr3, address, &word, NULL)) {
+                            serial_puts("    <unmapped stack>\n");
+                            break;
+                        }
                         serial_puts("    [RSP+");
                         serial_puthex((uint64_t)(i * 8), 3);
                         serial_puts("]=0x");
-                        serial_puthex(sp[i], 16);
-                        if (sp[i] >= 0x20000000ULL && sp[i] < 0x20200000ULL)
+                        serial_puthex(word, 16);
+                        if (word >= 0x20000000ULL && word < 0x20200000ULL)
                             serial_puts("  <-- user call site");
                         serial_puts("\n");
                     }
                 }
 
                 serial_puts("  [WILD] Code @ RIP: ");
-                uint8_t *wc = (uint8_t *)wrip;
-                for (int bi = 0; bi < 16; bi++) {
-                    serial_puthex(wc[bi], 2);
-                    serial_puts(" ");
-                }
-                serial_puts("\n");
+                debug_dump_code_in_cr3(cr3, wrip);
             }
         }
 
@@ -1676,13 +1774,10 @@ void isr_handler(interrupt_frame_t *frame)
         if (frame->rip >= 0x10000ULL && frame->rip < 0x100000000ULL &&
             ((frame->cs & 0xFFFF) == 0x40 ||
              (frame->cs & 0xFFFF) == 0x23)) {
-            uint8_t *code = (uint8_t *)(frame->rip & 0xFFFFFFFF);
+            uint64_t cr3;
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
             serial_puts("  Code @ RIP: ");
-            for (int bi = 0; bi < 16; bi++) {
-                serial_puthex(code[bi], 2);
-                serial_puts(" ");
-            }
-            serial_puts("\n");
+            debug_dump_code_in_cr3(cr3, frame->rip & 0xFFFFFFFF);
         }
 
         /* Page fault: demand paging for mmap'd regions */
@@ -1746,13 +1841,21 @@ void isr_handler(interrupt_frame_t *frame)
          * fault again on unmigrated mappings, which would cascade. */
         if ((frame->cs & 0xFFFF) == 0x40 ||
             (frame->cs & 0xFFFF) == 0x23) {
-            uint32_t *sp = (uint32_t *)(uint64_t)frame->rsp;
+            uint64_t cr3;
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
             serial_puts("  Stack dump (RSP):\n");
             for (int i = 0; i < 16; i++) {
+                uint32_t word;
+                uint64_t address = frame->rsp + i * 4ULL;
+                if (address < frame->rsp ||
+                    !debug_read_u32_in_cr3(cr3, address, &word)) {
+                    serial_puts("    <unmapped stack>\n");
+                    break;
+                }
                 serial_puts("    [RSP+");
                 serial_puthex((uint64_t)(i * 4), 2);
                 serial_puts("] = 0x");
-                serial_puthex((uint64_t)sp[i], 8);
+                serial_puthex(word, 8);
                 serial_puts("\n");
             }
         }
@@ -1763,10 +1866,8 @@ void isr_handler(interrupt_frame_t *frame)
          * Reads `[rbp] = prev_rbp, [rbp+8] = ret_addr` up to 16 frames,
          * symbolizing each return address. Safety: RBP must be
          * 8-aligned and stay within the 8MB user stack window anchored
-         * at the faulting RSP. This avoids walking page tables (which
-         * don't handle the 1GB huge pages in the upper-half direct map
-         * correctly) while still preventing cascade faults when RBP is
-         * garbage from -fomit-frame-pointer code.
+         * at the faulting RSP. Each word must also be mapped in the
+         * faulting address space; the range alone cannot establish that.
          *
          * Binaries compiled without `-fno-omit-frame-pointer` usually
          * yield only frame #0 reliably (RIP via the symbolize hook
@@ -1784,6 +1885,8 @@ void isr_handler(interrupt_frame_t *frame)
                 const uint64_t rsp_cmp = idt_stack_compare_addr(rsp);
                 const uint64_t WIN  = 8ULL * 1024 * 1024;  /* USER_STACK_SIZE */
                 void          *proc = proc_current();
+                uint64_t cr3;
+                __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
 
                 for (int depth = 0; depth < 16; depth++) {
                     uint64_t rbp_cmp = idt_stack_compare_addr(rbp);
@@ -1796,8 +1899,13 @@ void isr_handler(interrupt_frame_t *frame)
                     if (rbp_cmp + 16 < rbp_cmp) break;     /* overflow guard */
                     if (rbp_cmp < lower || rbp_cmp > rsp_cmp + WIN) break;
 
-                    uint64_t prev_rbp = ((uint64_t *)rbp)[0];
-                    uint64_t ret      = ((uint64_t *)rbp)[1];
+                    uint64_t prev_rbp, ret;
+                    if (rbp > UINT64_MAX - 8 ||
+                        !debug_read_u64_in_cr3(cr3, rbp, &prev_rbp, NULL) ||
+                        !debug_read_u64_in_cr3(cr3, rbp + 8, &ret, NULL)) {
+                        serial_puts("    <unmapped frame>\n");
+                        break;
+                    }
 
                     serial_puts("    #");
                     serial_putdec((uint64_t)depth);
@@ -1826,11 +1934,16 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts("  [COMPAT32] 32-bit code — exception in compat mode\n");
             /* Walk EBP chain to reconstruct call stack (32-bit frames) */
             uint32_t ebp = (uint32_t)frame->rbp;
+            uint64_t cr3;
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
             serial_puts("  Call stack (EBP chain):\n");
             for (int depth = 0; depth < 16 && ebp >= 0x10000 && ebp < 0x30000000; depth++) {
-                uint32_t *fp = (uint32_t *)(uint64_t)ebp;
-                uint32_t ret_addr = fp[1];
-                uint32_t prev_ebp = fp[0];
+                uint32_t ret_addr, prev_ebp;
+                if (!debug_read_u32_in_cr3(cr3, ebp, &prev_ebp) ||
+                    !debug_read_u32_in_cr3(cr3, ebp + 4ULL, &ret_addr)) {
+                    serial_puts("    <unmapped frame>\n");
+                    break;
+                }
                 serial_puts("    [");
                 serial_putdec((uint64_t)depth);
                 serial_puts("] EBP=0x");
@@ -1861,6 +1974,17 @@ void isr_handler(interrupt_frame_t *frame)
         fb_puts(" at 0x");
         fb_puthex(frame->rip, 16);
         fb_puts("\n");
+
+        /* Win32 termination below may longjmp or exit the faulting worker
+         * before the generic crash-report path. Preserve an unhandled INT3
+         * and the preceding loader diagnostics before taking that path.
+         * Handled breakpoints already returned from exception dispatch.
+         * Do not depend on status_out: a rejected code-range validation can
+         * leave it unset even though the processor reached this fatal path. */
+        if (vec == 3 && (win64_guest_exception_segment(frame->cs) ||
+                         (frame->cs & 0xFFFF) == 0x40 ||
+                         (frame->cs & 0xFFFF) == 0x23))
+            idt_diag_flush("win32-unhandled-breakpoint");
 
         /* Fault recovery: if dl_fault_jmpbuf is set, longjmp back instead
          * of killing. Used by INIT_ARRAY to survive unresolved calls. */
@@ -2005,6 +2129,7 @@ compat32_null_recovery:
             serial_puts("  [WIN32] Unhandled exception status=0x");
             serial_puthex((uint32_t)win32_exception_status, 8);
             serial_puts(" - terminating process\n");
+            if (vec != 3) idt_diag_flush("win32-unhandled-exception");
             if (win32_terminate_current_child(win32_exception_status) ||
                 win32_terminate_current_main(win32_exception_status))
                 return;
@@ -2386,6 +2511,8 @@ void __initk idt_init(void)
     /* Override: vector 0x71 = keyboard IRQ (uses isr_stub_33) */
     idt_set_entry(0x71, isr_stub_33, X86_IST_IRQ);
     idt[0x71].selector = cs;
+    idt_set_entry(0x7c, isr_stub_124, X86_IST_IRQ);
+    idt[0x7c].selector = cs;
 
     /* Vector 40: I211 NIC MSI interrupt */
     idt_set_entry(40, isr_stub_40, X86_IST_IRQ);
@@ -2398,6 +2525,8 @@ void __initk idt_init(void)
     /* Vector 42: RTL8111 NIC MSI interrupt */
     idt_set_entry(42, isr_stub_42, X86_IST_IRQ);
     idt[42].selector = cs;
+    idt_set_entry(43, isr_stub_43, X86_IST_IRQ);
+    idt[43].selector = cs;
 
     /* SMP work IPI: lightweight stub, no fxsave (safe for APs) */
     extern void isr_stub_smp_ipi(void);

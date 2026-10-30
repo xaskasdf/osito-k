@@ -797,6 +797,43 @@ int x509_verify_chain_link(const uint8_t *child_cert, uint32_t child_len,
     return result;
 }
 
+int x509_verify_chain_link_legacy(const uint8_t *child_cert, uint32_t child_len,
+                                  const uint8_t *issuer_cert, uint32_t issuer_len)
+{
+    static const uint8_t algorithm[] = {
+        0x30,0x0d,0x06,0x09,0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x05,0x05,0x00
+    };
+    static const uint8_t oiw_algorithm[] = {
+        0x30,0x09,0x06,0x05,0x2b,0x0e,0x03,0x02,0x1d,0x05,0x00
+    };
+    cert_parts_t cp;
+    if (!child_cert || !child_len || !issuer_cert || !issuer_len ||
+        cert_split(child_cert, child_len, &cp) != 0) return -1;
+    if (!((cp.sigalg_len == sizeof(algorithm) &&
+           bytes_eq(cp.sigalg, algorithm, sizeof(algorithm)) == 0) ||
+          (cp.sigalg_len == sizeof(oiw_algorithm) &&
+           bytes_eq(cp.sigalg, oiw_algorithm, sizeof(oiw_algorithm)) == 0)))
+        return x509_verify_chain_link(child_cert, child_len, issuer_cert, issuer_len);
+
+    /* The signed inner AlgorithmIdentifier must agree with the outer one.
+     * Keep SHA-1 results outside the modern-chain verification cache. */
+    const uint8_t *p = cp.tbs, *end;
+    if (der_enter(&p, cp.tbs + cp.tbs_len, 0x30, &end) != 0) return -1;
+    if (p < end && *p == 0xa0 && der_skip_tlv(&p, end) != 0) return -1;
+    if (der_skip_tlv(&p, end) != 0 || (uint32_t)(end - p) < cp.sigalg_len ||
+        bytes_eq(p, cp.sigalg, cp.sigalg_len) != 0) return -1;
+    const uint8_t *n, *e;
+    uint32_t n_len, e_len;
+    if (extract_rsa_pubkey(issuer_cert, issuer_len, &n, &n_len, &e, &e_len) != 0)
+        return -1;
+    extern void sha1(const void *, uint32_t, uint8_t[20]);
+    extern int rsa_pkcs1_v15_sha1_verify(const uint8_t *, uint32_t,
+        const uint8_t *, uint32_t, const uint8_t *, uint32_t, const uint8_t[20]);
+    uint8_t digest[20];
+    sha1(cp.tbs, cp.tbs_len, digest);
+    return rsa_pkcs1_v15_sha1_verify(cp.sig, cp.sig_len, n, n_len, e, e_len, digest);
+}
+
 int x509_verify_signed_blob(const uint8_t *tbs, uint32_t tbs_len,
                             const uint8_t *signature_algorithm,
                             uint32_t signature_algorithm_len,

@@ -43,6 +43,12 @@ int    WINAPI crt_strncmp(const char *a, const char *b, SIZE_T n);
 int    WINAPI crt_stricmp(const char *a, const char *b);
 int    WINAPI crt_strnicmp(const char *a, const char *b, SIZE_T n);
 char*  WINAPI crt_strcpy(char *dst, const char *src);
+int WINAPI crt_strcpy_s(char *,SIZE_T,const char *);
+int WINAPI crt_strcat_s(char *,SIZE_T,const char *);
+int WINAPI crt_memcpy_s(PVOID,SIZE_T,PCVOID,SIZE_T);
+int WINAPI crt_memmove_s(PVOID,SIZE_T,PCVOID,SIZE_T);
+/* Internal CRT helper; resolves the current process/thread invalid handler. */
+void crt_report_invalid_parameter(void);
 char*  WINAPI crt_strncpy(char *dst, const char *src, SIZE_T n);
 int    WINAPI crt_strncpy_s(char *dst, SIZE_T dst_chars,
                             const char *src, SIZE_T count);

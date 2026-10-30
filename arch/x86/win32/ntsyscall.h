@@ -95,6 +95,11 @@ typedef struct _NT_SERVICE_TABLE {
 
 /* Initialize SSDT with our handlers */
 void nt_syscall_init(NT_SERVICE_TABLE *table);
+/* Kernel callers use native-width argument storage, including in PE32 mode. */
+NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args);
+NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args);
+NTSTATUS sys_NtProtectVirtualMemory(ULONG_PTR *args);
+NTSTATUS sys_NtQueryVirtualMemory(ULONG_PTR *args);
 
 /* Release VirtualAlloc regions that belong to a terminating Win32 process. */
 void nt_vm_release_process(ULONG owner_pid);
@@ -113,6 +118,56 @@ ULONGLONG nt_vm_range_conflict_end(ULONGLONG base, ULONGLONG size);
 /* Validate that a complete range is committed in VMAs owned by the current
  * Win32 process and CR3, with logical protection suitable for the access. */
 BOOL nt_vm_user_range_accessible(ULONGLONG base, SIZE_T size, BOOL writable);
+
+/* Kernel-owned, noncopyable CPU view of driver-retained WB physical RAM.
+ * This is a process CPU VA, never a GPU VA or DMA/bus address. Only the BSP
+ * may map/unmap (Win32 threads currently run there; no cross-CPU shootdown).
+ * The caller zero-initializes stable storage and offers one retained reference
+ * to BOTH this record and its backing. Once self is set, VM owns that reference
+ * until retired() returns it, outside vm_track_lock. The callback may free the
+ * record; the initiating caller must independently keep it alive until return.
+ * Do not infer reference ownership from state alone. On pre-admission failure
+ * self stays NULL and no callback runs. A partial-map failure can retire inline
+ * or remain quarantined until process teardown. Successful mapping must remain
+ * alive even if its creator exits before publishing the CPU VA.
+ *
+ * retired(safe=TRUE) proves every installed PTE was removed. FALSE means an
+ * unexpected mapping prevented proof: quarantine the backing indefinitely,
+ * even after the address-space root is destroyed. Never retry a stale CR3.
+ * Callback work must be bounded; schedule deferred native cleanup if needed.
+ * Callers provide full page-aligned, zero-padded, pinned PMM RAM, at most 256MiB,
+ * with the appropriate driver access lease held until safe retirement. No device MMIO,
+ * imported memory, WC pages, arbitrary PE pointers, or physical addresses from
+ * an application are accepted by this kernel-only contract.
+ */
+typedef struct nt_vm_driver_view NT_VM_DRIVER_VIEW;
+typedef void (*NT_VM_DRIVER_RETIRED)(NT_VM_DRIVER_VIEW *, BOOL safe, PVOID context);
+enum {
+    NT_VM_DRIVER_LIVE = 1,
+    NT_VM_DRIVER_QUARANTINED,
+    NT_VM_DRIVER_RETIRED_STATE
+};
+struct nt_vm_driver_view {
+    NT_VM_DRIVER_VIEW *self;
+    NT_VM_DRIVER_RETIRED retired;
+    PVOID context;
+    uint64_t address, physical, cr3;
+    SIZE_T bytes, mapped_bytes;
+    ULONG owner_pid, state;
+};
+NTSTATUS nt_vm_map_driver_view(NT_VM_DRIVER_VIEW *view, uint64_t physical,
+                               SIZE_T bytes, BOOL compat32, BOOL writable,
+                               NT_VM_DRIVER_RETIRED retired, PVOID context);
+/* Concurrent coherent fence access: caller retains an I/O-coherent WB backing
+ * reference, separately from GPU execution/mapping ownership. The application
+ * receives a read-only, NX CPU view; its writes and protection changes remain
+ * denied. This certifies neither GPU mapping policy nor atomic fence updates.
+ * All reference-transfer/quarantine rules above apply unchanged. Ordinary
+ * writable surface views continue to require an exclusive CPU lease.
+ */
+NTSTATUS nt_vm_map_coherent_driver_view(NT_VM_DRIVER_VIEW *,uint64_t physical,
+    SIZE_T bytes,BOOL compat32,NT_VM_DRIVER_RETIRED,PVOID context);
+NTSTATUS nt_vm_unmap_driver_view(NT_VM_DRIVER_VIEW *view);
 /* Dump VMA ownership/protection metadata for a fatal guest address. */
 void nt_vm_debug_address(uint64_t address);
 
@@ -134,6 +189,7 @@ int nt_vm_selftest(void);
 /* Thread impersonation state is owned by the NT thread object. ADVAPI32 uses
  * these helpers so pseudo handles and duplicated thread handles observe the
  * same per-thread security context. */
+/* Returns an owned reference; release it with advapi32_token_release. */
 PVOID nt_thread_get_impersonation_token(PVOID thread_object);
 BOOL nt_thread_set_impersonation_token(PVOID thread_object,
                                        PVOID token_object);
@@ -161,10 +217,17 @@ PVOID nt_pipe_stream_identity(HANDLE handle, ULONG owner_pid, BOOL write);
 /* Inspect or evict inactive immutable file-backed section control areas. */
 void nt_section_cache_dump(void);
 int nt_section_cache_flush_unused(void);
+void nt_section_cache_drop_file(PVOID file);
+
+/* Caller must keep the event alive, e.g. through a retained IOCP handle. */
+void ntsync_event_set_state(PVOID event, BOOL signaled);
 
 /* Dispatch a syscall. Called from assembly entry point.
  * nr = EAX, args[] populated from R10/RDX/R8/R9/stack. */
 NTSTATUS nt_syscall_dispatch(NT_SERVICE_TABLE *table,
                              ULONG nr, ULONG_PTR *args);
+
+/* Kernel-only entry for a Win32 path that has already been redirected. */
+NTSTATUS nt_create_file_resolved(ULONG_PTR *args, const char *physical_path);
 
 #endif /* NTSYSCALL_H */

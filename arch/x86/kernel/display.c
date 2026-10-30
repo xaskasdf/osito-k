@@ -10,9 +10,14 @@
  */
 
 #include "../include/types.h"
+#include "../include/display_source.h"
 #include "../include/boot_info.h"
 #include "../include/paging.h"
 #include "../include/sys/display_syscalls.h"
+#include "../include/display_identity.h"
+#include "../include/pci.h"
+#include "../drivers/intel_gfx.h"
+#include "../drivers/gpu.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -133,6 +138,83 @@ static bool display_virtio_owns_primary_scanout(void)
 {
     return disp.virtio_scanout && virtio_gpu_is_vga_compatible &&
            virtio_gpu_is_vga_compatible();
+}
+
+/* GOP mappings live for the whole boot. Do not export them as the visible
+ * screen after another backend has taken ownership of primary scanout. */
+bool display_gop_is_primary(void)
+{
+    return !disp.gpu_scanout && !(virtio_gpu_ready && virtio_gpu_ready() &&
+        virtio_gpu_is_vga_compatible && virtio_gpu_is_vga_compatible());
+}
+
+bool display_get_retained_gop(display_source_mode_t *out)
+{
+    extern boot_info_t saved_boot_info;
+    extern uint32_t *fb_get_vram(void);
+    const boot_info_t *b=&saved_boot_info;
+    if (!out || !display_gop_is_primary() ||
+        (gpu_display_is_ready && gpu_display_is_ready()) || !fb_get_vram() ||
+        !b->fb_base || !b->fb_width || !b->fb_height || b->fb_pitch<b->fb_width)
+        return false;
+    if (disp.initialized && (!display_gop_mirror_compatible() ||
+        disp.gop_fb!=fb_get_vram() || disp.gop_width!=b->fb_width ||
+        disp.gop_height!=b->fb_height || disp.gop_pitch!=b->fb_pitch))
+        return false;
+    *out=(display_source_mode_t){fb_get_vram(),b->fb_width,b->fb_height,b->fb_pitch};
+    return true;
+}
+
+extern pci_dev_t *pci_get_virtio_gpu(void) __attribute__((weak));
+extern gpu_device_t *pci_get_gpu(void) __attribute__((weak));
+extern const intel_gfx_state_t *intel_gfx_get_state(void) __attribute__((weak));
+extern const char *intel_gfx_device_name(uint16_t id) __attribute__((weak));
+
+static void display_identity_pci(display_identity_t *out, uint8_t bus,
+                                uint8_t dev, uint8_t func,
+                                uint16_t vendor, uint16_t device)
+{
+    uint32_t id, class_revision;
+    if (!vendor || vendor == 0xffff ||
+        !pci_diag_read32(bus, dev, func, 0, &id) ||
+        id != ((uint32_t)device << 16 | vendor) ||
+        !pci_diag_read32(bus, dev, func, 8, &class_revision) ||
+        class_revision >> 24 != 3)
+        return;
+    out->vendor = vendor;
+    out->device = device;
+    out->vga_compatible = ((class_revision >> 16) & 0xff) == 0;
+}
+
+void display_get_primary_identity(display_identity_t *out)
+{
+    if (!out) return;
+    *out = (display_identity_t){.description = "UEFI GOP Display"};
+    /* A present render adapter or secondary virtio surface does not identify
+     * the visible desktop. Follow the same ownership as primary capture. */
+    if (disp.gpu_scanout) {
+        out->description = "NVIDIA Display";
+        const gpu_device_t *gpu = pci_get_gpu ? pci_get_gpu() : NULL;
+        if (gpu)
+            display_identity_pci(out, gpu->pci_bus, gpu->pci_dev, gpu->pci_func,
+                                 gpu->vendor_id, gpu->device_id);
+        return;
+    }
+    if (!display_gop_is_primary()) {
+        out->description = "VirtIO GPU Display";
+        const pci_dev_t *gpu = pci_get_virtio_gpu ? pci_get_virtio_gpu() : NULL;
+        if (gpu)
+            display_identity_pci(out, gpu->bus, gpu->dev, gpu->func,
+                                 gpu->vendor_id, gpu->device_id);
+        return;
+    }
+    const intel_gfx_state_t *intel = intel_gfx_get_state ? intel_gfx_get_state() : NULL;
+    if (intel && intel->ready && intel->gop_scanout_retained) {
+        display_identity_pci(out, intel->bus, intel->dev, intel->func,
+                             intel->vendor_id, intel->device_id);
+        if (out->vendor && intel_gfx_device_name)
+            out->description = intel_gfx_device_name(out->device);
+    }
 }
 
 /* ── Display mode state (multi-monitor placeholder) ──────────── */
@@ -515,7 +597,7 @@ void display_wait_vblank(void)
 
 /* ── Initialization ──────────────────────────────────────────── */
 
-int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
+static int display_init_impl(uint32_t *gop_base, uint32_t width, uint32_t height,
                  uint32_t pitch, uint32_t target_fps)
 {
     serial_puts("[DISP] Initializing display subsystem...\n");
@@ -622,6 +704,17 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
         serial_puts("CPU memcpy (GOP)\n");
 
     return 0;
+}
+
+int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
+                 uint32_t pitch, uint32_t target_fps)
+{
+    display_source_change_t change={0};
+    display_source_mode_t same={gop_base,width,height,pitch};
+    if (!display_source_begin(&change,&same)) return -16;
+    int result=display_init_impl(gop_base,width,height,pitch,target_fps);
+    (void)display_source_end(&change);
+    return result;
 }
 
 /* ── Non-temporal MMIO blit ──────────────────────────────────── */
@@ -779,7 +872,7 @@ void display_force_refresh(void)
 
 /* Resize display buffers after modeset.
  * Re-allocates back buffers for the new resolution. */
-int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch)
+static int display_resize_impl(uint32_t new_width, uint32_t new_height, uint32_t new_pitch)
 {
     if (!disp.initialized) return -1;
 
@@ -823,8 +916,18 @@ int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch)
     return 0;
 }
 
+int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch)
+{
+    display_source_change_t change={0};
+    display_source_mode_t same={disp.gop_fb,new_width,new_height,new_pitch};
+    if (!display_source_begin(&change,&same)) return -16;
+    int result=display_resize_impl(new_width,new_height,new_pitch);
+    (void)display_source_end(&change);
+    return result;
+}
+
 /* Enable GPU scanout (called after gpu_display_init succeeds) */
-void display_enable_gpu_scanout(void)
+static void display_enable_gpu_scanout_impl(void)
 {
     if (!disp.initialized) return;
     if (gpu_display_is_ready && gpu_display_flip &&
@@ -832,6 +935,14 @@ void display_enable_gpu_scanout(void)
         disp.gpu_scanout = true;
         serial_puts("[DISP] GPU scanout enabled (page flip)\n");
     }
+}
+
+void display_enable_gpu_scanout(void)
+{
+    display_source_change_t change={0};
+    if (!display_source_begin(&change,NULL)) return;
+    display_enable_gpu_scanout_impl();
+    (void)display_source_end(&change);
 }
 
 /* ── Back Buffer Access ──────────────────────────────────────── */

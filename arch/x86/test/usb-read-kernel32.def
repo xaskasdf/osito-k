@@ -1,0 +1,13 @@
+LIBRARY kernel32.dll
+EXPORTS
+CreateFileA@28
+WriteFile@20
+ReadFile@20
+GetFileSize@8
+SetFilePointer@16
+FlushFileBuffers@4
+CloseHandle@4
+GetStdHandle@4
+QueryPerformanceCounter@4
+QueryPerformanceFrequency@4
+ExitProcess@4

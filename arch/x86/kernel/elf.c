@@ -493,6 +493,19 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
 
     memset(loaded->stack_base, 0, USER_STACK_SIZE);
 
+    /* Registrar el stack como VMA anonima. musl mide el stack del hilo
+     * principal sondeando con mremap en pthread_getattr_np; sin VMA mremap
+     * devuelve EFAULT en la primera sonda y musl reporta 4KB de stack, lo que
+     * rompe el chequeo IsOnCentralStack() de V8 (y cualquier consumidor de
+     * pthread_attr_getstack). Tambien hace que /proc/self/maps lo liste. */
+    {
+        extern int vma_register_anon(uint64_t base, uint64_t pages, uint32_t prot);
+        if (vma_register_anon((uint64_t)loaded->stack_base, stack_pages,
+                              0x1 | 0x2 /* PROT_READ|PROT_WRITE */) != 0) {
+            serial_puts("[ELF] WARN: stack VMA no registrada\n");
+        }
+    }
+
     /* Stack grows downward. Top = base + size.
      *
      * ASLR-lite: randomize stack top by 0..4080 bytes (256-slot granularity,

@@ -10,5 +10,6 @@ PVOID ncrypt_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);
 const WIN32_EXPORT *ncrypt_abi_table(int *count);
 PVOID wintrust_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);
 const WIN32_EXPORT *wintrust_abi_table(int *count);
+void crypt32_release_process(DWORD process_id);
 
 #endif

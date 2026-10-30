@@ -21,6 +21,11 @@
 #define FD_TYPE_PROC     5   /* /proc/self/maps, ... */
 #define FD_TYPE_DIR      6   /* synthetic OsitoFS v2 directory */
 #define FD_TYPE_SOCKET   7   /* BSD socket backed by kernel/socket.c */
+#define FD_TYPE_EVENTFD  8   /* contador pollable (kernel/pollobj.c) */
+#define FD_TYPE_TIMERFD  9   /* timer pollable (kernel/pollobj.c) */
+#define FD_TYPE_EPOLL    10  /* instancia de epoll (kernel/pollobj.c) */
+#define FD_TYPE_MEMFD    11  /* memoria anonima con API de archivo */
+#define FD_TYPE_SOCKPAIR 12  /* extremo de socketpair AF_UNIX */
 
 typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
@@ -51,6 +56,7 @@ typedef struct {
     uint64_t    offset;     /* file position */
     const fd_device_ops_t *device_ops;
     void       *device_data;
+    void       *poll_obj;   /* ositok_poll_obj_t* (eventfd/timerfd/epoll/socketpair) */
     char        dir_path[64]; /* normalized prefix for FD_TYPE_DIR */
 } fd_entry_t;
 

@@ -120,8 +120,11 @@ static void osfs3_spin_unlock(void)
 {
     uint64_t flags = mutation_lock_irq_flags;
     __atomic_store_n(&mutation_lock, 0U, __ATOMIC_RELEASE);
-    if (flags & (1ULL << 9))
+    if (flags & (1ULL << 9)) {
         __asm__ volatile ("sti" ::: "memory");
+        extern void sched_io_checkpoint(void) __attribute__((weak));
+        if (sched_io_checkpoint) sched_io_checkpoint();
+    }
 }
 
 static uint64_t osfs3_block_offset(uint32_t block)
@@ -2188,6 +2191,11 @@ uint32_t osfs3_file_mtime(const void *file)
     return ino > 0 ? (uint32_t)inode_table[ino].mtime : 0;
 }
 
+uint64_t osfs3_partition_start(void)
+{
+    return mounted ? partition_offset : UINT64_MAX;
+}
+
 uint64_t osfs3_volume_id(void)
 {
     osfs3_spin_lock();
@@ -2773,8 +2781,8 @@ int osfs3_set_size_reserved(void *file, uint64_t size)
     return result;
 }
 
-int osfs3_write_ex(void *file, uint64_t offset, const void *buf, uint64_t len,
-                   uint32_t io_flags)
+static int osfs3_write_checked(void *file, uint64_t offset, const void *buf,
+                                uint64_t len, uint32_t io_flags, bool append)
 {
     if (io_flags & ~OSFS_IO_FLAG_MASK) return -1;
     osfs3_spin_lock();
@@ -2792,8 +2800,12 @@ int osfs3_write_ex(void *file, uint64_t offset, const void *buf, uint64_t len,
     }
 
     uint32_t ino = (uint32_t)ino_number;
-    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_ACQ_REL);
     osfs3_inode_t *inode = &inode_table[ino];
+    if (append && inode->size != offset) {
+        osfs3_spin_unlock();
+        return OSFS_APPEND_RETRY;
+    }
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_ACQ_REL);
     osfs3_inode_t original = *inode;
     uint64_t end = offset + len;
     uint64_t blocks64 = (end + OSFS3_BLOCK_SIZE - 1U) >> OSFS3_BLOCK_SHIFT;
@@ -2840,6 +2852,18 @@ done:
     __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_RELEASE);
     osfs3_spin_unlock();
     return result;
+}
+
+int osfs3_write_ex(void *file, uint64_t offset, const void *buf, uint64_t len,
+                   uint32_t io_flags)
+{
+    return osfs3_write_checked(file, offset, buf, len, io_flags, false);
+}
+
+int osfs3_append_ex(void *file, uint64_t expected_size, const void *buf,
+                    uint64_t len, uint32_t io_flags)
+{
+    return osfs3_write_checked(file, expected_size, buf, len, io_flags, true);
 }
 
 int osfs3_write(void *file, uint64_t offset, const void *buf, uint64_t len)

@@ -15,9 +15,8 @@
  * (matches okGL.h convention + hello-gl-clear's check).
  *
  * Design notes:
- *   * The pipe_screen + pipe_context tuple is created per-call. A future
- *     wave can promote the screen into a process-global singleton; the
- *     public API doesn't change.
+ *   * Software contexts share a reference-counted pipe_screen within the
+ *     module instance. Each context retains its own pipe_context and drawable.
  *   * Off-screen rendering is the only currently-supported mode
  *     (window_id is plumbed through but kopper / VkSurface attach is
  *     deferred to the same future wave).
@@ -79,12 +78,39 @@ extern VkResult vkEnumeratePhysicalDevices(VkInstance, uint32_t *, VkPhysicalDev
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include "frontend/api.h"
+#include "frontend/sw_winsys.h"
+#include "gallium/drivers/softpipe/sp_public.h"
+#include "gallium/winsys/sw/null/null_sw_winsys.h"
 #include "mesa/main/menums.h"
+#include "mesa/main/context.h"
+#include "mesa/main/errors.h"
+#include "mesa/main/api_exec_decl.h"
 #include "state_tracker/st_context.h"
 #include "util/u_inlines.h"
 #include "util/u_atomic.h"
 extern struct pipe_screen *
 okGLZinkCreateScreen(VkInstance instance, VkPhysicalDevice phys);
+
+void
+okGLShaderSource32(uint32_t shader, int32_t count, const uint32_t *strings,
+                   const int32_t *lengths)
+{
+    struct gl_context *current = _mesa_get_current_context();
+    if (!current) return;
+    if (count <= 0 || !strings) {
+        _mesa_ShaderSource(shader, count, NULL, lengths);
+        return;
+    }
+    const char **wide = malloc((size_t)count * sizeof(*wide));
+    if (!wide) {
+        _mesa_error(current, GL_OUT_OF_MEMORY, "glShaderSource(PE32 array)");
+        return;
+    }
+    for (int32_t i = 0; i < count; i++)
+        wide[i] = (const char *)(uintptr_t)strings[i];
+    _mesa_ShaderSource(shader, count, wide, lengths);
+    free(wide);
+}
 
 /* OsitoK compositor flip — same syscall used by the SHM/SDL paths. */
 #define SYS_GUI_FLIP 507
@@ -104,16 +130,77 @@ struct OK_GLContext {
     VkInstance          instance;
     VkPhysicalDevice    phys;
     struct pipe_screen *screen;
+    struct sw_winsys *software_winsys;
     struct pipe_context *pipe;
     struct st_context  *st;
     struct pipe_frontend_screen frontend_screen;
     struct st_visual visual;
     struct ok_frontend_drawable drawable;
     struct pipe_resource *color_resource;
+    struct pipe_resource *depth_resource;
     struct pipe_resource *readback_resource;
 };
 
 static uint32_t next_drawable_id = 1;
+
+/* A process-private module has one software device. Shared GL textures and
+ * buffers must belong to the same Gallium screen in every context. */
+static struct pipe_screen *software_screen;
+static struct sw_winsys *software_winsys;
+static unsigned software_screen_refs;
+static volatile int software_screen_lock;
+
+static int
+okgl_acquire_software_screen(OK_GLContext *ctx)
+{
+    while (__atomic_exchange_n(&software_screen_lock, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+    if (!software_screen) {
+        software_winsys = null_sw_create();
+        if (software_winsys)
+            software_screen = softpipe_create_screen(software_winsys);
+        if (!software_screen && software_winsys) {
+            software_winsys->destroy(software_winsys);
+            software_winsys = NULL;
+        }
+    }
+    if (software_screen) {
+        ++software_screen_refs;
+        ctx->screen = software_screen;
+        ctx->software_winsys = software_winsys;
+    }
+    __atomic_store_n(&software_screen_lock, 0, __ATOMIC_RELEASE);
+    return ctx->screen ? 0 : -1;
+}
+
+static void
+okgl_release_screen(OK_GLContext *ctx)
+{
+    if (ctx->software_winsys) {
+        while (__atomic_exchange_n(&software_screen_lock, 1, __ATOMIC_ACQUIRE))
+            __asm__ volatile ("pause");
+        if (--software_screen_refs == 0) {
+            software_screen->destroy(software_screen);
+            software_winsys->destroy(software_winsys);
+            software_screen = NULL;
+            software_winsys = NULL;
+        }
+        __atomic_store_n(&software_screen_lock, 0, __ATOMIC_RELEASE);
+    } else if (ctx->screen && ctx->screen->destroy) {
+        ctx->screen->destroy(ctx->screen);
+    }
+    ctx->screen = NULL;
+    ctx->software_winsys = NULL;
+}
+
+int
+okGLShareContexts(OK_GLContext *source, OK_GLContext *target)
+{
+    if (!source || !target || !source->st || !target->st ||
+        source->screen != target->screen)
+        return -1;
+    return _mesa_share_state(target->st->ctx, source->st->ctx) ? 0 : -1;
+}
 
 static int
 ok_frontend_get_param(struct pipe_frontend_screen *fscreen,
@@ -168,6 +255,27 @@ ok_drawable_validate(struct st_context *st,
             }
             pipe_resource_reference(&out[i], ctx->color_resource);
             break;
+        case ST_ATTACHMENT_DEPTH_STENCIL:
+            if (!ctx->depth_resource) {
+                struct pipe_resource templ;
+                memset(&templ, 0, sizeof(templ));
+                templ.target = PIPE_TEXTURE_2D;
+                templ.format = ctx->visual.depth_stencil_format;
+                templ.width0 = (uint32_t)ctx->width;
+                templ.height0 = (uint16_t)ctx->height;
+                templ.depth0 = 1;
+                templ.array_size = 1;
+                templ.nr_samples = ctx->visual.samples;
+                templ.nr_storage_samples = ctx->visual.samples;
+                templ.usage = PIPE_USAGE_DEFAULT;
+                templ.bind = PIPE_BIND_DEPTH_STENCIL;
+                ctx->depth_resource =
+                    ctx->screen->resource_create(ctx->screen, &templ);
+                if (!ctx->depth_resource)
+                    return false;
+            }
+            pipe_resource_reference(&out[i], ctx->depth_resource);
+            break;
         default:
             printf("okGL: unsupported drawable attachment %d\n",
                    (int)statts[i]);
@@ -196,6 +304,53 @@ ok_drawable_flush_swapbuffers(struct st_context *st,
     (void)st;
     (void)drawable;
     return true;
+}
+
+static OK_GLContext *
+okgl_finish_create(OK_GLContext *ctx)
+{
+    ctx->frontend_screen.screen = ctx->screen;
+    ctx->frontend_screen.get_param = ok_frontend_get_param;
+
+    ctx->visual.buffer_mask = ST_ATTACHMENT_BACK_LEFT_MASK |
+                              ST_ATTACHMENT_DEPTH_STENCIL_MASK;
+    ctx->visual.color_format = PIPE_FORMAT_B8G8R8A8_UNORM;
+    ctx->visual.depth_stencil_format = PIPE_FORMAT_Z24_UNORM_S8_UINT;
+    ctx->visual.accum_format = PIPE_FORMAT_NONE;
+    ctx->visual.samples = 0;
+
+    ctx->drawable.owner = ctx;
+    ctx->drawable.base.stamp = 1;
+    ctx->drawable.base.ID = next_drawable_id++;
+    if (ctx->drawable.base.ID == 0)
+        ctx->drawable.base.ID = next_drawable_id++;
+    ctx->drawable.base.fscreen = &ctx->frontend_screen;
+    ctx->drawable.base.visual = &ctx->visual;
+    ctx->drawable.base.flush_front = ok_drawable_flush_front;
+    ctx->drawable.base.validate = ok_drawable_validate;
+    ctx->drawable.base.flush_swapbuffers = ok_drawable_flush_swapbuffers;
+
+    struct st_context_attribs attribs;
+    memset(&attribs, 0, sizeof(attribs));
+    attribs.profile = API_OPENGL_COMPAT;
+    attribs.major = 1;
+    attribs.minor = 0;
+    attribs.visual = ctx->visual;
+
+    enum st_context_error error = ST_CONTEXT_SUCCESS;
+    ctx->st = st_api_create_context(&ctx->frontend_screen, &attribs,
+                                    &error, NULL);
+    if (!ctx->st) {
+        printf("okGL: st_api_create_context failed (%d)\n", (int)error);
+        st_screen_destroy(&ctx->frontend_screen);
+        okgl_release_screen(ctx);
+        if (ctx->instance) vkDestroyInstance(ctx->instance, NULL);
+        free(ctx);
+        return NULL;
+    }
+    ctx->pipe = ctx->st->pipe;
+
+    return ctx;
 }
 
 OK_GLContext *
@@ -254,47 +409,25 @@ okGLCreateContext(uint32_t window_id, int width, int height)
         return NULL;
     }
 
-    ctx->frontend_screen.screen = ctx->screen;
-    ctx->frontend_screen.get_param = ok_frontend_get_param;
+    return okgl_finish_create(ctx);
+}
 
-    ctx->visual.buffer_mask = ST_ATTACHMENT_BACK_LEFT_MASK;
-    ctx->visual.color_format = PIPE_FORMAT_B8G8R8A8_UNORM;
-    ctx->visual.depth_stencil_format = PIPE_FORMAT_NONE;
-    ctx->visual.accum_format = PIPE_FORMAT_NONE;
-    ctx->visual.samples = 0;
-
-    ctx->drawable.owner = ctx;
-    ctx->drawable.base.stamp = 1;
-    ctx->drawable.base.ID = next_drawable_id++;
-    if (ctx->drawable.base.ID == 0)
-        ctx->drawable.base.ID = next_drawable_id++;
-    ctx->drawable.base.fscreen = &ctx->frontend_screen;
-    ctx->drawable.base.visual = &ctx->visual;
-    ctx->drawable.base.flush_front = ok_drawable_flush_front;
-    ctx->drawable.base.validate = ok_drawable_validate;
-    ctx->drawable.base.flush_swapbuffers = ok_drawable_flush_swapbuffers;
-
-    struct st_context_attribs attribs;
-    memset(&attribs, 0, sizeof(attribs));
-    attribs.profile = API_OPENGL_COMPAT;
-    attribs.major = 1;
-    attribs.minor = 0;
-    attribs.visual = ctx->visual;
-
-    enum st_context_error error = ST_CONTEXT_SUCCESS;
-    ctx->st = st_api_create_context(&ctx->frontend_screen, &attribs,
-                                    &error, NULL);
-    if (!ctx->st) {
-        printf("okGL: st_api_create_context failed (%d)\n", (int)error);
-        st_screen_destroy(&ctx->frontend_screen);
-        if (ctx->screen->destroy) ctx->screen->destroy(ctx->screen);
-        vkDestroyInstance(ctx->instance, NULL);
+OK_GLContext *
+okGLCreateSoftwareContext(uint32_t window_id, int width, int height)
+{
+    if (width <= 0 || height <= 0 || width > UINT16_MAX || height > UINT16_MAX)
+        return NULL;
+    OK_GLContext *ctx = (OK_GLContext *)malloc(sizeof(*ctx));
+    if (!ctx) return NULL;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->window_id = window_id;
+    ctx->width = width;
+    ctx->height = height;
+    if (okgl_acquire_software_screen(ctx)) {
         free(ctx);
         return NULL;
     }
-    ctx->pipe = ctx->st->pipe;
-
-    return ctx;
+    return okgl_finish_create(ctx);
 }
 
 int
@@ -326,6 +459,7 @@ okGLResizeContext(OK_GLContext *ctx, uint32_t window_id,
                          NULL, NULL, NULL);
 
     pipe_resource_reference(&ctx->color_resource, NULL);
+    pipe_resource_reference(&ctx->depth_resource, NULL);
     pipe_resource_reference(&ctx->readback_resource, NULL);
     ctx->width = width;
     ctx->height = height;
@@ -361,6 +495,23 @@ okGLReadback(OK_GLContext *ctx, void *pixels, int width, int height,
         (uint64_t)copy_width * (uint64_t)copy_height * 4u;
     if (readback_size64 == 0 || readback_size64 > UINT32_MAX)
         return -1;
+
+    /* Softpipe maps textures directly; image-to-buffer copies are a Zink
+     * transfer path and are not valid Gallium texture copies on all drivers. */
+    if (ctx->software_winsys) {
+        st_context_flush(ctx->st, ST_FLUSH_END_OF_FRAME, NULL, NULL, NULL);
+        struct pipe_transfer *transfer = NULL;
+        const uint8_t *source = (const uint8_t *)pipe_texture_map(
+            ctx->pipe, ctx->color_resource, 0, 0, PIPE_MAP_READ,
+            0, 0, copy_width, copy_height, &transfer);
+        if (!source || !transfer)
+            return -1;
+        for (unsigned y = 0; y < copy_height; y++)
+            memcpy((uint8_t *)pixels + (size_t)y * (size_t)pitch,
+                   source + (size_t)y * transfer->stride, (size_t)copy_width * 4u);
+        pipe_texture_unmap(ctx->pipe, transfer);
+        return 0;
+    }
 
     unsigned readback_size = (unsigned)readback_size64;
     if (!ctx->readback_resource ||
@@ -429,16 +580,13 @@ okGLDestroyContext(OK_GLContext *ctx)
     }
     printf("okGL: destroy color resource begin\n");
     pipe_resource_reference(&ctx->color_resource, NULL);
+    pipe_resource_reference(&ctx->depth_resource, NULL);
     pipe_resource_reference(&ctx->readback_resource, NULL);
     printf("okGL: destroy color resource complete\n");
     printf("okGL: destroy frontend screen begin\n");
     st_screen_destroy(&ctx->frontend_screen);
     printf("okGL: destroy frontend screen complete\n");
-    if (ctx->screen && ctx->screen->destroy) {
-        printf("okGL: destroy pipe screen begin\n");
-        ctx->screen->destroy(ctx->screen);
-        printf("okGL: destroy pipe screen complete\n");
-    }
+    okgl_release_screen(ctx);
     if (ctx->instance) {
         printf("okGL: destroy Vulkan instance begin\n");
         vkDestroyInstance(ctx->instance, NULL);

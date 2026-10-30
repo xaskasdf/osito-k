@@ -5,12 +5,19 @@
 
 #include "ole32_shim.h"
 #include "win32_abi.h"
+#include "kernel32_shim.h"
+#include "gdi32_shim.h"
+#include "installengine.h"
+#include "compat32.h"
+#include "comdlg32_shim.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern DWORD WINAPI GetCurrentProcessId(void);
 extern DWORD WINAPI GetCurrentThreadId(void);
+extern int win32_user_range_readable(PCVOID pointer, SIZE_T size, BOOL compat);
+extern int win32_user_range_writable(PVOID pointer, SIZE_T size, BOOL compat);
 
 /* Use crt_malloc from msvcrt shim for CoTaskMemAlloc */
 extern PVOID WINAPI crt_malloc(SIZE_T size);
@@ -45,6 +52,9 @@ typedef struct {
 
 static OLE32_APARTMENT_ENTRY ole32_apartments[OLE32_APARTMENT_SLOTS];
 static volatile uint32_t ole32_apartment_lock;
+
+typedef struct { DWORD process_id; PVOID object32; } OLE32_MALLOC_PROXY;
+static OLE32_MALLOC_PROXY ole32_malloc_proxies[128];
 
 static void ole32_class_lock_acquire(void)
 {
@@ -208,9 +218,16 @@ void WINAPI shim_CoUninitialize(void)
 void ole32_release_process(DWORD process_id)
 {
     if (!process_id) return;
+    installengine_release_process(process_id);
+    comdlg32_release_process(process_id);
 
     DWORD released = 0;
     ole32_apartment_lock_acquire();
+    /* Proxy pages belong to the process address space. Teardown reclaims
+     * them there; never free a child allocation through the parent's VM. */
+    for (UINT i = 0; i < sizeof(ole32_malloc_proxies) / sizeof(ole32_malloc_proxies[0]); i++)
+        if (ole32_malloc_proxies[i].process_id == process_id)
+            ole32_malloc_proxies[i] = (OLE32_MALLOC_PROXY){0};
     for (int i = 0; i < OLE32_APARTMENT_SLOTS; i++) {
         OLE32_APARTMENT_ENTRY *entry = &ole32_apartments[i];
         if (entry->process_id != process_id)
@@ -331,9 +348,16 @@ typedef struct {
 static HRESULT WINAPI imalloc_QueryInterface(PVOID self, PVOID iid,
                                               PVOID *object)
 {
-    (void)iid;
-    if (!object) return (HRESULT)0x80004003; /* E_POINTER */
-    *object = self;
+    BOOL compat = g_compat32_mode != 0;
+    if (!object || !win32_user_range_writable(object, compat ? 4 : 8, compat))
+        return (HRESULT)0x80004003; /* E_POINTER */
+    ole32_store_pointer(object, NULL);
+    static const GUID unknown = {0,0,0,{0xc0,0,0,0,0,0,0,0x46}};
+    static const GUID allocator = {2,0,0,{0xc0,0,0,0,0,0,0,0x46}};
+    if (!iid || !win32_user_range_readable(iid, sizeof(GUID), compat) ||
+        (!ole32_guid_equal(iid, &unknown) && !ole32_guid_equal(iid, &allocator)))
+        return (HRESULT)0x80004002; /* E_NOINTERFACE */
+    ole32_store_pointer(object, self);
     return S_OK;
 }
 
@@ -375,8 +399,10 @@ static SIZE_T WINAPI imalloc_GetSize(PVOID self, PVOID ptr)
 
 static int WINAPI imalloc_DidAlloc(PVOID self, PVOID ptr)
 {
-    (void)self;
-    return ptr ? 1 : 0;
+    (void)self; (void)ptr;
+    /* Task and CRT allocations currently share the process heap without
+     * origin tags. IMalloc explicitly permits an indeterminate answer. */
+    return -1;
 }
 
 static void WINAPI imalloc_HeapMinimize(PVOID self)
@@ -398,12 +424,61 @@ static K32_IMALLOC_VTBL imalloc_vtbl = {
 
 static K32_IMALLOC imalloc = { &imalloc_vtbl };
 
+static PVOID imalloc_create32(void)
+{
+    DWORD pid = GetCurrentProcessId();
+    if (!pid) pid = 1;
+    PVOID existing = NULL;
+    ole32_apartment_lock_acquire();
+    for (UINT i = 0; i < sizeof(ole32_malloc_proxies) / sizeof(ole32_malloc_proxies[0]); i++)
+        if (ole32_malloc_proxies[i].process_id == pid) existing = ole32_malloc_proxies[i].object32;
+    ole32_apartment_lock_release();
+    if (existing) return existing;
+
+    DWORD *page = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!page || (ULONG_PTR)page > UINT32_MAX - 4095u) {
+        if (page) VirtualFree(page, 0, MEM_RELEASE);
+        return NULL;
+    }
+    static const char *const names[] = {"IMalloc_QueryInterface", "IMalloc_AddRef",
+        "IMalloc_Release", "IMalloc_Alloc", "IMalloc_Realloc", "IMalloc_Free",
+        "IMalloc_GetSize", "IMalloc_DidAlloc", "IMalloc_HeapMinimize"};
+    static const BYTE counts[] = {3,1,1,2,3,2,2,2,1};
+    const ULONG_PTR targets[] = {(ULONG_PTR)imalloc_QueryInterface,
+        (ULONG_PTR)imalloc_AddRef, (ULONG_PTR)imalloc_Release, (ULONG_PTR)imalloc_Alloc,
+        (ULONG_PTR)imalloc_Realloc, (ULONG_PTR)imalloc_Free, (ULONG_PTR)imalloc_GetSize,
+        (ULONG_PTR)imalloc_DidAlloc, (ULONG_PTR)imalloc_HeapMinimize};
+    for (UINT i = 0; i < 9; i++) {
+        page[i] = compat32_make_thunk_ex(targets[i], names[i], counts[i], CC_STDCALL);
+        if (!page[i]) { VirtualFree(page, 0, MEM_RELEASE); return NULL; }
+    }
+    PVOID object = page + 16;
+    page[16] = (DWORD)(ULONG_PTR)page;
+    int empty = -1;
+    ole32_apartment_lock_acquire();
+    for (UINT i = 0; i < sizeof(ole32_malloc_proxies) / sizeof(ole32_malloc_proxies[0]); i++) {
+        if (ole32_malloc_proxies[i].process_id == pid) existing = ole32_malloc_proxies[i].object32;
+        if (!ole32_malloc_proxies[i].process_id && empty < 0) empty = (int)i;
+    }
+    if (!existing && empty >= 0) {
+        ole32_malloc_proxies[empty] = (OLE32_MALLOC_PROXY){pid, object};
+        existing = object;
+    }
+    ole32_apartment_lock_release();
+    if (existing != object) VirtualFree(page, 0, MEM_RELEASE);
+    return existing;
+}
+
 HRESULT WINAPI shim_CoGetMalloc(DWORD context, PVOID *allocator)
 {
-    if (!allocator) return (HRESULT)0x80004003; /* E_POINTER */
-    *allocator = NULL;
+    BOOL compat = g_compat32_mode != 0;
+    if (!allocator || !win32_user_range_writable(allocator, compat ? 4 : 8, compat))
+        return (HRESULT)0x80004003; /* E_POINTER */
+    ole32_store_pointer(allocator, NULL);
     if (context != 1) return (HRESULT)0x80070057; /* E_INVALIDARG */
-    *allocator = &imalloc;
+    PVOID object = compat ? imalloc_create32() : &imalloc;
+    if (!object) return OLE32_E_OUTOFMEMORY;
+    ole32_store_pointer(allocator, object);
     return S_OK;
 }
 
@@ -430,6 +505,21 @@ HRESULT WINAPI shim_RevokeDragDrop(HANDLE hwnd)
 {
     (void)hwnd;
     return S_OK;
+}
+
+HRESULT WINAPI shim_DoDragDrop(PVOID data_object, PVOID drop_source,
+                               DWORD allowed_effects, DWORD *effect)
+{
+    if (!data_object || !drop_source || !effect)
+        return OLE32_E_INVALIDARG;
+
+    /* RegisterDragDrop does not yet retain or dispatch IDropTarget objects.
+     * Expose the real four-argument ABI for delay imports, but cancel this
+     * unsupported transfer without consuming the data or claiming a drop.
+     * In particular, a MOVE result would authorize the source to delete it. */
+    (void)allowed_effects;
+    *effect = 0; /* DROPEFFECT_NONE */
+    return (HRESULT)0x00040101; /* DRAGDROP_S_CANCEL */
 }
 
 /* ── GUID utilities ────────────────────────────────────────── */
@@ -477,7 +567,8 @@ int WINAPI shim_StringFromGUID2(PVOID guid, PVOID str, int max)
 
 PWSTR WINAPI shim_SysAllocStringLen(PCWSTR source, UINT length)
 {
-    if ((SIZE_T)length > (((SIZE_T)-1 - 6) / sizeof(WCHAR))) return NULL;
+    /* The byte-length prefix and PE32 allocation size are both 32-bit. */
+    if (length > (UINT32_MAX - 6U) / sizeof(WCHAR)) return NULL;
     SIZE_T bytes = (SIZE_T)length * sizeof(WCHAR);
     BYTE *allocation = (BYTE *)crt_malloc(sizeof(DWORD) + bytes +
                                           sizeof(WCHAR));
@@ -526,21 +617,6 @@ PWSTR WINAPI shim_SysAllocStringByteLen(PCSTR source, UINT length)
 }
 
 typedef struct {
-    USHORT vt;
-    USHORT reserved1;
-    USHORT reserved2;
-    USHORT reserved3;
-    union {
-        LONG lVal;
-        PWSTR bstrVal;
-        PVOID interface_pointer;
-        ULONG_PTR raw[2];
-    } value;
-} OLE32_VARIANT;
-
-_Static_assert(sizeof(OLE32_VARIANT) == 24, "Win64 VARIANT ABI");
-
-typedef struct {
     const PVOID lpVtbl;
 } OLE32_UNKNOWN;
 
@@ -570,7 +646,10 @@ static void ole32_interface_release(PVOID interface_pointer)
 
 void WINAPI shim_VariantInit(PVOID variant)
 {
-    if (variant) *(OLE32_VARIANT *)variant = (OLE32_VARIANT){0};
+    if (!variant) return;
+    BYTE *value = variant;
+    SIZE_T size = g_compat32_mode ? 16 : 24;
+    for (SIZE_T i = 0; i < size; i++) value[i] = 0;
 }
 
 static ULONG_PTR ole32_prop_read_pointer(const BYTE *address)
@@ -601,6 +680,75 @@ static void ole32_prop_release_interface(PVOID interface_pointer)
     if (!release) return;
     uint32_t arguments[1] = { object };
     compat32_callback_args(release, 1, arguments);
+}
+
+void WINAPI shim_ReleaseStgMedium(PVOID medium)
+{
+    if (!medium) return;
+    BYTE *value = (BYTE *)medium;
+    BOOL compat32 = g_compat32_mode;
+    SIZE_T data_offset = compat32 ? 4 : 8;
+    SIZE_T owner_offset = compat32 ? 8 : 16;
+    DWORD type = *(DWORD *)value;
+    PVOID resource = (PVOID)ole32_prop_read_pointer(value + data_offset);
+    PVOID owner = (PVOID)ole32_prop_read_pointer(value + owner_offset);
+    typedef PVOID (WINAPI *GLOBAL_OP)(PVOID);
+    typedef BOOL (WINAPI *DELETE_OP)(PVOID);
+    GLOBAL_OP free_global = (GLOBAL_OP)kernel32_resolve("GlobalFree", 0, FALSE);
+
+    if (resource) {
+        switch (type) {
+        case 1: /* TYMED_HGLOBAL: an explicit owner retains its allocation. */
+            if (!owner && free_global) free_global(resource);
+            break;
+        case 2: /* TYMED_FILE: the name is always ours, the file may not be. */
+            if (!owner) DeleteFileW((PCWSTR)resource);
+            shim_CoTaskMemFree(resource);
+            break;
+        case 4: /* TYMED_ISTREAM */
+        case 8: /* TYMED_ISTORAGE: release this reference even with an owner. */
+            ole32_prop_release_interface(resource);
+            break;
+        case 16: /* TYMED_GDI */
+            if (!owner) DeleteObject((HGDIOBJ)resource);
+            break;
+        case 32: /* TYMED_MFPICT */
+        case 64: /* TYMED_ENHMF */
+            if (!owner) {
+                DELETE_OP destroy = (DELETE_OP)gdi32_resolve(
+                    type == 32 ? "DeleteMetaFile" : "DeleteEnhMetaFile", 0, FALSE);
+                /* Metafile creation/destruction is not implemented by GDI
+                 * yet. Do not pass an opaque metafile to a heap allocator. */
+                if (!destroy) {
+                    serial_puts("[OLE32] ReleaseStgMedium unsupported metafile\n");
+                    break;
+                }
+                if (type == 64) {
+                    destroy(resource);
+                } else {
+                    GLOBAL_OP lock = (GLOBAL_OP)kernel32_resolve("GlobalLock", 0, FALSE);
+                    DELETE_OP unlock = (DELETE_OP)kernel32_resolve("GlobalUnlock", 0, FALSE);
+                    BYTE *picture = lock ? (BYTE *)lock(resource) : NULL;
+                    if (picture) {
+                        PVOID metafile = (PVOID)ole32_prop_read_pointer(
+                            picture + (compat32 ? 12 : 16));
+                        destroy(metafile);
+                        if (unlock) unlock(resource);
+                    }
+                    if (free_global) free_global(resource);
+                }
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    *(DWORD *)value = 0; /* TYMED_NULL; leave the inactive union untouched. */
+    if (owner) {
+        ole32_prop_release_interface(owner);
+        if (compat32) *(uint32_t *)(value + owner_offset) = 0;
+        else *(ULONG_PTR *)(value + owner_offset) = 0;
+    }
 }
 
 static HRESULT ole32_prop_clear_value(BYTE *value)
@@ -703,6 +851,182 @@ static HRESULT WINAPI shim_PropVariantClear(PVOID prop_variant)
     return ole32_prop_clear_value((BYTE *)prop_variant);
 }
 
+static void ole32_prop_write_pointer(BYTE *address, PVOID pointer)
+{
+    if (g_compat32_mode) *(uint32_t *)address = (uint32_t)(ULONG_PTR)pointer;
+    else *(ULONG_PTR *)address = (ULONG_PTR)pointer;
+}
+
+static void ole32_prop_addref_interface(PVOID interface_pointer)
+{
+    if (!interface_pointer) return;
+    if (!g_compat32_mode) {
+        ole32_interface_addref(interface_pointer);
+        return;
+    }
+    uint32_t object = (uint32_t)(ULONG_PTR)interface_pointer;
+    uint32_t vtable = *(const uint32_t *)(ULONG_PTR)object;
+    if (!vtable) return;
+    uint32_t addref = *(const uint32_t *)(ULONG_PTR)(vtable + 4);
+    if (!addref) return;
+    uint32_t arguments[1] = { object };
+    compat32_callback_args(addref, 1, arguments);
+}
+
+static HRESULT ole32_prop_copy_bytes(BYTE *pointer_slot, const BYTE *source,
+                                     SIZE_T bytes)
+{
+    ole32_prop_write_pointer(pointer_slot, NULL);
+    if (!source) return bytes ? OLE32_E_INVALIDARG : S_OK;
+    SIZE_T limit = g_compat32_mode ? 0xFFFFFFE0ULL : (SIZE_T)-32;
+    if (bytes > limit) return OLE32_E_OUTOFMEMORY;
+    BYTE *copy = (BYTE *)shim_CoTaskMemAlloc(bytes);
+    if (!copy) return OLE32_E_OUTOFMEMORY;
+    for (SIZE_T i = 0; i < bytes; i++) copy[i] = source[i];
+    ole32_prop_write_pointer(pointer_slot, copy);
+    return S_OK;
+}
+
+static SIZE_T ole32_prop_vector_size(USHORT type)
+{
+    switch (type) {
+    case 16: case 17: return 1;
+    case 2: case 11: case 18: return 2;
+    case 3: case 4: case 10: case 19: case 22: case 23: return 4;
+    case 5: case 6: case 7: case 20: case 21: case 64: return 8;
+    case 72: return 16;
+    case 8: case 9: case 13: case 30: case 31:
+        return g_compat32_mode ? 4 : 8;
+    case 12: return g_compat32_mode ? 16 : 24;
+    default: return 0;
+    }
+}
+
+static HRESULT ole32_prop_copy_value(BYTE *destination, const BYTE *source,
+                                     unsigned depth)
+{
+    SIZE_T value_size = g_compat32_mode ? 16 : 24;
+    SIZE_T pointer_offset = g_compat32_mode ? 12 : 16;
+    /* Even a self-copy duplicates owned data. Preserve the input header before
+     * replacing any output pointers; PropVariantCopy does not clear pvarDest. */
+    BYTE saved[24];
+    for (SIZE_T i = 0; i < value_size; i++) saved[i] = source[i];
+    ole32_prop_zero(destination);
+    if (depth >= 64) return OLE32_E_INVALIDARG;
+    USHORT type = *(const USHORT *)saved;
+    USHORT base_type = type & 0x0FFF;
+    if (type & 0x8000) return (HRESULT)0x80020008; /* DISP_E_BADVARTYPE */
+    if (type & 0x4000) { /* VT_BYREF retains the borrowed address. */
+        for (SIZE_T i = 0; i < value_size; i++) destination[i] = saved[i];
+        return S_OK;
+    }
+    if (type & 0x2000) return (HRESULT)0x80004001; /* SAFEARRAY not implemented. */
+
+    if (type & 0x1000) {
+        SIZE_T stride = ole32_prop_vector_size(base_type);
+        if (!stride) return (HRESULT)0x80020008;
+        DWORD count = *(const DWORD *)(saved + 8);
+        const BYTE *input = (const BYTE *)ole32_prop_read_pointer(
+            saved + pointer_offset);
+        SIZE_T limit = g_compat32_mode ? 0xFFFFFFE0ULL : (SIZE_T)-32;
+        if ((SIZE_T)count > limit / stride) return OLE32_E_OUTOFMEMORY;
+        if (count && !input) return OLE32_E_INVALIDARG;
+        for (SIZE_T i = 0; i < value_size; i++) destination[i] = saved[i];
+        ole32_prop_write_pointer(destination + pointer_offset, NULL);
+        if (!count) return S_OK;
+        SIZE_T bytes = (SIZE_T)count * stride;
+        BYTE *elements = (BYTE *)shim_CoTaskMemAlloc(bytes);
+        if (!elements) {
+            ole32_prop_zero(destination);
+            return OLE32_E_OUTOFMEMORY;
+        }
+        for (SIZE_T i = 0; i < bytes; i++) elements[i] = 0;
+        ole32_prop_write_pointer(destination + pointer_offset, elements);
+        /* A failed element leaves only earlier completed elements to clear. */
+        *(DWORD *)(destination + 8) = 0;
+        for (DWORD i = 0; i < count; i++) {
+            HRESULT status = S_OK;
+            if (base_type == 12) {
+                status = ole32_prop_copy_value(elements + i * stride,
+                                               input + i * stride, depth + 1);
+            } else if (base_type == 8 || base_type == 9 || base_type == 13 ||
+                       base_type == 30 || base_type == 31) {
+                BYTE item[24] = {0}, copy[24];
+                *(USHORT *)item = base_type;
+                ole32_prop_write_pointer(item + 8,
+                    (PVOID)ole32_prop_read_pointer(input + i * stride));
+                status = ole32_prop_copy_value(copy, item, depth + 1);
+                if (status == S_OK) ole32_prop_write_pointer(elements + i * stride,
+                    (PVOID)ole32_prop_read_pointer(copy + 8));
+            } else {
+                for (SIZE_T j = 0; j < stride; j++)
+                    elements[i * stride + j] = input[i * stride + j];
+            }
+            if (status != S_OK) {
+                ole32_prop_clear_value(destination);
+                return status;
+            }
+            *(DWORD *)(destination + 8) = i + 1;
+        }
+        return S_OK;
+    }
+
+    HRESULT status = S_OK;
+    PVOID pointer = (PVOID)ole32_prop_read_pointer(saved + 8);
+    for (SIZE_T i = 0; i < value_size; i++) destination[i] = saved[i];
+    switch (base_type) {
+    case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7:
+    case 10: case 11: case 14: case 16: case 17: case 18: case 19:
+    case 20: case 21: case 22: case 23: case 64:
+        break;
+    case 8: { /* Native PropVariantCopy uses terminated BSTR text. */
+        PWSTR copy = shim_SysAllocString((PCWSTR)pointer);
+        ole32_prop_write_pointer(destination + 8, copy);
+        if (pointer && !copy) status = OLE32_E_OUTOFMEMORY;
+        break;
+    }
+    case 9: case 13: case 66: case 67: case 68: case 69:
+        ole32_prop_addref_interface(pointer);
+        break;
+    case 30: case 31: case 72: {
+        SIZE_T bytes = 0;
+        if (pointer) {
+            if (base_type == 72) bytes = 16;
+            else if (base_type == 30) {
+                const BYTE *string = (const BYTE *)pointer;
+                while (string[bytes]) bytes++;
+                bytes++;
+            } else {
+                PCWSTR string = (PCWSTR)pointer;
+                while (string[bytes]) bytes++;
+                bytes = (bytes + 1) * sizeof(WCHAR);
+            }
+        }
+        status = ole32_prop_copy_bytes(destination + 8, pointer, bytes);
+        break;
+    }
+    case 65: /* VT_BLOB */
+        status = ole32_prop_copy_bytes(destination + pointer_offset,
+            (const BYTE *)ole32_prop_read_pointer(saved + pointer_offset),
+            *(const DWORD *)(saved + 8));
+        break;
+    case 70: case 71: case 73: case 0xFFF:
+        status = (HRESULT)0x80004001; /* Owned formats not implemented yet. */
+        break;
+    default:
+        status = (HRESULT)0x80020008;
+        break;
+    }
+    if (status != S_OK) ole32_prop_zero(destination);
+    return status;
+}
+
+static HRESULT WINAPI shim_PropVariantCopy(PVOID destination, PCVOID source)
+{
+    if (!destination || !source) return OLE32_E_INVALIDARG;
+    return ole32_prop_copy_value((BYTE *)destination, (const BYTE *)source, 0);
+}
+
 /* ── Export table ──────────────────────────────────────────── */
 
 static void ole32_test_expect(BOOL condition, const char *name,
@@ -778,7 +1102,52 @@ int ole32_apartment_selftest(void)
 
 typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
+static HRESULT WINAPI shim_CoSetProxyBlanket(PVOID proxy, DWORD authn_service,
+    DWORD authz_service, PWSTR principal, DWORD authn_level, DWORD impersonation,
+    PVOID identity, DWORD capabilities)
+{
+    if (!proxy) return OLE32_E_INVALIDARG;
+    static const GUID client_security = {0x13d,0,0,{0xc0,0,0,0,0,0,0,0x46}};
+    if (g_compat32_mode) {
+        /* QueryInterface's IID and output slot must be addressable by PE32. */
+        BYTE *scratch = shim_CoTaskMemAlloc(20);
+        if (!scratch) return OLE32_E_OUTOFMEMORY;
+        for (unsigned i = 0; i < 16; i++) scratch[i] = ((const BYTE *)&client_security)[i];
+        *(DWORD *)(scratch + 16) = 0;
+        const uint32_t *table = (const uint32_t *)(ULONG_PTR)*(const uint32_t *)proxy;
+        uint32_t query[3] = {(uint32_t)(ULONG_PTR)proxy, (uint32_t)(ULONG_PTR)scratch,
+                             (uint32_t)(ULONG_PTR)(scratch + 16)};
+        HRESULT result = (HRESULT)compat32_callback_args(table[0], 3, query);
+        uint32_t security = *(DWORD *)(scratch + 16);
+        shim_CoTaskMemFree(scratch);
+        if (result < 0) return result;
+        if (!security) return (HRESULT)0x80004002; /* E_NOINTERFACE */
+        table = (const uint32_t *)(ULONG_PTR)*(const uint32_t *)(ULONG_PTR)security;
+        uint32_t arguments[9] = {security, (uint32_t)(ULONG_PTR)proxy,
+            authn_service, authz_service, (uint32_t)(ULONG_PTR)principal,
+            authn_level, impersonation, (uint32_t)(ULONG_PTR)identity, capabilities};
+        result = (HRESULT)compat32_callback_args(table[4], 9, arguments);
+        compat32_callback_args(table[2], 1, &security);
+        return result;
+    }
+    OLE32_UNKNOWN *unknown = proxy;
+    const OLE32_UNKNOWN_VTBL *table = unknown->lpVtbl;
+    PVOID security = NULL;
+    HRESULT result = table->QueryInterface(proxy, &client_security, &security);
+    if (result < 0) return result;
+    if (!security) return (HRESULT)0x80004002;
+    const PVOID *methods = ((OLE32_UNKNOWN *)security)->lpVtbl;
+    typedef HRESULT (WINAPI *SET_BLANKET)(PVOID, PVOID, DWORD, DWORD, PWSTR,
+                                         DWORD, DWORD, PVOID, DWORD);
+    result = ((SET_BLANKET)methods[4])(security, proxy, authn_service, authz_service,
+                                      principal, authn_level, impersonation,
+                                      identity, capabilities);
+    ole32_interface_release(security);
+    return result;
+}
+
 static const SHIM_EXPORT ole32_exports[] = {
+    { "CoSetProxyBlanket", (PVOID)shim_CoSetProxyBlanket, 8, CC_STDCALL },
     { "CoInitialize",      (PVOID)shim_CoInitialize,     1, CC_STDCALL },
     { "CoInitializeEx",    (PVOID)shim_CoInitializeEx,   2, CC_STDCALL },
     { "CoUninitialize",    (PVOID)shim_CoUninitialize,   0, CC_STDCALL },
@@ -787,8 +1156,11 @@ static const SHIM_EXPORT ole32_exports[] = {
     { "CoTaskMemAlloc",    (PVOID)shim_CoTaskMemAlloc,   1, CC_STDCALL },
     { "CoTaskMemFree",     (PVOID)shim_CoTaskMemFree,    1, CC_STDCALL },
     { "PropVariantClear",  (PVOID)shim_PropVariantClear, 1, CC_STDCALL },
+    { "PropVariantCopy",   (PVOID)shim_PropVariantCopy,  2, CC_STDCALL },
     { "OleInitialize",     (PVOID)shim_OleInitialize,    1, CC_STDCALL },
     { "OleUninitialize",   (PVOID)shim_OleUninitialize,  0, CC_STDCALL },
+    { "DoDragDrop",        (PVOID)shim_DoDragDrop,       4, CC_STDCALL },
+    { "ReleaseStgMedium",  (PVOID)shim_ReleaseStgMedium, 1, CC_STDCALL },
     { "RegisterDragDrop",  (PVOID)shim_RegisterDragDrop, 2, CC_STDCALL },
     { "RevokeDragDrop",    (PVOID)shim_RevokeDragDrop,   1, CC_STDCALL },
     { "CoCreateGuid",      (PVOID)shim_CoCreateGuid,     1, CC_STDCALL },
@@ -797,57 +1169,84 @@ static const SHIM_EXPORT ole32_exports[] = {
     { NULL, NULL, 0, CC_STDCALL }
 };
 
+static BOOL ole32_variant_type_valid(USHORT type)
+{
+    if (type & 0x9000) return FALSE; /* reserved / PROPVARIANT vector */
+    USHORT base = type & 0x0fff;
+    if (base == 0 || base == 1) return type == base;
+    return (base >= 2 && base <= 14) ||
+           (base >= 16 && base <= 23) || base == 36;
+}
+
 HRESULT WINAPI shim_VariantClear(PVOID variant)
 {
     if (!variant) return (HRESULT)0x80070057; /* E_INVALIDARG */
-    OLE32_VARIANT *value = (OLE32_VARIANT *)variant;
-    USHORT type = value->vt;
+    BYTE *value = variant;
+    USHORT type = *(USHORT *)value;
+    if (!ole32_variant_type_valid(type)) return (HRESULT)0x80020008;
     if (!(type & 0x4000)) { /* VT_BYREF does not own the referenced value. */
-        switch (type & 0x0FFF) {
+        PVOID pointer = (PVOID)ole32_prop_read_pointer(value + 8);
+        if (type & 0x2000) {
+            /* SAFEARRAY ownership must never be mistaken for a BSTR. */
+            if (pointer) return (HRESULT)0x80004001;
+        } else switch (type & 0x0FFF) {
         case 8:  /* VT_BSTR */
-            shim_SysFreeString(value->value.bstrVal);
+            shim_SysFreeString(pointer);
             break;
         case 9:  /* VT_DISPATCH */
         case 13: /* VT_UNKNOWN */
-            ole32_interface_release(value->value.interface_pointer);
+            ole32_prop_release_interface(pointer);
+            break;
+        case 36: /* IRecordInfo-backed records are not implemented. */
+            if (pointer || ole32_prop_read_pointer(
+                    value + (g_compat32_mode ? 12 : 16)))
+                return (HRESULT)0x80004001;
             break;
         default:
-            if (type & 0x2000) return (HRESULT)0x80004001;
             break;
         }
     }
-    *value = (OLE32_VARIANT){0};
+    /* Native Clear changes the type only; other bytes are no longer owned. */
+    *(USHORT *)value = 0;
     return S_OK;
 }
 
 HRESULT WINAPI shim_VariantCopy(PVOID destination, PCVOID source)
 {
     if (!destination || !source) return (HRESULT)0x80070057;
+    const BYTE *in = source;
+    USHORT type = *(const USHORT *)in;
+    if (!ole32_variant_type_valid(type)) return (HRESULT)0x80020008;
     if (destination == source) return S_OK;
-    HRESULT status = shim_VariantClear(destination);
-    if (status != S_OK) return status;
-
-    OLE32_VARIANT *out = (OLE32_VARIANT *)destination;
-    const OLE32_VARIANT *in = (const OLE32_VARIANT *)source;
-    *out = *in;
-    if (!(in->vt & 0x4000)) {
-        switch (in->vt & 0x0FFF) {
-        case 8: {
-            UINT length = shim_SysStringLen(in->value.bstrVal);
-            out->value.bstrVal = in->value.bstrVal
-                ? shim_SysAllocStringLen(in->value.bstrVal, length) : NULL;
-            if (in->value.bstrVal && !out->value.bstrVal) {
-                *out = (OLE32_VARIANT){0};
-                return (HRESULT)0x8007000E;
-            }
-            break;
-        }
-        case 9:
-        case 13:
-            ole32_interface_addref(out->value.interface_pointer);
-            break;
+    SIZE_T size = g_compat32_mode ? 16 : 24;
+    BYTE saved[24];
+    for (SIZE_T i = 0; i < size; i++) saved[i] = in[i];
+    PVOID pointer = (PVOID)ole32_prop_read_pointer(saved + 8);
+    PWSTR string = NULL;
+    BOOL interface_owned = FALSE;
+    if (!(type & 0x4000)) {
+        if (type & 0x2000) {
+            if (pointer) return (HRESULT)0x80004001;
+        } else if (type == 8) {
+            string = shim_SysAllocStringByteLen((PCSTR)pointer,
+                shim_SysStringByteLen((PCWSTR)pointer));
+            if (!string) return OLE32_E_OUTOFMEMORY;
+            ole32_prop_write_pointer(saved + 8, string);
+        } else if (type == 9 || type == 13) {
+            ole32_prop_addref_interface(pointer);
+            interface_owned = TRUE;
+        } else if (type == 36 && (pointer || ole32_prop_read_pointer(
+                saved + (g_compat32_mode ? 12 : 16)))) {
+            return (HRESULT)0x80004001;
         }
     }
+    HRESULT status = shim_VariantClear(destination);
+    if (status != S_OK) {
+        shim_SysFreeString(string);
+        if (interface_owned) ole32_prop_release_interface(pointer);
+        return status;
+    }
+    for (SIZE_T i = 0; i < size; i++) ((BYTE *)destination)[i] = saved[i];
     return S_OK;
 }
 
@@ -862,6 +1261,7 @@ static const SHIM_EXPORT oleaut32_exports[] = {
     { "VariantInit", (PVOID)shim_VariantInit, 1, CC_STDCALL },
     { "VariantClear", (PVOID)shim_VariantClear, 1, CC_STDCALL },
     { "VariantCopy", (PVOID)shim_VariantCopy, 2, CC_STDCALL },
+    { "VariantChangeType", (PVOID)shim_VariantChangeType, 4, CC_STDCALL },
     { NULL, NULL, 0, CC_STDCALL }
 };
 
@@ -903,6 +1303,7 @@ PVOID oleaut32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
         case 8: return (PVOID)shim_VariantInit;
         case 9: return (PVOID)shim_VariantClear;
         case 10: return (PVOID)shim_VariantCopy;
+        case 12: return (PVOID)shim_VariantChangeType;
         case 149: return (PVOID)shim_SysStringByteLen;
         case 150: return (PVOID)shim_SysAllocStringByteLen;
         default: return NULL;
@@ -918,6 +1319,7 @@ PVOID oleaut32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 
 PVOID ole32_shim_init(void)
 {
+    installengine_init();
     serial_puts("[OLE32] ole32.dll shim initialized\n");
     return (PVOID)ole32_exports;
 }

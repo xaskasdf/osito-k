@@ -314,7 +314,8 @@ load_only_return:
     jc fail_load_only
     cmpb $0, load_only_started
     jne load_only_resumed
-    cmpw $0xfffa, exec_block + 14
+    /* COM return word at FFFEh, then the load-only initial AX at FFFCh. */
+    cmpw $0xfffc, exec_block + 14
     jne fail_load_only
     cmpw $0x0100, exec_block + 18
     jne fail_load_only
@@ -332,7 +333,7 @@ load_only_return:
     movw parent_psp, %dx
     cmpw %dx, %es:0x16
     jne fail_load_only
-    cmpw $0, %es:0xfffa
+    cmpw $0, %es:0xfffc
     jne fail_load_only
     movw $0x2f00, %ax
     int $0x21
@@ -439,7 +440,7 @@ dpmi_load_only_return:
     jc fail_dpmi_load_only
     cmpb $0, dpmi_load_only_started
     jne dpmi_load_only_resumed
-    cmpw $0xfffa, exec_block + 14
+    cmpw $0xfffc, exec_block + 14
     jne fail_dpmi_load_only
     cmpw $0x0100, exec_block + 18
     jne fail_dpmi_load_only

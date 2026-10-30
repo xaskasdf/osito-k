@@ -5,7 +5,7 @@
  * Works with: minicom -D /dev/ttyS0 -b 115200
  */
 
-#include "../include/types.h"
+#include "serial.h"
 
 #define COM1_PORT   0x3F8
 
@@ -19,23 +19,40 @@
 #define LSR_TX_EMPTY  0x20
 #define LSR_RX_READY  0x01
 
-#define SERIAL_TX_SPINS 4096u
+#define SERIAL_TX_CAPACITY 16384u
+#define SERIAL_FLUSH_NS 20000000ULL
+#define SERIAL_RECORD_BYTES 64u
 
-static volatile int serial_lock = 0;
-static inline int serial_acquire(void) {
-    for (uint32_t spins = 0; spins < 1000000; spins++) {
-        if (!__sync_lock_test_and_set(&serial_lock, 1))
-            return 1;
-        __asm__ volatile ("pause" ::: "memory");
-    }
-    return 0;
+static serial_tx_slot_t tx_slots[SERIAL_TX_CAPACITY];
+static serial_tx_t tx;
+
+static uint8_t uart_status(void *opaque)
+{
+    (void)opaque;
+    return inb(COM1_PORT + REG_LSR);
 }
-static inline void serial_release(void) {
-    __sync_lock_release(&serial_lock);
+
+static void uart_write(void *opaque, uint8_t value)
+{
+    (void)opaque;
+    outb(COM1_PORT + REG_DATA, value);
 }
+
+static uint64_t uart_now_ns(void *opaque)
+{
+    extern uint64_t idt_get_tsc_freq(void);
+    extern uint64_t idt_get_monotonic_ns(void);
+    (void)opaque;
+    return idt_get_tsc_freq() ? idt_get_monotonic_ns() : 0;
+}
+
+static const serial_tx_ops_t uart_ops = {uart_status, uart_write, uart_now_ns};
 
 void serial_init(void)
 {
+    bool present = inb(COM1_PORT + REG_LSR) != 0xff;
+    serial_tx_init(&tx, tx_slots, SERIAL_TX_CAPACITY, 1, present, &uart_ops, NULL);
+    if (!present) return;
     outb(COM1_PORT + REG_IER, 0x00);   /* Disable interrupts */
     outb(COM1_PORT + REG_LCR, 0x80);   /* DLAB=1 (set baud divisor) */
     outb(COM1_PORT + 0, 0x01);         /* Divisor lo: 1 = 115200 baud */
@@ -43,82 +60,116 @@ void serial_init(void)
     outb(COM1_PORT + REG_LCR, 0x03);   /* 8 bits, no parity, 1 stop */
     outb(COM1_PORT + REG_FCR, 0xC7);   /* Enable FIFO, 14-byte threshold */
     outb(COM1_PORT + REG_MCR, 0x0B);   /* DTR + RTS + OUT2 */
+    if ((inb(COM1_PORT + REG_FCR) & 0xc0) == 0xc0)
+        tx.fifo_depth = 16;
+    else
+        outb(COM1_PORT + REG_FCR, 0);  /* Do not use a broken 16550 FIFO. */
+}
+
+static void serial_record(const char *data, uint32_t length)
+{
+    extern bool shell_remote_capture(const char *, size_t) __attribute__((weak));
+    if (shell_remote_capture && shell_remote_capture(data, length)) return;
+    /* Keep the memory log independent of UART backpressure and availability. */
+    extern void klog_putc(char c) __attribute__((weak));
+    if (klog_putc)
+        for (uint32_t i = 0; i < length; i++) klog_putc(data[i]);
+    serial_tx_enqueue(&tx, data, length);
+    extern bool sched_is_enabled(void) __attribute__((weak));
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(flags));
+    /* Runtime diagnostics must not hold network/device dispatch waiting for
+     * the UART. The timer drains the queue; early boot and fatal paths still
+     * use the bounded synchronous flush when that consumer cannot run. */
+    if (sched_is_enabled && sched_is_enabled() && (flags & (1u << 9)))
+        serial_poll();
+    else
+        serial_flush();
 }
 
 void serial_putc(char c)
 {
-    /* Tee EVERY byte to klog. Doing this here (rather than only in
-     * serial_puts) means serial_puthex/putdec are captured too — they
-     * use serial_putc for each digit and bypass serial_puts entirely.
-     * Cost: one extra function call per byte; klog_putc is a ring-buf
-     * append, cheap. */
-    extern void klog_putc(char c) __attribute__((weak));
-    if (klog_putc) klog_putc(c);
-
-    for (uint32_t spins = 0; spins < SERIAL_TX_SPINS; spins++) {
-        if (inb(COM1_PORT + REG_LSR) & LSR_TX_EMPTY) {
-            outb(COM1_PORT + REG_DATA, (uint8_t)c);
-            return;
-        }
-        __asm__ volatile ("pause" ::: "memory");
-    }
+    serial_record(&c, 1);
 }
 
 void serial_putchar(char c)
 {
-    if (c == '\n') serial_putc('\r');
-    serial_putc(c);
+    if (c == '\n') serial_record("\r\n", 2);
+    else serial_putc(c);
 }
 
 void serial_puts(const char *s)
 {
-    /* klog tee happens at the serial_putc level — see comment there.
-     * No need to klog_puts(s) explicitly here. */
-    int locked = serial_acquire();
-    while (*s) {
-        if (*s == '\n') serial_putc('\r');
-        serial_putc(*s++);
-    }
-    if (locked) serial_release();
+    if (s) serial_write(s, strlen(s));
 }
 
 void serial_write(const char *data, uint64_t length)
 {
     if (!data || !length) return;
 
-    int locked = serial_acquire();
+    char record[SERIAL_RECORD_BYTES];
+    uint32_t used = 0;
     for (uint64_t i = 0; i < length; i++) {
         char c = data[i];
         if (!c) continue;
-        if (c == '\n') serial_putc('\r');
-        serial_putc(c);
+        uint32_t needed = c == '\n' ? 2 : 1;
+        if (used + needed > sizeof(record)) {
+            serial_record(record, used);
+            used = 0;
+        }
+        if (c == '\n') record[used++] = '\r';
+        record[used++] = c;
     }
-    if (locked) serial_release();
+    if (used) serial_record(record, used);
 }
 
 void serial_puthex(uint64_t val, int digits)
 {
     static const char hex[] = "0123456789ABCDEF";
-    serial_puts("0x");
-    for (int i = (digits - 1) * 4; i >= 0; i -= 4)
-        serial_putc(hex[(val >> i) & 0xF]);
+    char record[18] = {'0', 'x'};
+    if (digits < 0) digits = 0;
+    if (digits > 16) digits = 16;
+    for (int i = 0; i < digits; i++)
+        record[2 + i] = hex[(val >> ((digits - i - 1) * 4)) & 0xf];
+    serial_record(record, 2 + digits);
 }
 
 void serial_putdec(uint64_t val)
 {
     char buf[20];
-    int i = 0;
-    if (val == 0) { serial_putc('0'); return; }
-    while (val > 0) {
-        buf[i++] = '0' + (val % 10);
+    uint32_t i = sizeof(buf);
+    do {
+        buf[--i] = '0' + (val % 10);
         val /= 10;
-    }
-    while (--i >= 0) serial_putc(buf[i]);
+    } while (val);
+    serial_record(buf + i, sizeof(buf) - i);
 }
 
 int serial_getc(void)
 {
-    if (!(inb(COM1_PORT + REG_LSR) & LSR_RX_READY))
+    if (!tx.present || !(inb(COM1_PORT + REG_LSR) & LSR_RX_READY))
         return -1;
     return inb(COM1_PORT + REG_DATA);
+}
+
+void serial_poll(void)
+{
+    serial_tx_poll(&tx);
+}
+
+void serial_poll_irq(void)
+{
+    /* Port I/O may cause expensive VM exits. Keep the timer's UART work to
+     * one byte; ordinary producers can drain larger batches preemptibly. */
+    serial_tx_poll_limit(&tx, 1);
+}
+
+bool serial_flush(void)
+{
+    return serial_tx_flush(&tx, SERIAL_FLUSH_NS);
+}
+
+void serial_get_stats(serial_stats_t *stats)
+{
+    if (stats) serial_tx_stats(&tx, stats);
 }

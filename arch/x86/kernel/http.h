@@ -42,6 +42,7 @@ typedef struct {
     int         tcp_conn;
     bool        connected;
     bool        use_tls13;     /* set by http_open: true if TLS 1.3 succeeded */
+    bool        plaintext;     /* explicitly requested HTTP, without TLS */
 } http_session_t;
 
 /* ── HTTP API ───────────────────────────────────────────────── */
@@ -50,6 +51,11 @@ typedef struct {
  * Performs DNS + TCP + TLS handshake.
  * Returns 0 on success, -1 on failure. */
 int http_open(http_session_t *s, const char *hostname);
+
+/* Explicit scheme/port variant for system downloaders. The HTTPS entry point
+ * above keeps its existing port 443 and certificate-verification behavior. */
+int http_open_port(http_session_t *s, const char *hostname, uint16_t port,
+                    bool use_tls);
 
 /* Send HTTP request and receive response headers.
  * method: "GET" or "POST"
@@ -77,6 +83,8 @@ int http_read_body_full(http_session_t *s, const http_response_t *resp,
 
 /* Close HTTPS session. */
 void http_close(http_session_t *s);
+/* Forced owner teardown, after the thread using this session has stopped. */
+void http_abort(http_session_t *s);
 
 /* Get a response header value by name (case-insensitive).
  * Returns pointer to value string, or NULL if not found. */

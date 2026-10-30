@@ -360,6 +360,18 @@ void __initk mem_reserve_boot_stack(uint64_t boot_rsp)
     serial_puts(" pages)\n");
 }
 
+bool __initk mem_reserve_boot_stack_region(uint64_t base, uint64_t size)
+{
+    if (!size || ((base | size) & (PAGE_SIZE - 1)) ||
+        base >= MAX_PHYS_PAGES * PAGE_SIZE || size > MAX_PHYS_PAGES * PAGE_SIZE - base) return false;
+    /* Before the first allocation, a non-free bit can be LoaderData retained
+     * in the original EFI map, not a conflicting runtime allocation. */
+    mem_reserve_kernel(base, size);
+    __atomic_store_n(&identity_boot_stack_base, base, __ATOMIC_RELAXED);
+    __atomic_store_n(&identity_boot_stack_limit, base + size, __ATOMIC_RELEASE);
+    return true;
+}
+
 /* Return the end of a live low-identity reservation intersecting the
  * candidate range. Zero means free; UINT64_MAX denotes invalid input. This
  * intentionally does not expose every PMM-reserved page: only aliases that

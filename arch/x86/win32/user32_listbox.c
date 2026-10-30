@@ -969,8 +969,7 @@ static BOOL list_message(U32_LISTBOX *list, HWND window, DWORD message,
         list_redraw(list, window); return TRUE;
     }
     case 0x020A: {
-        UINT lines = 3;
-        SystemParametersInfoW(0x0068, 0, &lines, 0);
+        UINT lines = user32_wheel_scroll_lines();
         list->wheel += (short)((UINT)wp >> 16);
         int steps = list->wheel / 120;
         list->wheel %= 120;

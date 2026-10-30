@@ -59,7 +59,7 @@ static int ci_eq(const char *a, const char *b)
 
 void win32_abi_register(const char *dll_name, const WIN32_EXPORT *table, int count)
 {
-    if (!dll_name || !table) return;
+    if (!dll_name || !table || count <= 0) return;
     for (int i = 0; i < g_abi_count; i++) {
         if (ci_eq(g_abi[i].dll, dll_name)) {
             g_abi[i].table = table;
@@ -72,6 +72,15 @@ void win32_abi_register(const char *dll_name, const WIN32_EXPORT *table, int cou
     g_abi[g_abi_count].table = table;
     g_abi[g_abi_count].count = count;
     g_abi_count++;
+}
+
+void win32_abi_register_provider(const char *dll_name,
+                                 const WIN32_EXPORT *(*provider)(int *))
+{
+    if (!provider) return;
+    int count = 0;
+    const WIN32_EXPORT *table = provider(&count);
+    win32_abi_register(dll_name, table, count);
 }
 
 static const WIN32_EXPORT *find_in_table(const WIN32_EXPORT *t, int n,

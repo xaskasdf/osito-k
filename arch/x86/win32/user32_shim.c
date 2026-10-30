@@ -11,12 +11,20 @@
 #include "user32_listbox.h"
 #include "gdi32_shim.h"
 #include "kernel32_shim.h"
+#include "winmm_shim.h"
+#include "ntjob.h"
+#include "ntprocess.h"
+#include "ntsyscall.h"
+#include "advapi32_shim.h"
 #include "compat32.h"
 #include "win32_abi.h"
 #include "dllloader.h"
 #include "../kernel/smp.h"
 #include "../include/boot_info.h"
+#include "../include/display_identity.h"
 #include "../include/paging.h"
+#include "../include/surface_alpha.h"
+#include "user32_case_data.h"
 
 _Static_assert(sizeof(POINT) == 8, "Win32 POINT ABI");
 _Static_assert(sizeof(RECT) == 16, "Win32 RECT ABI");
@@ -45,6 +53,7 @@ extern BOOL WINAPI CloseHandle(HANDLE handle);
 extern PVOID WINAPI VirtualAlloc(PVOID address, SIZE_T size,
                                  DWORD allocation_type, DWORD protection);
 extern void *kcalloc(uint64_t count, uint64_t size);
+extern void *kmalloc(uint64_t size);
 extern void kfree(void *pointer);
 extern NTSTATUS ntsync_set_event_for_process(HANDLE event, ULONG owner_pid,
                                               LONG *previous_state);
@@ -59,6 +68,8 @@ extern DWORD ddraw_present_poll_interval(void) __attribute__((weak));
 extern void xhci_poll(void) __attribute__((weak));
 extern void ps2_poll(void) __attribute__((weak));
 extern bool compositor_is_running(void) __attribute__((weak));
+extern bool compositor_pointer_blocked_by_desktop(int32_t x, int32_t y)
+    __attribute__((weak));
 
 static void msg_read_from(const void *src, MSG *out);
 
@@ -102,6 +113,8 @@ extern void compositor_set_clip_rect(uint32_t window_id, bool enabled,
     __attribute__((weak));
 extern void compositor_set_pixel_alpha(uint32_t window_id, bool enabled)
     __attribute__((weak));
+extern void compositor_set_surface_alpha(uint32_t window_id,
+    const surface_alpha_t *alpha) __attribute__((weak));
 extern void compositor_set_size(uint32_t window_id, uint16_t width, uint16_t height)
     __attribute__((weak));
 extern void compositor_set_title(uint32_t window_id, const char *title)
@@ -399,7 +412,11 @@ static void menu_release_window_menus(HWND window, HMENU menu_bar,
 static void menu_release_process(DWORD pid);
 static void menu_sync_system_window(HWND window);
 static void icon_release_process(DWORD pid);
+static void imm_release_owner(DWORD pid, DWORD tid);
+static void imm_release_window(HWND window);
 static void user_object_release_process(DWORD pid);
+static void clipboard_release_window(HWND window);
+static void clipboard_release_owner(DWORD pid, DWORD tid);
 
 typedef struct {
     HWND        handle;
@@ -416,6 +433,8 @@ typedef struct {
     DWORD       layered_color_key;
     DWORD       layered_flags;
     BYTE        layered_alpha;
+    BOOL        layered_initialized;
+    surface_alpha_t surface_alpha;
     int         x, y, width, height;
     RECT        client;           /* client bounds relative to the outer surface */
     RECT        nc_outer;
@@ -437,8 +456,8 @@ typedef struct {
     uint32_t    z_order;
     uint32_t    render_z;
     int         paint_pending;
-    int         erase_pending;
-    RECT        update_rect;
+    int         erase_pending; /* 1: send WM_ERASEBKGND; 2: unhandled erase. */
+    GDI_REGION  update_region;
     DWORD       mouse_track_flags;
     DWORD       mouse_hover_time;
     DWORD       mouse_hover_start;
@@ -526,6 +545,8 @@ typedef struct {
     HWND owner;
     DLGPROC proc;
     LONG_PTR result;
+    LONG_PTR message_result;
+    LONG_PTR private_data;
 } U32_DIALOG_STATE;
 
 static U32_DIALOG_STATE dialog_states[MAX_WINDOWS];
@@ -583,6 +604,11 @@ typedef struct {
 static WINDOW_PROPERTY window_properties[MAX_WINDOW_PROPERTIES];
 
 static WINDOW *find_window(HWND hwnd);
+static int hwnd_is_desktop(HWND hwnd);
+static WINDOW *find_public_window(HWND hwnd);
+static BOOL window_user_accessible(const WINDOW *window);
+static int is_top_level_window(const WINDOW *window);
+static BOOL menu_handle_accessible(HMENU handle);
 static void release_window(WINDOW *w);
 static void property_release_window(HWND window);
 static void trace_window_release(const char *reason, const WINDOW *w,
@@ -657,6 +683,46 @@ BOOL user32_get_window_surface(HWND hwnd, void **pixels, int *width,
     return user32_get_window_dc_surface(hwnd, pixels, width, height, pitch, FALSE);
 }
 
+/* Acquire through the compositor's locked registry, not a borrowed USER32
+ * pointer/handle pair that can change while a resize releases old storage. */
+extern bool compositor_acquire_surface(uint32_t, compositor_surface_ref_t *)
+    __attribute__((weak));
+extern void compositor_release_surface(compositor_surface_ref_t *)
+    __attribute__((weak));
+
+BOOL user32_acquire_window_dc_surface(HWND hwnd, BOOL whole,
+                                       compositor_surface_ref_t *surface)
+{
+    if (!surface) return FALSE;
+    *surface = (compositor_surface_ref_t){0};
+    WINDOW *w = find_window(hwnd);
+    if (!w || w->destroying || !compositor_acquire_surface ||
+        !compositor_release_surface) return FALSE;
+    uint32_t id = w->compositor_id;
+    int left = whole ? 0 : w->client.left;
+    int top = whole ? 0 : w->client.top;
+    int width = whole ? w->width : window_client_width(w);
+    int height = whole ? w->height : window_client_height(w);
+    if (!id || !compositor_acquire_surface(id, surface)) return FALSE;
+    if (!w->used || w->destroying || w->handle != hwnd || w->compositor_id != id) {
+        compositor_release_surface(surface);
+        return FALSE;
+    }
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if ((uint32_t)left > surface->width) left = (int)surface->width;
+    if ((uint32_t)top > surface->height) top = (int)surface->height;
+    if (width < 0) width = 0;
+    if (height < 0) height = 0;
+    if ((uint32_t)width > surface->width - left) width = (int)surface->width - left;
+    if ((uint32_t)height > surface->height - top) height = (int)surface->height - top;
+    if (width && height)
+        surface->pixels += (SIZE_T)top * surface->pitch + left;
+    surface->width = (uint32_t)width;
+    surface->height = (uint32_t)height;
+    return TRUE;
+}
+
 void user32_mark_window_dirty(HWND hwnd)
 {
     WINDOW *w = find_window(hwnd);
@@ -728,6 +794,22 @@ static WINDOW *find_window(HWND hwnd)
         if (windows[i].used && windows[i].handle == hwnd)
             return &windows[i];
     }
+    return NULL;
+}
+
+static BOOL window_user_accessible(const WINDOW *window)
+{
+    return window && window->used && nt_job_user_access(GetCurrentProcessId(),
+        window->owner_pid, NT_JOB_USER_WINDOW, (ULONG_PTR)window->handle);
+}
+
+/* Public USER lookups enforce the caller's job. Internal compositor/input and
+ * process teardown continue to use find_window, independent of that caller. */
+static WINDOW *find_public_window(HWND hwnd)
+{
+    WINDOW *window = find_window(hwnd);
+    if (window_user_accessible(window)) return window;
+    if (hwnd && !hwnd_is_desktop(hwnd)) SetLastError(1400);
     return NULL;
 }
 
@@ -1105,7 +1187,7 @@ BOOL user32_accessibility_snapshot(HWND handle,
     if (!info) return FALSE;
     *info = (USER32_ACCESSIBLE_WINDOW_INFO){0};
 
-    WINDOW *w = find_window(handle);
+    WINDOW *w = find_public_window(handle);
     if (!w || w->destroying) return FALSE;
 
     int screen_x, screen_y;
@@ -1148,7 +1230,7 @@ BOOL user32_accessibility_snapshot(HWND handle,
 
 UINT user32_accessibility_children(HWND parent, HWND *children, UINT capacity)
 {
-    if (!find_window(parent)) return 0;
+    if (!find_public_window(parent)) return 0;
 
     HWND matches[MAX_WINDOWS];
     int count = 0;
@@ -1176,6 +1258,8 @@ static BOOL window_should_render(const WINDOW *w)
         return FALSE;
 
     for (int depth = 0; current && depth < MAX_WINDOWS; depth++) {
+        if ((current->ex_style & WS_EX_LAYERED) && !current->layered_initialized)
+            return FALSE;
         if (current->style & WS_MINIMIZE)
             return FALSE;
         if (!current->parent)
@@ -1183,11 +1267,12 @@ static BOOL window_should_render(const WINDOW *w)
         current = find_window(current->parent);
     }
 
-    current = w;
+    /* An owner is not a parent: a hidden owner may own visible popups
+     * (including their child surfaces). Only owner minimization suppresses
+     * that subtree. Start from the root reached by the parent walk above. */
     for (int depth = 0; current && current->owner && depth < MAX_WINDOWS; depth++) {
         current = find_window(current->owner);
-        if (!current || !window_style_is_visible(current) ||
-            (current->style & WS_MINIMIZE))
+        if (!current || (current->style & WS_MINIMIZE))
             return current ? FALSE : TRUE;
     }
     return TRUE;
@@ -1267,7 +1352,8 @@ static BOOL window_should_be_fullscreen(const WINDOW *w)
     int screen_x, screen_y;
 
     if (!w || !w->used || w->destroying || w->message_only ||
-        !window_should_render(w) || w->parent || (w->style & WS_CHILD))
+        !window_should_render(w) || w->parent || (w->style & WS_CHILD) ||
+        (w->ex_style & WS_EX_LAYERED))
         return FALSE;
 
     /* DirectDraw exclusive cooperative mode is independently sufficient to
@@ -1311,6 +1397,13 @@ static void sync_all_window_compositor_state(void)
                                    window_is_taskbar_candidate(w) != FALSE);
         if (compositor_set_user32_managed)
             compositor_set_user32_managed(w->compositor_id, true);
+        if (compositor_set_surface_alpha) {
+            surface_alpha_t alpha = (w->ex_style & WS_EX_LAYERED)
+                ? w->surface_alpha : (surface_alpha_t){.opacity = 255};
+            alpha.input_transparent = (w->ex_style & WS_EX_LAYERED) &&
+                                      (w->ex_style & WS_EX_TRANSPARENT);
+            compositor_set_surface_alpha(w->compositor_id, &alpha);
+        }
         if (compositor_set_fullscreen)
             compositor_set_fullscreen(w->compositor_id,
                                       window_should_be_fullscreen(w) != FALSE);
@@ -1425,6 +1518,10 @@ typedef struct {
     HWND window;
     int pointer_offset_x;
     int pointer_offset_y;
+    POINT start_pointer;
+    RECT start_rect;
+    POINT min_track, max_track;
+    UINT hit;
 } NATIVE_MOVE_STATE;
 
 static NATIVE_MOVE_STATE native_move;
@@ -1574,7 +1671,7 @@ typedef struct {
 static USER_HOOK user_hooks[USER_HOOK_SLOTS];
 static USER_HOOK_CONTEXT user_hook_contexts[USER_HOOK_CONTEXT_SLOTS];
 static spinlock_t user_hook_lock = SPINLOCK_INIT;
-static ULONG_PTR next_user_hook_handle = 0xD6000001;
+static ULONG_PTR next_user_hook_handle = 0xD7000001;
 static uint64_t next_user_hook_sequence = 1;
 
 static inline uint64_t user_hook_lock_irqsave(void)
@@ -1774,6 +1871,20 @@ HHOOK WINAPI SetWindowsHookExA(int idHook, HOOKPROC lpfn,
         return NULL;
     }
 
+    if (dwThreadId) {
+        DWORD owner = nt_thread_live_owner(dwThreadId);
+        if (!owner || !nt_job_user_same_domain(GetCurrentProcessId(), owner)) {
+            SetLastError(owner ? 5 : 1444);
+            return NULL;
+        }
+        if (owner != GetCurrentProcessId()) {
+            /* Remote hooks require loading the callback module into the
+             * target process. Do not accept an uncallable local address. */
+            SetLastError(hMod ? 50 : 5);
+            return NULL;
+        }
+    }
+
     USER_HOOK *slot = NULL;
     uint64_t flags = user_hook_lock_irqsave();
     for (int i = 0; i < USER_HOOK_SLOTS; i++) {
@@ -1790,7 +1901,7 @@ HHOOK WINAPI SetWindowsHookExA(int idHook, HOOKPROC lpfn,
 
     HHOOK handle = (HHOOK)next_user_hook_handle++;
     if (!next_user_hook_handle)
-        next_user_hook_handle = 0xD6000001;
+        next_user_hook_handle = 0xD7000001;
     slot->handle = handle;
     slot->type = idHook;
     slot->callback = lpfn;
@@ -1832,7 +1943,9 @@ BOOL WINAPI UnhookWindowsHookEx(HHOOK hhk)
     uint64_t flags = user_hook_lock_irqsave();
     for (int i = 0; i < USER_HOOK_SLOTS; i++) {
         if (user_hooks[i].used && user_hooks[i].handle == hhk &&
-            user_hooks[i].owner_pid == pid) {
+            nt_job_user_access(pid, user_hooks[i].owner_pid,
+                               NT_JOB_USER_HOOK, (ULONG_PTR)hhk)) {
+            nt_job_user_destroy(NT_JOB_USER_HOOK, (ULONG_PTR)hhk);
             user_hooks[i].used = FALSE;
             removed = TRUE;
             break;
@@ -1856,8 +1969,10 @@ static void user_hook_release_process(DWORD pid)
 {
     uint64_t flags = user_hook_lock_irqsave();
     for (int i = 0; i < USER_HOOK_SLOTS; i++)
-        if (user_hooks[i].used && user_hooks[i].owner_pid == pid)
+        if (user_hooks[i].used && user_hooks[i].owner_pid == pid) {
+            nt_job_user_destroy(NT_JOB_USER_HOOK, (ULONG_PTR)user_hooks[i].handle);
             user_hooks[i].used = FALSE;
+        }
     for (int i = 0; i < USER_HOOK_CONTEXT_SLOTS; i++) {
         if (user_hook_contexts[i].used &&
             user_hook_contexts[i].pid == pid) {
@@ -1879,8 +1994,10 @@ static void user_hook_release_thread(DWORD pid, DWORD tid)
         USER_HOOK *hook = &user_hooks[i];
         if (hook->used &&
             ((hook->owner_pid == pid && hook->installer_tid == tid) ||
-             hook->target_tid == tid))
+             hook->target_tid == tid)) {
+            nt_job_user_destroy(NT_JOB_USER_HOOK, (ULONG_PTR)hook->handle);
             hook->used = FALSE;
+        }
     }
     for (int i = 0; i < USER_HOOK_CONTEXT_SLOTS; i++) {
         USER_HOOK_CONTEXT *context = &user_hook_contexts[i];
@@ -2451,24 +2568,26 @@ static DWORD WINAPI MsgWaitForMultipleObjectsEx_u32(DWORD count,
             return count; /* WAIT_OBJECT_0 + message queue index */
 
         DWORD elapsed = (DWORD)(shim_timeGetTime() - start);
-        if (!timeout_ms ||
-            (timeout_ms != 0xFFFFFFFF && elapsed >= timeout_ms))
-            return wait_timeout;
-
-        DWORD wait_ms = timeout_ms == 0xFFFFFFFF
-                      ? 0xFFFFFFFF : timeout_ms - elapsed;
+        BOOL expired = timeout_ms != 0xFFFFFFFF && elapsed >= timeout_ms;
+        /* A zero or exhausted timeout still polls the objects. Returning
+         * before the NT wait loses already-signaled events and masks invalid
+         * handles. The NT poll also preserves auto-reset/abandoned semantics. */
+        DWORD wait_ms = timeout_ms == 0xFFFFFFFF ? 0xFFFFFFFF
+                      : expired ? 0 : timeout_ms - elapsed;
         if (wake_mask & QS_TIMER) {
             DWORD timer_ms;
             if (user_timer_next_timeout(NULL, 0, 0, &timer_ms) &&
                 (wait_ms == 0xFFFFFFFF || timer_ms < wait_ms))
                 wait_ms = timer_ms;
         }
-        if (!wait_ms)
+        if (!wait_ms && !expired)
             continue;
 
         BOOL include_queue = queue_event && wake_mask;
         DWORD wait_count = count + (include_queue ? 1U : 0U);
         if (!wait_count) {
+            if (expired)
+                return wait_timeout;
             extern void sched_yield(void);
             sched_yield();
             continue;
@@ -2497,8 +2616,11 @@ static DWORD WINAPI MsgWaitForMultipleObjectsEx_u32(DWORD count,
 
         if (result == wait_failed)
             return result;
-        if (result == wait_timeout)
+        if (result == wait_timeout) {
+            if (expired)
+                return result;
             continue;
+        }
         if ((flags & 1) == 0 && result < count)
             return result;
         /* The queue event is only a wakeup edge. Recheck the queue so a
@@ -2525,7 +2647,7 @@ static BOOL WINAPI WaitMessage_u32(void)
 static BOOL WINAPI ShutdownBlockReasonCreate_u32(HWND window,
                                                   PCWSTR reason)
 {
-    WINDOW *target = find_window(window);
+    WINDOW *target = find_public_window(window);
     if (!target) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return FALSE;
@@ -2551,7 +2673,7 @@ static BOOL WINAPI ShutdownBlockReasonCreate_u32(HWND window,
 
 static BOOL WINAPI ShutdownBlockReasonDestroy_u32(HWND window)
 {
-    WINDOW *target = find_window(window);
+    WINDOW *target = find_public_window(window);
     if (!target) {
         SetLastError(1400);
         return FALSE;
@@ -2817,6 +2939,9 @@ static void msg_write_to(void *dest, HWND hwnd, DWORD message,
     }
 }
 
+static void raw_input_retrieve_locked(ULONG_PTR handle, DWORD pid, DWORD tid,
+                                      BOOL remove);
+
 static int msg_retrieve(void *out, HWND hwnd, DWORD min_message,
                         DWORD max_message, BOOL remove, MSG *retrieved)
 {
@@ -2852,6 +2977,8 @@ static int msg_retrieve(void *out, HWND hwnd, DWORD min_message,
     source = msg_source[index];
     input_sequence = msg_input_sequence[index];
     msg_note_retrieval_locked(pid, tid, source, input_sequence);
+    if (source == MSG_SOURCE_INPUT && msg.message == 0x00FF)
+        raw_input_retrieve_locked((ULONG_PTR)msg.lParam, pid, tid, remove);
     if (remove)
         msg_remove_locked(index);
     msg_unlock_irqrestore(flags);
@@ -3013,38 +3140,64 @@ static void msg_capture_pending_input(WINDOW *capture)
     }
 }
 
-static void invalidate_window(WINDOW *w, const RECT *rect, BOOL erase)
+static void window_rect_region(WINDOW *w, const RECT *rect, GDI_REGION *region)
 {
-    RECT dirty;
-
-    if (!w) return;
-    if (rect) {
-        dirty = *rect;
-        if (dirty.left < 0) dirty.left = 0;
-        if (dirty.top < 0) dirty.top = 0;
-        if (dirty.right > window_client_width(w)) dirty.right = window_client_width(w);
-        if (dirty.bottom > window_client_height(w)) dirty.bottom = window_client_height(w);
-    } else {
-        dirty.left = 0;
-        dirty.top = 0;
-        dirty.right = window_client_width(w);
-        dirty.bottom = window_client_height(w);
+    RECT value = rect ? *rect : (RECT){0,0,window_client_width(w),window_client_height(w)};
+    if (value.left > value.right) {
+        LONG swap = value.left; value.left = value.right; value.right = swap;
     }
-    if (dirty.left >= dirty.right || dirty.top >= dirty.bottom) return;
-
-    if (!w->paint_pending) {
-        w->update_rect = dirty;
-    } else {
-        if (dirty.left < w->update_rect.left) w->update_rect.left = dirty.left;
-        if (dirty.top < w->update_rect.top) w->update_rect.top = dirty.top;
-        if (dirty.right > w->update_rect.right) w->update_rect.right = dirty.right;
-        if (dirty.bottom > w->update_rect.bottom)
-            w->update_rect.bottom = dirty.bottom;
+    if (value.top > value.bottom) {
+        LONG swap = value.top; value.top = value.bottom; value.bottom = swap;
     }
-    w->paint_pending = 1;
-    if (erase) w->erase_pending = 1;
-    __sync_fetch_and_or(&queue_changed_status, QS_PAINT);
-    msg_wait_event_signal(w->owner_pid, w->owner_tid);
+    gdi32_region_data_clear(region);
+    if (value.left < value.right && value.top < value.bottom) {
+        region->count = 1;
+        region->rects[0] = (GDI_RECT){value.left,value.top,value.right,value.bottom};
+    }
+}
+
+static void clear_window_update(WINDOW *w)
+{
+    uint64_t flags = msg_lock_irqsave();
+    gdi32_region_data_clear(&w->update_region);
+    w->paint_pending = w->erase_pending = 0;
+    msg_unlock_irqrestore(flags);
+}
+
+static BOOL change_window_update(WINDOW *w, const GDI_REGION *change,
+                                  BOOL validate, BOOL erase)
+{
+    GDI_REGION_SCOPE(client);
+    GDI_REGION_SCOPE(clipped);
+    GDI_REGION_SCOPE(next);
+    window_rect_region(w, NULL, &client);
+    if (!gdi32_region_data_combine(&clipped, change, &client, GDI_RGN_AND))
+        return FALSE;
+    uint64_t flags = msg_lock_irqsave();
+    if (!gdi32_region_data_combine(&next, &w->update_region, &clipped,
+                                   validate ? GDI_RGN_DIFF : GDI_RGN_OR) ||
+        !gdi32_region_data_combine(&next, &next, &client, GDI_RGN_AND)) {
+        msg_unlock_irqrestore(flags);
+        return FALSE;
+    }
+    gdi32_region_data_move(&w->update_region, &next);
+    w->paint_pending = w->update_region.count != 0;
+    if (!w->update_region.count) w->erase_pending = 0;
+    else if (!validate && erase && clipped.count) w->erase_pending = 1;
+    msg_unlock_irqrestore(flags);
+    if (!validate && clipped.count) {
+        __sync_fetch_and_or(&queue_changed_status, QS_PAINT);
+        msg_wait_event_signal(w->owner_pid, w->owner_tid);
+    }
+    return TRUE;
+}
+
+static BOOL invalidate_window(WINDOW *w, const RECT *rect, BOOL erase)
+{
+    if (!w) return FALSE;
+    GDI_REGION_SCOPE(region);
+    window_rect_region(w, rect, &region);
+    return change_window_update(w, &region, FALSE, erase);
 }
 
 static WINDOW *paint_pending_window(HWND filter)
@@ -3260,7 +3413,7 @@ static ULONG_PTR user_timer_set(HWND window, ULONG_PTR event_id,
 {
     DWORD pid = GetCurrentProcessId();
     DWORD tid = GetCurrentThreadId();
-    WINDOW *target = window ? find_window(window) : NULL;
+    WINDOW *target = window ? find_public_window(window) : NULL;
 
     if (window && !target) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
@@ -3558,8 +3711,12 @@ static BOOL icon_snapshot(HANDLE handle, USER_ICON *snapshot)
 {
     uint64_t flags = user_icon_lock_irqsave();
     USER_ICON *entry = icon_lookup_locked(handle);
+    DWORD error = entry ? 1402 : 6;
+    if (entry && !nt_job_user_access(GetCurrentProcessId(), entry->owner_pid,
+                                     NT_JOB_USER_ICON, (ULONG_PTR)handle)) entry = NULL;
     if (entry && snapshot) *snapshot = *entry;
     user_icon_unlock_irqrestore(flags);
+    if (!entry) SetLastError(error);
     return entry != NULL;
 }
 
@@ -3569,13 +3726,21 @@ static BOOL icon_destroy(HANDLE handle, BOOL enforce_owner)
     HBITMAP color = NULL;
     uint64_t flags = user_icon_lock_irqsave();
     USER_ICON *entry = icon_lookup_locked(handle);
+    if (entry && enforce_owner &&
+        !nt_job_user_access(GetCurrentProcessId(), entry->owner_pid,
+                            NT_JOB_USER_ICON, (ULONG_PTR)handle)) {
+        user_icon_unlock_irqrestore(flags);
+        SetLastError(1402);
+        return FALSE;
+    }
     if (!entry || (enforce_owner && entry->owner_pid != GetCurrentProcessId())) {
         user_icon_unlock_irqrestore(flags);
-        SetLastError(6); /* ERROR_INVALID_HANDLE */
+        SetLastError(entry ? 1435 : 6); /* ERROR_DESTROY_OBJECT_OF_OTHER_THREAD */
         return FALSE;
     }
     mask = entry->mask;
     color = entry->color;
+    nt_job_user_destroy(NT_JOB_USER_ICON, (ULONG_PTR)handle);
     entry->used = FALSE;
     entry->mask = NULL;
     entry->color = NULL;
@@ -3913,8 +4078,11 @@ static void user32_reset_corrupt_window_state(const char *where)
         log_count++;
     }
 
-    for (int i = 0; i < MAX_WINDOWS; i++)
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i].used)
+            nt_job_user_destroy(NT_JOB_USER_WINDOW, (ULONG_PTR)windows[i].handle);
         windows[i].used = 0;
+    }
     window_count = 0;
     focus_hwnd = NULL;
     active_hwnd = NULL;
@@ -3979,6 +4147,445 @@ static HWND input_target(void)
 
 static LRESULT dispatch_wndproc(WNDPROC wndproc, HWND hWnd, DWORD Msg,
                                 WPARAM wParam, LPARAM lParam);
+
+/* The hardware layer merges PS/2 and USB into system keyboard/mouse streams.
+ * Expose those streams honestly, without inventing individual USB HID devices.
+ * Registration, raw packet lifetime and queue insertion share msg_lock, so an
+ * exiting thread cannot leave a newly queued packet behind its queue purge. */
+#define U32_RAW_REG_SLOTS 128
+#define U32_RAW_PACKET_SLOTS 512
+#define U32_RAW_DEVICE_MOUSE 0x53000001u
+#define U32_RAW_DEVICE_KEYBOARD 0x53000002u
+#define U32_RAW_PACKET_TAG 0x52000000u
+
+typedef struct {
+    BOOL used;
+    DWORD pid;
+    WORD page, usage;
+    DWORD flags;
+    HWND target;
+} U32_RAW_REG;
+
+typedef struct {
+    WORD flags, padding, button_flags, button_data;
+    DWORD raw_buttons;
+    LONG x, y;
+    DWORD extra;
+} U32_RAW_MOUSE;
+
+typedef struct {
+    WORD make, flags, reserved, vk;
+    DWORD message, extra;
+} U32_RAW_KEYBOARD;
+
+typedef struct {
+    BOOL used, queued, delivered;
+    DWORD generation, token, pid, tid, type, code;
+    HWND target;
+    union { U32_RAW_MOUSE mouse; U32_RAW_KEYBOARD keyboard; } data;
+} U32_RAW_PACKET;
+
+_Static_assert(sizeof(U32_RAW_MOUSE) == 24, "RAWMOUSE layout");
+_Static_assert(sizeof(U32_RAW_KEYBOARD) == 16, "RAWKEYBOARD layout");
+static U32_RAW_REG raw_input_regs[U32_RAW_REG_SLOTS];
+static U32_RAW_PACKET raw_input_packets[U32_RAW_PACKET_SLOTS];
+static DWORD raw_input_registration_count;
+
+static UINT raw_input_error(DWORD error)
+{
+    SetLastError(error);
+    return (UINT)-1;
+}
+
+static BOOL raw_input_count_valid(UINT *count)
+{
+    return count && win32_user_range_readable(count, sizeof(*count),
+                                               g_compat32_mode != 0) &&
+           win32_user_range_writable(count, sizeof(*count), g_compat32_mode != 0);
+}
+
+UINT WINAPI GetRawInputDeviceList(PVOID output, UINT *count, UINT size)
+{
+    UINT stride = g_compat32_mode ? 8 : 16;
+    if (size != stride || !raw_input_count_valid(count))
+        return raw_input_error(87);
+    if (!output) { *count = 2; return 0; }
+    if (*count < 2) { *count = 2; return raw_input_error(122); }
+    if (((ULONG_PTR)output & 3) ||
+        !win32_user_range_writable(output, 2 * stride, g_compat32_mode != 0))
+        return raw_input_error(87);
+    BYTE list[32] = {0};
+    for (UINT i = 0; i < 2; i++) {
+        DWORD device = i ? U32_RAW_DEVICE_KEYBOARD : U32_RAW_DEVICE_MOUSE;
+        memcpy(list + i * stride, &device, sizeof(device));
+        memcpy(list + i * stride + (g_compat32_mode ? 4 : 8), &i, sizeof(i));
+    }
+    memcpy(output, list, 2 * stride);
+    return 2;
+}
+
+static UINT raw_input_device_info(HANDLE device, UINT command, PVOID output,
+                                   UINT *count, BOOL wide)
+{
+    ULONG_PTR handle = (ULONG_PTR)device;
+    if (handle != U32_RAW_DEVICE_MOUSE && handle != U32_RAW_DEVICE_KEYBOARD)
+        return raw_input_error(6);
+    if (!raw_input_count_valid(count)) return raw_input_error(87);
+    BOOL keyboard = handle == U32_RAW_DEVICE_KEYBOARD;
+    if (command == 0x20000005u) { /* RIDI_PREPARSEDDATA: not a HID collection. */
+        *count = 0;
+        return 0;
+    }
+    if (command == 0x2000000Bu) {
+        if (!output) { *count = 32; return 0; }
+        if (*count < 32) { *count = 32; return raw_input_error(122); }
+        if (*count != 32 ||
+            !win32_user_range_writable(output, 32, g_compat32_mode != 0))
+            return raw_input_error(87);
+        DWORD info[8] = {32, keyboard ? 1u : 0u, 0, 0, 0, 0, 0, 0};
+        if (keyboard) {
+            info[2] = 4; /* Enhanced keyboard, set-1 translation. */
+            info[4] = 1;
+            info[5] = 12;
+            info[6] = 3;
+            info[7] = 104;
+        } else {
+            info[3] = 5; /* The merged mouse path supports five buttons. */
+        }
+        memcpy(output, info, sizeof(info));
+        return sizeof(info);
+    }
+    if (command != 0x20000007u) return raw_input_error(87);
+    const char *name = keyboard ? "\\\\?\\OSITO#SYSTEM_KEYBOARD#0"
+                                : "\\\\?\\OSITO#SYSTEM_MOUSE#0";
+    UINT chars = (UINT)strlen(name) + 1;
+    if (!output) { *count = chars; return 0; }
+    if (*count < chars) { *count = chars; return raw_input_error(122); }
+    if (!win32_user_range_writable(output, chars * (wide ? 2u : 1u),
+                                    g_compat32_mode != 0))
+        return raw_input_error(87);
+    if (wide) {
+        WCHAR *dest = output;
+        for (UINT i = 0; i < chars; i++) dest[i] = (BYTE)name[i];
+    } else memcpy(output, name, chars);
+    return chars;
+}
+
+UINT WINAPI GetRawInputDeviceInfoA(HANDLE device, UINT command, PVOID output,
+                                   UINT *count)
+{
+    return raw_input_device_info(device, command, output, count, FALSE);
+}
+
+UINT WINAPI GetRawInputDeviceInfoW(HANDLE device, UINT command, PVOID output,
+                                   UINT *count)
+{
+    return raw_input_device_info(device, command, output, count, TRUE);
+}
+
+BOOL WINAPI RegisterRawInputDevices(PCVOID input, UINT count, UINT size)
+{
+    UINT stride = g_compat32_mode ? 12 : 16;
+    if (size != stride || !count || count > U32_RAW_REG_SLOTS || !input ||
+        ((ULONG_PTR)input & 3) ||
+        !win32_user_range_readable(input, (SIZE_T)count * stride,
+                                    g_compat32_mode != 0)) {
+        SetLastError(87);
+        return FALSE;
+    }
+    U32_RAW_REG updates[U32_RAW_REG_SLOTS];
+    DWORD pid = GetCurrentProcessId();
+    for (UINT i = 0; i < count; i++) {
+        const BYTE *source = (const BYTE *)input + i * stride;
+        U32_RAW_REG *reg = &updates[i];
+        memset(reg, 0, sizeof(*reg));
+        reg->used = TRUE;
+        reg->pid = pid;
+        memcpy(&reg->page, source, 2);
+        memcpy(&reg->usage, source + 2, 2);
+        memcpy(&reg->flags, source + 4, 4);
+        ULONG_PTR target = 0;
+        memcpy(&target, source + 8, g_compat32_mode ? 4 : 8);
+        reg->target = (HWND)target;
+        DWORD flags = reg->flags;
+        BOOL ordinary = reg->page == 1 && (reg->usage == 2 || reg->usage == 6);
+        BOOL no_legacy = ordinary && (flags & 0x30u) == 0x30u;
+        if (!reg->page || (flags & ~0x3731u) ||
+            ((flags & 1u) && reg->target) ||
+            ((flags & 0x100u) && !reg->target) ||
+            ((flags & 0x20u) && !no_legacy && reg->usage) ||
+            (!reg->usage && !(flags & 0x20u) && !(flags & 1u)) ||
+            (ordinary && reg->usage == 2 && (flags & 0x200u) && !no_legacy) ||
+            ((flags & 0x400u) && (!no_legacy || reg->usage != 6))) {
+            SetLastError(87);
+            return FALSE;
+        }
+        WINDOW *window = reg->target ? find_public_window(reg->target) : NULL;
+        if (reg->target && (!window || window->owner_pid != pid)) {
+            SetLastError(window ? 5 : 1400);
+            return FALSE;
+        }
+    }
+    U32_RAW_REG *staged = kmalloc(sizeof(raw_input_regs));
+    if (!staged) { SetLastError(8); return FALSE; }
+    uint64_t irq = msg_lock_irqsave();
+    memcpy(staged, raw_input_regs, sizeof(raw_input_regs));
+    BOOL success = TRUE;
+    for (UINT i = 0; i < count; i++) {
+        int match = -1, free_slot = -1;
+        for (int j = 0; j < U32_RAW_REG_SLOTS; j++) {
+            if (!staged[j].used) { if (free_slot < 0) free_slot = j; continue; }
+            if (staged[j].pid == pid && staged[j].page == updates[i].page &&
+                staged[j].usage == updates[i].usage) match = j;
+        }
+        if (updates[i].flags & 1u) {
+            if (match >= 0) staged[match].used = FALSE;
+        } else {
+            if (match < 0) match = free_slot;
+            if (match < 0) { success = FALSE; break; }
+            staged[match] = updates[i];
+        }
+    }
+    if (success) {
+        memcpy(raw_input_regs, staged, sizeof(raw_input_regs));
+        DWORD used = 0;
+        for (int i = 0; i < U32_RAW_REG_SLOTS; i++) used += staged[i].used != 0;
+        __atomic_store_n(&raw_input_registration_count, used, __ATOMIC_RELEASE);
+    }
+    msg_unlock_irqrestore(irq);
+    kfree(staged);
+    if (!success) SetLastError(8);
+    return success;
+}
+
+UINT WINAPI GetRegisteredRawInputDevices(PVOID output, UINT *count, UINT size)
+{
+    UINT stride = g_compat32_mode ? 12 : 16;
+    if (size != stride || !raw_input_count_valid(count))
+        return raw_input_error(87);
+    U32_RAW_REG entries[U32_RAW_REG_SLOTS];
+    UINT used = 0;
+    DWORD pid = GetCurrentProcessId();
+    uint64_t irq = msg_lock_irqsave();
+    for (int i = 0; i < U32_RAW_REG_SLOTS; i++)
+        if (raw_input_regs[i].used && raw_input_regs[i].pid == pid)
+            entries[used++] = raw_input_regs[i];
+    msg_unlock_irqrestore(irq);
+    if (!output) { *count = used; return 0; }
+    if (*count < used) { *count = used; return raw_input_error(122); }
+    if (((ULONG_PTR)output & 3) ||
+        !win32_user_range_writable(output, (SIZE_T)used * stride,
+                                    g_compat32_mode != 0))
+        return raw_input_error(87);
+    for (UINT i = 1; i < used; i++) {
+        U32_RAW_REG item = entries[i];
+        UINT j = i;
+        while (j && (entries[j - 1].page > item.page ||
+              (entries[j - 1].page == item.page && entries[j - 1].usage > item.usage))) {
+            entries[j] = entries[j - 1];
+            j--;
+        }
+        entries[j] = item;
+    }
+    for (UINT i = 0; i < used; i++) {
+        BYTE *dest = (BYTE *)output + i * stride;
+        ULONG_PTR target = (ULONG_PTR)entries[i].target;
+        memcpy(dest, &entries[i].page, 2);
+        memcpy(dest + 2, &entries[i].usage, 2);
+        memcpy(dest + 4, &entries[i].flags, 4);
+        memcpy(dest + 8, &target, g_compat32_mode ? 4 : 8);
+    }
+    return used;
+}
+
+static U32_RAW_PACKET *raw_input_packet_locked(ULONG_PTR token)
+{
+    if ((token & ~(ULONG_PTR)0x00FFFFFFu) != U32_RAW_PACKET_TAG) return NULL;
+    U32_RAW_PACKET *packet = &raw_input_packets[token & 511u];
+    return packet->used && packet->token == token ? packet : NULL;
+}
+
+static void raw_input_retrieve_locked(ULONG_PTR token, DWORD pid, DWORD tid,
+                                      BOOL remove)
+{
+    U32_RAW_PACKET *current = raw_input_packet_locked(token);
+    if (!current || current->pid != pid || current->tid != tid) return;
+    /* A subsequent raw message replaces the thread's previous raw payload.
+     * PM_NOREMOVE retains the queue's reference to the same packet. */
+    for (int i = 0; i < U32_RAW_PACKET_SLOTS; i++) {
+        U32_RAW_PACKET *packet = &raw_input_packets[i];
+        if (packet != current && packet->used && !packet->queued &&
+            packet->pid == pid && packet->tid == tid)
+            packet->used = FALSE;
+    }
+    current->delivered = TRUE;
+    if (remove) current->queued = FALSE;
+}
+
+UINT WINAPI GetRawInputData(HANDLE handle, UINT command, PVOID output,
+                             UINT *size, UINT header_size)
+{
+    DWORD pid = GetCurrentProcessId(), tid = GetCurrentThreadId();
+    U32_RAW_PACKET snapshot;
+    uint64_t irq = msg_lock_irqsave();
+    U32_RAW_PACKET *packet = raw_input_packet_locked((ULONG_PTR)handle);
+    BOOL valid = packet && packet->delivered && packet->pid == pid && packet->tid == tid;
+    if (valid) snapshot = *packet;
+    msg_unlock_irqrestore(irq);
+    if (!valid) return raw_input_error(6);
+    UINT header = g_compat32_mode ? 16 : 24;
+    if (header_size != header || !raw_input_count_valid(size) ||
+        (command != 0x10000003u && command != 0x10000005u))
+        return raw_input_error(87);
+    UINT full_size = header + (snapshot.type ? 16 : 24);
+    UINT needed = command == 0x10000005u ? header : full_size;
+    if (!output) { *size = needed; return 0; }
+    if (*size < needed) return raw_input_error(122);
+    if (((ULONG_PTR)output & 3) ||
+        !win32_user_range_writable(output, needed, g_compat32_mode != 0))
+        return raw_input_error(87);
+    BYTE data[48] = {0};
+    DWORD device = snapshot.type ? U32_RAW_DEVICE_KEYBOARD : U32_RAW_DEVICE_MOUSE;
+    memcpy(data, &snapshot.type, 4);
+    memcpy(data + 4, &full_size, 4);
+    memcpy(data + 8, &device, 4);
+    memcpy(data + (g_compat32_mode ? 12 : 16), &snapshot.code, 4);
+    memcpy(data + header, &snapshot.data, full_size - header);
+    memcpy(output, data, needed);
+    return needed;
+}
+
+static void raw_input_finish(ULONG_PTR token)
+{
+    DWORD pid = GetCurrentProcessId(), tid = GetCurrentThreadId();
+    uint64_t irq = msg_lock_irqsave();
+    U32_RAW_PACKET *packet = raw_input_packet_locked(token);
+    if (packet && packet->delivered && !packet->queued &&
+        packet->pid == pid && packet->tid == tid)
+        packet->used = FALSE;
+    msg_unlock_irqrestore(irq);
+}
+
+static void raw_input_release(DWORD pid, DWORD tid, HWND window)
+{
+    uint64_t irq = msg_lock_irqsave();
+    for (int i = msg_head; i != msg_tail;) {
+        if (msg_queue[i].message == 0x00FF && msg_source[i] == MSG_SOURCE_INPUT &&
+            msg_target_pid[i] == pid && (!tid || msg_target_tid[i] == tid) &&
+            (!window || msg_queue[i].hwnd == window))
+            msg_remove_locked(i);
+        else i = (i + 1) % MSG_QUEUE_SIZE;
+    }
+    for (int i = 0; i < U32_RAW_PACKET_SLOTS; i++) {
+        U32_RAW_PACKET *packet = &raw_input_packets[i];
+        if (packet->used && packet->pid == pid && (!tid || packet->tid == tid) &&
+            (!window || packet->target == window))
+            packet->used = FALSE;
+    }
+    if (!tid && !window) {
+        DWORD used = 0;
+        for (int i = 0; i < U32_RAW_REG_SLOTS; i++) {
+            if (raw_input_regs[i].pid == pid) raw_input_regs[i].used = FALSE;
+            used += raw_input_regs[i].used != 0;
+        }
+        __atomic_store_n(&raw_input_registration_count, used, __ATOMIC_RELEASE);
+    }
+    msg_unlock_irqrestore(irq);
+}
+
+static U32_RAW_REG *raw_input_registration_locked(DWORD pid, WORD usage)
+{
+    U32_RAW_REG *page = NULL;
+    for (int i = 0; i < U32_RAW_REG_SLOTS; i++) {
+        U32_RAW_REG *reg = &raw_input_regs[i];
+        if (!reg->used || reg->pid != pid || reg->page != 1) continue;
+        if (reg->usage == usage) {
+            if ((reg->flags & 0x30u) == 0x10u) return NULL; /* RIDEV_EXCLUDE */
+            return reg;
+        }
+        if (!reg->usage && (reg->flags & 0x20u)) page = reg;
+    }
+    return page;
+}
+
+static BOOL raw_input_no_legacy(HWND target, WORD usage)
+{
+    if (!__atomic_load_n(&raw_input_registration_count, __ATOMIC_ACQUIRE)) return FALSE;
+    WINDOW *window = find_window(target);
+    if (!window) return FALSE;
+    uint64_t irq = msg_lock_irqsave();
+    U32_RAW_REG *reg = raw_input_registration_locked(window->owner_pid, usage);
+    BOOL suppress = reg && reg->usage && (reg->flags & 0x30u) == 0x30u;
+    msg_unlock_irqrestore(irq);
+    return suppress;
+}
+
+static void raw_input_emit(WORD usage, PCVOID data, UINT bytes)
+{
+    if (!__atomic_load_n(&raw_input_registration_count, __ATOMIC_ACQUIRE)) return;
+    WINDOW *foreground = find_window(input_target());
+    DWORD foreground_pid = foreground ? foreground->owner_pid : 0;
+    DWORD notify_pid[U32_RAW_REG_SLOTS], notify_tid[U32_RAW_REG_SLOTS];
+    UINT notify_count = 0;
+    DWORD timestamp = shim_timeGetTime();
+    uint64_t irq = msg_lock_irqsave();
+    BOOL foreground_registered = raw_input_registration_locked(foreground_pid, usage) != NULL;
+    for (int i = 0; i < U32_RAW_REG_SLOTS; i++) {
+        U32_RAW_REG *reg = &raw_input_regs[i];
+        if (!reg->used || reg != raw_input_registration_locked(reg->pid, usage)) continue;
+        BOOL in_foreground = foreground_pid && reg->pid == foreground_pid;
+        if (!in_foreground && !(reg->flags & 0x100u) &&
+            (!(reg->flags & 0x1000u) || foreground_registered)) continue;
+        WINDOW *target = reg->target ? find_window(reg->target)
+                                    : (in_foreground ? foreground : NULL);
+        if (!target || target->destroying || target->owner_pid != reg->pid) continue;
+        U32_RAW_PACKET *packet = NULL;
+        for (int j = 0; j < U32_RAW_PACKET_SLOTS; j++) {
+            if (raw_input_packets[j].used) continue;
+            packet = &raw_input_packets[j];
+            DWORD generation = (packet->generation + 1) & 0x7FFFu;
+            if (!generation) generation = 1;
+            memset(packet, 0, sizeof(*packet));
+            packet->generation = generation;
+            packet->token = U32_RAW_PACKET_TAG | (generation << 9) | (UINT)j;
+            break;
+        }
+        if (!packet) break;
+        packet->used = packet->queued = TRUE;
+        packet->pid = reg->pid;
+        packet->tid = target->owner_tid;
+        packet->target = target->handle;
+        packet->type = usage == 6 ? 1 : 0;
+        packet->code = in_foreground ? 0 : 1;
+        memcpy(&packet->data, data, bytes);
+        if (!msg_enqueue_locked(target->handle, 0x00FF, packet->code, packet->token,
+                                 packet->pid, packet->tid, 0, timestamp,
+                                 cursor_pos.x, cursor_pos.y, FALSE, MSG_SOURCE_INPUT)) {
+            packet->used = FALSE;
+            break;
+        }
+        notify_pid[notify_count] = packet->pid;
+        notify_tid[notify_count++] = packet->tid;
+    }
+    msg_unlock_irqrestore(irq);
+    if (notify_count) __sync_fetch_and_or(&queue_changed_status, QS_RAWINPUT);
+    for (UINT i = 0; i < notify_count; i++)
+        msg_wait_event_signal(notify_pid[i], notify_tid[i]);
+}
+
+static void raw_input_mouse(LONG x, LONG y, WORD flags, DWORD buttons,
+                             DWORD old_buttons, short wheel)
+{
+    if (!x && !y && !flags && buttons == old_buttons && !wheel) return;
+    U32_RAW_MOUSE mouse = {.flags = flags, .x = x, .y = y};
+    for (UINT i = 0; i < 5; i++) {
+        DWORD mask = 1u << i;
+        if ((buttons ^ old_buttons) & mask)
+            mouse.button_flags |= (buttons & mask ? 1u : 2u) << (i * 2);
+    }
+    if (wheel) { mouse.button_flags |= 0x400; mouse.button_data = (WORD)wheel; }
+    raw_input_emit(2, &mouse, sizeof(mouse));
+}
 
 /* ── Default screen dimensions ─────────────────────────────── */
 
@@ -4209,7 +4816,7 @@ WORD WINAPI RegisterClassW(PVOID lpwc)
 static WORD WINAPI GetClassWord_u32(HWND hwnd, int index)
 {
     if (index != -32) return 0; /* GCW_ATOM */
-    WINDOW *window = find_window(hwnd);
+    WINDOW *window = find_public_window(hwnd);
     WNDCLASS_ENTRY *entry = window
         ? lookup_class_for_pid(window->class_name, window->owner_pid) : NULL;
     return entry ? entry->atom : 0;
@@ -4217,7 +4824,7 @@ static WORD WINAPI GetClassWord_u32(HWND hwnd, int index)
 
 LONG_PTR WINAPI GetClassLongPtrW(HWND hwnd, int index)
 {
-    WINDOW *window = find_window(hwnd);
+    WINDOW *window = find_public_window(hwnd);
     if (!window) {
         SetLastError(1400);
         return 0;
@@ -4244,7 +4851,7 @@ LONG_PTR WINAPI GetClassLongPtrW(HWND hwnd, int index)
 
 LONG_PTR WINAPI SetClassLongPtrW(HWND hwnd, int index, LONG_PTR value)
 {
-    WINDOW *window = find_window(hwnd);
+    WINDOW *window = find_public_window(hwnd);
     if (!window) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return 0;
@@ -4313,9 +4920,32 @@ static LONG_PTR WINAPI SetClassLongPtrA_u32(HWND hwnd, int index,
     return SetClassLongPtrW(hwnd, index, value);
 }
 
+int WINAPI GetClassNameA(HWND hwnd, PSTR class_name, int max_count)
+{
+    WINDOW *window = find_public_window(hwnd);
+    if (!window) {
+        SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
+        return 0;
+    }
+    /* A zero-sized query preserves the caller's buffer and last error. */
+    if (max_count <= 0) return 0;
+    if (!class_name) {
+        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
+
+    int length = 0;
+    while (length + 1 < max_count && window->class_name[length]) {
+        class_name[length] = window->class_name[length];
+        length++;
+    }
+    class_name[length] = 0;
+    return length;
+}
+
 int WINAPI GetClassNameW(HWND hwnd, PWSTR class_name, int max_count)
 {
-    WINDOW *window = find_window(hwnd);
+    WINDOW *window = find_public_window(hwnd);
     if (!window || !class_name || max_count <= 0) {
         SetLastError(window ? 87 : 1400);
         return 0;
@@ -4771,7 +5401,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     WINDOW *relation = NULL;
     int message_only = hwnd_is_message(hWndParent);
     if (hWndParent && !message_only && !hwnd_is_desktop(hWndParent)) {
-        relation = find_window(hWndParent);
+        relation = find_public_window(hWndParent);
         if (!relation) {
             SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
             return NULL;
@@ -4783,6 +5413,8 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
         SetLastError(1400);
         return NULL;
     }
+    if (!(dwStyle & WS_CHILD) && hMenu && !menu_handle_accessible(hMenu))
+        return NULL;
 
     WINDOW *w = alloc_window();
     if (!w) return NULL;
@@ -4799,6 +5431,8 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     w->layered_color_key = 0;
     w->layered_flags = 0;
     w->layered_alpha = 255;
+    w->layered_initialized = FALSE;
+    w->surface_alpha = (surface_alpha_t){.opacity = 255};
     w->x        = X;
     w->y        = Y;
     w->width    = nWidth;
@@ -4828,8 +5462,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     w->render_z = 0;
     w->paint_pending = 0;
     w->erase_pending = 0;
-    w->update_rect.left = w->update_rect.top = 0;
-    w->update_rect.right = w->update_rect.bottom = 0;
+    memset(&w->update_region, 0, sizeof(w->update_region));
     w->mouse_track_flags = 0;
     w->mouse_hover_time = 400;
     w->mouse_hover_start = 0;
@@ -4845,7 +5478,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
         release_window(w);
         return NULL;
     }
-    if (cls->system_class && (cls->atom == 0x80 || cls->atom == 0x82)) {
+    if (cls->system_class && (cls->atom == 0x80 || cls->atom == 0x81 || cls->atom == 0x82)) {
         w->control = user32_control_create(cls->atom);
         if (!w->control) {
             release_window(w);
@@ -5079,6 +5712,10 @@ static void trace_window_release(const char *reason, const WINDOW *w,
 static void release_window(WINDOW *w)
 {
     if (!w || !w->used) return;
+    w->destroying = 1;
+    clipboard_release_window(w->handle);
+    raw_input_release(w->owner_pid, w->owner_tid, w->handle);
+    nt_job_user_destroy(NT_JOB_USER_WINDOW, (ULONG_PTR)w->handle);
     user32_control_release(w->control);
     w->control = NULL;
     user32_listbox_release(w->listbox);
@@ -5089,6 +5726,7 @@ static void release_window(WINDOW *w)
     extern void comctl32_release_window(DWORD owner_pid, HWND window);
     comctl32_release_window(w->owner_pid, w->handle);
     user_timer_release_window(w->handle);
+    imm_release_window(w->handle);
     property_release_window(w->handle);
     menu_release_window_menus(w->handle,
         (w->style & WS_CHILD) ? NULL : w->menu, w->system_menu);
@@ -5104,8 +5742,7 @@ static void release_window(WINDOW *w)
     w->shm_pixels = NULL;
     w->surface_width = 0;
     w->surface_height = 0;
-    w->paint_pending = 0;
-    w->erase_pending = 0;
+    clear_window_update(w);
     w->mouse_track_flags = 0;
     w->mouse_hover_start = 0;
     if (focus_hwnd == w->handle) focus_hwnd = NULL;
@@ -5180,7 +5817,7 @@ static void destroy_window_tree(WINDOW *w, unsigned depth, HWND root,
 
 BOOL WINAPI DestroyWindow(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w || w->destroying) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return FALSE;
@@ -5205,6 +5842,9 @@ void user32_release_thread(DWORD pid, DWORD tid)
     if (!pid || !tid)
         return;
 
+    clipboard_release_owner(pid, tid);
+    gdi32_release_thread_dc(pid, tid);
+
     BOOL repair_activation = user32_foreground_active;
     WINDOW *active = window_root(find_window(active_hwnd), NULL);
     HWND preferred = active ? active->owner : NULL;
@@ -5219,11 +5859,13 @@ void user32_release_thread(DWORD pid, DWORD tid)
         relative_pointer.owner_tid == tid)
         relative_pointer_reset();
 
+    raw_input_release(pid, tid, NULL);
     msg_purge_thread(pid, tid);
     sent_message_release_thread(pid, tid);
     msg_wait_event_release_thread(pid, tid);
     user_timer_release_thread(pid, tid);
     user_hook_release_thread(pid, tid);
+    imm_release_owner(pid, tid);
 
     for (int i = 0; i < window_count; i++) {
         WINDOW *window = &windows[i];
@@ -5255,6 +5897,7 @@ void user32_release_thread(DWORD pid, DWORD tid)
 
 void user32_release_process(DWORD pid)
 {
+    clipboard_release_owner(pid, 0);
     BOOL repair_activation = user32_foreground_active;
     WINDOW *active = window_root(find_window(active_hwnd), NULL);
     HWND preferred = active ? active->owner : NULL;
@@ -5277,12 +5920,14 @@ void user32_release_process(DWORD pid)
         native_move.pointer_offset_x = 0;
         native_move.pointer_offset_y = 0;
     }
+    raw_input_release(pid, 0, NULL);
     msg_purge_process(pid);
     sent_message_release_process(pid);
     msg_wait_event_release_process(pid);
     user_timer_release_process(pid);
     user_hook_release_process(pid);
     icon_release_process(pid);
+    imm_release_owner(pid, 0);
     for (int i = 0; i < window_count; i++)
         if (windows[i].used && windows[i].owner_pid == pid) {
             trace_window_release("process-exit", &windows[i],
@@ -5312,7 +5957,7 @@ void user32_release_process(DWORD pid)
 
 BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return FALSE;
 
     BOOL repair_activation = user32_foreground_active;
@@ -5420,9 +6065,25 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
     return was_visible;
 }
 
+BOOL WINAPI OpenIcon(HWND hWnd)
+{
+    WINDOW *window = find_public_window(hWnd);
+    if (!window) {
+        SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
+        return FALSE;
+    }
+    if ((window->style & WS_MINIMIZE) &&
+        SendMessageA(hWnd, WM_QUERYOPEN, 0, 0)) {
+        /* Application code may destroy the window while answering. OpenIcon
+         * acknowledges a valid request even when WM_QUERYOPEN vetoes it. */
+        if (find_public_window(hWnd)) ShowWindow(hWnd, SW_SHOWNORMAL);
+    }
+    return TRUE;
+}
+
 BOOL WINAPI UpdateWindow(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return FALSE;
 
     if (w->wndproc && w->visible && w->paint_pending)
@@ -5433,7 +6094,7 @@ BOOL WINAPI UpdateWindow(HWND hWnd)
 
 static BOOL window_set_text(HWND hWnd, PCVOID input, BOOL wide)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return FALSE;
     SIZE_T length = 0;
     if (input) {
@@ -5471,7 +6132,7 @@ static BOOL window_set_text(HWND hWnd, PCVOID input, BOOL wide)
 
 PWSTR user32_copy_window_text(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return NULL;
     SIZE_T count = 0;
     if (w->text) while (w->text[count]) count++;
@@ -5484,7 +6145,7 @@ static LRESULT window_text_message(HWND hWnd, DWORD message,
                                     WPARAM capacity, LPARAM buffer, BOOL wide)
 {
     if (message == 0x000C) return window_set_text(hWnd, (PCVOID)buffer, wide);
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return 0;
     static const WCHAR empty[] = {0};
     PCWSTR text = w->text ? w->text : empty;
@@ -5523,7 +6184,7 @@ static BOOL WINAPI SetWindowTextW_k32(HWND hWnd, PCWSTR lpString)
 
 int WINAPI GetWindowTextLengthA(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return 0;
 
     return (int)(w->owner_pid == GetCurrentProcessId()
@@ -5533,7 +6194,7 @@ int WINAPI GetWindowTextLengthA(HWND hWnd)
 
 int WINAPI GetWindowTextLengthW(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return 0;
     return (int)(w->owner_pid == GetCurrentProcessId()
         ? SendMessageW(hWnd, 0x000E, 0, 0)
@@ -5542,13 +6203,13 @@ int WINAPI GetWindowTextLengthW(HWND hWnd)
 
 BOOL WINAPI IsWindowUnicode(HWND hWnd)
 {
-    WINDOW *window = find_window(hWnd);
+    WINDOW *window = find_public_window(hWnd);
     return window ? window->unicode : FALSE;
 }
 
 int WINAPI GetWindowTextA(HWND hWnd, PSTR text, int max_count)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!text || max_count <= 0) return 0;
     text[0] = 0;
     if (!w) return 0;
@@ -5559,7 +6220,7 @@ int WINAPI GetWindowTextA(HWND hWnd, PSTR text, int max_count)
 
 int WINAPI GetWindowTextW(HWND hWnd, PWSTR text, int max_count)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!text || max_count <= 0) return 0;
     text[0] = 0;
     if (!w) return 0;
@@ -5571,8 +6232,11 @@ int WINAPI GetWindowTextW(HWND hWnd, PWSTR text, int max_count)
 BOOL WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertAfter,
                          int X, int Y, int cx, int cy, DWORD uFlags)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return FALSE;
+
+    if (!(uFlags & SWP_NOZORDER) && hwnd_insert_token(hWndInsertAfter) == 2 &&
+        !find_public_window(hWndInsertAfter)) return FALSE;
 
     WINDOWPOS position = {
         .hwnd = hWnd,
@@ -5595,6 +6259,9 @@ BOOL WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertAfter,
     cy = position.cy;
     uFlags = position.flags;
 
+    /* WM_WINDOWPOSCHANGING may replace the insert-after handle. */
+    if (!(uFlags & SWP_NOZORDER) && hwnd_insert_token(hWndInsertAfter) == 2 &&
+        !find_public_window(hWndInsertAfter)) return FALSE;
     if (!(uFlags & SWP_NOZORDER) &&
         !place_window_in_z_order(w, hWndInsertAfter))
         return FALSE;
@@ -5691,9 +6358,18 @@ HDWP WINAPI DeferWindowPos(HDWP hWinPosInfo, HWND hWnd,
                            int cx, int cy, UINT uFlags)
 {
     DEFER_WINDOW_SET *set = find_defer_window_set(hWinPosInfo);
-    if (!set || set->owner_pid != GetCurrentProcessId() ||
-        !find_window(hWnd) || set->count >= MAX_WINDOWS) {
-        if (set) set->used = 0;
+    if (!set || set->owner_pid != GetCurrentProcessId()) {
+        SetLastError(87);
+        return NULL;
+    }
+    if (!find_public_window(hWnd) ||
+        (!(uFlags & SWP_NOZORDER) && hwnd_insert_token(hWndInsertAfter) == 2 &&
+         !find_public_window(hWndInsertAfter))) {
+        set->used = 0;
+        return NULL;
+    }
+    if (set->count >= MAX_WINDOWS) {
+        set->used = 0;
         SetLastError(87);
         return NULL;
     }
@@ -5738,7 +6414,7 @@ BOOL user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
                                          BOOL allow_window_changes,
                                          int width, int height)
 {
-    WINDOW *win = find_window(hWnd);
+    WINDOW *win = find_public_window(hWnd);
     if (!win) return FALSE;
     if (exclusive && allow_window_changes && (width <= 0 || height <= 0))
         return FALSE;
@@ -5746,10 +6422,7 @@ BOOL user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
     win->directdraw_exclusive = exclusive != FALSE;
 
     if (exclusive) {
-        win->paint_pending = 0;
-        win->erase_pending = 0;
-        win->update_rect.left = win->update_rect.top = 0;
-        win->update_rect.right = win->update_rect.bottom = 0;
+        clear_window_update(win);
     } else if (win->visible && !(win->style & WS_MINIMIZE)) {
         invalidate_window(win, NULL, TRUE);
     }
@@ -5766,10 +6439,7 @@ BOOL user32_configure_directdraw_window(HWND hWnd, BOOL exclusive,
                                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     if (result) {
         /* The primary surface, rather than GDI, supplies the exclusive frame. */
-        win->paint_pending = 0;
-        win->erase_pending = 0;
-        win->update_rect.left = win->update_rect.top = 0;
-        win->update_rect.right = win->update_rect.bottom = 0;
+        clear_window_update(win);
     }
     if (!result)
         sync_all_window_compositor_state();
@@ -5809,7 +6479,7 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
         SetLastError(998); /* ERROR_NOACCESS */
         return FALSE;
     }
-    if (hWnd && hWnd != (HWND)(ULONG_PTR)-1 && !find_window(hWnd)) {
+    if (hWnd && hWnd != (HWND)(ULONG_PTR)-1 && !find_public_window(hWnd)) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return FALSE;
     }
@@ -5894,7 +6564,7 @@ BOOL WINAPI GetMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
         SetLastError(998); /* ERROR_NOACCESS */
         return (BOOL)-1;
     }
-    if (hWnd && hWnd != (HWND)(ULONG_PTR)-1 && !find_window(hWnd)) {
+    if (hWnd && hWnd != (HWND)(ULONG_PTR)-1 && !find_public_window(hWnd)) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return (BOOL)-1;
     }
@@ -6138,16 +6808,45 @@ static LPARAM screen_point_lparam(POINT point)
     return (LPARAM)(WORD)point.x | ((LPARAM)(WORD)point.y << 16);
 }
 
+/* RECT and MINMAXINFO have the same layout on PE32 and PE64, but a PE32
+ * callback still needs a low process-mapped pointer, never a kernel stack. */
+static BOOL native_track_message(WINDOW *window, DWORD message, WPARAM wp,
+                                  void *data, size_t bytes)
+{
+    if (!window_on_current_thread(window) || !window->wndproc ||
+        bytes > USER_NCCALC_STRIDE) return FALSE;
+    if (!g_compat32_mode) {
+        dispatch_wndproc(window->wndproc, window->handle, message, wp,
+                         (LPARAM)(ULONG_PTR)data);
+        return TRUE;
+    }
+    USER_HOOK_CONTEXT *context = user_hook_context_get(TRUE);
+    PVOID scratch = user32_callback_scratch_page(context);
+    if (!context || !scratch || context->nccalc_depth >= USER_NCCALC_MAX_DEPTH)
+        return FALSE;
+    BYTE *wire = (BYTE *)scratch + USER_NCCALC_OFFSET +
+                 context->nccalc_depth * USER_NCCALC_STRIDE;
+    memcpy(wire, data, bytes);
+    context->nccalc_depth++;
+    dispatch_wndproc(window->wndproc, window->handle, message, wp,
+                     (LPARAM)(ULONG_PTR)wire);
+    context->nccalc_depth--;
+    memcpy(data, wire, bytes);
+    return TRUE;
+}
+
 static void native_move_finish(POINT point, BOOL send_button_up)
 {
     HWND handle = native_move.window;
     WINDOW *window = find_window(handle);
+    UINT hit = native_move.hit;
+    if (!handle || !window_on_current_thread(window)) return;
     native_move.window = NULL;
 
     if (window_on_current_thread(window) && window->wndproc) {
         if (send_button_up)
             dispatch_wndproc(window->wndproc, handle, WM_NCLBUTTONUP,
-                             HTCAPTION, screen_point_lparam(point));
+                             hit, screen_point_lparam(point));
         dispatch_wndproc(window->wndproc, handle, WM_EXITSIZEMOVE, 0, 0);
     }
 
@@ -6155,13 +6854,17 @@ static void native_move_finish(POINT point, BOOL send_button_up)
         ReleaseCapture();
 }
 
-static BOOL native_move_begin(HWND handle, POINT point)
+static BOOL native_track_begin(HWND handle, POINT point, UINT hit)
 {
     WINDOW *window = find_window(handle);
     if (!window)
         return FALSE;
     window = window_root(window, NULL);
-    if (!window_on_current_thread(window))
+    if (!window_on_current_thread(window) ||
+        (window->style & (WS_MINIMIZE | WS_MAXIMIZE | WS_DISABLED)))
+        return FALSE;
+    if (hit != HTCAPTION &&
+        (!(window->style & WS_THICKFRAME) || hit < HTLEFT || hit > HTBOTTOMRIGHT))
         return FALSE;
 
     if (native_move.window && native_move.window != window->handle)
@@ -6175,6 +6878,10 @@ static BOOL native_move_begin(HWND handle, POINT point)
     native_move.window = window->handle;
     native_move.pointer_offset_x = point.x - screen_x;
     native_move.pointer_offset_y = point.y - screen_y;
+    native_move.start_pointer = point;
+    native_move.start_rect = (RECT){screen_x, screen_y,
+                                   screen_x + window->width, screen_y + window->height};
+    native_move.hit = hit;
 
     SetCapture(window->handle);
     if (GetCapture() != window->handle) {
@@ -6185,7 +6892,51 @@ static BOOL native_move_begin(HWND handle, POINT point)
     if (window->wndproc)
         dispatch_wndproc(window->wndproc, window->handle,
                          WM_ENTERSIZEMOVE, 0, 0);
+    if (native_move.window != window->handle || GetCapture() != window->handle)
+        return FALSE;
+    if (hit != HTCAPTION) {
+        struct { POINT reserved, max_size, max_position, min_track, max_track; } limits = {0};
+        RECT margin = window_frame_margins(window->style, window->ex_style, FALSE);
+        limits.min_track = (POINT){margin.left + margin.right + 1, margin.top + margin.bottom + 1};
+        limits.max_size = limits.max_track = (POINT){current_mode_cx(), current_mode_cy()};
+        native_track_message(window, WM_GETMINMAXINFO, 0, &limits, sizeof(limits));
+        if (native_move.window != window->handle || GetCapture() != window->handle)
+            return FALSE;
+        /* Keep dimensions representable by the compositor's surface ABI. */
+        native_move.min_track.x = limits.min_track.x < 1 ? 1 : limits.min_track.x > 32767 ? 32767 : limits.min_track.x;
+        native_move.min_track.y = limits.min_track.y < 1 ? 1 : limits.min_track.y > 32767 ? 32767 : limits.min_track.y;
+        native_move.max_track.x = limits.max_track.x > 32767 ? 32767 : limits.max_track.x;
+        native_move.max_track.y = limits.max_track.y > 32767 ? 32767 : limits.max_track.y;
+        if (native_move.max_track.x < native_move.min_track.x) native_move.max_track.x = native_move.min_track.x;
+        if (native_move.max_track.y < native_move.min_track.y) native_move.max_track.y = native_move.min_track.y;
+    }
     return TRUE;
+}
+
+static BOOL native_move_begin(HWND handle, POINT point)
+{
+    return native_track_begin(handle, point, HTCAPTION);
+}
+
+static BOOL native_size_begin(HWND handle, POINT point, UINT hit)
+{
+    return native_track_begin(handle, point, hit);
+}
+
+static void native_track_clamp(RECT *rect, const NATIVE_MOVE_STATE *state)
+{
+    int width = rect->right - rect->left;
+    int height = rect->bottom - rect->top;
+    if (width < state->min_track.x) width = state->min_track.x;
+    if (width > state->max_track.x) width = state->max_track.x;
+    if (height < state->min_track.y) height = state->min_track.y;
+    if (height > state->max_track.y) height = state->max_track.y;
+    if (state->hit == HTLEFT || state->hit == HTTOPLEFT || state->hit == HTBOTTOMLEFT)
+        rect->left = rect->right - width;
+    else rect->right = rect->left + width;
+    if (state->hit == HTTOP || state->hit == HTTOPLEFT || state->hit == HTTOPRIGHT)
+        rect->top = rect->bottom - height;
+    else rect->bottom = rect->top + height;
 }
 
 static void native_move_update(POINT point)
@@ -6198,10 +6949,26 @@ static void native_move_update(POINT point)
     if (!window_on_current_thread(window))
         return;
 
-    int x = point.x - native_move.pointer_offset_x;
-    int y = point.y - native_move.pointer_offset_y;
-    SetWindowPos(window->handle, HWND_TOP, x, y, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    NATIVE_MOVE_STATE state = native_move;
+    RECT rect = state.start_rect;
+    int dx = point.x - state.start_pointer.x;
+    int dy = point.y - state.start_pointer.y;
+    if (state.hit == HTCAPTION) {
+        OffsetRect(&rect, dx, dy);
+        native_track_message(window, WM_MOVING, 0, &rect, sizeof(rect));
+    } else {
+        if (state.hit == HTLEFT || state.hit == HTTOPLEFT || state.hit == HTBOTTOMLEFT) rect.left += dx;
+        if (state.hit == HTRIGHT || state.hit == HTTOPRIGHT || state.hit == HTBOTTOMRIGHT) rect.right += dx;
+        if (state.hit == HTTOP || state.hit == HTTOPLEFT || state.hit == HTTOPRIGHT) rect.top += dy;
+        if (state.hit == HTBOTTOM || state.hit == HTBOTTOMLEFT || state.hit == HTBOTTOMRIGHT) rect.bottom += dy;
+        native_track_clamp(&rect, &state);
+        native_track_message(window, WM_SIZING, state.hit - HTLEFT + 1, &rect, sizeof(rect));
+        native_track_clamp(&rect, &state);
+    }
+    if (native_move.window != state.window || GetCapture() != state.window) return;
+    SetWindowPos(state.window, HWND_TOP, rect.left, rect.top,
+                 rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE | (state.hit == HTCAPTION ? SWP_NOSIZE : 0));
 }
 
 static BOOL window_caption_rect(const WINDOW *w, RECT *rect)
@@ -6323,26 +7090,26 @@ static void paint_window_frame(WINDOW *w)
 
 static BOOL dispatch_nonclient_press(const MSG *message, LRESULT *result)
 {
-    WINDOW *target = message ? find_window(message->hwnd) : NULL;
-    WINDOW *host = target;
-    if (target && target->parent) {
-        WINDOW *parent = find_window(target->parent);
-        if (parent && parent->wndproc)
-            host = parent;
-    }
-    if (!host || !host->wndproc || !window_on_current_thread(host))
-        return FALSE;
-
+    WINDOW *host = message ? find_window(message->hwnd) : NULL;
+    if (!host || capture_hwnd) return FALSE;
     LPARAM screen_position = screen_point_lparam(message->pt);
-    LRESULT hit = dispatch_wndproc(host->wndproc, host->handle,
-                                   WM_NCHITTEST, 0, screen_position);
-    if (hit <= HTCLIENT)
-        return FALSE;
-
-    *result = dispatch_wndproc(host->wndproc, host->handle,
-                               WM_NCLBUTTONDOWN, (WPARAM)hit,
-                               screen_position);
-    return TRUE;
+    /* CEF-style transparent children may nest more than one level. Respect
+     * HTCLIENT instead of treating every child click as a parent-frame click. */
+    for (int depth = 0; host && depth < MAX_WINDOWS; depth++) {
+        if (!host->wndproc || !window_on_current_thread(host)) return FALSE;
+        HWND handle = host->handle;
+        LRESULT hit = dispatch_wndproc(host->wndproc, handle, WM_NCHITTEST, 0, screen_position);
+        host = find_window(handle);
+        if (!host) return FALSE;
+        if (hit > HTCLIENT) {
+            *result = dispatch_wndproc(host->wndproc, handle, WM_NCLBUTTONDOWN,
+                                       (WPARAM)hit, screen_position);
+            return TRUE;
+        }
+        if (hit != -1) return FALSE; /* HTTRANSPARENT */
+        host = find_window(host->parent);
+    }
+    return FALSE;
 }
 
 LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
@@ -6353,6 +7120,7 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
 
     if (m.message == WM_QUIT)
         return 0;
+    if (m.hwnd && !find_public_window(m.hwnd)) return 0;
 
     BOOL input_message =
         msg_last_retrieved_source(GetCurrentProcessId(),
@@ -6362,7 +7130,7 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
         UINT hit = native_caption_press.hit;
         native_caption_press.window = NULL;
         if (capture_hwnd == handle) ReleaseCapture();
-        WINDOW *window = find_window(handle);
+        WINDOW *window = find_public_window(handle);
         if (window_on_current_thread(window) &&
             default_nonclient_hit(window,m.pt) == (LRESULT)hit) {
             UINT command = hit == HTCLOSE ? SC_CLOSE : hit == HTMINBUTTON ? SC_MINIMIZE :
@@ -6372,7 +7140,19 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
         }
         return 0;
     }
-    if (input_message && native_move.window) {
+    if (input_message && native_move.window &&
+        window_on_current_thread(find_window(native_move.window))) {
+        if ((m.message == WM_KEYDOWN || m.message == WM_SYSKEYDOWN) &&
+            (m.wParam == VK_ESCAPE || m.wParam == 0x0D)) {
+            HWND handle = native_move.window;
+            RECT initial = native_move.start_rect;
+            if (m.wParam == VK_ESCAPE)
+                SetWindowPos(handle, HWND_TOP, initial.left, initial.top,
+                             initial.right - initial.left, initial.bottom - initial.top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            native_move_finish(m.pt, FALSE);
+            return 0;
+        }
         if (m.message == WM_MOUSEMOVE) {
             native_move_update(m.pt);
             return 0;
@@ -6445,7 +7225,7 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
     /* Dispatch to 32-bit WndProc via compat32_callback_args.
      * Previous code fell back to DefWindowProc with "can't call 32-bit
      * from 64-bit" — but compat32_callback_args handles the mode switch. */
-    WINDOW *w = find_window(m.hwnd);
+    WINDOW *w = find_public_window(m.hwnd);
     if (w && w->wndproc) {
         return dispatch_wndproc(w->wndproc, m.hwnd, m.message,
                                 m.wParam, m.lParam);
@@ -6471,6 +7251,17 @@ void WINAPI PostQuitMessage(int nExitCode)
 
 BOOL WINAPI PostMessageA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
+    if ((ULONG_PTR)hWnd == 0xffffU) {
+        BOOL result = TRUE;
+        DWORD pid = GetCurrentProcessId();
+        for (int i = 0; i < window_count; i++) {
+            WINDOW *window = &windows[i];
+            if (is_top_level_window(window) && nt_job_user_same_domain(pid, window->owner_pid))
+                if (!msg_enqueue(window->handle, Msg, wParam, lParam)) result = FALSE;
+        }
+        return result;
+    }
+    if (hWnd && !find_public_window(hWnd)) return FALSE;
     return msg_enqueue(hWnd, Msg, wParam, lParam);
 }
 
@@ -6478,7 +7269,27 @@ static BOOL send_message_wait(HWND hWnd, DWORD Msg, WPARAM wParam,
                               LPARAM lParam, DWORD timeout_ms,
                               BOOL block_reentrancy, BOOL unicode, LRESULT *result)
 {
-    WINDOW *window = find_window(hWnd);
+    if ((ULONG_PTR)hWnd == 0xffffU) {
+        HWND matches[MAX_WINDOWS];
+        int count = 0;
+        DWORD pid = GetCurrentProcessId();
+        for (int i = 0; i < window_count; i++) {
+            WINDOW *window = &windows[i];
+            if (is_top_level_window(window) && nt_job_user_same_domain(pid, window->owner_pid))
+                matches[count++] = window->handle;
+        }
+        BOOL completed = TRUE;
+        for (int i = 0; i < count; i++) {
+            WINDOW *window = find_window(matches[i]);
+            if (!window || !nt_job_user_same_domain(pid, window->owner_pid)) continue;
+            LRESULT ignored;
+            if (!send_message_wait(matches[i], Msg, wParam, lParam, timeout_ms,
+                                    block_reentrancy, unicode, &ignored)) completed = FALSE;
+        }
+        *result = completed ? 1 : 0;
+        return completed;
+    }
+    WINDOW *window = find_public_window(hWnd);
     if (!window) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         *result = 0;
@@ -6625,8 +7436,13 @@ static LRESULT send_listbox_text(HWND window, DWORD message, WPARAM wp,
 static LRESULT send_message_text(HWND window, DWORD message, WPARAM wp,
                                   LPARAM lp, BOOL wide)
 {
-    WINDOW *w = find_window(window);
     LRESULT result = 0;
+    if ((ULONG_PTR)window == 0xffffU) {
+        send_message_wait(window, message, wp, lp, 0xffffffffU, FALSE, wide, &result);
+        return result;
+    }
+    WINDOW *w = find_public_window(window);
+    if (!w) return 0;
     BOOL target_wide = w ? w->unicode : wide;
     if (target_wide != wide && w && user32_listbox_has_strings(w->listbox) &&
         (message == 0x0180 || message == 0x0181 || message == 0x0189 ||
@@ -6682,9 +7498,14 @@ LRESULT WINAPI SendMessageA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
     (void)wParam;
+    if (hWnd && !find_public_window(hWnd)) return 0;
 
     switch (Msg) {
+    case 0x00FF: /* WM_INPUT */
+        raw_input_finish((ULONG_PTR)lParam);
+        return 0;
     case WM_NCCREATE:   return 1;       /* allow creation */
+    case WM_QUERYOPEN:  return 1;       /* allow restoring a minimized window */
     case 0x000C: /* WM_SETTEXT */
     case 0x000D: /* WM_GETTEXT */
     case 0x000E: /* WM_GETTEXTLENGTH */
@@ -6694,7 +7515,7 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
     case WM_DESTROY:    return 0;
     case WM_NCDESTROY:  return 0;
     case WM_ERASEBKGND: {
-        WINDOW *window = find_window(hWnd);
+        WINDOW *window = find_public_window(hWnd);
         WNDCLASS_ENTRY *entry = window
             ? lookup_class_for_pid(window->class_name, window->owner_pid) : NULL;
         if (!entry || !entry->hbrBackground) return 0;
@@ -6714,26 +7535,24 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
         return (LRESULT)(ULONG_PTR)GetSysColorBrush_u32(background);
     }
     case WM_NCCALCSIZE: {
-        WINDOW *window = find_window(hWnd);
+        WINDOW *window = find_public_window(hWnd);
         if (window && lParam) default_client_rect(window, (RECT *)(ULONG_PTR)lParam);
         return 0;
     }
     case WM_NCPAINT:
-        paint_window_frame(find_window(hWnd));
+        paint_window_frame(find_public_window(hWnd));
         return 0;
     case WM_NCHITTEST: {
         POINT point = {(short)(lParam & 0xFFFF), (short)((lParam >> 16) & 0xFFFF)};
-        return default_nonclient_hit(find_window(hWnd), point);
+        return default_nonclient_hit(find_public_window(hWnd), point);
     }
     case WM_NCLBUTTONDOWN:
         if (wParam == HTCAPTION) {
-            POINT point = {
-                .x = (short)(lParam & 0xFFFF),
-                .y = (short)((lParam >> 16) & 0xFFFF),
-            };
-            native_move_begin(hWnd, point);
+            SendMessageA(hWnd, WM_SYSCOMMAND, SC_MOVE | 2, lParam);
+        } else if (wParam >= HTLEFT && wParam <= HTBOTTOMRIGHT) {
+            SendMessageA(hWnd, WM_SYSCOMMAND, SC_SIZE | (wParam - HTLEFT + 1), lParam);
         } else if (wParam == HTCLOSE || wParam == HTMINBUTTON || wParam == HTMAXBUTTON) {
-            WINDOW *w = find_window(hWnd);
+            WINDOW *w = find_public_window(hWnd);
             RECT button;
             if (w && caption_button_rect(w,(UINT)wParam,&button)) {
                 WNDCLASS_ENTRY *cls = lookup_class_for_pid(w->class_name,w->owner_pid);
@@ -6749,14 +7568,14 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
     case WM_NCLBUTTONUP:
         return 0;
     case WM_NCACTIVATE:
-        paint_window_frame(find_window(hWnd));
+        paint_window_frame(find_public_window(hWnd));
         return 1;
     case WM_SETCURSOR:  return 1;
     case WM_ACTIVATE:   return 0;
     case WM_SYSKEYDOWN:
         if (wParam == VK_F4 && ((ULONG_PTR)lParam & (1UL << 29))) {
             HWND root = GetAncestor(hWnd, GA_ROOT);
-            WINDOW *window = find_window(root);
+            WINDOW *window = find_public_window(root);
             WNDCLASS_ENTRY *window_class = window
                 ? lookup_class_for_pid(window->class_name, window->owner_pid)
                 : NULL;
@@ -6766,7 +7585,7 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
         }
         return 0;
     case WM_WINDOWPOSCHANGED: {
-        WINDOW *w = find_window(hWnd);
+        WINDOW *w = find_public_window(hWnd);
         if (!w || !lParam)
             return 0;
 
@@ -6811,12 +7630,18 @@ LRESULT WINAPI DefWindowProcA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam
         case SC_RESTORE:
             ShowWindow(hWnd, SW_RESTORE);
             return 0;
-        case SC_MOVE:
-            native_move_begin(hWnd, cursor_pos);
+        case SC_MOVE: {
+            POINT point = (wParam & 0xFU)
+                ? (POINT){(short)(lParam & 0xFFFF), (short)((lParam >> 16) & 0xFFFF)} : cursor_pos;
+            native_move_begin(hWnd, point);
             return 0;
-        case SC_SIZE:
-            /* Interactive sizing is not implemented yet. */
+        }
+        case SC_SIZE: {
+            POINT point = {(short)(lParam & 0xFFFF), (short)((lParam >> 16) & 0xFFFF)};
+            if ((wParam & 0xFU) >= 1 && (wParam & 0xFU) <= 8)
+                native_size_begin(hWnd, point, HTLEFT + (UINT)(wParam & 0xFU) - 1);
             return 0;
+        }
         }
         break;
     case WM_PAINT:
@@ -6930,6 +7755,7 @@ static LRESULT dialog_default_proc(HWND hWnd, DWORD Msg,
 LRESULT WINAPI DefDlgProcA(HWND hDlg, DWORD msg, WPARAM wParam,
                             LPARAM lParam)
 {
+    if (!find_public_window(hDlg)) return 0;
     return dialog_default_proc(hDlg, msg, wParam, lParam);
 }
 
@@ -6942,12 +7768,21 @@ LRESULT WINAPI DefDlgProcW(HWND hDlg, DWORD msg, WPARAM wParam,
 static LRESULT WINAPI dialog_class_wndproc(HWND hWnd, DWORD Msg,
                                             WPARAM wParam, LPARAM lParam)
 {
+    if (!find_public_window(hWnd)) return 0;
     U32_DIALOG_STATE *state = dialog_state_find(hWnd);
     if (state && state->proc) {
+        state->message_result = 0;
         LRESULT handled = dispatch_wndproc((WNDPROC)state->proc, hWnd, Msg,
                                            wParam, lParam);
-        if (handled)
-            return handled;
+        if (handled) {
+            /* These dialog messages return their value directly. All other
+             * handled messages use DWLP_MSGRESULT, including WM_NOTIFY. */
+            if (Msg == WM_INITDIALOG || Msg == 0x002E || Msg == 0x002F ||
+                Msg == 0x0037 || Msg == 0x0039 ||
+                (Msg >= 0x0132 && Msg <= 0x0138))
+                return handled;
+            return state->used ? state->message_result : 0;
+        }
     }
     return dialog_default_proc(hWnd, Msg, wParam, lParam);
 }
@@ -6955,7 +7790,8 @@ static LRESULT WINAPI dialog_class_wndproc(HWND hWnd, DWORD Msg,
 static LRESULT WINAPI system_class_wndproc(HWND hWnd, DWORD Msg,
                                             WPARAM wParam, LPARAM lParam)
 {
-    WINDOW *window = find_window(hWnd);
+    WINDOW *window = find_public_window(hWnd);
+    if (!window) return 0;
     LRESULT result;
     USER_HOOK_CONTEXT *context = user_hook_context_get(FALSE);
     if (window && window->listbox && user32_listbox_message(window->listbox,
@@ -6969,7 +7805,7 @@ static LRESULT WINAPI system_class_wndproc(HWND hWnd, DWORD Msg,
 
 BOOL WINAPI GetClientRect(HWND hWnd, LPRECT lpRect)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     BOOL result = w && lpRect ? TRUE : FALSE;
     if (!result)
         return FALSE;
@@ -6999,7 +7835,7 @@ BOOL WINAPI GetClientRect(HWND hWnd, LPRECT lpRect)
 
 BOOL WINAPI GetWindowRect(HWND hWnd, LPRECT lpRect)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w || !lpRect) return FALSE;
     int screen_x, screen_y;
     window_screen_origin(w, &screen_x, &screen_y);
@@ -7022,7 +7858,7 @@ _Static_assert(sizeof(U32_WINDOWINFO) == 60, "WINDOWINFO ABI changed");
 
 static BOOL WINAPI GetWindowInfo_u32(HWND handle, U32_WINDOWINFO *info)
 {
-    WINDOW *w = find_window(handle);
+    WINDOW *w = find_public_window(handle);
     if (!w || !info || info->size != sizeof(*info)) {
         SetLastError(!w ? 1400 : 87);
         return FALSE;
@@ -7044,7 +7880,7 @@ static BOOL WINAPI GetWindowInfo_u32(HWND handle, U32_WINDOWINFO *info)
 
 BOOL WINAPI GetWindowPlacement(HWND hWnd, LPWINDOWPLACEMENT placement)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w || !placement || placement->length != sizeof(WINDOWPLACEMENT)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return FALSE;
@@ -7062,7 +7898,7 @@ BOOL WINAPI GetWindowPlacement(HWND hWnd, LPWINDOWPLACEMENT placement)
 
 BOOL WINAPI SetWindowPlacement(HWND hWnd, const WINDOWPLACEMENT *placement)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w || !placement || placement->length != sizeof(WINDOWPLACEMENT)) {
         SetLastError(87);
         return FALSE;
@@ -7179,7 +8015,7 @@ BOOL WINAPI PtInRect(const RECT *rect, POINT point)
 int WINAPI GetWindowRgn(HWND hWnd, HRGN hRgn)
 {
     (void)hRgn;
-    if (!find_window(hWnd)) return 0;
+    if (!find_public_window(hWnd)) return 0;
 
     /* Windows returns ERROR when a valid window has no custom region. */
     return 0;
@@ -7189,7 +8025,7 @@ int WINAPI SetWindowRgn(HWND hWnd, HRGN hRgn, BOOL bRedraw)
 {
     (void)hRgn;
     (void)bRedraw;
-    return find_window(hWnd) ? 1 : 0;
+    return find_public_window(hWnd) ? 1 : 0;
 }
 
 BOOL WINAPI AdjustWindowRect(LPRECT lpRect, DWORD dwStyle, BOOL bMenu)
@@ -7211,7 +8047,10 @@ BOOL WINAPI AdjustWindowRectEx(LPRECT lpRect, DWORD dwStyle, BOOL bMenu, DWORD d
 /* ── SystemParametersInfo / Timer stubs ──────────────────────── */
 
 #define SPI_GETNONCLIENTMETRICS 0x0029
+#define SPI_SETWORKAREA         0x002f
 #define SPI_GETWORKAREA         0x0030
+#define SPI_GETWHEELSCROLLLINES  0x0068
+#define SPI_SETWHEELSCROLLLINES  0x0069
 
 typedef struct {
     LONG lfHeight;
@@ -7366,22 +8205,163 @@ static int screen_cy(void);
 static int current_mode_cx(void);
 static int current_mode_cy(void);
 
-BOOL WINAPI SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni)
+static UINT spi_scroll_lines = 3;
+static RECT spi_work_area;
+static BOOL spi_work_area_set;
+static spinlock_t spi_lock = SPINLOCK_INIT;
+
+UINT user32_wheel_scroll_lines(void)
 {
-    (void)fWinIni;
-    if (uiAction == SPI_GETWORKAREA && pvParam) {
-        /* Return screen rect as work area. Use the LIVE screen size (same
-         * source as GetSystemMetrics) — the old compile-time
-         * SCREEN_WIDTH/SCREEN_HEIGHT constants were the one remaining size
-         * source that could disagree with every other metric, showing UE1 a
-         * phantom desktop-size mismatch. */
-        int32_t *rect = (int32_t *)pvParam;
-        rect[0] = 0;              /* left */
-        rect[1] = 0;              /* top */
-        rect[2] = current_mode_cx();    /* right */
-        rect[3] = current_mode_cy();    /* bottom */
+    return __atomic_load_n(&spi_scroll_lines, __ATOMIC_RELAXED);
+}
+
+static uint64_t spi_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&spi_lock);
+    return flags;
+}
+
+static void spi_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&spi_lock);
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+}
+
+static RECT spi_get_work_area(void)
+{
+    RECT screen = {0, 0, current_mode_cx(), current_mode_cy()};
+    uint64_t flags = spi_lock_irqsave();
+    RECT area = spi_work_area_set ? spi_work_area : screen;
+    spi_unlock_irqrestore(flags);
+    if (area.right > screen.right) area.right = screen.right;
+    if (area.bottom > screen.bottom) area.bottom = screen.bottom;
+    if (area.left >= area.right || area.top >= area.bottom) return screen;
+    return area;
+}
+
+/* WinUser.h action families, not a general odd/even convention: the early
+ * actions and the two bidirectional icon-spacing actions are exceptions. */
+static int spi_action_kind(UINT action, PVOID parameter)
+{
+    if (action == 0x0d || action == 0x18) return parameter ? 1 : 2;
+    if ((action >= 0x32 && action <= 0x4b) ||
+        (action >= 0x62 && action <= 0x71) ||
+        (action >= 0x74 && action <= 0x91) ||
+        (action >= 0x9c && action <= 0x9f) ||
+        (action >= 0xa2 && action <= 0xa3) ||
+        (action >= 0xae && action <= 0xaf) ||
+        (action >= 0x1000 && action <= 0x100f) ||
+        (action >= 0x1012 && action <= 0x1027) ||
+        (action >= 0x103e && action <= 0x1043) ||
+        (action >= 0x1048 && action <= 0x1051) ||
+        (action >= 0x2000 && action <= 0x2025))
+        return (action & 1) ? 2 : 1;
+    switch (action) {
+    case 0x01: case 0x03: case 0x05: case 0x0a: case 0x0e: case 0x10:
+    case 0x12: case 0x16: case 0x19: case 0x1b: case 0x1f: case 0x23:
+    case 0x26: case 0x29: case 0x2b: case 0x2d: case 0x30: case 0x4f:
+    case 0x50: case 0x53: case 0x54: case 0x59: case 0x5c: case 0x5e:
+    case 0x5f: case 0x72: case 0x73:
+        return 1;
+    case 0x02: case 0x04: case 0x06: case 0x0b: case 0x0c: case 0x0f:
+    case 0x11: case 0x13: case 0x14: case 0x15: case 0x17: case 0x1a:
+    case 0x1c: case 0x1d: case 0x1e: case 0x20: case 0x21: case 0x22:
+    case 0x24: case 0x25: case 0x2a: case 0x2c: case 0x2e: case 0x2f:
+    case 0x31: case 0x4c: case 0x4d: case 0x4e: case 0x51: case 0x52:
+    case 0x55: case 0x56: case 0x57: case 0x58: case 0x5a: case 0x5b:
+    case 0x5d: case 0x60: case 0x61:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+static BOOL spi_policy_check(UINT action, PVOID parameter, UINT flags)
+{
+    int kind = spi_action_kind(action, parameter);
+    /* WOW64 rejects unknown actions before entering the native USER service. */
+    if (!kind && g_compat32_mode) { SetLastError(120); return FALSE; }
+    if (kind != 1 &&
+        (nt_job_ui_restrictions(GetCurrentProcessId()) & NT_JOB_UI_SYSTEMPARAMETERS)) {
+        SetLastError(5);
+        return FALSE;
+    }
+    if (!kind) { SetLastError(87); return FALSE; }
+    /* No profile persistence or WM_SETTINGCHANGE broadcast backend yet. */
+    if (kind == 2 && flags) { SetLastError(50); return FALSE; }
+    return TRUE;
+}
+
+static BOOL spi_buffer(PVOID buffer, UINT size, BOOL write)
+{
+    if (!buffer || !nt_vm_user_range_accessible((ULONG_PTR)buffer, size, write)) {
+        SetLastError(998);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL spi_common(UINT action, UINT parameter, PVOID data)
+{
+    if (action == SPI_GETWORKAREA) {
+        if (!spi_buffer(data, sizeof(RECT), TRUE)) return FALSE;
+        *(RECT *)data = spi_get_work_area();
         return TRUE;
     }
+    if (action == SPI_SETWORKAREA) {
+        if (!spi_buffer(data, sizeof(RECT), FALSE)) return FALSE;
+        RECT area = *(const RECT *)data;
+        if (area.left < 0 || area.top < 0 || area.right <= area.left ||
+            area.bottom <= area.top || area.right > current_mode_cx() ||
+            area.bottom > current_mode_cy()) {
+            SetLastError(87);
+            return FALSE;
+        }
+        uint64_t flags = spi_lock_irqsave();
+        if (nt_job_ui_restrictions(GetCurrentProcessId()) & NT_JOB_UI_SYSTEMPARAMETERS) {
+            spi_unlock_irqrestore(flags);
+            SetLastError(5);
+            return FALSE;
+        }
+        spi_work_area = area;
+        spi_work_area_set = TRUE;
+        spi_unlock_irqrestore(flags);
+        return TRUE;
+    }
+    if (action == SPI_GETWHEELSCROLLLINES) {
+        if (!spi_buffer(data, sizeof(UINT), TRUE)) return FALSE;
+        *(UINT *)data = user32_wheel_scroll_lines();
+        SetLastError(0);
+        return TRUE;
+    }
+    if (action == SPI_SETWHEELSCROLLLINES) {
+        uint64_t flags = spi_lock_irqsave();
+        if (nt_job_ui_restrictions(GetCurrentProcessId()) & NT_JOB_UI_SYSTEMPARAMETERS) {
+            spi_unlock_irqrestore(flags);
+            SetLastError(5);
+            return FALSE;
+        }
+        __atomic_store_n(&spi_scroll_lines, parameter, __ATOMIC_RELAXED);
+        spi_unlock_irqrestore(flags);
+        SetLastError(0);
+        return TRUE;
+    }
+    static UINT unsupported_count;
+    if (__atomic_fetch_add(&unsupported_count, 1, __ATOMIC_RELAXED) < 128) {
+        serial_puts("[U32-SPI] unsupported action=0x");
+        serial_puthex(action, 8);
+        serial_puts(" pid="); serial_putdec(GetCurrentProcessId());
+        serial_puts("\n");
+    }
+    SetLastError(50);
+    return FALSE;
+}
+
+BOOL WINAPI SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni)
+{
+    if (!spi_policy_check(uiAction, pvParam, fWinIni)) return FALSE;
     if (uiAction == SPI_GETNONCLIENTMETRICS) {
         if (!pvParam || uiParam < U32_NONCLIENTMETRICSA_XP_SIZE) {
             SetLastError(87); /* ERROR_INVALID_PARAMETER */
@@ -7409,21 +8389,20 @@ BOOL WINAPI SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UI
 
         UINT write_size = uiParam < sizeof(metrics)
                         ? uiParam : (UINT)sizeof(metrics);
+        if (!spi_buffer(pvParam, write_size, TRUE)) return FALSE;
         spi_copy_bytes(pvParam, &metrics, write_size);
         spi_trace_nonclient('A', uiParam, pvParam, &metrics,
                             (uint64_t)__builtin_return_address(0));
         SetLastError(0);
         return TRUE;
     }
-    return TRUE;
+    return spi_common(uiAction, uiParam, pvParam);
 }
 
 BOOL WINAPI SystemParametersInfoW(UINT uiAction, UINT uiParam,
                                   PVOID pvParam, UINT fWinIni)
 {
-    (void)fWinIni;
-    if (uiAction == SPI_GETWORKAREA)
-        return SystemParametersInfoA(uiAction, uiParam, pvParam, fWinIni);
+    if (!spi_policy_check(uiAction, pvParam, fWinIni)) return FALSE;
     if (uiAction == SPI_GETNONCLIENTMETRICS) {
         if (!pvParam || uiParam < U32_NONCLIENTMETRICSW_XP_SIZE) {
             SetLastError(87); /* ERROR_INVALID_PARAMETER */
@@ -7451,13 +8430,14 @@ BOOL WINAPI SystemParametersInfoW(UINT uiAction, UINT uiParam,
 
         UINT write_size = uiParam < sizeof(metrics)
                         ? uiParam : (UINT)sizeof(metrics);
+        if (!spi_buffer(pvParam, write_size, TRUE)) return FALSE;
         spi_copy_bytes(pvParam, &metrics, write_size);
         spi_trace_nonclient('W', uiParam, pvParam, &metrics,
                             (uint64_t)__builtin_return_address(0));
         SetLastError(0);
         return TRUE;
     }
-    return TRUE;
+    return spi_common(uiAction, uiParam, pvParam);
 }
 
 static BOOL WINAPI SetProcessDpiAwarenessContext_u32(HANDLE context)
@@ -7500,7 +8480,7 @@ static HANDLE WINAPI GetThreadDpiAwarenessContext_u32(void)
 
 static UINT WINAPI GetDpiForWindow_u32(HWND window)
 {
-    if (!hwnd_is_desktop(window) && !find_window(window)) {
+    if (!hwnd_is_desktop(window) && !find_public_window(window)) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return 0;
     }
@@ -7515,7 +8495,7 @@ static UINT WINAPI GetDpiForSystem_u32(void)
 
 static HANDLE WINAPI GetWindowDpiAwarenessContext_u32(HWND window)
 {
-    if (!hwnd_is_desktop(window) && !find_window(window)) {
+    if (!hwnd_is_desktop(window) && !find_public_window(window)) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return NULL;
     }
@@ -7525,7 +8505,7 @@ static HANDLE WINAPI GetWindowDpiAwarenessContext_u32(HWND window)
 
 static BOOL WINAPI EnableNonClientDpiScaling_u32(HWND window)
 {
-    if (!hwnd_is_desktop(window) && !find_window(window)) {
+    if (!hwnd_is_desktop(window) && !find_public_window(window)) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return FALSE;
     }
@@ -7671,6 +8651,7 @@ static ULONG_PTR WINAPI SetCoalescableTimer_u32(HWND window,
 
 BOOL WINAPI KillTimer(HWND hWnd, ULONG_PTR uIDEvent)
 {
+    if (hWnd && !find_public_window(hWnd)) return FALSE;
     return user_timer_kill(hWnd, uIDEvent);
 }
 
@@ -7841,7 +8822,7 @@ static HANDLE primary_monitor(void)
 
 HANDLE WINAPI MonitorFromWindow(HWND hWnd, DWORD dwFlags)
 {
-    return (find_window(hWnd) || dwFlags) ? primary_monitor() : NULL;
+    return (find_public_window(hWnd) || dwFlags) ? primary_monitor() : NULL;
 }
 
 HANDLE WINAPI MonitorFromPoint(POINT pt, DWORD dwFlags)
@@ -7867,7 +8848,7 @@ BOOL WINAPI GetMonitorInfoW(HANDLE hMonitor, PVOID lpmi)
         return FALSE;
 
     mi->rcMonitor = (RECT){ 0, 0, current_mode_cx(), current_mode_cy() };
-    mi->rcWork = mi->rcMonitor;
+    mi->rcWork = spi_get_work_area();
     mi->dwFlags = 1; /* MONITORINFOF_PRIMARY */
     if (mi->cbSize >= sizeof(MONITORINFOEXW_K32)) {
         MONITORINFOEXW_K32 *ex = (MONITORINFOEXW_K32 *)lpmi;
@@ -7890,7 +8871,7 @@ BOOL WINAPI GetMonitorInfoA(HANDLE hMonitor, PVOID lpmi)
         return FALSE;
 
     mi->rcMonitor = (RECT){ 0, 0, current_mode_cx(), current_mode_cy() };
-    mi->rcWork = mi->rcMonitor;
+    mi->rcWork = spi_get_work_area();
     mi->dwFlags = 1; /* MONITORINFOF_PRIMARY */
     if (mi->cbSize >= sizeof(MONITORINFOEXA_K32)) {
         MONITORINFOEXA_K32 *ex = (MONITORINFOEXA_K32 *)lpmi;
@@ -8280,6 +9261,8 @@ typedef struct {
 
 _Static_assert(sizeof(DISPLAY_DEVICEA_U32) == 424,
                "DISPLAY_DEVICEA layout");
+_Static_assert(sizeof(DISPLAY_DEVICEW_U32) == 840,
+               "DISPLAY_DEVICEW layout");
 
 static void display_copy_ascii(WCHAR *dst, DWORD capacity, const char *src)
 {
@@ -8315,6 +9298,25 @@ static void display_copy_ansi(char *dst, DWORD capacity, const char *src)
     dst[i] = 0;
 }
 
+extern void display_get_primary_identity(display_identity_t *) __attribute__((weak));
+
+static void display_adapter_info(const char **description, char id[128], DWORD *flags)
+{
+    display_identity_t identity = {.description = "UEFI GOP Display"};
+    if (display_get_primary_identity)
+        display_get_primary_identity(&identity);
+    *description = identity.description;
+    *flags = 0x00000005; /* attached and primary; independent of 3D support */
+    id[0] = 0;
+    if (!identity.vendor) return;
+    if (identity.vga_compatible) *flags |= 0x10;
+    display_copy_ansi(id, 128, "PCI\\VEN_0000&DEV_0000");
+    for (unsigned i = 0; i < 4; i++) {
+        id[8+i] = "0123456789ABCDEF"[(identity.vendor >> (12-4*i)) & 15];
+        id[17+i] = "0123456789ABCDEF"[(identity.device >> (12-4*i)) & 15];
+    }
+}
+
 static BOOL WINAPI EnumDisplayDevicesA_u32(const char *device,
                                             DWORD device_index,
                                             PVOID display_device, DWORD flags)
@@ -8335,10 +9337,11 @@ static BOOL WINAPI EnumDisplayDevicesA_u32(const char *device,
     memset(out, 0, sizeof(*out));
     out->cb = sizeof(*out);
     if (!device) {
+        const char *description; char id[128];
+        display_adapter_info(&description, id, &out->state_flags);
         display_copy_ansi(out->device_name, 32, adapter_name);
-        display_copy_ansi(out->device_string, 128, "OsitoK Display Adapter");
-        out->state_flags = 0x00000015; /* attached, primary, VGA-compatible */
-        display_copy_ansi(out->device_id, 128, "PCI\\VEN_1AF4&DEV_1050");
+        display_copy_ansi(out->device_string, 128, description);
+        display_copy_ansi(out->device_id, 128, id);
         display_copy_ansi(out->device_key, 128,
                           "\\Registry\\Machine\\System\\CurrentControlSet"
                           "\\Control\\Video\\{OSITOK}\\0000");
@@ -8375,10 +9378,11 @@ static BOOL WINAPI EnumDisplayDevicesW_u32(PCWSTR device, DWORD device_index,
     memset(out, 0, sizeof(*out));
     out->cb = sizeof(*out);
     if (!device) {
+        const char *description; char id[128];
+        display_adapter_info(&description, id, &out->state_flags);
         display_copy_ascii(out->device_name, 32, adapter_name);
-        display_copy_ascii(out->device_string, 128, "OsitoK Display Adapter");
-        out->state_flags = 0x00000015; /* attached, primary, VGA-compatible */
-        display_copy_ascii(out->device_id, 128, "PCI\\VEN_1AF4&DEV_1050");
+        display_copy_ascii(out->device_string, 128, description);
+        display_copy_ascii(out->device_id, 128, id);
         display_copy_ascii(out->device_key, 128,
                            "\\Registry\\Machine\\System\\CurrentControlSet"
                            "\\Control\\Video\\{OSITOK}\\0000");
@@ -8490,6 +9494,7 @@ _Static_assert(sizeof(DEVMODEW) == 220, "Win32 DEVMODEW ABI");
                                 CDS_NORESET)
 
 #define DISP_CHANGE_SUCCESSFUL  0
+#define DISP_CHANGE_FAILED     -1
 #define DISP_CHANGE_BADMODE    -2
 #define DISP_CHANGE_BADFLAGS   -4
 #define DISP_CHANGE_BADPARAM   -5
@@ -8654,6 +9659,10 @@ static LONG restore_display_settings(uint32_t flags)
 
 LONG WINAPI ChangeDisplaySettingsA(DEVMODEA *dm, uint32_t flags)
 {
+    if (nt_job_ui_restrictions(GetCurrentProcessId()) & NT_JOB_UI_DISPLAYSETTINGS) {
+        SetLastError(5); /* ERROR_ACCESS_DENIED, including CDS_TEST. */
+        return DISP_CHANGE_FAILED;
+    }
     if (!dm)
         return restore_display_settings(flags);
     if (dm->dmSize < DEVMODEA_DISPLAY_SIZE)
@@ -8665,6 +9674,10 @@ LONG WINAPI ChangeDisplaySettingsA(DEVMODEA *dm, uint32_t flags)
 
 LONG WINAPI ChangeDisplaySettingsW(DEVMODEW *dm, uint32_t flags)
 {
+    if (nt_job_ui_restrictions(GetCurrentProcessId()) & NT_JOB_UI_DISPLAYSETTINGS) {
+        SetLastError(5);
+        return DISP_CHANGE_FAILED;
+    }
     if (!dm)
         return restore_display_settings(flags);
     if (dm->dmSize < DEVMODEW_DISPLAY_SIZE)
@@ -8789,8 +9802,17 @@ BOOL WINAPI EnumDisplaySettingsExW(const WCHAR *device, uint32_t mode,
 
 LONG_PTR WINAPI GetWindowLongPtrA(HWND hWnd, int nIndex)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return 0;
+    if (nIndex >= 0) {
+        U32_DIALOG_STATE *dialog = dialog_state_find(hWnd);
+        int pointer_size = g_compat32_mode ? 4 : 8;
+        if (dialog) {
+            if (nIndex == 0) return dialog->message_result;
+            if (nIndex == pointer_size) return (LONG_PTR)dialog->proc;
+            if (nIndex == 2 * pointer_size) return dialog->private_data;
+        }
+    }
     switch (nIndex) {
     case GWL_STYLE:    return (LONG_PTR)w->style;
     case GWL_EXSTYLE:  return (LONG_PTR)w->ex_style;
@@ -8811,9 +9833,22 @@ LONG WINAPI GetWindowLongA(HWND hWnd, int nIndex)
 LONG_PTR WINAPI SetWindowLongPtrA(HWND hWnd, int nIndex,
                                   LONG_PTR dwNewLong)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return 0;
     LONG_PTR old = GetWindowLongPtrA(hWnd, nIndex);
+    if (nIndex >= 0) {
+        U32_DIALOG_STATE *dialog = dialog_state_find(hWnd);
+        int pointer_size = g_compat32_mode ? 4 : 8;
+        if (dialog) {
+            if (nIndex == 0) dialog->message_result = dwNewLong;
+            else if (nIndex == pointer_size)
+                dialog->proc = (DLGPROC)(ULONG_PTR)dwNewLong;
+            else if (nIndex == 2 * pointer_size)
+                dialog->private_data = dwNewLong;
+            else SetLastError(1413); /* ERROR_INVALID_INDEX */
+            return old;
+        }
+    }
     switch (nIndex) {
     case GWL_STYLE:
         w->style = (DWORD)dwNewLong;
@@ -8822,8 +9857,14 @@ LONG_PTR WINAPI SetWindowLongPtrA(HWND hWnd, int nIndex,
         sync_all_window_compositor_state();
         break;
     case GWL_EXSTYLE:
+        if ((w->ex_style ^ (DWORD)dwNewLong) & WS_EX_LAYERED) {
+            w->layered_initialized = FALSE;
+            w->layered_flags = 0;
+            w->surface_alpha = (surface_alpha_t){.opacity = 255};
+        }
         w->ex_style = (DWORD)dwNewLong;
         place_window_in_z_order(w, HWND_TOP);
+        sync_all_window_compositor_state();
         break;
     case GWL_USERDATA: w->user_data = (PVOID)(ULONG_PTR)dwNewLong; break;
     case GWL_WNDPROC:
@@ -8836,7 +9877,7 @@ LONG_PTR WINAPI SetWindowLongPtrA(HWND hWnd, int nIndex,
         if (w->style & WS_CHILD) {
             SetParent(hWnd, relation);
         } else if (!relation || hwnd_is_desktop(relation) ||
-                   (find_window(relation) && relation != hWnd)) {
+                   (find_public_window(relation) && relation != hWnd)) {
             w->owner = (!relation || hwnd_is_desktop(relation)) ? NULL : relation;
             sync_all_window_compositor_state();
         } else {
@@ -8856,15 +9897,24 @@ LONG WINAPI SetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong)
 BOOL WINAPI SetLayeredWindowAttributes(HWND hWnd, DWORD crKey,
                                        BYTE bAlpha, DWORD dwFlags)
 {
-    WINDOW *w = find_window(hWnd);
-    if (!w || (dwFlags & ~3U) != 0 || (dwFlags & 3U) == 0) {
-        SetLastError(87); /* ERROR_INVALID_PARAMETER */
+    WINDOW *w = find_public_window(hWnd);
+    if (!w || !(w->ex_style & WS_EX_LAYERED) ||
+        (dwFlags & ~3U) != 0 || (dwFlags & 3U) == 0) {
+        SetLastError(w ? 87 : 1400);
         return FALSE;
     }
 
     w->layered_color_key = crKey;
     w->layered_alpha = bAlpha;
     w->layered_flags = dwFlags;
+    w->layered_initialized = TRUE;
+    w->surface_alpha = (surface_alpha_t){
+        .color_key = ((crKey & 255) << 16) | (crKey & 0xff00) | ((crKey >> 16) & 255),
+        .opacity = (dwFlags & 2) ? bAlpha : 255,
+        .color_key_enabled = (dwFlags & 1) != 0,
+    };
+    sync_all_window_compositor_state();
+    user32_mark_window_dirty(hWnd);
     SetLastError(0);
     return TRUE;
 }
@@ -8872,14 +9922,112 @@ BOOL WINAPI SetLayeredWindowAttributes(HWND hWnd, DWORD crKey,
 BOOL WINAPI GetLayeredWindowAttributes(HWND hWnd, DWORD *crKey,
                                        BYTE *alpha, DWORD *flags)
 {
-    WINDOW *w = find_window(hWnd);
-    if (!w || !w->layered_flags) {
+    WINDOW *w = find_public_window(hWnd);
+    if (!w || !(w->ex_style & WS_EX_LAYERED) || !w->layered_flags) {
         SetLastError(w ? 87 : 1400);
         return FALSE;
     }
     if (crKey) *crKey = w->layered_color_key;
     if (alpha) *alpha = w->layered_alpha;
     if (flags) *flags = w->layered_flags;
+    return TRUE;
+}
+
+BOOL WINAPI UpdateLayeredWindow(HWND window, HDC destination_dc,
+                                 const POINT *position, const U32_SIZE *size,
+                                 HDC source_dc, const POINT *source,
+                                 DWORD color_key, const U32_BLENDFUNCTION *blend,
+                                 DWORD flags)
+{
+    WINDOW *w = find_public_window(window);
+    if (!w) { SetLastError(1400); return FALSE; }
+    if (!(w->ex_style & WS_EX_LAYERED) || w->layered_flags ||
+        (flags & ~(ULW_ALPHA | ULW_COLORKEY | ULW_OPAQUE)) ||
+        ((flags & ULW_OPAQUE) && flags != ULW_OPAQUE) ||
+        (!source_dc && (destination_dc || size || source || flags)) ||
+        (source_dc && !flags) ||
+        ((flags & ULW_ALPHA) && (!blend || blend->BlendOp || blend->BlendFlags ||
+                                (blend->AlphaFormat & ~1u)))) {
+        SetLastError(87);
+        return FALSE;
+    }
+    int width = size ? size->cx : w->width;
+    int height = size ? size->cy : w->height;
+    if (source_dc && (width <= 0 || height <= 0 || width > 65535 || height > 65535)) {
+        SetLastError(87);
+        return FALSE;
+    }
+    int x = w->x, y = w->y;
+    if (position) {
+        int origin_x = 0, origin_y = 0;
+        WINDOW *parent = find_window(w->parent);
+        if (parent) window_client_origin(parent, &origin_x, &origin_y);
+        int64_t px = (int64_t)position->x - origin_x;
+        int64_t py = (int64_t)position->y - origin_y;
+        if (px < (-2147483647LL - 1) || px > 2147483647 ||
+            py < (-2147483647LL - 1) || py > 2147483647) {
+            SetLastError(87);
+            return FALSE;
+        }
+        x = (int)px;
+        y = (int)py;
+    }
+
+    if (source_dc) {
+        if (!shm_create_surface || !shm_map || !shm_unmap || !shm_destroy ||
+            !compositor_replace_surface || !compositor_create_window_inactive) {
+            SetLastError(50);
+            return FALSE;
+        }
+        uint32_t handle = shm_create_surface(width, height,
+            SHM_FLAG_CPU_WRITE | SHM_FLAG_CPU_READ);
+        uint32_t *pixels = handle ? shm_map(handle) : NULL;
+        if (!pixels) {
+            if (handle) shm_destroy(handle);
+            SetLastError(8);
+            return FALSE;
+        }
+        BOOL per_pixel = (flags & ULW_ALPHA) && (blend->AlphaFormat & 1);
+        if (!gdi32_copy_layered_pixels(source_dc, source ? source->x : 0,
+                                      source ? source->y : 0, width, height,
+                                      pixels, per_pixel)) {
+            shm_unmap(handle);
+            shm_destroy(handle);
+            return FALSE;
+        }
+        /* Publish only after the complete source has been copied. The
+         * compositor and retained window DCs then refer to owned storage. */
+        BOOL published = w->compositor_id
+            ? compositor_replace_surface(w->compositor_id, handle, width, height)
+            : (w->compositor_id = compositor_create_window_inactive(
+                handle, x, y, width, height, w->owner_pid, w->title)) != 0;
+        if (!published) {
+            shm_unmap(handle);
+            shm_destroy(handle);
+            SetLastError(8);
+            return FALSE;
+        }
+        uint32_t old = w->shm_handle;
+        w->shm_handle = handle;
+        w->shm_pixels = pixels;
+        w->surface_width = width;
+        w->surface_height = height;
+        if (old) { shm_unmap(old); shm_destroy(old); }
+        w->surface_alpha = (surface_alpha_t){
+            .color_key = ((color_key & 255) << 16) | (color_key & 0xff00) |
+                         ((color_key >> 16) & 255),
+            .opacity = (flags & ULW_ALPHA) ? blend->SourceConstantAlpha : 255,
+            .per_pixel = per_pixel,
+            .color_key_enabled = (flags & ULW_COLORKEY) != 0,
+        };
+        w->layered_initialized = TRUE;
+    }
+    DWORD positioning = SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOSENDCHANGING;
+    if (!position) positioning |= SWP_NOMOVE;
+    if (!size) positioning |= SWP_NOSIZE;
+    if (!SetWindowPos(window, NULL, x, y, width, height, positioning)) return FALSE;
+    if (!find_public_window(window)) { SetLastError(1400); return FALSE; }
+    user32_mark_window_dirty(window);
     return TRUE;
 }
 
@@ -8907,17 +10055,35 @@ HWND WINAPI WindowFromPoint(POINT point)
             continue;
         int screen_x, screen_y;
         window_screen_origin(w, &screen_x, &screen_y);
-        if (point.x >= screen_x && point.y >= screen_y &&
-            point.x < screen_x + w->width && point.y < screen_y + w->height &&
-            (!hit || w->render_z > hit->render_z))
+        int64_t local_x = (int64_t)point.x - screen_x;
+        int64_t local_y = (int64_t)point.y - screen_y;
+        if (local_x < 0 || local_y < 0 ||
+            local_x >= w->width || local_y >= w->height)
+            continue;
+        if (w->ex_style & WS_EX_LAYERED) {
+            if ((w->ex_style & WS_EX_TRANSPARENT) || !w->shm_pixels ||
+                local_x >= w->surface_width || local_y >= w->surface_height ||
+                !surface_alpha_coverage(((uint32_t *)w->shm_pixels)[
+                    (SIZE_T)local_y * w->surface_width + (SIZE_T)local_x],
+                    &w->surface_alpha))
+                continue;
+        }
+        if (!hit || w->render_z > hit->render_z)
             hit = w;
     }
     return hit ? hit->handle : NULL;
 }
 
+static HWND WINAPI WindowFromPoint_compat32(LONG x, LONG y)
+{
+    /* The PE32 thunk supplies two stack DWORDs; the native Microsoft ABI
+     * packs this eight-byte structure into one register. */
+    return WindowFromPoint((POINT){x, y});
+}
+
 HWND WINAPI GetAncestor(HWND hWnd, UINT flags)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) return NULL;
     if (flags == GA_PARENT) return w->parent;
     if (flags != GA_ROOT && flags != GA_ROOTOWNER) {
@@ -8957,7 +10123,7 @@ static int same_getwindow_group(const WINDOW *a, const WINDOW *b)
 
 HWND WINAPI GetTopWindow(HWND hWnd)
 {
-    WINDOW *parent = hWnd ? find_window(hWnd) : NULL;
+    WINDOW *parent = hWnd ? find_public_window(hWnd) : NULL;
     if (hWnd && !parent && !hwnd_is_desktop(hWnd)) {
         SetLastError(1400);
         return NULL;
@@ -8979,7 +10145,7 @@ HWND WINAPI GetTopWindow(HWND hWnd)
 
 HWND WINAPI GetWindow(HWND hWnd, UINT uCmd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) {
         SetLastError(1400);
         return NULL;
@@ -9033,7 +10199,7 @@ HWND WINAPI GetWindow(HWND hWnd, UINT uCmd)
 
 BOOL WINAPI BringWindowToTop(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) {
         SetLastError(1400);
         return FALSE;
@@ -9053,7 +10219,7 @@ BOOL WINAPI BringWindowToTop(HWND hWnd)
     }
     sort_window_handles_top_to_bottom(owned, owned_count);
     for (int i = owned_count - 1; i >= 0; i--) {
-        WINDOW *popup = find_window(owned[i]);
+        WINDOW *popup = find_public_window(owned[i]);
         if (popup && popup->owner == hWnd)
             place_window_in_z_order(popup, HWND_TOP);
     }
@@ -9077,7 +10243,7 @@ HWND WINAPI SetFocus(HWND hWnd)
             serial_puts("\n");
         }
     }
-    WINDOW *target = hWnd ? find_window(hWnd) : NULL;
+    WINDOW *target = hWnd ? find_public_window(hWnd) : NULL;
     /* Only track real windows we know about; NULL clears focus. */
     BOOL accepted = hWnd == NULL || target;
     if (accepted) {
@@ -9179,6 +10345,20 @@ static U32_USER_OBJECT user_objects[U32_USER_OBJECT_CAP];
 static U32_USER_OBJECT_OPEN user_object_opens[U32_USER_OBJECT_OPEN_CAP];
 static U32_PROCESS_STATION process_stations[U32_PROCESS_STATION_CAP];
 static spinlock_t user_object_lock = SPINLOCK_INIT;
+
+static uint64_t user_object_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&user_object_lock);
+    return flags;
+}
+
+static void user_object_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&user_object_lock);
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+}
 
 static BOOL user_object_handle_equal(HANDLE left, HANDLE right)
 {
@@ -9428,7 +10608,7 @@ static BOOL user_object_snapshot(HANDLE handle, U32_USER_OBJECT_VIEW *view)
         return TRUE;
     }
 
-    spin_lock(&user_object_lock);
+    uint64_t irq_flags = user_object_lock_irqsave();
     U32_USER_OBJECT *object = user_object_find_locked(handle);
     if (object) {
         view->type = object->type;
@@ -9436,7 +10616,7 @@ static BOOL user_object_snapshot(HANDLE handle, U32_USER_OBJECT_VIEW *view)
         view->inheritable = object->inheritable;
         user_object_copy_name(view->name, object->name);
     }
-    spin_unlock(&user_object_lock);
+    user_object_unlock_irqrestore(irq_flags);
     return object != NULL;
 }
 
@@ -9458,7 +10638,7 @@ static void user_object_release_process(DWORD pid)
     if (!pid)
         return;
 
-    spin_lock(&user_object_lock);
+    uint64_t irq_flags = user_object_lock_irqsave();
     for (int i = 0; i < U32_PROCESS_STATION_CAP; i++)
         if (process_stations[i].used && process_stations[i].pid == pid)
             process_stations[i].used = FALSE;
@@ -9478,7 +10658,7 @@ static void user_object_release_process(DWORD pid)
     }
     for (int i = 0; i < U32_USER_OBJECT_CAP; i++)
         user_object_maybe_destroy_locked(&user_objects[i]);
-    spin_unlock(&user_object_lock);
+    user_object_unlock_irqrestore(irq_flags);
 }
 
 HWND WINAPI GetDesktopWindow(void) { return U32_DESKTOP_WINDOW_HANDLE; }
@@ -9487,9 +10667,9 @@ HWND WINAPI GetShellWindow(void) { return GetDesktopWindow(); }
 static HANDLE WINAPI GetProcessWindowStation_stub(void)
 {
     DWORD pid = GetCurrentProcessId();
-    spin_lock(&user_object_lock);
+    uint64_t irq_flags = user_object_lock_irqsave();
     HANDLE station = user_object_process_station_locked(pid);
-    spin_unlock(&user_object_lock);
+    user_object_unlock_irqrestore(irq_flags);
     return station;
 }
 
@@ -9497,7 +10677,7 @@ static HANDLE WINAPI CreateWindowStationW_stub(PCWSTR name, DWORD flags,
                                                  DWORD access, PVOID attrs)
 {
     (void)access;
-    if (flags != 0) {
+    if (flags & ~1U) { /* CWF_CREATE_ONLY */
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return NULL;
     }
@@ -9508,6 +10688,24 @@ static HANDLE WINAPI CreateWindowStationW_stub(PCWSTR name, DWORD flags,
         return NULL;
     }
 
+    if (!checked_name[0]) {
+        /* NULL/empty requests the logon station, not an unnamed object. */
+        ULONGLONG logon_id = advapi32_process_logon_id();
+        static const char hex[] = "0123456789abcdef";
+        user_object_copy_ascii_name(checked_name,
+                                    "Service-0x00000000-00000000$");
+        for (DWORD i = 0; i < 8; i++) {
+            checked_name[10 + i] = hex[(logon_id >> (60 - i * 4)) & 15];
+            checked_name[19 + i] = hex[(logon_id >> (28 - i * 4)) & 15];
+        }
+    }
+    for (DWORD i = 0; checked_name[i]; i++) {
+        if (checked_name[i] == '\\') {
+            SetLastError(123); /* ERROR_INVALID_NAME */
+            return NULL;
+        }
+    }
+
     static const WCHAR interactive_name[] = {
         'W', 'i', 'n', 'S', 't', 'a', '0', 0
     };
@@ -9516,7 +10714,7 @@ static HANDLE WINAPI CreateWindowStationW_stub(PCWSTR name, DWORD flags,
     BOOL existing = FALSE;
     HANDLE handle = NULL;
 
-    spin_lock(&user_object_lock);
+    uint64_t irq_flags = user_object_lock_irqsave();
     U32_USER_OBJECT *object = NULL;
     if (name && user_object_name_equal(checked_name, interactive_name)) {
         handle = U32_DEFAULT_WINSTA_HANDLE;
@@ -9536,16 +10734,21 @@ static HANDLE WINAPI CreateWindowStationW_stub(PCWSTR name, DWORD flags,
         }
     }
 
+    if (existing && (flags & 1U)) {
+        user_object_unlock_irqrestore(irq_flags);
+        SetLastError(183); /* ERROR_ALREADY_EXISTS */
+        return NULL;
+    }
     if (!handle || !user_object_add_open_locked(pid, handle)) {
         if (object && !existing)
             user_object_maybe_destroy_locked(object);
-        spin_unlock(&user_object_lock);
+        user_object_unlock_irqrestore(irq_flags);
         SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;
     }
     if (object)
         object->open_refs++;
-    spin_unlock(&user_object_lock);
+    user_object_unlock_irqrestore(irq_flags);
 
     if (existing)
         SetLastError(183); /* ERROR_ALREADY_EXISTS */
@@ -9555,9 +10758,9 @@ static HANDLE WINAPI CreateWindowStationW_stub(PCWSTR name, DWORD flags,
 static BOOL WINAPI SetProcessWindowStation_stub(HANDLE station)
 {
     DWORD pid = GetCurrentProcessId();
-    spin_lock(&user_object_lock);
+    uint64_t irq_flags = user_object_lock_irqsave();
     if (user_object_type_locked(station) != U32_USER_OBJECT_WINSTA) {
-        spin_unlock(&user_object_lock);
+        user_object_unlock_irqrestore(irq_flags);
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
@@ -9576,13 +10779,13 @@ static BOOL WINAPI SetProcessWindowStation_stub(HANDLE station)
     if (user_object_handle_equal(station, U32_DEFAULT_WINSTA_HANDLE)) {
         if (existing_slot >= 0)
             process_stations[existing_slot].used = FALSE;
-        spin_unlock(&user_object_lock);
+        user_object_unlock_irqrestore(irq_flags);
         return TRUE;
     }
     if (existing_slot < 0)
         existing_slot = free_slot;
     if (existing_slot < 0) {
-        spin_unlock(&user_object_lock);
+        user_object_unlock_irqrestore(irq_flags);
         SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
         return FALSE;
     }
@@ -9590,34 +10793,34 @@ static BOOL WINAPI SetProcessWindowStation_stub(HANDLE station)
     process_stations[existing_slot].used = TRUE;
     process_stations[existing_slot].pid = pid;
     process_stations[existing_slot].station = station;
-    spin_unlock(&user_object_lock);
+    user_object_unlock_irqrestore(irq_flags);
     return TRUE;
 }
 
 static BOOL user_object_close(HANDLE handle, U32_USER_OBJECT_TYPE type)
 {
     DWORD pid = GetCurrentProcessId();
-    spin_lock(&user_object_lock);
+    uint64_t irq_flags = user_object_lock_irqsave();
     if (user_object_type_locked(handle) != type) {
-        spin_unlock(&user_object_lock);
+        user_object_unlock_irqrestore(irq_flags);
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
     if (type == U32_USER_OBJECT_WINSTA &&
         user_object_handle_equal(user_object_process_station_locked(pid),
                                  handle)) {
-        spin_unlock(&user_object_lock);
+        user_object_unlock_irqrestore(irq_flags);
         SetLastError(170); /* ERROR_BUSY */
         return FALSE;
     }
     if (type == U32_USER_OBJECT_DESKTOP &&
         user_object_handle_equal(handle, U32_DEFAULT_DESKTOP_HANDLE)) {
-        spin_unlock(&user_object_lock);
+        user_object_unlock_irqrestore(irq_flags);
         SetLastError(170); /* ERROR_BUSY */
         return FALSE;
     }
     if (!user_object_remove_open_locked(pid, handle)) {
-        spin_unlock(&user_object_lock);
+        user_object_unlock_irqrestore(irq_flags);
         SetLastError(6); /* ERROR_INVALID_HANDLE */
         return FALSE;
     }
@@ -9626,7 +10829,7 @@ static BOOL user_object_close(HANDLE handle, U32_USER_OBJECT_TYPE type)
     if (object && object->open_refs)
         object->open_refs--;
     user_object_maybe_destroy_locked(object);
-    spin_unlock(&user_object_lock);
+    user_object_unlock_irqrestore(irq_flags);
     return TRUE;
 }
 
@@ -9646,6 +10849,10 @@ static HANDLE WINAPI CreateDesktopW_stub(PCWSTR name, PCWSTR device,
                                           DWORD access, PVOID attrs)
 {
     (void)access;
+    if (nt_job_ui_restrictions(GetCurrentProcessId()) & NT_JOB_UI_DESKTOP) {
+        SetLastError(5);
+        return NULL;
+    }
     if (!name || !name[0] || device || devmode || (flags & ~1U)) {
         SetLastError(87); /* ERROR_INVALID_PARAMETER */
         return NULL;
@@ -9665,7 +10872,12 @@ static HANDLE WINAPI CreateDesktopW_stub(PCWSTR name, PCWSTR device,
     BOOL existing = FALSE;
     HANDLE handle = NULL;
 
-    spin_lock(&user_object_lock);
+    uint64_t irq_flags = user_object_lock_irqsave();
+    if (nt_job_ui_restrictions(pid) & NT_JOB_UI_DESKTOP) {
+        user_object_unlock_irqrestore(irq_flags);
+        SetLastError(5);
+        return NULL;
+    }
     HANDLE station = user_object_process_station_locked(pid);
     U32_USER_OBJECT *object = NULL;
     if (user_object_handle_equal(station, U32_DEFAULT_WINSTA_HANDLE) &&
@@ -9690,13 +10902,13 @@ static HANDLE WINAPI CreateDesktopW_stub(PCWSTR name, PCWSTR device,
     if (!handle || !user_object_add_open_locked(pid, handle)) {
         if (object && !existing)
             user_object_maybe_destroy_locked(object);
-        spin_unlock(&user_object_lock);
+        user_object_unlock_irqrestore(irq_flags);
         SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;
     }
     if (object)
         object->open_refs++;
-    spin_unlock(&user_object_lock);
+    user_object_unlock_irqrestore(irq_flags);
 
     if (existing)
         SetLastError(183); /* ERROR_ALREADY_EXISTS */
@@ -9706,6 +10918,33 @@ static HANDLE WINAPI CreateDesktopW_stub(PCWSTR name, PCWSTR device,
 static BOOL WINAPI CloseDesktop_stub(HANDLE desktop)
 {
     return user_object_close(desktop, U32_USER_OBJECT_DESKTOP);
+}
+
+static BOOL WINAPI SwitchDesktop_u32(HANDLE desktop)
+{
+    DWORD pid = GetCurrentProcessId();
+    uint64_t flags = user_object_lock_irqsave();
+    DWORD error = 0;
+    if (nt_job_ui_restrictions(pid) & NT_JOB_UI_DESKTOP) error = 5;
+    else if (user_object_type_locked(desktop) != U32_USER_OBJECT_DESKTOP) error = 6;
+    /* Only the already-active interactive desktop has a compositor backend. */
+    else if (!user_object_handle_equal(desktop, U32_DEFAULT_DESKTOP_HANDLE) ||
+             !user_object_handle_equal(user_object_process_station_locked(pid),
+                                        U32_DEFAULT_WINSTA_HANDLE)) error = 50;
+    user_object_unlock_irqrestore(flags);
+    if (error) SetLastError(error);
+    return error == 0;
+}
+
+static BOOL WINAPI ExitWindowsEx_u32(UINT flags, DWORD reason)
+{
+    (void)flags;
+    (void)reason;
+    if (nt_job_ui_restrictions(GetCurrentProcessId()) & NT_JOB_UI_EXITWINDOWS)
+        SetLastError(5);
+    else
+        SetLastError(50); /* Win32 logoff/shutdown is not implemented. */
+    return FALSE;
 }
 
 static BOOL user_object_write_flags(const U32_USER_OBJECT_VIEW *view,
@@ -9817,7 +11056,7 @@ BOOL WINAPI CreateCaret(HWND hWnd, HBITMAP hBitmap, int nWidth, int nHeight)
     (void)hBitmap;
     (void)nWidth;
     (void)nHeight;
-    if (!hWnd || !find_window(hWnd)) {
+    if (!hWnd || !find_public_window(hWnd)) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return FALSE;
     }
@@ -10039,7 +11278,38 @@ BOOL WINAPI TrackMouseEvent(PVOID lpEventTrack)
         return FALSE;
     }
 
-    WINDOW *w = find_window(hwnd);
+    if (flags & TME_QUERY) {
+        /* TME_QUERY reports this thread's active tracking, not the input
+         * hwndTrack (which callers normally leave NULL). A cancelled or
+         * never-started track returns an empty window/time as on Windows. */
+        WINDOW *tracked = NULL;
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            WINDOW *candidate = &windows[i];
+            if (candidate->used && !candidate->destroying &&
+                window_on_current_thread(candidate) &&
+                (candidate->mouse_track_flags & (TME_HOVER | TME_LEAVE))) {
+                tracked = candidate;
+                break;
+            }
+        }
+        DWORD active = tracked ? tracked->mouse_track_flags : 0;
+        DWORD time = tracked ? tracked->mouse_hover_time : 0;
+        HWND window = tracked ? tracked->handle : NULL;
+        if (cb_size == sizeof(TRACKMOUSEEVENT32)) {
+            TRACKMOUSEEVENT32 *event32 = lpEventTrack;
+            event32->dwFlags = active;
+            event32->hwndTrack = (uint32_t)(ULONG_PTR)window;
+            event32->dwHoverTime = time;
+        } else {
+            TRACKMOUSEEVENT *event64 = lpEventTrack;
+            event64->dwFlags = active;
+            event64->hwndTrack = window;
+            event64->dwHoverTime = time;
+        }
+        return TRUE;
+    }
+
+    WINDOW *w = find_public_window(hwnd);
     if (!w) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return FALSE;
@@ -10056,19 +11326,6 @@ BOOL WINAPI TrackMouseEvent(PVOID lpEventTrack)
             serial_putdec(cb_size);
             serial_puts("\n");
         }
-    }
-
-    if (flags & TME_QUERY) {
-        if (cb_size == sizeof(TRACKMOUSEEVENT32)) {
-            TRACKMOUSEEVENT32 *event32 = (TRACKMOUSEEVENT32 *)lpEventTrack;
-            event32->dwFlags = w->mouse_track_flags;
-            event32->dwHoverTime = w->mouse_hover_time;
-        } else {
-            TRACKMOUSEEVENT *event64 = (TRACKMOUSEEVENT *)lpEventTrack;
-            event64->dwFlags = w->mouse_track_flags;
-            event64->dwHoverTime = w->mouse_hover_time;
-        }
-        return TRUE;
     }
 
     DWORD requested = flags & (TME_HOVER | TME_LEAVE);
@@ -10096,7 +11353,7 @@ BOOL WINAPI TrackMouseEvent(PVOID lpEventTrack)
 
 HWND WINAPI SetCapture(HWND hWnd)
 {
-    WINDOW *window = find_window(hWnd);
+    WINDOW *window = find_public_window(hWnd);
     if (!window) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return NULL;
@@ -10152,6 +11409,15 @@ static HANDLE WINAPI GetKeyboardLayout_k32(DWORD thread_id)
     return (HANDLE)(ULONG_PTR)0x04090409; /* en-US */
 }
 
+static int WINAPI GetKeyboardType_k32(int information)
+{
+    /* The Win32 input translator exposes an enhanced PC keyboard with F1-F12,
+     * independent of whether the underlying input arrives over PS/2 or HID. */
+    if (information == 0) return 4;
+    if (information == 2) return 12;
+    return 0; /* OEM subtype zero; invalid selectors preserve last-error. */
+}
+
 static int WINAPI GetKeyboardLayoutList_k32(int capacity, HANDLE *layouts)
 {
     if (capacity == 0)
@@ -10163,6 +11429,14 @@ static int WINAPI GetKeyboardLayoutList_k32(int capacity, HANDLE *layouts)
 
     layouts[0] = (HANDLE)(ULONG_PTR)0x04090409; /* en-US */
     return 1;
+}
+
+static BOOL WINAPI ImmIsIME_k32(HANDLE layout)
+{
+    (void)layout;
+    /* The installed layout set contains only the built-in en-US translator.
+     * Creating an input context does not install an IME for that layout. */
+    return FALSE;
 }
 
 static UINT WINAPI ImmGetIMEFileNameW_k32(HANDLE layout, PWSTR filename,
@@ -10187,6 +11461,8 @@ static UINT WINAPI ImmGetIMEFileNameA_k32(HANDLE layout, PSTR filename,
 
 typedef struct {
     HANDLE handle;
+    DWORD owner_pid;
+    DWORD owner_tid;
     DWORD conversion;
     DWORD sentence;
     BOOL open;
@@ -10210,11 +11486,51 @@ static IMM_CONTEXT_ENTRY *imm_find_context(HANDLE handle)
     return NULL;
 }
 
+static IMM_CONTEXT_ENTRY *imm_context_for_caller(HANDLE handle)
+{
+    IMM_CONTEXT_ENTRY *entry = imm_find_context(handle);
+    if (!entry || !nt_job_user_access(GetCurrentProcessId(), entry->owner_pid,
+            NT_JOB_USER_INPUT_CONTEXT, (ULONG_PTR)handle)) {
+        SetLastError(6);
+        return NULL;
+    }
+    /* A job grant makes the handle recognizable; IMM state remains local to
+     * its creating process, including between members of the same job. */
+    return entry->owner_pid == GetCurrentProcessId() ? entry : NULL;
+}
+
+static void imm_release_window(HWND window)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (imm_associations[i].window == window)
+            imm_associations[i] = (IMM_ASSOCIATION){0};
+}
+
+static void imm_destroy_entry(IMM_CONTEXT_ENTRY *entry)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (imm_associations[i].context == entry->handle)
+            imm_associations[i] = (IMM_ASSOCIATION){0};
+    nt_job_user_destroy(NT_JOB_USER_INPUT_CONTEXT, (ULONG_PTR)entry->handle);
+    entry->used = 0;
+}
+
+static void imm_release_owner(DWORD pid, DWORD tid)
+{
+    for (int i = 0; i < MAX_IMM_CONTEXTS; i++) {
+        IMM_CONTEXT_ENTRY *entry = &imm_contexts[i];
+        if (entry->used && (!pid || entry->owner_pid == pid) &&
+            (!tid || entry->owner_tid == tid)) imm_destroy_entry(entry);
+    }
+}
+
 static HANDLE WINAPI ImmCreateContext_k32(void)
 {
     for (int i = 0; i < MAX_IMM_CONTEXTS; i++) {
         if (imm_contexts[i].used) continue;
         imm_contexts[i].handle = (HANDLE)next_imm_context++;
+        imm_contexts[i].owner_pid = GetCurrentProcessId();
+        imm_contexts[i].owner_tid = GetCurrentThreadId();
         imm_contexts[i].conversion = 0;
         imm_contexts[i].sentence = 0;
         imm_contexts[i].open = FALSE;
@@ -10227,21 +11543,16 @@ static HANDLE WINAPI ImmCreateContext_k32(void)
 
 static BOOL WINAPI ImmDestroyContext_k32(HANDLE context)
 {
-    IMM_CONTEXT_ENTRY *entry = imm_find_context(context);
+    IMM_CONTEXT_ENTRY *entry = imm_context_for_caller(context);
     if (!entry) return FALSE;
-
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (imm_associations[i].context == context) {
-            imm_associations[i].window = NULL;
-            imm_associations[i].context = NULL;
-        }
-    }
-    entry->used = 0;
+    imm_destroy_entry(entry);
     return TRUE;
 }
 
 static HANDLE WINAPI ImmGetContext_k32(HWND window)
 {
+    WINDOW *entry = find_public_window(window);
+    if (!entry || entry->owner_pid != GetCurrentProcessId()) return NULL;
     for (int i = 0; i < MAX_WINDOWS; i++)
         if (imm_associations[i].window == window)
             return imm_associations[i].context;
@@ -10257,6 +11568,18 @@ static BOOL WINAPI ImmReleaseContext_k32(HWND window, HANDLE context)
 
 static HANDLE WINAPI ImmAssociateContext_k32(HWND window, HANDLE context)
 {
+    WINDOW *entry = find_public_window(window);
+    if (!entry) return NULL;
+    HANDLE previous_context = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (imm_associations[i].window == window)
+            previous_context = imm_associations[i].context;
+    if (previous_context == context) return previous_context;
+    if (entry->owner_pid != GetCurrentProcessId()) {
+        SetLastError(5);
+        return NULL;
+    }
+    if (context && !imm_context_for_caller(context)) return NULL;
     int free_slot = -1;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (imm_associations[i].window == window) {
@@ -10282,13 +11605,13 @@ static HANDLE WINAPI ImmAssociateContext_k32(HWND window, HANDLE context)
 
 static BOOL WINAPI ImmGetOpenStatus_k32(HANDLE context)
 {
-    IMM_CONTEXT_ENTRY *entry = imm_find_context(context);
+    IMM_CONTEXT_ENTRY *entry = imm_context_for_caller(context);
     return entry ? entry->open : FALSE;
 }
 
 static BOOL WINAPI ImmSetOpenStatus_k32(HANDLE context, BOOL open)
 {
-    IMM_CONTEXT_ENTRY *entry = imm_find_context(context);
+    IMM_CONTEXT_ENTRY *entry = imm_context_for_caller(context);
     if (!entry) return FALSE;
     entry->open = open != FALSE;
     return TRUE;
@@ -10298,7 +11621,7 @@ static BOOL WINAPI ImmGetConversionStatus_k32(HANDLE context,
                                                 DWORD *conversion,
                                                 DWORD *sentence)
 {
-    IMM_CONTEXT_ENTRY *entry = imm_find_context(context);
+    IMM_CONTEXT_ENTRY *entry = imm_context_for_caller(context);
     if (!entry) return FALSE;
     if (conversion) *conversion = entry->conversion;
     if (sentence) *sentence = entry->sentence;
@@ -10309,7 +11632,7 @@ static BOOL WINAPI ImmSetConversionStatus_k32(HANDLE context,
                                                 DWORD conversion,
                                                 DWORD sentence)
 {
-    IMM_CONTEXT_ENTRY *entry = imm_find_context(context);
+    IMM_CONTEXT_ENTRY *entry = imm_context_for_caller(context);
     if (!entry) return FALSE;
     entry->conversion = conversion;
     entry->sentence = sentence;
@@ -10811,7 +12134,7 @@ UINT WINAPI SendInput(UINT cInputs, const INPUT *pInputs, int cbSize)
     HWND target = input_target();
     DWORD target_pid = GetCurrentProcessId();
     DWORD target_tid = GetCurrentThreadId();
-    WINDOW *window = target ? find_window(target) : NULL;
+    WINDOW *window = target ? find_public_window(target) : NULL;
     if (window) {
         target_pid = window->owner_pid;
         target_tid = window->owner_tid;
@@ -11038,6 +12361,66 @@ UINT WINAPI SendInput(UINT cInputs, const INPUT *pInputs, int cbSize)
     return inserted;
 }
 
+static void WINAPI keybd_event_k32(BYTE vk, BYTE scan, DWORD flags,
+                                   ULONG_PTR extra_info)
+{
+    /* Reuse SendInput's state transitions, routing, queue limits and wakeups.
+     * Its parser expects the caller's INPUT layout, including for this local
+     * buffer passed by a PE32 caller through the native thunk. */
+    if (g_compat32_mode) {
+        DWORD raw[7] = { INPUT_KEYBOARD, (DWORD)vk | ((DWORD)scan << 16),
+                         flags, 0, (DWORD)extra_info, 0, 0 };
+        SendInput(1, (const INPUT *)(const void *)raw, sizeof(raw));
+    } else {
+        INPUT input = {0};
+        input.type = INPUT_KEYBOARD;
+        input.data.ki.wVk = vk;
+        input.data.ki.wScan = scan;
+        input.data.ki.dwFlags = flags;
+        input.data.ki.dwExtraInfo = extra_info;
+        SendInput(1, &input, sizeof(input));
+    }
+}
+
+static short WINAPI VkKeyScanExA_k32(char character, HANDLE layout)
+{
+    /* The installed layout advertised by GetKeyboardLayout is en-US. */
+    if (layout && (ULONG_PTR)layout != 0x04090409U) {
+        SetLastError(87);
+        return -1;
+    }
+    BYTE c = (BYTE)character;
+    if (c >= 'a' && c <= 'z') return (short)(c - 'a' + 'A');
+    if (c >= 'A' && c <= 'Z') return (short)(c | 0x100);
+    if (c >= '0' && c <= '9') return c;
+    if (c == ' ') return VK_SPACE;
+    if (c < 32) {
+        switch (c) {
+        case 0: return 0x332; /* Ctrl+Shift+2 */
+        case 3: return 3;     /* VK_CANCEL */
+        case 8: case 9: case 13: case 27: return c;
+        case 10: return 0x20d;
+        case 28: return 0x2dc;
+        case 29: return 0x2dd;
+        case 30: return 0x336;
+        case 31: return 0x3bd;
+        default: return (short)(0x200 | ('A' + c - 1));
+        }
+    }
+    if (c == 127) return 0x208;
+    static const char plain[] = "`-=[]\\;',./";
+    static const char shifted[] = "~_+{}|:\"<>?";
+    static const BYTE keys[] = {0xc0,0xbd,0xbb,0xdb,0xdd,0xdc,0xba,0xde,0xbc,0xbe,0xbf};
+    for (unsigned i = 0; i < sizeof(keys); i++) {
+        if (c == (BYTE)plain[i]) return keys[i];
+        if (c == (BYTE)shifted[i]) return (short)(keys[i] | 0x100);
+    }
+    static const char digits[] = ")!@#$%^&*(";
+    for (unsigned i = 0; i < 10; i++)
+        if (c == (BYTE)digits[i]) return (short)(('0' + i) | 0x100);
+    return -1;
+}
+
 DWORD WINAPI MapVirtualKeyA(DWORD uCode, DWORD uMapType)
 {
     switch (uMapType) {
@@ -11190,6 +12573,11 @@ int WINAPI ToUnicodeEx(DWORD uVirtKey, DWORD uScanCode,
 
 /* ── Misc ──────────────────────────────────────────────────── */
 
+BOOL WINAPI MessageBeep(UINT type)
+{
+    return winmm_message_beep(type);
+}
+
 int WINAPI MessageBoxA(HWND hWnd, PCSTR lpText, PCSTR lpCaption, DWORD uType)
 {
     (void)hWnd;
@@ -11326,6 +12714,52 @@ HICON WINAPI CreateIconIndirect(const ICONINFO *icon_info)
     return (HICON)handle;
 }
 
+HICON WINAPI CreateIconFromResourceEx(PVOID bits, DWORD bytes, BOOL is_icon,
+                                       DWORD version, int width, int height,
+                                       UINT flags)
+{
+    DWORD prefix = is_icon ? 0 : 4;
+    if (!bits || bytes < prefix + 12 || version < 0x20000 || version > 0x30000 ||
+        width < 0 || height < 0 || (flags & ~0x8041u) ||
+        !win32_user_range_readable(bits, bytes, g_compat32_mode ? TRUE : FALSE)) {
+        SetLastError(87);
+        return NULL;
+    }
+    if (flags & 0x40u) { /* LR_DEFAULTSIZE */
+        if (!width) width = GetSystemMetrics(is_icon ? 11 : 13);
+        if (!height) height = GetSystemMetrics(is_icon ? 12 : 14);
+    }
+    const BYTE *source = bits;
+    GDI_ICON_IMAGE image;
+    if (!gdi32_decode_icon_dib(source + prefix, bytes - prefix, width, height,
+                                (flags & 1u) != 0, &image)) {
+        SetLastError(87);
+        return NULL;
+    }
+    DWORD hot_x = image.width / 2, hot_y = image.height / 2;
+    if (!is_icon) {
+        DWORD original_x = source[0] | (DWORD)source[1] << 8;
+        DWORD original_y = source[2] | (DWORD)source[3] << 8;
+        hot_x = (DWORD)((uint64_t)original_x * image.width / image.source_width);
+        hot_y = (DWORD)((uint64_t)original_y * image.height / image.source_height);
+    }
+    /* Like native Windows, raw resource buffers have no module/resource ID
+     * to cache for LR_SHARED; their created handles still have normal lifetime. */
+    HICON icon = (HICON)icon_create(is_icon != FALSE, hot_x, hot_y,
+                                    image.mask, image.color, GetCurrentProcessId());
+    if (!icon) {
+        DeleteObject(image.mask);
+        if (image.color) DeleteObject(image.color);
+    }
+    return icon;
+}
+
+HICON WINAPI CreateIconFromResource(PVOID bits, DWORD bytes, BOOL is_icon,
+                                     DWORD version)
+{
+    return CreateIconFromResourceEx(bits, bytes, is_icon, version, 0, 0, 0x8040u);
+}
+
 HICON WINAPI CopyIcon(HICON icon)
 {
     if (icon == U32_SHARED_ICON_A || icon == U32_SHARED_ICON_W)
@@ -11337,10 +12771,7 @@ HICON WINAPI CopyIcon(HICON icon)
                                   GetCurrentProcessId());
 
     USER_ICON source;
-    if (!icon_snapshot(icon, &source)) {
-        SetLastError(6);
-        return NULL;
-    }
+    if (!icon_snapshot(icon, &source)) return NULL;
     HBITMAP mask = source.mask ? gdi32_clone_bitmap(source.mask) : NULL;
     HBITMAP color = source.color ? gdi32_clone_bitmap(source.color) : NULL;
     if ((source.mask && !mask) || (source.color && !color)) {
@@ -11380,10 +12811,7 @@ BOOL WINAPI GetIconInfo(HICON icon, ICONINFO *icon_info)
         icon_info_write(icon_info, &source, source.mask, source.color);
         return TRUE;
     }
-    if (!icon_snapshot(icon, &source)) {
-        SetLastError(6);
-        return FALSE;
-    }
+    if (!icon_snapshot(icon, &source)) return FALSE;
 
     HBITMAP mask = source.mask ? gdi32_clone_bitmap(source.mask) : NULL;
     HBITMAP color = source.color ? gdi32_clone_bitmap(source.color) : NULL;
@@ -11409,10 +12837,7 @@ BOOL WINAPI DrawIconEx(HDC hdc, int x, int y, HICON icon, int width,
         return TRUE;
 
     USER_ICON source;
-    if (!icon_snapshot(icon, &source)) {
-        SetLastError(6);
-        return FALSE;
-    }
+    if (!icon_snapshot(icon, &source)) return FALSE;
     return gdi32_draw_icon_bitmap(hdc, source.color, source.mask,
                                   x, y, width, height);
 }
@@ -11435,10 +12860,14 @@ BOOL user32_release_icon(HICON icon)
 extern HDC  gdi32_alloc_screen_dc(void);
 extern HDC  gdi32_alloc_window_dc(HANDLE window);
 extern HANDLE gdi32_window_from_dc(HDC hdc);
-extern void gdi32_free_screen_dc(HDC hdc);
+extern int  gdi32_free_screen_dc(HDC hdc);
 
 HDC WINAPI GetDC(HWND hWnd)
 {
+    if (hWnd && hWnd != GetDesktopWindow() && !find_public_window(hWnd)) {
+        SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
+        return NULL;
+    }
     /* A screen DC still belongs to the desktop window on NT.  ANGLE validates
      * its default EGL native display with WindowFromDC(GetDC(NULL)); retaining
      * a NULL owner here made every Win32 ANGLE backend reject the display. */
@@ -11455,9 +12884,165 @@ HDC WINAPI GetDC(HWND hWnd)
     return hdc;
 }
 
+/* The system-visible region uses screen coordinates until the final offset.
+ * Keep it separate from SelectClipRgn: applications may clear their own clip
+ * without escaping a GetDCEx intersection or child/sibling exclusion. */
+static BOOL dcex_combine_window(HGDIOBJ region, const WINDOW *w,
+                                 BOOL client, int mode)
+{
+    int x, y;
+    window_screen_origin(w, &x, &y);
+    GDI_RECT rect = {x, y, x + w->width, y + w->height};
+    if (client) rect = (GDI_RECT){x + w->client.left, y + w->client.top,
+                                x + w->client.right, y + w->client.bottom};
+    HGDIOBJ part = CreateRectRgnIndirect(&rect);
+    if (!part) return FALSE;
+    int result = CombineRgn(region, region, part, mode);
+    DeleteObject(part);
+    return result != GDI_RGN_ERROR;
+}
+
+static HGDIOBJ dcex_visible_region(WINDOW *w, DWORD flags, int *ox, int *oy)
+{
+    *ox = *oy = 0;
+    HGDIOBJ visible = CreateRectRgn(0, 0, GetSystemMetrics(SM_CXSCREEN),
+                                           GetSystemMetrics(SM_CYSCREEN));
+    if (!visible || !w) return visible;
+    if (flags & DCX_WINDOW) window_screen_origin(w, ox, oy);
+    else window_client_origin(w, ox, oy);
+    if (!dcex_combine_window(visible, w, !(flags & DCX_WINDOW), GDI_RGN_AND))
+        goto fail;
+
+    WINDOW *current = w;
+    for (int depth = 0; current && depth < MAX_WINDOWS; depth++) {
+        if (!current->visible || current->message_only || (current->style & WS_MINIMIZE)) {
+            if (!SetRectRgn(visible, 0, 0, 0, 0)) goto fail;
+            return visible;
+        }
+        if ((current == w && (flags & DCX_CLIPSIBLINGS)) ||
+            (current != w && (current->style & WS_CLIPSIBLINGS))) {
+            for (int i = 0; i < window_count; i++) {
+                WINDOW *sibling = &windows[i];
+                if (!sibling || !sibling->used || sibling == current ||
+                    !sibling->visible || sibling->message_only ||
+                    (sibling->style & WS_MINIMIZE) ||
+                    sibling->parent != current->parent ||
+                    !sibling_is_above(sibling, current)) continue;
+                if (!dcex_combine_window(visible, sibling, FALSE, GDI_RGN_DIFF))
+                    goto fail;
+            }
+        }
+        if (!current->parent) break;
+        current = find_window(current->parent);
+        if (!current || !dcex_combine_window(visible, current, TRUE, GDI_RGN_AND))
+            goto fail;
+    }
+    if (flags & DCX_CLIPCHILDREN) {
+        for (int i = 0; i < window_count; i++) {
+            WINDOW *child = &windows[i];
+            if (!child || !child->used || child->parent != w->handle ||
+                !child->visible || child->message_only ||
+                (child->style & WS_MINIMIZE)) continue;
+            if (!dcex_combine_window(visible, child, FALSE, GDI_RGN_DIFF)) goto fail;
+        }
+    }
+    return visible;
+fail:
+    DeleteObject(visible);
+    return NULL;
+}
+
+/* A retained common DC must follow window geometry/visibility changes. The
+ * extra clip is already in device coordinates, so moving the window does not
+ * move that region relative to the client, as confirmed on native Windows. */
+HGDIOBJ user32_get_dc_visible_region(HANDLE window, DWORD flags, HGDIOBJ device_clip)
+{
+    WINDOW *w = window && !hwnd_is_desktop(window) ? find_public_window(window) : NULL;
+    if (window && !hwnd_is_desktop(window) && !w) return NULL;
+    int x, y;
+    HGDIOBJ visible = dcex_visible_region(w, flags, &x, &y);
+    if (!visible) return NULL;
+    BOOL valid = OffsetRgn(visible, -x, -y) != GDI_RGN_ERROR;
+    if (valid && device_clip) {
+        valid = CombineRgn(visible, visible, device_clip,
+            flags & DCX_INTERSECTRGN ? GDI_RGN_AND : GDI_RGN_DIFF) != GDI_RGN_ERROR;
+    } else if (valid && (flags & DCX_INTERSECTRGN)) {
+        valid = SetRectRgn(visible, 0, 0, 0, 0);
+    }
+    if (!valid) { DeleteObject(visible); return NULL; }
+    return visible;
+}
+
+HDC WINAPI GetDCEx(HWND hWnd, HANDLE hrgnClip, DWORD flags)
+{
+    WINDOW *w = hWnd && !hwnd_is_desktop(hWnd) ? find_public_window(hWnd) : NULL;
+    if (hWnd && !hwnd_is_desktop(hWnd) && !w) {
+        SetLastError(1400);
+        return NULL;
+    }
+    /* Cached contexts cover FLTK's actual DCX_CACHE call and explicit region
+     * clipping. A parent DC can draw outside the child's backing surface;
+     * that, and class/private DC sharing, need a separate implementation. */
+    WNDCLASS_ENTRY *cls = w ? find_class_for_pid(w->class_name, w->owner_pid) : NULL;
+    /* WineD3D requests USESTYLE|CACHE for its actual swapchain window. These
+     * flags replace explicit clipping with the window/class styles; rejecting
+     * USESTYLE makes it silently render to a zero-sized backup window. Resolve
+     * the styles at acquisition, like native cached DCs. */
+    if (flags & (DCX_WINDOW | DCX_PARENTCLIP)) flags |= DCX_CACHE;
+    if (flags & DCX_USESTYLE) {
+        flags &= ~(DCX_CLIPCHILDREN | DCX_CLIPSIBLINGS | DCX_PARENTCLIP);
+        if (w && (w->style & WS_CLIPSIBLINGS)) flags |= DCX_CLIPSIBLINGS;
+        if (!(flags & DCX_WINDOW)) {
+            if (cls && (cls->style & 0x80u)) flags |= DCX_PARENTCLIP;
+            if (w && (w->style & WS_CLIPCHILDREN) && !(w->style & WS_MINIMIZE))
+                flags |= DCX_CLIPCHILDREN;
+        }
+    }
+    if (flags & DCX_WINDOW) flags &= ~DCX_CLIPCHILDREN;
+    if (!w || !w->parent)
+        flags = (flags & ~DCX_PARENTCLIP) | DCX_CLIPSIBLINGS;
+    if (flags & (DCX_CLIPCHILDREN | DCX_CLIPSIBLINGS)) flags &= ~DCX_PARENTCLIP;
+    if ((flags & DCX_PARENTCLIP) ||
+        (!(flags & DCX_CACHE) && cls && (cls->style & (0x20u | 0x40u | 0x80u)))) {
+        SetLastError(50); /* ERROR_NOT_SUPPORTED */
+        return NULL;
+    }
+    const DWORD supported = DCX_WINDOW | DCX_CACHE | DCX_NORESETATTRS |
+        DCX_CLIPCHILDREN | DCX_CLIPSIBLINGS | DCX_EXCLUDERGN |
+        DCX_INTERSECTRGN | DCX_LOCKWINDOWUPDATE | DCX_USESTYLE;
+    if ((flags & ~supported) ||
+        ((flags & (DCX_INTERSECTRGN | DCX_EXCLUDERGN)) ==
+                  (DCX_INTERSECTRGN | DCX_EXCLUDERGN))) {
+        SetLastError(87);
+        return NULL;
+    }
+    BOOL transfer = (flags & (DCX_INTERSECTRGN | DCX_EXCLUDERGN)) != 0;
+    HGDIOBJ device_clip = NULL;
+    if (transfer && hrgnClip) {
+        int x = 0, y = 0;
+        if (w) {
+            if (flags & DCX_WINDOW) window_screen_origin(w, &x, &y);
+            else window_client_origin(w, &x, &y);
+        }
+        device_clip = CreateRectRgn(0, 0, 0, 0);
+        if (!device_clip) { SetLastError(8); return NULL; }
+        if (!CombineRgn(device_clip, hrgnClip, NULL, GDI_RGN_COPY) ||
+            !OffsetRgn(device_clip, -x, -y)) {
+            DeleteObject(device_clip); SetLastError(6); return NULL;
+        }
+    }
+    HWND owner = hWnd ? hWnd : GetDesktopWindow();
+    HGDIOBJ visible = user32_get_dc_visible_region(owner, flags, device_clip);
+    HDC dc = visible ? gdi32_alloc_extended_dc(owner, (flags & DCX_WINDOW) != 0,
+                          visible, transfer ? hrgnClip : NULL, device_clip, flags) : NULL;
+    DeleteObject(visible);
+    if (!dc) { DeleteObject(device_clip); SetLastError(8); }
+    return dc;
+}
+
 HDC WINAPI GetWindowDC(HWND hWnd)
 {
-    if (!find_window(hWnd)) {
+    if (!find_public_window(hWnd)) {
         SetLastError(1400);
         return NULL;
     }
@@ -11481,24 +13066,33 @@ HWND WINAPI WindowFromDC(HDC hDC)
 int WINAPI ReleaseDC(HWND hWnd, HDC hDC)
 {
     (void)hWnd;
-    gdi32_free_screen_dc(hDC);
-    return 1;
+    return gdi32_free_screen_dc(hDC);
 }
 
 BOOL WINAPI InvalidateRect(HWND hWnd, const RECT *lpRect, BOOL bErase)
 {
     if (!hWnd) {
         DWORD pid = GetCurrentProcessId();
+        BOOL success = TRUE;
         for (int i = 0; i < window_count; i++)
             if (windows[i].used && windows[i].owner_pid == pid)
-                invalidate_window(&windows[i], lpRect, bErase);
-        return TRUE;
+                if (!invalidate_window(&windows[i], lpRect, bErase)) success = FALSE;
+        return success;
     }
 
-    WINDOW *w = find_window(hWnd);
-    if (!w) return FALSE;
-    invalidate_window(w, lpRect, bErase);
-    return TRUE;
+    WINDOW *w = find_public_window(hWnd);
+    if (!w) { SetLastError(1400); return FALSE; }
+    return invalidate_window(w, lpRect, bErase);
+}
+
+BOOL WINAPI InvalidateRgn(HWND hWnd, HANDLE region, BOOL erase)
+{
+    WINDOW *w = find_public_window(hWnd);
+    if (!w) { SetLastError(1400); return FALSE; }
+    if (!region) return invalidate_window(w, NULL, erase);
+    GDI_REGION_SCOPE(change);
+    if (!gdi32_region_data_read(region, &change)) return FALSE;
+    return change_window_update(w, &change, FALSE, erase);
 }
 
 BOOL WINAPI RedrawWindow(HWND hWnd, const RECT *lprcUpdate,
@@ -11512,7 +13106,7 @@ BOOL WINAPI RedrawWindow(HWND hWnd, const RECT *lprcUpdate,
 
 BOOL WINAPI SetForegroundWindow(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) {
         SetLastError(1400);
         return FALSE;
@@ -12018,6 +13612,7 @@ HWND WINAPI CreateDialogParamA(HINSTANCE hInstance, PCSTR lpTemplateName,
 
 BOOL WINAPI EndDialog(HWND hDlg, LONG_PTR nResult)
 {
+    if (!find_public_window(hDlg)) return FALSE;
     U32_DIALOG_STATE *state = dialog_state_find(hDlg);
     if (!state || !state->modal || state->ended) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
@@ -12050,7 +13645,7 @@ static HWND dialog_next_tab_item(HWND dialog, HWND current)
 
 BOOL WINAPI IsDialogMessageA(HWND hDlg, LPMSG lpMsg)
 {
-    if (!dialog_state_find(hDlg) || !lpMsg) {
+    if (!find_public_window(hDlg) || !dialog_state_find(hDlg) || !lpMsg) {
         SetLastError(!lpMsg ? 87 : 1400);
         return FALSE;
     }
@@ -12088,7 +13683,7 @@ BOOL WINAPI IsDialogMessageW(HWND hDlg, LPMSG lpMsg)
 
 HWND WINAPI GetDlgItem(HWND hDlg, int nIDDlgItem)
 {
-    if (!find_window(hDlg)) {
+    if (!find_public_window(hDlg)) {
         SetLastError(1400);
         return NULL;
     }
@@ -12109,6 +13704,118 @@ BOOL WINAPI SetDlgItemTextA(HWND hDlg, int nIDDlgItem, PCSTR lpString)
         return FALSE;
     }
     return SetWindowTextA(item, lpString);
+}
+
+BOOL WINAPI SetDlgItemTextW(HWND dialog, int id, PCWSTR text)
+{
+    HWND item = GetDlgItem(dialog, id);
+    if (!item) {
+        SetLastError(1421); /* ERROR_CONTROL_ID_NOT_FOUND */
+        return FALSE;
+    }
+    return SetWindowTextW_k32(item, text);
+}
+
+UINT WINAPI IsDlgButtonChecked(HWND dialog, int id)
+{
+    HWND item = GetDlgItem(dialog, id);
+    return item ? (UINT)SendMessageA(item, 0x00F0 /* BM_GETCHECK */, 0, 0) : 0;
+}
+
+LRESULT WINAPI SendDlgItemMessageA(HWND dialog, int id, UINT message,
+                                    WPARAM wparam, LPARAM lparam)
+{
+    HWND item = GetDlgItem(dialog, id);
+    return item ? SendMessageA(item, message, wparam, lparam) : 0;
+}
+
+LRESULT WINAPI SendDlgItemMessageW(HWND dialog, int id, UINT message,
+                                    WPARAM wparam, LPARAM lparam)
+{
+    HWND item = GetDlgItem(dialog, id);
+    return item ? SendMessageW(item, message, wparam, lparam) : 0;
+}
+
+UINT WINAPI GetDlgItemTextA(HWND dialog, int id, PSTR buffer, int capacity)
+{
+    if (!buffer || capacity <= 0) return 0;
+    buffer[0] = 0;
+    return (UINT)SendDlgItemMessageA(dialog, id, 0x000D /* WM_GETTEXT */,
+                                     (WPARAM)capacity, (LPARAM)buffer);
+}
+
+int WINAPI LoadStringA(HANDLE module, UINT id, PSTR buffer, int capacity)
+{
+    if (!buffer || capacity <= 0) return 0;
+    buffer[0] = 0;
+    PCVOID data;
+    DWORD bytes;
+    if (!kernel32_resource_data_w(module,
+            (PCWSTR)(ULONG_PTR)((id >> 4) + 1), (PCWSTR)(ULONG_PTR)6,
+            &data, &bytes)) return 0;
+    PCWSTR cursor = (PCWSTR)data;
+    DWORD remaining = bytes / sizeof(WCHAR);
+    for (UINT index = 0; index <= (id & 15); index++) {
+        if (!remaining) return 0;
+        WORD length = *cursor++;
+        remaining--;
+        if (length > remaining) return 0;
+        if (index == (id & 15)) {
+            int written = 0;
+            for (WORD i = 0; i < length;) {
+                int units = 1;
+                if (cursor[i] >= 0xD800 && cursor[i] <= 0xDBFF &&
+                    i + 1 < length && cursor[i + 1] >= 0xDC00 &&
+                    cursor[i + 1] <= 0xDFFF) units = 2;
+                char converted[8];
+                int count = WideCharToMultiByte(0, 0, cursor + i, units,
+                    converted, sizeof(converted), NULL, NULL);
+                if (count <= 0 || count >= capacity - written) break;
+                for (int j = 0; j < count; j++) buffer[written++] = converted[j];
+                i += (WORD)units;
+            }
+            buffer[written] = 0;
+            return written;
+        }
+        cursor += length;
+        remaining -= length;
+    }
+    return 0;
+}
+
+int WINAPI LoadStringW(HANDLE module, UINT id, PWSTR buffer, int capacity)
+{
+    if (!buffer || capacity < 0) return 0;
+    if (capacity) buffer[0] = 0;
+    PCVOID data;
+    DWORD bytes;
+    if (!kernel32_resource_data_w(module,
+            (PCWSTR)(ULONG_PTR)((id >> 4) + 1), (PCWSTR)(ULONG_PTR)6,
+            &data, &bytes)) return 0;
+    PCWSTR cursor = (PCWSTR)data;
+    DWORD remaining = bytes / sizeof(WCHAR);
+    for (UINT index = 0; index <= (id & 15); index++) {
+        if (!remaining) return 0;
+        WORD length = *cursor++;
+        remaining--;
+        if (length > remaining) return 0;
+        if (index == (id & 15)) {
+            if (!capacity) {
+                /* cchBufferMax == 0 returns a borrowed UTF-16 pointer, not
+                 * copied characters. Respect the caller's pointer width. */
+                ULONG_PTR address = (ULONG_PTR)cursor;
+                memcpy(buffer, &address, g_compat32_mode ? 4 : 8);
+                return length;
+            }
+            int count = length < capacity ? length : capacity - 1;
+            memcpy(buffer, cursor, (size_t)count * sizeof(WCHAR));
+            buffer[count] = 0;
+            return count;
+        }
+        cursor += length;
+        remaining -= length;
+    }
+    return 0;
 }
 
 static void dialog_uint_to_text(UINT value, BOOL is_signed, char text[12])
@@ -12144,7 +13851,7 @@ UINT WINAPI GetDlgItemInt(HWND hDlg, int nIDDlgItem, BOOL *translated,
     if (translated) *translated = FALSE;
 
     HWND item = GetDlgItem(hDlg, nIDDlgItem);
-    WINDOW *window = find_window(item);
+    WINDOW *window = find_public_window(item);
     if (!window) return 0;
 
     const char *text = window->title;
@@ -12180,7 +13887,7 @@ UINT WINAPI GetDlgItemInt(HWND hDlg, int nIDDlgItem, BOOL *translated,
 
 int WINAPI GetDlgCtrlID(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) {
         SetLastError(1400);
         return 0;
@@ -12202,7 +13909,7 @@ HWND WINAPI FindWindowExA(HWND hWndParent, HWND hWndChildAfter,
     }
 
     if (hWndParent && !hwnd_is_message(hWndParent) &&
-        !hwnd_is_desktop(hWndParent) && !find_window(hWndParent)) {
+        !hwnd_is_desktop(hWndParent) && !find_public_window(hWndParent)) {
         SetLastError(1400);
         return NULL;
     }
@@ -12228,7 +13935,7 @@ HWND WINAPI FindWindowExA(HWND hWndParent, HWND hWndChildAfter,
 
     int after = hWndChildAfter == NULL;
     for (int i = 0; i < candidate_count; i++) {
-        WINDOW *w = find_window(candidates[i]);
+        WINDOW *w = find_public_window(candidates[i]);
         if (!w) continue;
         if (!after) {
             if (w->handle == hWndChildAfter) after = 1;
@@ -12317,12 +14024,13 @@ LRESULT WINAPI SendMessageTimeoutW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM l
 
 BOOL WINAPI PostThreadMessageA(DWORD idThread, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
-    if (!idThread) {
+    DWORD owner = nt_thread_live_owner(idThread);
+    if (!owner) {
         SetLastError(1444); /* ERROR_INVALID_THREAD_ID */
         return FALSE;
     }
     return msg_enqueue_target(NULL, Msg, wParam, lParam,
-                              GetCurrentProcessId(), idThread);
+                              owner, idThread);
 }
 
 BOOL WINAPI PostThreadMessageW(DWORD idThread, DWORD Msg, WPARAM wParam, LPARAM lParam)
@@ -12334,7 +14042,7 @@ BOOL WINAPI PostThreadMessageW(DWORD idThread, DWORD Msg, WPARAM wParam, LPARAM 
 
 HANDLE WINAPI GetPropA(HWND hWnd, PCSTR lpString)
 {
-    if (!find_window(hWnd) || !lpString)
+    if (!find_public_window(hWnd) || !lpString)
         return NULL;
     WINDOW_PROPERTY *property = property_find_a(hWnd, lpString);
     property_trace(property ? "get-a" : "miss-a", hWnd, property);
@@ -12343,7 +14051,7 @@ HANDLE WINAPI GetPropA(HWND hWnd, PCSTR lpString)
 
 HANDLE WINAPI GetPropW(HWND hWnd, PCWSTR lpString)
 {
-    if (!find_window(hWnd) || !lpString)
+    if (!find_public_window(hWnd) || !lpString)
         return NULL;
     WINDOW_PROPERTY *property = property_find_w(hWnd, lpString);
     property_trace(property ? "get-w" : "miss-w", hWnd, property);
@@ -12352,7 +14060,7 @@ HANDLE WINAPI GetPropW(HWND hWnd, PCWSTR lpString)
 
 BOOL WINAPI SetPropA(HWND hWnd, PCSTR lpString, HANDLE hData)
 {
-    if (!find_window(hWnd)) {
+    if (!find_public_window(hWnd)) {
         SetLastError(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return FALSE;
     }
@@ -12382,7 +14090,7 @@ BOOL WINAPI SetPropA(HWND hWnd, PCSTR lpString, HANDLE hData)
 
 BOOL WINAPI SetPropW(HWND hWnd, PCWSTR lpString, HANDLE hData)
 {
-    if (!find_window(hWnd)) {
+    if (!find_public_window(hWnd)) {
         SetLastError(1400);
         return FALSE;
     }
@@ -12412,7 +14120,7 @@ BOOL WINAPI SetPropW(HWND hWnd, PCWSTR lpString, HANDLE hData)
 
 HANDLE WINAPI RemovePropA(HWND hWnd, PCSTR lpString)
 {
-    if (!find_window(hWnd) || !lpString)
+    if (!find_public_window(hWnd) || !lpString)
         return NULL;
     WINDOW_PROPERTY *property = property_find_a(hWnd, lpString);
     if (!property)
@@ -12425,7 +14133,7 @@ HANDLE WINAPI RemovePropA(HWND hWnd, PCSTR lpString)
 
 HANDLE WINAPI RemovePropW(HWND hWnd, PCWSTR lpString)
 {
-    if (!find_window(hWnd) || !lpString)
+    if (!find_public_window(hWnd) || !lpString)
         return NULL;
     WINDOW_PROPERTY *property = property_find_w(hWnd, lpString);
     if (!property)
@@ -12440,7 +14148,7 @@ HANDLE WINAPI RemovePropW(HWND hWnd, PCWSTR lpString)
 
 DWORD WINAPI GetWindowThreadProcessId(HWND hWnd, DWORD *lpdwProcessId)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) {
         if (lpdwProcessId) *lpdwProcessId = 0;
         return 0;
@@ -12501,7 +14209,7 @@ BOOL WINAPI EnumWindows(WNDENUMPROC lpfn, LPARAM lParam)
     sort_window_handles_top_to_bottom(matches, match_count);
 
     for (int i = 0; i < match_count; i++) {
-        WINDOW *w = find_window(matches[i]);
+        WINDOW *w = find_public_window(matches[i]);
         if (!is_top_level_window(w))
             continue;
         if (!call_window_enum_proc(lpfn, w->handle, lParam))
@@ -12529,7 +14237,7 @@ BOOL WINAPI EnumThreadWindows(DWORD dwThreadId, WNDENUMPROC lpfn,
     sort_window_handles_top_to_bottom(matches, match_count);
 
     for (int i = 0; i < match_count; i++) {
-        WINDOW *w = find_window(matches[i]);
+        WINDOW *w = find_public_window(matches[i]);
         if (!is_top_level_window(w) || w->owner_tid != dwThreadId)
             continue;
         if (!call_window_enum_proc(lpfn, w->handle, lParam))
@@ -12560,6 +14268,9 @@ static HWND mouse_input_target(void)
         return input_target();
     if (capture_hwnd && find_window(capture_hwnd))
         return capture_hwnd;
+    if (compositor_pointer_blocked_by_desktop &&
+        compositor_pointer_blocked_by_desktop(cursor_pos.x, cursor_pos.y))
+        return NULL;
 
     return WindowFromPoint(cursor_pos);
 }
@@ -12601,7 +14312,8 @@ static BYTE prev_was_e0 = 0;
 
 void win32_post_keyboard_scan(WORD scan, BOOL key_up)
 {
-    if (!win32_input_active()) return;
+    if (!win32_input_active() &&
+        !__atomic_load_n(&raw_input_registration_count, __ATOMIC_ACQUIRE)) return;
     BYTE scancode = (BYTE)scan;
     BOOL extended = (scan & 0xFF00) == 0xE000;
     BYTE vk;
@@ -12621,6 +14333,13 @@ void win32_post_keyboard_scan(WORD scan, BOOL key_up)
     MSG key_message = { 0 };
     keyboard_prepare_message(vk, scancode, extended, key_up, FALSE,
                               &key_message);
+    U32_RAW_KEYBOARD raw_key = {
+        .make = scancode,
+        .flags = (key_up ? 1 : 0) | (extended ? 2 : 0) | (scan == 0xE145 ? 4 : 0),
+        .vk = (WORD)key_message.wParam,
+        .message = key_message.message,
+    };
+    raw_input_emit(6, &raw_key, sizeof(raw_key));
 
     /* Find active window for message target. MUST use the window's real handle
      * (windows[i].handle) — find_window() matches by handle, and Window.dll's
@@ -12634,7 +14353,7 @@ void win32_post_keyboard_scan(WORD scan, BOOL key_up)
      * (menu/console) otherwise. This fixes B2: movement keys were landing on a
      * non-viewport window and never reaching the gameplay input. */
     HWND target = input_target();
-    if (!target) return;
+    if (!target || raw_input_no_legacy(target, 6)) return;
 
     msg_enqueue_input(target, key_message.message, key_message.wParam,
                        key_message.lParam);
@@ -12642,7 +14361,8 @@ void win32_post_keyboard_scan(WORD scan, BOOL key_up)
 
 void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
 {
-    if (!win32_input_active()) {
+    if (!win32_input_active() &&
+        !__atomic_load_n(&raw_input_registration_count, __ATOMIC_ACQUIRE)) {
         prev_was_e0 = 0;
         return;
     }
@@ -12661,7 +14381,8 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
  * buttons: bit 0 = left, bit 1 = right, bit 2 = middle.
  * wheel_delta: mouse wheel delta (positive = up, negative = down).
  */
-void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
+static void win32_post_mouse_legacy(int dx, int dy, DWORD buttons,
+                                     short wheel_delta)
 {
     if (dx || dy || buttons != mouse_buttons || wheel_delta)
         g_last_input_time = shim_timeGetTime();
@@ -12684,6 +14405,7 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
 
     /* A warp-based consumer observes anchor plus the physical delta. */
     HWND target = mouse_input_target();
+    if (raw_input_no_legacy(target, 2)) target = NULL;
 
     /* ── Phase 1 diagnostic: WM_MOUSEMOVE routing during capture ── */
     {
@@ -12763,6 +14485,12 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
     }
 }
 
+void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
+{
+    raw_input_mouse(dx, dy, 0, buttons, mouse_buttons, wheel_delta);
+    win32_post_mouse_legacy(dx, dy, buttons, wheel_delta);
+}
+
 static int map_fullscreen_axis(int physical, int offset,
                                uint32_t content_extent,
                                int logical_extent)
@@ -12816,8 +14544,9 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
                              int raw_dx, int raw_dy,
                              DWORD buttons, short wheel_delta)
 {
+    raw_input_mouse(raw_dx, raw_dy, 0, buttons, mouse_buttons, wheel_delta);
     if (relative_pointer_mode_active()) {
-        win32_post_mouse_event(raw_dx, raw_dy, buttons, wheel_delta);
+        win32_post_mouse_legacy(raw_dx, raw_dy, buttons, wheel_delta);
         return;
     }
 
@@ -12835,7 +14564,7 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
     cursor_pos.x = previous_x;
     cursor_pos.y = previous_y;
     g_abs_prev_valid = 0;
-    win32_post_mouse_event(current_x - previous_x,
+    win32_post_mouse_legacy(current_x - previous_x,
                            current_y - previous_y,
                            buttons, wheel_delta);
 }
@@ -12844,6 +14573,14 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
  * raw logical coordinates in [lmin,lmax]. */
 void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 {
+    int64_t raw_range = (int64_t)lmax - lmin;
+    if (raw_range > 0) {
+        int64_t raw_x = ((int64_t)ax - lmin) * 65535 / raw_range;
+        int64_t raw_y = ((int64_t)ay - lmin) * 65535 / raw_range;
+        if (raw_x < 0) raw_x = 0; else if (raw_x > 65535) raw_x = 65535;
+        if (raw_y < 0) raw_y = 0; else if (raw_y > 65535) raw_y = 65535;
+        raw_input_mouse((LONG)raw_x, (LONG)raw_y, 1, buttons, mouse_buttons, 0);
+    }
     g_last_input_time = shim_timeGetTime();
     int physical_width = screen_cx();
     int physical_height = screen_cy();
@@ -12915,6 +14652,7 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
     nx = cursor_pos.x;
     ny = cursor_pos.y;
     HWND target = mouse_input_target();
+    if (raw_input_no_legacy(target, 2)) target = NULL;
 
     /* ── Phase 1 diagnostic: abs-path WM_MOUSEMOVE during capture ── */
     {
@@ -13003,6 +14741,8 @@ typedef struct {
 static U32_CLIPBOARD_FORMAT clipboard_formats[U32_MAX_CLIPBOARD_FORMATS];
 static spinlock_t clipboard_lock = SPINLOCK_INIT;
 static DWORD clipboard_sequence;
+static DWORD clipboard_open_pid, clipboard_open_tid;
+static HWND clipboard_open_window, clipboard_owner_window;
 
 static inline uint64_t clipboard_lock_irqsave(void)
 {
@@ -13017,6 +14757,34 @@ static inline void clipboard_unlock_irqrestore(uint64_t flags)
     spin_unlock(&clipboard_lock);
     if (flags & (1ULL << 9))
         __asm__ volatile ("sti" ::: "memory");
+}
+
+/* The open clipboard belongs to a thread. Its content owner is independently
+ * assigned by EmptyClipboard and survives CloseClipboard. */
+static BOOL clipboard_open_by_caller(void)
+{
+    return clipboard_open_pid == GetCurrentProcessId() &&
+           clipboard_open_tid == GetCurrentThreadId() && clipboard_open_tid;
+}
+
+static void clipboard_release_window(HWND window)
+{
+    uint64_t flags = clipboard_lock_irqsave();
+    if (clipboard_owner_window == window) clipboard_owner_window = NULL;
+    if (clipboard_open_window == window) clipboard_open_window = NULL;
+    clipboard_unlock_irqrestore(flags);
+}
+
+static void clipboard_release_owner(DWORD pid, DWORD tid)
+{
+    uint64_t flags = clipboard_lock_irqsave();
+    if (clipboard_open_pid == pid && (!tid || clipboard_open_tid == tid)) {
+        clipboard_open_pid = clipboard_open_tid = 0;
+        clipboard_open_window = NULL;
+    }
+    clipboard_unlock_irqrestore(flags);
+    /* Window teardown separately clears content ownership. In particular, a
+     * thread may have opened the clipboard using another thread's window. */
 }
 
 static WCHAR clipboard_fold_char(WCHAR ch)
@@ -13102,28 +14870,81 @@ UINT WINAPI RegisterClipboardFormatA(PCSTR name)
 
 BOOL WINAPI OpenClipboard(HANDLE hWndNewOwner)
 {
-    (void)hWndNewOwner;
+    if (hWndNewOwner && !hwnd_is_desktop(hWndNewOwner) &&
+        !find_public_window(hWndNewOwner)) {
+        SetLastError(1400);
+        return FALSE;
+    }
+    DWORD pid = GetCurrentProcessId(), tid = GetCurrentThreadId();
+    uint64_t flags = clipboard_lock_irqsave();
+    if (clipboard_open_tid &&
+        (clipboard_open_pid != pid || clipboard_open_tid != tid ||
+         clipboard_open_window != hWndNewOwner)) {
+        clipboard_unlock_irqrestore(flags);
+        SetLastError(5); /* ERROR_ACCESS_DENIED: another opener holds it. */
+        return FALSE;
+    }
+    clipboard_open_pid = pid;
+    clipboard_open_tid = tid;
+    clipboard_open_window = hWndNewOwner;
+    clipboard_unlock_irqrestore(flags);
     return TRUE;
 }
 
 BOOL WINAPI CloseClipboard(void)
 {
+    uint64_t flags = clipboard_lock_irqsave();
+    if (!clipboard_open_by_caller()) {
+        clipboard_unlock_irqrestore(flags);
+        SetLastError(1418); /* ERROR_CLIPBOARD_NOT_OPEN */
+        return FALSE;
+    }
+    clipboard_open_pid = clipboard_open_tid = 0;
+    clipboard_open_window = NULL;
+    clipboard_unlock_irqrestore(flags);
     return TRUE;
+}
+
+HWND WINAPI GetClipboardOwner(void)
+{
+    uint64_t flags = clipboard_lock_irqsave();
+    HWND owner = clipboard_owner_window;
+    clipboard_unlock_irqrestore(flags);
+    return owner;
 }
 
 BOOL WINAPI EmptyClipboard(void)
 {
     uint64_t flags = clipboard_lock_irqsave();
+    if (!clipboard_open_by_caller()) {
+        clipboard_unlock_irqrestore(flags);
+        SetLastError(1418);
+        return FALSE;
+    }
+    HWND previous_owner = clipboard_owner_window;
+    clipboard_owner_window = clipboard_open_window;
     for (int i = 0; i < U32_MAX_CLIPBOARD_FORMATS; i++)
         clipboard_formats[i].data = NULL;
     clipboard_sequence++;
     clipboard_unlock_irqrestore(flags);
+    /* Never call application code while holding the IRQ-safe clipboard lock. */
+    if (previous_owner) SendMessageA(previous_owner, 0x0307, 0, 0);
     return TRUE;
 }
 
 HANDLE WINAPI SetClipboardData(UINT format, HANDLE memory)
 {
     uint64_t flags = clipboard_lock_irqsave();
+    if (nt_job_ui_restrictions(GetCurrentProcessId()) & NT_JOB_UI_WRITECLIPBOARD) {
+        clipboard_unlock_irqrestore(flags);
+        SetLastError(5);
+        return NULL;
+    }
+    if (!clipboard_open_by_caller() || !clipboard_owner_window) {
+        clipboard_unlock_irqrestore(flags);
+        SetLastError(1418);
+        return NULL;
+    }
     U32_CLIPBOARD_FORMAT *entry = clipboard_entry(format);
     if (!entry) {
         clipboard_unlock_irqrestore(flags);
@@ -13139,9 +14960,20 @@ HANDLE WINAPI SetClipboardData(UINT format, HANDLE memory)
 HANDLE WINAPI GetClipboardData(UINT format)
 {
     uint64_t flags = clipboard_lock_irqsave();
+    if (nt_job_ui_restrictions(GetCurrentProcessId()) & NT_JOB_UI_READCLIPBOARD) {
+        clipboard_unlock_irqrestore(flags);
+        SetLastError(5);
+        return NULL;
+    }
+    if (!clipboard_open_by_caller()) {
+        clipboard_unlock_irqrestore(flags);
+        SetLastError(1418);
+        return NULL;
+    }
     U32_CLIPBOARD_FORMAT *entry = clipboard_entry(format);
     HANDLE data = entry ? entry->data : NULL;
     clipboard_unlock_irqrestore(flags);
+    if (!data) SetLastError(1168); /* ERROR_NOT_FOUND for unavailable data. */
     return data;
 }
 
@@ -13184,6 +15016,11 @@ int WINAPI GetClipboardFormatNameA(UINT format, PSTR buffer, int max_count)
 UINT WINAPI EnumClipboardFormats(UINT format)
 {
     uint64_t flags = clipboard_lock_irqsave();
+    if (!clipboard_open_by_caller()) {
+        clipboard_unlock_irqrestore(flags);
+        SetLastError(1418);
+        return 0;
+    }
     UINT start = format < U32_REGISTERED_FORMAT_BASE
                ? 0 : format - U32_REGISTERED_FORMAT_BASE + 1;
     UINT result = 0;
@@ -13238,7 +15075,7 @@ _Static_assert(sizeof(PAINTSTRUCT64_K32) == 72,
 
 HDC WINAPI BeginPaint(HWND hWnd, PVOID lpPaint)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w || !lpPaint) {
         SetLastError(!w ? 1400 : 87);
         return NULL;
@@ -13246,17 +15083,18 @@ HDC WINAPI BeginPaint(HWND hWnd, PVOID lpPaint)
     BOOL compat32 = g_compat32_mode;
     HDC hdc = gdi32_alloc_window_dc(hWnd);
     RECT paint = { 0, 0, 0, 0 };
-    BOOL erase = FALSE;
+    BOOL erase = FALSE, send_erase = FALSE;
     if (!hdc) {
         SetLastError(8); /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;
     }
-    if (w->paint_pending) {
-        paint = w->update_rect;
-        erase = w->erase_pending ? TRUE : FALSE;
-    }
+    uint64_t flags = msg_lock_irqsave();
+    gdi32_region_data_bounds(&w->update_region, (GDI_RECT *)&paint);
+    erase = w->update_region.count && w->erase_pending;
+    send_erase = (w->erase_pending & 1) != 0;
     uint64_t token;
-    if (!gdi32_push_paint_clip(hdc, (const GDI_RECT *)&paint, &token)) {
+    if (!gdi32_push_paint_region(hdc, &w->update_region, &token)) {
+        msg_unlock_irqrestore(flags);
         gdi32_free_screen_dc(hdc);
         SetLastError(8);
         return NULL;
@@ -13265,8 +15103,9 @@ HDC WINAPI BeginPaint(HWND hWnd, PVOID lpPaint)
     /* Consume this update before calling application code. A callback may
      * invalidate again, recurse into painting, or destroy its own window. */
     w->paint_pending = w->erase_pending = 0;
-    memset(&w->update_rect, 0, sizeof(w->update_rect));
-    if (erase && SendMessageA(hWnd, WM_ERASEBKGND, (WPARAM)hdc, 0))
+    gdi32_region_data_clear(&w->update_region);
+    msg_unlock_irqrestore(flags);
+    if (erase && send_erase && SendMessageA(hWnd, WM_ERASEBKGND, (WPARAM)hdc, 0))
         erase = FALSE;
 
     if (compat32) {
@@ -13291,7 +15130,7 @@ HDC WINAPI BeginPaint(HWND hWnd, PVOID lpPaint)
 BOOL WINAPI EndPaint(HWND hWnd, PVOID lpPaint)
 {
     HDC hdc = NULL;
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     uint64_t token = 0;
 
     if (lpPaint) {
@@ -13422,7 +15261,7 @@ HWND WINAPI CreateWindowExW(DWORD dwExStyle, PCWSTR lpClassName,
     }
     HWND window = CreateWindowExA(dwExStyle, class_arg, name_arg, dwStyle,
         X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
-    WINDOW *entry = find_window(window);
+    WINDOW *entry = find_public_window(window);
     if (entry) {
         WNDCLASS_ENTRY *cls = lookup_class_for_pid(entry->class_name, entry->owner_pid);
         if (cls && cls->system_class) entry->unicode = TRUE;
@@ -13791,7 +15630,7 @@ LONG_PTR WINAPI SetWindowLongPtrW(HWND hWnd, int nIndex,
                                    LONG_PTR dwNewLong)
 {
     LONG_PTR result = SetWindowLongPtrA(hWnd, nIndex, dwNewLong);
-    WINDOW *window = find_window(hWnd);
+    WINDOW *window = find_public_window(hWnd);
     if (window && nIndex == GWL_WNDPROC) window->unicode = TRUE;
     return result;
 }
@@ -13799,31 +15638,31 @@ LONG_PTR WINAPI SetWindowLongPtrW(HWND hWnd, int nIndex,
 BOOL WINAPI IsWindow(HWND hWnd)
 {
     WINDOW *w = find_window(hWnd);
-    return w ? TRUE : FALSE;
+    return hwnd_is_desktop(hWnd) || window_user_accessible(w);
 }
 
 BOOL WINAPI IsIconic(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     return w && (w->style & WS_MINIMIZE) ? TRUE : FALSE;
 }
 
 BOOL WINAPI IsZoomed(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     return w && (w->style & WS_MAXIMIZE) ? TRUE : FALSE;
 }
 
 BOOL WINAPI IsWindowEnabled(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     return w && !(w->style & WS_DISABLED) ? TRUE : FALSE;
 }
 
 BOOL WINAPI IsChild(HWND hWndParent, HWND hWnd)
 {
-    WINDOW *child = find_window(hWnd);
-    if (!find_window(hWndParent) || !child || hWndParent == hWnd)
+    WINDOW *child = find_public_window(hWnd);
+    if (!find_public_window(hWndParent) || !child || hWndParent == hWnd)
         return FALSE;
 
     for (int i = 0; i < MAX_WINDOWS && child->parent; i++) {
@@ -13838,7 +15677,7 @@ BOOL WINAPI IsChild(HWND hWndParent, HWND hWnd)
 
 HWND WINAPI GetParent(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) {
         SetLastError(1400);
         return NULL;
@@ -13861,7 +15700,7 @@ BOOL WINAPI EnumChildWindows(HWND hWndParent, WNDENUMPROC lpEnumFunc,
     }
     if (!hWndParent)
         return EnumWindows(lpEnumFunc, lParam);
-    if (!find_window(hWndParent) && !hwnd_is_desktop(hWndParent) &&
+    if (!find_public_window(hWndParent) && !hwnd_is_desktop(hWndParent) &&
         !hwnd_is_message(hWndParent)) {
         SetLastError(1400);
         return FALSE;
@@ -13883,7 +15722,7 @@ BOOL WINAPI EnumChildWindows(HWND hWndParent, WNDENUMPROC lpEnumFunc,
     sort_window_handles_top_to_bottom(matches, match_count);
 
     for (int i = 0; i < match_count; i++) {
-        WINDOW *candidate = find_window(matches[i]);
+        WINDOW *candidate = find_public_window(matches[i]);
         if (!candidate) continue;
         BOOL still_child = hwnd_is_message(hWndParent)
             ? candidate->message_only
@@ -13901,7 +15740,7 @@ BOOL WINAPI EnumChildWindows(HWND hWndParent, WNDENUMPROC lpEnumFunc,
  * same two-LONG layout in both PE ABIs. */
 BOOL WINAPI ClientToScreen(HWND hWnd, PVOID lpPoint)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     LONG *pt = (LONG *)lpPoint;
     if (!pt || (!w && !hwnd_is_desktop(hWnd))) return FALSE;
     if (w) {
@@ -13915,7 +15754,7 @@ BOOL WINAPI ClientToScreen(HWND hWnd, PVOID lpPoint)
 
 BOOL WINAPI ScreenToClient(HWND hWnd, PVOID lpPoint)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     LONG *pt = (LONG *)lpPoint;
     if (!pt || (!w && !hwnd_is_desktop(hWnd))) return FALSE;
     if (w) {
@@ -13927,29 +15766,69 @@ BOOL WINAPI ScreenToClient(HWND hWnd, PVOID lpPoint)
     return TRUE;
 }
 
+static void erase_window_update(HWND hWnd)
+{
+    WINDOW *w = find_public_window(hWnd);
+    if (!w || !(w->erase_pending & 1)) return;
+    HDC dc = gdi32_alloc_window_dc(hWnd);
+    if (!dc) return;
+    uint64_t token = 0;
+    uint64_t flags = msg_lock_irqsave();
+    BOOL send = (w->erase_pending & 1) && w->update_region.count &&
+        gdi32_push_paint_region(dc, &w->update_region, &token);
+    if (send) w->erase_pending = 0;
+    msg_unlock_irqrestore(flags);
+    if (send) {
+        LRESULT erased = SendMessageA(hWnd, WM_ERASEBKGND, (WPARAM)dc, 0);
+        flags = msg_lock_irqsave();
+        w = find_public_window(hWnd);
+        /* A query sends the request once. An unhandled background is still
+         * reported by BeginPaint, but another query must not resend it. */
+        if (w && !erased && w->update_region.count) w->erase_pending |= 2;
+        msg_unlock_irqrestore(flags);
+        gdi32_pop_paint_clip(dc, token, TRUE);
+    }
+    gdi32_free_screen_dc(dc);
+}
+
+static BOOL snapshot_window_update(HWND hWnd, BOOL erase, GDI_REGION *region)
+{
+    if (!find_public_window(hWnd)) { SetLastError(1400); return FALSE; }
+    if (erase) erase_window_update(hWnd);
+    uint64_t flags = msg_lock_irqsave();
+    WINDOW *w = find_public_window(hWnd);
+    if (w) gdi32_region_data_assign(region, &w->update_region);
+    else gdi32_region_data_clear(region); /* Destroyed by WM_ERASEBKGND. */
+    msg_unlock_irqrestore(flags);
+    return TRUE;
+}
+
 BOOL WINAPI GetUpdateRect(HWND hWnd, PVOID lpRect, BOOL bErase)
 {
-    WINDOW *w = find_window(hWnd);
-    if (!w) return FALSE;
-    if (!w->paint_pending) {
-        if (lpRect) memset(lpRect, 0, sizeof(RECT));
-        return FALSE;
+    GDI_REGION_SCOPE(region);
+    if (!snapshot_window_update(hWnd, bErase, &region)) return FALSE;
+    GDI_RECT bounds;
+    gdi32_region_data_bounds(&region, &bounds);
+    if (lpRect) *(RECT *)lpRect = *(RECT *)&bounds;
+    return region.count != 0;
+}
+
+int WINAPI GetUpdateRgn(HWND hWnd, HANDLE destination, BOOL erase)
+{
+    BOOL compat32 = g_compat32_mode;
+    if (!find_public_window(hWnd)) { SetLastError(1400); return GDI_RGN_ERROR; }
+    if (!destination) { SetLastError(6); return GDI_RGN_ERROR; }
+    GDI_REGION_SCOPE(region);
+    if (!snapshot_window_update(hWnd, erase, &region)) return GDI_RGN_ERROR;
+    DWORD saved_error = GetLastError();
+    int type = gdi32_region_data_write(destination, &region);
+    if (!type) {
+        /* Windows treats a non-NULL invalid destination as an empty result;
+         * a NULL destination is an error. Neither consumes the update. */
+        if (!region.count || compat32) SetLastError(saved_error);
+        return GDI_NULLREGION;
     }
-    if (lpRect) *(RECT *)lpRect = w->update_rect;
-    if (bErase && w->erase_pending) {
-        HDC dc = gdi32_alloc_window_dc(hWnd);
-        uint64_t token;
-        if (dc && gdi32_push_paint_clip(
-                dc, (const GDI_RECT *)&w->update_rect, &token)) {
-            w->erase_pending = 0;
-            LRESULT erased = SendMessageA(hWnd, WM_ERASEBKGND, (WPARAM)dc, 0);
-            w = find_window(hWnd);
-            if (w && !erased && w->paint_pending) w->erase_pending = 1;
-            gdi32_pop_paint_clip(dc, token, TRUE);
-        }
-        if (dc) gdi32_free_screen_dc(dc);
-    }
-    return TRUE;
+    return type;
 }
 
 int WINAPI FillRect(HDC hDC, PVOID lprc, HBRUSH hbr)
@@ -13994,7 +15873,7 @@ static LONG_PTR dialog_box_template(HINSTANCE instance, PCVOID template_data,
                                     SIZE_T template_size, HWND parent,
                                     DLGPROC proc, LPARAM init_param)
 {
-    BOOL owner_disabled = parent && find_window(parent) &&
+    BOOL owner_disabled = parent && find_public_window(parent) &&
                           IsWindowEnabled(parent);
     if (owner_disabled)
         EnableWindow(parent, FALSE);
@@ -14003,7 +15882,7 @@ static LONG_PTR dialog_box_template(HINSTANCE instance, PCVOID template_data,
     HWND dialog = dialog_create_template(instance, template_data,
         template_size, parent, proc, init_param, TRUE, &state);
     if (!dialog || !state) {
-        if (owner_disabled && find_window(parent))
+        if (owner_disabled && find_public_window(parent))
             EnableWindow(parent, TRUE);
         return -1;
     }
@@ -14040,9 +15919,9 @@ static LONG_PTR dialog_box_template(HINSTANCE instance, PCVOID template_data,
     LONG_PTR result = state->result;
     HWND owner = state->owner;
     BOOL restore_owner = state->owner_disabled;
-    if (state->window && find_window(state->window))
+    if (state->window && find_public_window(state->window))
         DestroyWindow(state->window);
-    if (restore_owner && owner && find_window(owner)) {
+    if (restore_owner && owner && find_public_window(owner)) {
         EnableWindow(owner, TRUE);
         SetForegroundWindow(owner);
     }
@@ -14186,6 +16065,50 @@ static U32_MENU *menu_find_locked(HMENU handle)
         if (u32_menus[i].used && u32_menus[i].handle == handle)
             return &u32_menus[i];
     return NULL;
+}
+
+static U32_MENU *menu_find_public_locked(HMENU handle)
+{
+    U32_MENU *menu = menu_find_locked(handle);
+    if (menu && nt_job_user_access(GetCurrentProcessId(), menu->owner_pid,
+                                   NT_JOB_USER_MENU, (ULONG_PTR)handle)) return menu;
+    SetLastError(1401);
+    return NULL;
+}
+
+static BOOL menu_handle_accessible(HMENU handle)
+{
+    uint64_t flags = menu_lock_irqsave();
+    BOOL valid = menu_find_public_locked(handle) != NULL;
+    menu_unlock_irqrestore(flags);
+    return valid;
+}
+
+BOOL WINAPI UserHandleGrantAccess(HANDLE handle, HANDLE job, BOOL grant)
+{
+    DWORD previous_error = GetLastError(), owner = 0;
+    UINT kind = 0;
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    WINDOW *window = find_window(handle);
+    U32_MENU *menu = menu_find_locked(handle);
+    USER_ICON *icon = icon_lookup_locked(handle);
+    IMM_CONTEXT_ENTRY *context = imm_find_context(handle);
+    if (window) { owner = window->owner_pid; kind = NT_JOB_USER_WINDOW; }
+    else if (menu) { owner = menu->owner_pid; kind = NT_JOB_USER_MENU; }
+    else if (icon) { owner = icon->owner_pid; kind = NT_JOB_USER_ICON; }
+    else if (context) { owner = context->owner_pid; kind = NT_JOB_USER_INPUT_CONTEXT; }
+    else for (int i = 0; i < USER_HOOK_SLOTS; i++)
+        if (user_hooks[i].used && user_hooks[i].handle == handle) {
+            owner = user_hooks[i].owner_pid; kind = NT_JOB_USER_HOOK; break;
+        }
+    BOOL result = FALSE;
+    if (!kind || !nt_job_user_access(GetCurrentProcessId(), owner, kind,
+                                     (ULONG_PTR)handle)) SetLastError(87);
+    else result = nt_job_user_grant(job, owner, kind, (ULONG_PTR)handle, grant);
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+    if (result) SetLastError(previous_error);
+    return result;
 }
 
 static U32_MENU *menu_alloc_locked(BOOL popup, DWORD owner_pid)
@@ -14403,7 +16326,7 @@ static BOOL menu_can_attach_submenu_locked(U32_MENU *parent,
                                            HMENU current_submenu)
 {
     if (!submenu_handle) return TRUE;
-    U32_MENU *submenu = menu_find_locked(submenu_handle);
+    U32_MENU *submenu = menu_find_public_locked(submenu_handle);
     if (!submenu || submenu == parent || submenu->owner_pid != parent->owner_pid)
         return FALSE;
     if (submenu->parent_menu && submenu->parent_menu != parent->handle &&
@@ -14484,6 +16407,7 @@ static void menu_destroy_locked(U32_MENU *menu, unsigned depth)
     if (!menu || !menu->used || menu->destroying || depth >= U32_MAX_MENUS)
         return;
     HMENU handle = menu->handle;
+    nt_job_user_destroy(NT_JOB_USER_MENU, (ULONG_PTR)handle);
     menu->destroying = TRUE;
     for (UINT i = 0; i < menu->item_count; i++) {
         U32_MENU *submenu = menu_find_locked(menu->items[i].submenu);
@@ -14625,7 +16549,7 @@ HMENU WINAPI CreatePopupMenu(void)
 BOOL WINAPI DestroyMenu(HMENU handle)
 {
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle);
+    U32_MENU *menu = menu_find_public_locked(handle);
     if (!menu) {
         menu_unlock_irqrestore(flags);
         SetLastError(1401);
@@ -14639,14 +16563,14 @@ BOOL WINAPI DestroyMenu(HMENU handle)
 BOOL WINAPI IsMenu(HMENU handle)
 {
     uint64_t flags = menu_lock_irqsave();
-    BOOL valid = menu_find_locked(handle) != NULL;
+    BOOL valid = menu_find_public_locked(handle) != NULL;
     menu_unlock_irqrestore(flags);
     return valid;
 }
 
 HMENU WINAPI GetSystemMenu(HWND handle, BOOL revert)
 {
-    WINDOW *window = find_window(handle);
+    WINDOW *window = find_public_window(handle);
     if (!window || window->message_only) {
         SetLastError(1400);
         return NULL;
@@ -14674,7 +16598,7 @@ HMENU WINAPI GetSystemMenu(HWND handle, BOOL revert)
 BOOL WINAPI EnableMenuItem(HMENU handle, UINT requested_item, UINT enable)
 {
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle), *containing = NULL;
+    U32_MENU *menu = menu_find_public_locked(handle), *containing = NULL;
     int index = menu_find_item_locked(menu, requested_item,
         (enable & MF_BYPOSITION) != 0, &containing, 0);
     if (index < 0) {
@@ -14700,7 +16624,7 @@ static BOOL menu_insert_item(HMENU handle, UINT requested_item,
         return FALSE;
     }
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle);
+    U32_MENU *menu = menu_find_public_locked(handle);
     if (!menu) {
         menu_unlock_irqrestore(flags);
         SetLastError(1401);
@@ -14765,7 +16689,7 @@ BOOL WINAPI GetMenuInfo(HMENU handle, LPMENUINFO raw_info)
         return FALSE;
     }
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle);
+    U32_MENU *menu = menu_find_public_locked(handle);
     if (!menu) {
         menu_unlock_irqrestore(flags);
         SetLastError(1401);
@@ -14800,7 +16724,7 @@ BOOL WINAPI SetMenuInfo(HMENU handle, LPCMENUINFO raw_info)
         return FALSE;
     }
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle);
+    U32_MENU *menu = menu_find_public_locked(handle);
     if (!menu) {
         menu_unlock_irqrestore(flags);
         SetLastError(1401);
@@ -14815,7 +16739,7 @@ BOOL WINAPI SetMenuDefaultItem(HMENU handle, UINT requested_item,
                                UINT by_position)
 {
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle);
+    U32_MENU *menu = menu_find_public_locked(handle);
     if (!menu) {
         menu_unlock_irqrestore(flags);
         SetLastError(1401);
@@ -14863,7 +16787,7 @@ static UINT menu_get_default_locked(U32_MENU *menu, UINT by_position,
 UINT WINAPI GetMenuDefaultItem(HMENU handle, UINT by_position, UINT flags)
 {
     uint64_t lock_flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle);
+    U32_MENU *menu = menu_find_public_locked(handle);
     UINT result = menu_get_default_locked(menu, by_position, flags, 0);
     menu_unlock_irqrestore(lock_flags);
     if (!menu) SetLastError(1401);
@@ -14888,7 +16812,7 @@ HMENU WINAPI LoadMenuW(HINSTANCE hInstance, PCWSTR lpMenuName)
 HMENU WINAPI GetSubMenu(HMENU hMenu, int nPos)
 {
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(hMenu);
+    U32_MENU *menu = menu_find_public_locked(hMenu);
     HMENU result = menu && nPos >= 0 && (UINT)nPos < menu->item_count
                  ? menu->items[nPos].submenu : NULL;
     menu_unlock_irqrestore(flags);
@@ -14899,7 +16823,7 @@ HMENU WINAPI GetSubMenu(HMENU hMenu, int nPos)
 int WINAPI GetMenuItemCount(HMENU hMenu)
 {
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(hMenu);
+    U32_MENU *menu = menu_find_public_locked(hMenu);
     int count = menu ? (int)menu->item_count : -1;
     menu_unlock_irqrestore(flags);
     if (!menu) SetLastError(1401);
@@ -14909,7 +16833,7 @@ int WINAPI GetMenuItemCount(HMENU hMenu)
 UINT WINAPI GetMenuState(HMENU hMenu, UINT uId, UINT uFlags)
 {
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(hMenu), *containing = NULL;
+    U32_MENU *menu = menu_find_public_locked(hMenu), *containing = NULL;
     int index = menu_find_item_locked(menu, uId,
         (uFlags & MF_BYPOSITION) != 0, &containing, 0);
     if (index < 0) {
@@ -14936,7 +16860,7 @@ static BOOL menu_get_item_info(HMENU handle, UINT requested_item,
         return FALSE;
     }
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle), *containing = NULL;
+    U32_MENU *menu = menu_find_public_locked(handle), *containing = NULL;
     int index = menu_find_item_locked(menu, requested_item, by_position,
                                       &containing, 0);
     if (index < 0) {
@@ -14997,7 +16921,7 @@ static BOOL menu_set_item_info(HMENU handle, UINT requested_item,
         return FALSE;
     }
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle), *containing = NULL;
+    U32_MENU *menu = menu_find_public_locked(handle), *containing = NULL;
     int index = menu_find_item_locked(menu, requested_item, by_position,
                                       &containing, 0);
     if (index < 0) {
@@ -15026,7 +16950,7 @@ BOOL WINAPI SetMenuItemInfoW(HMENU menu, UINT item, BOOL by_position,
 DWORD WINAPI CheckMenuItem(HMENU handle, UINT requested_item, UINT check)
 {
     uint64_t flags = menu_lock_irqsave();
-    U32_MENU *menu = menu_find_locked(handle), *containing = NULL;
+    U32_MENU *menu = menu_find_public_locked(handle), *containing = NULL;
     int index = menu_find_item_locked(menu, requested_item,
         (check & MF_BYPOSITION) != 0, &containing, 0);
     if (index < 0) {
@@ -15051,7 +16975,7 @@ BOOL WINAPI TrackPopupMenu(HMENU hMenu, UINT uFlags, int x, int y,
         SetLastError(1401);
         return FALSE;
     }
-    if (!find_window(hWnd)) {
+    if (!find_public_window(hWnd)) {
         SetLastError(1400);
         return FALSE;
     }
@@ -15064,6 +16988,10 @@ BOOL WINAPI TrackPopupMenu(HMENU hMenu, UINT uFlags, int x, int y,
 
 HCURSOR WINAPI SetCursor(HCURSOR hCursor)
 {
+    if (hCursor && hCursor != U32_SHARED_CURSOR_A && hCursor != U32_SHARED_CURSOR_W) {
+        USER_ICON cursor;
+        if (!icon_snapshot(hCursor, &cursor)) { SetLastError(1402); return NULL; }
+    }
     HCURSOR previous = current_cursor;
     current_cursor = hCursor;
     return previous;
@@ -15113,6 +17041,9 @@ HANDLE WINAPI CopyImage(HANDLE image, UINT type, int cx, int cy, UINT flags)
         SetLastError(6);
         return NULL;
     }
+    if ((type == 1 || type == 2) && image != U32_SHARED_ICON_A &&
+        image != U32_SHARED_ICON_W && image != U32_SHARED_CURSOR_A &&
+        image != U32_SHARED_CURSOR_W && !icon_snapshot(image, NULL)) return NULL;
     if (flags & 0x00000004u) /* LR_COPYRETURNORG */
         return image;
 
@@ -15164,14 +17095,14 @@ UINT WINAPI RegisterWindowMessageW(PCWSTR lpString)
 
 BOOL WINAPI PostMessageW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
-    return msg_enqueue(hWnd, Msg, wParam, lParam);
+    return PostMessageA(hWnd, Msg, wParam, lParam);
 }
 
 /* ── Additional stubs ──────────────────────────────────────── */
 
 BOOL WINAPI EnableWindow(HWND hWnd, BOOL bEnable)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w) {
         SetLastError(1400);
         return FALSE;
@@ -15196,7 +17127,7 @@ BOOL WINAPI EnableWindow(HWND hWnd, BOOL bEnable)
 
 HMENU WINAPI GetMenu(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     return w && !(w->style & WS_CHILD) ? w->menu : NULL;
 }
 
@@ -15232,7 +17163,7 @@ HWND WINAPI GetFocus(void)
 
 BOOL WINAPI IsWindowVisible(HWND hWnd)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     return w && !w->message_only && window_style_is_visible(w);
 }
 
@@ -15240,8 +17171,8 @@ int WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cP
 {
     /* NULL denotes screen space; the result packs the applied client-origin delta. */
     LONG dx = 0, dy = 0;
-    WINDOW *from = hWndFrom ? find_window(hWndFrom) : NULL;
-    WINDOW *to   = hWndTo   ? find_window(hWndTo)   : NULL;
+    WINDOW *from = hWndFrom ? find_public_window(hWndFrom) : NULL;
+    WINDOW *to   = hWndTo   ? find_public_window(hWndTo)   : NULL;
     if ((hWndFrom && !from && !hwnd_is_desktop(hWndFrom)) ||
         (hWndTo && !to && !hwnd_is_desktop(hWndTo))) {
         SetLastError(1400);
@@ -15297,14 +17228,14 @@ BOOL WINAPI RegisterHotKey(HWND hWnd, int id, UINT fsModifiers, UINT vk)
 
 BOOL WINAPI SetMenu(HWND hWnd, HMENU hMenu)
 {
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (!w || (w->style & WS_CHILD)) {
         SetLastError(w ? 87 : 1400);
         return FALSE;
     }
     if (hMenu) {
         uint64_t flags = menu_lock_irqsave();
-        U32_MENU *menu = menu_find_locked(hMenu);
+        U32_MENU *menu = menu_find_public_locked(hMenu);
         BOOL valid = menu && !menu->system_menu;
         menu_unlock_irqrestore(flags);
         if (!valid) {
@@ -15319,7 +17250,7 @@ BOOL WINAPI SetMenu(HWND hWnd, HMENU hMenu)
 
 HWND WINAPI SetParent(HWND hWndChild, HWND hWndNewParent)
 {
-    WINDOW *child = find_window(hWndChild);
+    WINDOW *child = find_public_window(hWndChild);
     if (!child) {
         SetLastError(1400);
         return NULL;
@@ -15332,7 +17263,7 @@ HWND WINAPI SetParent(HWND hWndChild, HWND hWndNewParent)
 
     WINDOW *parent = NULL;
     if (!to_message && !hwnd_is_desktop(new_parent)) {
-        parent = find_window(new_parent);
+        parent = find_public_window(new_parent);
         if (!parent || new_parent == hWndChild || IsChild(hWndChild, new_parent)) {
             SetLastError(1400);
             return NULL;
@@ -15365,7 +17296,7 @@ HWND WINAPI SetActiveWindow(HWND hWnd)
         user32_deactivate_compositor_windows();
         return prev;
     }
-    WINDOW *w = find_window(hWnd);
+    WINDOW *w = find_public_window(hWnd);
     if (w)
         dispatch_wm_activate(w);
     return prev;
@@ -15379,20 +17310,26 @@ BOOL WINAPI UnregisterHotKey(HWND hWnd, int id)
 
 BOOL WINAPI ValidateRect(HWND hWnd, const RECT *lpRect)
 {
-    WINDOW *w = find_window(hWnd);
-    if (!w) return FALSE;
-    if (!w->paint_pending) return TRUE;
-    if (!lpRect ||
-        (lpRect->left <= w->update_rect.left &&
-         lpRect->top <= w->update_rect.top &&
-         lpRect->right >= w->update_rect.right &&
-         lpRect->bottom >= w->update_rect.bottom)) {
-        w->paint_pending = 0;
-        w->erase_pending = 0;
-        w->update_rect.left = w->update_rect.top = 0;
-        w->update_rect.right = w->update_rect.bottom = 0;
+    WINDOW *w = find_public_window(hWnd);
+    if (!w) { SetLastError(1400); return FALSE; }
+    if (!lpRect) {
+        clear_window_update(w);
+        return TRUE;
     }
-    return TRUE;
+    GDI_REGION_SCOPE(change);
+    window_rect_region(w, lpRect, &change);
+    return change_window_update(w, &change, TRUE, FALSE);
+}
+
+BOOL WINAPI ValidateRgn(HWND hWnd, HANDLE region)
+{
+    WINDOW *w = find_public_window(hWnd);
+    if (!w) { SetLastError(1400); return FALSE; }
+    if (!region) { clear_window_update(w); return TRUE; }
+    GDI_REGION_SCOPE(change);
+    /* A bad non-NULL region leaves the pending update intact on Windows. */
+    if (!gdi32_region_data_read(region, &change)) return TRUE;
+    return change_window_update(w, &change, TRUE, FALSE);
 }
 
 static HANDLE WINAPI SetWinEventHook_k32(DWORD event_min, DWORD event_max,
@@ -15432,6 +17369,18 @@ static PWSTR WINAPI CharNextW_k32(PCWSTR current)
 static PWSTR WINAPI CharPrevW_k32(PCWSTR start, PCWSTR current)
 {
     return (PWSTR)(start && current && current > start ? current - 1 : start);
+}
+
+static PSTR WINAPI CharPrevA_k32(PCSTR start, PCSTR current)
+{
+    extern BOOL WINAPI IsDBCSLeadByte(BYTE);
+    if (!start || !current || current <= start) return (PSTR)start;
+    PCSTR previous = start;
+    while (*start && start < current) {
+        previous = start;
+        start += IsDBCSLeadByte((BYTE)*start) && start[1] ? 2 : 1;
+    }
+    return (PSTR)previous;
 }
 
 static int ws_put_uint(WCHAR *out, int pos, uint32_t value, unsigned base,
@@ -15715,7 +17664,7 @@ static LONG WINAPI DwmGetCompositionTimingInfo_u32(HWND window, PVOID timing)
     U32_DWM_TIMING_INFO *info = (U32_DWM_TIMING_INFO *)timing;
     if (!info || info->cb_size != sizeof(*info))
         return (LONG)0x80070057; /* E_INVALIDARG */
-    if (window && !hwnd_is_desktop(window) && !find_window(window))
+    if (window && !hwnd_is_desktop(window) && !find_public_window(window))
         return (LONG)0x80070006; /* E_HANDLE */
 
     uint32_t lo, hi;
@@ -16501,6 +18450,53 @@ int user32_window_model_selftest(void)
                    "WindowFromPoint selects deepest visible child",
                    &checks, &failures);
 
+    WINDOW *layered_hit = find_window(grandchild);
+    if (layered_hit) {
+        DWORD saved_ex_style = layered_hit->ex_style;
+        void *saved_pixels = layered_hit->shm_pixels;
+        int saved_width = layered_hit->surface_width;
+        int saved_height = layered_hit->surface_height;
+        BOOL saved_initialized = layered_hit->layered_initialized;
+        surface_alpha_t saved_alpha = layered_hit->surface_alpha;
+        uint32_t sample[4] = {0, 0, 0, 0xffff0000u};
+        layered_hit->ex_style |= WS_EX_LAYERED;
+        layered_hit->shm_pixels = sample;
+        layered_hit->surface_width = layered_hit->surface_height = 2;
+        layered_hit->surface_alpha = (surface_alpha_t){.opacity = 255, .per_pixel = 1};
+        layered_hit->layered_initialized = FALSE;
+        wm_test_expect(WindowFromPoint(child_hit) != grandchild,
+                       "uninitialized layered window is not a hit", &checks, &failures);
+        layered_hit->layered_initialized = TRUE;
+        wm_test_expect(WindowFromPoint(child_hit) == grandchild,
+                       "opaque layered pixel receives input", &checks, &failures);
+        layered_hit->surface_width = 1;
+        wm_test_expect(WindowFromPoint(child_hit) != grandchild,
+                       "layered hit respects allocated width", &checks, &failures);
+        layered_hit->surface_width = 2;
+        layered_hit->surface_height = 1;
+        wm_test_expect(WindowFromPoint(child_hit) != grandchild,
+                       "layered hit respects allocated height", &checks, &failures);
+        layered_hit->surface_height = 2;
+        sample[3] = 0;
+        wm_test_expect(WindowFromPoint(child_hit) != grandchild,
+                       "zero-alpha pixel passes input through", &checks, &failures);
+        sample[3] = 0xffff0000u;
+        layered_hit->surface_alpha.color_key = 0xff0000;
+        layered_hit->surface_alpha.color_key_enabled = 1;
+        wm_test_expect(WindowFromPoint(child_hit) != grandchild,
+                       "color-key pixel passes input through", &checks, &failures);
+        layered_hit->surface_alpha.color_key_enabled = 0;
+        layered_hit->ex_style |= WS_EX_TRANSPARENT;
+        wm_test_expect(WindowFromPoint(child_hit) != grandchild,
+                       "transparent layered style passes input through", &checks, &failures);
+        layered_hit->ex_style = saved_ex_style;
+        layered_hit->shm_pixels = saved_pixels;
+        layered_hit->surface_width = saved_width;
+        layered_hit->surface_height = saved_height;
+        layered_hit->layered_initialized = saved_initialized;
+        layered_hit->surface_alpha = saved_alpha;
+    }
+
     grandchild_b = CreateWindowExA(0, class_name, "wm-grandchild-b",
         WS_CHILD | WS_VISIBLE, -5, -9, 20, 10,
         child_b, (HMENU)(ULONG_PTR)202, NULL, NULL);
@@ -16532,6 +18528,10 @@ int user32_window_model_selftest(void)
     wm_test_destroy_count = 0;
     wm_test_ncdestroy_count = 0;
 
+    /* This focus-repair case needs only `other` eligible after hiding the
+     * parent. Owned popups remain visible when their owner is hidden. */
+    ShowWindow(popup_a, SW_HIDE);
+    ShowWindow(popup_b, SW_HIDE);
     wm_test_setfocus_count = 0;
     wm_test_killfocus_count = 0;
     SetFocus(child_a);
@@ -16745,8 +18745,20 @@ static void input_test_owner_thread(HWND parent, const char *class_name,
     extern void sched_yield(void);
     extern int proc_waitpid(uint32_t pid, int32_t *status);
     POINT saved_cursor = cursor_pos;
+    RECT client;
+    BOOL has_client = GetClientRect(parent, &client) &&
+                      client.right - client.left >= 32 &&
+                      client.bottom - client.top >= 32;
+    input_test_expect(has_client, "input ownership target fits parent client",
+                      checks, failures);
+    if (!has_client) return;
+    /* At (24,24), the injected (28,28) click hits the desktop's 30px panel.
+     * Use the client center so this test exercises an exposed Win32 child,
+     * with the same native-chrome exclusion used by actual HID input. */
+    int child_x = (client.right - client.left - 32) / 2;
+    int child_y = (client.bottom - client.top - 32) / 2;
     HWND child = CreateWindowExA(0, class_name, "input-owner", WS_CHILD | WS_VISIBLE,
-                                  24, 24, 32, 32, parent, NULL, NULL, NULL);
+                                  child_x, child_y, 32, 32, parent, NULL, NULL, NULL);
     input_test_expect(child != NULL, "create native input ownership target", checks, failures);
     if (!child) return;
     SetFocus(parent);
@@ -16759,6 +18771,13 @@ static void input_test_owner_thread(HWND parent, const char *class_name,
     input_owner_test.target = child;
     input_owner_test.x = rect.left + 4;
     input_owner_test.y = rect.top + 4;
+    POINT hit = {input_owner_test.x, input_owner_test.y};
+    input_test_expect(WindowFromPoint(hit) == child,
+                      "input ownership point selects child", checks, failures);
+    input_test_expect(!compositor_pointer_blocked_by_desktop ||
+                      !compositor_pointer_blocked_by_desktop(hit.x, hit.y),
+                      "input ownership point is not covered by desktop",
+                      checks, failures);
     input_owner_test.callbacks = input_owner_test.wrong_thread = 0;
     input_owner_test.reply_task = input_owner_test.paint_task = 0;
     input_owner_test.paints = 0;
@@ -17861,9 +19880,125 @@ int user32_dialog_selftest(void)
     return failures;
 }
 
+static uint32_t u32_case_map(uint32_t code, BOOL upper)
+{
+    const U32_CASE_RANGE *ranges = upper ? u32_upper_ranges : u32_lower_ranges;
+    SIZE_T low = 0;
+    SIZE_T high = upper ? sizeof(u32_upper_ranges) / sizeof(*ranges)
+                       : sizeof(u32_lower_ranges) / sizeof(*ranges);
+    while (low < high) {
+        SIZE_T mid = low + (high - low) / 2;
+        const U32_CASE_RANGE *range = &ranges[mid];
+        if (code < range->first) high = mid;
+        else if (code > range->last) low = mid + 1;
+        else return (code - range->first) % range->step
+                  ? code : (uint32_t)((int32_t)code + range->delta);
+    }
+    return code;
+}
+
+static void u32_case_buffer(PWSTR text, SIZE_T count, BOOL upper)
+{
+    for (SIZE_T i = 0; i < count; i++) {
+        uint32_t code = text[i];
+        if (code >= 0xD800 && code <= 0xDBFF && i + 1 < count &&
+            text[i + 1] >= 0xDC00 && text[i + 1] <= 0xDFFF) {
+            code = 0x10000 + ((code - 0xD800) << 10) + text[i + 1] - 0xDC00;
+            code = u32_case_map(code, upper) - 0x10000;
+            text[i] = (WCHAR)(0xD800 + (code >> 10));
+            text[++i] = (WCHAR)(0xDC00 + (code & 1023));
+        } else {
+            text[i] = (WCHAR)u32_case_map(code, upper);
+        }
+    }
+}
+
+static PWSTR u32_case_string(PWSTR text, BOOL upper)
+{
+    /* Low-word values are character operands, not addresses to dereference. */
+    if ((ULONG_PTR)text <= 0xFFFF)
+        return (PWSTR)(ULONG_PTR)u32_case_map((uint32_t)(ULONG_PTR)text, upper);
+    SIZE_T count = 0;
+    while (text[count]) count++;
+    u32_case_buffer(text, count, upper);
+    return text;
+}
+
+static PWSTR WINAPI CharUpperW_u32(PWSTR text)
+{
+    return u32_case_string(text, TRUE);
+}
+
+static PSTR WINAPI CharUpperA_k32(PSTR text)
+{
+    BOOL character = (ULONG_PTR)text <= 0xFFFF;
+    char operand[2] = {(char)(ULONG_PTR)text, 0};
+    PSTR cursor = character ? operand : text;
+    while (*cursor) {
+        WCHAR wide;
+        if (MultiByteToWideChar(0, 0, cursor, 1, &wide, 1) == 1) {
+            wide = (WCHAR)u32_case_map(wide, TRUE);
+            char encoded;
+            if (WideCharToMultiByte(0, 0, &wide, 1, &encoded, 1,
+                                    NULL, NULL) == 1) *cursor = encoded;
+        }
+        cursor++;
+    }
+    return character ? (PSTR)(ULONG_PTR)(BYTE)operand[0] : text;
+}
+
+static PWSTR WINAPI CharLowerW_u32(PWSTR text)
+{
+    return u32_case_string(text, FALSE);
+}
+
+static PSTR WINAPI CharLowerA_k32(PSTR text)
+{
+    BOOL character = (ULONG_PTR)text <= 0xFFFF;
+    char operand[2] = {(char)(ULONG_PTR)text, 0};
+    PSTR cursor = character ? operand : text;
+    while (*cursor) {
+        WCHAR wide;
+        if (MultiByteToWideChar(0, 0, cursor, 1, &wide, 1) == 1) {
+            wide = (WCHAR)u32_case_map(wide, FALSE);
+            char encoded;
+            if (WideCharToMultiByte(0, 0, &wide, 1, &encoded, 1,
+                                    NULL, NULL) == 1) *cursor = encoded;
+        }
+        cursor++;
+    }
+    return character ? (PSTR)(ULONG_PTR)(BYTE)operand[0] : text;
+}
+
+static DWORD WINAPI CharUpperBuffW_u32(PWSTR text, DWORD count)
+{
+    if (!text) return 0;
+    u32_case_buffer(text, count, TRUE);
+    return count;
+}
+
+static DWORD WINAPI CharLowerBuffW_u32(PWSTR text, DWORD count)
+{
+    if (!text) return 0;
+    u32_case_buffer(text, count, FALSE);
+    return count;
+}
+
 typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT user32_exports[] = {
+    { "SendDlgItemMessageA", (PVOID)SendDlgItemMessageA, 5, CC_STDCALL },
+    { "SendDlgItemMessageW", (PVOID)SendDlgItemMessageW, 5, CC_STDCALL },
+    { "GetDlgItemTextA",    (PVOID)GetDlgItemTextA, 4, CC_STDCALL },
+    { "LoadStringA",        (PVOID)LoadStringA, 4, CC_STDCALL },
+    { "LoadStringW",        (PVOID)LoadStringW, 4, CC_STDCALL },
+    { "CharUpperA",         (PVOID)CharUpperA_k32, 1, CC_STDCALL },
+    { "CharLowerA",         (PVOID)CharLowerA_k32, 1, CC_STDCALL },
+    { "CharPrevA",          (PVOID)CharPrevA_k32, 2, CC_STDCALL },
+    { "CharUpperW",            (PVOID)CharUpperW_u32, 1, CC_STDCALL },
+    { "CharLowerW",            (PVOID)CharLowerW_u32, 1, CC_STDCALL },
+    { "CharUpperBuffW",        (PVOID)CharUpperBuffW_u32, 2, CC_STDCALL },
+    { "CharLowerBuffW",        (PVOID)CharLowerBuffW_u32, 2, CC_STDCALL },
     /* Window class */
     { "RegisterClassExA",   (PVOID)RegisterClassExA, 1, CC_STDCALL },
     { "RegisterClassA",     (PVOID)RegisterClassA, 1, CC_STDCALL },
@@ -17878,6 +20013,7 @@ static const SHIM_EXPORT user32_exports[] = {
     { "SetClassLongW",      (PVOID)SetClassLongW, 3, CC_STDCALL },
     { "SetClassLongPtrA",   (PVOID)SetClassLongPtrA_u32, 3, CC_STDCALL },
     { "SetClassLongPtrW",   (PVOID)SetClassLongPtrW, 3, CC_STDCALL },
+    { "GetClassNameA",      (PVOID)GetClassNameA, 3, CC_STDCALL },
     { "GetClassNameW",      (PVOID)GetClassNameW, 3, CC_STDCALL },
     /* Window creation */
     { "CreateWindowExA",    (PVOID)CreateWindowExA, 12, CC_STDCALL },
@@ -17900,6 +20036,7 @@ static const SHIM_EXPORT user32_exports[] = {
       CC_STDCALL },
     { "GetLayeredWindowAttributes", (PVOID)GetLayeredWindowAttributes, 4,
       CC_STDCALL },
+    { "UpdateLayeredWindow", (PVOID)UpdateLayeredWindow, 9, CC_STDCALL },
     /* Message loop */
     { "PeekMessageA",       (PVOID)PeekMessageA, 5, CC_STDCALL },
     { "GetMessageA",        (PVOID)GetMessageA, 4, CC_STDCALL },
@@ -18012,6 +20149,8 @@ static const SHIM_EXPORT user32_exports[] = {
     { "GetThreadDesktop",   (PVOID)GetThreadDesktop_stub, 1, CC_STDCALL },
     { "SetProcessWindowStation", (PVOID)SetProcessWindowStation_stub, 1, CC_STDCALL },
     { "CreateDesktopW",     (PVOID)CreateDesktopW_stub, 6, CC_STDCALL },
+    { "SwitchDesktop",      (PVOID)SwitchDesktop_u32, 1, CC_STDCALL },
+    { "ExitWindowsEx",      (PVOID)ExitWindowsEx_u32, 2, CC_STDCALL },
     { "GetUserObjectInformationA", (PVOID)GetUserObjectInformationA_stub, 5, CC_STDCALL },
     { "GetUserObjectInformationW", (PVOID)GetUserObjectInformationW_stub, 5, CC_STDCALL },
     { "GetActiveWindow",    (PVOID)GetActiveWindow, 0, CC_STDCALL },
@@ -18031,9 +20170,13 @@ static const SHIM_EXPORT user32_exports[] = {
     { "GetCapture",         (PVOID)GetCapture, 0, CC_STDCALL },
     { "ReleaseCapture",     (PVOID)ReleaseCapture, 0, CC_STDCALL },
     { "SendInput",          (PVOID)SendInput, 3, CC_STDCALL },
+    { "keybd_event",        (PVOID)keybd_event_k32, 4, CC_STDCALL },
+    { "VkKeyScanExA",       (PVOID)VkKeyScanExA_k32, 2, CC_STDCALL },
     { "GetAsyncKeyState",   (PVOID)GetAsyncKeyState, 1, CC_STDCALL },
     { "GetKeyboardLayout",  (PVOID)GetKeyboardLayout_k32, 1, CC_STDCALL },
+    { "GetKeyboardType",    (PVOID)GetKeyboardType_k32, 1, CC_STDCALL },
     { "GetKeyboardLayoutList", (PVOID)GetKeyboardLayoutList_k32, 2, CC_STDCALL },
+    { "ImmIsIME",            (PVOID)ImmIsIME_k32, 1, CC_STDCALL },
     { "ImmGetIMEFileNameW", (PVOID)ImmGetIMEFileNameW_k32, 3, CC_STDCALL },
     { "ImmGetIMEFileNameA", (PVOID)ImmGetIMEFileNameA_k32, 3, CC_STDCALL },
     { "ImmCreateContext",   (PVOID)ImmCreateContext_k32, 0, CC_STDCALL },
@@ -18067,6 +20210,12 @@ static const SHIM_EXPORT user32_exports[] = {
     { "GetGuiResources",    (PVOID)GetGuiResources_k32, 2, CC_STDCALL },
     { "GetKeyState",        (PVOID)GetKeyState, 1, CC_STDCALL },
     { "GetKeyboardState",   (PVOID)GetKeyboardState, 1, CC_STDCALL },
+    { "GetRawInputDeviceList", (PVOID)GetRawInputDeviceList, 3, CC_STDCALL },
+    { "GetRawInputDeviceInfoA", (PVOID)GetRawInputDeviceInfoA, 4, CC_STDCALL },
+    { "GetRawInputDeviceInfoW", (PVOID)GetRawInputDeviceInfoW, 4, CC_STDCALL },
+    { "RegisterRawInputDevices", (PVOID)RegisterRawInputDevices, 3, CC_STDCALL },
+    { "GetRegisteredRawInputDevices", (PVOID)GetRegisteredRawInputDevices, 3, CC_STDCALL },
+    { "GetRawInputData", (PVOID)GetRawInputData, 5, CC_STDCALL },
     { "SetKeyboardState",   (PVOID)SetKeyboardState, 1, CC_STDCALL },
     { "GetMessageExtraInfo",(PVOID)GetMessageExtraInfo, 0, CC_STDCALL },
     { "SetMessageExtraInfo",(PVOID)SetMessageExtraInfo, 1, CC_STDCALL },
@@ -18080,6 +20229,7 @@ static const SHIM_EXPORT user32_exports[] = {
     { "ToUnicode",          (PVOID)ToUnicode, 6, CC_STDCALL },
     { "ToUnicodeEx",        (PVOID)ToUnicodeEx, 7, CC_STDCALL },
     /* Misc */
+    { "MessageBeep",        (PVOID)MessageBeep, 1, CC_STDCALL },
     { "MessageBoxA",        (PVOID)MessageBoxA, 4, CC_STDCALL },
     { "MessageBoxW",        (PVOID)MessageBoxW, 4, CC_STDCALL },
     { "MessageBoxIndirectW",(PVOID)MessageBoxIndirectW_k32, 1, CC_STDCALL },
@@ -18089,15 +20239,19 @@ static const SHIM_EXPORT user32_exports[] = {
     { "LoadIconA",          (PVOID)LoadIconA, 2, CC_STDCALL },
     { "LoadIconW",          (PVOID)LoadIconW, 2, CC_STDCALL },
     { "CreateIconIndirect", (PVOID)CreateIconIndirect, 1, CC_STDCALL },
+    { "CreateIconFromResource", (PVOID)CreateIconFromResource, 4, CC_STDCALL },
+    { "CreateIconFromResourceEx", (PVOID)CreateIconFromResourceEx, 7, CC_STDCALL },
     { "CopyIcon",           (PVOID)CopyIcon, 1, CC_STDCALL },
     { "GetIconInfo",        (PVOID)GetIconInfo, 2, CC_STDCALL },
     { "DrawIconEx",         (PVOID)DrawIconEx, 9, CC_STDCALL },
     { "DestroyIcon",        (PVOID)DestroyIcon,     1, CC_STDCALL },
     { "GetDC",              (PVOID)GetDC, 1, CC_STDCALL },
+    { "GetDCEx",            (PVOID)GetDCEx, 3, CC_STDCALL },
     { "GetWindowDC",        (PVOID)GetWindowDC, 1, CC_STDCALL },
     { "WindowFromDC",       (PVOID)WindowFromDC, 1, CC_STDCALL },
     { "ReleaseDC",          (PVOID)ReleaseDC, 2, CC_STDCALL },
     { "InvalidateRect",     (PVOID)InvalidateRect, 3, CC_STDCALL },
+    { "InvalidateRgn",      (PVOID)InvalidateRgn, 3, CC_STDCALL },
     { "RedrawWindow",       (PVOID)RedrawWindow, 4, CC_STDCALL },
     { "SetForegroundWindow",(PVOID)SetForegroundWindow, 1, CC_STDCALL },
     { "AllowSetForegroundWindow", (PVOID)AllowSetForegroundWindow, 1, CC_STDCALL },
@@ -18113,6 +20267,8 @@ static const SHIM_EXPORT user32_exports[] = {
     { "GetDlgItemInt",      (PVOID)GetDlgItemInt, 4, CC_STDCALL },
     { "SetDlgItemInt",      (PVOID)SetDlgItemInt, 4, CC_STDCALL },
     { "SetDlgItemTextA",    (PVOID)SetDlgItemTextA, 3, CC_STDCALL },
+    { "SetDlgItemTextW",    (PVOID)SetDlgItemTextW, 3, CC_STDCALL },
+    { "IsDlgButtonChecked", (PVOID)IsDlgButtonChecked, 2, CC_STDCALL },
     { "GetDlgCtrlID",       (PVOID)GetDlgCtrlID, 1, CC_STDCALL },
     /* Window search */
     { "FindWindowExA",      (PVOID)FindWindowExA, 4, CC_STDCALL },
@@ -18139,6 +20295,8 @@ static const SHIM_EXPORT user32_exports[] = {
     { "EnumThreadWindows",  (PVOID)EnumThreadWindows, 3, CC_STDCALL },
     /* Clipboard */
     { "OpenClipboard",      (PVOID)OpenClipboard, 1, CC_STDCALL },
+    { "GetClipboardOwner",  (PVOID)GetClipboardOwner, 0, CC_STDCALL },
+    { "OpenIcon",           (PVOID)OpenIcon, 1, CC_STDCALL },
     { "CloseClipboard",     (PVOID)CloseClipboard, 0, CC_STDCALL },
     { "EmptyClipboard",     (PVOID)EmptyClipboard, 0, CC_STDCALL },
     { "SetClipboardData",   (PVOID)SetClipboardData, 2, CC_STDCALL },
@@ -18176,6 +20334,7 @@ static const SHIM_EXPORT user32_exports[] = {
     { "ClientToScreen",     (PVOID)ClientToScreen, 2, CC_STDCALL },
     { "ScreenToClient",     (PVOID)ScreenToClient, 2, CC_STDCALL },
     { "GetUpdateRect",      (PVOID)GetUpdateRect, 3, CC_STDCALL },
+    { "GetUpdateRgn",       (PVOID)GetUpdateRgn, 3, CC_STDCALL },
     { "FillRect",           (PVOID)FillRect, 3, CC_STDCALL },
     { "DrawFocusRect",      (PVOID)DrawFocusRect, 2, CC_STDCALL },
     { "DrawTextA",          (PVOID)DrawTextA, 5, CC_STDCALL },
@@ -18193,6 +20352,7 @@ static const SHIM_EXPORT user32_exports[] = {
       5, CC_STDCALL },
     /* Menu */
     { "CreateMenu",         (PVOID)CreateMenu, 0, CC_STDCALL },
+    { "UserHandleGrantAccess", (PVOID)UserHandleGrantAccess, 3, CC_STDCALL },
     { "CreatePopupMenu",    (PVOID)CreatePopupMenu, 0, CC_STDCALL },
     { "DestroyMenu",        (PVOID)DestroyMenu, 1, CC_STDCALL },
     { "IsMenu",             (PVOID)IsMenu, 1, CC_STDCALL },
@@ -18245,6 +20405,7 @@ static const SHIM_EXPORT user32_exports[] = {
     { "SystemParametersInfoW",  (PVOID)SystemParametersInfoW, 4, CC_STDCALL },
     { "UnregisterHotKey",       (PVOID)UnregisterHotKey, 2, CC_STDCALL },
     { "ValidateRect",           (PVOID)ValidateRect, 2, CC_STDCALL },
+    { "ValidateRgn",            (PVOID)ValidateRgn, 2, CC_STDCALL },
     { "SetWinEventHook",        (PVOID)SetWinEventHook_k32, 7, CC_STDCALL },
     { "UnhookWinEvent",         (PVOID)UnhookWinEvent_k32, 1, CC_STDCALL },
     { "NotifyWinEvent",         (PVOID)NotifyWinEvent_k32, 4, CC_STDCALL },
@@ -18280,7 +20441,10 @@ PVOID user32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 
 PVOID user32_shim_init(void)
 {
+    win32_abi_register_compat32_bridge((PVOID)WindowFromPoint,
+                                     (PVOID)WindowFromPoint_compat32);
     icon_release_all();
+    imm_release_owner(0, 0);
     user_icon_lock = SPINLOCK_INIT;
     wndclass_count = 0;
     window_count = 0;
@@ -18294,6 +20458,8 @@ PVOID user32_shim_init(void)
     thread_dpi_context = NULL;
     user_object_reset();
     for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i].used)
+            nt_job_user_destroy(NT_JOB_USER_WINDOW, (ULONG_PTR)windows[i].handle);
         windows[i].used = 0;
         dialog_states[i].used = FALSE;
     }
@@ -18317,10 +20483,13 @@ PVOID user32_shim_init(void)
         user_timers[i].pending = FALSE;
     }
     user_hook_lock = SPINLOCK_INIT;
-    next_user_hook_handle = 0xD6000001;
+    next_user_hook_handle = 0xD7000001;
     next_user_hook_sequence = 1;
-    for (int i = 0; i < USER_HOOK_SLOTS; i++)
+    for (int i = 0; i < USER_HOOK_SLOTS; i++) {
+        if (user_hooks[i].used)
+            nt_job_user_destroy(NT_JOB_USER_HOOK, (ULONG_PTR)user_hooks[i].handle);
         user_hooks[i].used = FALSE;
+    }
     for (int i = 0; i < USER_HOOK_CONTEXT_SLOTS; i++) {
         user_hook_contexts[i].used = FALSE;
         user_hook_contexts[i].depth = 0;

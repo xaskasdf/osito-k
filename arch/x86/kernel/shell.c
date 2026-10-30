@@ -9,9 +9,26 @@
 
 #include "../include/types.h"
 #include "../include/boot_info.h"
+#include "../include/input_events.h"
 #include "../include/sys/display_syscalls.h"
+#include "../drivers/ps2.h"
 #include "../fs/vfs.h"
 #include "rag.h"
+#include "oftp_rx.h"
+#include "shell_redirect.h"
+#ifndef __EMSCRIPTEN__
+#include "shell_remote.h"
+#include "sshd.h"
+#include "driver_manager.h"
+#include "kexec.h"
+#include "kernel_update.h"
+#include "../drivers/iwx.h"
+#include "../drivers/iwx_scan.h"
+#include "../drivers/intel_gfx_driver.h"
+#include "wpa2_crypto.h"
+#include "wpa2_selftest.h"
+#include "wpa2_rsn.h"
+#endif
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -31,6 +48,10 @@ extern bool console_screen_log_is_enabled(void);
 extern int  term_readline(const char *prompt, char *buf, uint32_t buf_size);
 extern int  term_readline_alloc(const char *prompt, char **buf_out,
                                 uint64_t *len_out);
+#ifndef __EMSCRIPTEN__
+extern int term_readline_alloc_poll(const char *, char **, uint64_t *,
+                                   bool (*poll)(bool empty));
+#endif
 extern void term_init(void);
 
 /* Keyboard */
@@ -48,16 +69,21 @@ extern int  proc_exec(const char *filename, int argc, const char **argv);
 extern uint64_t idt_get_ticks(void);
 extern void boot_diag_mark(const char *reason) __attribute__((weak));
 extern void boot_diag_flush(const char *reason) __attribute__((weak));
+extern bool boot_diag_checkpoint(const char *reason) __attribute__((weak));
 
 static void shell_reset_win32_state(void)
 {
     extern int *proc_win32_compat32_mode_slot(void);
-    extern void *user32_shim_init(void);
-    extern void *ddraw_shim_init(void);
+    extern void user32_release_process(uint32_t process_id);
+    extern void ddraw_release_process(uint32_t process_id);
 
     *proc_win32_compat32_mode_slot() = 0;
-    user32_shim_init();
-    ddraw_shim_init();
+    /* The shell hosts the primary Win32 process (PID 1). Its launcher or
+     * installer children can outlive it, so recovery must not reinitialize
+     * their windows, queues or DirectDraw surfaces. Normal exit already
+     * releases this owner; these releases also cover non-local recovery. */
+    user32_release_process(1);
+    ddraw_release_process(1);
 }
 
 /* OsitoFS */
@@ -70,6 +96,9 @@ extern uint32_t osfs2_free_blocks(void);
 extern uint32_t osfs2_get_block_size(void);
 extern void acpi_shutdown(void);
 extern void acpi_reboot(void);
+#ifndef __EMSCRIPTEN__
+extern int acpi_reboot_check(void);
+#endif
 
 /* Heap */
 extern void *kmalloc(uint64_t size);
@@ -512,6 +541,280 @@ void (*sh_redir_fn)(const char *s, size_t len);
 /* Pipe / `<` stdin handoff. Non-static so wasm cmd_cc can read it. */
 const char *sh_stdin_buf;
 uint32_t    sh_stdin_len;
+static int shell_console_owner = -1;
+
+/* Keep the exported WASM globals; x86 remote commands have their own I/O. */
+char *redir_buf;
+uint32_t redir_pos, redir_max;
+static bool redir_overflow;
+#ifndef __EMSCRIPTEN__
+static struct {
+    void (*redirect)(const char *, size_t);
+    const char *input;
+    uint32_t input_len;
+    char *capture;
+    uint32_t pos, max;
+    bool overflow;
+    int status;
+    shell_remote_output_fn output;
+    void *arg;
+} remote_io;
+static int remote_owner = -1;
+static int command_owner = -1;
+static unsigned command_depth;
+extern int sched_current_get(void);
+
+enum console_job_phase { CONSOLE_NONE, CONSOLE_QUEUED, CONSOLE_RUNNING,
+                         CONSOLE_RETURNED, CONSOLE_CANCELLED };
+static struct {
+    unsigned lock;
+    bool ready;
+    enum console_job_phase phase;
+    uint64_t id;
+    char *line;
+    int owner_pid;
+    bool win32;
+    bool stop_requested;
+} console_job;
+
+static void shell_console_lock(void)
+{
+    while (__atomic_exchange_n(&console_job.lock, 1, __ATOMIC_ACQUIRE))
+        sched_yield();
+}
+
+static void shell_console_unlock(void)
+{
+    __atomic_store_n(&console_job.lock, 0, __ATOMIC_RELEASE);
+}
+
+/* Called only by the main prompt, never by password or heredoc readers.
+ * Observed local input cancels a request racing the idle -> editing edge. */
+static bool shell_console_poll(bool empty)
+{
+    char *cancelled = NULL;
+    bool claimed = false;
+    shell_console_lock();
+    if (console_job.phase == CONSOLE_QUEUED) {
+        if (empty) {
+            console_job.phase = CONSOLE_RUNNING;
+            claimed = true;
+        } else {
+            cancelled = console_job.line;
+            console_job.line = NULL;
+            console_job.phase = CONSOLE_CANCELLED;
+        }
+    }
+    console_job.ready = empty && console_job.phase != CONSOLE_RUNNING;
+    shell_console_unlock();
+    if (cancelled) kfree(cancelled);
+    return claimed;
+}
+
+/* Transfers ownership of an already validated, copied command to the shell. */
+static bool shell_console_submit(char *line, uint64_t *id, bool win32)
+{
+    if (!line || !id) return false;
+    shell_console_lock();
+    bool ready = console_job.ready;
+    if (ready) {
+        console_job.ready = false;
+        console_job.line = line;
+        console_job.phase = CONSOLE_QUEUED;
+        console_job.owner_pid = 0;
+        console_job.win32 = win32;
+        console_job.stop_requested = false;
+        *id = ++console_job.id;
+    }
+    shell_console_unlock();
+    return ready;
+}
+
+static char *shell_console_take(void)
+{
+    shell_console_lock();
+    char *line = NULL;
+    if (console_job.phase == CONSOLE_RUNNING) {
+        extern int32_t proc_current_pid(void);
+        line = console_job.line;
+        console_job.line = NULL;
+        console_job.owner_pid = proc_current_pid();
+    }
+    shell_console_unlock();
+    return line;
+}
+
+static void shell_console_returned(void)
+{
+    shell_console_lock();
+    console_job.phase = CONSOLE_RETURNED;
+    shell_console_unlock();
+}
+
+bool shell_remote_active(void)
+{
+    int owner = __atomic_load_n(&remote_owner, __ATOMIC_ACQUIRE);
+    return owner >= 0 && owner == sched_current_get();
+}
+
+#define sh_redir_fn (* (shell_remote_active() ? &remote_io.redirect : &sh_redir_fn))
+#define sh_stdin_buf (* (shell_remote_active() ? &remote_io.input : &sh_stdin_buf))
+#define sh_stdin_len (* (shell_remote_active() ? &remote_io.input_len : &sh_stdin_len))
+#define redir_buf (* (shell_remote_active() ? &remote_io.capture : &redir_buf))
+#define redir_pos (* (shell_remote_active() ? &remote_io.pos : &redir_pos))
+#define redir_max (* (shell_remote_active() ? &remote_io.max : &redir_max))
+#define redir_overflow (* (shell_remote_active() ? &remote_io.overflow : &redir_overflow))
+
+bool shell_remote_capture(const char *data, size_t length)
+{
+    if (!shell_remote_active()) return false;
+    if (sh_redir_fn) sh_redir_fn(data, length);
+    else remote_io.output(remote_io.arg, data, length);
+    return true;
+}
+
+static bool shell_command_try_lock(void)
+{
+    int owner = sched_current_get();
+    if (__atomic_load_n(&command_owner, __ATOMIC_ACQUIRE) == owner) {
+        command_depth++;
+        return true;
+    }
+    int expected = -1;
+    if (!__atomic_compare_exchange_n(&command_owner, &expected, owner, false,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return false;
+    command_depth = 1;
+    return true;
+}
+static void shell_command_lock(void)
+{
+    if (shell_remote_active()) return;
+    while (!shell_command_try_lock()) sched_yield();
+}
+static void shell_command_release(void)
+{
+    if (!--command_depth) __atomic_store_n(&command_owner, -1, __ATOMIC_RELEASE);
+}
+static void shell_command_unlock(void)
+{
+    if (shell_remote_active()) return;
+    shell_command_release();
+}
+
+int shell_remote_execute(char *line, shell_remote_output_fn output, void *arg)
+{
+    extern void shell_exec_pipeline(char *);
+    if (!line || !output) return 126;
+    /* A session owns its I/O, never the local prompt's command lifetime.
+     * Only individual commands requiring shared shell state claim the gate. */
+    int expected = -1;
+    if (!__atomic_compare_exchange_n(&remote_owner, &expected,
+            -2, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        return 126;
+    }
+    memset(&remote_io, 0, sizeof(remote_io));
+    remote_io.output = output;
+    remote_io.arg = arg;
+    __atomic_store_n(&remote_owner, sched_current_get(), __ATOMIC_RELEASE);
+    shell_exec_pipeline(line);
+    int result = remote_io.status;
+    __atomic_store_n(&remote_owner, -1, __ATOMIC_RELEASE);
+    memset(&remote_io, 0, sizeof(remote_io));
+    return result;
+}
+
+static bool shell_remote_independent_command(int argc, char **argv)
+{
+    static const char *const queries[] = {
+        "help", "?", "uname", "ps", "cpus", "mem", "uptime", "dmesg",
+        "ifconfig", "route", "netstat", "thermal", "cpuidle", "lockup"
+    };
+    if (argc < 1 || !argv || !argv[0]) return false;
+    if (argc == 1) {
+        for (unsigned i = 0; i < sizeof(queries) / sizeof(queries[0]); i++)
+            if (!strcmp(argv[0], queries[i])) return true;
+    }
+    if (!strcmp(argv[0], "wlan"))
+        return argc == 2 && (!strcmp(argv[1], "status") ||
+                            !strcmp(argv[1], "networks") ||
+                            !strcmp(argv[1], "link"));
+    if (!strcmp(argv[0], "sshd") || !strcmp(argv[0], "drivers"))
+        return argc == 2 && !strcmp(argv[1], "status");
+    if (!strcmp(argv[0], "console"))
+        return true; /* The mailbox validates availability and request IDs. */
+    if (!strcmp(argv[0], "thermal"))
+        return argc == 2 && !strcmp(argv[1], "sample");
+    if (!strcmp(argv[0], "cpuidle"))
+        return argc == 2 && !strcmp(argv[1], "status");
+    if (!strcmp(argv[0], "lockup"))
+        return argc == 2 && !strcmp(argv[1], "status");
+    if (!strcmp(argv[0], "kprof"))
+        return argc == 1 || (argc == 2 && (!strcmp(argv[1], "start") ||
+            !strcmp(argv[1], "stop") || !strcmp(argv[1], "raw")));
+    if (!strcmp(argv[0], "sched"))
+        return (argc == 2 && (!strcmp(argv[1], "stats") ||
+                             !strcmp(argv[1], "snapshot"))) ||
+               (argc == 3 && !strcmp(argv[1], "stack"));
+    if (!strcmp(argv[0], "hwbp"))
+        return argc == 1 || (argc == 2 && !strcmp(argv[1], "status")) ||
+               (argc == 3 && !strcmp(argv[1], "clear")) ||
+               ((argc == 8 || argc == 9) && !strcmp(argv[1], "trace"));
+    if (!strcmp(argv[0], "perf"))
+        return argc == 1 || (argc == 2 && !strcmp(argv[1], "snapshot"));
+    if (!strcmp(argv[0], "serial-stats") || !strcmp(argv[0], "usb-perf"))
+        return argc == 1;
+    /* File commands use session-local buffers and the same serialized FS
+     * operations as the binary transfer service, not local-shell globals. */
+    return !strcmp(argv[0], "cat") || !strcmp(argv[0], "head") ||
+           !strcmp(argv[0], "tail") || !strcmp(argv[0], "grep") ||
+           !strcmp(argv[0], "echo") || !strcmp(argv[0], "ls") ||
+           !strcmp(argv[0], "hexdump") ||
+           !strcmp(argv[0], "touch") || !strcmp(argv[0], "cp") ||
+           !strcmp(argv[0], "mv") || !strcmp(argv[0], "rm") ||
+           !strcmp(argv[0], "sync") ||
+           (!strcmp(argv[0], "storage") && argc <= 2);
+}
+
+/* Console-only programs still own the hardware keyboard/graphics. They must
+ * not be launched pretending that they are attached to the SSH channel. */
+static bool shell_remote_supported(int argc, char **argv)
+{
+    static const char *const commands[] = {
+        "help", "?", "uname", "ps", "cpus", "mem", "uptime", "echo", "thermal", "cpuidle", "lockup",
+        "ls", "cat", "head", "tail", "grep", "stat", "hexdump", "dmesg",
+        "storage", "pci", "usb", "net", "netstat", "ifconfig", "route", "ping", "resolve",
+        "tcptest", "tlstest", "curl", "kdownload", "kupload", "kupdate",
+        "kexec", "ipconf", "netconf", "dhcp", "apipa", "ntpsync", "txdelay",
+        "touch", "cp", "mv", "rm", "sync", "reboot", "sshd", "wlan", "drivers", "console"
+    };
+    /* Loader policy and caches share process state. Keep these diagnostics
+     * behind the command gate, including the query, rather than admitting
+     * them as independent commands while a foreground application runs. */
+    if (!strcmp(argv[0], "win32-loader"))
+        return argc == 1 ||
+               (argc == 2 && (!strcmp(argv[1], "clear") ||
+                              !strcmp(argv[1], "flush"))) ||
+               (argc == 3 && !strcmp(argv[1], "strict") &&
+                    (!strcmp(argv[2], "on") || !strcmp(argv[2], "off")));
+    if (!strcmp(argv[0], "kprof") || !strcmp(argv[0], "sched") ||
+        !strcmp(argv[0], "hwbp") ||
+        !strcmp(argv[0], "perf") || !strcmp(argv[0], "serial-stats") ||
+        !strcmp(argv[0], "usb-perf"))
+        return shell_remote_independent_command(argc, argv);
+    if (!strcmp(argv[0], "wlan")) {
+        if (argc == 1) return true;
+        return !strcmp(argv[1], "status") || !strcmp(argv[1], "networks") ||
+               !strcmp(argv[1], "link") || !strcmp(argv[1], "selftest") || !strcmp(argv[1], "saved");
+    }
+    for (unsigned i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
+        if (!strcmp(argv[0], commands[i])) return true;
+    return false;
+}
+#else
+static void shell_command_lock(void) { }
+static void shell_command_unlock(void) { }
+#endif
 
 void sh_puts(const char *s)
 {
@@ -588,11 +891,17 @@ static int parse_args(char *line, char *argv[])
 
 static void cmd_help(void)
 {
+    sh_puts("  ps2       PS/2 controller, touchpad and packet diagnostics\n");
+    sh_puts("  storage   Saved boot storage log, six lines/page: storage [page]\n");
+    sh_puts("  usb-perf  Cumulative USB command and interrupt-masked wait timings\n");
     sh_puts_color("OsitoK Shell Commands:\n", 0x00FF8800);
     sh_puts("  help      Show this message\n");
     sh_puts("  uname     System information\n");
     sh_puts("  ps        List processes\n");
     sh_puts("  cpus      Show CPU cores (SMP)\n");
+    sh_puts("  thermal   CPU temperature/status; thermal sample for power/idle\n");
+    sh_puts("  lockup    Opt-in AP/NMI stall diagnostics (status, arm, sample, off)\n");
+    sh_puts("  cpuidle   CPU idle status; hlt, mwait, selftest\n");
     sh_puts("  mem       Memory usage\n");
     sh_puts("  uptime    Show uptime\n");
     sh_puts("  echo      Print arguments\n");
@@ -604,6 +913,7 @@ static void cmd_help(void)
     sh_puts("  |         Pipe stdout of one cmd into next (e.g. dmesg | grep PCI)\n");
     sh_puts("  kexec     Boot a new kernel ELF (kexec [filename])\n");
     sh_puts("  kdownload Fetch a file via OFTP (kdownload <ip> <port> <name> [save|--kexec])\n");
+    sh_puts("  wlan      AX200 status, start/stop, scan, connect assistant\n");
     sh_puts("  kupload   Push a file via OFTP (kupload <ip> <port> <local|--dmesg> [remote])\n");
     sh_puts("  netconf   Set IP/gw/dns manually (escape hatch when DHCP fails)\n");
     sh_puts("            netconf <ip> <gw> <dns>\n");
@@ -611,8 +921,9 @@ static void cmd_help(void)
     sh_puts("  txdelay   Pace reply-path TX by N µs after last RX (debug)\n");
     sh_puts("            txdelay [N]  — get/set, see net.c hypothesis-A comment\n");
     sh_puts("  diagclean Remove boot logs and crash dumps from OsitoFS\n");
-    sh_puts("  kupdate   Pull + kexec a kernel update via HTTPS\n");
+    sh_puts("  kupdate   Update USB boot kernel + kexec (HTTPS or --file)\n");
     sh_puts("            (kupdate [host] [path] [--channel <ch>] [--no-kexec])\n");
+    sh_puts("            (kupdate --file <path> [--no-kexec]; --status is read-only)\n");
     sh_puts("            default: https://wasm.naranjositos.tech/k/x86_64/stable/kernel.elf\n");
     sh_puts("  exec      Run an ELF binary\n");
     sh_puts("  execg     Run an ELF with stdout/stderr kept off the framebuffer\n");
@@ -631,6 +942,9 @@ static void cmd_help(void)
     sh_puts("  git       Version control (init/add/commit/log/status/diff/branch/checkout)\n");
     sh_puts("  sched     Scheduler test (sched [stats])\n");
     sh_puts("  httpd     HTTP server (httpd [port] / httpd stop)\n");
+#ifndef __EMSCRIPTEN__
+    sh_puts("  sshd      SSH maintenance console (keygen/key/start [port]/status/stop)\n");
+#endif
     sh_puts("  dhcp      Retry DHCP discovery (manual)\n");
     sh_puts("  apipa     Auto-assign link-local 169.254.X.Y (RFC 3927)\n");
     sh_puts("  ipconf    Set static IP (ipconf <ip> [gw] [mask] [dns])\n");
@@ -663,13 +977,17 @@ static void cmd_help(void)
     sh_puts("  win32-iocp-test  Validate IOCP lifecycle and the PE32 thunk path\n");
     sh_puts("  win32-wait-test  Validate registered-wait cancellation and completion\n");
     sh_puts("  msi       Install MSI/MSIX package (msi install file.msi | msix file.msix)\n");
-    sh_puts("  dosrun    Run DOS code (dosrun [--emulate [--max-steps N]] file.com|file.exe)\n");
+    sh_puts("  dosrun    Run DOS code (dosrun [--trace[=N]] [--emulate [--max-steps N]] file.com|file.exe)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  desktop   Launch graphical desktop (desktop [hz])\n");
     sh_puts("  modes     List display modes\n");
     sh_puts("  mode      Show/set mode (mode native [hz] | mode <w> <h> [hz] | mode refresh <hz>)\n");
     sh_puts("  kexec     Load + boot kernel from disk (kexec [file])\n");
+#ifndef __EMSCRIPTEN__
+    sh_puts("  reboot    Reboot system (--check validates without reset)\n");
+#else
     sh_puts("  reboot    Reboot system\n");
+#endif
     sh_puts("  halt      Halt CPU\n");
     sh_puts_color("I/O Redirection:\n", 0x00FF8800);
     sh_puts("  cmd > file    Write output to file\n");
@@ -1147,12 +1465,6 @@ static void cmd_cat(int argc, char *argv[])
         return;
     }
 
-    /* Get file info */
-    typedef struct {
-        char     name[64];
-        uint64_t size;
-    } osfs2_file_min_t;
-
     void *file = osfs2_find(argv[1]);
     if (!file) {
         sh_puts("File not found: ");
@@ -1161,8 +1473,7 @@ static void cmd_cat(int argc, char *argv[])
         return;
     }
 
-    osfs2_file_min_t *finfo = (osfs2_file_min_t *)file;
-    uint64_t file_size = finfo->size;
+    uint64_t file_size = osfs2_file_size(file);
 
     /* Limit display to 4KB */
     if (file_size > 4096) {
@@ -1285,66 +1596,50 @@ static void cmd_screenlog(int argc, char *argv[])
 
 #define OFTP_BUF_MAX  (16u * 1024u * 1024u)   /* up to 16 MB kernels       */
 #define OFTP_LOCAL_PORT  7780
-#define OFTP_TIMEOUT_TICKS  5000               /* 5 s no-progress timeout  */
+#define OFTP_TIMEOUT_TICKS  5000               /* 50 s at 100 Hz */
 
 static struct {
     bool       active;
-    bool       error;
-    bool       done;
-    uint8_t   *buf;
-    uint32_t   buf_size;
-    uint32_t   total_size;       /* set by first valid chunk           */
-    uint32_t   high_watermark;   /* highest offset+chunk_len observed  */
-    uint64_t   last_chunk_tick;
+    uint8_t    peer_ip[4];
+    uint16_t   peer_port;
+    oftp_rx_t  rx;
+    uint64_t   last_progress_tick;
 } oftp_state;
+static volatile int oftp_lock;
+
+static uint64_t oftp_lock_irqsave(void)
+{
+    uint64_t flags = 0;
+#ifndef __EMSCRIPTEN__
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+    while (__sync_lock_test_and_set(&oftp_lock, 1)) {
+#ifndef __EMSCRIPTEN__
+        __asm__ volatile ("pause");
+#endif
+    }
+    return flags;
+}
+
+static void oftp_unlock_irqrestore(uint64_t flags)
+{
+    __sync_lock_release(&oftp_lock);
+#ifndef __EMSCRIPTEN__
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+#else
+    (void)flags;
+#endif
+}
 
 static void oftp_handler(const uint8_t *src_ip, uint16_t src_port,
                           const void *data, uint32_t len)
 {
-    (void)src_ip; (void)src_port;
-    if (!oftp_state.active || len < 4) return;
-
-    const uint8_t *p = (const uint8_t *)data;
-    if (p[0] == 'O' && p[1] == 'F' && p[2] == 'T' && p[3] == 'E') {
-        oftp_state.error = true;
-        oftp_state.done  = true;
-        return;
-    }
-    if (!(p[0] == 'O' && p[1] == 'F' && p[2] == 'T' && p[3] == 'D')) return;
-    if (len < 16) return;
-
-    uint32_t total  = ((uint32_t)p[4]  << 24) | ((uint32_t)p[5]  << 16) |
-                      ((uint32_t)p[6]  <<  8) |  (uint32_t)p[7];
-    uint32_t offset = ((uint32_t)p[8]  << 24) | ((uint32_t)p[9]  << 16) |
-                      ((uint32_t)p[10] <<  8) |  (uint32_t)p[11];
-    uint32_t cklen  = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
-                      ((uint32_t)p[14] <<  8) |  (uint32_t)p[15];
-
-    if (total == 0 || total > oftp_state.buf_size) {
-        oftp_state.error = true;
-        oftp_state.done  = true;
-        return;
-    }
-    oftp_state.total_size = total;
-    oftp_state.last_chunk_tick = idt_get_ticks();
-
-    /* EOF marker */
-    if (cklen == 0 && offset == total) {
-        oftp_state.done = true;
-        return;
-    }
-    if (offset > total || offset + cklen > total) return;
-    if (16u + cklen > len) return;  /* truncated packet */
-
-    /* Lazily grow high_watermark for done-detection */
-    uint32_t end = offset + cklen;
-    if (end > oftp_state.high_watermark) oftp_state.high_watermark = end;
-
-    uint8_t *dst = oftp_state.buf + offset;
-    const uint8_t *s = p + 16;
-    for (uint32_t i = 0; i < cklen; i++) dst[i] = s[i];
-
-    if (oftp_state.high_watermark >= total) oftp_state.done = true;
+    uint64_t flags = oftp_lock_irqsave();
+    if (oftp_state.active && src_port == oftp_state.peer_port &&
+        memcmp(src_ip, oftp_state.peer_ip, 4) == 0 &&
+        oftp_rx_packet(&oftp_state.rx, data, len))
+        oftp_state.last_progress_tick = idt_get_ticks();
+    oftp_unlock_irqrestore(flags);
 }
 
 static int parse_ip(const char *s, uint8_t ip[4]);  /* forward */
@@ -1367,38 +1662,54 @@ static void cmd_kdownload(int argc, char *argv[])
         sh_puts("kdownload: bad IP\n");
         return;
     }
-    /* Parse port */
-    uint16_t server_port = 0;
-    for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++)
-        server_port = server_port * 10 + (uint16_t)(*p - '0');
-    if (server_port == 0) {
+    uint32_t port = 0;
+    for (const char *p = argv[2]; *p; p++) {
+        if (*p < '0' || *p > '9' || port > 6553 ||
+            (port == 6553 && *p > '5')) {
+            sh_puts("kdownload: bad port\n");
+            return;
+        }
+        port = port * 10 + (uint32_t)(*p - '0');
+    }
+    if (!port) {
         sh_puts("kdownload: bad port\n");
         return;
     }
+    uint16_t server_port = (uint16_t)port;
 
     const char *filename = argv[3];
     const char *save_as  = (argc >= 5) ? argv[4] : NULL;
-    bool do_kexec = save_as && save_as[0] == '-' && save_as[1] == '-' &&
-                    save_as[2] == 'k';   /* "--kexec" */
+    bool do_kexec = save_as && strcmp(save_as, "--kexec") == 0;
     if (do_kexec) save_as = "tmp.kexec.elf";
+    if (!filename[0] || strlen(filename) > 60) {
+        sh_puts("kdownload: filename must contain 1..60 bytes\n");
+        return;
+    }
 
     uint8_t *buf = (uint8_t *)kmalloc(OFTP_BUF_MAX);
     if (!buf) { sh_puts("kdownload: out of memory\n"); return; }
 
-    /* Reset state */
-    for (uint32_t i = 0; i < sizeof(oftp_state); i++)
-        ((uint8_t *)&oftp_state)[i] = 0;
-    oftp_state.buf       = buf;
-    oftp_state.buf_size  = OFTP_BUF_MAX;
-    oftp_state.active    = true;
-    oftp_state.last_chunk_tick = idt_get_ticks();
-
-    /* Listener registered once per kernel boot */
-    static bool listener_registered = false;
-    if (!listener_registered) {
-        net_udp_listen(OFTP_LOCAL_PORT, oftp_handler);
-        listener_registered = true;
+    /* Registration is idempotent, including after net_init resets listeners. */
+    if (net_udp_listen(OFTP_LOCAL_PORT, oftp_handler) < 0) {
+        sh_puts("kdownload: cannot register UDP listener\n");
+        kfree(buf);
+        return;
     }
+    uint64_t flags = oftp_lock_irqsave();
+    if (oftp_state.active) {
+        oftp_unlock_irqrestore(flags);
+        sh_puts("kdownload: another transfer is active\n");
+        kfree(buf);
+        return;
+    }
+    memset(&oftp_state, 0, sizeof(oftp_state));
+    oftp_state.rx.buf = buf;
+    oftp_state.rx.capacity = OFTP_BUF_MAX;
+    memcpy(oftp_state.peer_ip, server_ip, 4);
+    oftp_state.peer_port = server_port;
+    oftp_state.last_progress_tick = idt_get_ticks();
+    oftp_state.active = true;
+    oftp_unlock_irqrestore(flags);
 
     /* Build & send REQ */
     uint8_t req[64];
@@ -1412,9 +1723,21 @@ static void cmd_kdownload(int argc, char *argv[])
 
     extern int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
                              uint16_t src_port, const void *data, uint32_t len);
-    if (net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, req, 64) < 0) {
+    /* A cold ARP cache makes the first send fail while resolution starts. */
+    uint64_t send_start = idt_get_ticks();
+    int send_rc;
+    do {
+        send_rc = net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, req, 64);
+        if (send_rc >= 0) break;
+        net_poll();
+        sh_hlt();
+    } while (idt_get_ticks() - send_start < 100);
+    if (send_rc < 0) {
         sh_puts("kdownload: REQ send failed\n");
+        flags = oftp_lock_irqsave();
         oftp_state.active = false;
+        oftp_state.rx.buf = NULL;
+        oftp_unlock_irqrestore(flags);
         kfree(buf);
         return;
     }
@@ -1423,85 +1746,84 @@ static void cmd_kdownload(int argc, char *argv[])
     sh_puts(argv[1]); sh_puts(":"); sh_putdec(server_port);
     sh_puts(" for "); sh_puts(filename); sh_puts("\n");
 
-    /* Drain loop with NAK-retransmit on stall.
-     *
-     * UDP loses tail packets when the server bursts faster than our drain.
-     * Instead of failing outright, send a NAK("OFTN" + offset) asking the
-     * server to resume from the current high_watermark. Try up to NAK_MAX
-     * times before giving up. */
+    /* Resume at the first missing byte, never at the highest observed offset. */
     extern void net_poll(void);
     uint64_t last_print  = idt_get_ticks();
-    uint32_t last_high   = 0;
+    uint32_t last_received = 0;
     uint64_t stall_since = idt_get_ticks();
     int nak_attempts = 0;
     const int NAK_MAX = 5;
-    const uint64_t STALL_TICKS = 500;   /* NAK after 500 ms no progress */
+    const uint64_t STALL_TICKS = 500;   /* 5 s at 100 Hz */
+    oftp_rx_t rx;
 
-    while (!oftp_state.done) {
+    for (;;) {
         net_poll();
+        flags = oftp_lock_irqsave();
+        rx = oftp_state.rx;
+        uint64_t last_progress = oftp_state.last_progress_tick;
+        oftp_unlock_irqrestore(flags);
         uint64_t now = idt_get_ticks();
+        if (rx.done || rx.error) break;
 
         /* Reset stall window whenever data flows */
-        if (oftp_state.high_watermark != last_high) {
-            last_high   = oftp_state.high_watermark;
+        if (rx.received != last_received) {
+            last_received = rx.received;
             stall_since = now;
         }
 
-        /* NAK retransmit on short stall — far faster than waiting the
-         * full 5 s hard timeout, which leaves the user staring at a
-         * frozen progress line for the tail-loss case (3 chunks lost
-         * out of 887). */
-        if (oftp_state.total_size > 0 &&
-            oftp_state.high_watermark < oftp_state.total_size &&
-            now - stall_since > STALL_TICKS) {
+        if (now - stall_since > STALL_TICKS) {
             if (nak_attempts >= NAK_MAX) {
                 sh_puts("kdownload: NAK budget exhausted (");
-                sh_putdec(oftp_state.high_watermark); sh_puts("/");
-                sh_putdec(oftp_state.total_size); sh_puts(")\n");
-                oftp_state.error = true;
+                sh_putdec(rx.received); sh_puts("/");
+                sh_putdec(rx.total); sh_puts(")\n");
+                rx.error = true;
                 break;
             }
             nak_attempts++;
             sh_puts("  NAK resume@");
-            sh_putdec(oftp_state.high_watermark);
+            sh_putdec(rx.received);
             sh_puts(" (");
             sh_putdec(nak_attempts); sh_puts("/"); sh_putdec(NAK_MAX);
             sh_puts(")\n");
             uint8_t nak[8];
             nak[0]='O'; nak[1]='F'; nak[2]='T'; nak[3]='N';
-            uint32_t off = oftp_state.high_watermark;
+            uint32_t off = rx.received;
             nak[4] = (uint8_t)(off >> 24);
             nak[5] = (uint8_t)(off >> 16);
             nak[6] = (uint8_t)(off >>  8);
             nak[7] = (uint8_t)(off);
-            net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, nak, 8);
+            if (rx.total)
+                net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, nak, 8);
+            else
+                net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, req, 64);
             stall_since = now;
-            oftp_state.last_chunk_tick = now;
         }
 
-        /* Absolute timeout — no chunk in 5 s even after NAKs */
-        if (now - oftp_state.last_chunk_tick > OFTP_TIMEOUT_TICKS) {
+        /* Duplicates, stray packets and EOF markers cannot extend this. */
+        if (now - last_progress > OFTP_TIMEOUT_TICKS) {
             sh_puts("kdownload: hard timeout\n");
-            oftp_state.error = true;
+            rx.error = true;
             break;
         }
 
         if (now - last_print > 500) {
             last_print = now;
             sh_puts("  rx ");
-            sh_putdec(oftp_state.high_watermark);
+            sh_putdec(rx.received);
             sh_puts(" / ");
-            sh_putdec(oftp_state.total_size);
+            sh_putdec(rx.total);
             sh_puts(" B\n");
         }
+        sh_hlt();
     }
 
-    bool ok = !oftp_state.error &&
-              oftp_state.high_watermark >= oftp_state.total_size &&
-              oftp_state.total_size > 0;
-    uint32_t got   = oftp_state.high_watermark;
-    uint32_t total = oftp_state.total_size;
+    bool ok = !rx.error && rx.done && rx.received == rx.total && rx.total > 0;
+    uint32_t got = rx.received;
+    uint32_t total = rx.total;
+    flags = oftp_lock_irqsave();
     oftp_state.active = false;
+    oftp_state.rx.buf = NULL;
+    oftp_unlock_irqrestore(flags);
 
     if (!ok) {
         sh_puts("kdownload: FAILED (");
@@ -1527,7 +1849,11 @@ static void cmd_kdownload(int argc, char *argv[])
         if (f) {
             uint64_t cur = osfs2_file_size(f);
             if (cur != got) {
-                osfs2_delete(save_as);
+                if (osfs2_delete(save_as) < 0) {
+                    sh_puts("kdownload: cannot replace file\n");
+                    kfree(buf);
+                    return;
+                }
                 f = NULL;
             }
         }
@@ -1537,9 +1863,12 @@ static void cmd_kdownload(int argc, char *argv[])
             kfree(buf);
             return;
         }
-        osfs2_write(f, 0, buf, got);
         extern int disk_flush(void);
-        disk_flush();
+        if (osfs2_write(f, 0, buf, got) < 0 || disk_flush() < 0) {
+            sh_puts("kdownload: save/flush failed; kexec cancelled\n");
+            kfree(buf);
+            return;
+        }
         sh_puts("kdownload: saved -> ");
         sh_puts(save_as);
         sh_puts(" (synced)\n");
@@ -1779,154 +2108,14 @@ static void cmd_kupload(int argc, char *argv[])
     if (free_buf) kfree(src_buf);
 }
 
-/* Web-based update path — placeholder for the eventual WAN flow that
- * uses naranjositos.tech.  Requires DNS + TLS + HTTP client (already
- * available in net.c/tls.c/http.c) but isn't wired up yet because the
- * kernel currently only has a direct cable to a Mac, no Internet.    */
 static void cmd_kupdate(int argc, char *argv[])
 {
-    const char *host    = "wasm.naranjositos.tech";
-    const char *path    = "/k/x86_64/stable/kernel.elf";
-    const char *save_as = "kernel.elf";
-    bool do_kexec = true;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--no-kexec") == 0) do_kexec = false;
-        else if (strcmp(argv[i], "--channel") == 0 && i + 1 < argc) {
-            i++;
-            static char path_buf[64];
-            int n = 0;
-            const char *prefix = "/k/x86_64/";
-            while (*prefix && n < 60) path_buf[n++] = *prefix++;
-            const char *ch = argv[i];
-            while (*ch && n < 56) path_buf[n++] = *ch++;
-            const char *suffix = "/kernel.elf";
-            while (*suffix && n < 63) path_buf[n++] = *suffix++;
-            path_buf[n] = 0;
-            path = path_buf;
-        } else if (argv[i][0] == '/') {
-            path = argv[i];
-        } else if (argv[i][0] != '-') {
-            host = argv[i];
-        }
-    }
-
-    if (!osfs2_is_mounted()) {
-        sh_puts("kupdate: no FS mounted, cannot save\n");
-        return;
-    }
-
-    sh_puts("kupdate: GET https://");
-    sh_puts(host);
-    sh_puts(path);
-    sh_puts("\n");
-
-    void *session = kmalloc(http_session_size());
-    if (!session) { sh_puts("kupdate: out of memory (session)\n"); return; }
-    void *resp = kmalloc(http_response_size());
-    if (!resp) { kfree(session); sh_puts("kupdate: out of memory (resp)\n"); return; }
-
-    if (http_open(session, host) < 0) {
-        sh_puts("kupdate: http_open failed (DNS/TLS)\n");
-        kfree(resp); kfree(session);
-        return;
-    }
-
-    const char *headers[] = {
-        "Connection: close",
-        "User-Agent: OsitoK/1.0 (kupdate)",
-        NULL,
-    };
-    if (http_request(session, "GET", path, host, headers,
-                     NULL, 0, resp) < 0) {
-        sh_puts("kupdate: http_request failed\n");
-        http_close(session);
-        kfree(resp); kfree(session);
-        return;
-    }
-
-    /* Reach into response for status + content_length without including
-     * http.h.  Layout matches http_response_t (http.h:26-32): int32
-     * status, then headers array, header_count, bool chunked, uint32
-     * content_length.  We only need status & content_length, accessed
-     * via the public header accessor. */
-    const char *clen_s = http_get_header(resp, "Content-Length");
-    uint32_t clen = 0;
-    if (clen_s) {
-        for (const char *p = clen_s; *p >= '0' && *p <= '9'; p++)
-            clen = clen * 10 + (uint32_t)(*p - '0');
-    }
-    if (clen == 0 || clen > 32 * 1024 * 1024) {
-        sh_puts("kupdate: bad/missing Content-Length (got ");
-        sh_putdec(clen);
-        sh_puts(")\n");
-        http_close(session);
-        kfree(resp); kfree(session);
-        return;
-    }
-
-    sh_puts("kupdate: Content-Length=");
-    sh_putdec(clen);
-    sh_puts(" bytes\n");
-
-    void *buf = kmalloc(clen);
-    if (!buf) {
-        sh_puts("kupdate: out of memory (body)\n");
-        http_close(session);
-        kfree(resp); kfree(session);
-        return;
-    }
-
-    int got = http_read_body_full(session, resp, buf, clen);
-    http_close(session);
-    kfree(resp); kfree(session);
-    if (got < 0 || (uint32_t)got != clen) {
-        sh_puts("kupdate: body read short (");
-        sh_putdec((uint64_t)got);
-        sh_puts("/");
-        sh_putdec(clen);
-        sh_puts(")\n");
-        kfree(buf);
-        return;
-    }
-
-    /* Sanity: first 4 bytes must be ELF magic 0x7F 'E' 'L' 'F'. */
-    const uint8_t *b = (const uint8_t *)buf;
-    if (!(b[0] == 0x7F && b[1] == 'E' && b[2] == 'L' && b[3] == 'F')) {
-        sh_puts("kupdate: payload not ELF, aborting\n");
-        kfree(buf);
-        return;
-    }
-
-    extern void *osfs2_create(const char *name, uint64_t size);
-    extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
-    extern int   osfs2_delete(const char *name);
-    extern int   disk_flush(void);
-
-    void *f = osfs2_find(save_as);
-    if (f) {
-        uint64_t cur = osfs2_file_size(f);
-        if (cur != clen) { osfs2_delete(save_as); f = NULL; }
-    }
-    if (!f) f = osfs2_create(save_as, clen);
-    if (!f) {
-        sh_puts("kupdate: osfs2_create failed\n");
-        kfree(buf);
-        return;
-    }
-    osfs2_write(f, 0, buf, clen);
-    disk_flush();
-    kfree(buf);
-
-    sh_puts("kupdate: saved -> ");
-    sh_puts(save_as);
-    sh_puts(" (synced)\n");
-
-    if (do_kexec) {
-        sh_puts("kupdate: chaining to kexec...\n");
-        cmd_kexec(save_as);
-    } else {
-        sh_puts("kupdate: --no-kexec, skipping reboot\n");
-    }
+#ifndef __EMSCRIPTEN__
+    kernel_update_command(argc, argv);
+#else
+    (void)argc; (void)argv;
+    sh_puts("kupdate: native x86 USB update only\n");
+#endif
 }
 
 /* ── Builtin: ping ──────────────────────────────────────────── */
@@ -1947,6 +2136,986 @@ static int parse_ip(const char *s, uint8_t ip[4])
     ip[3] = (uint8_t)val;
     return 0;
 }
+
+#ifndef __EMSCRIPTEN__
+static void wlan_hex(const char *label, uint64_t value, int digits)
+{
+    char text[19] = "0x";
+    const char *hex = "0123456789ABCDEF";
+    for (int i = 0; i < digits; i++)
+        text[2 + i] = hex[(value >> ((digits - 1 - i) * 4)) & 15];
+    text[2 + digits] = 0;
+    sh_puts(label); sh_puts(text); sh_puts("\n");
+}
+
+static void wlan_fault_report(const iwx_boot_snapshot_t *s)
+{
+    if (!s->captured) return;
+    sh_puts("Boot snapshot: captured BEFORE shutdown/reset\n");
+    wlan_hex("PCI ID: ", s->pci_id, 8);
+    wlan_hex("PCI command/status (pre-stop): ", s->pci_command_status, 8);
+    if (s->pci_error) {
+        sh_puts("PCI snapshot note: "); sh_puts(s->pci_error); sh_puts("\n");
+    }
+    if (s->pcie_valid) {
+        wlan_hex("PCIe capability offset: ", s->pcie_offset, 4);
+        wlan_hex("PCIe flags: ", s->pcie_flags, 4);
+        wlan_hex("PCIe device control: ", s->pcie_device_control, 4);
+        wlan_hex("PCIe device status: ", s->pcie_device_status, 4);
+        wlan_hex("PCIe link control: ", s->pcie_link_control, 4);
+        wlan_hex("PCIe link status: ", s->pcie_link_status, 4);
+    }
+    if (s->pci_valid) {
+        sh_puts(s->csr_valid ? "CSR snapshot: accessible\n" : "CSR snapshot: inaccessible (raw values)\n");
+        wlan_hex("INT (pre-stop): ", s->interrupt, 8);
+        wlan_hex("FH_INT (pre-stop): ", s->fh_interrupt, 8);
+        wlan_hex("INT_MASK (pre-stop): ", s->int_mask, 8);
+        wlan_hex("GP_CNTRL (pre-stop): ", s->gp_cntrl, 8);
+        wlan_hex("RESET (pre-stop): ", s->reset, 8);
+        wlan_hex("HW_IF_CONFIG (pre-stop): ", s->hw_if, 8);
+        wlan_hex("Context address readback: ", s->context_observed, 16);
+    }
+    wlan_hex("Context address expected: ", s->context_expected, 16);
+    wlan_hex("Context flags: ", s->context_flags, 8);
+    wlan_hex("Context MAC: ", s->context_mac, 4);
+    sh_puts("Context dwords: "); sh_putdec(s->context_dwords); sh_puts("\n");
+    wlan_hex("Free RX ring: ", s->free_ring, 16);
+    wlan_hex("Used RX ring: ", s->used_ring, 16);
+    wlan_hex("RX status address: ", s->status, 16);
+    wlan_hex("First LMAC section: ", s->lmac, 16);
+    wlan_hex("First UMAC section: ", s->umac, 16);
+    wlan_hex("First paging section: ", s->paging, 16);
+    sh_puts("Pinned DMA bytes at capture: "); sh_putdec(s->dma_bytes);
+    sh_puts("; RX read/producer: "); sh_putdec(s->rx_read); sh_puts("/");
+    sh_putdec(s->rx_producer); sh_puts("\n");
+    if (s->prph_error) {
+        sh_puts("Peripheral snapshot note: "); sh_puts(s->prph_error); sh_puts("\n");
+    }
+    for (unsigned i = 0; i < s->prph_count; i++) {
+        sh_puts(s->prph[i].name); sh_puts(": ");
+        wlan_hex("", s->prph[i].value, 8);
+        if (!s->prph[i].valid) sh_puts("  unavailable/power-gated value\n");
+    }
+}
+
+static void wlan_trace_report(const iwx_probe_report_t *r)
+{
+    if (!r->trace_count) return;
+    sh_puts("Boot trace: bounded read-only PCI/CSR samples; poll count=");
+    sh_putdec(r->poll_count); sh_puts("; dropped=");
+    sh_putdec(r->trace_dropped); sh_puts("\n");
+    sh_puts("PCIe status is sticky; unchanged bits do not exclude a repeated error.\n");
+    for (unsigned i = 0; i < r->trace_count && i < IWX_BOOT_TRACE_SAMPLES; i++) {
+        const iwx_boot_trace_sample_t *t = &r->trace[i];
+        sh_puts("Trace["); sh_putdec(i); sh_puts("] "); sh_puts(t->phase);
+        sh_puts(" +"); sh_putdec(t->elapsed_us); sh_puts(" us\n");
+        wlan_hex("  PCI ID: ", t->pci_id, 8);
+        wlan_hex("  PCI command/status: ", t->pci_command_status, 8);
+        if (t->pm_valid) wlan_hex("  PMCSR: ", t->pm_control, 4);
+        if (t->pcie_valid) {
+            wlan_hex("  PCIe device control/status: ",
+                t->pcie_device_control | ((uint32_t)t->pcie_device_status << 16), 8);
+            wlan_hex("  PCIe link control/status: ",
+                t->pcie_link_control | ((uint32_t)t->pcie_link_status << 16), 8);
+        }
+        if (t->csr_sampled) {
+            sh_puts(t->csr_valid ? "  CSR: valid\n" : "  CSR: incomplete/inaccessible\n");
+            wlan_hex("  INT: ", t->interrupt, 8);
+            wlan_hex("  FH_INT: ", t->fh_interrupt, 8);
+            wlan_hex("  GP_CNTRL: ", t->gp_cntrl, 8);
+            wlan_hex("  RESET: ", t->reset, 8);
+            if (t->csr_valid) {
+                wlan_hex("  HW_IF_CONFIG: ", t->hw_if, 8);
+                wlan_hex("  INT_MASK: ", t->int_mask, 8);
+                wlan_hex("  Context register: ", t->context_observed, 16);
+            }
+        }
+        wlan_hex("  Context allocated: ", t->context_expected, 16);
+        sh_puts("  DMA bytes: "); sh_putdec(t->dma_bytes);
+        sh_puts("; RX read/producer: "); sh_putdec(t->rx_read);
+        sh_puts("/"); sh_putdec(t->rx_producer); sh_puts("\n");
+        if (t->note) { sh_puts("  Note: "); sh_puts(t->note); sh_puts("\n"); }
+    }
+}
+
+static void wlan_platform_report(const dma_diag_t *r)
+{
+    if (!r->prepared) return;
+    sh_puts("Platform evidence: read-only baseline and pre-stop; sticky, non-atomic samples\n");
+    wlan_hex("PCI segment: ", r->segment, 4);
+    wlan_hex("Requester ID (bus/devfn): ", r->requester, 4);
+    if (r->path_note) { sh_puts("PCI path note: "); sh_puts(r->path_note); sh_puts("\n"); }
+    wlan_hex("DMAR table: ", r->table, 16);
+    sh_puts("DMAR length/host-width/DRHD-count: "); sh_putdec(r->table_length);
+    sh_puts("/"); sh_putdec(r->host_width); sh_puts("/"); sh_putdec(r->units_seen); sh_puts("\n");
+    wlan_hex("DMAR flags: ", r->table_flags, 2);
+    if (r->dmar_note) { sh_puts("DMAR note: "); sh_puts(r->dmar_note); sh_puts("\n"); }
+    if (r->base) {
+        wlan_hex("Selected DRHD base: ", r->base, 16);
+        wlan_hex("DRHD flags/size: ", r->unit_flags | ((uint16_t)r->unit_size << 8), 4);
+        wlan_hex("DRHD version: ", r->version, 8);
+        wlan_hex("DRHD CAP: ", r->cap, 16);
+        wlan_hex("DRHD ECAP: ", r->ecap, 16);
+        wlan_hex("FRCD offset: ", r->fault_offset, 4);
+        sh_puts("FRCD slots: "); sh_putdec(r->fault_regs); sh_puts("\n");
+    }
+    for (unsigned n = 0; n < 2; n++) {
+        const dma_diag_sample_t *s = &r->sample[n];
+        if (!s->captured) continue;
+        sh_puts(n ? "Platform PRE-STOP\n" : "Platform BASELINE\n");
+        sh_puts("  Monotonic start/end us: "); sh_putdec(s->start_ns / 1000);
+        sh_puts("/"); sh_putdec(s->end_ns / 1000); sh_puts("\n");
+        for (unsigned i = 0; i < r->path_count; i++) {
+            const pci_dev_t *p = &r->path[i];
+            const dma_aer_sample_t *a = &s->aer[i];
+            sh_puts(i ? "  Upstream bridge\n" : "  Endpoint\n");
+            wlan_hex("    BDF (bus/devfn): ", (p->bus << 8) | (p->dev << 3) | p->func, 4);
+            wlan_hex("    ID: ", a->id, 8);
+            wlan_hex("    Command/status: ", a->command_status, 8);
+            if (a->pcie_valid) {
+                wlan_hex("    PCIe device control/status: ", a->device, 8);
+                wlan_hex("    PCIe link control/status: ", a->link, 8);
+            }
+            if (a->note) { sh_puts("    Note: "); sh_puts(a->note); sh_puts("\n"); }
+            if (!a->valid) continue;
+            wlan_hex("    AER offset: ", a->aer_offset, 4);
+            wlan_hex("    UNC status: ", a->unc_status, 8);
+            wlan_hex("    UNC mask: ", a->unc_mask, 8);
+            wlan_hex("    UNC severity: ", a->severity, 8);
+            wlan_hex("    COR status: ", a->cor_status, 8);
+            wlan_hex("    COR mask: ", a->cor_mask, 8);
+            wlan_hex("    AER control (low 5 bits = first error): ", a->control, 8);
+            for (unsigned j = 0; j < 4; j++) {
+                sh_puts("    Header["); sh_putdec(j); wlan_hex("]: ", a->header[j], 8);
+            }
+            if (a->root) {
+                wlan_hex("    Root command: ", a->root_command, 8);
+                wlan_hex("    Root status: ", a->root_status, 8);
+                wlan_hex("    Root error source IDs: ", a->source, 8);
+            }
+            if (a->changed) sh_puts("    AER status changed during capture\n");
+            const dma_aer_sample_t *before = &r->sample[0].aer[i];
+            if (n && before->valid && before->id == a->id && before->aer_offset == a->aer_offset) {
+                wlan_hex("    Newly set UNC bits: ", a->unc_status & ~before->unc_status, 8);
+                wlan_hex("    Newly set COR bits: ", a->cor_status & ~before->cor_status, 8);
+            }
+        }
+        if (!r->iommu_ready) continue;
+        const dma_iommu_sample_t *m = &s->iommu;
+        if (m->note) { sh_puts("  IOMMU note: "); sh_puts(m->note); sh_puts("\n"); }
+        wlan_hex("  GSTS: ", m->gsts, 8);
+        wlan_hex("  RTADDR (raw, not dereferenced): ", m->root, 16);
+        wlan_hex("  FSTS before: ", m->fsts, 8);
+        wlan_hex("  FSTS after: ", m->fsts_after, 8);
+        if (m->valid) sh_puts(m->gsts & (1U << 31) ? "  Translation: enabled\n" : "  Translation: disabled\n");
+        if (r->cap & 0x60) wlan_hex("  PMEN: ", m->pmen, 8);
+        if (r->cap & 0x20) {
+            wlan_hex("  Protected low base: ", m->low_base, 8);
+            wlan_hex("  Protected low limit: ", m->low_limit, 8);
+        }
+        if (r->cap & 0x40) {
+            wlan_hex("  Protected high base: ", m->high_base, 16);
+            wlan_hex("  Protected high limit: ", m->high_limit, 16);
+        }
+        sh_puts("  FRCD checked/active/target/stored/unstable: "); sh_putdec(m->checked);
+        sh_puts("/"); sh_putdec(m->active); sh_puts("/"); sh_putdec(m->target);
+        sh_puts("/"); sh_putdec(m->stored); sh_puts("/"); sh_putdec(m->unstable); sh_puts("\n");
+        if (m->changed) sh_puts("  IOMMU state changed during capture\n");
+        for (unsigned j = 0; j < m->stored; j++) {
+            const dma_fault_record_t *f = &m->faults[j];
+            sh_puts("  FRCD["); sh_putdec(f->index); sh_puts(f->target ? "] TARGET\n" : "] other requester\n");
+            wlan_hex("    Low: ", f->low, 16); wlan_hex("    High: ", f->high, 16);
+            wlan_hex("    Source ID: ", (uint16_t)f->high, 4);
+            wlan_hex("    Fault reason: ", (f->high >> 32) & 255, 2);
+        }
+    }
+    sh_puts("No faults captured does not prove DMA success; advanced fault logs/page tables are not read.\n");
+}
+
+static void wlan_boot_report(const iwx_probe_report_t *r)
+{
+    sh_puts("Stage: "); sh_puts(r->stage); sh_puts("\n");
+    if (r->error) { sh_puts("Error: "); sh_puts(r->error); sh_puts("\n"); }
+    if (r->stop_error) {
+        sh_puts("Shutdown error: "); sh_puts(r->stop_error); sh_puts("\n");
+    }
+    sh_puts(r->rfh_ready ? "RFH: initialized\n" : "RFH: not confirmed\n");
+    sh_puts("ALIVE ABI: "); sh_putdec(r->alive_version);
+    sh_puts("; RX packets: "); sh_putdec(r->rx_packets); sh_puts("\n");
+    wlan_hex("ALIVE status: ", r->alive_status, 4);
+    wlan_hex("INT observed: ", r->interrupt, 8);
+    wlan_hex("PCI command (after): ", r->command_after, 4);
+    if (r->alive) {
+        sh_puts("Firmware ALIVE notification validated\n");
+        wlan_hex("LMAC major: ", r->lmac_major, 8);
+        wlan_hex("LMAC minor: ", r->lmac_minor, 8);
+        wlan_hex("UMAC major: ", r->umac_major, 8);
+        wlan_hex("UMAC minor: ", r->umac_minor, 8);
+    }
+    if (r->dma_path.attempted) {
+        sh_puts(r->dma_path.ready ? "PCI DMA upstream path: ready\n" :
+                                    "PCI DMA upstream path: failed\n");
+        wlan_hex("  Segment: ", r->dma_path.segment, 4);
+        for (unsigned i = 0; i < r->dma_path.count; i++) {
+            const pci_dma_bridge_t *p = &r->dma_path.bridge[i];
+            wlan_hex("  Bridge BDF (bus/devfn): ", (p->bus << 8) | (p->dev << 3) | p->func, 4);
+            wlan_hex("    Command before: ", p->before, 4);
+            wlan_hex("    Command after: ", p->after, 4);
+            sh_puts(p->written ? "    BME enable attempted; " : "    No write; ");
+            sh_puts(p->verified ? "readback verified\n" : "not verified\n");
+        }
+        sh_puts("  Shared bridges remain bus-owned; endpoint stop does not disable them.\n");
+    }
+    wlan_trace_report(r);
+    wlan_platform_report(&r->platform);
+    wlan_fault_report(&r->fault);
+    if (r->retained_bytes) {
+        sh_puts("DMA quarantined bytes: "); sh_putdec(r->retained_bytes);
+        sh_puts("; retry wlan stop. kexec is blocked until shutdown succeeds.\n");
+    } else if (r->stopped) sh_puts("Device stopped; DMA allocations released\n");
+    sh_puts("Firmware diagnostics do not establish a link; use wlan connect after start.\n");
+}
+
+/* Deliberately bypass shell redirection: a hung command never commits its
+ * captured output. The live saved line distinguishes checkpoint I/O from the
+ * following hardware operation. No extra device reads occur here. */
+static bool wlan_progress(void *arg, const char *phase, const iwx_probe_report_t *r)
+{
+    (void)arg;
+    serial_puts("[IWX-PROGRESS] checkpoint-start "); serial_puts(phase); serial_puts("\n");
+    fb_puts("wlan trace: "); fb_puts(phase); fb_puts(" ...\n");
+    if (r) {
+        serial_puts("[IWX-PROGRESS] state stage="); serial_puts(r->stage ? r->stage : "none");
+        serial_puts(" error="); serial_puts(r->error ? r->error : "none");
+        serial_puts(" bridge-ready="); serial_putdec(r->dma_path.ready);
+        serial_puts(" rfh="); serial_putdec(r->rfh_ready);
+        serial_puts(" alive="); serial_putdec(r->alive);
+        serial_puts(" rx="); serial_putdec(r->rx_packets);
+        serial_puts(" polls="); serial_putdec(r->poll_count);
+        serial_puts(" stopped="); serial_putdec(r->stopped);
+        serial_puts(" retained="); serial_putdec(r->retained_bytes);
+        serial_puts("\n");
+        if (r->trace_count && r->trace_count <= IWX_BOOT_TRACE_SAMPLES) {
+            const iwx_boot_trace_sample_t *t = &r->trace[r->trace_count - 1];
+            serial_puts("[IWX-PROGRESS] last-sample="); serial_puts(t->phase);
+            serial_puts(" pci="); serial_puthex(t->pci_command_status, 8);
+            serial_puts(" csr-valid="); serial_putdec(t->csr_valid);
+            serial_puts(" int="); serial_puthex(t->interrupt, 8);
+            serial_puts(" fh="); serial_puthex(t->fh_interrupt, 8);
+            serial_puts(" gp="); serial_puthex(t->gp_cntrl, 8);
+            serial_puts(" context="); serial_puthex(t->context_expected, 16);
+            serial_puts(" observed="); serial_puthex(t->context_observed, 16);
+            serial_puts("\n");
+        }
+        for (unsigned i = 0; i < r->dma_path.count && i < PCI_DMA_PATH_MAX; i++) {
+            const pci_dma_bridge_t *p = &r->dma_path.bridge[i];
+            serial_puts("[IWX-PROGRESS] bridge "); serial_puthex(p->bus, 2);
+            serial_puts(":"); serial_puthex(p->dev, 2);
+            serial_puts("."); serial_puthex(p->func, 1);
+            serial_puts(" command="); serial_puthex(p->before, 4);
+            serial_puts(" -> "); serial_puthex(p->after, 4);
+            serial_puts(" verified="); serial_putdec(p->verified); serial_puts("\n");
+        }
+    }
+    bool ok = boot_diag_checkpoint && boot_diag_checkpoint(phase);
+    serial_puts(ok ? "[IWX-PROGRESS] checkpoint-saved " : "[IWX-PROGRESS] checkpoint-failed ");
+    serial_puts(phase); serial_puts("\n");
+    fb_puts(ok ? "wlan trace: saved\n" : "wlan trace: persistence failed\n");
+    return ok;
+}
+
+static void wlan_nvm_report(const iwx_nvm_report_t *n)
+{
+    sh_puts("NVM commands sent/completed: "); sh_putdec(n->commands_sent);
+    sh_puts("/"); sh_putdec(n->commands_completed);
+    sh_puts("; polls: "); sh_putdec(n->command_polls); sh_puts("\n");
+    wlan_hex("Last command group: ", n->last_group, 2);
+    wlan_hex("Last command opcode: ", n->last_opcode, 2);
+    sh_puts("Last command index: "); sh_putdec(n->last_index);
+    sh_puts("; response bytes: "); sh_putdec(n->response_bytes); sh_puts("\n");
+    sh_puts("INIT_COMPLETE: "); sh_puts(n->init_complete ? "yes\n" : "no\n");
+    sh_puts("INIT notifications: "); sh_putdec(n->init_notifications);
+    sh_puts("; payload bytes: "); sh_putdec(n->init_payload_bytes); sh_puts("\n");
+    wlan_hex("INIT sequence: ", n->init_sequence, 4);
+    sh_puts("NVM response ABI: "); sh_putdec(n->response_version); sh_puts("\n");
+    if (!n->valid) { sh_puts("NVM: not validated\n"); return; }
+    sh_puts("MAC: ");
+    for (unsigned i = 0; i < 6; i++) {
+        if (i) sh_puts(":");
+        const char *hex = "0123456789ABCDEF";
+        char byte[3] = {hex[n->mac[i] >> 4], hex[n->mac[i] & 15], 0};
+        sh_puts(byte);
+    }
+    sh_puts(n->mac_from_otp ? " (OTP)\n" : " (OEM strap)\n");
+    wlan_hex("NVM version: ", n->nvm_version, 4);
+    wlan_hex("NVM general flags: ", n->general_flags, 8);
+    wlan_hex("MAC SKU flags: ", n->mac_sku, 8);
+    sh_puts("Board type: "); sh_putdec(n->board_type);
+    sh_puts("; reserved MAC addresses: "); sh_putdec(n->n_hw_addrs); sh_puts("\n");
+    wlan_hex("TX chain mask: ", n->tx_chains, 8);
+    wlan_hex("RX chain mask: ", n->rx_chains, 8);
+    sh_puts("Location-aware regulatory: "); sh_putdec(n->lar_enabled); sh_puts("\n");
+    sh_puts("Raw channel profiles: "); sh_putdec(n->n_channels); sh_puts("\n");
+    for (unsigned i = 0; i < n->n_channels; i++) {
+        sh_puts("  profile["); sh_putdec(i); wlan_hex("]: ", n->channel_profile[i], 8);
+    }
+    sh_puts("NVM read only; channel permissions/regulatory setup and association pending.\n");
+}
+
+static void wlan_runtime_report(void)
+{
+    iwx_status_t s;
+    if (iwx_get_status(&s) != 0) { sh_puts("WLAN transport: busy\n"); return; }
+    static const char *states[] = {"off", "active", "failed", "DMA quarantined"};
+    sh_puts("WLAN transport: "); sh_puts(states[s.state]); sh_puts("\n");
+    sh_puts("Session: "); sh_putdec(s.generation);
+    sh_puts(s.worker_started ? "; RX worker: started\n" : "; RX worker: not started\n");
+    sh_puts("Owned DMA bytes: "); sh_putdec(s.dma_bytes);
+    sh_puts("; runtime polls: "); sh_putdec(s.polls); sh_puts("\n");
+    sh_puts("RX buffers/reposted/packets: "); sh_putdec(s.rx_buffers);
+    sh_puts("/"); sh_putdec(s.rx_reposted); sh_puts("/"); sh_putdec(s.rx_packets); sh_puts("\n");
+    sh_puts("Last RX read/write/outstanding/pending: "); sh_putdec(s.rx_read);
+    sh_puts("/"); sh_putdec(s.rx_write); sh_puts("/"); sh_putdec(s.rx_outstanding);
+    sh_puts("/"); sh_putdec(s.rx_pending); sh_puts("\n");
+    sh_puts("Firmware commands sent/completed: "); sh_putdec(s.nvm.commands_sent);
+    sh_puts("/"); sh_putdec(s.nvm.commands_completed); sh_puts("\n");
+    wlan_hex("Last firmware command (group:opcode): ",
+             ((unsigned)s.nvm.last_group << 8) | s.nvm.last_opcode, 4);
+    sh_puts("Last command index/response bytes: "); sh_putdec(s.nvm.last_index);
+    sh_puts("/"); sh_putdec(s.nvm.response_bytes); sh_puts("\n");
+    if (s.error) { sh_puts("Last runtime error: "); sh_puts(s.error); sh_puts("\n"); }
+    if (s.stop_error) { sh_puts("Last shutdown error: "); sh_puts(s.stop_error); sh_puts("\n"); }
+}
+
+static const char *wlan_network_error(const iwx_bss_t *b);
+
+static void wlan_scan_security(const iwx_bss_t *b)
+{
+    const char *error = wlan_network_error(b);
+    sh_puts("  Connect: ");
+    sh_puts(error ? error : !b->rsn ? "OPEN" : b->rsn_ie[5] == WPA2_CIPHER_TKIP ?
+            "WPA2-PSK/CCMP (TKIP group)" : "WPA2-PSK/CCMP");
+    sh_puts("\n");
+    wlan_hex("  Capability: ", b->capability, 4);
+    if (!b->rsn) return;
+    /* These are public beacon/probe-response IEs, never installed keys. */
+    sh_puts("  RSN IE payload ("); sh_putdec(b->rsn_len); sh_puts(" bytes):\n");
+    const char *hex = "0123456789abcdef";
+    for (unsigned pos = 0; pos < b->rsn_len;) {
+        char line[37] = "    ";
+        unsigned count = b->rsn_len - pos;
+        if (count > 16) count = 16;
+        for (unsigned i = 0; i < count; i++) {
+            line[4 + 2 * i] = hex[b->rsn_ie[pos + i] >> 4];
+            line[5 + 2 * i] = hex[b->rsn_ie[pos + i] & 15];
+        }
+        line[4 + 2 * count] = 0;
+        sh_puts(line); sh_puts("\n");
+        pos += count;
+    }
+}
+
+static void wlan_scan_report(bool list)
+{
+    iwx_scan_status_t s;
+    iwx_bss_t *bss = list ? kmalloc(IWX_SCAN_BSS_MAX * sizeof(*bss)) : NULL;
+    if (list && !bss) { sh_puts("wlan: no memory for scan snapshot\n"); return; }
+    int count = iwx_scan_results(&s, bss, list ? IWX_SCAN_BSS_MAX : 0);
+    if (count < 0) { sh_puts("WLAN scan: busy\n"); kfree(bss); return; }
+    static const char *states[] = {"idle", "running", "aborting", "complete", "aborted", "failed"};
+    sh_puts("WLAN scan: "); sh_puts(states[s.state]);
+    sh_puts("; generation: "); sh_putdec(s.generation);
+    sh_puts("; networks: "); sh_putdec(s.count); sh_puts("\n");
+    if (s.error) { sh_puts("Scan detail: "); sh_puts(s.error); sh_puts("\n"); }
+    sh_puts(s.radio_ready ? "Radio configured; " : "Radio not configured; ");
+    sh_puts(s.regulatory.valid ? "regulatory profile current\n" : "regulatory profile not current\n");
+    if (s.regulatory.valid) {
+        char country[3] = {s.regulatory.mcc >> 8, s.regulatory.mcc & 255, 0};
+        sh_puts("Firmware country: "); sh_puts(s.regulatory.mcc ? country : "00");
+        sh_puts("; source: "); sh_putdec(s.regulatory.source);
+        sh_puts("; passive channels: "); sh_putdec(s.regulatory.count); sh_puts("\n");
+    }
+    sh_puts("Overflow/malformed/ignored: "); sh_putdec(s.dropped);
+    sh_puts("/"); sh_putdec(s.malformed); sh_puts("/"); sh_putdec(s.ignored);
+    sh_puts("; completion/EBS: "); sh_putdec(s.completion_status);
+    sh_puts("/"); sh_putdec(s.ebs_status); sh_puts("\n");
+    for (int i = 0; i < count; i++) {
+        const iwx_bss_t *b = &bss[i];
+        for (unsigned j = 0; j < 6; j++) {
+            const char *hex = "0123456789abcdef";
+            char byte[3] = {hex[b->bssid[j] >> 4], hex[b->bssid[j] & 15], 0};
+            if (j) sh_puts(":");
+            sh_puts(byte);
+        }
+        sh_puts(" ch="); sh_putdec(b->channel);
+        sh_puts(" signal=");
+        if (b->signal_dbm == -256) sh_puts("unknown");
+        else { sh_puts("-"); sh_putdec(-b->signal_dbm); sh_puts("dBm"); }
+        sh_puts(b->rsn ? " RSN" : b->wpa ? " WPA" : (b->capability & 16) ? " privacy" : " open");
+        char ssid[129];
+        iwx_ssid_text(ssid, b->ssid, b->ssid_len);
+        sh_puts(" SSID=\""); sh_puts(b->ssid_len ? ssid : "<hidden>"); sh_puts("\"\n");
+        wlan_scan_security(b);
+    }
+    kfree(bss);
+}
+
+static const char *wlan_link_state_text(enum iwx_link_state state)
+{
+    static const char *states[] = {"idle", "preparing", "waiting for channel", "authenticating",
+        "associating", "configuring", "associated", "failed", "stopped"};
+    return (unsigned)state < sizeof(states) / sizeof(states[0]) ? states[state] : "unknown";
+}
+
+static void wlan_link_diagnostics(const iwx_link_status_t *s)
+{
+    static const char *reasons[] = {
+        "accepted", "bounds", "state", "rx-status", "channel", "amsdu", "format", "fragment",
+        "peer", "destination", "ccmp", "iv", "replay", "plain-cipher", "llc", "eapol-address",
+        "closed-port", "duplicate", "tkip", "michael-mic", "crypto-offload"
+    };
+    _Static_assert(sizeof(reasons) / sizeof(reasons[0]) == IWX_RX_REASON_COUNT, "RX reason names");
+    sh_puts("WLAN RX reasons:");
+    for (unsigned i = 0; i < IWX_RX_REASON_COUNT; i++) if (s->rx_reasons[i]) {
+        sh_puts(" "); sh_puts(reasons[i]); sh_puts("="); sh_putdec(s->rx_reasons[i]);
+    }
+    sh_puts("\nRX trace overwritten: "); sh_putdec(s->rx_trace_overwritten); sh_puts("\n");
+    for (unsigned i = 0; i < s->rx_trace_count && i < IWX_LINK_TRACE_MAX; i++) {
+        const iwx_rx_sample_t *d = &s->rx_trace[(s->rx_trace_next + IWX_LINK_TRACE_MAX - s->rx_trace_count + i) % IWX_LINK_TRACE_MAX];
+        sh_puts("RX ms="); sh_putdec(d->time_ns / 1000000); sh_puts(" reason=");
+        sh_puts((unsigned)d->reason < IWX_RX_REASON_COUNT ? reasons[d->reason] : "unknown");
+        sh_puts(" bytes/ch/addr="); sh_putdec(d->frame_bytes); sh_puts("/");
+        sh_putdec(d->channel); sh_puts("/"); sh_putdec(d->addresses); sh_puts("\n");
+        wlan_hex("  FC: ", d->frame_control, 4); wlan_hex("  FW status: ", d->status, 8);
+        wlan_hex("  FW flags: ", d->flags, 2); wlan_hex("  EtherType candidate: ", d->ether_type, 4);
+        sh_puts("  header/body/version/type="); sh_putdec(d->header_bytes); sh_puts("/");
+        sh_putdec(d->eapol_bytes); sh_puts("/"); sh_putdec(d->version); sh_puts("/");
+        sh_putdec(d->packet_type); sh_puts("\n"); wlan_hex("  Key info candidate: ", d->key_info, 4);
+    }
+    sh_puts("Data RX trace skipped: "); sh_putdec(s->data_trace_skipped); sh_puts("\n");
+    for (unsigned i = 0; i < s->data_trace_count && i < IWX_LINK_TRACE_MAX; i++) {
+        const iwx_rx_sample_t *d = &s->data_trace[i];
+        sh_puts("Data RX ms="); sh_putdec(d->time_ns / 1000000); sh_puts(" reason=");
+        sh_puts((unsigned)d->reason < IWX_RX_REASON_COUNT ? reasons[d->reason] : "unknown");
+        sh_puts(" bytes/ch/addr="); sh_putdec(d->frame_bytes); sh_puts("/");
+        sh_putdec(d->channel); sh_puts("/"); sh_putdec(d->addresses); sh_puts("\n");
+        wlan_hex("  FC: ", d->frame_control, 4); wlan_hex("  FW status: ", d->status, 8);
+        wlan_hex("  FW flags: ", d->flags, 2); wlan_hex("  Sequence: ", d->sequence, 4);
+        sh_puts("  Key slot/PN/previous="); sh_putdec(d->key_slot); sh_puts("/");
+        sh_putdec(d->pn); sh_puts("/"); sh_putdec(d->previous_pn); sh_puts("\n");
+        wlan_hex("  EtherType candidate: ", d->ether_type, 4);
+        sh_puts("  Header bytes/UDP source/destination="); sh_putdec(d->header_bytes); sh_puts("/");
+        sh_putdec(d->udp_source); sh_puts("/"); sh_putdec(d->udp_destination); sh_puts("\n");
+        wlan_hex("  DHCP xid candidate: ", d->dhcp_xid, 8);
+    }
+    sh_puts("EAPOL TX trace overwritten: "); sh_putdec(s->eapol_tx_overwritten); sh_puts("\n");
+    for (unsigned i = 0; i < s->eapol_tx_count && i < IWX_LINK_TRACE_MAX; i++) {
+        const iwx_tx_sample_t *d = &s->eapol_tx[(s->eapol_tx_next + IWX_LINK_TRACE_MAX - s->eapol_tx_count + i) % IWX_LINK_TRACE_MAX];
+        sh_puts("TX ms="); sh_putdec(d->submitted_ns / 1000000); sh_puts(" kind=");
+        sh_puts(d->kind == 1 ? "M2" : d->kind == 2 ? "M4" : d->kind == 3 ? "group" : "unknown");
+        sh_puts(" queue/index="); sh_putdec(d->queue); sh_puts("/"); sh_putdec(d->index);
+        sh_puts(d->dma_match ? " DMA-copy=match\n" : " DMA-copy=MISMATCH\n");
+        sh_puts("  bytes/bc/tb0/tb1/tb2="); sh_putdec(d->frame_bytes); sh_puts("/");
+        sh_putdec(d->byte_count);
+        for (unsigned j = 0; j < 3; j++) { sh_puts("/"); sh_putdec(d->tb_bytes[j]); }
+        sh_puts("\n"); wlan_hex("  FC: ", d->frame_control, 4);
+        wlan_hex("  Command flags: ", d->command_flags, 8); wlan_hex("  Rate: ", d->rate, 8);
+        sh_puts("  EAPOL version="); sh_putdec(d->version); sh_puts("\n");
+        wlan_hex("  Key info: ", d->key_info, 4);
+        if (!d->completed) { sh_puts("  Completion: pending\n"); continue; }
+        sh_puts("  Completed ms="); sh_putdec(d->completed_ns / 1000000);
+        sh_puts(" RTS/no-ACK/BT="); sh_putdec(d->rts_failures); sh_puts("/");
+        sh_putdec(d->ack_failures); sh_puts("/"); sh_putdec(d->bt_kills); sh_puts("\n");
+        wlan_hex("  Firmware TX status (not WPA acceptance): ", d->status, 4);
+        wlan_hex("  Completion rate: ", d->completion_rate, 8);
+    }
+}
+
+static void wlan_selftest_report(void)
+{
+    static const char *names[] = {"HMAC-SHA1", "PBKDF2-PMK", "PTK", "PMKID", "M2-MIC", "AES-unwrap"};
+    _Static_assert(sizeof(names) / sizeof(names[0]) == WPA2_TEST_COUNT, "selftest names");
+    sh_puts("WPA2 selftest: public vectors, no radio or credentials\n");
+    unsigned failed = wpa2_selftest();
+    for (unsigned i = 0; i < WPA2_TEST_COUNT; i++) {
+        sh_puts("WPA2 KAT "); sh_puts(names[i]); sh_puts(failed & (1U << i) ? ": FAIL\n" : ": PASS\n");
+    }
+    sh_puts(failed ? "WPA2 selftest: FAIL\n" : "WPA2 selftest: PASS (6/6)\n");
+}
+
+static void wlan_link_report(void)
+{
+    iwx_link_status_t s;
+    if (iwx_link_status(&s)) { sh_puts("WLAN link: busy\n"); return; }
+    sh_puts("WLAN link: "); sh_puts(wlan_link_state_text(s.state)); sh_puts("\n");
+    sh_puts("Channel/AID/AP status/reason: "); sh_putdec(s.channel); sh_puts("/");
+    sh_putdec(s.aid); sh_puts("/"); sh_putdec(s.peer_status); sh_puts("/"); sh_putdec(s.reason); sh_puts("\n");
+    sh_puts(s.port_open ? "Data port: open\n" : "Data port: closed\n");
+    sh_puts("Link TX sent/completed/failed: "); sh_putdec(s.tx_sent); sh_puts("/");
+    sh_putdec(s.tx_completed); sh_puts("/"); sh_putdec(s.tx_failed); sh_puts("\n");
+    sh_puts("Data TX legacy rate: "); sh_putdec(s.data_rate_kbps); sh_puts(" kbps\n");
+    if (s.queue_response) {
+        sh_puts("TX queue response bytes/id/flags/write/reserved: "); sh_putdec(s.queue_bytes); sh_puts("/");
+        sh_putdec(s.queue_id); sh_puts("/"); sh_putdec(s.queue_flags); sh_puts("/");
+        sh_putdec(s.queue_write_pointer); sh_puts("/"); sh_putdec(s.queue_reserved); sh_puts("\n");
+    }
+    sh_puts("Link RX ignored/malformed: "); sh_putdec(s.rx_ignored); sh_puts("/");
+    sh_putdec(s.rx_malformed); sh_puts("\n");
+    sh_puts("EAPOL accepted/dropped, key installs: "); sh_putdec(s.eapol_received); sh_puts("/");
+    sh_putdec(s.eapol_dropped); sh_puts(", "); sh_putdec(s.key_installs); sh_puts("\n");
+    sh_puts("EAPOL RX queue/size drops: "); sh_putdec(s.eapol_ingress_dropped); sh_puts("\n");
+    sh_puts("WPA2 M1 PMKID mismatches (advisory): "); sh_putdec(s.pmkid_mismatches); sh_puts("\n");
+    if (s.eapol_last_drop.reason) {
+        const wpa2_rx_diagnostic_t *d = &s.eapol_last_drop;
+        static const char *states[] = {"off", "wait M1", "wait M3", "install",
+            "wait M4 TX", "wait group", "established", "group install", "wait group TX", "failed"};
+        sh_puts("WPA2 last rejection: "); sh_puts(d->reason); sh_puts("\n");
+        sh_puts("WPA2 RX state: ");
+        sh_puts((unsigned)d->state < sizeof(states) / sizeof(states[0]) ? states[d->state] : "unknown");
+        sh_puts("\nWPA2 RX bytes/body/version/type/descriptor: ");
+        sh_putdec(d->bytes); sh_puts("/"); sh_putdec(d->body_bytes); sh_puts("/");
+        sh_putdec(d->version); sh_puts("/"); sh_putdec(d->packet_type); sh_puts("/");
+        sh_putdec(d->descriptor); sh_puts("\n");
+        wlan_hex("WPA2 RX key info: ", d->key_info, 4);
+        sh_puts("WPA2 RX key/data bytes: "); sh_putdec(d->key_bytes); sh_puts("/");
+        sh_putdec(d->data_bytes); sh_puts("\n");
+    }
+    sh_puts("Ethernet TX queued/dropped, RX queued/dropped: "); sh_putdec(s.data_tx); sh_puts("/");
+    sh_putdec(s.data_tx_dropped); sh_puts(", "); sh_putdec(s.data_rx); sh_puts("/");
+    sh_putdec(s.data_rx_dropped); sh_puts("\n");
+    if (s.error) { sh_puts("Link detail: "); sh_puts(s.error); sh_puts("\n"); }
+    wlan_link_diagnostics(&s);
+}
+
+static bool wlan_parse_bssid(const char *s, uint8_t address[6])
+{
+    if (strlen(s) != 17) return false;
+    for (unsigned i = 0; i < 6; i++) {
+        unsigned byte = 0;
+        for (unsigned j = 0; j < 2; j++) {
+            unsigned c = (unsigned char)s[i * 3 + j];
+            if (c >= '0' && c <= '9') c -= '0';
+            else if (c >= 'a' && c <= 'f') c = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') c = c - 'A' + 10;
+            else return false;
+            byte = byte * 16 + c;
+        }
+        address[i] = byte;
+        if (i < 5 && s[i * 3 + 2] != ':') return false;
+    }
+    return true;
+}
+
+static bool wlan_connect_allowed(void)
+{
+    extern int sched_current_get(void);
+    if (!nic_is_iwx()) {
+        sh_puts("wlan: Wi-Fi is not the selected NIC; existing Ethernet is unchanged\n"); return false;
+    }
+    if (shell_console_owner < 0 || sched_current_get() != shell_console_owner || sh_stdin_buf || sh_redir_fn) {
+        sh_puts("wlan connect requires the interactive console without redirection\n"); return false;
+    }
+    iwx_status_t runtime;
+    iwx_link_status_t link;
+    if (iwx_get_status(&runtime) || iwx_link_status(&link)) {
+        sh_puts("wlan: transport busy; retry wlan connect\n"); return false;
+    }
+    if (runtime.state != IWX_ACTIVE) {
+        sh_puts("wlan: run wlan start <firmware> before connecting\n"); return false;
+    }
+    if (link.state != IWX_LINK_IDLE) {
+        sh_puts("wlan: link already active or awaiting cleanup; use wlan status\n");
+        sh_puts("To change networks, run wlan stop, then wlan start <firmware>.\n"); return false;
+    }
+    return true;
+}
+
+static const char *wlan_network_error(const iwx_bss_t *b)
+{
+    if (!b->ssid_len || b->ssid_len > sizeof(b->ssid)) return "hidden SSID is not supported";
+    if ((b->capability & 3) != 1) return "not an infrastructure network";
+    if (b->rsn) {
+        if (!(b->capability & 16)) return "inconsistent RSN/privacy advertisement";
+        return wpa2_rsn_check(b->rsn_ie, b->rsn_len);
+    }
+    return b->wpa || (b->capability & 16) ? "legacy WPA/WEP is not supported" : NULL;
+}
+
+static void wlan_network_print(const iwx_bss_t *b)
+{
+    char ssid[129];
+    iwx_ssid_text(ssid, b->ssid, b->ssid_len);
+    sh_puts("\""); sh_puts(b->ssid_len ? ssid : "<hidden>"); sh_puts("\"\n    ");
+    for (unsigned j = 0; j < 6; j++) {
+        const char *hex = "0123456789abcdef";
+        char byte[3] = {hex[b->bssid[j] >> 4], hex[b->bssid[j] & 15], 0};
+        if (j) sh_puts(":");
+        sh_puts(byte);
+    }
+    sh_puts(" ch="); sh_putdec(b->channel); sh_puts(" signal=");
+    if (b->signal_dbm == -256) sh_puts("unknown");
+    else {
+        if (b->signal_dbm < 0) sh_puts("-");
+        sh_putdec(b->signal_dbm < 0 ? -b->signal_dbm : b->signal_dbm); sh_puts("dBm");
+    }
+    const char *error = wlan_network_error(b);
+    if (error) {
+        sh_puts(" unavailable: "); sh_puts(error); sh_puts("\n");
+    } else sh_puts(!b->rsn ? " OPEN\n" : b->rsn_ie[5] == WPA2_CIPHER_TKIP ?
+                   " WPA2-PSK/CCMP (TKIP group)\n" : " WPA2-PSK/CCMP\n");
+}
+
+static void wlan_connect_selected(const iwx_bss_t *selected, bool rsn)
+{
+    extern int sched_sleep_ticks(uint64_t ticks);
+    extern int term_read_secret(const char *prompt, char *buf, unsigned capacity, bool echo);
+    extern bool net_link_ready(void);
+    extern int dhcp_discover(void);
+    const char *error = wlan_network_error(selected);
+    if (rsn != selected->rsn) error = "security mode does not match the observed network";
+    if (error) { sh_puts("wlan: "); sh_puts(error); sh_puts("\n"); return; }
+    sh_puts("wlan: selected "); wlan_network_print(selected);
+    uint8_t pmk[32] = {0};
+    if (rsn) {
+        char password[64];
+        const bool echo_password = false;
+        int length = term_read_secret(echo_password ? "WPA2 password (visible): "
+                                                   : "WPA2 password (not echoed): ",
+                                      password, sizeof(password), echo_password);
+        int result = length < 0 ? -1 : wpa2_pmk((const uint8_t *)password, (unsigned)length,
+                                                selected->ssid, selected->ssid_len, pmk);
+        wpa2_clear(password, sizeof(password));
+        if (result) {
+            wpa2_clear(pmk, sizeof(pmk));
+            sh_puts("wlan: cancelled or invalid password (8..63 ASCII characters required)\n"); return;
+        }
+    }
+    error = iwx_connect_network(selected, rsn ? pmk : NULL);
+    if (error) {
+        wpa2_clear(pmk, sizeof(pmk));
+        sh_puts("wlan: "); sh_puts(error); sh_puts("\n");
+        wlan_link_report();
+        return;
+    }
+    sh_puts("wlan: waiting for association and data-port authorization...\n");
+    uint64_t start = idt_get_ticks();
+    bool ready = false;
+    enum iwx_link_state previous = IWX_LINK_IDLE;
+    while (idt_get_ticks() - start < 3000) {
+        iwx_link_status_t link;
+        net_poll();
+        if (!iwx_link_status(&link)) {
+            if (link.state != previous) {
+                sh_puts("wlan: "); sh_puts(wlan_link_state_text(link.state));
+                if (link.state == IWX_LINK_ASSOCIATED && !link.port_open)
+                    sh_puts(rsn ? "; waiting for WPA2 key exchange" : "; authorizing data port");
+                sh_puts("\n"); previous = link.state;
+            }
+            if (link.state == IWX_LINK_FAILED || link.state == IWX_LINK_STOPPED) break;
+            if (link.port_open && net_link_ready()) { ready = true; break; }
+        }
+        if (sched_sleep_ticks(1) < 0) sched_yield();
+    }
+    if (!ready) {
+        wpa2_clear(pmk, sizeof(pmk));
+        wlan_link_report();
+        sh_puts("wlan: connection failed or timed out; stopping transport\n");
+        iwx_probe_report_t report;
+        if (iwx_stop(&report)) { sh_puts("wlan: stop incomplete; use wlan stop and status\n"); }
+        net_poll();
+        return;
+    }
+    if (driver_wlan_remember(selected, rsn ? pmk : NULL))
+        sh_puts("wlan: connected, but profile could not be saved\n");
+    else sh_puts("wlan: trusted network saved for automatic reconnection\n");
+    wpa2_clear(pmk, sizeof(pmk));
+    wlan_link_report();
+    sh_puts("wlan: data port authorized; requesting IPv4 via DHCP...\n");
+    if (dhcp_discover()) sh_puts("wlan: linked, but DHCP failed; retry dhcp or configure link-local with apipa\n");
+    else sh_puts("wlan: IPv4 configured; use ifconfig, resolve, ping and curl to test connectivity\n");
+}
+
+static void wlan_connect_command(const uint8_t bssid[6], bool rsn)
+{
+    if (!wlan_connect_allowed()) return;
+    iwx_bss_t *networks = kmalloc(sizeof(*networks) * IWX_SCAN_BSS_MAX);
+    if (!networks) { sh_puts("wlan: no memory for scan snapshot\n"); return; }
+    iwx_scan_status_t scan;
+    iwx_bss_t selected = {0};
+    unsigned matches = 0;
+    int count = iwx_scan_results(&scan, networks, IWX_SCAN_BSS_MAX);
+    if (count >= 0 && scan.state == IWX_SCAN_COMPLETE) {
+        for (int i = 0; i < count; i++) if (!memcmp(networks[i].bssid, bssid, 6)) {
+            selected = networks[i]; matches++;
+        }
+    }
+    kfree(networks);
+    if (matches != 1) { sh_puts("wlan: scan first; BSSID must identify one observed network\n"); return; }
+    wlan_connect_selected(&selected, rsn);
+}
+
+static int wlan_connect_scan(iwx_bss_t *networks, bool refresh)
+{
+    extern int sched_sleep_ticks(uint64_t ticks);
+    iwx_scan_status_t scan;
+    if (iwx_scan_results(&scan, NULL, 0) < 0) {
+        sh_puts("wlan: scan busy; retry wlan connect\n"); return -1;
+    }
+    if (refresh || (scan.state != IWX_SCAN_COMPLETE && scan.state != IWX_SCAN_RUNNING &&
+                    scan.state != IWX_SCAN_ABORTING)) {
+        const char *error = iwx_scan_start();
+        if (error) { sh_puts("wlan: "); sh_puts(error); sh_puts("\n"); return -1; }
+    }
+    sh_puts("wlan: reading passive scan results...\n");
+    uint64_t start = idt_get_ticks();
+    while (idt_get_ticks() - start < 3500) {
+        net_poll();
+        if (iwx_scan_results(&scan, NULL, 0) >= 0) {
+            if (scan.state == IWX_SCAN_COMPLETE) {
+                int count = iwx_scan_results(&scan, networks, IWX_SCAN_BSS_MAX);
+                if (count >= 0 && scan.state == IWX_SCAN_COMPLETE) return count;
+            } else if (scan.state != IWX_SCAN_RUNNING && scan.state != IWX_SCAN_ABORTING) {
+                sh_puts("wlan: scan incomplete");
+                if (scan.error) { sh_puts(": "); sh_puts(scan.error); }
+                sh_puts("\n"); return -1;
+            }
+        }
+        if (sched_sleep_ticks(1) < 0) sched_yield();
+    }
+    sh_puts("wlan: scan wait timed out; use wlan status or wlan abort\n");
+    return -1;
+}
+
+static void wlan_connect_assistant(void)
+{
+    if (!wlan_connect_allowed()) return;
+    iwx_bss_t *networks = kmalloc(sizeof(*networks) * IWX_SCAN_BSS_MAX);
+    if (!networks) { sh_puts("wlan: no memory for scan snapshot\n"); return; }
+    int count = wlan_connect_scan(networks, false);
+    unsigned page = 0;
+    while (count >= 0) {
+        unsigned pages = count ? ((unsigned)count + 5) / 6 : 1;
+        sh_puts("Wi-Fi networks: "); sh_putdec(count);
+        sh_puts("; page "); sh_putdec(page + 1); sh_puts("/"); sh_putdec(pages); sh_puts("\n");
+        if (!count) sh_puts("No networks found.\n");
+        for (unsigned i = page * 6; i < (unsigned)count && i < (page + 1) * 6; i++) {
+            sh_putdec(i + 1); sh_puts(". "); wlan_network_print(&networks[i]);
+        }
+        sh_puts("Number = connect; r = rescan; n/p = page; q or empty = cancel\n");
+        char *answer = NULL;
+        uint64_t length = 0;
+        int rc = term_readline_alloc("Wi-Fi> ", &answer, &length);
+        if (rc || !length || (length == 1 && answer[0] == 'q')) {
+            kfree(answer);
+            sh_puts(rc == -2 ? "wlan: no memory for selection\n" : "wlan: cancelled\n"); break;
+        }
+        unsigned choice = 0;
+        char action = length == 1 ? answer[0] : 0;
+        /* Never accept a truncated prefix of pasted input as a network index. */
+        if (length <= 3) {
+            for (uint64_t i = 0; i < length; i++) {
+                if (answer[i] < '0' || answer[i] > '9') { choice = 0; break; }
+                choice = choice * 10 + (unsigned)(answer[i] - '0');
+            }
+        }
+        kfree(answer);
+        if (action == 'r') { count = wlan_connect_scan(networks, true); page = 0; continue; }
+        if (action == 'n') { if (page + 1 < pages) page++; continue; }
+        if (action == 'p') { if (page) page--; continue; }
+        if (!choice || choice > (unsigned)count) {
+            sh_puts("wlan: invalid selection\n"); continue;
+        }
+        const char *error = wlan_network_error(&networks[choice - 1]);
+        if (error) { sh_puts("wlan: "); sh_puts(error); sh_puts("\n"); continue; }
+        /* Preserve the displayed identity across the password prompt. The driver
+         * revalidates SSID, BSSID, channel and RSN before any association TX. */
+        iwx_bss_t selected = networks[choice - 1];
+        kfree(networks);
+        wlan_connect_selected(&selected, selected.rsn);
+        return;
+    }
+    kfree(networks);
+}
+
+static void wlan_connect_usage(void)
+{
+    sh_puts("Usage: wlan connect\n");
+    sh_puts("       wlan connect wpa2 <BSSID>\n");
+    sh_puts("       wlan connect open <BSSID>\n");
+}
+
+static void cmd_wlan_connect(int argc, char *argv[])
+{
+    if (argc == 2) { wlan_connect_assistant(); return; }
+    uint8_t bssid[6];
+    if (argc != 4 || (strcmp(argv[2], "open") && strcmp(argv[2], "wpa2")) ||
+        !wlan_parse_bssid(argv[3], bssid)) {
+        wlan_connect_usage(); return;
+    }
+    wlan_connect_command(bssid, !strcmp(argv[2], "wpa2"));
+}
+
+static int wlan_manual_pause(int argc, char *argv[])
+{
+    /* Manual firmware startup prepares a new selection; it must not let the
+     * worker rejoin a saved network before the next interactive command. */
+    if ((argc == 2 && !strcmp(argv[1], "stop")) ||
+        (argc == 3 && (!strcmp(argv[1], "start") || !strcmp(argv[1], "starttrace"))))
+        return 1;
+    if (argc >= 2 && (!strcmp(argv[1], "connect") || !strcmp(argv[1], "auto")))
+        return 0;
+    return -1;
+}
+
+static void cmd_wlan(int argc, char *argv[])
+{
+    if (driver_wlan_command(argc, argv)) return;
+    if (argc == 2 && !strcmp(argv[1], "selftest")) { wlan_selftest_report(); return; }
+    if (argc >= 2 && !strcmp(argv[1], "connect")) { cmd_wlan_connect(argc, argv); return; }
+    if (argc == 4 && !strcmp(argv[1], "associate")) {
+        uint8_t bssid[6];
+        if ((strcmp(argv[2], "open") && strcmp(argv[2], "wpa2")) || !wlan_parse_bssid(argv[3], bssid)) {
+            sh_puts("Usage: wlan associate wpa2 <BSSID>\n");
+            sh_puts("       wlan associate open <BSSID>\n"); return;
+        }
+        const char *err = iwx_associate(bssid, !strcmp(argv[2], "wpa2"));
+        if (err) { sh_puts("wlan: "); sh_puts(err); sh_puts("\n"); }
+        wlan_link_report();
+        return;
+    }
+    if (argc == 2 && (!strcmp(argv[1], "scan") || !strcmp(argv[1], "abort") ||
+                      !strcmp(argv[1], "networks"))) {
+        bool list = !strcmp(argv[1], "networks");
+        const char *err = list ? NULL : !strcmp(argv[1], "scan") ? iwx_scan_start() : iwx_scan_abort();
+        if (err) { sh_puts("wlan: "); sh_puts(err); sh_puts("\n"); }
+        wlan_scan_report(list);
+        return;
+    }
+    if (argc == 2 && strcmp(argv[1], "stop") == 0) {
+        iwx_probe_report_t r;
+        iwx_stop(&r);
+        net_poll();
+        wlan_boot_report(&r);
+        return;
+    }
+    bool start = argc == 3 && (strcmp(argv[1], "start") == 0 || strcmp(argv[1], "starttrace") == 0);
+    bool nvm = start || (argc == 3 && (strcmp(argv[1], "nvm") == 0 || strcmp(argv[1], "nvmtrace") == 0));
+    bool fwtrace = argc == 3 && (strcmp(argv[1], "fwtrace") == 0 ||
+                    strcmp(argv[1], "nvmtrace") == 0 || strcmp(argv[1], "starttrace") == 0);
+    bool fwboot = argc == 3 && (nvm || fwtrace || strcmp(argv[1], "fwboot") == 0);
+    if (argc == 3 && (fwboot || strcmp(argv[1], "firmware") == 0)) {
+        if (fwtrace) {
+            sh_puts("wlan: slow persistent trace; checkpoint I/O changes boot timing\n");
+            if (!wlan_progress(NULL, "wlan-file-lookup", NULL)) return;
+        }
+        vfs_node_t file;
+        if (!vfs_find(argv[2], VFS_MODE_NATIVE, &file)) {
+            sh_puts("wlan: firmware file not found\n");
+            return;
+        }
+        if (file.size < 88 || file.size > IWX_FW_MAX_SIZE) {
+            sh_puts("wlan: firmware size outside 88 bytes..4 MiB\n");
+            return;
+        }
+        if (fwtrace && !wlan_progress(NULL, "wlan-file-allocate", NULL)) return;
+        uint8_t *buf = kmalloc(file.size);
+        if (!buf) { sh_puts("wlan: no memory for firmware inspection\n"); return; }
+        if (fwtrace && !wlan_progress(NULL, "wlan-file-read", NULL)) { kfree(buf); return; }
+        uint64_t done = 0;
+        while (done < file.size) {
+            int n = vfs_read(&file, done, buf + done, file.size - done);
+            if (n <= 0 || (uint64_t)n > file.size - done) break;
+            done += (uint64_t)n;
+        }
+        if (done != file.size) {
+            kfree(buf);
+            sh_puts("wlan: short read or filesystem error\n");
+            return;
+        }
+        if (fwboot) {
+            if (fwtrace && !wlan_progress(NULL, "wlan-file-ready", NULL)) { kfree(buf); return; }
+            sh_puts(start ? "wlan: starting persistent firmware/NVM transport; no association\n" :
+                    nvm ? "wlan: firmware init/NVM diagnostic, then shutdown; no association\n" :
+                          "wlan: firmware boot/ALIVE diagnostic, then shutdown; no association\n");
+            iwx_probe_report_t r;
+            iwx_nvm_report_t nr;
+            if (start) iwx_start(buf, done, &r, &nr, fwtrace ? wlan_progress : NULL, NULL);
+            else if (nvm) iwx_fw_nvm(buf, done, &r, &nr, fwtrace ? wlan_progress : NULL, NULL);
+            else if (fwtrace) iwx_fw_boot_traced(buf, done, &r, wlan_progress, NULL);
+            else iwx_fw_boot(buf, done, &r);
+            kfree(buf);
+            wlan_boot_report(&r);
+            if (nvm) wlan_nvm_report(&nr);
+            if (start) wlan_runtime_report();
+            if (fwtrace) {
+                sh_puts("Progress checkpoints: "); sh_putdec(r.progress_count);
+                sh_puts("; deferred during MAC access: "); sh_putdec(r.progress_deferred); sh_puts("\n");
+                if (r.progress_failed_at) {
+                    sh_puts("Persistence failed at: "); sh_puts(r.progress_failed_at); sh_puts("\n");
+                }
+            }
+            return;
+        }
+        iwx_fw_info_t info;
+        const char *err = iwx_fw_inspect(buf, done, &info);
+        kfree(buf);
+        if (err) { sh_puts("wlan: "); sh_puts(err); sh_puts("\n"); return; }
+        sh_puts("wlan: API-77 TLV layout valid; firmware NOT loaded\n");
+        sh_puts("Version: "); sh_putdec(info.version[0]); sh_puts(".");
+        wlan_hex("", info.version[1], 8);
+        wlan_hex("PHY config: ", info.phy_config, 8);
+        sh_puts("LMAC/UMAC/paging sections: ");
+        for (int i = 0; i < 3; i++) {
+            if (i) sh_puts("/");
+            sh_putdec(info.sections[i]);
+        }
+        sh_puts("; paging bytes: "); sh_putdec(info.paging_size);
+        sh_puts("; command versions: "); sh_putdec(info.commands); sh_puts("\n");
+        sh_puts("Container inspection does not authenticate firmware or select a radio SKU.\n");
+        return;
+    }
+    bool probe = argc == 2 && strcmp(argv[1], "probe") == 0;
+    if (!probe && argc != 1 && !(argc == 2 && strcmp(argv[1], "status") == 0)) {
+        sh_puts("Usage: wlan [status|probe|stop|scan|networks|abort|selftest]\n");
+        sh_puts("       wlan firmware|fwboot|fwtrace|nvm|nvmtrace|start|starttrace <path>\n");
+        sh_puts("       wlan associate wpa2 <BSSID>\n");
+        sh_puts("       wlan associate open <BSSID>\n");
+        wlan_connect_usage();
+        sh_puts("connect alone opens the network selection assistant.\n");
+        sh_puts("connect prompts locally for WPA2 credentials; associate is diagnostic only.\n");
+        return;
+    }
+    if (!probe) { wlan_runtime_report(); wlan_scan_report(false); wlan_link_report(); }
+    uint64_t pinned = iwx_retained_bytes();
+    if (pinned) {
+        sh_puts("WLAN DMA quarantined bytes: "); sh_putdec(pinned);
+        sh_puts("; run wlan stop before retry or kexec\n");
+    }
+    const pci_dev_t *d = pci_get_wlan();
+    if (!d) { sh_puts("wlan: no supported AX200 (8086:2723) detected\n"); return; }
+    sh_puts("AX200 8086:2723 PCI "); sh_putdec(d->bus); sh_puts(":");
+    sh_putdec(d->dev); sh_puts("."); sh_putdec(d->func); sh_puts("\n");
+    if (probe) {
+        sh_puts("wlan: probing hardware with DMA disabled; device will be stopped\n");
+        iwx_probe_report_t r;
+        int rc = iwx_probe(&r);
+        sh_puts("Stage: "); sh_puts(r.stage); sh_puts("\n");
+        if (rc) { sh_puts("Error: "); sh_puts(r.error); sh_puts("\n"); }
+        wlan_hex("BAR0: ", r.bar0, 16);
+        wlan_hex("HW_REV: ", r.hw_rev, 8); wlan_hex("HW_RF_ID: ", r.hw_rf_id, 8);
+        wlan_hex("GP_CNTRL: ", r.gp_cntrl, 8); wlan_hex("RESET: ", r.reset, 8);
+        wlan_hex("INT (before probe): ", r.interrupt, 8);
+        wlan_hex("PCI command (before): ", r.command_before, 4);
+        wlan_hex("PCI command (after): ", r.command_after, 4);
+        sh_puts(r.clock_ready ? "MAC clock: ready\n" : "MAC clock: not confirmed\n");
+        sh_puts(!r.rfkill_known ? "Radio switch: unknown\n" :
+                r.rfkill ? "Radio switch: blocked\n" : "Radio switch: enabled\n");
+        sh_puts(r.stopped ? "Device stopped; no firmware running\n" :
+                           "Device stop NOT confirmed; inspect error above\n");
+    }
+    sh_puts("IPv4 configuration: use ifconfig; connect runs DHCP after data authorization.\n");
+}
+#endif
 
 static void cmd_ping(int argc, char *argv[])
 {
@@ -2746,293 +3915,58 @@ static void cmd_rag(int argc, char *argv[])
 
 /* ── Builtin: kexec ──────────────────────────────────────────── */
 
-/* Trampoline symbol + size (from kexec_tramp.S) */
-extern void kexec_trampoline(void);
-extern void kexec_trampoline_end(void);
-
-/* Saved boot_info from main.c */
 extern boot_info_t saved_boot_info;
-
-/* ELF64 header (matching elf.c definitions) */
-typedef struct {
-    uint8_t  e_ident[16];
-    uint16_t e_type;
-    uint16_t e_machine;
-    uint32_t e_version;
-    uint64_t e_entry;
-    uint64_t e_phoff;
-    uint64_t e_shoff;
-    uint32_t e_flags;
-    uint16_t e_ehsize;
-    uint16_t e_phentsize;
-    uint16_t e_phnum;
-    uint16_t e_shentsize;
-    uint16_t e_shnum;
-    uint16_t e_shstrndx;
-} kexec_elf64_hdr_t;
-
-typedef struct {
-    uint32_t p_type;
-    uint32_t p_flags;
-    uint64_t p_offset;
-    uint64_t p_vaddr;
-    uint64_t p_paddr;
-    uint64_t p_filesz;
-    uint64_t p_memsz;
-    uint64_t p_align;
-} kexec_elf64_phdr_t;
-
-/* Segment copy descriptor for trampoline */
-typedef struct {
-    uint64_t src;
-    uint64_t dst;
-    uint64_t len;
-} kexec_seg_t;
-
-/* APIC registers for shutdown */
-#define KEXEC_APIC_BASE    0xFEE00000
-#define KEXEC_APIC_SVR     0xF0
-#define KEXEC_APIC_ICR_LO  0x300
-#define KEXEC_APIC_ICR_HI  0x310
-#define KEXEC_APIC_LVT_TMR 0x320
 
 static void cmd_kexec(const char *arg)
 {
-    const char *filename = (arg && *arg) ? arg : "kernel.elf";
-
-    sh_puts("kexec: loading ");
-    sh_puts(filename);
-    sh_puts(" from OsitoFS...\n");
-
-    /* Step 1: Read ELF from disk */
-    void *file = osfs2_find(filename);
-    if (!file) {
-        sh_puts_color("  File not found\n", 0x00FF0000);
-        return;
-    }
-
-    uint64_t file_size = osfs2_file_size(file);
-    if (file_size < 64 || file_size > 8 * 1024 * 1024) {
-        sh_puts_color("  Invalid file size\n", 0x00FF0000);
-        return;
-    }
-
-    uint8_t *elf_data = (uint8_t *)kmalloc(file_size);
-    if (!elf_data) {
-        sh_puts_color("  Out of memory\n", 0x00FF0000);
-        return;
-    }
-
-    if (osfs2_read(file, 0, elf_data, file_size) < 0) {
-        sh_puts_color("  Read failed\n", 0x00FF0000);
-        kfree(elf_data);
-        return;
-    }
-
-    /* Step 2: Validate ELF header — kexec is ring-0 with no return.
-     * A bad jump can reboot the box (we've already burned a couple of
-     * test cycles to that), so we're paranoid: every byte that the
-     * ELF spec lets us check, we check.  Tradeoff: refuse to run a
-     * potentially-good kernel rather than gamble on a partial download.
-     */
-    kexec_elf64_hdr_t *ehdr = (kexec_elf64_hdr_t *)elf_data;
-    if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
-        ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F') {
-        sh_puts_color("  validate: bad ELF magic\n", 0x00FF0000);
-        kfree(elf_data); return;
-    }
-    if (ehdr->e_ident[4] != 2) {  /* EI_CLASS: ELFCLASS64 */
-        sh_puts_color("  validate: not ELF64\n", 0x00FF0000);
-        kfree(elf_data); return;
-    }
-    if (ehdr->e_ident[5] != 1) {  /* EI_DATA: little-endian */
-        sh_puts_color("  validate: not little-endian\n", 0x00FF0000);
-        kfree(elf_data); return;
-    }
-    if (ehdr->e_type != 2) {      /* ET_EXEC */
-        sh_puts_color("  validate: e_type != ET_EXEC (got 0x", 0x00FF0000);
-        serial_puthex(ehdr->e_type, 4); sh_puts_color(")\n", 0x00FF0000);
-        kfree(elf_data); return;
-    }
-    if (ehdr->e_machine != 0x3E) { /* EM_X86_64 */
-        sh_puts_color("  validate: e_machine != X86_64 (got 0x", 0x00FF0000);
-        serial_puthex(ehdr->e_machine, 4); sh_puts_color(")\n", 0x00FF0000);
-        kfree(elf_data); return;
-    }
-    /* Entry point must be in the high-half kernel range (we only
-     * support upper-half kernels — UEFI loads us at 0xFFFF8000_xxxxxxxx). */
-    if ((ehdr->e_entry >> 32) != 0xFFFF8000ULL) {
-        sh_puts_color("  validate: entry not in upper-half (0xFFFF8000_*); got 0x",
-                       0x00FF0000);
-        serial_puthex(ehdr->e_entry, 16); sh_puts_color("\n", 0x00FF0000);
-        kfree(elf_data); return;
-    }
-    /* Sanity: phnum/phentsize/phoff inside file */
-    if (ehdr->e_phnum == 0 || ehdr->e_phnum > 16 ||
-        ehdr->e_phentsize != 56 ||
-        ehdr->e_phoff + (uint64_t)ehdr->e_phnum * 56 > file_size) {
-        sh_puts_color("  validate: phdr table out of bounds\n", 0x00FF0000);
-        kfree(elf_data); return;
-    }
-    /* Walk PT_LOAD segments; require at least one and check filesz/offset. */
-    int n_load = 0;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        kexec_elf64_phdr_t *ph = (kexec_elf64_phdr_t *)
-            (elf_data + ehdr->e_phoff + i * 56);
-        if (ph->p_type != 1) continue;
-        n_load++;
-        if (ph->p_offset + ph->p_filesz > file_size ||
-            ph->p_filesz > ph->p_memsz) {
-            sh_puts_color("  validate: PT_LOAD segment overflows file\n",
-                           0x00FF0000);
-            kfree(elf_data); return;
-        }
-        /* Each load vaddr must also be in upper-half */
-        if ((ph->p_vaddr >> 32) != 0xFFFF8000ULL) {
-            sh_puts_color("  validate: PT_LOAD vaddr not upper-half\n",
-                           0x00FF0000);
-            kfree(elf_data); return;
-        }
-    }
-    if (n_load == 0) {
-        sh_puts_color("  validate: no PT_LOAD segments\n", 0x00FF0000);
-        kfree(elf_data); return;
-    }
-
-    sh_puts("  validate: OK (ELF64 x86_64 ET_EXEC, entry=0x");
-    serial_puthex(ehdr->e_entry, 16);
-    sh_puts(", ");
-    sh_putdec(n_load);
-    sh_puts(" PT_LOADs)\n");
-
-    /* Step 3: Parse PT_LOAD segments, copy to temp area at 0x8000000 (128MB) */
-    #define KEXEC_TEMP_BASE  0x8000000ULL
-    #define KEXEC_MAX_SEGS   8
-
-    kexec_seg_t segs[KEXEC_MAX_SEGS];
-    int nseg = 0;
-    uint64_t temp_off = 0;
-    uint64_t kernel_lo = ~0ULL, kernel_hi = 0;
-
-    for (int i = 0; i < ehdr->e_phnum && nseg < KEXEC_MAX_SEGS; i++) {
-        uint64_t phoff = ehdr->e_phoff + i * ehdr->e_phentsize;
-        if (phoff + sizeof(kexec_elf64_phdr_t) > file_size) break;
-
-        kexec_elf64_phdr_t *ph = (kexec_elf64_phdr_t *)(elf_data + phoff);
-        if (ph->p_type != 1 /* PT_LOAD */ || ph->p_memsz == 0) continue;
-
-        /* Copy file data to temp area */
-        uint64_t temp_addr = KEXEC_TEMP_BASE + temp_off;
-        uint8_t *dst = (uint8_t *)temp_addr;
-
-        /* Zero the full memsz range (covers BSS) */
-        for (uint64_t j = 0; j < ph->p_memsz; j++)
-            dst[j] = 0;
-
-        /* Copy filesz from ELF data */
-        if (ph->p_filesz > 0 && ph->p_offset + ph->p_filesz <= file_size) {
-            uint8_t *src = elf_data + ph->p_offset;
-            for (uint64_t j = 0; j < ph->p_filesz; j++)
-                dst[j] = src[j];
-        }
-
-        /* Record segment for trampoline */
-        segs[nseg].src = temp_addr;
-        segs[nseg].dst = ph->p_paddr;
-        segs[nseg].len = ph->p_memsz;  /* copy full memsz (includes zeroed BSS) */
-        nseg++;
-
-        sh_puts("  LOAD: 0x");
-        serial_puthex(ph->p_paddr, 8);
-        sh_puts(" (");
-        sh_putdec(ph->p_filesz);
-        sh_puts("/");
-        sh_putdec(ph->p_memsz);
-        sh_puts(" bytes)\n");
-
-        /* Track kernel extent */
-        if (ph->p_paddr < kernel_lo) kernel_lo = ph->p_paddr;
-        if (ph->p_paddr + ph->p_memsz > kernel_hi)
-            kernel_hi = ph->p_paddr + ph->p_memsz;
-
-        temp_off += (ph->p_memsz + 4095) & ~4095ULL;  /* page-align */
-    }
-
-    if (nseg == 0) {
-        sh_puts_color("  No LOAD segments found\n", 0x00FF0000);
-        kfree(elf_data);
-        return;
-    }
-
-    /* Step 4: Prepare boot_info_t + mmap copy at safe location */
-    /* Must be above temp range: temp starts at 0x8000000 (128MB), BSS expands ~23MB
-     * so temp ends around 0x9700000 (151MB). Place safe data at 256MB. */
-    #define KEXEC_INFO_ADDR  0x10010000ULL  /* 256MB + 64KB */
-    #define KEXEC_MMAP_ADDR  0x10000000ULL  /* 256MB (room for 64KB mmap) */
-
-    boot_info_t *new_info = (boot_info_t *)KEXEC_INFO_ADDR;
-    *new_info = saved_boot_info;
-    new_info->kernel_phys_base = kernel_lo;
-    new_info->kernel_size = kernel_hi - kernel_lo;
-
-    /* Copy UEFI memory map to safe location (it lives in kernel BSS which gets overwritten) */
-    {
-        uint8_t *mmap_src = (uint8_t *)(uintptr_t)saved_boot_info.mmap_addr;
-        uint8_t *mmap_dst = (uint8_t *)KEXEC_MMAP_ADDR;
-        uint64_t mmap_sz = saved_boot_info.mmap_size;
-        if (mmap_sz > 0x20000) mmap_sz = 0x20000;  /* cap at 128KB */
-        for (uint64_t i = 0; i < mmap_sz; i++)
-            mmap_dst[i] = mmap_src[i];
-        new_info->mmap_addr = KEXEC_MMAP_ADDR;
-        new_info->mmap_size = mmap_sz;
-    }
-
-    /* Step 5: Copy trampoline to safe location (above temp+safe data) */
-    #define KEXEC_TRAMP_ADDR 0x10020000ULL  /* 256MB + 128KB */
-    uint64_t tramp_size = (uint64_t)kexec_trampoline_end - (uint64_t)kexec_trampoline;
-    uint8_t *tramp_dst = (uint8_t *)KEXEC_TRAMP_ADDR;
-    uint8_t *tramp_src = (uint8_t *)(uint64_t)kexec_trampoline;
-    for (uint64_t i = 0; i < tramp_size; i++)
-        tramp_dst[i] = tramp_src[i];
-
-    /* Copy segment table next to trampoline */
-    kexec_seg_t *seg_copy = (kexec_seg_t *)(KEXEC_TRAMP_ADDR + 4096);
-    for (int i = 0; i < nseg; i++)
-        seg_copy[i] = segs[i];
-
-
-    sh_puts_color("\n  Jumping to new kernel...\n\n", 0x0000FF00);
-
-    /* Step 6: Shut down subsystems */
-
-    /* Disable APIC timer (prevent timer interrupts during copy) */
-    volatile uint32_t *apic = (volatile uint32_t *)KEXEC_APIC_BASE;
-    apic[KEXEC_APIC_LVT_TMR / 4] = (1 << 16);  /* mask timer LVT */
-
-    /* Send INIT IPI to all APs (puts them back to wait-for-SIPI state) */
-    apic[KEXEC_APIC_ICR_HI / 4] = 0;
-    apic[KEXEC_APIC_ICR_LO / 4] = 0x000C4500;  /* INIT, all-excluding-self */
-    /* Brief spin wait for INIT to take effect */
-    for (volatile int d = 0; d < 1000000; d++) {}
-
-    /* Disable interrupts */
-    sh_cli();
-
-    /* Step 7: Jump to trampoline */
-    typedef void (*tramp_fn)(void *info, uint64_t entry,
-                             kexec_seg_t *segs, uint64_t nseg);
-    tramp_fn tramp = (tramp_fn)KEXEC_TRAMP_ADDR;
-
-    tramp(new_info, ehdr->e_entry, seg_copy, nseg);
-
-    /* Should never reach here */
-    for (;;) sh_hlt();
+#ifndef __EMSCRIPTEN__
+    kexec_command(arg);
+#else
+    (void)arg;
+    sh_puts("kexec: not available on this architecture\n");
+#endif
 }
 
 /* ── Builtin: reboot ─────────────────────────────────────────── */
 
-static void cmd_reboot(void)
+static void cmd_reboot(int argc, char **argv)
 {
+    if (argc != 1) {
+#ifndef __EMSCRIPTEN__
+        if (argc == 2 && !strcmp(argv[1], "--check")) {
+            int result = acpi_reboot_check();
+            if (shell_remote_active()) remote_io.status = result ? 1 : 0;
+            return;
+        }
+#else
+        (void)argv;
+#endif
+#ifndef __EMSCRIPTEN__
+        sh_puts("Usage: reboot [--check]\n");
+        if (shell_remote_active()) remote_io.status = 126;
+#else
+        sh_puts("Usage: reboot\n");
+#endif
+        return;
+    }
+#ifndef __EMSCRIPTEN__
+    /* Reset on the local console so its final diagnostics cannot depend on
+     * the SSH transport that is about to lose interrupts and connectivity. */
+    if (shell_remote_active()) {
+        char *line = NULL;
+        uint64_t id;
+        if (!sh_redir_fn && !sh_stdin_buf) line = kmalloc(sizeof("reboot"));
+        if (line) memcpy(line, "reboot", sizeof("reboot"));
+        if (!line || !shell_console_submit(line, &id, false)) {
+            kfree(line);
+            sh_puts("reboot: requires an idle local console, memory and no redirection; nothing queued\n");
+            remote_io.status = 126;
+            return;
+        }
+        sh_puts("reboot: queued on local console\n");
+        return;
+    }
+#endif
     sh_puts("Rebooting...\n");
     acpi_reboot();
 }
@@ -3512,25 +4446,149 @@ static void parse_redirects(int *argc, char *argv[], redir_t *r)
 
 /* Captured output buffer for redirection. Non-static so wasm
  * osito_chat_sync can hijack temporarily to capture chat output. */
-char    *redir_buf;
-uint32_t redir_pos;
-uint32_t redir_max;
 
 void redir_capture(const char *s, size_t len)
 {
-    for (size_t i = 0; i < len; i++) {
-        if (redir_pos < redir_max - 1)
-            redir_buf[redir_pos++] = s[i];
-    }
+    if (!shell_capture_append(redir_buf, &redir_pos, redir_max, s, len))
+        redir_overflow = true;
 }
 
 /* ── Dispatch command ────────────────────────────────────────── */
+
+#ifndef __EMSCRIPTEN__
+/* Requote argv instead of feeding a second, unvalidated command language to
+ * the local shell. This IPC bound does not limit locally typed commands. */
+static char *shell_console_launch_line(int argc, char **argv)
+{
+    if (argc < 3 || strcmp(argv[1], "launch")) return NULL;
+    if (!strcmp(argv[2], "desktop") || !strcmp(argv[2], "win32-process-test") ||
+        !strcmp(argv[2], "win32-vm-test") ||
+        !strcmp(argv[2], "sched-signal-test") || !strcmp(argv[2], "gpu-worker-test") ||
+        !strcmp(argv[2], "gpu-render-test")) {
+        if (argc != 3) return NULL;
+    } else if (!strcmp(argv[2], "gpu-native")) {
+        if (argc != 4 || (strcmp(argv[3], "on") && strcmp(argv[3], "off") &&
+                          strcmp(argv[3], "status") && strcmp(argv[3], "render"))) return NULL;
+    } else if (!strcmp(argv[2], "gpu-shader-test")) {
+        if (argc != 4 || !argv[3][0]) return NULL;
+    } else if (!strcmp(argv[2], "reboot")) {
+        if (argc != 4 || strcmp(argv[3], "--check")) return NULL;
+    } else if ((!strcmp(argv[2], "winexec") || !strcmp(argv[2], "dosrun")) && argc >= 4) {
+        if (!argv[3][0]) return NULL;
+    } else return NULL;
+    size_t bytes = 1;
+    for (int i = 2; i < argc; i++) {
+        for (const unsigned char *p = (const unsigned char *)argv[i]; *p; p++) {
+            if (*p < 32 || *p == 127 || *p == '"' || *p == '|' ||
+                *p == '<' || *p == '>' || *p == ';') return NULL;
+            if (++bytes > 4096) return NULL;
+        }
+        bytes += 2 + (i != 2);
+        if (bytes > 4096) return NULL;
+    }
+    char *line = kmalloc(bytes);
+    if (!line) return NULL;
+    char *p = line;
+    for (int i = 2; i < argc; i++) {
+        if (i != 2) *p++ = ' ';
+        *p++ = '"';
+        size_t n = strlen(argv[i]);
+        memcpy(p, argv[i], n); p += n;
+        *p++ = '"';
+    }
+    *p = 0;
+    return line;
+}
+
+static void shell_console_command(int argc, char **argv)
+{
+    if (argc == 2 && !strcmp(argv[1], "status")) {
+        static const char *const phases[] = {"none", "queued", "running", "returned", "cancelled-local-input"};
+        shell_console_lock();
+        bool ready = console_job.ready;
+        enum console_job_phase phase = console_job.phase;
+        uint64_t id = console_job.id;
+        bool stopping = console_job.stop_requested && phase == CONSOLE_RUNNING;
+        shell_console_unlock();
+        sh_puts(ready ? "console: idle\n" : "console: busy\n");
+        sh_puts("last request: "); sh_putdec(id);
+        sh_puts(" "); sh_puts(phases[phase]); sh_puts("\n");
+        if (stopping) sh_puts("stop: requested; waiting for Win32 exit checkpoint\n");
+        return;
+    }
+    if (shell_remote_active() && argc == 3 && !strcmp(argv[1], "stop")) {
+        uint64_t id = 0;
+        const char *p = argv[2];
+        bool valid = *p != 0;
+        for (; *p; p++) {
+            if (*p < '0' || *p > '9' ||
+                id > (UINT64_MAX - (unsigned)(*p - '0')) / 10) {
+                valid = false;
+                break;
+            }
+            id = id * 10 + (unsigned)(*p - '0');
+        }
+        int result = -1;
+        shell_console_lock();
+        if (valid && id && id == console_job.id &&
+            console_job.phase == CONSOLE_RUNNING && console_job.win32 &&
+            console_job.owner_pid > 0) {
+            extern int win32_request_console_exit(int, uint32_t);
+            result = win32_request_console_exit(console_job.owner_pid, 0xC000013AU);
+            if (result >= 0) console_job.stop_requested = true;
+        }
+        shell_console_unlock();
+        if (result < 0) {
+            sh_puts("console: no matching running Win32 request, or exit is not ready\n");
+            remote_io.status = 126;
+        } else {
+            sh_puts("console: stop requested for "); sh_putdec(id);
+            sh_puts("; use console status to confirm return\n");
+        }
+        return;
+    }
+    char *line = shell_remote_active() ? shell_console_launch_line(argc, argv) : NULL;
+    if (!line) {
+        sh_puts("Usage: console status\n"
+                "       console stop <request-id>\n"
+                "       console launch desktop\n"
+                "       console launch win32-process-test\n"
+                "       console launch win32-vm-test\n"
+                "       console launch sched-signal-test\n"
+                "       console launch gpu-worker-test\n"
+                "       console launch gpu-native on|render|off|status\n"
+                "       console launch winexec <path> [args...]\n"
+                "       console launch dosrun <path> [args...]\n"
+                "       console launch reboot --check\n"
+                "Launch requires SSH and an idle local prompt; max 4096 bytes, no redirects.\n");
+        if (shell_remote_active()) remote_io.status = 126;
+        return;
+    }
+    uint64_t id;
+    if (!shell_console_submit(line, &id, !strcmp(argv[2], "winexec"))) {
+        kfree(line);
+        sh_puts("console: local prompt is not idle; nothing queued\n");
+        remote_io.status = 126;
+        return;
+    }
+    sh_puts("console: queued request "); sh_putdec(id);
+    sh_puts(" on local console; use console status for progress\n");
+}
+#endif
 
 /* Forward decl — pipeline driver calls into this for each stage. */
 /* Non-static so wasm cmd_make can invoke commands via shell pipeline. */
 void shell_exec(char *line);
 
+static void shell_exec_pipeline_impl(char *line);
 void shell_exec_pipeline(char *line)
+{
+    shell_command_lock();
+    shell_exec_pipeline_impl(line);
+    shell_command_unlock();
+}
+
+static void shell_exec_pipeline_impl(char *line)
 {
     char *segments[8];
     int   nseg = 0;
@@ -3572,20 +4630,30 @@ void shell_exec_pipeline(char *line)
             char    *saved_buf = redir_buf;
             uint32_t saved_pos = redir_pos;
             uint32_t saved_max = redir_max;
+            bool saved_overflow = redir_overflow;
             void   (*saved_fn)(const char *, size_t) = sh_redir_fn;
 
             redir_buf  = cap;
             redir_pos  = 0;
             redir_max  = 1024 * 1024;
+            redir_overflow = false;
             sh_redir_fn = redir_capture;
 
             shell_exec(segments[i]);
 
             uint32_t this_len = redir_pos;
+            bool overflow = redir_overflow;
             sh_redir_fn = saved_fn;
             redir_buf   = saved_buf;
             redir_pos   = saved_pos;
             redir_max   = saved_max;
+            redir_overflow = saved_overflow;
+
+            if (overflow) {
+                kfree(cap);
+                sh_puts("pipe: output exceeds capture limit\n");
+                break;
+            }
 
             if (prev_buf) kfree(prev_buf);
             prev_buf = cap;
@@ -3600,7 +4668,17 @@ void shell_exec_pipeline(char *line)
     if (prev_buf) kfree(prev_buf);
 }
 
+static void shell_dispatch(int argc, char *argv[]);
+
+static void shell_exec_impl(char *line);
 void shell_exec(char *line)
+{
+    shell_command_lock();
+    shell_exec_impl(line);
+    shell_command_unlock();
+}
+
+static void shell_exec_impl(char *line)
 {
     char *argv[MAX_ARGS];
     int argc = parse_args(line, argv);
@@ -3612,6 +4690,33 @@ void shell_exec(char *line)
     parse_redirects(&argc, argv, &redir);
 
     if (argc == 0) return;
+
+#ifndef __EMSCRIPTEN__
+    if (!strcmp(argv[0], "console") && (redir.in_file || redir.out_file)) {
+        sh_puts("console: redirects are not supported; nothing queued\n");
+        if (shell_remote_active()) remote_io.status = 126;
+        return;
+    }
+    bool exclusive = false;
+    if (shell_remote_active()) {
+        /* Reject before touching redirects. I/O and FS operations do not
+         * need an idle local shell; machine-wide changes still do. */
+        if (!shell_remote_supported(argc, argv)) {
+            sh_puts("Remote console does not support this command: ");
+            sh_puts(argv[0]); sh_puts("\n");
+            remote_io.status = 126;
+            return;
+        }
+        if (!shell_remote_independent_command(argc, argv)) {
+            exclusive = shell_command_try_lock();
+            if (!exclusive) {
+                sh_puts("shell: command requires exclusive console access; stop the active application first\n");
+                remote_io.status = 126;
+                return;
+            }
+        }
+    }
+#endif
 
     /* Input redirection: `<file` loads file contents into sh_stdin_buf so
      * the command sees it as piped stdin. Restored after exec. */
@@ -3627,6 +4732,9 @@ void shell_exec(char *line)
             sh_puts("redirect: file not found: ");
             sh_puts(redir.in_file);
             sh_puts("\n");
+#ifndef __EMSCRIPTEN__
+            if (exclusive) shell_command_release();
+#endif
             return;
         }
         uint64_t fsz = osfs2_file_size(f);
@@ -3642,20 +4750,81 @@ void shell_exec(char *line)
     /* Setup output redirection — 1 MB buffer covers a full dmesg dump
      * (the prior 64 KB cap silently truncated everything past the first
      * boot block, hiding the diagnostic we needed). */
-    bool redirected = false;
     char *out_buf = NULL;
+    shell_output_t output = {0};
+    char *saved_redir_buf = redir_buf;
+    uint32_t saved_redir_pos = redir_pos, saved_redir_max = redir_max;
+    bool saved_overflow = redir_overflow;
+    void (*saved_redir_fn)(const char *, size_t) = sh_redir_fn;
+    const char *output_error = NULL;
     if (redir.out_file) {
         out_buf = (char *)kmalloc(1024 * 1024);
-        if (out_buf) {
-            redir_buf = out_buf;
-            redir_pos = 0;
-            redir_max = 1024 * 1024;
-            sh_redir_fn = redir_capture;
-            redirected = true;
-        }
+        output_error = out_buf ? shell_output_open(&output, redir.out_file, redir.append)
+                               : "out of memory";
+        if (output_error) goto output_done;
+        redir_buf = out_buf;
+        redir_pos = 0;
+        redir_max = 1024 * 1024;
+        redir_overflow = false;
+        sh_redir_fn = redir_capture;
     }
 
+    shell_dispatch(argc, argv);
+
+    if (out_buf) {
+        output_error = shell_output_finish(&output, out_buf, redir_pos);
+        if (!output_error && redir_overflow)
+            output_error = "output exceeds capture limit; file is incomplete";
+    }
+output_done:
+    if (redir.out_file) {
+        /* Status is not command output: do not feed it into an outer pipe. */
+        sh_redir_fn = NULL;
+        if (output_error) {
+            sh_puts("redirect: ");
+            sh_puts(redir.out_file);
+            sh_puts(": ");
+            sh_puts(output_error);
+            sh_puts("\n");
+        } else if (!saved_redir_fn) {
+            sh_puts("[");
+            sh_putdec(redir_pos);
+            sh_puts(" bytes -> ");
+            sh_puts(redir.out_file);
+            sh_puts(" (synced)]\n");
+        }
+        sh_redir_fn = saved_redir_fn;
+        redir_buf = saved_redir_buf;
+        redir_pos = saved_redir_pos;
+        redir_max = saved_redir_max;
+        redir_overflow = saved_overflow;
+    }
+    if (out_buf) kfree(out_buf);
+    if (in_buf) {
+        kfree(in_buf);
+        sh_stdin_buf = saved_stdin_buf;
+        sh_stdin_len = saved_stdin_len;
+    }
+#ifndef __EMSCRIPTEN__
+    if (exclusive) shell_command_release();
+#endif
+}
+
+/* A builtin's early return must still finalize and restore the caller's I/O. */
+static void shell_dispatch(int argc, char *argv[])
+{
     const char *cmd = argv[0];
+#ifndef __EMSCRIPTEN__
+    if (shell_remote_active() && !shell_remote_supported(argc, argv)) {
+        sh_puts("Remote console does not support this command: ");
+        sh_puts(cmd); sh_puts("\n");
+        remote_io.status = 126;
+        return;
+    }
+    if (!strcmp(cmd, "sshd")) { sshd_command(argc, argv); return; }
+    if (!strcmp(cmd, "drivers")) { driver_services_command(argc, argv); return; }
+    if (!strcmp(cmd, "console")) { shell_console_command(argc, argv); return; }
+#endif
 
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
         cmd_help();
@@ -3665,6 +4834,38 @@ void shell_exec(char *line)
         cmd_ps();
     } else if (strcmp(cmd, "cpus") == 0) {
         cmd_cpus();
+    } else if (strcmp(cmd, "cpuidle") == 0) {
+#ifndef __EMSCRIPTEN__
+        extern void cpu_idle_dump(void);
+        extern void cpu_idle_set(bool mwait);
+        extern void cpu_idle_selftest(void);
+        if (argc == 1 || (argc == 2 && !strcmp(argv[1], "status"))) cpu_idle_dump();
+        else if (argc == 2 && !strcmp(argv[1], "hlt")) cpu_idle_set(false);
+        else if (argc == 2 && !strcmp(argv[1], "mwait")) cpu_idle_set(true);
+        else if (argc == 2 && !strcmp(argv[1], "selftest")) cpu_idle_selftest();
+        else sh_puts("Usage: cpuidle [status]; cpuidle hlt; cpuidle mwait; cpuidle selftest\n");
+#else
+        sh_puts("cpuidle: native x86 only\n");
+#endif
+    } else if (strcmp(cmd, "lockup") == 0) {
+#if defined(__x86_64__) && !defined(__EMSCRIPTEN__)
+        extern void lockup_command(int argc, char **argv);
+        lockup_command(argc, argv);
+#else
+        sh_puts("lockup: native x86 only\n");
+#endif
+    } else if (strcmp(cmd, "thermal") == 0) {
+#ifndef __EMSCRIPTEN__
+        extern void thermal_dump(void);
+        extern void thermal_sample_dump(void);
+        extern void thermal_msr_selftest(void);
+        if (argc == 1) thermal_dump();
+        else if (argc == 2 && !strcmp(argv[1], "sample")) thermal_sample_dump();
+        else if (argc == 2 && !strcmp(argv[1], "selftest")) thermal_msr_selftest();
+        else sh_puts("Usage: thermal | thermal sample | thermal selftest\n");
+#else
+        sh_puts("thermal: native x86 only\n");
+#endif
     } else if (strcmp(cmd, "mem") == 0) {
         cmd_mem();
     } else if (strcmp(cmd, "cpu") == 0) {
@@ -3695,8 +4896,13 @@ void shell_exec(char *line)
         if (argc >= 2 && strcmp(argv[1], "reset") == 0) io_predict_reset();
         else io_predict_stats();
     } else if (strcmp(cmd, "hwbp") == 0) {
-        extern void hwbp_list(void);
-        hwbp_list();
+#ifndef __EMSCRIPTEN__
+        extern int hwbp_command(int, char **);
+        int result = hwbp_command(argc, argv);
+        if (shell_remote_active() && result) remote_io.status = 1;
+#else
+        sh_puts("hwbp: native x86 only\n");
+#endif
     } else if (strcmp(cmd, "watch") == 0) {
         /* Usage: watch <addr_hex> [w|rw|x] [len]
          * Defaults: write, len=8. Slot is auto-allocated. */
@@ -4155,9 +5361,15 @@ void shell_exec(char *line)
                 parse_ip(argv[3], dns) < 0) {
                 sh_puts("netconf: bad IP\n");
             } else {
+#ifndef __EMSCRIPTEN__
+                if (!driver_ipv4_claim()) { sh_puts("network: automatic configuration in progress\n"); return; }
+#endif
                 net_set_ip(ip);
                 net_set_gateway(gw);
                 net_dns_set_server(dns);
+#ifndef __EMSCRIPTEN__
+                driver_ipv4_release();
+#endif
                 sh_puts("netconf: ip="); sh_puts(argv[1]);
                 sh_puts(" gw="); sh_puts(argv[2]);
                 sh_puts(" dns="); sh_puts(argv[3]);
@@ -4186,6 +5398,66 @@ void shell_exec(char *line)
             sh_puts("txdelay <- ");
             sh_putdec((uint64_t)v);
             sh_puts(" us\n");
+        }
+    } else if (strcmp(cmd, "ps2") == 0) {
+        extern void ps2_get_stats(ps2_stats_t *) __attribute__((weak));
+        if (!ps2_get_stats) {
+            sh_puts("ps2: driver not compiled\n");
+        } else {
+            ps2_stats_t s;
+            ps2_get_stats(&s);
+            sh_puts("PS2: "); sh_puts(s.status); sh_puts("\n");
+            sh_puts("controller="); sh_putdec(s.controller);
+            sh_puts(" ready="); sh_putdec(s.ready);
+            sh_puts(" synaptics="); sh_putdec(s.synaptics);
+            sh_puts(" id="); sh_putdec(s.device_id);
+            sh_puts(" identity="); sh_putdec(s.identity);
+            sh_puts(" packet_size="); sh_putdec(s.packet_size); sh_puts("\n");
+            sh_puts("irq12="); sh_putdec(s.irq12);
+            sh_puts(" aux_bytes="); sh_putdec(s.aux_bytes);
+            sh_puts(" packets="); sh_putdec(s.packets);
+            sh_puts(" delivered="); sh_putdec(s.delivered);
+            sh_puts(" dropped="); sh_putdec(s.dropped); sh_puts("\n");
+            sh_puts("bad_bytes="); sh_putdec(s.bad_bytes);
+            sh_puts(" resyncs="); sh_putdec(s.resyncs);
+            sh_puts(" timeouts="); sh_putdec(s.timeouts);
+            sh_puts(" resends="); sh_putdec(s.resends); sh_puts("\n");
+            input_mouse_snapshot_t mouse;
+            input_get_mouse_snapshot(&mouse);
+            sh_puts("cursor_x="); sh_putdec(mouse.x < 0 ? 0 : (uint64_t)mouse.x);
+            sh_puts(" cursor_y="); sh_putdec(mouse.y < 0 ? 0 : (uint64_t)mouse.y);
+            sh_puts(" buttons="); sh_putdec(mouse.buttons);
+            sh_puts(" press_left="); sh_putdec(mouse.press_count[0]);
+            sh_puts(" release_left="); sh_putdec(mouse.release_count[0]); sh_puts("\n");
+        }
+    } else if (strcmp(cmd, "storage") == 0) {
+        extern uint32_t boot_diag_storage_count(void) __attribute__((weak));
+        extern uint32_t boot_diag_storage_dropped(void) __attribute__((weak));
+        extern const char *boot_diag_storage_line(uint32_t) __attribute__((weak));
+        uint32_t count = boot_diag_storage_count ? boot_diag_storage_count() : 0;
+        uint32_t pages = (count + 5) / 6;
+        uint32_t page = pages;
+        bool valid = argc <= 2;
+        if (argc == 2) {
+            page = 0;
+            for (const char *s = argv[1]; *s; s++) {
+                if (*s < '0' || *s > '9' || page > pages) { valid = false; break; }
+                page = page * 10 + (uint32_t)(*s - '0');
+            }
+            if (!page || page > pages) valid = false;
+        }
+        if (!count || !boot_diag_storage_line) {
+            sh_puts("storage: no boot snapshot available\n");
+        } else if (!valid) {
+            sh_puts("Usage: storage [page 1.."); sh_putdec(pages); sh_puts("]\n");
+        } else {
+            sh_puts("Boot storage page "); sh_putdec(page); sh_puts("/"); sh_putdec(pages);
+            sh_puts(osfs2_is_mounted() ? " (FS mounted)\n" : " (no FS mounted)\n");
+            uint32_t dropped = boot_diag_storage_dropped ? boot_diag_storage_dropped() : 0;
+            if (dropped) { sh_putdec(dropped); sh_puts(" older lines omitted\n"); }
+            for (uint32_t i = (page - 1) * 6; i < page * 6 && i < count; i++) {
+                sh_puts(boot_diag_storage_line(i)); sh_puts("\n");
+            }
         }
     } else if (strcmp(cmd, "dmesg") == 0) {
         /* Dump the kernel ring buffer (klog). serial_puts has been
@@ -4259,7 +5531,11 @@ void shell_exec(char *line)
         uint8_t *ip = net_get_ip_ptr();
         uint8_t mac[6];
         net_get_mac(mac);
+#ifndef __EMSCRIPTEN__
+        sh_puts(nic_is_iwx() ? "wlan0: " : "eth0: ");
+#else
         sh_puts("eth0: ");
+#endif
         sh_putdec(ip[0]); sh_puts("."); sh_putdec(ip[1]); sh_puts(".");
         sh_putdec(ip[2]); sh_puts("."); sh_putdec(ip[3]); sh_puts("\n");
         sh_puts("  HW ");
@@ -4270,16 +5546,32 @@ void shell_exec(char *line)
             sh_puts(h);
         }
         sh_puts("\n");
+#ifndef __EMSCRIPTEN__
+        sh_puts("  Driver: "); sh_puts(nic_ops.name ? nic_ops.name : "none");
+        sh_puts(nic_link_up() ? "; link up\n" : "; link down\n");
+#endif
     } else if (strcmp(cmd, "dhcp") == 0) {
         extern int dhcp_discover(void);
+#ifndef __EMSCRIPTEN__
+        if (!driver_ipv4_claim()) { sh_puts("network: automatic configuration in progress\n"); return; }
+#endif
         sh_puts("Retrying DHCP discovery...\n");
         int rc = dhcp_discover();
+#ifndef __EMSCRIPTEN__
+        driver_ipv4_release();
+#endif
         sh_puts(rc == 0 ? "DHCP: success — `ifconfig` to see IP\n"
                         : "DHCP: failed — try `apipa` or `ipconf`\n");
     } else if (strcmp(cmd, "apipa") == 0) {
         extern int apipa_assign(void);
+#ifndef __EMSCRIPTEN__
+        if (!driver_ipv4_claim()) { sh_puts("network: automatic configuration in progress\n"); return; }
+#endif
         sh_puts("Running APIPA link-local autoconfig (RFC 3927)...\n");
         int rc = apipa_assign();
+#ifndef __EMSCRIPTEN__
+        driver_ipv4_release();
+#endif
         sh_puts(rc == 0 ? "APIPA: assigned — `ifconfig` to see IP\n"
                         : "APIPA: failed — use `ipconf`\n");
     } else if (strcmp(cmd, "ipconf") == 0) {
@@ -4306,15 +5598,51 @@ void shell_exec(char *line)
                 }
                 if (field < 4) buf[i][field] = (uint8_t)val;
             }
+#ifndef __EMSCRIPTEN__
+            if (!driver_ipv4_claim()) { sh_puts("network: automatic configuration in progress\n"); return; }
+#endif
             net_set_ip(buf[0]);
             if (n > 1) net_set_gateway(buf[1]);
             if (n > 2) net_set_netmask(buf[2]);
             if (n > 3) net_dns_set_server(buf[3]);
+#ifndef __EMSCRIPTEN__
+            driver_ipv4_release();
+#endif
             sh_puts("ipconf: applied\n");
         }
     } else if (strcmp(cmd, "route") == 0) {
+#ifndef __EMSCRIPTEN__
+        extern uint8_t *net_get_ip_ptr(void);
+        extern uint8_t *net_get_gateway_ptr(void);
+        extern uint8_t *net_get_netmask_ptr(void);
+        const uint8_t *ip = net_get_ip_ptr(), *mask = net_get_netmask_ptr(), *gw = net_get_gateway_ptr();
+        const char *iface = nic_is_iwx() ? "wlan0" : "eth0";
+        sh_puts("Destination/Mask                  Gateway       Iface\n");
+        if (ip[0] | ip[1] | ip[2] | ip[3]) {
+            for (unsigned i = 0; i < 4; i++) { if (i) sh_puts("."); sh_putdec(ip[i] & mask[i]); }
+            sh_puts("/");
+            for (unsigned i = 0; i < 4; i++) { if (i) sh_puts("."); sh_putdec(mask[i]); }
+            sh_puts("  direct  "); sh_puts(iface); sh_puts("\n");
+        }
+        if (gw[0] | gw[1] | gw[2] | gw[3]) {
+            sh_puts("0.0.0.0/0.0.0.0                   ");
+            for (unsigned i = 0; i < 4; i++) { if (i) sh_puts("."); sh_putdec(gw[i]); }
+            sh_puts("  "); sh_puts(iface); sh_puts("\n");
+        } else sh_puts("(no default route)\n");
+#else
         sh_puts("Destination     Gateway         Flags  Iface\n");
         sh_puts("0.0.0.0         (gateway)       UG     eth0\n");
+#endif
+    } else if (strcmp(cmd, "wlan") == 0) {
+#ifndef __EMSCRIPTEN__
+        if (!driver_wlan_claim()) sh_puts("wlan: automatic operation in progress; see drivers status\n");
+        else {
+            cmd_wlan(argc, argv);
+            driver_wlan_release(wlan_manual_pause(argc, argv));
+        }
+#else
+        sh_puts("wlan: native PCI hardware is not available in WASM\n");
+#endif
     } else if (strcmp(cmd, "netstat") == 0) {
         sh_puts("Proto  Local     Remote    State\n");
         /* TODO: iterate TCP connection table */
@@ -6981,7 +8309,20 @@ q4kgdone:
         }
     } else if (strcmp(cmd, "sched") == 0) {
         /* X-SCHED: scheduler test and stats */
-        if (argc >= 2 && strcmp(argv[1], "stats") == 0) {
+        if (argc == 2 && strcmp(argv[1], "snapshot") == 0) {
+            extern void proc_debug_dump_all(void);
+            proc_debug_dump_all();
+            sh_puts("Scheduler snapshot complete.\n");
+        } else if (argc >= 2 && strcmp(argv[1], "stack") == 0) {
+            uint32_t pid;
+            extern int proc_debug_dump_stack(uint32_t pid);
+            if (argc != 3 || sh_parse_u32(argv[2], &pid) < 0 || !pid) {
+                sh_puts("Usage: sched stack <native-pid>\n");
+                if (shell_remote_active()) remote_io.status = 2;
+            } else if (proc_debug_dump_stack(pid) < 0) {
+                if (shell_remote_active()) remote_io.status = 1;
+            }
+        } else if (argc >= 2 && strcmp(argv[1], "stats") == 0) {
             sh_puts("Scheduler: ");
             sh_puts(sched_is_enabled() ? "active" : "inactive");
             sh_puts("\nContext switches: ");
@@ -7013,9 +8354,19 @@ q4kgdone:
             sh_puts("Usage: tensor bench|info\n");
         }
     } else if (strcmp(cmd, "kprof") == 0) {
-        /* Always-on profiling: show RIP histogram */
+#ifndef __EMSCRIPTEN__
         extern void kprof_report(void);
-        kprof_report();
+        extern void kprof_start(void);
+        extern void kprof_stop(void);
+        extern void kprof_dump_raw(void);
+        if (argc == 1) kprof_report();
+        else if (argc == 2 && !strcmp(argv[1], "start")) kprof_start();
+        else if (argc == 2 && !strcmp(argv[1], "stop")) kprof_stop();
+        else if (argc == 2 && !strcmp(argv[1], "raw")) kprof_dump_raw();
+        else sh_puts("Usage: kprof [start|stop|raw]\n");
+#else
+        sh_puts("kprof: native x86 only\n");
+#endif
     } else if (strcmp(cmd, "crashdump") == 0) {
         /* List saved crash reports */
         extern void *osfs2_find(const char *name);
@@ -7057,16 +8408,43 @@ q4kgdone:
         if (!found) sh_puts("No crash reports saved\n");
     } else if (strcmp(cmd, "httpd") == 0) {
         cmd_httpd(argc, argv);
+    } else if (strcmp(cmd, "serial-test") == 0) {
+        extern int serial_selftest(void);
+        sh_puts(serial_selftest() ? "Serial contract test: FAIL\n"
+                                 : "Serial contract test: PASS\n");
+    } else if (strcmp(cmd, "usb-perf") == 0) {
+        extern void usb_storage_perf_report(void) __attribute__((weak));
+        if (argc != 1) sh_puts("Usage: usb-perf\n");
+        else if (usb_storage_perf_report) usb_storage_perf_report();
+        else sh_puts("usb-perf: USB storage not built\n");
+    } else if (strcmp(cmd, "serial-stats") == 0) {
+        extern void serial_stats_dump(void);
+        serial_stats_dump();
     } else if (strcmp(cmd, "dos-api-test") == 0 || strcmp(cmd, "dos-dpmi-test") == 0 ||
-               strcmp(cmd, "dos-dpmi-stack-test") == 0) {
+               strcmp(cmd, "dos-dpmi-stack-test") == 0 || strcmp(cmd, "dos-rf-test") == 0 ||
+               strcmp(cmd, "dos-fpu-test") == 0 || strcmp(cmd, "dos-bios-test") == 0 ||
+               strcmp(cmd, "dos-xms-test") == 0 || strcmp(cmd, "dos-umb-test") == 0) {
+        extern int dos_umb_selftest(void);
+        extern int dos_xms_selftest(void);
         extern int dos_api_selftest(void);
         extern int dpmi_selftest(void);
         extern int dos_dpmi_stack_selftest(void);
+        extern int dos_cpu_rf_selftest(void);
+        extern int dos_fpu_selftest(void);
+        extern int dos_bios_memory_selftest(void);
+        extern int dos_bios_contract_selftest(void);
         bool dpmi_only = strcmp(cmd, "dos-dpmi-test") == 0;
         bool stack_only = strcmp(cmd, "dos-dpmi-stack-test") == 0;
-        int failures = stack_only ? dos_dpmi_stack_selftest()
+        bool rf_only = strcmp(cmd, "dos-rf-test") == 0;
+        bool fpu_only = strcmp(cmd, "dos-fpu-test") == 0;
+        bool bios_only = strcmp(cmd, "dos-bios-test") == 0;
+        bool xms_only = strcmp(cmd, "dos-xms-test") == 0;
+        bool umb_only = strcmp(cmd, "dos-umb-test") == 0;
+        int failures = umb_only ? dos_umb_selftest() : xms_only ? dos_xms_selftest()
+                     : bios_only ? dos_bios_memory_selftest() + dos_bios_contract_selftest()
+                     : fpu_only ? dos_fpu_selftest() : rf_only ? dos_cpu_rf_selftest() : stack_only ? dos_dpmi_stack_selftest()
                      : dpmi_only ? dpmi_selftest() : dos_api_selftest();
-        sh_puts(stack_only ? "DOS DPMI stack test: "
+        sh_puts(umb_only ? "DOS UMB contract test: " : xms_only ? "DOS XMS contract test: " : bios_only ? "DOS BIOS contract test: " : fpu_only ? "DOS FPU contract test: " : rf_only ? "DOS RF contract test: " : stack_only ? "DOS DPMI stack test: "
                 : dpmi_only ? "DOS DPMI contract test: " : "DOS API contract test: ");
         if (!failures) {
             sh_puts("PASS\n");
@@ -7255,6 +8633,53 @@ q4kgdone:
             sh_putdec((uint64_t)failures);
             sh_puts(")\n");
         }
+    } else if (strcmp(cmd, "gpu-native") == 0) {
+#ifndef __EMSCRIPTEN__
+        /* The control command runs on the BSP console task, outside any PE. */
+        NTSTATUS status=STATUS_SUCCESS;
+        if (argc==2 && strcmp(argv[1],"on")==0) status=intel_gfx_driver_start();
+        else if (argc==2 && strcmp(argv[1],"render")==0) status=intel_gfx_driver_start_render();
+        else if (argc==2 && strcmp(argv[1],"off")==0) status=intel_gfx_driver_stop();
+        else if (argc!=2 || strcmp(argv[1],"status")!=0) {
+            sh_puts("Usage: gpu-native on|render|off|status\n"); return;
+        }
+        intel_gfx_driver_snapshot_t state;
+        NTSTATUS sampled=intel_gfx_driver_snapshot(&state);
+        sh_puts("Native GPU status="); sh_putdec((uint32_t)status);
+        if (!sampled) {
+            sh_puts(" phase="); sh_putdec(state.phase);
+            sh_puts(" adapter="); sh_putdec(state.adapter_registered);
+            sh_puts(" engine="); sh_putdec(state.engine_owned);
+            sh_puts(" completed="); sh_putdec(state.completed);
+            sh_puts(" failed="); sh_putdec(state.failed);
+            sh_puts(" last_pid="); sh_putdec(state.last_pid);
+            sh_puts(" last_result="); sh_putdec((uint32_t)state.last_result);
+            sh_puts(" node="); sh_putdec(state.node);
+        }
+        sh_puts("\n");
+#else
+        sh_puts("Native GPU: unavailable\n");
+#endif
+    } else if (strcmp(cmd, "gpu-render-test") == 0) {
+        extern int intel_gfx_rcs_service_test(void);
+        int result=intel_gfx_rcs_service_test();
+        sh_puts(result==2 ? "GPU render test: unavailable\n" :
+            result ? "GPU render test: FAIL\n" : "GPU render test: PASS\n");
+    } else if (strcmp(cmd, "gpu-shader-test") == 0) {
+        extern int intel_gfx_rcs_program_file(const char *);
+        if (argc!=2) { sh_puts("Usage: gpu-shader-test <compiled-fixtures.bin>\n"); return; }
+        int result=intel_gfx_rcs_program_file(argv[1]);
+        sh_puts(result==2 ? "GPU shader test: unavailable\n" :
+            result ? "GPU shader test: FAIL\n" : "GPU shader test: PASS\n");
+    } else if (strcmp(cmd, "gpu-worker-test") == 0) {
+        extern int intel_gfx_bcs_service_test(void);
+        int result=intel_gfx_bcs_service_test();
+        sh_puts(result==2 ? "GPU worker test: unavailable\n" :
+            result ? "GPU worker test: FAIL\n" : "GPU worker test: PASS\n");
+    } else if (strcmp(cmd, "sched-signal-test") == 0) {
+        extern int sched_signal_selftest(void);
+        sh_puts(sched_signal_selftest() ? "GPU scheduler signal test: FAIL\n" :
+            "GPU scheduler signal test: PASS\n");
     } else if (strcmp(cmd, "win32-process-test") == 0) {
         extern int nt_process_inspection_selftest(void);
         int failures = nt_process_inspection_selftest();
@@ -7409,6 +8834,22 @@ q4kgdone:
             compat32_crash_jmpbuf = NULL;
             sh_diag_mark(winexec_crashed ? "winexec-crash-done" : "winexec-done");
         }
+    } else if (strcmp(cmd, "win32-msi-engine-test") == 0) {
+        extern int msi_engine_selftest(const char *, const char *, int);
+        if (argc < 3 || argc > 4) {
+            sh_puts("Usage (disposable disk): win32-msi-engine-test <package.msi> <reference-directory> [fault]\n");
+        } else {
+            int failures = msi_engine_selftest(argv[1], argv[2], argc == 4 && strcmp(argv[3], "fault") == 0);
+            sh_puts(failures ? "Windows Installer engine test: FAIL\n" : "Windows Installer engine test: PASS\n");
+        }
+    } else if (strcmp(cmd, "win32-msi-test") == 0) {
+        extern int msi_io_selftest(const char *, const char *, const char *);
+        if (argc != 4) {
+            sh_puts("Usage: win32-msi-test <package.msi> <cabinet.cab> <reference-directory>\n");
+        } else {
+            int failures = msi_io_selftest(argv[1], argv[2], argv[3]);
+            sh_puts(failures ? "Windows Installer I/O test: FAIL\n" : "Windows Installer I/O test: PASS\n");
+        }
     } else if (strcmp(cmd, "msi") == 0 || strcmp(cmd, "msiexec") == 0 ||
                strcmp(cmd, "msix") == 0) {
         extern int win32_install(const char *filename);
@@ -7450,7 +8891,7 @@ q4kgdone:
         }
     } else if (strcmp(cmd, "dosrun") == 0) {
         if (argc < 2) {
-            sh_puts("Usage: dosrun [--emulate [--max-steps N]] [--] <file.com|file.exe> [args]\n");
+            sh_puts("Usage: dosrun [--trace[=N]] [--emulate [--max-steps N]] [--] <file.com|file.exe> [args]\n");
         } else {
             extern int dos_run(const char *filename, int argc, const char **argv);
             extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
@@ -7711,7 +9152,7 @@ q4kgdone:
     } else if (strcmp(cmd, "kupdate") == 0) {
         cmd_kupdate(argc, argv);
     } else if (strcmp(cmd, "reboot") == 0) {
-        cmd_reboot();
+        cmd_reboot(argc, argv);
     } else if (strcmp(cmd, "halt") == 0 || strcmp(cmd, "shutdown") == 0) {
         cmd_halt();
     } else if (strcmp(cmd, "beep") == 0) {
@@ -7737,48 +9178,6 @@ q4kgdone:
         }
     }
 
-    /* Finalize output redirection — write captured output to file */
-    if (redirected) {
-        sh_redir_fn = NULL;  /* Restore normal output first */
-
-        if (redir.out_file && out_buf && redir_pos > 0) {
-            extern void *osfs2_create(const char *name, uint64_t size);
-            extern int osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
-            extern uint64_t osfs2_file_size(void *file);
-
-            void *f = osfs2_find(redir.out_file);
-            if (!f)
-                f = osfs2_create(redir.out_file, redir_pos);
-            if (f) {
-                uint64_t off = redir.append ? osfs2_file_size(f) : 0;
-                osfs2_write(f, off, out_buf, redir_pos);
-                /* Flush write-back cache del controller — sin esto, USB
-                 * MSC pierde la data al desenchufar.  El usuario espera
-                 * que después de `>` el archivo esté en disco.            */
-                extern int disk_flush(void);
-                disk_flush();
-                sh_puts("[");
-                sh_putdec(redir_pos);
-                sh_puts(" bytes -> ");
-                sh_puts(redir.out_file);
-                sh_puts(" (synced)]\n");
-            } else {
-                sh_puts("Error: cannot create ");
-                sh_puts(redir.out_file);
-                sh_puts("\n");
-            }
-        }
-        redir_buf = NULL;
-        redir_pos = 0;
-    }
-    if (out_buf) kfree(out_buf);
-
-    /* Restore stdin and free input-redirect buffer if used */
-    if (in_buf) {
-        kfree(in_buf);
-        sh_stdin_buf = saved_stdin_buf;
-        sh_stdin_len = saved_stdin_len;
-    }
 }
 
 /* ── Shell main loop ─────────────────────────────────────────── */
@@ -7879,6 +9278,9 @@ void __cold shell_run(void)
     sh_puts_color(" [wasm32 | 256MB heap]\n\n", 0x00666666);
 #endif
     sh_diag_flush("shell-banner");
+#ifndef __EMSCRIPTEN__
+    driver_services_start();
+#endif
     sh_diag_mark("shell-autoexec-check");
 
     /* A root marker lets debuggers boot to an idle shell without moving apps. */
@@ -7894,7 +9296,20 @@ void __cold shell_run(void)
         sh_diag_flush("shell-prompt");
         char *line = NULL;
         uint64_t line_len = 0;
+#ifndef __EMSCRIPTEN__
+        int status = term_readline_alloc_poll("osito> ", &line, &line_len,
+                                             shell_console_poll);
+        bool console_launch = status == 1;
+        if (console_launch) {
+            line = shell_console_take();
+            line_len = line ? strlen(line) : 0;
+            sh_puts("[SSH console] ");
+            if (line) sh_puts(line);
+            sh_puts("\n");
+        }
+#else
         int status = term_readline_alloc("osito> ", &line, &line_len);
+#endif
 
         if (status == -1) {
             /* EOF (Ctrl+D) */
@@ -7968,7 +9383,13 @@ void __cold shell_run(void)
         }
 
         sh_diag_mark("shell-exec");
+        extern int sched_current_get(void);
+        shell_console_owner = sched_current_get();
         shell_exec_pipeline(line);
+        shell_console_owner = -1;
+#ifndef __EMSCRIPTEN__
+        if (console_launch) shell_console_returned();
+#endif
         sh_diag_mark("shell-exec-done");
 
         kfree(line);

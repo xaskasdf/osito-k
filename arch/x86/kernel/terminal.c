@@ -26,6 +26,8 @@ extern void fb_putchar(char c);
 
 /* Keyboard */
 extern char kb_getchar(void);
+extern int kb_getchar_interruptible(bool (*cancel)(void *), void *context)
+    __attribute__((weak));
 extern char kb_trygetchar(void);
 extern bool kb_has_input(void);
 
@@ -157,15 +159,112 @@ static const char *hist_get(int index)
     return history[index % TERM_HISTORY];
 }
 
+/* Navigation sequences arrive from PS/2, HID and the serial terminal. */
+static bool term_apply_csi(char final, unsigned param)
+{
+    if (final == 'A' || final == 'B') {
+        int index = hist_index + (final == 'A' ? -1 : 1);
+        const char *entry = index == hist_count ? "" : hist_get(index);
+        if (!entry) return true;
+        uint64_t len = strlen(entry);
+        if (!term_line_reserve(len + 1)) return false;
+        term_erase_line();
+        memcpy(line_buf, entry, len + 1);
+        line_len = line_pos = len;
+        hist_index = index;
+        term_redraw_line();
+    } else if (final == 'D') {
+        if (line_pos) { term_putchar('\b'); line_pos--; }
+    } else if (final == 'C') {
+        if (line_pos < line_len) term_putchar(line_buf[line_pos++]);
+    } else if (final == 'H' || (final == '~' && (param == 1 || param == 7))) {
+        while (line_pos) { term_putchar('\b'); line_pos--; }
+    } else if (final == 'F' || (final == '~' && (param == 4 || param == 8))) {
+        while (line_pos < line_len) term_putchar(line_buf[line_pos++]);
+    } else if (final == '~' && param == 3 && line_pos < line_len) {
+        for (uint64_t i = line_pos; i < line_len; i++)
+            line_buf[i] = line_buf[i + 1];
+        line_len--;
+        for (uint64_t i = line_pos; i < line_len; i++) term_putchar(line_buf[i]);
+        term_putchar(' ');
+        for (uint64_t i = line_pos; i <= line_len; i++) term_putchar('\b');
+    }
+    return true;
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 enum {
     TERM_READ_OK = 0,
+    TERM_READ_EVENT = 1,
     TERM_READ_EOF = -1,
     TERM_READ_NOMEM = -2,
 };
 
-static int term_readline_edit(const char *prompt)
+static void term_clear_secret(char *buf, unsigned capacity)
+{
+    volatile char *p = buf;
+    while (capacity--) *p++ = 0;
+}
+
+/* Caller-owned input, independent of the editor and command history. Errors
+ * drain through Enter rather than leaving a pasted suffix as a shell command. */
+int term_read_secret(const char *prompt, char *buf, unsigned capacity, bool echo)
+{
+    if (!buf || !capacity || capacity > 0x7fffffffU) return -1;
+    term_clear_secret(buf, capacity);
+    if (prompt) term_puts(prompt);
+    unsigned n = 0, escape = 0;
+    bool invalid = false;
+    for (;;) {
+        unsigned char c = (unsigned char)kb_getchar();
+        if (c == 3 || c == 4 || c == '\r' || c == '\n') {
+            term_putchar('\n');
+            if (c == 3 || c == 4 || invalid) {
+                term_clear_secret(buf, capacity);
+                return -1;
+            }
+            return (int)n;
+        }
+        if (c == 27) { escape = 1; continue; }
+        if (escape == 1) {
+            escape = 0;
+            if (c == '[' || c == 'O') { escape = 2; continue; }
+        } else if (escape == 2) {
+            if (c >= 0x20 && c <= 0x3f) continue;
+            escape = 0;
+            if (c >= 0x40 && c <= 0x7e) continue;
+        }
+        if (c == 21) {
+            if (echo) for (unsigned i = 0; i < n; i++) term_puts("\b \b");
+            term_clear_secret(buf, capacity);
+            n = 0; invalid = false;
+        } else if (c == '\b' || c == 0x7f) {
+            if (n) {
+                buf[--n] = 0;
+                if (echo) term_puts("\b \b");
+            }
+        } else if (c >= 0x20 && c <= 0x7e) {
+            if (n < capacity - 1 && !invalid) {
+                buf[n++] = c;
+                if (echo) term_putchar(c);
+            } else invalid = true;
+        } else if (c >= 0x80 || c == '\t') invalid = true;
+    }
+}
+
+struct term_prompt_wait {
+    bool (*poll)(bool empty);
+    bool empty;
+};
+
+static bool term_prompt_poll(void *context)
+{
+    struct term_prompt_wait *wait = context;
+    return wait->poll(wait->empty);
+}
+
+static int term_readline_edit_poll(const char *prompt, bool (*poll)(bool empty))
 {
     if (prompt) {
         term_puts_color(prompt, 0x0000FF88);
@@ -183,9 +282,51 @@ static int term_readline_edit(const char *prompt)
     line_buf[0] = '\0';
     hist_index = hist_count;
     term_sigint = false;
+    unsigned escape_state = 0, escape_param = 0;
+    bool escape_invalid = false;
 
     for (;;) {
-        char c = kb_getchar();
+        char c;
+        if (poll && kb_getchar_interruptible) {
+            struct term_prompt_wait wait = {poll, !line_len && !escape_state};
+            int key = kb_getchar_interruptible(term_prompt_poll, &wait);
+            if (key < 0) return TERM_READ_EVENT;
+            /* Revoke idle admission before applying a local keystroke. */
+            poll(false);
+            c = (char)key;
+        } else c = kb_getchar();
+
+        /* Incremental parsing never waits for a suffix after a lone Escape.
+         * Consume a complete CSI/SS3 sequence, not printable fragments of it. */
+        if (c == 27) {
+            escape_state = 1;
+            escape_param = 0;
+            escape_invalid = false;
+            continue;
+        }
+        if (escape_state == 1) {
+            escape_state = 0;
+            if (c == '[' || c == 'O') { escape_state = 2; continue; }
+        } else if (escape_state == 2) {
+            if (c >= '0' && c <= '9') {
+                if (escape_param > 999) escape_invalid = true;
+                else escape_param = escape_param * 10 + (unsigned)(c - '0');
+                continue;
+            }
+            if (c >= 0x20 && c <= 0x3F) {
+                escape_invalid = true;
+                continue;
+            }
+            escape_state = 0;
+            if (c >= 0x40 && c <= 0x7E) {
+                if (!escape_invalid && !term_apply_csi(c, escape_param)) {
+                    term_puts("\nterminal: out of memory\n");
+                    return TERM_READ_NOMEM;
+                }
+                continue;
+            }
+            /* Control keys cancel incomplete sequences and retain their role. */
+        }
 
         /* Ctrl+C — interrupt */
         if (c == 3) {
@@ -320,6 +461,11 @@ static int term_readline_edit(const char *prompt)
     }
 }
 
+static int term_readline_edit(const char *prompt)
+{
+    return term_readline_edit_poll(prompt, NULL);
+}
+
 /* Fixed-buffer compatibility API for bounded prompts. */
 int term_readline(const char *prompt, char *buf, uint32_t buf_size)
 {
@@ -341,16 +487,20 @@ int term_readline(const char *prompt, char *buf, uint32_t buf_size)
 }
 
 /* Unbounded shell API. The caller owns *buf_out and must kfree() it. */
-int term_readline_alloc(const char *prompt, char **buf_out, uint64_t *len_out)
+int term_readline_alloc_poll(const char *prompt, char **buf_out, uint64_t *len_out,
+                            bool (*poll)(bool empty))
 {
-    if (!buf_out)
+    if (!buf_out) {
+        if (poll) poll(false);
         return TERM_READ_NOMEM;
+    }
 
     *buf_out = NULL;
     if (len_out)
         *len_out = 0;
 
-    int status = term_readline_edit(prompt);
+    int status = term_readline_edit_poll(prompt, poll);
+    if (poll) poll(false);
     if (status != TERM_READ_OK)
         return status;
 
@@ -363,6 +513,11 @@ int term_readline_alloc(const char *prompt, char **buf_out, uint64_t *len_out)
     line_pos = 0;
     line_len = 0;
     return TERM_READ_OK;
+}
+
+int term_readline_alloc(const char *prompt, char **buf_out, uint64_t *len_out)
+{
+    return term_readline_alloc_poll(prompt, buf_out, len_out, NULL);
 }
 
 /* Check if Ctrl+C was pressed */

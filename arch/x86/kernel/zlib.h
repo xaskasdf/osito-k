@@ -12,7 +12,9 @@
 #include "../include/types.h"
 
 /* Compress src into dst (zlib format: header + deflate + adler32).
- * dst must be pre-allocated (worst case: src_len + src_len/1000 + 32).
+ * *dst_len is the destination capacity. Insufficient space returns -1.
+ * A conservative capacity is 2 * src_len + 32 (check arithmetic overflow).
+ * Independent blocks up to 32 KiB give the best compression with this encoder.
  * On success, *dst_len is set to compressed size. Returns 0 or -1. */
 int zlib_deflate(const uint8_t *src, uint32_t src_len,
                  uint8_t *dst, uint32_t *dst_len);

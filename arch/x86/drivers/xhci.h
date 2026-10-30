@@ -92,6 +92,10 @@
 #define XHCI_IR_ERSTBA        0x10
 #define XHCI_IR_ERDP          0x18
 
+#define XHCI_IMAN_IP          (1 << 0)
+#define XHCI_IMAN_IE          (1 << 1)
+#define XHCI_ERDP_EHB         (1 << 3)
+
 /* ── Transfer Request Block (TRB) — 16 bytes ────────────────── */
 
 typedef struct __attribute__((packed)) {
@@ -114,6 +118,8 @@ _Static_assert(sizeof(xhci_trb_t) == 16, "TRB must be 16 bytes");
 #define TRB_ENABLE_SLOT         9
 #define TRB_ADDRESS_DEVICE      11
 #define TRB_CONFIGURE_ENDPOINT  12
+#define TRB_RESET_ENDPOINT      14
+#define TRB_SET_TR_DEQUEUE       16
 #define TRB_EVALUATE_CONTEXT    13
 #define TRB_NOOP_CMD            23
 #define TRB_TRANSFER_EVENT      32
@@ -123,6 +129,8 @@ _Static_assert(sizeof(xhci_trb_t) == 16, "TRB must be 16 bytes");
 /* TRB control flags */
 #define TRB_CYCLE               (1 << 0)
 #define TRB_TC                  (1 << 1)   /* Toggle Cycle (Link TRB) */
+#define TRB_ISP                 (1 << 2)   /* Interrupt on Short Packet */
+#define TRB_CH                  (1 << 4)   /* Chain to next TRB in TD */
 #define TRB_IOC                 (1 << 5)
 #define TRB_IDT                 (1 << 6)
 #define TRB_BSR                 (1 << 9)
@@ -281,7 +289,14 @@ typedef struct {
      * use prev_keys as a sliding window of the most recent slots. */
     uint8_t     prev_keys[6];
     uint8_t     prev_mods;
+    uint8_t     hid_pending;   /* 0=idle, 1=completed, 2=dispatching */
+    uint32_t    hid_pending_len;
 } xhci_device_t;
+
+typedef struct {
+    xhci_trb_t trb;
+    uint64_t sequence;
+} xhci_pending_event_t;
 
 /* ── Controller State ────────────────────────────────────────── */
 
@@ -309,6 +324,12 @@ typedef struct {
     xhci_erste_t *erst;
     uint32_t     evt_deq;
     uint8_t      evt_cycle;
+    bool         poll_status_valid;
+    uint64_t     poll_status_ns;
+    xhci_pending_event_t pending[XHCI_EVT_RING_SIZE];
+    uint64_t     pending_sequence;
+    uint32_t     pending_count;
+    bool         pending_lock;
 
     xhci_device_t devices[XHCI_MAX_SLOTS];
     uint32_t      num_devices;

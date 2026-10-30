@@ -21,6 +21,7 @@
  */
 
 #include "../include/types.h"
+#include "net.h"
 
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
@@ -79,13 +80,15 @@ static void apipa_pick(uint8_t out[4])
 }
 
 /* Espera ticks ms con net_poll_wait para no bloquear el sistema. */
-static void apipa_sleep(uint64_t ticks)
+static bool apipa_sleep(uint64_t ticks, uint64_t epoch)
 {
     uint64_t start = idt_get_ticks();
     while (idt_get_ticks() - start < ticks) {
+        if (net_link_epoch() != epoch || !net_link_ready()) return false;
         boot_diag_heartbeat("apipa-wait");
         net_poll_wait();
     }
+    return net_link_epoch() == epoch && net_link_ready();
 }
 
 /* Comprobar si vimos algún paquete ARP que indique que candidate_ip ya
@@ -101,6 +104,9 @@ static bool apipa_in_use(const uint8_t candidate_ip[4])
 
 int apipa_assign(void)
 {
+    net_poll();
+    uint64_t epoch = net_link_epoch();
+    if (!net_link_ready()) return -1;
     uint8_t mac[6];
     net_get_mac(mac);
     apipa_seed = ((uint64_t)mac[0] << 40) | ((uint64_t)mac[1] << 32) |
@@ -124,13 +130,13 @@ int apipa_assign(void)
 
         /* PROBE_WAIT antes de empezar — RFC exige 0..1s para evitar
          * tormentas si todo el segmento se enciende a la vez.            */
-        apipa_sleep(APIPA_PROBE_WAIT_TICKS);
+        if (!apipa_sleep(APIPA_PROBE_WAIT_TICKS, epoch)) return -1;
 
         /* 3 ARP probes con spaciado de ~1.5s.                             */
         bool conflict = false;
         for (int p = 0; p < APIPA_PROBE_NUM; p++) {
             net_arp_probe(cand);
-            apipa_sleep(APIPA_PROBE_INT_TICKS);
+            if (!apipa_sleep(APIPA_PROBE_INT_TICKS, epoch)) return -1;
             if (apipa_in_use(cand)) { conflict = true; break; }
         }
         if (conflict) {
@@ -139,19 +145,21 @@ int apipa_assign(void)
         }
 
         /* No conflict — esperar antes de announce.                       */
-        apipa_sleep(APIPA_ANNOUNCE_WAIT_TICKS);
+        if (!apipa_sleep(APIPA_ANNOUNCE_WAIT_TICKS, epoch)) return -1;
 
         /* Setear IP localmente ANTES del announce (announce dice
          * "spa=X.Y" → necesita que our_ip sea X.Y).                      */
         uint8_t mask[4] = { 255, 255, 0, 0 };
-        net_set_ip(cand);
-        net_set_netmask(mask);
+        uint8_t zero[4] = {0};
+        uint64_t start = idt_get_ticks();
+        while (net_apply_ipv4(epoch, cand, mask, zero, zero)) {
+            if (idt_get_ticks() - start >= 100 || !apipa_sleep(1, epoch)) return -1;
+        }
 
         /* 2 announces — gratuitous ARP "who-has X.Y? tell X.Y".          */
         for (int a = 0; a < APIPA_ANNOUNCE_NUM; a++) {
             net_arp_probe(cand);
-            if (a < APIPA_ANNOUNCE_NUM - 1)
-                apipa_sleep(APIPA_ANNOUNCE_INT_TICKS);
+            if (a < APIPA_ANNOUNCE_NUM - 1 && !apipa_sleep(APIPA_ANNOUNCE_INT_TICKS, epoch)) return -1;
         }
 
         serial_puts("[APIPA] assigned ");

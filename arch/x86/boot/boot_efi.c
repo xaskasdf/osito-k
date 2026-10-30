@@ -14,6 +14,8 @@
 
 #include <efi.h>
 #include <efilib.h>
+#include "boot_paging.h"
+#include "../include/boot_trace.h"
 
 /* ── Boot info passed to kernel ─────────────────────────────── */
 
@@ -98,71 +100,123 @@ static boot_display_mode_t gop_modes[BOOT_MAX_DISPLAY_MODES];
 static UINT32 gop_mode_count;
 static UINT32 gop_selected_mode;
 
-/* Keep enough desktop space for modern windowed applications while bounding
- * the compositor cost on firmware that exposes very large GOP modes. */
-#define GOP_PREFER_W 1280
-#define GOP_PREFER_H  800
+static BOOLEAN gop_mode_usable(const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info,
+                               UINTN size)
+{
+    if (!info || size < sizeof(*info) || !info->HorizontalResolution ||
+        !info->VerticalResolution ||
+        info->PixelsPerScanLine < info->HorizontalResolution ||
+        (info->PixelFormat != PixelRedGreenBlueReserved8BitPerColor &&
+         info->PixelFormat != PixelBlueGreenRedReserved8BitPerColor))
+        return FALSE;
+
+    UINT64 row_bytes = (UINT64)info->PixelsPerScanLine * sizeof(UINT32);
+    return info->VerticalResolution <= (~(UINT64)0) / row_bytes;
+}
+
+static BOOLEAN gop_framebuffer_usable(const EFI_GRAPHICS_OUTPUT_PROTOCOL *gop)
+{
+    if (!gop || !gop->Mode || gop->Mode->Mode >= gop->Mode->MaxMode ||
+        !gop_mode_usable(gop->Mode->Info, gop->Mode->SizeOfInfo))
+        return FALSE;
+
+    UINT64 bytes = (UINT64)gop->Mode->Info->PixelsPerScanLine *
+                   gop->Mode->Info->VerticalResolution * sizeof(UINT32);
+    return gop->Mode->FrameBufferBase && gop->Mode->FrameBufferSize >= bytes &&
+           gop->Mode->FrameBufferBase <= (~(UINT64)0) - bytes;
+}
 
 static EFI_STATUS init_gop(void)
 {
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
     EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
-    EFI_STATUS status;
+    EFI_STATUS status = EFI_NOT_FOUND;
 
-    status = uefi_call_wrapper(BS->LocateProtocol, 3, &gop_guid, NULL, (void **)&gop);
-    if (EFI_ERROR(status)) {
+    gop_fb_base = 0;
+    gop_fb_width = gop_fb_height = gop_fb_pitch = 0;
+    gop_mode_count = gop_selected_mode = 0;
+
+    /* Prefer the firmware console's adapter on systems with multiple GPUs. */
+    if (ST->ConsoleOutHandle)
+        status = uefi_call_wrapper(BS->HandleProtocol, 3, ST->ConsoleOutHandle,
+                                   &gop_guid, (void **)&gop);
+    if (EFI_ERROR(status) || !gop)
+        status = uefi_call_wrapper(BS->LocateProtocol, 3, &gop_guid, NULL,
+                                   (void **)&gop);
+    if (EFI_ERROR(status) || !gop) {
         Print(L"GOP not available\r\n");
-        return status;
+        return EFI_ERROR(status) ? status : EFI_NOT_FOUND;
     }
 
-    /* Enumerate all modes — collect valid BGRX/RGBX modes */
-    UINT32 best_mode = gop->Mode->Mode;
-    UINT32 best_w = 0, best_h = 0;
-    gop_mode_count = 0;
+    if (!gop->Mode || !gop->Mode->MaxMode)
+        return EFI_UNSUPPORTED;
 
-    for (UINT32 i = 0; i < gop->Mode->MaxMode && gop_mode_count < BOOT_MAX_DISPLAY_MODES; i++) {
-        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info;
-        UINTN info_size = 0;
-        if (EFI_ERROR(uefi_call_wrapper(gop->QueryMode, 4, gop, i, &info_size, &info)))
-            continue;
-        /* Only RGBX (0) and BGRX (1) — skip BltOnly (3) and bitmask (2) */
-        if (info->PixelFormat > PixelBlueGreenRedReserved8BitPerColor)
-            continue;
+    /* A valid firmware mode already drives the connected display. Only try a
+     * mode change when it cannot provide the kernel's linear framebuffer. */
+    if (!gop_framebuffer_usable(gop)) {
+        status = EFI_UNSUPPORTED;
+        for (UINT32 i = 0; i < gop->Mode->MaxMode; i++) {
+            EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = NULL;
+            UINTN info_size = 0;
+            EFI_STATUS query = uefi_call_wrapper(gop->QueryMode, 4, gop, i,
+                                                 &info_size, &info);
+            BOOLEAN usable = !EFI_ERROR(query) && gop_mode_usable(info, info_size);
+            if (info)
+                uefi_call_wrapper(BS->FreePool, 1, info);
+            if (!usable)
+                continue;
 
-        UINT32 w = info->HorizontalResolution;
-        UINT32 h = info->VerticalResolution;
-        UINT32 pf = (info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor) ? 1 : 0;
-
-        gop_modes[gop_mode_count].width        = w;
-        gop_modes[gop_mode_count].height       = h;
-        gop_modes[gop_mode_count].pitch        = info->PixelsPerScanLine;
-        gop_modes[gop_mode_count].pixel_format = pf;
-        gop_mode_count++;
-
-        /* Select: prefer exact GOP_PREFER_WxGOP_PREFER_H;
-         * fallback to largest resolution that fits within those bounds */
-        if (w <= GOP_PREFER_W && h <= GOP_PREFER_H) {
-            if (w * h > best_w * best_h) {
-                best_mode = i;
-                best_w = w;
-                best_h = h;
+            Print(L"GOP: activating mode %d (no usable framebuffer)\r\n", i);
+            status = uefi_call_wrapper(gop->SetMode, 2, gop, i);
+            Print(L"GOP: SetMode(%d) returned %r\r\n", i, status);
+            if (!EFI_ERROR(status)) {
+                if (gop_framebuffer_usable(gop))
+                    break;
+                status = EFI_DEVICE_ERROR;
             }
         }
-        Print(L"  GOP mode %d: %dx%d pf=%d\r\n", i, w, h, pf);
+        if (EFI_ERROR(status) || !gop_framebuffer_usable(gop)) {
+            Print(L"GOP: no usable linear framebuffer (%r)\r\n", status);
+            return status;
+        }
     }
 
-    /* Switch to the selected mode if different from current */
-    if (best_mode != gop->Mode->Mode) {
-        Print(L"GOP: switching to mode %d (%dx%d)\r\n", best_mode, best_w, best_h);
-        uefi_call_wrapper(gop->SetMode, 2, gop, best_mode);
-    }
-    gop_selected_mode = best_mode;
-
-    /* Read final active mode parameters */
+    UINT32 active_mode = gop->Mode->Mode;
+    const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *current = gop->Mode->Info;
     gop_fb_base   = gop->Mode->FrameBufferBase;
-    gop_fb_width  = gop->Mode->Info->HorizontalResolution;
-    gop_fb_height = gop->Mode->Info->VerticalResolution;
-    gop_fb_pitch  = gop->Mode->Info->PixelsPerScanLine;
+    gop_fb_width  = current->HorizontalResolution;
+    gop_fb_height = current->VerticalResolution;
+    gop_fb_pitch  = current->PixelsPerScanLine;
+
+    /* The handoff uses compact table indices, not firmware mode IDs. Reserve
+     * index zero for the active mode even when the table fills up. */
+    gop_modes[gop_mode_count++] = (boot_display_mode_t){
+        gop_fb_width, gop_fb_height, gop_fb_pitch, (UINT32)current->PixelFormat
+    };
+    Print(L"GOP: keeping active mode %d (%dx%d)\r\n",
+          active_mode, gop_fb_width, gop_fb_height);
+
+    for (UINT32 i = 0; i < gop->Mode->MaxMode; i++) {
+        if (i == active_mode)
+            continue;
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = NULL;
+        UINTN info_size = 0;
+        EFI_STATUS query = uefi_call_wrapper(gop->QueryMode, 4, gop, i,
+                                             &info_size, &info);
+        if (!EFI_ERROR(query) && gop_mode_usable(info, info_size)) {
+            if (gop_mode_count < BOOT_MAX_DISPLAY_MODES) {
+                gop_modes[gop_mode_count++] = (boot_display_mode_t){
+                    info->HorizontalResolution, info->VerticalResolution,
+                    info->PixelsPerScanLine, (UINT32)info->PixelFormat
+                };
+            }
+            Print(L"  GOP mode %d: %dx%d pf=%d\r\n", i,
+                  info->HorizontalResolution, info->VerticalResolution,
+                  info->PixelFormat);
+        }
+        if (info)
+            uefi_call_wrapper(BS->FreePool, 1, info);
+    }
 
     Print(L"GOP: %dx%d pitch=%d fb=0x%lx (%d modes found)\r\n",
           gop_fb_width, gop_fb_height, gop_fb_pitch, gop_fb_base, gop_mode_count);
@@ -453,6 +507,7 @@ static EFI_STATUS load_kernel_elf(EFI_HANDLE ImageHandle)
 /* ── Memory Map ─────────────────────────────────────────────── */
 
 static UINT8  *mmap_buf;
+static UINTN   mmap_capacity;
 static UINTN   mmap_size;
 static UINTN   mmap_key;
 static UINTN   mmap_desc_size;
@@ -460,24 +515,74 @@ static UINT32  mmap_desc_ver;
 
 static EFI_STATUS get_memory_map(void)
 {
-    EFI_STATUS status;
+    for (unsigned attempt = 0; attempt < 4; attempt++) {
+        mmap_size = mmap_capacity;
+        EFI_STATUS status = uefi_call_wrapper(BS->GetMemoryMap, 5,
+            &mmap_size, (EFI_MEMORY_DESCRIPTOR *)mmap_buf, &mmap_key,
+            &mmap_desc_size, &mmap_desc_ver);
+        if (status != EFI_BUFFER_TOO_SMALL) {
+            if (!EFI_ERROR(status) && (!mmap_size ||
+                mmap_desc_size < sizeof(EFI_MEMORY_DESCRIPTOR) ||
+                mmap_size % mmap_desc_size))
+                return EFI_DEVICE_ERROR;
+            return status;
+        }
+        if (mmap_desc_size < sizeof(EFI_MEMORY_DESCRIPTOR) ||
+            mmap_desc_size > (~(UINTN)0) / 16 ||
+            mmap_size > (~(UINTN)0) - 16 * mmap_desc_size)
+            return EFI_OUT_OF_RESOURCES;
+        UINTN capacity = mmap_size + 16 * mmap_desc_size;
+        UINT8 *buffer = NULL;
+        status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                   capacity, (void **)&buffer);
+        if (EFI_ERROR(status))
+            return status;
+        if (mmap_buf)
+            uefi_call_wrapper(BS->FreePool, 1, mmap_buf);
+        mmap_buf = buffer;
+        mmap_capacity = capacity;
+    }
+    return EFI_BUFFER_TOO_SMALL;
+}
 
-    mmap_size = 0;
-    status = uefi_call_wrapper(BS->GetMemoryMap, 5,
-                               &mmap_size, NULL, &mmap_key,
-                               &mmap_desc_size, &mmap_desc_ver);
-    if (status != EFI_BUFFER_TOO_SMALL)
-        return status;
+static EFI_STATUS exit_boot_services(EFI_HANDLE image, boot_info_t *info)
+{
+    for (unsigned attempt = 0; attempt < 4; attempt++) {
+        EFI_STATUS status = get_memory_map();
+        if (EFI_ERROR(status))
+            return status;
+        info->mmap_addr = (UINT64)mmap_buf;
+        info->mmap_size = mmap_size;
+        info->mmap_desc_size = mmap_desc_size;
+        info->mmap_desc_ver = mmap_desc_ver;
+        /* No printing, protocol calls or allocations between these calls. */
+        status = uefi_call_wrapper(BS->ExitBootServices, 2, image, mmap_key);
+        if (status != EFI_INVALID_PARAMETER)
+            return status;
+    }
+    return EFI_INVALID_PARAMETER;
+}
 
-    mmap_size += 4 * mmap_desc_size;
-    status = uefi_call_wrapper(BS->AllocatePool, 3,
-                               EfiLoaderData, mmap_size, (void **)&mmap_buf);
-    if (EFI_ERROR(status)) return status;
-
-    status = uefi_call_wrapper(BS->GetMemoryMap, 5,
-                               &mmap_size, (EFI_MEMORY_DESCRIPTOR *)mmap_buf,
-                               &mmap_key, &mmap_desc_size, &mmap_desc_ver);
-    return status;
+/* SysV arguments: CR3, stack top, entry, boot_info. The low firmware mappings
+ * retain this trampoline until the high-half kernel takes control. */
+__attribute__((naked, noreturn, sysv_abi))
+static void boot_enter_kernel(UINT64 cr3 __attribute__((unused)),
+                              UINT64 stack __attribute__((unused)),
+                              UINT64 entry __attribute__((unused)),
+                              boot_info_t *info __attribute__((unused)))
+{
+    __asm__ volatile (
+        "cli\n\t"
+        "cld\n\t"
+        "mov %rdi, %cr3\n\t"
+        "mov %rsi, %rsp\n\t"
+        "and $-16, %rsp\n\t"
+        "xor %ebp, %ebp\n\t"
+        "mov %rcx, %rdi\n\t"
+        "call *%rdx\n\t"
+        "1: cli\n\t"
+        "hlt\n\t"
+        "jmp 1b\n\t");
 }
 
 /* ── EFI Main ───────────────────────────────────────────────── */
@@ -510,7 +615,18 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     /* Step 3: Find ACPI RSDP */
     find_acpi_rsdp(ST);
 
-    /* Step 4: Get memory map (LAST before ExitBootServices) */
+    /* Keep our stack and boot_info in loader-owned memory, not on the
+     * firmware stack that the kernel will reclaim as BootServicesData. */
+    EFI_PHYSICAL_ADDRESS stack_base = 0xffffffffULL;
+    const UINTN stack_pages = 128;
+    status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateMaxAddress,
+                               EfiLoaderData, stack_pages, &stack_base);
+    if (EFI_ERROR(status)) {
+        Print(L"FATAL: Cannot allocate kernel stack: %r\r\n", status);
+        goto halt;
+    }
+
+    /* Preliminary map for building tables. Refresh again immediately at exit. */
     status = get_memory_map();
     if (EFI_ERROR(status)) {
         Print(L"FATAL: Cannot get memory map: %r\r\n", status);
@@ -521,7 +637,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
           mmap_size / mmap_desc_size, mmap_desc_size);
 
     /* Step 5: Fill boot_info */
-    boot_info_t info;
+    static boot_info_t info;
     info.magic           = BOOT_INFO_MAGIC;
     info.version         = BOOT_INFO_VERSION;
     info.fb_base         = gop_fb_base;
@@ -541,89 +657,40 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     for (UINT32 i = 0; i < gop_mode_count; i++)
         info.display_modes[i] = gop_modes[i];
 
-    /* Step 5.5: Build a new PML4 that clones UEFI's mappings and adds
-     * an upper-half direct map at 0xFFFF800000000000+ so the relocated
-     * kernel can be entered at VA = KERNEL_VBASE + phys.
-     *
-     * We cannot patch UEFI's PML4 in place — it is marked read-only in
-     * UEFI's own tables — so we allocate our own PML4 page, copy the
-     * 512 entries, append PML4[256] → new PDPT (1GB huge pages 0..16 GB),
-     * and switch CR3.
-     *
-     * This is a preparatory no-op as long as kernel_entry_addr still
-     * points to the lower half; once kernel.ld relocates, the jump
-     * below lands on the new PML4[256] entry and this path becomes
-     * load-bearing. The kernel's own paging_init builds an equivalent
-     * mirror (Fase 1) in its replacement CR3, so the handoff is
-     * seamless. */
-    {
-        UINT64 old_cr3;
-        __asm__ volatile ("mov %%cr3, %0" : "=r"(old_cr3));
-        UINT64 *old_pml4 = (UINT64 *)(old_cr3 & ~0xFFFULL);
-
-        EFI_PHYSICAL_ADDRESS my_pml4_phys = 0;
-        EFI_STATUS st = uefi_call_wrapper(BS->AllocatePages, 4,
-                                          AllocateAnyPages, EfiLoaderData,
-                                          1, &my_pml4_phys);
-        if (EFI_ERROR(st)) {
-            Print(L"FATAL: AllocatePages PML4 failed: %r\r\n", st);
-            goto halt;
-        }
-
-        EFI_PHYSICAL_ADDRESS pdpt_phys = 0;
-        st = uefi_call_wrapper(BS->AllocatePages, 4,
-                               AllocateAnyPages, EfiLoaderData,
-                               1, &pdpt_phys);
-        if (EFI_ERROR(st)) {
-            Print(L"FATAL: AllocatePages PDPT failed: %r\r\n", st);
-            goto halt;
-        }
-
-        UINT64 *my_pml4 = (UINT64 *)my_pml4_phys;
-        UINT64 *pdpt    = (UINT64 *)pdpt_phys;
-
-        for (int i = 0; i < 512; i++) my_pml4[i] = old_pml4[i];
-
-        for (int i = 0; i < 512; i++) pdpt[i] = 0;
-        /* 1GB huge pages covering 0..16 GB. PRESENT | WRITABLE | PS. */
-        for (int gb = 0; gb < 16; gb++)
-            pdpt[gb] = ((UINT64)gb << 30) | 0x83;
-
-        my_pml4[256] = pdpt_phys | 0x3; /* PRESENT | WRITABLE */
-
-        __asm__ volatile ("mov %0, %%cr3" : : "r"(my_pml4_phys) : "memory");
-
-        Print(L"Upper-half PML4[256] -> PDPT 0x%lx (16 GB) via new PML4 0x%lx\r\n",
-              pdpt_phys, my_pml4_phys);
+    UINT64 firmware_cr3, kernel_cr3 = 0;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(firmware_cr3));
+    UINT64 fb_bytes = (UINT64)gop_fb_pitch * gop_fb_height * sizeof(UINT32);
+    UINT32 apic_lo, apic_hi;
+    __asm__ volatile ("rdmsr" : "=a"(apic_lo), "=d"(apic_hi) : "c"(0x1b));
+    UINT64 apic_base = (((UINT64)apic_hi << 32) | apic_lo) & 0xfffffffff000ULL;
+    status = boot_prepare_paging((const UINT64 *)(firmware_cr3 & BOOT_PT_MASK),
+        mmap_buf, mmap_size, mmap_desc_size, gop_fb_base, fb_bytes, apic_base, &kernel_cr3);
+    if (EFI_ERROR(status)) {
+        Print(L"FATAL: Cannot prepare RAM/GOP mappings: %r\r\n", status);
+        goto halt;
     }
+    Print(L"Handoff: CR3=0x%lx stack=0x%lx-0x%lx entry=0x%lx\r\n",
+          kernel_cr3, stack_base, stack_base + stack_pages * 4096, kernel_entry_addr);
+    Print(L"Handoff: GOP 0x%lx -> 0x%lx (%ld bytes); firmware CR3 unchanged\r\n",
+          gop_fb_base, BOOT_DIRECT_BASE + gop_fb_base, fb_bytes);
+    Print(L"Stages (bottom right): E0=exit pending, E1=exit OK, C1=kernel, C2=BSS OK\r\n");
 
     Print(L"\r\nExiting boot services...\r\n");
 
-    /* Step 6: ExitBootServices — point of no return */
-    status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, mmap_key);
+    boot_trace(gop_fb_base, gop_fb_width, gop_fb_height, gop_fb_pitch, 0xe0, 0);
+    status = exit_boot_services(ImageHandle, &info);
+    __asm__ volatile ("cli" ::: "memory");
     if (EFI_ERROR(status)) {
-        /* Memory map may have changed, retry once */
-        get_memory_map();
-        info.mmap_addr      = (UINT64)mmap_buf;
-        info.mmap_size      = mmap_size;
-        info.mmap_desc_size = mmap_desc_size;
-        info.mmap_desc_ver  = mmap_desc_ver;
-        status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, mmap_key);
-        if (EFI_ERROR(status)) {
-            Print(L"FATAL: ExitBootServices failed: %r\r\n", status);
-            goto halt;
-        }
+        /* Even a failed exit may have shut down the console protocol. */
+        boot_trace(gop_fb_base, gop_fb_width, gop_fb_height, gop_fb_pitch, 0xef, status);
+        goto halt;
     }
-
-    /* === We are now bare-metal — no UEFI services === */
-
-    /* Jump to kernel */
-    typedef void (*kernel_entry_fn)(boot_info_t *);
-    kernel_entry_fn entry = (kernel_entry_fn)kernel_entry_addr;
-    entry(&info);
+    boot_trace(gop_fb_base, gop_fb_width, gop_fb_height, gop_fb_pitch, 0xe1, 0);
+    boot_enter_kernel(kernel_cr3, stack_base + stack_pages * 4096,
+                      kernel_entry_addr, &info);
 
     /* Should never reach here */
 halt:
-    for (;;) __asm__ volatile ("hlt");
+    for (;;) __asm__ volatile ("cli; hlt");
     return EFI_SUCCESS;
 }
