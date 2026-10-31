@@ -30,7 +30,7 @@ unmodified (`TLS_CRYPTO_SRC` in the Makefile):
   with signatures, CA flags, path lengths, dates and the server name;
 - RSA PKCS#1 v1.5 verification and the RSA public operation (`src/rsa`, `src/int`, i31);
 - ECDSA verification on P-256, P-384 and P-521 (`src/ec`), which
-  `kernel/ecdh_p256.c` also uses for P-256 ECDHE;
+  `kernel/ecdh.c` also uses for P-256 and P-384 ECDHE;
 - `src/hash/multihash.c` and `src/codec/ccopy.c`.
 
 BearSSL 0.6 has no RSA-PSS, which TLS 1.3 requires of RSA servers, so

@@ -273,7 +273,7 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/serial_tx.c kernel/serial_test.c
            kernel/apipa.c kernel/rag.c kernel/cert_pin.c kernel/certmgr.c \
            kernel/rsa.c kernel/x509.c kernel/ecdsa_p256.c kernel/ecdsa_p384.c \
            kernel/http_plain.c kernel/ocsp.c kernel/crl.c \
-           kernel/tls_verify.c kernel/ca_roots.c kernel/ecdh_p256.c kernel/random_drbg.c \
+           kernel/tls_verify.c kernel/ca_roots.c kernel/ecdh.c kernel/random_drbg.c \
            kernel/inferconnect.c kernel/inferconnect_rpc.c kernel/inferconnect_client.c \
            kernel/inferconnect_oict.c kernel/inference_shims.c kernel/agent_simple.c \
            kernel/cluster.c kernel/cluster_rendezvous.c
@@ -376,7 +376,7 @@ WPA_CRYPTO_SRC = lib/bearssl/src/hash/sha1.c lib/bearssl/src/mac/hmac.c \
                  lib/bearssl/src/symcipher/aes_ct_cbcdec.c
 WPA_CRYPTO_OBJ = $(WPA_CRYPTO_SRC:%.c=$(BUILD)/%.o)
 # BearSSL's X.509 engine and RSA/ECDSA checks for the TLS clients
-# (kernel/tls_verify.c, ecdh_p256.c); its hashes and codecs are the above
+# (kernel/tls_verify.c, ecdh.c); its hashes and codecs are the above
 TLS_CRYPTO_SRC = $(filter-out $(WPA_CRYPTO_SRC),$(wildcard lib/bearssl/src/codec/*.c \
                  lib/bearssl/src/ec/*.c lib/bearssl/src/hash/multihash.c lib/bearssl/src/int/*.c \
                  lib/bearssl/src/rsa/*.c lib/bearssl/src/x509/*.c))
@@ -408,7 +408,7 @@ KERN_MINIMAL = kernel/main.c kernel/serial.c kernel/framebuffer.c kernel/lockup.
                kernel/file_sync.c kernel/file_sync_fs.c \
                kernel/screen_capture.c kernel/screen_capture_gop.c $(DRIVER_KERN_SRC) \
                kernel/crypto.c kernel/tls.c kernel/http.c kernel/claude.c \
-               kernel/tls_verify.c kernel/ca_roots.c kernel/ecdh_p256.c kernel/random_drbg.c \
+               kernel/tls_verify.c kernel/ca_roots.c kernel/ecdh.c kernel/random_drbg.c \
                kernel/tokenizer.c kernel/smp.c kernel/dynlink.c \
                kernel/zlib.c kernel/git.c \
                kernel/shm.c kernel/compositor.c kernel/display.c kernel/display_source.c \
@@ -1843,7 +1843,9 @@ $(BUILD)/lib/tinyssh/%.o: lib/tinyssh/%.c $(SSH_HEADERS)
 $(BUILD)/kernel/serial.o $(BUILD)/kernel/serial_tx.o: KCFLAGS += -mgeneral-regs-only
 $(BUILD)/kernel/wpa2.o $(BUILD)/kernel/wpa2_crypto.o $(BUILD)/kernel/wpa2_rsn.o $(BUILD)/kernel/wpa2_selftest.o $(BUILD)/kernel/random_secure.o: KCFLAGS += -Ilib/bearssl/port -mgeneral-regs-only
 $(BUILD)/win32/advapi32_shim.o: KCFLAGS += -Ilib/bearssl/port
-$(BUILD)/kernel/tls_verify.o $(BUILD)/kernel/ca_roots.o $(BUILD)/kernel/ecdh_p256.o: KCFLAGS += -Ilib/bearssl/port
+# bearssl.h takes the compiler's stddef.h, then include/stdint.h -> types.h,
+# which defines NULL again (the same value, spelled differently)
+$(BUILD)/kernel/tls_verify.o $(BUILD)/kernel/ca_roots.o $(BUILD)/kernel/ecdh.o: KCFLAGS += -Ilib/bearssl/port -Wno-macro-redefined
 
 # No time(), /dev/urandom or RDRAND inside BearSSL: the X.509 engine gets
 # the time from tls_verify.c, randomness comes from random_drbg.c

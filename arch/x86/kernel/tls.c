@@ -18,7 +18,7 @@
 #include "tls.h"
 #include "tls13.h"
 #include "crypto.h"
-#include "ecdh_p256.h"
+#include "ecdh.h"
 
 /* ── External dependencies ───────────────────────────────────── */
 
@@ -315,12 +315,13 @@ static int tls_send_client_hello(tls_conn_t *tls, const char *hostname)
         tmemcpy(msg + pos, hostname, hn_len); pos += hn_len;
     }
 
-    /* Supported Groups extension (0x000A) — x25519, then secp256r1 */
+    /* Supported Groups extension (0x000A) — x25519, secp256r1, secp384r1 */
     put16(msg + pos, 0x000A); pos += 2;
-    put16(msg + pos, 6); pos += 2;  /* ext len */
-    put16(msg + pos, 4); pos += 2;  /* named curve list len */
+    put16(msg + pos, 8); pos += 2;  /* ext len */
+    put16(msg + pos, 6); pos += 2;  /* named curve list len */
     put16(msg + pos, 0x001D); pos += 2;  /* x25519 */
     put16(msg + pos, 0x0017); pos += 2;  /* secp256r1 */
+    put16(msg + pos, 0x0018); pos += 2;  /* secp384r1 */
 
     /* EC Point Formats (0x000B) — uncompressed only */
     put16(msg + pos, 0x000B); pos += 2;
@@ -455,7 +456,7 @@ static int parse_server_key_exchange(tls_conn_t *tls,
         return -1;
     }
 
-    if (named_curve != 0x001D && named_curve != 0x0017) {  /* x25519, secp256r1 */
+    if (named_curve != 0x001D && !ecdh_point_len(named_curve)) {  /* x25519, P-256, P-384 */
         serial_puts("[TLS] Unsupported curve: 0x");
         serial_puthex(named_curve, 4);
         serial_puts("\n");
@@ -463,7 +464,7 @@ static int parse_server_key_exchange(tls_conn_t *tls,
     }
     tls->group = named_curve;
 
-    if (pubkey_len != (named_curve == 0x0017 ? 65 : 32) ||
+    if (pubkey_len != (named_curve == 0x001D ? 32 : ecdh_point_len(named_curve)) ||
         4 + (uint32_t)pubkey_len > len) return -1;
 
     /* The signature: algorithm (2), length (2), the bytes; by the leaf's
@@ -489,19 +490,22 @@ static int parse_server_key_exchange(tls_conn_t *tls,
     }
 
     /* Compute shared secret */
-    if (named_curve == 0x0017) {
-        if (ecdh_p256_keygen(tls->p256_priv, tls->p256_pub) < 0 ||
-            ecdh_p256_shared(tls->p256_priv, data + 4, 65, tls->premaster_secret) < 0)
+    if (named_curve != 0x001D) {
+        if (ecdh_keygen(named_curve, tls->ec_priv, tls->ec_pub) < 0 ||
+            ecdh_shared(named_curve, tls->ec_priv, data + 4, pubkey_len, tls->premaster_secret) < 0)
             return -1;
+        tls->premaster_len = ecdh_scalar_len(named_curve);
         serial_puts("[TLS] ServerKeyExchange: signed by the certificate's key (");
         serial_puts(tls_scheme_name(scheme));
-        serial_puts("); P-256 secret computed\n");
+        serial_puts(named_curve == 0x0017 ? "); P-256 secret computed\n"
+                                          : "); P-384 secret computed\n");
         return 0;
     }
     uint8_t server_pubkey[32];
     tmemcpy(server_pubkey, data + 4, 32);
 
     x25519(tls->premaster_secret, tls->ecdhe_privkey, server_pubkey);
+    tls->premaster_len = 32;
 
     serial_puts("[TLS] ServerKeyExchange: signed by the certificate's key (");
     serial_puts(tls_scheme_name(scheme));
@@ -519,7 +523,7 @@ static void tls_derive_keys(tls_conn_t *tls)
     tmemcpy(seed, tls->client_random, 32);
     tmemcpy(seed + 32, tls->server_random, 32);
 
-    tls_prf_sha256(tls->premaster_secret, 32,
+    tls_prf_sha256(tls->premaster_secret, tls->premaster_len,
                     "master secret", seed, 64,
                     tls->master_secret, 48);
 
@@ -551,14 +555,14 @@ static void tls_derive_keys(tls_conn_t *tls)
 
 static int tls_send_client_finish(tls_conn_t *tls)
 {
-    /* 1. ClientKeyExchange: our ECDHE public key, X25519 or P-256 */
+    /* 1. ClientKeyExchange: our ECDHE public key, X25519, P-256 or P-384 */
     {
-        uint8_t msg[4 + 1 + 65];
-        uint32_t kl = tls->group == 0x0017 ? 65 : 32;
+        uint8_t msg[4 + 1 + ECDH_MAX_POINT];
+        uint32_t kl = tls->group == 0x001D ? 32 : ecdh_point_len(tls->group);
         msg[0] = TLS_HS_CLIENT_KEY_EXCH;
         put24(msg + 1, 1 + kl);
         msg[4] = (uint8_t)kl;
-        tmemcpy(msg + 5, kl == 65 ? tls->p256_pub : tls->ecdhe_pubkey, kl);
+        tmemcpy(msg + 5, tls->group == 0x001D ? tls->ecdhe_pubkey : tls->ec_pub, kl);
 
         sha256_update(&tls->hs_hash, msg, 5 + kl);
 

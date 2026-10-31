@@ -218,8 +218,12 @@ can go through it.
     before the server's Finished is accepted.
 - **TLS 1.2 (`kernel/tls.c`):** `http.c` falls back to it only when the server
   may not speak 1.3, never after a failed authentication.
-  - ECDHE over X25519 or P-256 (`kernel/ecdh_p256.c`), an RSA or ECDSA
+  - ECDHE over X25519, P-256 or P-384 (`kernel/ecdh.c`), an RSA or ECDSA
     certificate, AES-128-GCM.
+  - P-384 is offered because an OpenSSL TLS 1.2 server uses an ECDSA
+    certificate only when the client lists its curve: `ecc384.badssl.com`'s
+    is P-384 (the key exchange still picks P-256). Without it, that site
+    failed.
   - The chain must verify, and the ServerKeyExchange must carry the leaf's
     signature over both randoms and the key.
   - The server's Finished must match.
@@ -266,8 +270,6 @@ can go through it.
     a time; up to 32 MB each.
   - Measured: Let's Encrypt's shards are 60–200 KB, Google's a few hundred
     bytes, Amazon's 2.1 MB (47,616 entries; that request took 3.9 s in all).
-- **What isn't checked:** ECDHE over P-384 only (`ecc384.badssl.com`'s
-  server).
 - **Measured on the phone (2026-10-30):** each request takes 0.6–1.8 s
   (badssl.com is under a different name each time).
 

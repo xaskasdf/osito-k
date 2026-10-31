@@ -59,7 +59,7 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/fs.c kernel/gui_task.c \
             kernel/pci.c kernel/net.c kernel/dhcp.c kernel/ntp.c \
             kernel/crypto.c kernel/random.c kernel/tls.c kernel/http.c kernel/smp.c \
-            kernel/tls13.c kernel/hkdf.c kernel/tls_verify.c kernel/revocation.c kernel/ca_roots.c kernel/ecdh_p256.c \
+            kernel/tls13.c kernel/hkdf.c kernel/tls_verify.c kernel/revocation.c kernel/ca_roots.c kernel/ecdh.c \
             kernel/claude.c kernel/tokenizer.c kernel/tokenizer_trie.c \
             kernel/tensor.c kernel/tensor_neon.c kernel/tensor_sdot.c kernel/tensor_arena.c \
             kernel/inference.c kernel/dispatch.c kernel/llm.c \
@@ -90,7 +90,7 @@ BEARSSL_CFLAGS := -ffreestanding -nostdlib -fpie -march=armv8.2-a -mtune=cortex-
                   -DBR_USE_WIN32_RAND=0 -DBR_RDRAND=0 -DBR_AES_X86NI=0 -DBR_SSE2=0 \
                   -DBR_POWER8=0 -DBR_LE_UNALIGNED=0 -DBR_BE_UNALIGNED=0
 # Kernel files that include bearssl.h get its string.h
-BEARSSL_USERS  := $(BUILD)/kernel/tls_verify.o $(BUILD)/kernel/ca_roots.o $(BUILD)/kernel/ecdh_p256.o
+BEARSSL_USERS  := $(BUILD)/kernel/tls_verify.o $(BUILD)/kernel/ca_roots.o $(BUILD)/kernel/ecdh.o
 
 # Objects
 ASM_OBJS := $(patsubst %.S,$(BUILD)/%.o,$(ASM_SRCS))

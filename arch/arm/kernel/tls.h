@@ -66,10 +66,11 @@ typedef struct {
     uint8_t   client_random[32];
     uint8_t   server_random[32];
 
-    /* ECDHE */
+    /* ECDHE: X25519's key; the secret, 32 bytes or P-384's 48 */
     uint8_t   ecdhe_privkey[32];
     uint8_t   ecdhe_pubkey[32];
-    uint8_t   premaster_secret[32];
+    uint8_t   premaster_secret[48];
+    uint32_t  premaster_len;
 
     /* Master secret + key material */
     uint8_t   master_secret[48];
@@ -96,10 +97,10 @@ typedef struct {
     uint16_t  suite;
     tls_pubkey_t leaf;
 
-    /* The ECDHE group the server chose; P-256's key if it's that */
+    /* The ECDHE group the server chose; our P-256 or P-384 key (ecdh.c) */
     uint16_t  group;
-    uint8_t   p256_priv[32];
-    uint8_t   p256_pub[65];
+    uint8_t   ec_priv[48];
+    uint8_t   ec_pub[97];
 
     /* A decrypted record's data that tls_recv hasn't returned yet */
     uint8_t   app_buf[TLS_MAX_RECORD + 256];
