@@ -21,6 +21,11 @@ extern void kfree(void *ptr);
 extern uint64_t kprof_irq_save(void);
 extern void kprof_irq_restore(uint64_t flags);
 extern uint64_t kprof_read_cr3(void);
+#elif defined(__EMSCRIPTEN__)
+/* The browser build has no interrupts and no page tables */
+static uint64_t kprof_irq_save(void) { return 0; }
+static void kprof_irq_restore(uint64_t flags) { (void)flags; }
+static uint64_t kprof_read_cr3(void) { return 0; }
 #else
 static uint64_t kprof_irq_save(void)
 {

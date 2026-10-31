@@ -434,6 +434,47 @@ int pe_protection_selftest(void) { return -1; }
 int user32_input_selftest(void) { return -1; }
 int user32_window_model_selftest(void) { return -1; }
 int wsock_selftest(void) { return -1; }
+int user32_dialog_selftest(void) { return -1; }
+int ole32_apartment_selftest(void) { return -1; }
+int nt_file_selftest(void) { return -1; }
+int ddraw_selftest(void) { return -1; }
+int dsound_selftest(void) { return -1; }
+int msi_engine_selftest(const char *a, const char *b, int c) { (void)a; (void)b; (void)c; return -1; }
+int msi_io_selftest(const char *a, const char *b, const char *c) { (void)a; (void)b; (void)c; return -1; }
+void user32_release_process(uint32_t process_id) { (void)process_id; }
+void ddraw_release_process(uint32_t process_id) { (void)process_id; }
+
+/* ── What x86's shell reaches since 2026-10-30 that the browser hasn't:
+ * DOS/DPMI, audio and serial selftests, Intel GPU tests, the scheduler's
+ * stack and process dumps, OsitoFS v3 modes. Selftests fail as above. */
+int dos_api_selftest(void) { return -1; }
+int dos_bios_contract_selftest(void) { return -1; }
+int dos_bios_memory_selftest(void) { return -1; }
+int dos_cpu_rf_selftest(void) { return -1; }
+int dos_dpmi_stack_selftest(void) { return -1; }
+int dos_fpu_selftest(void) { return -1; }
+int dos_umb_selftest(void) { return -1; }
+int dos_xms_selftest(void) { return -1; }
+int dpmi_selftest(void) { return -1; }
+int oss_audio_selftest(void) { return -1; }
+int serial_selftest(void) { return -1; }
+void serial_stats_dump(void) {}
+int sched_signal_selftest(void) { return -1; }
+int intel_gfx_bcs_service_test(void) { return -1; }
+int intel_gfx_rcs_service_test(void) { return -1; }
+int intel_gfx_rcs_program_file(const char *path) { (void)path; return -1; }
+volatile uint32_t *idt_get_apic_base(void) { return NULL; }     /* kprof: no LAPIC */
+void x86_tss_reset_ist2(void) {}
+void sched_reset_current_compat_ist1(void) {}
+void sched_reset_current_compat_ist3(void) {}
+int sched_current_get(void) { return 0; }                       /* the shell, alone */
+const char *proc_current_name(void) { return "shell"; }
+uint32_t proc_exec_pid(void) { return 0; }
+void proc_start_reaper(void) {}
+void proc_debug_dump_all(void) {}
+int proc_debug_dump_stack(uint32_t pid) { (void)pid; return -1; }
+int osfs3_get_mode(uint32_t ino, uint16_t *mode) { (void)ino; (void)mode; return -1; }
+int osfs3_set_mode(uint32_t ino, uint16_t mode) { (void)ino; (void)mode; return -1; }
 
 void dll_export_lookup_dump(void) {}
 void dll_file_cache_dump(void) {}

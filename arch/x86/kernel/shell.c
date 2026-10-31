@@ -8318,9 +8318,13 @@ q4kgdone:
             extern int proc_debug_dump_stack(uint32_t pid);
             if (argc != 3 || sh_parse_u32(argv[2], &pid) < 0 || !pid) {
                 sh_puts("Usage: sched stack <native-pid>\n");
+#ifndef __EMSCRIPTEN__
                 if (shell_remote_active()) remote_io.status = 2;
+#endif
             } else if (proc_debug_dump_stack(pid) < 0) {
+#ifndef __EMSCRIPTEN__
                 if (shell_remote_active()) remote_io.status = 1;
+#endif
             }
         } else if (argc >= 2 && strcmp(argv[1], "stats") == 0) {
             sh_puts("Scheduler: ");
