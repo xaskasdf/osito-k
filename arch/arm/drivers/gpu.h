@@ -1,0 +1,1208 @@
+/*
+ * OsitoK x86-64 — GPU Driver
+ *
+ * Phase 0: PCI detection (vendor/device ID, BAR addresses, generation).
+ * Phase 1: MMIO probe (chip ID, engines, PTIMER, Falcon detect).
+ * Phase 2: VRAM discovery, BAR1 read/write test, PRAMIN window.
+ * Phase 3: PCI BAR sizes, gpu_write, PRAMIN window slide + R/W.
+ * Phase 4: GSP Falcon deep probe, firmware load to RAM, upload to VRAM.
+ * Phase 5: GSP boot (ELF parse, BOOTVEC, CPUCTL start, mailbox handshake).
+ * Phase 6: GSP shared memory message queues (host↔GSP bidirectional).
+ * Phase 7: RPC protocol (function IDs, poll with timeout, init sequence).
+ * Phase 8: RM init commands (SET_SYSTEM_INFO, ALLOC_ROOT, etc.).
+ * Phase 9: VBIOS read + BIT parse + FWSEC extraction.
+ * Phase 10: FWSEC-FRTS execution + WPR2 creation.
+ */
+
+#ifndef OSITOK_GPU_H
+#define OSITOK_GPU_H
+
+#include "../include/types.h"
+
+/* ── NVIDIA MMIO Register Defines (BAR0 offsets, envytools) ──── */
+
+/* PMC — Card Master Control */
+#define NV_PMC_BOOT_0          0x000000
+#define NV_PMC_BOOT_42         0x0000A8
+#define NV_PMC_INTR_0          0x000100
+#define NV_PMC_ENABLE          0x000200
+
+/* PTIMER — GPU Timer */
+#define NV_PTIMER_TIME_0       0x009400   /* Low 32 bits (ns) */
+#define NV_PTIMER_TIME_1       0x009410   /* High 32 bits (ns) */
+
+/* PFB — Framebuffer / Memory Controller */
+#define NV_PFB_CFG0            0x100C04
+
+/* Falcon microcontroller bases (Turing+) */
+#define NV_PGSP_BASE           0x110000
+#define NV_PSEC_BASE           0x087000
+#define NV_PPMU_BASE           0x10A000
+#define NV_FALCON_HWCFG        0x000064   /* Offset within falcon base */
+
+/* PMC_ENABLE engine bits */
+#define NV_PMC_ENABLE_PGRAPH   (1 << 12)
+#define NV_PMC_ENABLE_PFB      (1 << 20)
+#define NV_PMC_ENABLE_PFIFO    (1 <<  8)
+#define NV_PMC_ENABLE_PTIMER   (1 << 16)
+#define NV_PMC_ENABLE_CE0      (1 <<  6)
+#define NV_PMC_ENABLE_CE1      (1 <<  7)
+
+/* PFB — VRAM size (Turing+, envytools) */
+#define NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE  0x100CE0  /* bits 29:0 << 17 = bytes */
+
+/* PRAMIN — Instance memory window through BAR0 */
+#define NV_PRAMIN_BASE      0x700000   /* 1MB window */
+#define NV_PRAMIN_SIZE      0x100000
+
+/* PBUS — BAR0 PRAMIN window control (Fermi+, envytools) */
+#define NV_PBUS_BAR0_WINDOW    0x001700   /* bits 23:0 = VRAM addr >> 16 */
+
+/* Falcon Microcontroller Registers (offsets from falcon base) */
+#define NV_FALCON_HWCFG2          0x000068   /* IMEM/DMEM sizes */
+#define NV_FALCON_HWCFG2_IMEM_MASK   0x000001FF  /* bits 8:0 * 256 = IMEM bytes */
+#define NV_FALCON_HWCFG2_DMEM_SHIFT  9
+#define NV_FALCON_HWCFG2_DMEM_MASK   0x0003FE00  /* bits 17:9 * 256 = DMEM bytes */
+
+#define NV_FALCON_MAILBOX0         0x000040
+#define NV_FALCON_MAILBOX1         0x000044
+#define NV_FALCON_OS               0x000080
+#define NV_FALCON_CPUCTL           0x000100
+#define NV_FALCON_CPUCTL_STARTCPU  (1 << 1)
+#define NV_FALCON_CPUCTL_HALTED    (1 << 4)
+#define NV_FALCON_CPUCTL_STOPPED   (1 << 5)
+#define NV_FALCON_BOOTVEC          0x000104
+#define NV_FALCON_DMACTL           0x00010C
+#define NV_FALCON_DMATRFBASE      0x000110
+#define NV_FALCON_DMATRFMOFFS     0x000114   /* DMA destination offset (falcon IMEM/DMEM) */
+#define NV_FALCON_DMATRFCMD       0x000118   /* DMA transfer command (trigger) */
+#define NV_FALCON_DMATRFFBOFFS    0x00011C   /* DMA source offset (relative to DMATRFBASE) */
+#define NV_FALCON_IMEMC            0x000180
+#define NV_FALCON_IMEMD            0x000184
+#define NV_FALCON_DMEMC            0x0001C0
+#define NV_FALCON_DMEMD            0x0001C4
+
+#define GSP_FW_VRAM_OFFSET_MB      128   /* Firmware placement: VRAM+128MB */
+
+/* GSP Queue Doorbell (notify GSP of new messages) */
+#define NV_PGSP_QUEUE_HEAD         0x110C00
+
+/* ── GSP Message Queue Constants ─────────────────────────────── */
+
+#define GSP_PAGE_SIZE              4096
+#define GSP_PAGE_SHIFT             12
+#define GSP_MSGQ_NUM_PAGES         63       /* Entries per queue */
+#define GSP_MSG_SIGNATURE          0x43505256  /* "VRPC" LE */
+#define GSP_MSG_HDR_VERSION        0x03000000
+
+/* Shared memory region offsets */
+#define GSP_SHM_PTE_OFF            0x00000
+#define GSP_SHM_CPUQ_HDR_OFF      0x01000
+#define GSP_SHM_CPUQ_DATA_OFF     0x02000
+#define GSP_SHM_GSPQ_HDR_OFF      0x41000
+#define GSP_SHM_GSPQ_DATA_OFF     0x42000
+#define GSP_SHM_TOTAL_SIZE         0x81000  /* ~513KB */
+
+#define GSP_QUEUE_ARGS_VRAM_MB     126   /* Init args at VRAM+126MB */
+
+/* ── Minimal ELF64 types (for GSP firmware parsing) ────────── */
+
+#define ELF_MAGIC       0x464C457F  /* "\x7FELF" as uint32_t LE */
+#define ELFCLASS64      2
+#define ELFDATA2LSB     1
+#define PT_LOAD         1
+
+typedef struct {
+    uint8_t  e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;          /* Entry point */
+    uint64_t e_phoff;          /* Program header table offset */
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;          /* Number of program headers */
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} elf64_ehdr_t;               /* 64 bytes */
+
+typedef struct {
+    uint32_t p_type;           /* PT_LOAD = 1 */
+    uint32_t p_flags;
+    uint64_t p_offset;         /* Offset in file */
+    uint64_t p_vaddr;          /* Virtual address */
+    uint64_t p_paddr;          /* Physical address */
+    uint64_t p_filesz;         /* Size in file */
+    uint64_t p_memsz;          /* Size in memory */
+    uint64_t p_align;
+} elf64_phdr_t;               /* 56 bytes */
+
+/* ── GSP Message Queue Structures ─────────────────────────────── */
+
+/* TX header — written by producer, read by consumer (32 bytes) */
+typedef struct {
+    uint32_t version;       /* Queue version = 1 */
+    uint32_t size;          /* Total queue data size (bytes) */
+    uint32_t msgSize;       /* Entry size = 4096 */
+    uint32_t msgCount;      /* Number of entries = 63 */
+    uint32_t writePtr;      /* Next write index (volatile) */
+    uint32_t flags;         /* 0 normally */
+    uint32_t rxHdrOff;      /* Offset of RX header from queue header start */
+    uint32_t entryOff;      /* Offset of data entries from queue header start */
+} gsp_msgq_tx_hdr_t;       /* 32 bytes */
+
+/* RX header — written by consumer, read by producer (4 bytes + pad) */
+typedef struct {
+    uint32_t readPtr;       /* Next read index (volatile) */
+} gsp_msgq_rx_hdr_t;
+
+/* Message element header (48 bytes, prefixes every queue entry) */
+typedef struct {
+    uint8_t  authTag[16];   /* Zeros (no encryption) */
+    uint8_t  aad[16];       /* Zeros (no encryption) */
+    uint32_t checkSum;      /* XOR checksum (total XOR = 0) */
+    uint32_t seqNum;        /* Sequence number */
+    uint32_t elemCount;     /* Pages used by this message */
+    uint32_t pad;
+} gsp_msg_elem_hdr_t;      /* 48 bytes = 0x30 */
+
+/* RPC message header (32 bytes, follows element header) */
+typedef struct {
+    uint32_t header_version; /* 0x03000000 */
+    uint32_t signature;      /* 0x43505256 "VRPC" */
+    uint32_t length;         /* Total length incl header */
+    uint32_t function;       /* RPC function number */
+    uint32_t rpc_result;     /* Status from GSP */
+    uint32_t rpc_result_private;
+    uint32_t sequence;       /* RPC sequence */
+    uint32_t cpuRmGfid;     /* GPU function ID */
+} gsp_rpc_hdr_t;            /* 32 bytes = 0x20 */
+
+/* Message queue init arguments (passed to GSP at boot via VRAM) */
+typedef struct {
+    uint64_t sharedMemPhysAddr;    /* Physical addr of shared region */
+    uint32_t pageTableEntryCount;  /* PTEs in first page */
+    uint32_t pad;
+    uint64_t cmdQueueOffset;       /* CPU queue offset = 0x1000 */
+    uint64_t statQueueOffset;      /* GSP queue offset = 0x41000 */
+} gsp_msgq_init_args_t;           /* 32 bytes */
+
+/* ── GSP-RM RPC Function IDs (rpc_global_enums.h, verified 535.113.01) ── */
+
+#define GSP_RPC_NOP                       0
+#define GSP_RPC_SET_GUEST_SYSTEM_INFO     1
+#define GSP_RPC_ALLOC_ROOT                2
+#define GSP_RPC_ALLOC_DEVICE              3
+#define GSP_RPC_ALLOC_MEMORY              4
+#define GSP_RPC_FREE                      10
+#define GSP_RPC_GET_GSP_STATIC_INFO       65   /* was 68 — WRONG (68=RMFS_CLEANUP) */
+#define GSP_RPC_CONTINUATION_RECORD       71   /* was 0x43 — WRONG */
+#define GSP_RPC_GSP_SET_SYSTEM_INFO       72   /* was 70 — WRONG (70=UPDATE_BAR_PDE) */
+#define GSP_RPC_SET_REGISTRY              73   /* was 69 — WRONG (69=RMFS_TEST) */
+#define GSP_RPC_GSP_INIT_POST_OBJGPU      74   /* was 71 — WRONG (71=CONTINUATION_RECORD) */
+#define GSP_RPC_GSP_RM_CONTROL            76
+#define GSP_RPC_GSP_RM_ALLOC             103   /* was 77 — WRONG (77=GET_STATIC_INFO2) */
+
+/* GSP-RM Event IDs (async GSP→host, start at 0x1000) */
+#define GSP_EVENT_GSP_INIT_DONE           0x1001  /* was 0x80 — WRONG */
+#define GSP_EVENT_RUN_CPU_SEQUENCER       0x1002  /* was 0x81 — WRONG */
+#define GSP_EVENT_POST_EVENT              0x1003  /* was 0x82 — WRONG */
+
+/* RPC result sentinels */
+#define GSP_RPC_RESULT_PENDING            0xFFFFFFFF
+#define GSP_RPC_RESULT_OK                 0x00000000
+
+/* ── GSP-RM Handle Constants ───────────────────────────────── */
+
+#define GSP_RM_CLIENT_HANDLE     0xC1D00000
+#define GSP_RM_DEVICE_HANDLE     0xDE1D0000
+#define GSP_RM_SUBDEVICE_HANDLE  0x5D1D0000
+#define GSP_RM_VASPACE_HANDLE    0x90F10000
+#define GSP_RM_TSG_HANDLE        0xA06C0000
+#define GSP_RM_CHAN_HANDLE       0xF1F00000
+
+/* ── RM Class IDs (NVIDIA RM Object Classes) ──────────────── */
+
+#define NV01_ROOT               0x0000
+#define NV01_DEVICE_0           0x0080
+#define NV20_SUBDEVICE_0        0x2080
+#define FERMI_VASPACE_A         0x90F1
+#define KEPLER_CHANNEL_GROUP_A  0xA06C
+#define TURING_CHANNEL_GPFIFO_A 0xC46F
+#define AMPERE_CHANNEL_GPFIFO_A 0xC56F  /* Also used by Ada Lovelace */
+
+/* ── X32: Generic RM Alloc/Control Structures ─────────────── */
+
+/* rpc_gsp_rm_alloc (func 103) — 32-byte header + variable params.
+ * Reference: g_rpc-structures.h rpc_gsp_rm_alloc_v03_00 */
+typedef struct {
+    uint32_t hClient;       /* Client handle (e.g. 0xC1D00000) */
+    uint32_t hParent;       /* Parent object handle */
+    uint32_t hObject;       /* New object handle to create */
+    uint32_t hClass;        /* RM class ID (0x2080, 0x90F1, etc.) */
+    uint32_t status;        /* [OUT] result status */
+    uint32_t paramsSize;    /* Size of params[] in bytes */
+    uint32_t flags;         /* Allocation flags (0 normally) */
+    uint8_t  reserved[4];   /* Padding */
+    /* uint8_t params[]; — variable-length, appended inline */
+} __attribute__((packed)) rpc_rm_alloc_hdr_t;  /* 32 bytes */
+
+/* rpc_gsp_rm_control (func 76) — 24-byte header + variable params.
+ * Reference: g_rpc-structures.h rpc_gsp_rm_control_v03_00 (535.113.01) */
+typedef struct {
+    uint32_t hClient;       /* Client handle */
+    uint32_t hObject;       /* Target object handle */
+    uint32_t cmd;           /* Control command (NV*_CTRL_CMD_*) */
+    uint32_t status;        /* [OUT] result status */
+    uint32_t paramsSize;    /* Size of params[] in bytes */
+    uint32_t flags;         /* RPC flags (0 normally) */
+    /* uint8_t params[]; — variable-length, appended inline */
+} __attribute__((packed)) rpc_rm_ctrl_hdr_t;   /* 24 bytes */
+
+/* NV2080_ALLOC_PARAMETERS (NV20_SUBDEVICE_0) */
+typedef struct {
+    uint32_t subDeviceId;   /* Subdevice instance (0 for single GPU) */
+} nv2080_alloc_params_t;    /* 4 bytes */
+
+/* NV_VASPACE_ALLOCATION_PARAMETERS (FERMI_VASPACE_A) */
+typedef struct {
+    uint32_t index;              /* GPU index (0 = NV_VASPACE_ALLOCATION_INDEX_GPU_NEW) */
+    uint32_t flags;              /* NV_VASPACE_ALLOCATION_FLAGS_* */
+    uint64_t vaSize;             /* VA space total size */
+    uint64_t vaStartInternal;    /* Internal VA start */
+    uint64_t vaLimitInternal;    /* Internal VA limit */
+    uint32_t bigPageSize;        /* Big page size (0 = default) */
+    uint8_t  pad[4];
+    uint64_t vaBase;             /* VA base address */
+} nv_vaspace_alloc_params_t;    /* 48 bytes */
+
+#define NV_VASPACE_ALLOCATION_INDEX_GPU_NEW             0x00
+#define NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED (1 << 3)
+
+/* ── X33: Channel + GPFIFO Structures ─────────────────────── */
+
+/* NV2080 engine types (engine.h, verified) */
+#define NV2080_ENGINE_TYPE_NULL   0x00
+#define NV2080_ENGINE_TYPE_GR0    0x01   /* Graphics/Compute */
+#define NV2080_ENGINE_TYPE_COPY0  0x09   /* Copy Engine 0 */
+
+/* Address space types for NV_MEMORY_DESC_PARAMS (verified from nouveau r535) */
+#define ADDR_FBMEM    1   /* Framebuffer / VRAM */
+#define ADDR_SYSMEM   2   /* System memory (host RAM) */
+
+/* Cache attributes */
+#define NV_MEMORY_UNCACHED  0
+#define NV_MEMORY_CACHED    1
+
+/* NV_MEMORY_DESC_PARAMS — memory descriptor for channel allocations */
+typedef struct {
+    uint64_t base;           /* Physical address */
+    uint64_t size;           /* Size in bytes */
+    uint32_t addressSpace;   /* ADDR_SYSMEM or ADDR_FBMEM */
+    uint32_t cacheAttrib;    /* NV_MEMORY_UNCACHED/CACHED */
+} nv_mem_desc_t;             /* 24 bytes */
+
+/* NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS (KEPLER_CHANNEL_GROUP_A 0xA06C).
+ * Reference: open-gpu-kernel-modules alloc_channel.h */
+typedef struct {
+    uint32_t hObjectError;          /* Error notifier handle (0) */
+    uint32_t hObjectEccError;       /* ECC error notifier (0) */
+    uint32_t hVASpace;              /* VA space handle */
+    uint32_t engineType;            /* NV2080_ENGINE_TYPE_* */
+    uint32_t bIsCallingContextVgpuPlugin;  /* false (0) */
+} nv_tsg_alloc_params_t;           /* 20 bytes */
+
+/* NV_CHANNEL_ALLOC_PARAMS (TURING/AMPERE/ADA_CHANNEL_GPFIFO_A).
+ * Full wire-format struct. Reference: open-gpu-kernel-modules alloc_channel.h */
+#define NV_MAX_SUBDEVICES  8
+typedef struct {
+    uint32_t hObjectError;                         /* 0:   Error notifier handle */
+    uint32_t hObjectBuffer;                        /* 4:   Unused */
+    uint64_t gpFifoOffset;                         /* 8:   Physical addr of GPFIFO ring */
+    uint32_t gpFifoEntries;                        /* 16:  Number of GPFIFO entries */
+    uint32_t flags;                                /* 20:  NVOS04_FLAGS_* */
+    uint32_t hContextShare;                        /* 24:  Context share handle (0) */
+    uint32_t hVASpace;                             /* 28:  VA space handle */
+    uint32_t hUserdMemory[NV_MAX_SUBDEVICES];      /* 32:  USERD memory handles (0) */
+    uint64_t userdOffset[NV_MAX_SUBDEVICES];       /* 64:  USERD offsets (0) */
+    uint32_t engineType;                           /* 128: NV2080_ENGINE_TYPE_* */
+    uint32_t cid;                                  /* 132: Channel ID */
+    uint32_t subDeviceId;                          /* 136: Subdevice index (0) */
+    uint32_t hObjectEccError;                      /* 140: ECC error handle (0) */
+    nv_mem_desc_t instanceMem;                     /* 144: Instance memory (RAMFC) */
+    nv_mem_desc_t userdMem;                        /* 168: User submit data */
+    nv_mem_desc_t ramfcMem;                        /* 192: RAMFC (often = instanceMem) */
+    nv_mem_desc_t mthdbufMem;                      /* 216: Method buffer */
+    uint32_t hPhysChannelGroup;                    /* 240: Physical channel group (0) */
+    uint32_t internalFlags;                        /* 244: Internal flags (0) */
+    nv_mem_desc_t errorNotifierMem;                /* 248: Error notifier memory */
+    nv_mem_desc_t eccErrorNotifierMem;             /* 272: ECC error notifier */
+    uint32_t ProcessID;                            /* 296: Process ID (0) */
+    uint32_t SubProcessID;                         /* 300: Sub-process ID (0) */
+    uint32_t encryptIv[3];                         /* 304: Encryption IV (0) */
+    uint32_t decryptIv[3];                         /* 316: Decryption IV (0) */
+    uint32_t hmacNonce[8];                         /* 328: HMAC nonce (0) */
+} nv_chan_alloc_params_t;                          /* 360 bytes */
+
+/* NVOS04 channel flags */
+#define NVOS04_FLAGS_CHANNEL_TYPE_PHYSICAL   0
+#define NVOS04_FLAGS_PRIVILEGED_CHANNEL      (1 << 5)
+
+/* GPFIFO entry format (8 bytes each, clc36f.h Volta+).
+ * Word 0: bit 0 = FETCH (0=unconditional), bits 31:2 = addr[31:2]
+ * Word 1: bits 7:0 = addr[39:32], bit 8 = PRIV, bit 9 = LEVEL,
+ *          bits 30:10 = length in dwords, bit 31 = SYNC */
+#define GPFIFO_ENTRY_COUNT  512     /* 512 entries × 8B = 4KB */
+
+typedef struct {
+    uint32_t entry_lo;    /* bit 0=FETCH, bits 31:2 = addr[31:2] */
+    uint32_t entry_hi;    /* bits 7:0=addr[39:32], bit 8=PRIV, bits 30:10=LEN(dw) */
+} gpfifo_entry_t;         /* 8 bytes */
+
+/* Build a GPFIFO entry pointing to a pushbuffer segment */
+static inline void gpfifo_make_entry(gpfifo_entry_t *e, uint64_t addr, uint32_t len_bytes)
+{
+    e->entry_lo = (uint32_t)(addr & 0xFFFFFFFC);  /* addr[31:2], FETCH=0 (unconditional) */
+    e->entry_hi = (uint32_t)((addr >> 32) & 0xFF) /* addr[39:32] */
+                | ((len_bytes / 4) << 10);         /* length in dwords */
+}
+
+/* USERD control offsets (Volta+ Nvc36fControl, 512B mapped page) */
+#define USERD_GP_GET   0x88   /* GPFIFO get pointer (RO, updated by GPU) */
+#define USERD_GP_PUT   0x8C   /* GPFIFO put pointer (RW, written by CPU) */
+
+/* ── X34: Compute Class + Pushbuffer Defines ─────────────── */
+
+/* Compute class IDs per GPU generation (clXXc0.h, Mesa headers) */
+#define TURING_COMPUTE_A     0xC5C0   /* TU102/TU104/TU106/TU116/TU117 */
+#define AMPERE_COMPUTE_A     0xC6C0   /* GA102/GA104/GA106 */
+#define ADA_COMPUTE_A        0xC9C0   /* AD102/AD103/AD104/AD106/AD107 */
+
+/* Pushbuffer method header encoding (dev_ram.ref.txt, Turing+).
+ * Format: SEC_OP(31:29) | COUNT(28:16) | SUBCHAN(15:13) | METHOD_ADDR(11:0)
+ * METHOD_ADDR = byte_address >> 2 (dword-addressed in header) */
+#define NV_METHOD(sc, mthd, cnt) \
+    ((0x1u << 29) | ((uint32_t)(cnt) << 16) | ((uint32_t)(sc) << 13) | ((mthd) >> 2))
+#define NV_METHOD_NI(sc, mthd, cnt) \
+    ((0x3u << 29) | ((uint32_t)(cnt) << 16) | ((uint32_t)(sc) << 13) | ((mthd) >> 2))
+#define NV_METHOD_IMMD(sc, mthd, data) \
+    ((0x4u << 29) | ((uint32_t)(data) << 16) | ((uint32_t)(sc) << 13) | ((mthd) >> 2))
+#define NV_NOP  0x00000000u
+
+/* Subchannel assignments (Graphics/Compute runlist) */
+#define SUBCHANNEL_3D       0
+#define SUBCHANNEL_COMPUTE  1
+#define SUBCHANNEL_I2M      2
+#define SUBCHANNEL_2D       3
+#define SUBCHANNEL_CE       4
+
+/* Host methods (NVA06F, all subchannels, byte addresses) */
+#define NVA06F_SET_OBJECT              0x0000
+#define NVA06F_NOP                     0x0008
+#define NVA06F_SEMAPHOREA              0x0010   /* Semaphore addr upper */
+#define NVA06F_SEMAPHOREB              0x0014   /* Semaphore addr lower */
+#define NVA06F_SEMAPHOREC              0x0018   /* Semaphore payload */
+#define NVA06F_SEMAPHORED              0x001C   /* Semaphore operation */
+#define NVA06F_NON_STALL_INTERRUPT     0x0020
+
+/* Semaphore operations (SEMAPHORED bits) */
+#define NVA06F_SEMAPHORED_OPERATION_RELEASE       0x00000002
+#define NVA06F_SEMAPHORED_RELEASE_WFI_EN          (1 << 20)
+#define NVA06F_SEMAPHORED_RELEASE_SIZE_4BYTE      0x00000000
+
+/* Compute engine methods (clc5c0.h / clc6c0.h / clc9c0.h) */
+#define NVC5C0_SET_OBJECT                         0x0000
+#define NVC5C0_NO_OPERATION                       0x0100
+#define NVC5C0_WAIT_FOR_IDLE                      0x0110
+#define NVC5C0_INVALIDATE_SHADER_CACHES           0x021C
+#define NVC5C0_SET_QMD_VERSION                    0x0288
+#define NVC5C0_SET_CWD_SLOT_COUNT                 0x02B0
+#define NVC5C0_SEND_PCAS_A                        0x02B4   /* QMD address >> 8 */
+#define NVC5C0_SEND_PCAS_B                        0x02B8   /* FROM + DELTA */
+
+/* Inline-to-Memory (I2M) methods — used for uploading data via pushbuffer */
+#define NVC5C0_LINE_LENGTH_IN                     0x0180
+#define NVC5C0_LINE_COUNT                         0x0184
+#define NVC5C0_OFFSET_OUT_UPPER                   0x0188
+#define NVC5C0_OFFSET_OUT                         0x018C
+#define NVC5C0_LAUNCH_DMA                         0x01B0
+#define NVC5C0_LOAD_INLINE_DATA                   0x01B4
+
+/* INVALIDATE_SHADER_CACHES bitfields */
+#define INVALIDATE_SHADER_CACHES_INSTRUCTION      (1 << 0)
+#define INVALIDATE_SHADER_CACHES_DATA             (1 << 2)
+#define INVALIDATE_SHADER_CACHES_CONSTANT         (1 << 3)
+#define INVALIDATE_SHADER_CACHES_FLUSH_DATA       (1 << 4)
+
+/* NVA06F channel control commands (via gsp_rm_control on channel handle) */
+#define NVA06F_CTRL_CMD_BIND             0xa06f0104
+#define NVA06F_CTRL_CMD_GPFIFO_SCHEDULE  0xa06f0103
+
+/* NVA06F_CTRL_BIND_PARAMS */
+typedef struct {
+    uint32_t engineType;    /* NV2080_ENGINE_TYPE_* */
+} nva06f_ctrl_bind_params_t;
+
+/* NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS */
+typedef struct {
+    uint32_t bEnable;       /* 1=enable, 0=disable */
+    uint32_t bSkipSubmit;   /* 0 normally */
+} nva06f_ctrl_gpfifo_schedule_params_t;
+
+/* Pushbuffer state (host-managed command buffer) */
+#define PUSHBUF_SIZE_DWORDS  1024   /* 4KB pushbuffer */
+typedef struct {
+    uint32_t *buf;          /* Pushbuffer memory (page-aligned) */
+    uint64_t  buf_phys;     /* Physical address */
+    uint32_t  pos;          /* Current write position (dwords) */
+    uint32_t  capacity;     /* Total capacity (dwords) */
+} pushbuf_state_t;
+
+/* Compute state (managed by host) */
+typedef struct {
+    uint32_t  compute_class;       /* Generation-specific class ID */
+    bool      class_bound;         /* SET_OBJECT sent to subchannel 1 */
+    bool      channel_bound;       /* NVA06F_CTRL_BIND sent */
+    bool      channel_scheduled;   /* NVA06F_CTRL_GPFIFO_SCHEDULE sent */
+    pushbuf_state_t pb;            /* Pushbuffer */
+    /* Semaphore for GPU→CPU signaling */
+    uint32_t *semaphore;           /* Semaphore memory (page-aligned) */
+    uint64_t  sem_phys;            /* Physical address */
+    bool      ready;               /* Compute dispatch ready */
+} compute_state_t;
+
+/* ── X36: QMD (Queue Meta Data) + Dispatch ───────────────── */
+
+/* QMD size: 256 bytes = 64 dwords (QMDV02_03 / QMDV03_00) */
+#define QMD_SIZE_BYTES   256
+#define QMD_SIZE_DWORDS  64
+#define QMD_ALIGNMENT    256   /* Must be 256-byte aligned */
+
+/* QMD version constants */
+#define QMD_MAJOR_VERSION_V02   2   /* Turing, Ampere (compat) */
+#define QMD_MAJOR_VERSION_V03   3   /* Ampere (native) */
+#define QMD_VERSION_V02_03      3   /* Turing+ */
+#define QMD_VERSION_V03_00      0   /* Ampere+ native */
+
+/* QMD dword indices for key fields (QMDV02_03 layout) */
+#define QMD_DW4    4    /* QMD_GROUP_ID, SM_GLOBAL_CACHING, SEM_RELEASE_ENABLE */
+#define QMD_DW5    5    /* INVALIDATE cache flags */
+#define QMD_DW11  11    /* RELEASE_MEMBAR, CWD_MEMBAR, API_VISIBLE_CALL_LIMIT */
+#define QMD_DW12  12    /* CTA_RASTER_WIDTH */
+#define QMD_DW13  13    /* CTA_RASTER_HEIGHT (bits 15:0) */
+#define QMD_DW14  14    /* CTA_RASTER_DEPTH (bits 15:0) */
+#define QMD_DW17  17    /* SHARED_MEMORY_SIZE */
+#define QMD_DW18  18    /* QMD_VERSION, CTA_THREAD_DIMENSION0 */
+#define QMD_DW19  19    /* CTA_THREAD_DIMENSION1, CTA_THREAD_DIMENSION2 */
+#define QMD_DW20  20    /* CONSTANT_BUFFER_VALID, REGISTER_COUNT_V */
+#define QMD_DW23  23    /* RELEASE0_ADDRESS_LOWER */
+#define QMD_DW24  24    /* RELEASE0_ADDRESS_UPPER + flags */
+#define QMD_DW25  25    /* RELEASE0_PAYLOAD */
+#define QMD_DW29  29    /* SHADER_LOCAL_MEMORY_LOW_SIZE, BARRIER_COUNT */
+#define QMD_DW30  30    /* SHADER_LOCAL_MEMORY_HIGH_SIZE */
+#define QMD_DW32  32    /* CONSTANT_BUFFER_ADDR_LOWER(0) */
+#define QMD_DW33  33    /* CONSTANT_BUFFER_ADDR_UPPER(0) + SIZE_SHIFTED4 */
+#define QMD_DW48  48    /* PROGRAM_ADDRESS_LOWER */
+#define QMD_DW49  49    /* PROGRAM_ADDRESS_UPPER */
+
+/* SEND_SIGNALING_PCAS_B (0x02BC) — Turing dispatch trigger */
+#define NVC5C0_SEND_SIGNALING_PCAS_B          0x02BC
+#define SIGNALING_PCAS_B_INVALIDATE           (1 << 0)
+#define SIGNALING_PCAS_B_SCHEDULE             (1 << 1)
+
+/* SEND_SIGNALING_PCAS2_B (0x02C0) — Ampere+ dispatch trigger */
+#define NVC6C0_SEND_SIGNALING_PCAS2_B         0x02C0
+#define PCAS2_ACTION_INVALIDATE_COPY_SCHEDULE 3
+
+/* Compute dispatch descriptor */
+typedef struct {
+    uint64_t  program_addr;        /* GPU virtual addr of SASS shader */
+    uint32_t  grid_x, grid_y, grid_z;    /* Grid dimensions (CTA count) */
+    uint32_t  block_x, block_y, block_z; /* Block dimensions (threads) */
+    uint32_t  register_count;      /* GPRs per thread */
+    uint32_t  shared_mem_size;     /* Shared memory (aligned to 0x100) */
+    uint32_t  barrier_count;       /* Number of barriers */
+    /* Semaphore fence (host-accessible physical address) */
+    uint64_t  sem_addr;            /* Semaphore address for RELEASE0 */
+    uint32_t  sem_payload;         /* Value to write on completion */
+    /* Constant buffer 0 (kernel parameters) */
+    uint64_t  cbuf_addr;           /* GPU virtual addr of constant buffer */
+    uint32_t  cbuf_size;           /* Size in bytes (0 = no CB) */
+} compute_dispatch_t;
+
+/* Compute method offsets for memory windows (clc5c0.h) */
+#define NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_A  0x077C
+#define NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_B  0x0780
+#define NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW      0x07B0
+
+/* ── X35: Copy Engine (CE) DMA Defines ───────────────────── */
+
+/* CE class IDs per GPU generation (clXXb5.h, open-gpu-doc) */
+#define TURING_DMA_COPY_A     0xC5B5
+#define AMPERE_DMA_COPY_A     0xC6B5
+#define AMPERE_DMA_COPY_B     0xC7B5   /* Also used by Ada Lovelace */
+
+/* CE method offsets (stable from Maxwell through Hopper) */
+#define CE_NOP                      0x0100
+#define CE_SET_SEMAPHORE_A          0x0240   /* addr upper 17 bits */
+#define CE_SET_SEMAPHORE_B          0x0244   /* addr lower 32 bits */
+#define CE_SET_SEMAPHORE_PAYLOAD    0x0248   /* 32-bit payload value */
+#define CE_SET_SRC_PHYS_MODE        0x0260   /* physical src type */
+#define CE_SET_DST_PHYS_MODE        0x0264   /* physical dst type */
+#define CE_LAUNCH_DMA               0x0300   /* trigger the copy */
+#define CE_OFFSET_IN_UPPER          0x0400   /* src addr upper */
+#define CE_OFFSET_IN_LOWER          0x0404   /* src addr lower */
+#define CE_OFFSET_OUT_UPPER         0x0408   /* dst addr upper */
+#define CE_OFFSET_OUT_LOWER         0x040C   /* dst addr lower */
+#define CE_PITCH_IN                 0x0410   /* src pitch (2D) */
+#define CE_PITCH_OUT                0x0414   /* dst pitch (2D) */
+#define CE_LINE_LENGTH_IN           0x0418   /* bytes per line */
+#define CE_LINE_COUNT               0x041C   /* line count (1=linear) */
+
+/* LAUNCH_DMA bitfields (clc5b5.h, identical across generations) */
+#define CE_LAUNCH_DMA_TRANSFER_NONE           (0 << 0)
+#define CE_LAUNCH_DMA_TRANSFER_PIPELINED      (1 << 0)
+#define CE_LAUNCH_DMA_TRANSFER_NON_PIPELINED  (2 << 0)
+#define CE_LAUNCH_DMA_FLUSH_ENABLE            (1 << 2)
+#define CE_LAUNCH_DMA_SEM_NONE                (0 << 3)
+#define CE_LAUNCH_DMA_SEM_RELEASE_1WORD       (1 << 3)
+#define CE_LAUNCH_DMA_SRC_PITCH               (1 << 7)
+#define CE_LAUNCH_DMA_DST_PITCH               (1 << 8)
+#define CE_LAUNCH_DMA_SRC_PHYSICAL            (1 << 12)
+#define CE_LAUNCH_DMA_DST_PHYSICAL            (1 << 13)
+
+/* Physical memory target (SET_SRC_PHYS_MODE / SET_DST_PHYS_MODE) */
+#define CE_PHYS_TARGET_LOCAL_FB            0   /* VRAM */
+#define CE_PHYS_TARGET_COHERENT_SYSMEM     1   /* System RAM, coherent */
+#define CE_PHYS_TARGET_NONCOHERENT_SYSMEM  2   /* System RAM, non-coherent */
+
+/* CE state (managed by host) */
+typedef struct {
+    uint32_t  ce_class;            /* Generation-specific CE class ID */
+    bool      class_bound;         /* SET_OBJECT sent to subchannel 4 */
+    pushbuf_state_t pb;            /* CE pushbuffer (shared or separate) */
+    uint32_t *semaphore;           /* CE semaphore memory */
+    uint64_t  sem_phys;            /* Physical address */
+    uint32_t  fence_seq;           /* Monotonic fence sequence */
+    bool      ready;               /* CE operational */
+} ce_state_t;
+
+/* Channel state (managed by host) */
+typedef struct {
+    /* GPFIFO ring buffer */
+    gpfifo_entry_t *gpfifo;         /* GPFIFO ring (page-aligned) */
+    uint64_t        gpfifo_phys;    /* Physical address */
+    uint32_t        gpfifo_entries; /* Entry count (512) */
+    uint32_t        gp_put;         /* Next write index */
+
+    /* Instance memory (RAMFC — channel control block in VRAM or sysmem) */
+    void           *inst_mem;       /* Page-aligned */
+    uint64_t        inst_phys;
+
+    /* USERD (user submit data — GP_PUT/GP_GET doorbell area) */
+    void           *userd_mem;      /* Page-aligned */
+    uint64_t        userd_phys;
+
+    /* RM handles */
+    uint32_t        tsg_handle;     /* TSG (channel group) RM handle */
+    uint32_t        chan_handle;    /* Channel RM handle */
+    uint32_t        chan_class;     /* Channel class (gen-dependent) */
+
+    bool            allocated;      /* Channel successfully allocated */
+} channel_state_t;
+
+/* ── GSP-RM Payload Structures (Phase 8) ──────────────────── */
+
+/* SET_SYSTEM_INFO payload (func 72, 88 bytes) */
+typedef struct {
+    uint64_t gpuPhysAddr;           /* BAR0 */
+    uint64_t gpuPhysFbAddr;         /* BAR1 */
+    uint64_t gpuPhysInstAddr;       /* 0 */
+    uint64_t nvDomainBusDeviceFunc; /* PCI BDF encoded */
+    uint64_t simAccessBufPhysAddr;  /* 0 */
+    uint64_t pcieAtomicsOpMask;     /* 0 */
+    uint64_t consoleMemSize;        /* 0 */
+    uint64_t maxUserVa;             /* (1ULL << 47) - 4096 */
+    uint32_t pciConfigMirrorBase;   /* 0x088000 */
+    uint32_t pciConfigMirrorSize;   /* 0x001000 */
+    uint32_t PCIDeviceID;           /* (device_id << 16) | vendor_id */
+    uint32_t PCISubDeviceID;        /* 0 */
+    uint32_t PCIRevisionID;         /* 0 */
+    uint32_t pad0;
+} gsp_system_info_t;               /* 88 bytes */
+
+/* Registry entry (for SET_REGISTRY, func 73) */
+typedef struct {
+    char     name[64];
+    uint32_t type;      /* 1=DWORD */
+    uint32_t len;       /* 4 */
+    uint32_t value;
+    uint32_t pad;
+} gsp_registry_entry_t;            /* 76 bytes */
+
+typedef struct {
+    uint32_t numEntries;
+    uint32_t pad;
+    gsp_registry_entry_t entries[2];
+} gsp_registry_table_t;            /* 160 bytes */
+
+/* ALLOC_ROOT payload (func 2) */
+typedef struct {
+    uint32_t hClient;   /* 0xC1D00000 */
+    uint32_t hClass;    /* 0x0000 NV01_ROOT */
+    uint32_t processID; /* 0 */
+    uint32_t pad;
+} gsp_alloc_root_t;                /* 16 bytes */
+
+/* ALLOC_DEVICE payload (func 3) */
+typedef struct {
+    uint32_t hClient;         /* parent */
+    uint32_t hDevice;         /* 0xDE1D0000 */
+    uint32_t hClass;          /* 0x0080 NV01_DEVICE */
+    uint32_t pad;
+    uint32_t deviceInstance;  /* 0 */
+    uint32_t pad2;
+} gsp_alloc_device_t;              /* 24 bytes */
+
+/* GET_GSP_STATIC_INFO response (partial — only GPU name parsed) */
+typedef struct {
+    char     gpu_name[40];     /* Null-terminated GPU name string */
+    /* ... many more fields (~0x6c8 bytes total, not parsed yet) ... */
+} gsp_static_info_t;
+
+/* ── VBIOS ROM Structures (Phase 9) ──────────────────────────── */
+
+/* VBIOS ROM header (at offset 0x00 of each image) */
+typedef struct {
+    uint16_t signature;       /* 0xAA55 */
+    uint8_t  reserved[22];
+    uint16_t pcir_offset;     /* Offset to PCIR structure */
+} __attribute__((packed)) vbios_rom_hdr_t;
+
+/* PCIR structure (PCI Data Structure, PCI spec 3.0 §6.3.1.2) */
+typedef struct {
+    uint8_t  signature[4];    /* "PCIR" */
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint16_t device_list_off;
+    uint16_t pcir_length;
+    uint8_t  pcir_revision;
+    uint8_t  class_code[3];
+    uint16_t image_length;    /* In 512-byte units */
+    uint16_t image_revision;
+    uint8_t  code_type;       /* 0x00=x86, 0x03=UEFI, 0xE0=FwSec */
+    uint8_t  last_image;      /* Bit 7 = last image flag */
+    uint16_t max_runtime_size;
+} __attribute__((packed)) vbios_pcir_t;
+
+/* VBIOS code type constants */
+#define VBIOS_CODE_TYPE_PCAT   0x00
+#define VBIOS_CODE_TYPE_UEFI   0x03
+#define VBIOS_CODE_TYPE_FWSEC  0xE0
+
+/* VBIOS image descriptor */
+#define VBIOS_MAX_IMAGES  8
+typedef struct {
+    uint32_t offset;          /* Offset within VBIOS data */
+    uint32_t size;            /* Image size in bytes */
+    uint8_t  code_type;       /* Code type from PCIR */
+    uint16_t vendor_id;       /* PCI vendor from PCIR */
+    uint16_t device_id;       /* PCI device from PCIR */
+} vbios_image_t;
+
+/* VBIOS state */
+#define VBIOS_MAX_SIZE  (256 * 1024)  /* 256KB max VBIOS */
+typedef struct {
+    uint8_t       *data;          /* Allocated VBIOS buffer */
+    uint32_t       size;          /* Total VBIOS size */
+    uint32_t       image_count;
+    vbios_image_t  images[VBIOS_MAX_IMAGES];
+    uint32_t       fwsec_count;   /* Number of FwSec images */
+    bool           valid;
+} vbios_state_t;
+
+/* ── BIT Table Structures (Phase 9) ──────────────────────────── */
+
+/* BIT header (BIOS Information Table) */
+#define BIT_SIGNATURE  0x00544942  /* "BIT\0" as uint32_t LE */
+typedef struct {
+    uint32_t signature;       /* "BIT\0" */
+    uint16_t header_size;
+    uint8_t  version_major;
+    uint8_t  version_minor;
+    uint8_t  token_count;
+    uint8_t  token_entry_size;
+} __attribute__((packed)) bit_header_t;
+
+/* BIT token entry */
+typedef struct {
+    uint8_t  id;              /* Token ID (0x70 = Falcon Data) */
+    uint8_t  data_version;
+    uint16_t data_size;
+    uint16_t data_offset;     /* Offset from VBIOS start */
+} __attribute__((packed)) bit_token_t;
+
+#define BIT_TOKEN_FALCON_DATA  0x70
+
+/* Falcon ucode table entry (pointed to by token 0x70) */
+typedef struct {
+    uint8_t  version;
+    uint8_t  header_size;
+    uint8_t  entry_size;
+    uint8_t  entry_count;
+    uint8_t  desc_version;
+    uint8_t  desc_size;
+} __attribute__((packed)) falcon_ucode_table_hdr_t;
+
+/* Falcon ucode descriptor (follows table header) */
+typedef struct {
+    uint32_t stored_size;     /* Compressed size in VBIOS */
+    uint32_t uncompressed_size;
+    uint32_t vbios_offset;    /* Offset into VBIOS data */
+    uint8_t  application_id;  /* 0x01 = FWSEC */
+    uint8_t  target_id;       /* Falcon target: 0x01=PMU, 0x03=GSP, 0x04=SEC2 */
+    uint8_t  flags;
+    uint8_t  pad;
+} __attribute__((packed)) falcon_ucode_desc_t;
+
+#define FALCON_APP_FWSEC  0x01
+#define FALCON_APP_GBL    0x02   /* Generic Bootloader */
+#define FALCON_TARGET_GSP  0x03
+#define FALCON_TARGET_SEC2 0x04
+
+/* FWSEC state */
+typedef struct {
+    uint8_t  *data;           /* Pointer into VBIOS buffer (not separately allocated) */
+    uint32_t  size;           /* FWSEC blob size */
+    uint32_t  vbios_offset;   /* Offset within VBIOS */
+    uint8_t   target_id;      /* Falcon target */
+    bool      found;
+} fwsec_state_t;
+
+/* ── FWSEC-FRTS / WPR2 Structures (Phase 10) ────────────────── */
+
+/* GspFwWprMeta — WPR2 metadata structure in VRAM */
+typedef struct {
+    uint32_t magic;                /* 0x57505232 "WPR2" */
+    uint32_t revision;             /* Structure revision */
+    uint64_t sysmemAddrOfRadix3Elf;
+    uint32_t sizeOfRadix3Elf;
+    uint32_t pad0;
+    uint64_t sysmemAddrOfBootloader;
+    uint32_t sizeOfBootloader;
+    uint32_t bootloaderCodeOffset;
+    uint32_t bootloaderDataOffset;
+    uint32_t pad1;
+    uint32_t nonWprHeapOffset;
+    uint32_t nonWprHeapSize;
+    uint64_t gspFwRsvdStart;
+    uint64_t gspFwWprEnd;
+    uint64_t fbSize;
+    uint64_t vgaWorkspaceOffset;
+    uint64_t vgaWorkspaceSize;
+    uint32_t bootCount;
+    uint32_t pad2;
+} gsp_fw_wpr_meta_t;
+
+#define WPR2_MAGIC  0x57505232  /* "WPR2" */
+
+/* FWSEC command defines */
+#define FWSEC_FRTS_CMD         0x15  /* FRTS = Falcon Recovery Table Setup */
+#define FWSEC_SB_CMD           0x16  /* Secure Boot command */
+
+/* FBIF — Falcon Framebuffer Interface (enables DMA from system memory) */
+#define NV_PFALCON_FBIF_TRANSCFG              0x000600  /* Offset from falcon base */
+#define FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM  0x02
+
+/* Falcon DMATRFBASE1 — high 32 bits for 64-bit DMA addressing */
+#define NV_FALCON_DMATRFBASE1  0x000128
+
+/* DMATRFCMD bit definitions (envytools, nova-core) */
+#define DMATRFCMD_IDLE         (1 << 1)   /* DMA engine idle */
+#define DMATRFCMD_IMEM         (1 << 4)   /* 1=IMEM target, 0=DMEM target */
+#define DMATRFCMD_SIZE_256B    (6 << 8)   /* Transfer size = 256 bytes */
+
+/* ── X28: FWSEC Internal Header + GBL Structures ─────────────── */
+
+/* FWSEC internal firmware header (at start of FWSEC blob from BIT).
+ * Contains offsets to bootloader (GBL), OS code, OS data, and application sections.
+ * Reference: nouveau nvkm_falcon_fw, nova-core falcon_fw_hdr */
+typedef struct {
+    uint32_t os_code_offset;       /* OS code section offset (bytes) */
+    uint32_t os_code_size;         /* OS code section size */
+    uint32_t os_data_offset;       /* OS data section offset */
+    uint32_t os_data_size;         /* OS data section size */
+    uint32_t num_apps;             /* Number of applications */
+    uint32_t app_code_start;       /* App code start offset */
+    uint32_t app_code_size;        /* App code size */
+    uint32_t app_data_start;       /* App data start offset */
+    uint32_t app_data_size;        /* App data size */
+    uint32_t bl_code_offset;       /* Bootloader (GBL) code offset */
+    uint32_t bl_code_size;         /* Bootloader code size */
+    uint32_t bl_data_offset;       /* Bootloader data offset */
+    uint32_t bl_data_size;         /* Bootloader data size */
+} __attribute__((packed)) falcon_fw_hdr_t;
+
+/* BootloaderDmemDescV2 — written to Falcon DMEM via PIO.
+ * Tells GBL where FWSEC code/data live in system memory (DMA-accessible).
+ * Reference: nova-core BootloaderDmemDescV2, nouveau nv_flcn_bl_dmem_desc_v2 */
+typedef struct {
+    uint32_t reserved[4];          /* 16 bytes reserved */
+    uint32_t signature;            /* 0x42444456 "VDBD" LE */
+    uint32_t ctx_dma;              /* DMA context (0 for bare-metal) */
+    uint32_t code_dma_base;        /* Low 32 bits phys addr of code */
+    uint32_t code_dma_base1;       /* High 32 bits of code addr */
+    uint32_t non_sec_code_off;     /* Non-secure code offset */
+    uint32_t non_sec_code_size;    /* Non-secure code size */
+    uint32_t sec_code_off;         /* Secure code offset (0 for FWSEC) */
+    uint32_t sec_code_size;        /* Secure code size */
+    uint32_t code_entry_point;     /* Code entry point offset */
+    uint32_t data_dma_base;        /* Low 32 bits phys addr of data */
+    uint32_t data_dma_base1;       /* High 32 bits of data addr */
+    uint32_t data_size;            /* Data section size */
+    uint32_t argc;                 /* Argument count */
+    uint32_t argv;                 /* Argument value (FRTS_CMD=0x15) */
+} __attribute__((packed)) bl_dmem_desc_v2_t;
+
+/* GBL state (extracted from BIT Falcon ucode table or FWSEC internal header) */
+typedef struct {
+    uint8_t  *code;               /* GBL code pointer (into FWSEC blob) */
+    uint32_t  code_size;
+    uint8_t  *data;               /* GBL data pointer (optional) */
+    uint32_t  data_size;
+    bool      found;
+} gbl_state_t;
+
+/* Dead register sentinel */
+#define NV_DEAD_REG            0xFFFFFFFF
+
+/* GPU backend types */
+typedef enum {
+    GPU_BACKEND_NONE = 0,
+    GPU_BACKEND_NVIDIA_GSP,     /* GSP-shim: load firmware, RM protocol */
+    GPU_BACKEND_NVIDIA_CUSTOM,  /* Direct MMIO: PFIFO/PGRAPH, no GSP */
+    GPU_BACKEND_VULKAN,         /* NVK path: Vulkan compute dispatch */
+} gpu_backend_t;
+
+/* NVIDIA GPU generation */
+typedef enum {
+    GPU_GEN_UNKNOWN = 0,
+    GPU_GEN_TURING,       /* RTX 2000 series */
+    GPU_GEN_AMPERE,       /* RTX 3000 series */
+    GPU_GEN_ADA_LOVELACE, /* RTX 4000 series */
+    GPU_GEN_BLACKWELL,    /* RTX 5000 series */
+} gpu_gen_t;
+
+/* GPU device info (populated during PCI enumeration) */
+typedef struct {
+    uint16_t     vendor_id;     /* 0x10DE for NVIDIA */
+    uint16_t     device_id;
+    gpu_gen_t    generation;
+    gpu_backend_t backend;
+
+    /* PCI BARs (physical addresses) */
+    uint64_t     bar0_base;     /* MMIO registers (16MB) */
+    uint64_t     bar0_size;
+    uint64_t     bar1_base;     /* VRAM aperture */
+    uint64_t     bar1_size;
+
+    /* PCI Bus/Device/Function */
+    uint8_t      pci_bus;
+    uint8_t      pci_dev;
+    uint8_t      pci_func;
+    uint8_t      pci_pad;
+
+    /* Mapped virtual addresses (after memory manager init) */
+    volatile void *bar0_mapped;
+    volatile void *bar1_mapped;
+} gpu_device_t;
+
+/* PCI Vendor/Device IDs */
+#define PCI_VENDOR_NVIDIA  0x10DE
+
+/* Detect GPU generation from PCI device ID */
+static inline gpu_gen_t gpu_detect_gen(uint16_t device_id)
+{
+    uint16_t chip = device_id >> 4;
+    if (chip >= 0x1E0 && chip < 0x200) return GPU_GEN_TURING;
+    if (chip >= 0x220 && chip < 0x260) return GPU_GEN_AMPERE;
+    if (chip >= 0x260 && chip < 0x280) return GPU_GEN_ADA_LOVELACE;
+    if (chip >= 0x280 && chip < 0x2C0) return GPU_GEN_BLACKWELL;
+    return GPU_GEN_UNKNOWN;
+}
+
+static inline const char *gpu_gen_name(gpu_gen_t gen)
+{
+    switch (gen) {
+    case GPU_GEN_TURING:       return "Turing";
+    case GPU_GEN_AMPERE:       return "Ampere";
+    case GPU_GEN_ADA_LOVELACE: return "Ada Lovelace";
+    case GPU_GEN_BLACKWELL:    return "Blackwell";
+    default:                   return "Unknown";
+    }
+}
+
+/* ── Phase 1: MMIO Probe Results ───────────────────────────────── */
+
+typedef struct {
+    bool        present;          /* BAR0 accessible */
+    uint32_t    boot0;            /* Raw PMC_BOOT_0 value */
+    uint32_t    boot42;           /* Raw PMC_BOOT_42 value */
+    uint32_t    chip_id;          /* bits 31:20 of boot0 */
+    uint32_t    chip_rev;         /* bits 3:0 of boot0 */
+    uint32_t    engines;          /* Raw PMC_ENABLE value */
+    uint64_t    gpu_timer_ns;     /* PTIMER nanoseconds since power-on */
+    bool        gsp_present;      /* GSP falcon detected */
+    bool        sec2_present;     /* SEC2 falcon detected */
+    bool        pmu_present;      /* PMU falcon detected */
+
+    /* Phase 2: VRAM / BAR1 */
+    uint32_t    vram_size_mb;      /* VRAM total in MB */
+    bool        bar1_accessible;   /* BAR1 reads != 0xFFFFFFFF */
+    bool        bar1_rw_ok;        /* Write/read test pattern OK */
+    bool        pramin_accessible; /* PRAMIN window readable */
+    bool        pramin_rw_ok;      /* PRAMIN write/read through window slide OK */
+} gpu_probe_t;
+
+/* ── Phase 4-5: GSP Falcon State ───────────────────────────── */
+
+typedef struct {
+    /* Falcon hardware */
+    uint32_t    hwcfg, hwcfg2;
+    uint32_t    imem_size, dmem_size;   /* bytes */
+    uint32_t    cpuctl;
+    bool        halted, stopped;
+    uint32_t    mailbox0, mailbox1;
+    /* Firmware */
+    void       *fw_data;          /* RAM buffer */
+    uint64_t    fw_size;
+    uint64_t    vram_offset;      /* VRAM placement */
+    bool        fw_loaded;        /* In RAM */
+    bool        fw_uploaded;      /* In VRAM, verified */
+    /* Boot (Phase 5) */
+    uint64_t    elf_entry;        /* ELF e_entry */
+    uint16_t    elf_phnum;        /* Number of program headers */
+    uint16_t    elf_machine;      /* e_machine (RISC-V = 0xF3) */
+    uint32_t    boot_status;      /* Post-boot mailbox0 value */
+    bool        booted;           /* CPUCTL_STARTCPU sent */
+    bool        boot_ack;         /* Mailbox handshake OK */
+    /* Message Queues (Phase 6) */
+    void       *shm_base;         /* Shared memory region (513KB) */
+    uint64_t    shm_phys;         /* Physical address */
+    uint32_t    cmd_seq;          /* Command sequence counter */
+    uint32_t    rpc_seq;          /* RPC sequence counter */
+    bool        queues_ready;     /* Queues initialized */
+    /* RPC Protocol (Phase 7) */
+    char        gpu_name[40];     /* From GET_GSP_STATIC_INFO */
+    bool        rpc_ready;        /* INIT_DONE received */
+    /* RM Init (Phase 8) */
+    bool        rm_init_done;     /* RM init sequence completed */
+    /* SEC2 Booter (X31) */
+    void       *booter_data;      /* booter.bin in RAM */
+    uint64_t    booter_size;
+    bool        booter_loaded;    /* booter.bin loaded from OsitoFS */
+    bool        sec2_boot_ok;     /* SEC2 booter completed successfully */
+} gsp_state_t;
+
+/* ── API ────────────────────────────────────────────────────── */
+
+/* Phase 1-3: Probe GPU via MMIO (read-only in Phase 1) */
+int gpu_init(uint64_t bar0_phys);
+
+/* Get probe results (valid after gpu_init succeeds) */
+gpu_probe_t *gpu_get_probe(void);
+
+/* GPU register access (wrappers for use by gsp.c) */
+uint32_t gpu_reg_read(uint32_t reg);
+void     gpu_reg_write(uint32_t reg, uint32_t val);
+
+/* Phase 4: GSP Falcon probe + firmware loading */
+int  gsp_probe(void);
+int  gsp_load_firmware(void);
+gsp_state_t *gsp_get_state(void);
+
+/* Phase 5: GSP Falcon boot (ELF parse, boot sequence, mailbox poll) */
+int  gsp_boot(void);
+
+/* Phase 6: GSP message queues */
+int  gsp_queue_init(void);      /* Allocate + init shared memory */
+int  gsp_queue_send(uint32_t function, const void *payload, uint32_t len);
+int  gsp_queue_recv(void *buf, uint32_t buf_size,
+                    uint32_t *function, uint32_t *rpc_result);
+
+/* Phase 7: RPC protocol */
+int  gsp_rpc_poll(uint32_t *function, uint32_t *result,
+                  void *buf, uint32_t buf_size, uint32_t timeout_ms);
+int  gsp_rpc_init(void);       /* Post-boot RPC init sequence */
+
+/* Phase 8: RM init commands */
+int  gsp_rm_init(void);        /* 7-step RM init sequence */
+
+/* X32: Generic RM alloc/control */
+int  gsp_rm_alloc(uint32_t hParent, uint32_t hObject, uint32_t hClass,
+                  const void *params, uint32_t params_size);
+int  gsp_rm_control(uint32_t hObject, uint32_t cmd,
+                    const void *params, uint32_t params_size);
+
+/* X33: Channel + GPFIFO */
+int  gsp_channel_init(void);          /* Allocate TSG + channel + GPFIFO */
+channel_state_t *gsp_get_channel(void);  /* Get channel state */
+
+/* X34: Compute class bind + kernel dispatch */
+int  gsp_compute_init(void);          /* Bind compute class, activate channel */
+compute_state_t *gsp_get_compute(void);  /* Get compute state */
+int  gsp_compute_barrier(void);       /* Push WAIT_FOR_IDLE + semaphore fence */
+
+/* X35: Copy Engine DMA */
+int  gsp_ce_init(void);                           /* Bind CE class, init state */
+ce_state_t *gsp_get_ce(void);                     /* Get CE state */
+int  gsp_ce_copy_h2d(uint64_t src_phys, uint64_t dst_vram, uint32_t size);  /* Host→Device */
+int  gsp_ce_copy_d2h(uint64_t src_vram, uint64_t dst_phys, uint32_t size);  /* Device→Host */
+
+/* X36: Compute dispatch + kernel completion */
+int  gsp_compute_dispatch(const compute_dispatch_t *desc); /* Build QMD + SEND_PCAS */
+int  gsp_compute_wait(uint64_t sem_addr, uint32_t expected, uint32_t timeout_ms);
+int  gsp_compute_copy_results(uint64_t src_vram, void *dst, uint32_t size); /* D2H + sync */
+
+/* X37: SASS kernel infrastructure (see sass.h for types) */
+int  sass_init(void);          /* Register + upload pre-encoded SASS kernels */
+int  sass_smoke_test(void);    /* Dispatch NOP kernel, check semaphore */
+
+/* X38: GMMU page tables + kernel loader */
+int      gmmu_init(void);              /* Build identity-map page tables, configure instance block */
+uint64_t gmmu_get_pdb_phys(void);      /* Get PDB physical address */
+bool     gmmu_is_initialized(void);    /* Check if GMMU is ready */
+
+/* X39: GPU tensor operations (see gpu_tensor.h for full API) */
+int  gpu_tensor_init(void);            /* Init tensor subsystem + self-test */
+
+/* X40: GPU-accelerated inference (see gpu_inference.h for full API) */
+int  gpu_llama_benchmark_standalone(void);  /* Run GPU vs CPU benchmark (no model needed) */
+
+/* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
+int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */
+int  gpu_parse_bit(void);            /* Parse BIT table, extract FWSEC */
+vbios_state_t *gpu_get_vbios(void);  /* Get VBIOS state */
+fwsec_state_t *gpu_get_fwsec(void);  /* Get FWSEC state */
+
+/* Phase 10: FWSEC-FRTS execution + WPR2 creation */
+int  gsp_fwsec_frts(void);    /* GBL-based (v2), falls back to legacy */
+
+/* GBL state accessor */
+gbl_state_t *gpu_get_gbl(void);
+
+/* ── X27: Falcon PIO Load ──────────────────────────────── */
+
+/* PIO write to Falcon IMEM via IMEMC/IMEMD registers.
+ * base: Falcon MMIO base (e.g. NV_PGSP_BASE).
+ * dst:  Byte offset in IMEM (must be 4-byte aligned).
+ * data: Source dwords.
+ * size: Byte count (must be multiple of 4). */
+void falcon_pio_load_imem(uint32_t base, uint32_t dst,
+                          const uint32_t *data, uint32_t size);
+
+/* PIO write to Falcon DMEM via DMEMC/DMEMD registers. */
+void falcon_pio_load_dmem(uint32_t base, uint32_t dst,
+                          const uint32_t *data, uint32_t size);
+
+/* PIO read from Falcon IMEM (for verification). */
+void falcon_pio_read_imem(uint32_t base, uint32_t src,
+                          uint32_t *buf, uint32_t size);
+
+/* PIO read from Falcon DMEM (for verification). */
+void falcon_pio_read_dmem(uint32_t base, uint32_t src,
+                          uint32_t *buf, uint32_t size);
+
+/* Halt Falcon, clear mailboxes, verify halted. Returns 0 on success. */
+int  falcon_reset(uint32_t base);
+
+/* Set BOOTVEC and start Falcon. Returns 0 on success (no poll). */
+int  falcon_boot(uint32_t base, uint32_t boot_addr);
+
+/* Self-test: PIO write + readback verify on IMEM/DMEM. Returns 0 on success. */
+int  falcon_pio_selftest(uint32_t base);
+
+/* ── X30: Falcon DMA Load + Two-Stage GSP Boot ──────────── */
+
+/* DMA-load firmware from system RAM to Falcon IMEM or DMEM.
+ * Uses DMATRFBASE/DMATRFCMD in 256-byte chunks.
+ * base:     Falcon MMIO base (e.g. NV_PGSP_BASE).
+ * src_phys: Physical address of source data in system RAM.
+ * dst_off:  Destination byte offset in falcon IMEM/DMEM.
+ * size:     Byte count (rounded up to 256B chunks).
+ * to_imem:  true = IMEM target, false = DMEM target.
+ * Returns 0 on success, -1 on timeout. */
+int  falcon_dma_load(uint32_t base, uint64_t src_phys,
+                     uint32_t dst_off, uint32_t size, bool to_imem);
+
+/* ── X29: Radix3 Page Tables + WPR Metadata + GSP Bootloader ── */
+
+/* Radix3 page table constants */
+#define RADIX3_PAGE_SIZE       4096
+#define RADIX3_PTES_PER_PAGE   512      /* 4096 / 8 bytes per entry */
+
+/* Radix3 state (host-allocated page tables in system RAM) */
+typedef struct {
+    uint64_t *lvl0;           /* Level 0: 1 page, 1 entry → L1 */
+    uint64_t *lvl1;           /* Level 1: N pages, entries → L2 */
+    uint64_t *lvl2;           /* Level 2: N pages, entries → FW pages */
+    uint32_t  num_l1_pages;
+    uint32_t  num_l2_pages;
+    uint32_t  num_fw_pages;
+    bool      built;
+} radix3_state_t;
+
+/* GSP bootloader descriptor (RmRiscvUCodeDesc — found inside gsp.bin).
+ * Reference: nouveau nvkm_gsp_fwsec_sb, nova-core RmRiscvUCodeDesc */
+typedef struct {
+    uint32_t bootloader_offset;
+    uint32_t bootloader_size;
+    uint32_t bootloader_param_offset;
+    uint32_t bootloader_param_size;
+    uint32_t riscv_elf_offset;        /* Main firmware offset */
+    uint32_t riscv_elf_size;          /* Main firmware size */
+    uint32_t manifest_offset;
+    uint32_t manifest_size;
+    uint32_t monitor_data_offset;
+    uint32_t monitor_data_size;
+    uint32_t monitor_code_offset;
+    uint32_t monitor_code_size;
+    uint32_t app_version;
+} __attribute__((packed)) rm_riscv_ucode_desc_t;
+
+/* GspFwWprMeta v2 — written to end-of-VRAM for GSP bootloader.
+ * Reference: nouveau GspFwWprMeta, open-gpu-kernel-modules */
+typedef struct {
+    uint32_t magic;                    /* 0x57505232 "WPR2" */
+    uint32_t revision;                 /* 1 */
+    uint64_t sysmemAddrOfRadix3Elf;   /* DMA addr of radix3 L0 page */
+    uint64_t sizeOfRadix3Elf;         /* Firmware ELF total size */
+    uint64_t sysmemAddrOfBootloader;  /* DMA addr of GSP bootloader */
+    uint64_t sizeOfBootloader;        /* Bootloader size */
+    uint32_t bootloaderCodeOffset;
+    uint32_t bootloaderDataOffset;
+    uint32_t bootloaderManifestOffset;
+    uint32_t pad0;
+    uint32_t nonWprHeapOffset;
+    uint32_t nonWprHeapSize;
+    uint64_t gspFwRsvdStart;
+    uint64_t gspFwWprEnd;
+    uint64_t fbSize;
+    uint64_t vgaWorkspaceOffset;
+    uint64_t vgaWorkspaceSize;
+    uint32_t bootCount;
+    uint32_t pad2;
+} gsp_fw_wpr_meta_v2_t;
+
+/* WPR metadata VRAM placement (end of VRAM minus 256KB) */
+#define WPR_META_VRAM_OFFSET_FROM_END  (256 * 1024)
+
+/* X29 API */
+int  gsp_build_radix3(void);          /* Build 3-level PTs from firmware in RAM */
+int  gsp_extract_bootloader(void);    /* Extract bootloader desc from gsp.bin */
+int  gsp_write_wpr_meta(void);        /* Build + write WPR meta to VRAM */
+
+#endif /* OSITOK_GPU_H */

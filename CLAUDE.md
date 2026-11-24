@@ -1,25 +1,141 @@
-# Osito-K - Developer Notes
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What is this
-Bare-metal preemptive kernel for ESP8266 (Wemos D1, Xtensa LX106 @ 80MHz).
-No Espressif SDK — runs directly on hardware using `nosdk8266` approach.
-A [naranjositos.tech](https://naranjositos.tech/) project.
+Multi-arch bare-metal OS, one tree per arch under `arch/<arch>/`. A [naranjositos.tech](https://naranjositos.tech/) project.
+- **x86-64** (`arch/x86/`) — the primary active target: UEFI-booted kernel with a Linux-ABI syscall layer, Win32 PE (UT99/Steam) and DOS/DPMI compatibility layers, networking/TLS, and on-device LLM inference. Almost all recent commits land here.
+- **ESP8266** (`arch/xtensa/`) — the original target: preemptive kernel for Wemos D1 (Xtensa LX106 @ 80MHz), no Espressif SDK (`nosdk8266` approach).
+- **AArch64** (`arch/arm/`, SM8350 / ROG Phone 5) and **wasm32** (`arch/wasm/`, Emscripten, runs in the browser).
+- Shared code: `gui/` (desktop GUI used by every arch), `include/common/` (on-disk formats such as OsitoFS). Host tools: `tools/` (`tools/ositofs/` builds/edits disk images).
+
+The repo root also contains untracked/ignored debugging debris — `.tmp-*` screenshots and logs, `nvme_*.img` disk images, game files (WADs, UT99 DLLs), and stray QEMU build-tree directories (`hw/`, `accel/`, `block/`, `tcg/`…). None of it is project source; ignore it when exploring.
 
 ## Build & Flash
 
-```bash
-# Linux:
-export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
-make                    # default: all features enabled
-make ENABLE_ELITE=0 ENABLE_FORTH=0 ENABLE_DOOM=1   # DOOM config
-make flash              # flash via /dev/ttyUSB0
+The root `Makefile` is a **delegator** — each arch has its own Makefile under `arch/<arch>/`:
 
-# Windows:
-export PATH="/c/Users/xasko/osito-k/tools/xtensa-lx106-elf/bin:$PATH"
-make PYTHON=py          # or run esptool manually
+```bash
+make            # default → ESP8266/Xtensa firmware (arch/xtensa/build/osito.elf + osito0x00000.bin)
+make x86        # x86-64 bare-metal OS → arch/x86/build/{boot.efi,kernel.elf}
+make arm        # AArch64 (SM8350 / ROG Phone 5)
+make wasm       # wasm32 hosted build
+make flash      # flash ESP8266 via /dev/ttyUSB0
+make clean-all  # wipe every arch's build/
 ```
 
-**Feature flags** (see Makefile):
+CI (`.github/workflows/build.yml`) builds **all four arches** on push/PR to `master` and `experiment`: `make xtensa PYTHON=python3`, `make x86 CLANG=1 SKIP_MODEL=1`, `make arm CROSS_COMPILE=aarch64-linux-gnu-`, `make wasm` (emsdk). Build-only — CI runs no tests. `release.yml` (on `v*` tags) builds Xtensa only.
+
+### ESP8266 (Xtensa)
+```bash
+# Linux:
+export PATH="$PWD/arch/xtensa/tools/xtensa-lx106-elf/bin:$PATH"
+make                    # default: all features enabled (arch/xtensa/build/osito.elf)
+make ENABLE_ELITE=0 ENABLE_FORTH=0 ENABLE_DOOM=1   # DOOM config
+make flash              # flash via /dev/ttyUSB0
+# Windows: export PATH=".../arch/xtensa/tools/xtensa-lx106-elf/bin:$PATH"; make PYTHON=py
+```
+
+### x86-64 bare-metal AI OS — the primary active target
+Two toolchains: the default is the **`x86_64-elf-gcc`** cross toolchain; **`CLANG=1`** uses `clang --target=x86_64-elf` + `ld.lld` + `llvm-objcopy` instead (what CI and the Windows/msys2 machine use — no cross-gcc needed). Both still need **gnu-efi** for `boot.efi`; the Makefile auto-detects it at `/usr/local` (macOS, ncroxon source build) or `/usr` (`sudo apt install gnu-efi`), or override `EFI_PREFIX`.
+```bash
+make -C arch/x86 CLANG=1    # → build/boot.efi + build/kernel.elf + lib/vulkan/libvulkan.a
+make -C arch/x86 CLANG=1 build/boot.efi build/kernel.elf   # skip libvulkan
+make -C arch/x86 minimal    # kernel-minimal.elf — fallback when the full kernel crashes (BSS/NVMe-DMA overlap)
+make -C arch/x86 tcc        # kernel.elf via in-tree TCC (self-host verification)
+make -C arch/x86 legacy     # monolithic ositok.efi (old single-PE path)
+make -C tools/ositofs       # host FS tools: mkfs/write/read/ls/info/delete/rename/fsck/defrag
+```
+Build knobs (all default 0; a flags stamp in `build/` forces a kernel rebuild when they change):
+- `SKIP_MODEL=1` — skip the boot-time GGUF model load (inference unavailable); faster boot loop.
+- `QUIET=1` — compile out high-volume serial tracing. Every serial byte is a VM exit under QEMU/KVM, so this matters for UT99/Steam runs.
+- Opt-in tracing: `COMPAT_TRACE`, `PE_LOADER_TRACE`, `WIN32_TRACE`, `WIN32_VM_TRACE`, `WIN32_LOOKUP_TRACE`, `WIN32_LATENCY_TRACE`, `WIN32_IF_AUDIT`, `IOCP_TRACE`, `DOS_TRACE`, `DOS_IRQ_TRACE`, plus `INTEL_*_DIAGNOSTIC` (real-hardware Intel GPU probes). See the comments in `arch/x86/Makefile`.
+
+### Run x86-64 in QEMU (the main dev loop)
+The runner scripts build an ESP FAT image (boot.efi → `BOOTX64.EFI`, plus `kernel.elf`) via `mtools`, boot it under OVMF/edk2 on `q35`/`-m 512M`/`-smp 4` with virtio-net (`hostfwd udp 7778→7777`, `tcp 50052→50052`), xHCI kbd+tablet, and attach `arch/x86/build/nvme.img` as NVMe if present (the UT99/DOOM image).
+```bash
+arch/x86/scripts/qemu-cocoa.sh                                # macOS: -accel hvf -display cocoa
+arch/x86/scripts/qemu-test.sh [--no-build] [--no-gl] [--kill] # generic; virtio-gpu-gl by default
+tools/smoke-test.sh [secs]                                    # headless boot, waits for DHCP/shell in the serial log
+tools/deploy.sh <elf> [--gl] [--auto] [--tail]                # write an ELF into build/nvme.img and relaunch QEMU
+```
+**The serial log is the debugging lifeline**: `arch/x86/build/serial.log`. Exit QEMU with `Ctrl-A X`. Poke the in-OS UDP inference server from the host: `echo "hola osito" | nc -u localhost 7777`.
+
+### Windows (this machine)
+The checkout is `D:\projects\osito-k`; msys2 lives in `C:\msys64` (clang, lld, llvm-tools, mtools, qemu; gnu-efi installed by hand under msys2's `/usr/local`). There is **no WSL on this machine**. Details in `README-windows.md`.
+- **Build + boot (TCG)**: run `.\build-windows.ps1` from PowerShell; it takes `-Display none|gtk|sdl`, `-Nvme <img>`, `-BuildOnly` and `-NoBuild`. The equivalent from an MSYS2 MINGW64 shell is `OK_BUILD=1 arch/x86/scripts/run-windows.sh`, with `OK_DISPLAY` and `OK_NVME`. Booted without NVMe, the kernel reaches the `osito>` prompt in under a minute. The NVMe image is attached read-write, so the guest can modify it.
+- **No hardware acceleration**: WHPX cannot boot OVMF (a #GP in `PlatformPei` on an early `WRMSR`, before `boot.efi` runs). This is an upstream QEMU limitation with no command-line workaround; see `docs/windows-qemu-whpx.md`. `arch/x86/scripts/run-wsl-kvm.sh` (KVM) only works on a Linux/WSL host that has QEMU installed, and none is set up right now.
+- **Native clang can't read symlinks created from WSL.** If the build fails with "no such file" on a file that exists, check `find <dir> -type l` and replace the symlinks with copies.
+- **wasm**: emsdk (emcc 6.0) is in `C:\Users\xasko\emsdk`. From an MSYS2 shell, `export EM_CONFIG=C:/Users/xasko/emsdk/.emscripten PATH=/c/Users/xasko/emsdk/upstream/emscripten:/c/Users/xasko/emsdk/node/22.16.0_64bit/bin:/c/Users/xasko/emsdk/python/3.13.3_64bit:$PATH`, then `make wasm`.
+  - The wasm build compiles x86's shell and many kernel files. A shell command that calls something native needs `#ifndef __EMSCRIPTEN__` or a stub in `arch/wasm/hal/stubs.c`; selftests are stubbed to return -1.
+  - To run it, serve `arch/wasm/build` over HTTP. Headless Chrome with `--dump-dom --virtual-time-budget=30000` shows the terminal's text up to the `osito>` prompt.
+
+### AArch64 on the ROG Phone 5 (SM8350)
+Full guide: `arch/arm/BUILDING-ROG5.md`. The phone is on this machine's USB (fastboot in `C:\platform-tools`); the toolchain and the boot-image pieces (shim, DTBs, `mkbootimg.py`, stock backups) live on the Mac `cortessamuel@192.168.1.7` in `~/phone_breaker2`.
+- `arch/arm/scripts/rog5-boot.sh` ships the working tree to the Mac and builds it there with `aarch64-elf-gcc`. clang can't build `arch/arm` (no `__builtin_setjmp` on aarch64).
+  - `--usb` is the normal dev loop (~15 s, no buttons): it sends the kernel to the running Osito-K over its USB console (`kload`) and checks that the new kernel answers.
+  - `--flash` packs `boot.img` and flashes the active slot, for a kernel that must survive a reboot (~75 s, no buttons). If Osito-K is running, it sends `reboot bootloader` first (the restart reason goes into the PMIC over SPMI, `platform/sm8350/pmic_arb.c`). Then it waits for the new kernel and checks `uname`'s build stamp against the flashed image. Only a hung or pre-2026-10-29 kernel needs Power + Vol-Down. `fastboot boot` bootloops on this device.
+  - `rog5-console.ps1 -Command <line>` runs one shell command on the phone and prints the answer.
+  - `--virt-check` also boots the virt build in local QEMU.
+  - `--screen-debug` builds with `SCREEN_DEBUG=1` (below).
+- There is no UART output. Feedback comes from the USB console (`dmesg` replays the boot log) and from the screen:
+  - The text console mirrors everything `serial_*` prints. By default it covers the whole panel. The volume keys page it back through the log (`platform/sm8350/keys.c`), and Power prints a status line.
+  - Screen debug mode (`SCREEN_DEBUG=1`, or shell `screen debug` at runtime) adds boot progress bars and a blinking heartbeat square per CPU above the console, which then starts at pixel row 700.
+  - An orange/purple panic band with ESR/ELR/`_start` as bit cells appears in both modes. With the progress bars, it's the only clue when the kernel dies before USB is up; the guide explains how to decode it.
+- MMU and caches are on (`platform/sm8350/mmu.c`, flat map). Anything a device DMAs to must come from `dma_alloc()` (uncached window), not the page allocator.
+  - The window is Normal non-cacheable and registers are Device memory, which Arm doesn't order against each other. So a driver needs barriers as Linux's `readl`/`writel` have them: `dmb oshst` before a register write that hands the device a buffer, and `dmb oshld` after a register read that says DMA data is ready. See `rd`/`wr` in `dwc3_acm.c`; without them the USB gadget wedged when serviced from a slow A55.
+  - Copy bulk data in or out of the window with several independent wide loads per turn (`dma_copy` in `ufs.c`), not `memcpy`. An in-order A55 waits out each uncached load: UFS reads from the shell ran at 4 MB/s until that changed.
+- SMP: tasks run on all 8 cores (`kernel/sched.c`, `kernel/smp.c`). `task_create` keeps a task on the boot CPU, as before SMP; `task_create_on(..., cpu)` places it elsewhere, or anywhere with `TASK_ANY_CPU`. Shared state needs a lock from `include/spinlock.h`. The scheduler, heap, page allocator and console already have one. Don't use `__atomic` builtins: they emit LSE, which virt's Cortex-A72 lacks.
+- The hypervisor traps GIC MMIO and emulates it from the abort syndrome, so a load/store with writeback or a pair (`str w0, [x1], #4`, `stp`) becomes a synchronous external abort. Access the GIC (and any other region it might trap) only through the asm `mmio_rd32`/`mmio_wr32`/`mmio_rd64` in `include/aarch64.h`.
+- Boot sets every CPU cluster to its top frequency through the EPSS hardware (`platform/sm8350/cpufreq.c`, shell `cpufreq`): A55 1.8 GHz, A78 2.42 GHz, X1 2.84 GHz. The bootloader leaves the big cores at 710/844 MHz.
+  - The A78s and the X1 share a voltage rail, so lowering one alone changes nothing.
+  - `cpufreq try` runs a level under a watcher on another CPU, which restores it if the lowered CPUs stop ticking.
+  - `platform/sm8350/thermal.c` reads the TSENS sensors (shell `temp`), and its task caps both big clusters together above 95 °C.
+- UFS (`platform/sm8350/ufs.c`, shell `ufs`) holds every partition of the phone, ABL and the boot slots included. Osito-K writes only to LUN 0's `userdata` (OsitoFS, mounted at boot): `permitted()` refuses any write outside that partition's LBA range and any opcode that isn't a read or WRITE(10)/SYNCHRONIZE CACHE. Never widen that without the user asking.
+  - The filesystem is OsitoFS v3 (`fs/ositofs3.c`, x86's driver ported, with directories), on the partition's first 32 GB. `ufs mkfs userdata` formats it in-kernel, and `ufs migrate userdata` converts a v2. Use the v3 API with paths from `fs_path` (`include/fs.h`), which resolves them against the shell's current directory. `fs/ositofs2.c` stays only for the migration and for dormant x86 ports.
+  - Copy files on with `arch/arm/scripts/rog5-put.ps1 -File <path>` (shell `put <path>`) and off with `rog5-get.ps1 -Name <path>` (shell `get`); run programs with `exec <path> [args]`.
+  - `arch/arm/scripts/rog5-screenshot.ps1 [-Out <file.png>]` saves the panel as a PNG on this PC (shell `screenshot` writes `screen.bmp`).
+- The shell (`kernel/shell.c`, editor in `kernel/term.c`) has pipes, `>`/`>>`/`<`, quotes, history and Tab completion, as x86's, plus `;`/`&&`/`||`, wildcards (`*`, `?`) and here documents (`<< WORD`).
+  - A command's output is whatever the shell task prints with `serial_*`; `console_capture` sends it into the pipe or file.
+  - Report errors with `err_puts`, which skips the capture and marks the command failed for `&&`/`||` (`note_puts` only skips the capture).
+  - A command that reads input takes the pipe through `stdin_in` / `text_of` (apps through `read(0)`).
+  - A new command goes in `dispatch()` and in `command_names[]` (for Tab).
+- Programs are C in `arch/arm/apps/` against the libc in `arch/arm/libc/`, built as static PIEs that `kernel/elf.c` relocates. `arch/arm/scripts/rog5-app.sh [--run <app> args]` builds them on the Mac, copies them to the phone, and optionally runs one. They run one at a time in the shell's task at EL1 with no memory protection; a fault in their own code ends them, anything else panics.
+- `desktop` runs the shared GUI (`gui/`) on the panel in its phablet layout (`GUI_LAYOUT_PHABLET`, 300%), with the console inside its Terminal window (`kernel/gui_task.c`); `desktop off` returns to the plain console. Layout changes in `gui/` also affect x86 and wasm, so build x86 too.
+- Power rails (the PMICs' LDOs) belong to the AOP, so SPMI writes to them are refused; `pmic list <sid>` marks what EE 0 may write. Switch them through RPMh (`platform/sm8350/rpmh.c`: command DB lookup, then a vote through an apps RSC AMC), and only with the device tree's voltages.
+  - The touchscreen (`platform/sm8350/touch.c`, shell `touch`) powers up that way at boot.
+  - Its I2C SE has the FIFO disabled (GPI DMA only), so the driver bit-bangs the two pins.
+  - Taps and swipes reach the desktop through `platform_touch_event`.
+- Memory: the page allocator (`mem_alloc_pages`) covers DDR bank 0, 208 MB. `mem_alloc_aligned_high` serves big allocations (models, `put` buffers, inference state) from 15 GB of high memory: the rest of the 16 GB, less the device tree's carve-outs (`high_ram[]` in `platform/sm8350/mmu.c`). Kernels from `kload` must stay in bank 0.
+- USB networking: `net up` re-enumerates the gadget as ACM + CDC-NCM (`platform/sm8350/dwc3_acm.c`, framing in `ncm.c`), and the console moves to COM4. Windows binds its inbox UsbNcm. The phone then takes DHCP (Windows ICS) or a link-local 169.254.79.x.
+  - Through ICS it reaches the internet: `resolve`, `date` (SNTP), and `https <host> [path]` over TLS 1.3 or 1.2 (`kernel/tls13.c`, `tls.c`).
+  - HTTPS authenticates the server through `kernel/tls_verify.c`: BearSSL 0.6's X.509 engine (`lib/bearssl`) against Mozilla's roots (`kernel/ca_roots.c`, from `tools/ca-roots/gen-bearssl-anchors.py`), plus the handshake signature. Keep it fail-closed. Revocation is the leaf's CRL (`kernel/revocation.c`, fetched over `http_open_plain`): only a listed serial refuses; a CRL that can't be fetched or checked is let through.
+  - Key material comes from `random_bytes` (`kernel/random.c`: an HMAC-DRBG over the hardware PRNG), never from the timer counter.
+  - Files that include `bearssl.h` can't include `hal.h`/`types.h` (its `string.h` clashes with their static inlines): declare the few kernel functions they need, as `tls_verify.c` does, and add them to `BEARSSL_USERS` in the Makefile.
+  - Code ported from x86 counts timeouts in 100 Hz ticks: on arm that's `timer_get_tick_count()`. `timer_get_ticks()` is the 19.2 MHz counter.
+  - Task stacks are 32 KB (`TASK_STACK_SIZE` in `kernel/task.h`), and nothing catches an overflow, which corrupts the next task's stack. Put big buffers in static storage or the heap.
+  - The stack (`kernel/net.c`) isn't reentrant: hold it with `net_hold`/`net_release` around any use.
+  - The `net` task polls it only when it's free.
+- Local LLM: `kernel/llm.c` (`model <file.gguf>`, `chat <text>`, `llm selftest`) runs x86's inference stack, ported.
+  - Its SIMD paths are NEON under x86's AVX2 names (`kernel/tensor_neon.c`). Q4_0/Q4_1/Q8_0 matvecs use SDOT on an 8-bit copy of the input (`kernel/tensor_sdot.c`, the only file built with `+dotprod`) where `ID_AA64ISAR0_EL1` shows it; QEMU's Cortex-A72 lacks it.
+  - The scheduler saves no FP/SIMD state, so FP code (the Makefile's `FP_SRCS`) must stay in one pinned task per CPU. `model`/`chat` pin the shell to the X1 (CPU 7) while they run.
+  - Matvecs are split over the X1 and three worker tasks pinned to the A78s (CPUs 4–6), which spin only while `model`/`chat` runs.
+- Status 2026-10-29: boots to `shell>`, with the shell interactive over USB. The side USB-C port enumerates as a CDC-ACM serial port (`VID_1209&PID_0001`, COM3 on this machine), and you can drive it from PowerShell with `System.IO.Ports.SerialPort`.
+- The kernel is a PIE linked at 0 that relocates itself in `start.S`, so it runs at any load address and stored pointers work. Linker-script symbols that C reads must be section-relative (an absolute symbol's GOT entry gets no relocation). After linking, `readelf -r kernel.elf` should show only `R_AARCH64_RELATIVE`.
+
+### Tests
+CI runs no tests. Three kinds of test exist in `arch/x86/`:
+- **Host tests** (the majority): `arch/x86/scripts/test-*.sh`. Most of them compile an `arch/x86/test/*_host.c` harness against the real kernel sources with gcc and clang, often under ASan/UBSan, and run it natively. They need Linux. From this machine, run them on the `xasko@kerberus` WSL (Ubuntu-24.04) with `arch/x86/scripts/remote-test.sh <name>...`, e.g. `remote-test.sh boot-diag`. It syncs the tree incrementally over SSH and runs `test-<name>.sh` there.
+  - Arguments for a single test go after `--`, e.g. `remote-test.sh dos-fpu-compare -- /tmp/out.log`.
+  - Run arbitrary commands with `--exec`, e.g. `remote-test.sh --exec 'make -C arch/x86 serial-host-test'`.
+  - kerberus's SSH shell is PowerShell 5.1, so send remote commands through this script rather than raw `ssh`.
+  - kerberus still lacks `libmpfr-dev libgmp-dev lld llvm` (used by the `dos-fpu-*` and PE-building tests); installing them needs the user's sudo.
+  - Some tests expect fixtures pre-generated into `arch/x86/build/`, which is not synced.
+- **QEMU tests**: about 20 of the `test-*.sh` / `test-*-qemu.py` scripts boot the kernel and assert on the serial log. They need a built `kernel.elf` and often an `nvme.img`.
+- **In-OS fixtures**: `arch/x86/scripts/build-*-test.sh` cross-build PE32/PE64 Win32 fixtures (`clang --target=*-windows-msvc` + `lld-link` + `llvm-dlltool`, so no Windows SDK is needed). `make -C arch/x86 dos-*-test` builds DOS `.COM` fixtures into `build/test/`. Linux-ABI ELF test programs (`hello_c`, `fork_test`, `mmap_test`…) and in-OS tools (`tcc.elf`, `qjs.elf`) are built with the minimal libc via `make -C arch/x86/libc <name>.elf` (uses `tcc` and the `x86_64-elf` binutils). Copy them onto the NVMe/ESP image with `tools/ositofs` and run them from the in-OS shell.
+
+### ESP8266 feature flags & serial
+**Feature flags** (see `arch/xtensa/Makefile`):
 ```
 ENABLE_ELITE=1   Elite wireframe flight demo + ship models (~2.1KB IRAM)
 ENABLE_FORTH=1   zForth scripting engine (~4.2KB IRAM)
@@ -28,12 +144,18 @@ ENABLE_DOOM=0    DOOM wireframe 2.5D engine (~3.5KB IRAM)
 
 **Serial monitor**: 74880 baud (ROM bootloader uses ~52MHz APB, not 80MHz).
 ```bash
-python3 tools/tviewer.py                    # terminal video bridge (SSH-safe)
-python3 tools/tviewer.py /dev/ttyUSB0 74880 # explicit port/baud
-python3 tools/console.py /dev/ttyUSB0       # text-only console
+python3 arch/xtensa/scripts/tviewer.py                    # terminal video bridge (SSH-safe)
+python3 arch/xtensa/scripts/tviewer.py /dev/ttyUSB0 74880 # explicit port/baud
+python3 arch/xtensa/scripts/console.py /dev/ttyUSB0       # text-only console
 ```
 
 **Restore original firmware**: `python3 -m esptool --port /dev/ttyUSB0 write_flash 0x0 backup/wemos_d1_full_backup.bin`
+
+## Conventions
+- **LF line endings** are enforced by `.gitattributes`. CRLF from Windows editors produces whole-file diffs.
+- Commit subjects are subsystem-prefixed and action-oriented, e.g. `x86/win32: fix UT99 rendering, display modes and C++ catches` or `x86/dos: implement Ctrl-C callbacks across real mode and DPMI`.
+- Architecture-specific code stays under `arch/<arch>/`. Only reusable on-disk formats and APIs move to `include/common/`.
+- `AGENTS.md` repeats these guidelines for other agents. Keep it in sync when they change.
 
 ## Critical Architecture Details
 
@@ -67,150 +189,115 @@ python3 tools/console.py /dev/ttyUSB0       # text-only console
 - Image format MUST be version 1 (v2 doesn't boot on ESP8266).
 - GCC 10.3 (earlephilhower) libgcc lacks Xtensa div/mul builtins. Makefile auto-finds GCC 8.4 libgcc via LIBGCC_COMPAT.
 
-## Code Map
-```
-src/boot/vectors.S          Vector table (VECBASE, correct offsets)
-src/boot/crt0.S             Startup: SP, VECBASE, BSS clear, call kernel_main
-src/boot/nosdk_init.c       WDT disable, PLL 80MHz, UART pins, baud
-src/kernel/context_switch.S Full ISR: save ctx → ISR stack → os_exception_handler → restore ctx → rfe
-src/kernel/sched.cpp        Round-robin scheduler, task_create, task_yield (software int)
-src/kernel/timer_tick.c     FRC1 100Hz, exception dispatcher, INUM 7/9 handling
-src/kernel/task.h           TCB struct, context frame offsets, all kernel API declarations
-src/kernel/sem.cpp          Counting semaphores
-src/kernel/mq.cpp           Message queues (IPC)
-src/kernel/timer_sw.cpp     Software timers (one-shot / periodic)
-src/mem/pool_alloc.cpp      Fixed-block allocator (32B × 256 = 8KB)
-src/mem/heap.cpp            General-purpose heap allocator (8KB, first-fit, coalescing)
-src/fs/ositofs.cpp          Flash filesystem (SPI flash, 64KB-aligned sectors)
-src/math/fixedpoint.h/cpp   Fixed-point 16.16 math (sin/cos/div/sqrt/lerp)
-src/math/matrix3.h/cpp      3D vectors (vec3_t), 3×3 matrices (mat3_t), perspective projection
-src/drivers/uart.cpp        UART0: polled TX, interrupt RX, ring buffer, mutex
-src/drivers/gpio.cpp        GPIO read/write/mode
-src/drivers/adc.cpp         SAR ADC (10-bit, A0 pin)
-src/drivers/input.cpp       Joystick input (ADC + button, event queue)
-src/drivers/font.cpp        4×6 bitmap font (ASCII 32-126)
-src/drivers/video.cpp       Framebuffer 128×64, line drawing, text, UART streaming
-src/forth/zforth.c          zForth core interpreter (MIT, adapted for no-libc)
-src/forth/zforth.h          zForth API header (ctx struct, eval, push/pop)
-src/forth/zfconf.h          zForth config: int32 cells, 2KB dict, 16-deep stacks
-src/forth/zf_host.cpp       Host callbacks, core.zf bootstrap, REPL, file runner
-src/forth/setjmp.h          jmp_buf typedef for Xtensa CALL0
-src/forth/setjmp.S          setjmp/longjmp asm (6 regs, 24 bytes)
-src/doom/doom.h             DOOM engine data structures (level, player, enemies, game state)
-src/doom/doom_gen.cpp       Procedural level generator (4x4 grid, snake path, enemy placement)
-src/doom/doom_render.cpp    2.5D wireframe renderer (walls, enemy sprites, weapon, HUD)
-src/doom/doom_game.cpp      Game loop: input, movement, collision, shooting, AI, game over
-src/shell/shell.cpp         Interactive shell (ps, mem, heap, fs, gpio, forth, run, doom, etc.)
-src/main.cpp                kernel_main: init → create tasks → timer → sched_start
-```
+## Code layout
+Per-file maps for every arch are in [docs/code-map.md](docs/code-map.md). Overview of `arch/x86/`, the tree you will touch most:
+- `boot/boot_efi.c` — the UEFI loader. It reads `kernel.elf` from the ESP, fills the handoff struct in `include/boot_info.h`, and jumps to the kernel. `kernel.ld` links the kernel at 0x2000000.
+- `kernel/` — the core kernel and most subsystems, roughly one flat file per subsystem: scheduler, paging, syscalls, net/TLS, shell, inference, compositor, and so on.
+- `drivers/` — PCI device drivers: NVMe, AHCI, xHCI, virtio-*, HDA, NVIDIA GPU/GSP, Intel graphics.
+- `fs/` — OsitoFS v2/v3 plus the foreign filesystems, all behind the VFS.
+- `win32/` — the PE loader, DLL shims, NT syscalls and handle table. This is the Win32 compat layer for UT99 and Steam.
+- `dos/` — DOS/DPMI execution: real-mode CPU, INT 21h/31h services, XMS/EMS, the x87 FPU.
+- `lib/` — vendored third-party code (Mesa/OpenGL, DXVK, Vulkan, BearSSL, tinyssh, softfloat).
+- `libc/` — the minimal userspace libc and in-OS tools (TCC, QuickJS).
+- `test/` — host harnesses (`*_host.c`) and in-OS test programs. `scripts/` holds QEMU runners, test drivers and debug helpers.
 
-## Math Library Summary
+## Roadmap & status
+The feature tables live in [docs/roadmap.md](docs/roadmap.md): ESP8266 `F*`, x86 `X-*`, wasm `W-*`, AArch64 `A-*`, and the `H*` hardware-boot plan. When a feature lands or changes status, add or update its row there, not here.
 
-### fixedpoint.h — Fixed-point 16.16
-- Types: `fix16_t` (int32_t), `angle_t` (uint8_t, 0-255 = 0°-360°)
-- Inline: `fix_add`, `fix_sub`, `fix_mul`, `fix_neg`, `fix_abs`, `fix_lerp`, `fix_clamp`, `fix_dist_approx`
-- Functions: `fix_sin`, `fix_cos`, `fix_div`, `fix_sqrt`, `fix_print`
-- Macros: `FIX16(n)`, `FIX16_C(f)`, `FIX16_TO_INT(x)`, `FIX16_ROUND(x)`
+## Detailed Feature Documentation
 
-### matrix3.h — 3D Vectors & Matrices
-- Types: `vec3_t` (12B), `mat3_t` (36B)
-- Inline: `vec3()`, `vec3_add/sub/neg/scale/dot/length`, `mat3_identity`
-- Functions: `mat3_rotate_x/y/z`, `mat3_multiply`, `mat3_transform`, `project`
-- `project()` uses `FIX16_ROUND`, screen center at (64,32), returns 0 if behind camera
-- `mat3_multiply` uses internal temp buffer — safe even if out aliases a or b
+For implementation details, API specifics, register-level documentation, and debugging notes:
 
-## zForth Integration
-
-Minimal Forth interpreter (github.com/zevv/zForth, MIT). Replaced BASIC+VM.
-- **Config**: int32_t cells, 2KB dictionary, 16-deep data/return stacks
-- **Context**: `zf_ctx` struct (~2.3KB in BSS), persistent across invocations
-- **Bootstrap**: core.zf embedded as `static const char[]` — defines if/else/fi, do/loop, variables, s"
-- **Syscalls**: emit(0), print(1), tell(2), fb-clear(128), fb-pixel(129), fb-line(130), fb-flush(131), fb-text(132), yield(133), ticks(134), delay(135), wire-render(136), wire-models(137)
-- **wire-render** `( model rx ry rz -- )`: models 0=cube, 1=cobra, 2=sidewinder, 3=viper, 4=coriolis
-- **setjmp/longjmp**: custom Xtensa CALL0 asm, saves a0/a1/a12-a15 (24 bytes)
-- **Shell**: `forth` (REPL, Ctrl+C exit), `run <file.zf>` (execute from OsitoFS)
-
-### Historical: BASIC + VM (removed)
-Tiny BASIC interpreter and bytecode VM were the original scripting layer (F1-F5).
-Replaced by zForth to save ~4KB IRAM. Original source preserved in git history
-(commit 434697a..11d5a48). Could be restored as optional compile-time feature
-by re-adding src/basic/ and src/vm/ to the Makefile.
-
-## Resource Budget
-
-### IRAM .text breakdown by subsystem
-```
-Subsystem                        IRAM (bytes)   Config flag
-─────────────────────────────────────────────────────────────
-Core (boot, kernel, scheduler)     ~4,800       always
-Drivers (uart, gpio, adc, input)   ~2,200       always
-Video (framebuffer, font)          ~2,600       always
-Memory (pool, heap)                ~1,800       always
-Filesystem (ositofs)               ~2,100       always
-Math (fixedpoint, matrix3)         ~2,200       always
-Shell                              ~2,600       always
-────── subtotal core ──────       ~18,300
-Elite (wire3d, ships, game)        ~2,100       ENABLE_ELITE
-zForth (zforth, zf_host, setjmp)   ~4,200       ENABLE_FORTH
-DOOM (gen, render, game, combat)   ~5,900       ENABLE_DOOM
-```
-
-### Build configurations
-```
-Config                              .text    .data    .bss    IRAM free
-All features (Elite+Forth+DOOM)    ~30,500  ~15,700  ~37,800  ~2.3KB
-Elite + Forth (default)             24,594    9,848   37,232   ~8.2KB
-DOOM only (with combat)             24,274    5,908   36,432   ~8.5KB
-Core only (no features)            ~18,300   ~5,800  ~35,400  ~14.5KB
-```
-
-### DRAM usage
-```
-sin_table 1KB + pool 8KB + heap 8KB + FS buffers ~4KB + stacks ~12KB
-+ zf_ctx ~2.3KB (if ENABLE_FORTH) + doom_state ~1.5KB (if ENABLE_DOOM)
-Total used: ~35-37KB of ~80KB available
-```
-
-### Other resources
-```
-Flash:   OsitoFS on SPI flash (4MB total)
-Tasks:   idle, input, shell (3 of 8 slots used)
-```
-
-## Roadmap
-
-| Feature | Description | Status |
-|---------|-------------|--------|
-| F1-F5   | Kernel, scheduler, drivers, FS, heap, font, framebuffer | Done |
-| F6      | Fixed-point 16.16 math library (sin/cos/div/sqrt) | Done |
-| F7      | 3D vectors, matrices, perspective projection | Done |
-| F8      | Wireframe renderer — vertex/edge → rotate → project → draw | Done |
-| F9      | Ship models — Cobra, Sidewinder, Coriolis, Viper, Asp, Shuttle | Done |
-| F10     | Game loop + HUD — flight, starfield, radar, joystick | Done |
-| **zF**  | **zForth** — replaced BASIC+VM, saved ~4KB IRAM | Done |
-| **F12** | **DOOM wireframe** — 2.5D BSP engine, procedural levels | Done |
-| **F11** | **Spreadsheet engine** — cell grid, formula parser, cursor UI | Next |
-
-### F12: DOOM Wireframe 2.5D
-Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
-Compile-time feature: `ENABLE_DOOM=1`. Disabled by default to save IRAM.
-Controls: WASD=move, Q/E=strafe, A/D=turn, F/SPACE=shoot, M=minimap, R=new level, Ctrl+C=exit.
-Uses fix16 math for all transforms. doom_state_t in static BSS (~1.5KB).
-
-**Combat system**:
-- **Enemies**: denemy_t (12B), max 8 per level, placed in rooms away from spawn
-- **AI states**: IDLE → CHASE (speed 0.06/frame) → ATTACK (damage every ~0.3s) → HURT (stun) → DEAD
-- **Shooting**: hitscan — project enemy to screen X, check if within ±12px of crosshair, closest hit wins
-- **Sprites**: wireframe diamond scaled by distance, state-dependent visuals (shake on hurt, arms on attack, flat line when dead)
-- **Player HP**: 10, enemy HP: 3. Damage flash (border), muzzle flash (radial lines)
-- **Game over**: screen with kill count, R to restart, Ctrl+C to exit
-- **Minimap**: enemies shown as X marks, dead enemies hidden
-
-### F11: Spreadsheet Engine
-Cell grid (e.g. 8×16), each cell holds number or formula string.
-Formula parser: `=A1+B2*3`, cell references, basic operators (+−×÷).
-Evaluation with dependency tracking (topological sort or mark-dirty).
-UI: grid rendered on framebuffer, cursor navigation with joystick, cell editing via UART.
+- **[docs/x86-features-detail.md](docs/x86-features-detail.md)** — All x86-64 feature descriptions (X9-X42, X-OS*, X-NET*, X-CL*, X-WIN32, etc.)
+- **[docs/x86-network-stack.md](docs/x86-network-stack.md)** — Sesión bring-up red bare-metal (B450-F + I211): pipes, kdownload/OFTP, nic_stats, MSI fixes (PCI cap aligned + GPIE.EIAME), RDT off-by-one, reply-path TX bug + workaround
+- **[docs/session-2026-05-16-17-net-pki-overhaul.md](docs/session-2026-05-16-17-net-pki-overhaul.md)** — 26-commit TCP + TLS + PKI overhaul: RFC 2018 SACK (multi-block), RFC 7323 timestamps + PAWS, RFC 6298 Jacobson RTT, TLS 1.3 client real (X25519 + AES-128-GCM + HKDF), RSA-2048, ECDSA P-256/P-384, X.509 chain validation (link sig + constraints + validity + SAN + pin + AIA + OCSP + CRL), OCSP stapling client, 1.3-preferred HTTP dispatch with 1.2 fallback
+- **[docs/kernel-demencial.md](docs/kernel-demencial.md)** — 10 features avanzadas: cpu_features, PMU counters, superpage tensor arena, multipath dispatch, sys_inference syscall, ASLR lite, predictive scheduling, speculative I/O, zero-copy SG TX, hardware breakpoints, self-optimizing kernel
+- **[docs/unicode-architecture.md](docs/unicode-architecture.md)** — Subsistema Unicode 4 capas estilo Plan 9: libutf codec, PSF2 font loader desde OsitoFS, LRU cache, renderer width-aware (CJK 16×16), boot font Latin-1 link-time. Implementado y validado en fork osito-x; documento describe diseño completo + plan de port a mainline
+- **[docs/kernel-diagram.md](docs/kernel-diagram.md)** — 5 diagramas Mermaid: arquitectura completa (111 archivos en 12 subsistemas), secuencia de boot (22 pasos), dispatch de syscalls, forward pass de inference, y mapa de integración de las 10 features
+- **[docs/esp8266-detail.md](docs/esp8266-detail.md)** — Math library API, zForth integration, resource budget, DOOM/Elite details
+- **[docs/aarch64-detail.md](docs/aarch64-detail.md)** — AArch64/SM8350 (ROG Phone 5) port details
+- **[docs/wasm-port.md](docs/wasm-port.md)** — WebAssembly/Emscripten port: build, R2 asset hosting + CORS, subsystem map, dlopen arch-validation
+- **[docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)** — GPU compute roadmap (X27-X40)
+- **[docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)** — OS self-hosting tiers 0-9
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **osito-k** (76066 symbols, 93233 relationships, 76 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+
+## When Debugging
+
+1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
+2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
+3. `READ gitnexus://repo/osito-k/process/{processName}` — trace the full execution flow step by step
+4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
+
+## When Refactoring
+
+- **Renaming**: MUST use `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` first. Review the preview — graph edits are safe, text_search edits need manual review. Then run with `dry_run: false`.
+- **Extracting/Splitting**: MUST run `gitnexus_context({name: "target"})` to see all incoming/outgoing refs, then `gitnexus_impact({target: "target", direction: "upstream"})` to find all external callers before moving code.
+- After any refactor: run `gitnexus_detect_changes({scope: "all"})` to verify only expected files changed.
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
+- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+
+## Tools Quick Reference
+
+| Tool | When to use | Command |
+|------|-------------|---------|
+| `query` | Find code by concept | `gitnexus_query({query: "auth validation"})` |
+| `context` | 360-degree view of one symbol | `gitnexus_context({name: "validateUser"})` |
+| `impact` | Blast radius before editing | `gitnexus_impact({target: "X", direction: "upstream"})` |
+| `detect_changes` | Pre-commit scope check | `gitnexus_detect_changes({scope: "staged"})` |
+| `rename` | Safe multi-file rename | `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` |
+| `cypher` | Custom graph queries | `gitnexus_cypher({query: "MATCH ..."})` |
+
+## Impact Risk Levels
+
+| Depth | Meaning | Action |
+|-------|---------|--------|
+| d=1 | WILL BREAK — direct callers/importers | MUST update these |
+| d=2 | LIKELY AFFECTED — indirect deps | Should test |
+| d=3 | MAY NEED TESTING — transitive | Test if critical path |
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/osito-k/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/osito-k/clusters` | All functional areas |
+| `gitnexus://repo/osito-k/processes` | All execution flows |
+| `gitnexus://repo/osito-k/process/{name}` | Step-by-step execution trace |
+
+## Self-Check Before Finishing
+
+Before completing any code modification task, verify:
+1. `gitnexus_impact` was run for all modified symbols
+2. No HIGH/CRITICAL risk warnings were ignored
+3. `gitnexus_detect_changes()` confirms changes match expected scope
+4. All d=1 (WILL BREAK) dependents were updated
+
+## CLI
+
+- Re-index: `npx gitnexus analyze`
+- Check freshness: `npx gitnexus status`
+- Generate docs: `npx gitnexus wiki`
+
+<!-- gitnexus:end -->

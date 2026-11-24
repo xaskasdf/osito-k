@@ -1,0 +1,224 @@
+{
+  "format": 1,
+  "description": "Qualified WineD3D 3.8 D3D9 dependencies; MSYS2 package versions are pinned independently per ABI. The Mesa module is built separately from this repository.",
+  "upstream_sources": {
+    "wine": "https://github.com/wine-mirror/wine/tree/wine-3.8",
+    "msys2_recipe": "https://github.com/msys2/MINGW-packages/tree/master/mingw-w64-wined3d",
+    "mesa": "arch/x86/lib/opengl/mesa"
+  },
+  "sources": [
+    {
+      "id": "gcc32",
+      "cache_name": "mingw-w64-i686-libgcc-16.2.0-4-any.pkg.tar.zst",
+      "url": "https://mirror.msys2.org/mingw/mingw32/mingw-w64-i686-libgcc-16.2.0-4-any.pkg.tar.zst",
+      "bytes": 100788,
+      "sha256": "09fb7b5a39557d01517c392bbcec01f9dbd1079289a87befd6363f4ddc4957af",
+      "members": [
+        {
+          "source": ".PKGINFO",
+          "destination": "System/Backends/d3d9/packages/gcc32.PKGINFO",
+          "bytes": 1091,
+          "sha256": "f5fbdc7a0ef119455c7fce786efcd99c48b3a8cc514629c6eae30c3fca73523a"
+        },
+        {
+          "source": "mingw32/bin/libgcc_s_dw2-1.dll",
+          "destination": "Windows/SysWOW64/libgcc_s_dw2-1.dll",
+          "bytes": 201149,
+          "sha256": "ef0edf5009eb623d2c8da814c1a85af18d39615dc27ce6d1e46b37992d3c2eca"
+        },
+        {
+          "source": "mingw32/share/licenses/libgcc/COPYING.RUNTIME",
+          "destination": "System/Backends/d3d9/licenses/gcc32/COPYING.RUNTIME",
+          "bytes": 3324,
+          "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74"
+        },
+        {
+          "source": "mingw32/share/licenses/libgcc/COPYING3",
+          "destination": "System/Backends/d3d9/licenses/gcc32/COPYING3",
+          "bytes": 35147,
+          "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+        }
+      ]
+    },
+    {
+      "id": "winpthread32",
+      "cache_name": "mingw-w64-i686-libwinpthread-14.0.0.r426.g4564ee4b5-1-any.pkg.tar.zst",
+      "url": "https://mirror.msys2.org/mingw/mingw32/mingw-w64-i686-libwinpthread-14.0.0.r426.g4564ee4b5-1-any.pkg.tar.zst",
+      "bytes": 39636,
+      "sha256": "f057aff99ce2008e00f25ed579da849e9bb7affccf4a3b5757499c8306a5f94c",
+      "members": [
+        {
+          "source": ".PKGINFO",
+          "destination": "System/Backends/d3d9/packages/winpthread32.PKGINFO",
+          "bytes": 748,
+          "sha256": "efb558618d226da2539bcd0af405bee3178e538778a4f5a6744ebce58ebd987d"
+        },
+        {
+          "source": "mingw32/bin/libwinpthread-1.dll",
+          "destination": "Windows/SysWOW64/libwinpthread-1.dll",
+          "bytes": 84255,
+          "sha256": "04578a232e3e2d254c6f42d850bdebc10819387eb6fe774eab4fb0d2be5a9b3c"
+        },
+        {
+          "source": "mingw32/share/licenses/libwinpthread/COPYING",
+          "destination": "System/Backends/d3d9/licenses/winpthread32/COPYING",
+          "bytes": 2883,
+          "sha256": "63263614cdd29f2f93cba85e992f041b31f9fc7b4033692f31269489a8a1b177"
+        }
+      ]
+    },
+    {
+      "id": "wined3d32",
+      "cache_name": "mingw-w64-i686-wined3d-3.8-3-any.pkg.tar.zst",
+      "url": "https://mirror.msys2.org/mingw/mingw32/mingw-w64-i686-wined3d-3.8-3-any.pkg.tar.zst",
+      "bytes": 1010190,
+      "sha256": "e58245bff5b7fed5bd7af8c0aaee8c47389dece7d0fa977199b3eb84df1bbff9",
+      "members": [
+        {
+          "source": ".PKGINFO",
+          "destination": "System/Backends/d3d9/packages/wined3d32.PKGINFO",
+          "bytes": 410,
+          "sha256": "17f760a85bbc186fc9956e4609233e3daa03eb2f5de42cd5ac77a8a28e663147"
+        },
+        {
+          "source": "mingw32/bin/d3d9.dll",
+          "destination": "Windows/SysWOW64/d3d9-provider.dll",
+          "bytes": 194987,
+          "sha256": "65a281d31da6f022ab129be31e63872fb181d3c9d1935585642255f7a610ffa9"
+        },
+        {
+          "source": "mingw32/bin/libwine.dll",
+          "destination": "Windows/SysWOW64/libwine.dll",
+          "bytes": 1738303,
+          "sha256": "c4177a9a79c3ef28365725848e3fdea913859cb918daf6810ac9b5f549843616"
+        },
+        {
+          "source": "mingw32/bin/wined3d.dll",
+          "destination": "Windows/SysWOW64/wined3d.dll",
+          "bytes": 1347914,
+          "sha256": "477cbc64df15471ef28bc6c1c2d5d224e580e7cd6a3b12d40a7ebe83972ef042"
+        }
+      ]
+    },
+    {
+      "id": "gcc64",
+      "cache_name": "mingw-w64-x86_64-gcc-libs-16.1.0-5-any.pkg.tar.zst",
+      "url": "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-libs-16.1.0-5-any.pkg.tar.zst",
+      "bytes": 1153552,
+      "sha256": "aa560f5438c35b71c3e7b24fd5becbca028f70c5b4d1f1697a86ff80fec947da",
+      "members": [
+        {
+          "source": ".PKGINFO",
+          "destination": "System/Backends/d3d9/packages/gcc64.PKGINFO",
+          "bytes": 1219,
+          "sha256": "12511a122e27798810f0591c0d8151fe52b20bdd213adc7aa74f6b2386a1de99"
+        },
+        {
+          "source": "mingw64/bin/libgcc_s_seh-1.dll",
+          "destination": "Windows/System32/libgcc_s_seh-1.dll",
+          "bytes": 151732,
+          "sha256": "278f1101f2371c58b6b412a3206718e22343940a5164aceb4fb75f2bf3b38ed4"
+        },
+        {
+          "source": "mingw64/share/licenses/gcc-libs/COPYING.LIB",
+          "destination": "System/Backends/d3d9/licenses/gcc64/COPYING.LIB",
+          "bytes": 26527,
+          "sha256": "a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861"
+        },
+        {
+          "source": "mingw64/share/licenses/gcc-libs/COPYING.RUNTIME",
+          "destination": "System/Backends/d3d9/licenses/gcc64/COPYING.RUNTIME",
+          "bytes": 3324,
+          "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74"
+        },
+        {
+          "source": "mingw64/share/licenses/gcc-libs/COPYING3",
+          "destination": "System/Backends/d3d9/licenses/gcc64/COPYING3",
+          "bytes": 35147,
+          "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+        },
+        {
+          "source": "mingw64/share/licenses/gcc-libs/README",
+          "destination": "System/Backends/d3d9/licenses/gcc64/README",
+          "bytes": 236,
+          "sha256": "33400d067fa3e2bd670a0868dcdb60c9486e8f559b675cf9ff1ff55d4e0d06ab"
+        }
+      ]
+    },
+    {
+      "id": "winpthread64",
+      "cache_name": "mingw-w64-x86_64-libwinpthread-14.0.0.r98.g19f5121a2-1-any.pkg.tar.zst",
+      "url": "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-libwinpthread-14.0.0.r98.g19f5121a2-1-any.pkg.tar.zst",
+      "bytes": 31425,
+      "sha256": "565a7ac155098633ce66096c02c98f274127111758fd25d3f0e5451c4cd21120",
+      "members": [
+        {
+          "source": ".PKGINFO",
+          "destination": "System/Backends/d3d9/packages/winpthread64.PKGINFO",
+          "bytes": 764,
+          "sha256": "453d0569459dbab0d4f3c647a0c2b17b756de27376dfa979619a60471ef4a585"
+        },
+        {
+          "source": "mingw64/bin/libwinpthread-1.dll",
+          "destination": "Windows/System32/libwinpthread-1.dll",
+          "bytes": 65954,
+          "sha256": "83908d14abfafb8b3bfa38cf51ecee569ee77aaedfe6a8dfe1f2ce0a968e6281"
+        },
+        {
+          "source": "mingw64/share/licenses/libwinpthread/COPYING",
+          "destination": "System/Backends/d3d9/licenses/winpthread64/COPYING",
+          "bytes": 2883,
+          "sha256": "63263614cdd29f2f93cba85e992f041b31f9fc7b4033692f31269489a8a1b177"
+        }
+      ]
+    },
+    {
+      "id": "wined3d64",
+      "cache_name": "mingw-w64-x86_64-wined3d-3.8-4-any.pkg.tar.zst",
+      "url": "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-wined3d-3.8-4-any.pkg.tar.zst",
+      "bytes": 1009123,
+      "sha256": "821c0bf1ca1385ccdea182e4f4e58e8aa4e6d325396a40a196931d823affb787",
+      "members": [
+        {
+          "source": ".PKGINFO",
+          "destination": "System/Backends/d3d9/packages/wined3d64.PKGINFO",
+          "bytes": 495,
+          "sha256": "983310f0112d919fa47f8e8cb304bdd43110709119e5c6f68b02f023a0c8002c"
+        },
+        {
+          "source": "mingw64/bin/d3d9.dll",
+          "destination": "Windows/System32/d3d9-provider.dll",
+          "bytes": 176018,
+          "sha256": "11b9f75ad28a14c50d258ae552cc754a5b17d2924698b6fcdabb0e248a12fae0"
+        },
+        {
+          "source": "mingw64/bin/libwine.dll",
+          "destination": "Windows/System32/libwine.dll",
+          "bytes": 1740962,
+          "sha256": "e7f84fd2249d1b193dba512e0b26d7e46f7fcc5944236cf29e360be8a2b01b7f"
+        },
+        {
+          "source": "mingw64/bin/wined3d.dll",
+          "destination": "Windows/System32/wined3d.dll",
+          "bytes": 1304586,
+          "sha256": "9adcff9c872f1edece17fefd3dae10e5d7816b425512280087d5984cefe20098"
+        }
+      ]
+    },
+    {
+      "id": "wine-license",
+      "cache_name": "wine-3.8-COPYING.LIB",
+      "url": "https://raw.githubusercontent.com/wine-mirror/wine/wine-3.8/COPYING.LIB",
+      "bytes": 26434,
+      "sha256": "e237fa56668030e928551ddd60f05df5fe957f75eab874bbd017e085ed722e7c",
+      "members": [
+        {
+          "source": null,
+          "destination": "System/Backends/d3d9/licenses/wine/COPYING.LIB",
+          "bytes": 26434,
+          "sha256": "e237fa56668030e928551ddd60f05df5fe957f75eab874bbd017e085ed722e7c"
+        }
+      ]
+    }
+  ]
+}

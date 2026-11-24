@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OsitoK — WebAssembly Shell</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#FF6B2C">
+    <script>
+        /* Register Service Worker for offline support + PWA install.
+         * On a fresh build the cache name auto-bumps (Makefile sed-
+         * stamps wasm-md5), which surfaces here as 'updatefound' →
+         * 'installed' with a controller. Show a small banner so the
+         * user knows to reload. */
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function() {
+                navigator.serviceWorker.register('sw.js').then(function(reg) {
+                    function listenForUpdates(installing) {
+                        installing.addEventListener('statechange', function() {
+                            if (installing.state === 'installed' &&
+                                navigator.serviceWorker.controller) {
+                                showUpdateBanner();
+                            }
+                        });
+                    }
+                    if (reg.installing) listenForUpdates(reg.installing);
+                    reg.addEventListener('updatefound', function() {
+                        if (reg.installing) listenForUpdates(reg.installing);
+                    });
+                }).catch(function(e) {
+                    console.warn('[osito] SW registration failed:', e);
+                });
+            });
+        }
+        function showUpdateBanner() {
+            if (document.getElementById('osito-update-banner')) return;
+            var b = document.createElement('div');
+            b.id = 'osito-update-banner';
+            b.style.cssText =
+                'position:fixed; top:8px; right:8px; z-index:9999;' +
+                'background:#FF6B2C; color:#000; padding:8px 14px;' +
+                'font-family: "Courier New", monospace; font-size:12px;' +
+                'border-radius:3px; cursor:pointer; user-select:none;' +
+                'box-shadow:0 2px 6px rgba(0,0,0,0.5);';
+            b.textContent = '⟳ new build available — click to reload';
+            b.onclick = function() { location.reload(); };
+            document.body.appendChild(b);
+        }
+    </script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #0D0D0D;
+            color: #00FF88;
+            font-family: 'Courier New', 'VT323', monospace;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .toolbar {
+            background: #161b22;
+            border-bottom: 1px solid #FF6B2C;
+            padding: 10px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .toolbar h1 {
+            font-size: 14px;
+            color: #FF6B2C;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+
+        .toolbar .badge {
+            font-size: 11px;
+            color: #00FF88;
+            border: 1px solid #00FF88;
+            padding: 2px 8px;
+        }
+
+        #terminal {
+            flex: 1;
+            padding: 16px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-size: 13px;
+            line-height: 1.5;
+            color: #00FF88;
+            background: #0D0D0D;
+        }
+
+        .input-row {
+            display: flex;
+            align-items: center;
+            padding: 8px 16px;
+            border-top: 1px solid #222;
+            background: #111;
+        }
+
+        #prompt-label {
+            color: #FF6B2C;
+            font-size: 13px;
+            margin-right: 8px;
+            white-space: nowrap;
+        }
+
+        #input-field {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: #00FF88;
+            font-family: inherit;
+            font-size: 13px;
+            caret-color: #FFD93D;
+        }
+
+        .status-bar {
+            background: #161b22;
+            border-top: 1px solid #30363d;
+            padding: 4px 16px;
+            font-size: 11px;
+            color: #888;
+            display: flex;
+            gap: 16px;
+        }
+
+        .status-bar .ok { color: #00FF88; }
+        .status-bar .warn { color: #FFD93D; }
+    </style>
+</head>
+<body>
+
+<div class="toolbar">
+    <h1>[>_] OsitoK / WebAssembly</h1>
+    <span class="badge">WASM</span>
+</div>
+
+<div id="terminal">Loading kernel...</div>
+
+<div class="input-row">
+    <span id="prompt-label">></span>
+    <input id="input-field" type="text" autocomplete="off" autocorrect="off"
+           autocapitalize="off" spellcheck="false" placeholder="waiting for kernel..." disabled>
+</div>
+
+<div class="status-bar">
+    <span id="status-arch">arch: wasm32</span>
+    <span id="status-mem">mem: --</span>
+    <span id="status-fs">fs: --</span>
+</div>
+
+<script>
+    // ── Terminal output ──────────────────────────────────────────
+
+    const terminal = document.getElementById('terminal');
+    const inputField = document.getElementById('input-field');
+
+    terminal.textContent = '';
+
+    // UTF-8 accumulator: buffer bytes until a complete code point is ready.
+    var _utf8_buf = [];
+
+    function wasm_putchar(c) {
+        c = c & 0xFF;         // C char may be signed; normalize to 0-255
+        if (c === 13) return; // \r
+
+        _utf8_buf.push(c);
+
+        // Determine expected sequence length from the first byte.
+        var b0 = _utf8_buf[0];
+        var expected;
+        if      (b0 < 0x80)              expected = 1;
+        else if ((b0 & 0xE0) === 0xC0)  expected = 2;
+        else if ((b0 & 0xF0) === 0xE0)  expected = 3;
+        else if ((b0 & 0xF8) === 0xF0)  expected = 4;
+        else { _utf8_buf = []; return; } // invalid lead byte
+
+        if (_utf8_buf.length < expected) return; // need more bytes
+
+        // Decode the complete sequence.
+        var bytes = _utf8_buf.splice(0, expected);
+        var cp;
+        if (expected === 1) {
+            cp = bytes[0];
+        } else if (expected === 2) {
+            cp = ((bytes[0] & 0x1F) << 6)  | (bytes[1] & 0x3F);
+        } else if (expected === 3) {
+            cp = ((bytes[0] & 0x0F) << 12) | ((bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
+        } else {
+            cp = ((bytes[0] & 0x07) << 18) | ((bytes[1] & 0x3F) << 12) |
+                 ((bytes[2] & 0x3F) << 6)  | (bytes[3] & 0x3F);
+        }
+
+        if (cp === 10) {
+            terminal.textContent += '\n';
+        } else {
+            try { terminal.textContent += String.fromCodePoint(cp); }
+            catch(e) { terminal.textContent += '?'; }
+        }
+        terminal.scrollTop = terminal.scrollHeight;
+    }
+
+    function wasm_clear_terminal() {
+        terminal.textContent = '';
+        _utf8_buf = [];
+    }
+
+    // ── Keyboard input → C ring buffer ──────────────────────────
+
+    // ── Command history (persisted to localStorage) ─────────────
+    var __hist = [];
+    var __histIdx = 0;
+    var __histDraft = '';
+    try {
+        var stored = localStorage.getItem('osito-history');
+        if (stored) __hist = JSON.parse(stored).slice(-200);
+    } catch (e) {}
+    function __saveHist() {
+        try { localStorage.setItem('osito-history',
+                                   JSON.stringify(__hist.slice(-200))); }
+        catch (e) {}
+    }
+    __histIdx = __hist.length;
+
+    // ── Alias expansion (client-side, persisted) ────────────────
+    var __aliases = {};
+    try {
+        var s = localStorage.getItem('osito-aliases');
+        if (s) __aliases = JSON.parse(s);
+    } catch (e) {}
+    function __saveAliases() {
+        try { localStorage.setItem('osito-aliases', JSON.stringify(__aliases)); }
+        catch (e) {}
+    }
+    function __expandAlias(line) {
+        // alias <name> = <value>     define
+        // alias <name>               show one
+        // alias                      list
+        // unalias <name>             remove
+        var trimmed = line.replace(/^\s+/, '');
+        if (trimmed.indexOf('alias') === 0 &&
+            (trimmed.length === 5 || trimmed[5] === ' ')) {
+            var rest = trimmed.substring(5).replace(/^\s+/, '');
+            if (rest === '') {
+                /* List all */
+                var keys = Object.keys(__aliases).sort();
+                if (keys.length === 0) return '__OSITO_LOG: no aliases defined\n';
+                var out = '';
+                keys.forEach(function(k) { out += k + '=' + __aliases[k] + '\n'; });
+                return '__OSITO_LOG:' + out;
+            }
+            var eq = rest.indexOf('=');
+            if (eq < 0) {
+                /* Just print one */
+                var key = rest.trim();
+                return '__OSITO_LOG:' + (__aliases[key]
+                    ? key + '=' + __aliases[key] + '\n'
+                    : key + ': not defined\n');
+            }
+            var name = rest.substring(0, eq).trim();
+            var val  = rest.substring(eq + 1).trim();
+            __aliases[name] = val;
+            __saveAliases();
+            return '__OSITO_LOG:[alias] ' + name + '=' + val + '\n';
+        }
+        if (trimmed.indexOf('unalias') === 0 &&
+            (trimmed.length === 7 || trimmed[7] === ' ')) {
+            var name2 = trimmed.substring(7).trim();
+            if (__aliases[name2]) {
+                delete __aliases[name2];
+                __saveAliases();
+                return '__OSITO_LOG:[unalias] ' + name2 + '\n';
+            }
+            return '__OSITO_LOG:' + name2 + ': not defined\n';
+        }
+        /* Expand if first word is an alias */
+        var sp = trimmed.indexOf(' ');
+        var first = sp < 0 ? trimmed : trimmed.substring(0, sp);
+        if (__aliases[first]) {
+            return __aliases[first] + (sp < 0 ? '' : trimmed.substring(sp));
+        }
+        return line;
+    }
+    function __echoLog(text) {
+        /* Print directly to terminal without going through kernel */
+        var t = document.getElementById('terminal');
+        if (t) { t.textContent += text; t.scrollTop = t.scrollHeight; }
+    }
+
+    inputField.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            var line = inputField.value;
+            inputField.value = '';
+            /* Alias expansion before kernel sees the line */
+            var expanded = __expandAlias(line);
+            if (expanded.indexOf('__OSITO_LOG:') === 0) {
+                __echoLog(expanded.substring(12));
+                /* Still record to history */
+                if (line.length > 0 && (__hist.length === 0 ||
+                                        __hist[__hist.length - 1] !== line)) {
+                    __hist.push(line);
+                    if (__hist.length > 500) __hist = __hist.slice(-500);
+                    __saveHist();
+                }
+                __histIdx = __hist.length;
+                __histDraft = '';
+                return;
+            }
+            line = expanded;
+            // Push each character + newline into C ring buffer
+            for (let i = 0; i < line.length; i++) {
+                Module.ccall('wasm_kb_push', null, ['number'], [line.charCodeAt(i)]);
+            }
+            Module.ccall('wasm_kb_push', null, ['number'], [13]); // '\r' → enter
+            // History: append non-empty, non-duplicate-of-prev lines
+            if (line.length > 0 && (__hist.length === 0 ||
+                                    __hist[__hist.length - 1] !== line)) {
+                __hist.push(line);
+                if (__hist.length > 500) __hist = __hist.slice(-500);
+                __saveHist();
+            }
+            __histIdx = __hist.length;
+            __histDraft = '';
+            e.preventDefault();
+        } else if (e.key === 'ArrowUp') {
+            if (__hist.length === 0) { e.preventDefault(); return; }
+            if (__histIdx === __hist.length) __histDraft = inputField.value;
+            if (__histIdx > 0) __histIdx--;
+            inputField.value = __hist[__histIdx];
+            // Move cursor to end
+            inputField.setSelectionRange(inputField.value.length,
+                                         inputField.value.length);
+            e.preventDefault();
+        } else if (e.key === 'ArrowDown') {
+            if (__histIdx >= __hist.length) { e.preventDefault(); return; }
+            __histIdx++;
+            inputField.value = (__histIdx === __hist.length)
+                ? __histDraft
+                : __hist[__histIdx];
+            inputField.setSelectionRange(inputField.value.length,
+                                         inputField.value.length);
+            e.preventDefault();
+        } else if (e.key === 'Backspace') {
+            Module.ccall('wasm_kb_push', null, ['number'], [8]); // '\b'
+        } else if (e.ctrlKey && e.key === 'c') {
+            Module.ccall('wasm_kb_push', null, ['number'], [3]); // Ctrl+C
+            e.preventDefault();
+        }
+    });
+
+    // Enable input field once WASM is running
+    function wasm_enable_input() {
+        inputField.disabled = false;
+        inputField.placeholder = 'type a command...';
+        inputField.focus();
+        document.getElementById('prompt-label').textContent = '$';
+
+        // Live status bar — polls kernel state every 2s.
+        var __osito_boot_t = Date.now();
+        function fmtUptime(ms) {
+            var s = Math.floor(ms / 1000);
+            var h = Math.floor(s / 3600);
+            var m = Math.floor((s % 3600) / 60);
+            var sec = s % 60;
+            if (h > 0) return h + 'h' + (m < 10 ? '0' : '') + m + 'm';
+            if (m > 0) return m + 'm' + (sec < 10 ? '0' : '') + sec + 's';
+            return sec + 's';
+        }
+        function refreshStatus() {
+            try {
+                const usedKb = Module.ccall('wasm_get_mem_used_kb', 'number', [], []);
+                document.getElementById('status-mem').textContent =
+                    'mem: ' + (usedKb > 1024 ? (usedKb / 1024).toFixed(1) + ' MB' : usedKb + ' KB') +
+                    ' · up ' + fmtUptime(Date.now() - __osito_boot_t);
+            } catch(e) {}
+            try {
+                const lbl = Module.ccall('wasm_status_fs_label', 'string', [], []);
+                const n   = Module.ccall('wasm_status_fs_files', 'number', [], []);
+                const mb  = Module.ccall('wasm_status_fs_free_mb', 'number', [], []);
+                document.getElementById('status-fs').textContent =
+                    lbl ? ('fs: ' + lbl + ' (' + n + ' files, ' + mb + ' MB free)')
+                        : 'fs: --';
+            } catch(e) {}
+        }
+        refreshStatus();
+        setInterval(refreshStatus, 2000);
+    }
+
+    // ── Model pre-fetch ─────────────────────────────────────────
+    // Start fetching the GGUF model immediately (parallel with WASM init).
+    // C side polls window.__modelFetchDone via emscripten_sleep.
+
+    window.__modelBuf      = null;   // Uint8Array once downloaded
+    window.__modelFetchDone = false; // true when fetch completes (success or fail)
+
+    // Optional override via ?model=URL or ?fs=URL query params (for testing).
+    // Also: localStorage 'osito-model' lets users persist a non-default
+    // choice across reloads, set via the in-shell `model <name|url>` cmd.
+    var qs = new URLSearchParams(window.location.search);
+    var modelOverride = qs.get('model');
+    var fsOverride    = qs.get('fs');
+    var savedModel = null;
+    try { savedModel = localStorage.getItem('osito-model'); } catch (e) {}
+
+    (function() {
+        var MODEL_URL = modelOverride || savedModel
+            /* Brandon-tiny-10m is the default: instruct-tuned (ChatML)
+             * with custom block-shared arch + DenseFormer DWA + value
+             * residual + register tokens. Runs at ~64 ms/tok in WASM
+             * with the full sampling stack (rep_penalty + ngram=3).
+             * Override:
+             *   ?model=https://wasm.naranjositos.tech/models/smollm2-135m-instruct-q4_0.gguf
+             *   ?model=https://wasm.naranjositos.tech/models/tinystories-llama2-20m.Q4_K_M.gguf
+             * Or in-shell: `model brandon|tinystories|smollm` (reloads page) */
+            || 'https://wasm.naranjositos.tech/models/brandon-tiny-10m-instruct.f16.gguf';
+        fetch(MODEL_URL)
+            .then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.arrayBuffer();
+            })
+            .then(function(ab) {
+                window.__modelBuf = new Uint8Array(ab);
+                console.log('[WASM] model downloaded: ' + ab.byteLength + ' bytes');
+                window.__modelFetchDone = true;
+            })
+            .catch(function(e) {
+                console.error('[WASM] model fetch failed:', e);
+                window.__modelFetchDone = true;
+            });
+    })();
+
+    // ── Filesystem image pre-fetch ────────────────────────────────
+    // OsitoFS .img with game data (Q2 PAK files etc.)
+
+    window.__fsImageBuf  = null;
+    window.__fsImageDone = false;
+
+    (function() {
+        var FS_URL = fsOverride
+            /* Default = clean 32 MB starter image (448 free 64KB blocks).
+             * Quake 2 game data stays available via:
+             *   ?fs=https://wasm.naranjositos.tech/images/q2_wasm.img */
+            || 'https://wasm.naranjositos.tech/images/osito-starter.img';
+        fetch(FS_URL)
+            .then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.arrayBuffer();
+            })
+            .then(function(ab) {
+                window.__fsImageBuf = new Uint8Array(ab);
+                console.log('[WASM] FS image downloaded: ' + ab.byteLength + ' bytes');
+                window.__fsImageDone = true;
+            })
+            .catch(function(e) {
+                console.warn('[WASM] FS image fetch failed (standalone mode):', e.message);
+                window.__fsImageDone = true;
+            });
+    })();
+
+    // ── OsitoK worker→kernel sync bridge (oi_chat) ──────────────
+    //
+    // SharedArrayBuffer + Atomics.wait lets the cc-worker block on
+    // a kernel-side LLM inference (window.__osito.chat) without
+    // freezing the page. Layout (Int32 indices):
+    //   [0] = state (0 idle, 1 request, 2 response, 3 error)
+    //   [1] = prompt length (bytes)
+    //   [2] = response length (bytes)
+    //   [16..16+4096) = prompt bytes (max 4 KB)
+    //   [16+4096..end) = response bytes
+    // Total SAB size = 16 + 4096 + 8192 = 12304 bytes.
+    window.__osito = window.__osito || {};
+    const __OSITO_SAB_SIZE = 16 + 4096 + 8192;
+    const __OSITO_PROMPT_OFF = 16;
+    const __OSITO_PROMPT_MAX = 4096;
+    const __OSITO_RESP_OFF = 16 + 4096;
+    const __OSITO_RESP_MAX = 8192;
+    /* Expose on window so kernel C side (EM_JS in osito_kernel_poll)
+     * can reach the SAB via window.__ositoSab. */
+    window.__ositoSab = null;
+
+    window.__osito.chat = async function(prompt) {
+        if (!Module || !Module.ccall) return '[oi_chat] runtime not ready';
+        try {
+            return Module.ccall('osito_chat_sync', 'string', ['string'], [prompt]);
+        } catch (e) {
+            return '[oi_chat] ' + e.message;
+        }
+    };
+
+    function __ositoBindWorkerPort(port) {
+        if (typeof SharedArrayBuffer === 'undefined') {
+            console.warn('[osito] SharedArrayBuffer not available — oi_chat will fail.',
+                'Serve with COOP=same-origin + COEP=credentialless (see arch/wasm/serve.py).');
+            return null;
+        }
+        if (!window.__ositoSab) window.__ositoSab = new SharedArrayBuffer(__OSITO_SAB_SIZE);
+        const i32 = new Int32Array(window.__ositoSab);
+        port.postMessage({ id: 'osito-bind', sab: window.__ositoSab });
+        /* The actual oi_chat fulfilment runs in the kernel's
+         * osito_kernel_poll() (called from kb_getchar). The port
+         * is kept here for forward compat / debugging. */
+        port.start && port.start();
+    }
+
+    // ── In-browser C/C++ compiler (clang.wasm + lld.wasm) ────────
+    //
+    // Lazy-loads a worker that runs binji/wasm-clang against the toolchain
+    // hosted at wasm.naranjositos.tech/toolchain/. First call to compile()
+    // pays ~50MB download (cached by browser); subsequent calls are fast.
+
+    window.__cc = (function() {
+        let worker = null;
+        let port = null;
+        let ready = null;
+        let pendingWrite = '';
+        let resolveCompile = null;
+
+        const WORKER_SRC = `
+            /* IndexedDB cache for clang/lld/sysroot/memfs.
+             * First visit: fetch from R2 + persist (~50 MB).
+             * Later visits: instant load from IDB. */
+            const DB_NAME = 'osito-cc-v1', STORE = 'toolchain';
+            function idbOpen() {
+              return new Promise((resolve, reject) => {
+                const req = indexedDB.open(DB_NAME, 1);
+                req.onupgradeneeded = () => { req.result.createObjectStore(STORE); };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+              });
+            }
+            async function idbGet(key) {
+              try {
+                const db = await idbOpen();
+                return await new Promise((resolve) => {
+                  const tx = db.transaction(STORE);
+                  const r = tx.objectStore(STORE).get(key);
+                  r.onsuccess = () => resolve(r.result || null);
+                  r.onerror = () => resolve(null);
+                });
+              } catch { return null; }
+            }
+            async function idbPut(key, ab) {
+              try {
+                const db = await idbOpen();
+                await new Promise((resolve) => {
+                  const tx = db.transaction(STORE, 'readwrite');
+                  tx.objectStore(STORE).put(ab, key);
+                  tx.oncomplete = resolve;
+                  tx.onerror = resolve;
+                  tx.onabort = resolve;
+                });
+              } catch {}
+            }
+            async function fetchCached(url, label) {
+              let ab = await idbGet(url);
+              if (ab) {
+                port && port.postMessage({ id: 'write', data: '\\x1b[2m[cache] ' + (label||url) + ' (' + (ab.byteLength/1024/1024).toFixed(1) + ' MB)\\x1b[0m\\n' });
+                return ab;
+              }
+              const r = await fetch(url);
+              if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching ' + url);
+              ab = await r.arrayBuffer();
+              await idbPut(url, ab);
+              return ab;
+            }
+
+            self.importScripts('https://wasm.naranjositos.tech/toolchain/shared.js');
+            const T = 'https://wasm.naranjositos.tech/toolchain';
+            let api, port;
+            let ositokH = null;  /* lazy-loaded ositok.h text */
+
+            /* OsitoK kernel-bridge plumbing (oi_chat). On constructor the
+             * main thread sends an MessagePort tied to a SAB. The App's
+             * oi_chat import (defined in shared.js, runs in this worker
+             * context) reads self.ositoSab + self.ositoPort + self.ositoI32,
+             * so we assign onto self/globalThis directly. */
+            self.ositoPort = null;
+            self.ositoSab  = null;
+            self.ositoI32  = null;
+
+            const opts = {
+                clang: T + '/clang.wasm', lld: T + '/lld.wasm',
+                sysroot: T + '/sysroot.tar', memfs: T + '/memfs.wasm',
+                async readBuffer(f) { return await fetchCached(f, f.split('/').pop()); },
+                async compileStreaming(f) { return WebAssembly.compile(await fetchCached(f, f.split('/').pop())); },
+                hostWrite(s) { port && port.postMessage({ id: 'write', data: s }); }
+            };
+            self.onmessage = async (e) => {
+                if (e.data && e.data.id === 'osito-port') {
+                    self.ositoPort = e.data.port;
+                    self.ositoPort.onmessage = (ev) => {
+                        if (ev.data && ev.data.id === 'osito-bind') {
+                            self.ositoSab = ev.data.sab;
+                            self.ositoI32 = new Int32Array(self.ositoSab);
+                        }
+                    };
+                    self.ositoPort.start && self.ositoPort.start();
+                    return;
+                }
+                if (e.data.id === 'constructor') {
+                    port = e.data.data;
+                    port.onmessage = self.onmessage;
+                    api = new API(opts);
+                    /* Wrap api.ready so it ALSO awaits ositok.h injection
+                     * into MemFS at /include/ositok.h. Compile handlers
+                     * await api.ready, so this guarantees the header is
+                     * in place before clang runs. */
+                    const baseReady = api.ready;
+                    api.ready = (async function() {
+                        await baseReady;
+                        try {
+                            if (!ositokH) ositokH = await (await fetch(T + '/ositok.h')).text();
+                            /* Tar paths in sysroot have no leading slash —
+                             * match that convention so AddFileNode resolves
+                             * the parent dir correctly. */
+                            api.memfs.addFile('include/ositok.h', ositokH);
+                        } catch (e) {
+                            port.postMessage({ id: 'write', data: '\\n[cc] ositok.h fetch failed: ' + e.message + '\\n' });
+                        }
+                    })();
+                    port.postMessage({ id: 'ready' });
+                } else if (e.data.id === 'compileLinkRun') {
+                    try { await api.compileLinkRun(e.data.data, { lang: e.data.lang || 'c++' }); }
+                    catch (err) { port.postMessage({ id: 'write', data: '\\n[cc] ' + err.message + '\\n' }); }
+                    port.postMessage({ id: 'done' });
+                } else if (e.data.id === 'preprocess') {
+                    try {
+                        const lang = e.data.lang || 'c++';
+                        const input = lang === 'c' ? 't.c' : 't.cc';
+                        await api.ready;
+                        await api.preprocess({ input, contents: e.data.data, lang });
+                    } catch (err) {
+                        port.postMessage({ id: 'write', data: '\\n[cc -E] ' + err.message + '\\n' });
+                    }
+                    port.postMessage({ id: 'done' });
+                } else if (e.data.id === 'compile') {
+                    /* compile + link, return bytes (no run) */
+                    try {
+                        const lang = e.data.lang || 'c++';
+                        const ext = lang === 'c' ? 'c' : 'cc';
+                        const input = 't.' + ext, obj = 't.o', wasm = 't.wasm';
+                        await api.ready;
+                        await api.compile({ input, contents: e.data.data, obj, lang });
+                        if (e.data.objectOnly) {
+                            /* cc -c: stop after producing the .o */
+                            const view = api.memfs.getFileContents(obj);
+                            const ab = view.slice().buffer;
+                            port.postMessage({ id: 'compiled', wasm: ab }, [ab]);
+                        } else {
+                            await api.link(obj, wasm);
+                            const view = api.memfs.getFileContents(wasm);
+                            const ab = view.slice().buffer;
+                            port.postMessage({ id: 'compiled', wasm: ab }, [ab]);
+                        }
+                    } catch (err) {
+                        port.postMessage({ id: 'compiled', error: err.message });
+                    }
+                } else if (e.data.id === 'runWasi') {
+                    /* Instantiate with a minimal wasi_snapshot_preview1 shim.
+                     * api.run only knows wasi_unstable so it fails for
+                     * preview1-imported modules. We provide the syscalls the
+                     * pkg catalog programs actually use. */
+                    try {
+                        const writeOut = (s) => port.postMessage({ id: 'write', data: s });
+                        const argv = [(e.data.name || 'app')].concat(e.data.argv || []);
+                        const stdinBuf = e.data.stdin
+                            ? new Uint8Array(e.data.stdin) : new Uint8Array(0);
+                        let stdinPos = 0;
+                        const wasiPreview1 = (function() {
+                            let mem = null;
+                            const td = new TextDecoder('utf-8');
+                            const heap = () => new DataView(mem.buffer);
+                            const heapU8 = () => new Uint8Array(mem.buffer);
+                            const writeStr = (s) => writeOut(s);
+                            return {
+                                set memory(m) { mem = m; },
+                                fd_write(fd, iovs, iovs_len, nwritten) {
+                                    let total = 0; let s = '';
+                                    for (let i = 0; i < iovs_len; i++) {
+                                        const ptr = heap().getUint32(iovs + i*8, true);
+                                        const len = heap().getUint32(iovs + i*8 + 4, true);
+                                        s += td.decode(heapU8().subarray(ptr, ptr + len));
+                                        total += len;
+                                    }
+                                    if (fd === 1 || fd === 2) writeStr(s);
+                                    heap().setUint32(nwritten, total, true);
+                                    return 0;
+                                },
+                                fd_read(fd, iovs, iovs_len, nread) {
+                                    if (fd !== 0) {
+                                        heap().setUint32(nread, 0, true);
+                                        return 0;
+                                    }
+                                    /* Stream stdinBuf across iovec entries until exhausted. */
+                                    let total = 0;
+                                    for (let i = 0; i < iovs_len && stdinPos < stdinBuf.length; i++) {
+                                        const ptr = heap().getUint32(iovs + i*8, true);
+                                        const len = heap().getUint32(iovs + i*8 + 4, true);
+                                        const n = Math.min(len, stdinBuf.length - stdinPos);
+                                        heapU8().set(stdinBuf.subarray(stdinPos, stdinPos + n), ptr);
+                                        stdinPos += n;
+                                        total += n;
+                                    }
+                                    heap().setUint32(nread, total, true);
+                                    return 0;
+                                },
+                                fd_close() { return 0; },
+                                fd_seek() { return 0; },
+                                fd_fdstat_get() { return 0; },
+                                args_sizes_get(argc_ptr, argv_buf_size_ptr) {
+                                    let total = 0;
+                                    for (const a of argv) total += a.length + 1;
+                                    heap().setUint32(argc_ptr, argv.length, true);
+                                    heap().setUint32(argv_buf_size_ptr, total, true);
+                                    return 0;
+                                },
+                                args_get(argv_ptrs, argv_buf) {
+                                    const enc = new TextEncoder();
+                                    let off = argv_buf;
+                                    for (let i = 0; i < argv.length; i++) {
+                                        heap().setUint32(argv_ptrs + i*4, off, true);
+                                        const bytes = enc.encode(argv[i]);
+                                        heapU8().set(bytes, off);
+                                        heap().setUint8(off + bytes.length, 0);
+                                        off += bytes.length + 1;
+                                    }
+                                    return 0;
+                                },
+                                environ_sizes_get(c, b) {
+                                    heap().setUint32(c, 0, true);
+                                    heap().setUint32(b, 0, true);
+                                    return 0;
+                                },
+                                environ_get() { return 0; },
+                                proc_exit(code) {
+                                    /* Throw to break out of the start function. */
+                                    const err = new Error('wasi proc_exit');
+                                    err.code = code;
+                                    throw err;
+                                },
+                                clock_time_get(id, prec, ptr) {
+                                    const now = BigInt(Date.now()) * 1000000n;
+                                    new BigUint64Array(mem.buffer, ptr, 1)[0] = now;
+                                    return 0;
+                                },
+                                random_get(buf, n) {
+                                    crypto.getRandomValues(heapU8().subarray(buf, buf + n));
+                                    return 0;
+                                }
+                            };
+                        })();
+                        const mod = await WebAssembly.compile(e.data.bytes);
+                        const inst = await WebAssembly.instantiate(mod, {
+                            wasi_snapshot_preview1: wasiPreview1
+                        });
+                        wasiPreview1.memory = inst.exports.memory;
+                        try {
+                            if (inst.exports._start) inst.exports._start();
+                        } catch (err) {
+                            if (err && err.code !== undefined) {
+                                if (err.code !== 0)
+                                    writeOut('\\n[exit ' + err.code + ']\\n');
+                            } else throw err;
+                        }
+                    } catch (err) {
+                        port.postMessage({ id: 'write', data: '\\n[wasi] ' + (err.message || err) + '\\n' });
+                    }
+                    port.postMessage({ id: 'done' });
+                }
+            };`;
+
+        let resolveCompiled = null;
+
+        function ensureWorker() {
+            if (worker) return ready;
+            const blob = new Blob([WORKER_SRC], { type: 'application/javascript' });
+            worker = new Worker(URL.createObjectURL(blob));
+            const ch = new MessageChannel();
+            port = ch.port1;
+            ready = new Promise((resolve) => {
+                port.onmessage = (e) => {
+                    if (e.data.id === 'ready') resolve();
+                    else if (e.data.id === 'write') {
+                        pendingWrite += e.data.data;
+                        if (window.__cc.onWrite) window.__cc.onWrite(e.data.data);
+                    }
+                    else if (e.data.id === 'done' && resolveCompile) {
+                        const cb = resolveCompile;
+                        resolveCompile = null;
+                        cb(pendingWrite);
+                        pendingWrite = '';
+                    }
+                    else if (e.data.id === 'compiled' && resolveCompiled) {
+                        const cb = resolveCompiled;
+                        resolveCompiled = null;
+                        if (e.data.error) cb({ error: e.data.error });
+                        else              cb({ wasm: e.data.wasm });
+                    }
+                };
+            });
+            worker.postMessage({ id: 'constructor', data: ch.port2 }, [ch.port2]);
+            /* Bind a separate channel for the oi_chat sync bridge (SAB
+             * + Atomics.wait). The cc-worker uses port2 of THIS channel
+             * to request kernel inference. */
+            const oc = new MessageChannel();
+            __ositoBindWorkerPort(oc.port1);
+            worker.postMessage({ id: 'osito-port', port: oc.port2 }, [oc.port2]);
+            return ready;
+        }
+
+        return {
+            onWrite: null,
+            // Compile + link + run inline. src: string, lang: 'c' | 'c++'
+            compileLinkRun: async function(src, lang) {
+                await ensureWorker();
+                pendingWrite = '';
+                return new Promise((resolve) => {
+                    resolveCompile = resolve;
+                    port.postMessage({ id: 'compileLinkRun', data: src, lang: lang || 'c++' });
+                });
+            },
+            // Compile + link → Promise<{wasm: ArrayBuffer} | {error: string}>
+            // If objectOnly=true, returns the .o bytes (no link step).
+            compile: async function(src, lang, objectOnly) {
+                await ensureWorker();
+                return new Promise((resolve) => {
+                    resolveCompiled = resolve;
+                    port.postMessage({ id: 'compile', data: src, lang: lang || 'c++', objectOnly: !!objectOnly });
+                });
+            },
+            // Preprocess only (clang -cc1 -E). Output streams via onWrite.
+            preprocess: async function(src, lang) {
+                await ensureWorker();
+                pendingWrite = '';
+                return new Promise((resolve) => {
+                    resolveCompile = resolve;
+                    port.postMessage({ id: 'preprocess', data: src, lang: lang || 'c++' });
+                });
+            },
+            // Run a pre-compiled wasm module via WASI shim. bytes: ArrayBuffer
+            runWasi: async function(bytes, name, argv, stdin) {
+                await ensureWorker();
+                pendingWrite = '';
+                return new Promise((resolve) => {
+                    resolveCompile = resolve;
+                    /* Transfer the wasm bytes + stdin buffer to avoid copies. */
+                    const transfer = [];
+                    if (bytes instanceof ArrayBuffer) transfer.push(bytes);
+                    if (stdin instanceof ArrayBuffer && stdin.byteLength > 0)
+                        transfer.push(stdin);
+                    port.postMessage({ id: 'runWasi', bytes, name: name || 'app',
+                                       argv: argv || [], stdin: stdin || null }, transfer);
+                });
+            }
+        };
+    })();
+
+    // ── Emscripten module config ─────────────────────────────────
+
+    var Module = {
+        print: function(text) {
+            for (let i = 0; i < text.length; i++) wasm_putchar(text.charCodeAt(i));
+            wasm_putchar(10); // newline
+        },
+        printErr: function(text) {
+            terminal.textContent += '[ERR] ' + text + '\n';
+        },
+        onRuntimeInitialized: function() {
+            // Input is enabled here so the user can type during model load.
+            // main() runs next and polls __modelFetchDone before shell_run().
+            wasm_enable_input();
+        },
+        noInitialRun: false,
+    };
+</script>
+
+<!-- Emscripten-generated JS bundle (injected by emcc) -->
+{{{ SCRIPT }}}
+
+</body>
+</html>

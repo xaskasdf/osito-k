@@ -1,0 +1,16 @@
+LIBRARY GDI32.dll
+EXPORTS
+    CreateCompatibleDC@4
+    CreateDIBSection@24
+    SelectObject@8
+    DeleteObject@4
+    DeleteDC@4
+    GetObjectA@12
+    GetDIBits@28
+    BitBlt@36
+    StretchBlt@44
+    StretchDIBits@52
+    SetDIBitsToDevice@48
+    PatBlt@24
+    CreateSolidBrush@4
+    GdiFlush@0

@@ -1,0 +1,4 @@
+LIBRARY advapi32.dll
+EXPORTS
+    RegDisablePredefinedCache@0
+    RegDisablePredefinedCacheEx@0

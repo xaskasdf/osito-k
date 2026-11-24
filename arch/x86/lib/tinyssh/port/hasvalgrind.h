@@ -1,0 +1,1 @@
+/* No Valgrind dependency in the freestanding kernel. */

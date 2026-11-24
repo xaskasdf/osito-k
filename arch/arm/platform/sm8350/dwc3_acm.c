@@ -1,0 +1,1031 @@
+/*
+ * dwc3_acm.c -- USB gadget on the SM8350 DWC_usb31 (usb_1): CDC-ACM serial,
+ * and optionally a CDC-NCM network function beside it
+ *
+ * Minimal polled device-mode driver: one event buffer, EP0 control transfers
+ * and a CDC-ACM function, high speed only. Physical endpoints are
+ * 2 * ep + dir_in: 0/1 = EP0 OUT/IN, 2/3 = EP1 bulk OUT/IN (data), 5 = EP2
+ * interrupt IN (notifications, never used). ABL leaves the controller powered
+ * with its USB2 PHY up (fastboot runs on it), so there is no PHY init here;
+ * usb.c handles clocks and checks the SMMU.
+ *
+ * With the network on (usb_set_ncm, shell `net up`) the device re-enumerates
+ * as a composite: an IAD each for ACM (interfaces 0-1, as before) and NCM
+ * (2: control with EP4 interrupt IN = phys 9; 3: data, alt 1 with EP3 bulk
+ * OUT/IN = phys 6/7), and its own serial number, so Windows binds usbccgp
+ * plus usbser and UsbNcm to a separate device instance. The NTB framing and
+ * the frame queues are ncm.c's. If the host hasn't configured the composite
+ * 20 s after the switch, it goes back to the serial port alone: the console
+ * is the only way in.
+ *
+ * Programming model: Linux drivers/usb/dwc3 (core.h, gadget.c, ep0.c).
+ * The event buffer, TRBs and data buffers come from the uncached DMA window
+ * (mmu.c), so they need no cache maintenance, but they do need barriers
+ * against the registers (rd/wr).
+ */
+
+#include "../../include/hal.h"
+#include "../../include/types.h"
+#include "usb.h"
+
+/* Registers, as offsets from the DWC3 base */
+#define GCTL                0xC110
+#define GSTS                0xC118
+#define GUSB2PHYCFG0        0xC200
+#define GUSB3PIPECTL0       0xC2C0
+#define GEVNTADRLO          0xC400
+#define GEVNTADRHI          0xC404
+#define GEVNTSIZ            0xC408
+#define GEVNTCOUNT          0xC40C
+#define DCFG                0xC700
+#define DCTL                0xC704
+#define DEVTEN              0xC708
+#define DSTS                0xC70C
+#define DALEPENA            0xC720
+#define DEP_BASE(n)         (0xC800 + (n) * 0x10)
+#define DEPCMDPAR2          0x0
+#define DEPCMDPAR1          0x4
+#define DEPCMDPAR0          0x8
+#define DEPCMD              0xC
+#define QSCRATCH_GENERAL_CFG 0xF8808
+#define QSCRATCH_HS_PHY_CTRL 0xF8810
+#define QSCRATCH_SS_PHY_CTRL 0xF8830
+#define PIPE_UTMI_CLK_SEL   (1U << 0)
+#define PIPE3_PHYSTATUS_SW  (1U << 3)
+#define PIPE_UTMI_CLK_DIS   (1U << 8)
+
+#define GCTL_PRTCAP_MASK    (3U << 12)
+#define GCTL_PRTCAP_DEVICE  (2U << 12)
+#define USB2PHYCFG_SUSPHY   (1U << 6)
+#define USB2PHYCFG_ENBLSLPM (1U << 8)
+#define GEVNTSIZ_INTMASK    (1U << 31)
+#define DCFG_SPEED_MASK     7U                  /* 0 = high speed */
+#define DCFG_DEVADDR_MASK   (0x7FU << 3)
+#define DCFG_LPM_CAP        (1U << 22)
+#define DCTL_RUN_STOP       (1U << 31)
+#define DCTL_CSFTRST        (1U << 30)
+#define DSTS_DEVCTRLHLT     (1U << 22)
+#define DEVTEN_DISCONN      (1U << 0)
+#define DEVTEN_USBRST       (1U << 1)
+#define DEVTEN_CONNDONE     (1U << 2)
+#define UTMI_OTG_VBUS_VALID (1U << 20)
+#define SW_SESSVLD_SEL      (1U << 28)
+#define LANE0_PWR_PRESENT   (1U << 24)
+
+#define CMD_SETEPCONFIG     0x1
+#define CMD_SETXFERRES      0x2
+#define CMD_SETSTALL        0x4
+#define CMD_CLEARSTALL      0x5
+#define CMD_STARTXFER       0x6
+#define CMD_ENDXFER         0x8
+#define CMD_STARTCFG        0x9
+#define CMD_IOC             (1U << 8)
+#define CMD_ACT             (1U << 10)
+#define CMD_FORCERM         (1U << 11)
+#define CMD_PARAM(x)        ((uint32_t)(x) << 16)
+
+#define EPCFG_TYPE(t)       ((t) << 1)          /* 0 control, 2 bulk, 3 interrupt */
+#define EPCFG_MPS(n)        ((n) << 3)
+#define EPCFG_FIFO(n)       ((n) << 17)
+#define EPCFG_MODIFY        (2U << 30)
+#define EPCFG_XFERCMPL_EN   (1U << 8)
+#define EPCFG_XFERNRDY_EN   (1U << 10)
+#define EPCFG_BINTERVAL_M1(n) ((n) << 16)
+#define EPCFG_EPNUM(n)      ((n) << 25)
+
+#define TRB_HWO             (1U << 0)
+#define TRB_LST             (1U << 1)
+#define TRB_ISP_IMI         (1U << 10)
+#define TRB_IOC             (1U << 11)
+#define TRB_NORMAL          (1U << 4)
+#define TRB_SETUP           (2U << 4)
+#define TRB_STATUS2         (3U << 4)
+#define TRB_STATUS3         (4U << 4)
+#define TRB_DATA            (5U << 4)
+
+#define DEPEVT_XFERCOMPLETE 1
+#define DEPEVT_XFERNOTREADY 3
+#define CONTROL_STATUS      2               /* XferNotReady phase, status & 3 */
+#define DEVEVT_DISCONNECT   0
+#define DEVEVT_RESET        1
+#define DEVEVT_CONNDONE     2
+
+/* DMA area layout */
+#define DMA_EVT             0x0000          /* event buffer */
+#define EVT_SIZE            4096
+#define DMA_TRB(slot)       (0x1000 + (slot) * 16)
+#define TRB_EP0             0
+#define TRB_RX              1
+#define TRB_TX              2
+#define TRB_NCM_RX          3
+#define TRB_NCM_TX          4
+#define TRB_NCM_NOTIFY      5
+#define DMA_SETUP           0x1100          /* 8-byte SETUP packet */
+#define DMA_EP0BUF          0x1200          /* control data stage */
+#define DMA_RXBUF           0x2000
+#define DMA_TXBUF           0x3000
+#define DMA_NCM_RX          0x4000          /* one OUT NTB, up to NCM_NTB_OUT_MAX */
+#define DMA_NCM_TX          0x8000          /* one IN NTB */
+#define DMA_NCM_NOTIFY      0x9000
+#define DMA_SIZE            0xA000          /* usb.c's USB_DMA_PAGES */
+
+#define PHYS_NCM_OUT        6               /* EP3 bulk OUT */
+#define PHYS_NCM_IN         7               /* EP3 bulk IN */
+#define PHYS_NCM_NOTIFY     9               /* EP4 interrupt IN */
+#define NCM_TX_MAX          0x1000
+#define NCM_WATCH_MS        20000
+
+#define EP0_MPS             64
+#define BULK_MPS            512
+#define TX_CHUNK            511             /* < BULK_MPS: every transfer ends short, no ZLP needed */
+#define RX_XFER             2048            /* multiple of BULK_MPS; a short packet ends it early */
+
+/* ── Descriptors ─────────────────────────────────────────────── */
+
+/* pid.codes test VID/PID (0x1209:0x0001); class 0x02 at device level so
+ * Windows 10+ binds its inbox usbser.sys */
+static const uint8_t dev_desc[18] = {
+    18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, EP0_MPS,
+    0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
+};
+
+static const uint8_t cfg_desc[67] = {
+    9, 2, 67, 0, 2, 1, 0, 0x80, 50,             /* config 1, 2 interfaces, 100 mA */
+    9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,         /* interface 0: CDC comm, ACM */
+    5, 0x24, 0x00, 0x10, 0x01,                  /* header, CDC 1.10 */
+    5, 0x24, 0x01, 0x00, 0x01,                  /* call management, data on interface 1 */
+    4, 0x24, 0x02, 0x02,                        /* ACM: line coding + control line state */
+    5, 0x24, 0x06, 0x00, 0x01,                  /* union: master 0, slave 1 */
+    7, 5, 0x82, 0x03, 16, 0, 9,                 /* EP2 IN interrupt, 16 B, 2^8 uframes */
+    9, 4, 1, 0, 2, 0x0A, 0x00, 0x00, 0,         /* interface 1: CDC data */
+    7, 5, 0x01, 0x02, 0x00, 0x02, 0,            /* EP1 OUT bulk, 512 B */
+    7, 5, 0x81, 0x02, 0x00, 0x02, 0,            /* EP1 IN bulk, 512 B */
+};
+
+/* The composite: class EF/02/01 (functions in IADs), bcdDevice 2.00 */
+static const uint8_t dev_desc_ncm[18] = {
+    18, 1, 0x00, 0x02, 0xEF, 0x02, 0x01, EP0_MPS,
+    0x09, 0x12, 0x01, 0x00, 0x00, 0x02, 1, 2, 3, 1,
+};
+
+static const uint8_t cfg_desc_ncm[160] = {
+    9, 2, 160, 0, 4, 1, 0, 0x80, 50,            /* config 1, 4 interfaces, 100 mA */
+    8, 0x0B, 0, 2, 0x02, 0x02, 0x01, 0,         /* IAD: interfaces 0-1, CDC ACM */
+    9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,         /* the ACM function, as above */
+    5, 0x24, 0x00, 0x10, 0x01,
+    5, 0x24, 0x01, 0x00, 0x01,
+    4, 0x24, 0x02, 0x02,
+    5, 0x24, 0x06, 0x00, 0x01,
+    7, 5, 0x82, 0x03, 16, 0, 9,
+    9, 4, 1, 0, 2, 0x0A, 0x00, 0x00, 0,
+    7, 5, 0x01, 0x02, 0x00, 0x02, 0,
+    7, 5, 0x81, 0x02, 0x00, 0x02, 0,
+    8, 0x0B, 2, 2, 0x02, 0x0D, 0x00, 0,         /* IAD: interfaces 2-3, CDC NCM */
+    9, 4, 2, 0, 1, 0x02, 0x0D, 0x00, 0,         /* interface 2: NCM control */
+    5, 0x24, 0x00, 0x10, 0x01,                  /* header, CDC 1.10 */
+    5, 0x24, 0x06, 0x02, 0x03,                  /* union: master 2, slave 3 */
+    13, 0x24, 0x0F, 4, 0, 0, 0, 0, 0xEA, 0x05, 0, 0, 0, /* Ethernet: MAC string 4, 1514 */
+    6, 0x24, 0x1A, 0x00, 0x01, 0x01,            /* NCM 1.00: packet filter request */
+    7, 5, 0x84, 0x03, 16, 0, 9,                 /* EP4 IN interrupt, 16 B */
+    9, 4, 3, 0, 0, 0x0A, 0x00, 0x01, 0,         /* interface 3 alt 0: no endpoints */
+    9, 4, 3, 1, 2, 0x0A, 0x00, 0x01, 0,         /* alt 1: NCM data */
+    7, 5, 0x83, 0x02, 0x00, 0x02, 0,            /* EP3 IN bulk, 512 B */
+    7, 5, 0x03, 0x02, 0x00, 0x02, 0,            /* EP3 OUT bulk, 512 B */
+};
+
+/* GET_NTB_PARAMETERS: NTB16 only; IN NTBs up to 16 KB, OUT up to
+ * NCM_NTB_OUT_MAX, datagrams 4-byte aligned both ways */
+static const uint8_t ntb_params[28] = {
+    28, 0, 0x01, 0x00,
+    0x00, 0x40, 0x00, 0x00,                     /* dwNtbInMaxSize 16384 */
+    4, 0, 0, 0, 4, 0, 0, 0,                     /* in: divisor, remainder, alignment */
+    (uint8_t)NCM_NTB_OUT_MAX, (uint8_t)(NCM_NTB_OUT_MAX >> 8), 0, 0,
+    4, 0, 0, 0, 4, 0, 0, 0,                     /* out: same; any number of datagrams */
+};
+
+/* 115200 8N1; the host's SET_LINE_CODING just overwrites it */
+static uint8_t line_coding[7] = { 0x00, 0xC2, 0x01, 0x00, 0, 0, 8 };
+
+/* ── State ───────────────────────────────────────────────────── */
+
+static uint64_t dwc, dma;
+static uint32_t evt_pos;
+static int started, configured;
+
+enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS, EP0_STATUS };
+static int ep0_state;
+static int ep0_three_stage;
+static int ep0_active = -1;                 /* phys EP0 with a transfer in flight */
+static uint32_t ep0_rsc;                    /* its transfer resource index */
+static uint8_t ep0_out_req;                 /* class request waiting for OUT data */
+
+static int rx_active, tx_active;
+static uint32_t tx_rsc, rx_rsc;
+static int dtr;                 /* the host has the port open */
+static int in_poll;             /* acm_poll runs and may print: don't recurse */
+static int tx_stalled;          /* a wait for TX room timed out; drop until TX moves */
+
+#define TX_RING 8192
+#define RX_RING 8192
+static volatile uint8_t tx_ring[TX_RING];
+static volatile uint32_t tx_head, tx_tail;
+static volatile uint8_t rx_ring[RX_RING];
+static volatile uint32_t rx_head, rx_tail;
+
+static int log_budget = 40;                 /* enumeration log lines on the console */
+
+/* The network function */
+static int ncm_mode;                        /* the composite is what we present */
+static int ncm_alt;                         /* interface 3's alternate setting */
+static int ncm_rx_active, ncm_tx_active, ncm_notify_active;
+static uint32_t ncm_rx_rsc, ncm_tx_rsc, ncm_notify_rsc;
+static int ncm_notify_next;                 /* 2 speed, then 1 connect, 0 none */
+static uint32_t ncm_switch_ms;              /* a switch the host hasn't confirmed yet */
+static int ncm_watch;
+
+/* ── Low level ───────────────────────────────────────────────── */
+
+/* As Linux's readl/writel. The DMA window is Normal non-cacheable memory and
+ * the registers are Device memory, and Arm orders neither against the
+ * other: a TRB store could land after the DEPCMD write that starts the
+ * transfer, and the event buffer or a SETUP packet could be read before the
+ * GEVNTCOUNT read that says it's there. Until these barriers, servicing
+ * the gadget from an A55 at 403 MHz wedged EP0 within seconds (2026-10-29);
+ * at 1.8 GHz, and from the big cores, it never showed. */
+static uint32_t rd(uint32_t off)
+{
+    uint32_t v = mmio_read32(dwc + off);
+    __asm__ volatile("dmb oshld" ::: "memory");
+    return v;
+}
+
+static void wr(uint32_t off, uint32_t v)
+{
+    __asm__ volatile("dmb oshst" ::: "memory");
+    mmio_write32(dwc + off, v);
+}
+
+static volatile uint8_t *dma_ptr(uint32_t off)
+{
+    return (volatile uint8_t *)(uintptr_t)(dma + off);
+}
+
+static int log_ok(void)
+{
+    if (log_budget <= 0)
+        return 0;
+    log_budget--;
+    return 1;
+}
+
+/* Issue an endpoint command and wait for it; returns DEPCMD (status in
+ * bits 15:12, resource index in 22:16), or 0xFFFFFFFF on timeout. */
+static uint32_t ep_cmd(int phys, uint32_t cmd, uint32_t p0, uint32_t p1)
+{
+    uint32_t base = DEP_BASE(phys);
+    wr(base + DEPCMDPAR2, 0);
+    wr(base + DEPCMDPAR1, p1);
+    wr(base + DEPCMDPAR0, p0);
+    wr(base + DEPCMD, cmd | CMD_ACT);
+    for (int i = 0; i < 1000000; i++) {
+        uint32_t r = rd(base + DEPCMD);
+        if (!(r & CMD_ACT))
+            return r;
+    }
+    if (log_ok()) {
+        serial_puts("[USB ] ep");
+        serial_putdec(phys);
+        serial_puts(" cmd ");
+        serial_puthex(cmd, 2);
+        serial_puts(" timeout, depcmd=");
+        serial_puthex(rd(base + DEPCMD), 8);
+        serial_puts("\n");
+    }
+    return 0xFFFFFFFF;
+}
+
+static uint32_t ep_config(int phys, uint32_t type, uint32_t mps,
+                          uint32_t action, uint32_t p1_extra)
+{
+    uint32_t p0 = EPCFG_TYPE(type) | EPCFG_MPS(mps) | action;
+    if (phys & 1)
+        p0 |= EPCFG_FIFO(phys >> 1);
+    uint32_t p1 = EPCFG_XFERCMPL_EN | EPCFG_XFERNRDY_EN | EPCFG_EPNUM(phys) | p1_extra;
+    return ep_cmd(phys, CMD_SETEPCONFIG, p0, p1);
+}
+
+/* One-TRB transfer; returns the transfer resource index, or 0xFFFFFFFF if
+ * the command timed out */
+static uint32_t start_xfer(int phys, int slot, uint32_t buf_off, uint32_t len,
+                           uint32_t type)
+{
+    volatile uint32_t *trb = (volatile uint32_t *)dma_ptr(DMA_TRB(slot));
+    uint64_t buf = dma + buf_off;
+    trb[0] = (uint32_t)buf;
+    trb[1] = (uint32_t)(buf >> 32);
+    trb[2] = len;
+    trb[3] = type | TRB_LST | TRB_IOC | TRB_ISP_IMI | TRB_HWO;
+    uint64_t t = dma + DMA_TRB(slot);
+    uint32_t r = ep_cmd(phys, CMD_STARTXFER, (uint32_t)(t >> 32), (uint32_t)t);
+    return r == 0xFFFFFFFF ? r : (r >> 16) & 0x7F;
+}
+
+static void end_xfer(int phys, uint32_t rsc)
+{
+    ep_cmd(phys, CMD_ENDXFER | CMD_FORCERM | CMD_IOC | CMD_PARAM(rsc), 0, 0);
+}
+
+/* ── EP0 ─────────────────────────────────────────────────────── */
+
+static void ep0_start_setup(void)
+{
+    ep0_state = EP0_SETUP;
+    ep0_active = 0;
+    ep0_rsc = start_xfer(0, TRB_EP0, DMA_SETUP, 8, TRB_SETUP);
+}
+
+static void ep0_stall(uint8_t bmrt, uint8_t req, uint16_t wvalue)
+{
+    if (log_ok()) {
+        serial_puts("[USB ] stall ");
+        serial_puthex(bmrt, 2);
+        serial_putc(' ');
+        serial_puthex(req, 2);
+        serial_putc(' ');
+        serial_puthex(wvalue, 4);
+        serial_puts("\n");
+    }
+    ep_cmd(0, CMD_SETSTALL, 0, 0);
+    ep0_start_setup();
+}
+
+/* No data stage: the status stage starts on XferNotReady */
+static void ep0_ack(void)
+{
+    ep0_three_stage = 0;
+    ep0_active = -1;
+    ep0_state = EP0_WAIT_STATUS;
+}
+
+static void ep0_send(const uint8_t *src, uint32_t len, uint16_t wlength)
+{
+    volatile uint8_t *buf = dma_ptr(DMA_EP0BUF);
+    if (len > wlength)
+        len = wlength;
+    for (uint32_t i = 0; i < len; i++)
+        buf[i] = src[i];
+    ep0_three_stage = 1;
+    ep0_state = EP0_DATA;
+    ep0_active = 1;
+    ep0_rsc = start_xfer(1, TRB_EP0, DMA_EP0BUF, len, TRB_DATA);
+}
+
+static void ep0_send_string(const char *s, uint16_t wlength)
+{
+    uint8_t d[64];
+    uint32_t n = 0;
+    while (s[n] && n < 31) {
+        d[2 + 2 * n] = (uint8_t)s[n];
+        d[3 + 2 * n] = 0;
+        n++;
+    }
+    d[0] = (uint8_t)(2 + 2 * n);
+    d[1] = 3;
+    ep0_send(d, d[0], wlength);
+}
+
+static void ep0_recv(uint8_t req)
+{
+    ep0_out_req = req;
+    ep0_three_stage = 1;
+    ep0_state = EP0_DATA;
+    ep0_active = 0;
+    ep0_rsc = start_xfer(0, TRB_EP0, DMA_EP0BUF, EP0_MPS, TRB_DATA);
+}
+
+static void rx_refill(void);
+
+/* ── NCM ─────────────────────────────────────────────────────── */
+
+static void ncm_rx_arm(void)
+{
+    if (ncm_alt && !ncm_rx_active) {
+        ncm_rx_active = 1;
+        ncm_rx_rsc = start_xfer(PHYS_NCM_OUT, TRB_NCM_RX, DMA_NCM_RX, NCM_NTB_OUT_MAX, TRB_NORMAL);
+    }
+}
+
+/* The next notification: the link speed, then "connected" (as Linux's
+ * f_ncm does on SET_INTERFACE) */
+static void ncm_notify(void)
+{
+    if (!ncm_alt || ncm_notify_active || !ncm_notify_next)
+        return;
+    volatile uint8_t *n = dma_ptr(DMA_NCM_NOTIFY);
+    static const uint8_t speed[16] = {
+        0xA1, 0x2A, 0, 0, 2, 0, 8, 0,           /* CONNECTION_SPEED_CHANGE, interface 2 */
+        0x00, 0x0E, 0x27, 0x07, 0x00, 0x0E, 0x27, 0x07, /* 120 Mbit/s down and up */
+    };
+    static const uint8_t connect[8] = { 0xA1, 0x00, 1, 0, 2, 0, 0, 0 };  /* NETWORK_CONNECTION */
+    const uint8_t *src = ncm_notify_next == 2 ? speed : connect;
+    uint32_t len = ncm_notify_next == 2 ? 16 : 8;
+    for (uint32_t i = 0; i < len; i++)
+        n[i] = src[i];
+    ncm_notify_next--;
+    ncm_notify_active = 1;
+    ncm_notify_rsc = start_xfer(PHYS_NCM_NOTIFY, TRB_NCM_NOTIFY, DMA_NCM_NOTIFY, len, TRB_NORMAL);
+}
+
+static void ncm_stop_data(void)
+{
+    if (ncm_rx_active)
+        end_xfer(PHYS_NCM_OUT, ncm_rx_rsc);
+    if (ncm_tx_active)
+        end_xfer(PHYS_NCM_IN, ncm_tx_rsc);
+    if (ncm_notify_active)
+        end_xfer(PHYS_NCM_NOTIFY, ncm_notify_rsc);
+    ncm_rx_active = ncm_tx_active = ncm_notify_active = 0;
+    ncm_notify_next = 0;
+    if (ncm_alt)
+        ncm_link(0);
+    ncm_alt = 0;
+}
+
+static void ncm_set_alt(uint16_t alt)
+{
+    if (alt == 1 && !ncm_alt) {
+        ncm_alt = 1;
+        ncm_rx_arm();
+        ncm_notify_next = 2;
+        ncm_notify();
+        ncm_link(1);
+    } else if (alt == 0 && ncm_alt) {
+        ncm_stop_data();
+    }
+}
+
+/* Whatever ncm.c has queued, as one IN NTB */
+static void ncm_tx_kick(void)
+{
+    if (!ncm_alt || ncm_tx_active)
+        return;
+    uint32_t len = ncm_tx_build(dma_ptr(DMA_NCM_TX), NCM_TX_MAX);
+    if (!len)
+        return;
+    ncm_tx_active = 1;
+    ncm_tx_rsc = start_xfer(PHYS_NCM_IN, TRB_NCM_TX, DMA_NCM_TX, len, TRB_NORMAL);
+}
+
+static void ncm_rx_complete(void)
+{
+    volatile uint32_t *trb = (volatile uint32_t *)dma_ptr(DMA_TRB(TRB_NCM_RX));
+    uint32_t n = NCM_NTB_OUT_MAX - (trb[2] & 0xFFFFFF);
+    ncm_rx_active = 0;
+    ncm_rx_ntb(dma_ptr(DMA_NCM_RX), n);
+    ncm_rx_arm();
+}
+
+/* Class requests to interface 2 (CDC NCM 1.0, section 6.2) */
+static void ncm_request(uint8_t bmrt, uint8_t req, uint16_t wvalue, uint16_t wlength)
+{
+    static const uint8_t zero4[4] = { 0, 0, 0, 0 };
+    static const uint8_t in_size[4] = { 0x00, 0x40, 0x00, 0x00 };
+    switch (req) {
+    case 0x80:                                  /* GET_NTB_PARAMETERS */
+        ep0_send(ntb_params, sizeof(ntb_params), wlength);
+        return;
+    case 0x83:                                  /* GET_NTB_FORMAT: NTB16 */
+    case 0x89:                                  /* GET_CRC_MODE: none */
+        ep0_send(zero4, 2, wlength);
+        return;
+    case 0x85:                                  /* GET_NTB_INPUT_SIZE */
+        ep0_send(in_size, 4, wlength);
+        return;
+    case 0x86:                                  /* SET_NTB_INPUT_SIZE: ours are smaller */
+        if (wlength) {
+            ep0_recv(req);
+            return;
+        }
+        ep0_ack();
+        return;
+    case 0x43:                                  /* SET_ETHERNET_PACKET_FILTER */
+    case 0x84:                                  /* SET_NTB_FORMAT */
+    case 0x8A:                                  /* SET_CRC_MODE */
+        ep0_ack();
+        return;
+    }
+    ep0_stall(bmrt, req, wvalue);
+}
+
+static void acm_configure(void)
+{
+    ep_config(2, 2, BULK_MPS, 0, 0);
+    ep_config(3, 2, BULK_MPS, 0, 0);
+    ep_config(5, 3, 16, 0, EPCFG_BINTERVAL_M1(8));
+    uint32_t eps = (1U << 2) | (1U << 3) | (1U << 5);
+    if (ncm_mode) {
+        ep_config(PHYS_NCM_OUT, 2, BULK_MPS, 0, 0);
+        ep_config(PHYS_NCM_IN, 2, BULK_MPS, 0, 0);
+        ep_config(PHYS_NCM_NOTIFY, 3, 16, 0, EPCFG_BINTERVAL_M1(8));
+        eps |= (1U << PHYS_NCM_OUT) | (1U << PHYS_NCM_IN) | (1U << PHYS_NCM_NOTIFY);
+    }
+    wr(DALEPENA, rd(DALEPENA) | eps);
+    configured = 1;
+    ncm_watch = 0;
+    tx_active = 0;
+    rx_active = 0;
+    rx_refill();
+}
+
+static void acm_deconfigure(void)
+{
+    if (rx_active)
+        end_xfer(2, rx_rsc);
+    if (tx_active)
+        end_xfer(3, tx_rsc);
+    rx_active = tx_active = 0;
+    ncm_stop_data();
+    wr(DALEPENA, 3);
+    configured = dtr = 0;
+}
+
+static void ep0_get_descriptor(uint16_t wvalue, uint16_t wlength)
+{
+    uint8_t type = wvalue >> 8, idx = wvalue & 0xFF;
+    if (type == 1) {
+        if (ncm_mode)
+            ep0_send(dev_desc_ncm, sizeof(dev_desc_ncm), wlength);
+        else
+            ep0_send(dev_desc, sizeof(dev_desc), wlength);
+    } else if (type == 2) {
+        if (ncm_mode)
+            ep0_send(cfg_desc_ncm, sizeof(cfg_desc_ncm), wlength);
+        else
+            ep0_send(cfg_desc, sizeof(cfg_desc), wlength);
+    } else if (type == 3 && idx == 0) {
+        static const uint8_t langid[4] = { 4, 3, 0x09, 0x04 };   /* en-US */
+        ep0_send(langid, 4, wlength);
+    } else if (type == 3 && idx == 1) {
+        ep0_send_string("naranjositos", wlength);
+    } else if (type == 3 && idx == 2) {
+        ep0_send_string("Osito-K", wlength);
+    } else if (type == 3 && idx == 3) {
+        ep0_send_string(ncm_mode ? "0002" : "0001", wlength);   /* its own device instance */
+    } else if (type == 3 && idx == 4 && ncm_mode) {
+        ep0_send_string(NCM_HOST_MAC_STR, wlength);     /* the host side's MAC */
+    } else {
+        ep0_stall(0x80, 6, wvalue);     /* e.g. device qualifier: no full-speed config */
+    }
+}
+
+static void ep0_setup(void)
+{
+    volatile uint8_t *s = dma_ptr(DMA_SETUP);
+    uint8_t bmrt = s[0], req = s[1];
+    uint16_t wvalue = s[2] | (s[3] << 8);
+    uint16_t windex = s[4] | (s[5] << 8);
+    uint16_t wlength = s[6] | (s[7] << 8);
+    static const uint8_t zero2[2] = { 0, 0 };
+
+    if ((bmrt & 0x60) == 0x00) {                /* standard */
+        switch (req) {
+        case 0x06:                              /* GET_DESCRIPTOR */
+            ep0_get_descriptor(wvalue, wlength);
+            return;
+        case 0x05:                              /* SET_ADDRESS */
+            wr(DCFG, (rd(DCFG) & ~DCFG_DEVADDR_MASK) | ((wvalue & 0x7F) << 3));
+            if (log_ok()) {
+                serial_puts("[USB ] address ");
+                serial_putdec(wvalue & 0x7F);
+                serial_puts("\n");
+            }
+            ep0_ack();
+            return;
+        case 0x09:                              /* SET_CONFIGURATION */
+            if (wvalue == 1 && !configured)
+                acm_configure();
+            else if (wvalue == 0 && configured)
+                acm_deconfigure();
+            if (log_ok()) {
+                serial_puts("[USB ] configuration ");
+                serial_putdec(wvalue);
+                serial_puts("\n");
+            }
+            ep0_ack();
+            return;
+        case 0x08: {                            /* GET_CONFIGURATION */
+            uint8_t c = (uint8_t)configured;
+            ep0_send(&c, 1, wlength);
+            return;
+        }
+        case 0x00:                              /* GET_STATUS */
+            ep0_send(zero2, 2, wlength);
+            return;
+        case 0x0A: {                            /* GET_INTERFACE */
+            uint8_t alt = (uint8_t)(ncm_mode && windex == 3 ? ncm_alt : 0);
+            ep0_send(&alt, 1, wlength);
+            return;
+        }
+        case 0x01:                              /* CLEAR_FEATURE */
+            if ((bmrt & 0x1F) == 2 && wvalue == 0) {    /* ENDPOINT_HALT */
+                int phys = ((windex & 0xF) << 1) | ((windex >> 7) & 1);
+                ep_cmd(phys, CMD_CLEARSTALL, 0, 0);
+            }
+            ep0_ack();
+            return;
+        case 0x0B:                              /* SET_INTERFACE */
+            if (ncm_mode && windex == 3)
+                ncm_set_alt(wvalue);
+            ep0_ack();
+            return;
+        case 0x03:                              /* SET_FEATURE */
+            ep0_ack();
+            return;
+        }
+    } else if ((bmrt & 0x60) == 0x20 && ncm_mode && (windex & 0xFF) == 2) {
+        ncm_request(bmrt, req, wvalue, wlength);
+        return;
+    } else if ((bmrt & 0x60) == 0x20) {         /* class (CDC ACM) */
+        switch (req) {
+        case 0x20:                              /* SET_LINE_CODING */
+            ep0_recv(req);
+            return;
+        case 0x21:                              /* GET_LINE_CODING */
+            ep0_send(line_coding, 7, wlength);
+            return;
+        case 0x22:                              /* SET_CONTROL_LINE_STATE */
+            /* Windows repeats it several times per open/close: log changes */
+            if ((wvalue & 1) != dtr && log_ok()) {
+                serial_puts("[USB ] host port ");
+                if (wvalue & 1)
+                    serial_puts("open\n");
+                else
+                    serial_puts("closed\n");
+            }
+            dtr = wvalue & 1;
+            ep0_ack();
+            return;
+        case 0x23:                              /* SEND_BREAK */
+            ep0_ack();
+            return;
+        }
+    }
+    ep0_stall(bmrt, req, wvalue);
+}
+
+static void ep0_event(int phys, uint32_t type, uint32_t status)
+{
+    if (type == DEPEVT_XFERNOTREADY) {
+        if ((status & 3) == CONTROL_STATUS && ep0_state == EP0_WAIT_STATUS) {
+            ep0_state = EP0_STATUS;
+            ep0_active = phys;
+            ep0_rsc = start_xfer(phys, TRB_EP0, DMA_SETUP, 0,
+                                 ep0_three_stage ? TRB_STATUS3 : TRB_STATUS2);
+        }
+        return;
+    }
+    if (type != DEPEVT_XFERCOMPLETE)
+        return;
+
+    ep0_active = -1;
+    if (ep0_state == EP0_SETUP) {
+        ep0_setup();
+    } else if (ep0_state == EP0_DATA) {
+        if (ep0_out_req == 0x20) {
+            volatile uint8_t *buf = dma_ptr(DMA_EP0BUF);
+            for (int i = 0; i < 7; i++)
+                line_coding[i] = buf[i];
+        }
+        ep0_out_req = 0;
+        ep0_state = EP0_WAIT_STATUS;
+    } else if (ep0_state == EP0_STATUS) {
+        ep0_start_setup();
+    }
+}
+
+/* ── Bulk data ───────────────────────────────────────────────── */
+
+static uint32_t rx_free(void)
+{
+    return (rx_tail + RX_RING - rx_head - 1) % RX_RING;
+}
+
+/* Arm bulk OUT only when a whole transfer fits in the ring. Until then the
+ * controller NAKs the host, which is the flow control for bulk uploads. */
+static void rx_refill(void)
+{
+    if (!configured || rx_active || rx_free() < RX_XFER)
+        return;
+    rx_active = 1;
+    rx_rsc = start_xfer(2, TRB_RX, DMA_RXBUF, RX_XFER, TRB_NORMAL);
+}
+
+static void rx_complete(void)
+{
+    volatile uint32_t *trb = (volatile uint32_t *)dma_ptr(DMA_TRB(TRB_RX));
+    uint32_t n = RX_XFER - (trb[2] & 0xFFFFFF);
+    volatile uint8_t *buf = dma_ptr(DMA_RXBUF);
+    for (uint32_t i = 0; i < n; i++) {
+        rx_ring[rx_head] = buf[i];              /* rx_refill guaranteed room */
+        rx_head = (rx_head + 1) % RX_RING;
+    }
+    rx_active = 0;
+    rx_refill();
+}
+
+static void tx_kick(void)
+{
+    if (!configured || tx_active || tx_head == tx_tail)
+        return;
+    volatile uint8_t *buf = dma_ptr(DMA_TXBUF);
+    uint32_t n = 0;
+    while (n < TX_CHUNK && tx_tail != tx_head) {
+        buf[n++] = tx_ring[tx_tail];
+        tx_tail = (tx_tail + 1) % TX_RING;
+    }
+    tx_active = 1;
+    tx_rsc = start_xfer(3, TRB_TX, DMA_TXBUF, n, TRB_NORMAL);
+}
+
+/* ── Events ──────────────────────────────────────────────────── */
+
+static void dev_event(uint32_t ev)
+{
+    uint32_t type = (ev >> 8) & 0xF;
+    if (type == DEVEVT_RESET) {
+        if (log_ok())
+            serial_puts("[USB ] bus reset\n");
+        if (configured)
+            acm_deconfigure();
+        wr(DCFG, rd(DCFG) & ~DCFG_DEVADDR_MASK);
+        /* Windows resets mid-transfer during its first enumeration */
+        if (ep0_state != EP0_SETUP) {
+            if (ep0_active >= 0)
+                end_xfer(ep0_active, ep0_rsc);
+            ep0_start_setup();
+        }
+    } else if (type == DEVEVT_CONNDONE) {
+        uint32_t speed = rd(DSTS) & 7;
+        if (log_ok()) {
+            serial_puts("[USB ] connected, speed ");
+            serial_putdec(speed);
+            if (speed == 0)
+                serial_puts(" (high)");
+            serial_puts("\n");
+        }
+        ep_config(0, 0, EP0_MPS, EPCFG_MODIFY, 0);
+        ep_config(1, 0, EP0_MPS, EPCFG_MODIFY, 0);
+    } else if (type == DEVEVT_DISCONNECT) {
+        if (log_ok())
+            serial_puts("[USB ] disconnected\n");
+        if (configured)
+            acm_deconfigure();
+    }
+}
+
+static void switch_mode(int ncm);
+
+void acm_poll(void)
+{
+    if (!started || in_poll)
+        return;
+    in_poll = 1;
+    if (ncm_watch && timer_ms() - ncm_switch_ms > NCM_WATCH_MS) {
+        serial_puts("[USB ] the host didn't take the network function in 20 s: "
+                    "serial port only again\n");
+        switch_mode(0);
+        in_poll = 0;
+        return;
+    }
+    uint32_t count = rd(GEVNTCOUNT) & 0xFFFC;
+    for (uint32_t done = 0; done < count; done += 4) {
+        uint32_t ev = *(volatile uint32_t *)dma_ptr(DMA_EVT + evt_pos);
+        evt_pos = (evt_pos + 4) % EVT_SIZE;
+        if (ev & 1) {
+            if (((ev >> 1) & 0x7F) == 0)        /* device event */
+                dev_event(ev);
+            continue;
+        }
+        int phys = (ev >> 1) & 0x1F;
+        uint32_t type = (ev >> 6) & 0xF;
+        uint32_t status = (ev >> 12) & 0xF;
+        if (phys <= 1)
+            ep0_event(phys, type, status);
+        else if (type == DEPEVT_XFERCOMPLETE && phys == 2 && rx_active)
+            rx_complete();
+        else if (type == DEPEVT_XFERCOMPLETE && phys == 3)
+            tx_active = tx_stalled = 0;
+        else if (type == DEPEVT_XFERCOMPLETE && phys == PHYS_NCM_OUT && ncm_rx_active)
+            ncm_rx_complete();
+        else if (type == DEPEVT_XFERCOMPLETE && phys == PHYS_NCM_IN)
+            ncm_tx_active = 0;
+        else if (type == DEPEVT_XFERCOMPLETE && phys == PHYS_NCM_NOTIFY) {
+            ncm_notify_active = 0;
+            ncm_notify();
+        }
+    }
+    if (count) {
+        /* The event reads above finish before the controller may reuse
+         * those slots (wr only orders stores) */
+        __asm__ volatile("dmb osh" ::: "memory");
+        wr(GEVNTCOUNT, count);
+    }
+    rx_refill();
+    tx_kick();
+    ncm_rx_arm();
+    ncm_tx_kick();
+    in_poll = 0;
+}
+
+int acm_getc(void)
+{
+    if (rx_tail == rx_head)
+        return -1;
+    int c = rx_ring[rx_tail];
+    rx_tail = (rx_tail + 1) % RX_RING;
+    return c;
+}
+
+int acm_tx_idle(void)
+{
+    return !started || !configured || (!tx_active && tx_head == tx_tail);
+}
+
+int acm_state(void)
+{
+    return !started || !configured ? ACM_UNCONFIGURED : dtr ? ACM_PORT_OPEN : ACM_PORT_CLOSED;
+}
+
+void acm_stop(void)
+{
+    if (!started)
+        return;
+    wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);        /* host sees a disconnect */
+    for (int i = 0; i < 1000 && !(rd(DSTS) & DSTS_DEVCTRLHLT); i++)
+        udelay(100);
+    started = configured = 0;
+}
+
+void acm_putc(char c)
+{
+    uint32_t next = (tx_head + 1) % TX_RING;
+    /* Ring full: if a host is reading, service USB until there is room, so
+     * long output (dmesg, help) arrives whole. With no reader, or one that
+     * stopped reading for ~50 ms, drop instead of stalling the kernel. */
+    for (int i = 0; next == tx_tail && configured && dtr && !in_poll && !tx_stalled; i++) {
+        if (i == 50000) {
+            tx_stalled = 1;
+            break;
+        }
+        acm_poll();
+        udelay(1);
+    }
+    if (next == tx_tail)
+        return;                                 /* full: drop */
+    tx_ring[tx_head] = (uint8_t)c;
+    tx_head = next;
+}
+
+/* ── Start ───────────────────────────────────────────────────── */
+
+static int wait_clear(uint32_t off, uint32_t bit, uint32_t ms)
+{
+    for (uint32_t i = 0; i < ms * 10; i++) {
+        if (!(rd(off) & bit))
+            return 0;
+        udelay(100);
+    }
+    return -1;
+}
+
+static void dump_state(void)
+{
+    serial_puts("[USB ] dctl=");
+    serial_puthex(rd(DCTL), 8);
+    serial_puts(" dsts=");
+    serial_puthex(rd(DSTS), 8);
+    serial_puts(" gsts=");
+    serial_puthex(rd(GSTS), 8);
+    serial_puts("\n[USB ] u2phy=");
+    serial_puthex(rd(GUSB2PHYCFG0), 8);
+    serial_puts(" u3pipe=");
+    serial_puthex(rd(GUSB3PIPECTL0), 8);
+    serial_puts(" gencfg=");
+    serial_puthex(rd(QSCRATCH_GENERAL_CFG), 8);
+    serial_puts("\n");
+}
+
+int acm_start(uint64_t dwc3_base, uint64_t dma_base)
+{
+    dwc = dwc3_base;
+    dma = dma_base;
+
+    /* ABL ran fastboot at SuperSpeed and shut the USB3 PHY down on exit,
+     * taking the PIPE clock with it; the endpoint command logic runs on that
+     * clock, so commands never completed. Clock it from UTMI instead (Linux
+     * dwc3-qcom select_utmi_clk, "qcom,select-utmi-as-pipe-clk" in the
+     * ROG5 DTS). */
+    wr(QSCRATCH_GENERAL_CFG, rd(QSCRATCH_GENERAL_CFG) | PIPE_UTMI_CLK_DIS);
+    udelay(100);
+    wr(QSCRATCH_GENERAL_CFG, rd(QSCRATCH_GENERAL_CFG) | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
+    udelay(100);
+    wr(QSCRATCH_GENERAL_CFG, rd(QSCRATCH_GENERAL_CFG) & ~PIPE_UTMI_CLK_DIS);
+
+    /* Stop whatever ABL left, then soft-reset the device controller (keeps
+     * the PHY configuration). DWC_usb31 needs time before the PHY domain
+     * is touched again. */
+    wr(DCTL, rd(DCTL) & ~DCTL_RUN_STOP);
+    for (int i = 0; i < 1000 && !(rd(DSTS) & DSTS_DEVCTRLHLT); i++)
+        udelay(100);
+    wr(DCTL, DCTL_CSFTRST);
+    if (wait_clear(DCTL, DCTL_CSFTRST, 500)) {
+        serial_puts("[USB ] soft reset timed out\n");
+        return -1;
+    }
+    mdelay(50);
+
+    wr(GCTL, (rd(GCTL) & ~GCTL_PRTCAP_MASK) | GCTL_PRTCAP_DEVICE);
+    wr(GUSB2PHYCFG0, rd(GUSB2PHYCFG0) & ~(USB2PHYCFG_SUSPHY | USB2PHYCFG_ENBLSLPM));
+
+    evt_pos = 0;
+    wr(GEVNTADRLO, (uint32_t)(dma + DMA_EVT));
+    wr(GEVNTADRHI, (uint32_t)((dma + DMA_EVT) >> 32));
+    wr(GEVNTSIZ, EVT_SIZE | GEVNTSIZ_INTMASK);  /* polled: keep the IRQ masked */
+    wr(GEVNTCOUNT, 0);
+
+    wr(DCFG, rd(DCFG) & ~(DCFG_SPEED_MASK | DCFG_DEVADDR_MASK | DCFG_LPM_CAP));
+
+    /* One transfer resource per endpoint, then EP0 OUT/IN. A command that
+     * never completes means part of the controller has no clock: dump the
+     * state and stay disconnected. */
+    if (ep_cmd(0, CMD_STARTCFG, 0, 0) == 0xFFFFFFFF)
+        goto fail;
+    for (int phys = 0; phys <= PHYS_NCM_NOTIFY; phys++)
+        if (ep_cmd(phys, CMD_SETXFERRES, 1, 0) == 0xFFFFFFFF)
+            goto fail;
+    if (ep_config(0, 0, EP0_MPS, 0, 0) == 0xFFFFFFFF ||
+        ep_config(1, 0, EP0_MPS, 0, 0) == 0xFFFFFFFF)
+        goto fail;
+    wr(DALEPENA, 3);
+    ep0_start_setup();
+    if (ep0_rsc == 0xFFFFFFFF)
+        goto fail;
+
+    wr(DEVTEN, DEVTEN_DISCONN | DEVTEN_USBRST | DEVTEN_CONNDONE);
+
+    /* No PMIC/extcon hookup: tell the controller VBUS is there */
+    wr(QSCRATCH_HS_PHY_CTRL, rd(QSCRATCH_HS_PHY_CTRL) | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL);
+    wr(QSCRATCH_SS_PHY_CTRL, rd(QSCRATCH_SS_PHY_CTRL) | LANE0_PWR_PRESENT);
+
+    wr(DCTL, rd(DCTL) | DCTL_RUN_STOP);
+    if (wait_clear(DSTS, DSTS_DEVCTRLHLT, 500)) {
+        serial_puts("[USB ] controller did not start\n");
+        return -1;
+    }
+    started = 1;
+    serial_puts("[USB ] gadget up on usb_1, waiting for the host\n");
+    return 0;
+
+fail:
+    dump_state();
+    serial_puts("[USB ] endpoint commands stuck, gadget not started\n");
+    return -1;
+}
+
+/* Disconnect, and come back presenting the other configuration. Caller
+ * holds the console lock (or is acm_poll). */
+static void switch_mode(int ncm)
+{
+    acm_stop();
+    ep0_state = EP0_SETUP;
+    ep0_active = -1;
+    ep0_out_req = 0;
+    rx_active = tx_active = tx_stalled = dtr = 0;
+    if (ncm_alt)
+        ncm_link(0);
+    ncm_alt = ncm_rx_active = ncm_tx_active = ncm_notify_active = ncm_notify_next = 0;
+    ncm_mode = ncm;
+    ncm_watch = ncm;
+    ncm_switch_ms = timer_ms();
+    log_budget = 40;
+    mdelay(100);                                /* long enough for the host to notice */
+    acm_start(dwc, dma);
+}
+
+/* `net up` / `net down`: the composite with the network function, or the
+ * serial port alone. Returns what is now presented. */
+int usb_set_ncm(int on)
+{
+    if (!dwc)
+        return 0;
+    uint64_t flags = console_lock();
+    if (on != ncm_mode)
+        switch_mode(on);
+    console_unlock(flags);
+    return ncm_mode;
+}
+
+int usb_ncm_state(void)
+{
+    return !ncm_mode ? 0 : !configured ? 1 : !ncm_alt ? 2 : 3;
+}

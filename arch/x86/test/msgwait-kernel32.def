@@ -1,0 +1,18 @@
+LIBRARY kernel32.dll
+EXPORTS
+ExitProcess@4
+GetStdHandle@4
+WriteFile@20
+LoadLibraryA@4
+GetProcAddress@8
+CreateEventA@16
+SetEvent@4
+ResetEvent@4
+CloseHandle@4
+WaitForSingleObject@8
+GetCurrentThreadId@0
+GetCurrentThread@0
+QueueUserAPC@12
+GetLastError@0
+SetLastError@4
+GetCommandLineA@0

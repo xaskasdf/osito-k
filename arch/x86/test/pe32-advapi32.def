@@ -1,0 +1,15 @@
+LIBRARY ADVAPI32.dll
+EXPORTS
+    AddAce@20
+    AddAccessAllowedAce@16
+    AllocateAndInitializeSid@44
+    FreeSid@4
+    GetAce@12
+    GetAclInformation@16
+    GetLengthSid@4
+    InitializeAcl@12
+    MapGenericMask@8
+    RegCloseKey@4
+    RegCreateKeyExA@36
+    RegSetValueExA@24
+    SetFileSecurityA@12

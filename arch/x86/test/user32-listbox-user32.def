@@ -1,0 +1,18 @@
+LIBRARY USER32.dll
+EXPORTS
+    RegisterClassA@4
+    UnregisterClassA@8
+    CreateWindowExA@48
+    CreateWindowExW@48
+    DestroyWindow@4
+    IsWindow@4
+    SendMessageA@16
+    SendMessageW@16
+    DefWindowProcA@16
+    CallWindowProcA@20
+    SetWindowLongA@12
+    SetFocus@4
+    GetCapture@0
+    GetClientRect@8
+    GetSysColor@4
+    FillRect@12

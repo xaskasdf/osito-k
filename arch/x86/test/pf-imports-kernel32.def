@@ -1,0 +1,7 @@
+LIBRARY kernel32.dll
+EXPORTS
+ExitProcess@4
+GetStdHandle@4
+WriteFile@20
+GetLastError@0
+QueryProcessCycleTime@8

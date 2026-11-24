@@ -1,0 +1,3 @@
+LIBRARY tier0_s64.dll
+EXPORTS
+g_dwDllEntryThreadId DATA

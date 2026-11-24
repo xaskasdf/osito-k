@@ -1,0 +1,15 @@
+LIBRARY kernel32.dll
+EXPORTS
+CreateIoCompletionPort@16
+GetQueuedCompletionStatus@20
+GetQueuedCompletionStatusEx@24
+PostQueuedCompletionStatus@16
+CreateThread@24
+WaitForSingleObject@8
+GetTickCount@0
+GetLastError@0
+Sleep@4
+CloseHandle@4
+GetStdHandle@4
+WriteFile@20
+ExitProcess@4

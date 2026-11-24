@@ -1,0 +1,18 @@
+LIBRARY kernel32.dll
+EXPORTS
+CreateFileA@28
+CreateFileW@28
+WriteFile@20
+ReadFile@20
+SetFilePointer@16
+SetEndOfFile@4
+FlushFileBuffers@4
+CloseHandle@4
+LockFile@20
+UnlockFile@20
+GetLastError@0
+DuplicateHandle@28
+GetCurrentProcess@0
+GetStdHandle@4
+GetCommandLineA@0
+ExitProcess@4

@@ -1,0 +1,946 @@
+/*
+ * OsitoK x86-64 — Minimal NVMe Driver (Read-only)
+ *
+ * Supports: identify, read, write. Full OsitoFS v2 I/O.
+ *
+ * NVMe registers at BAR0 (MMIO). Admin queue + one I/O queue.
+ * Uses polling (no interrupts) for simplicity.
+ */
+
+#include "../include/types.h"
+#include "../include/paging.h"
+#include "../include/pci.h"
+
+/* ── Declarations ────────────────────────────────────────────── */
+
+extern void serial_puts(const char *s);
+extern void serial_putc(char c);
+extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
+extern void fb_puts(const char *s);
+extern void fb_putdec(uint64_t val);
+extern void fb_puthex(uint64_t val, int digits);
+
+extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
+extern void  mem_free_pages(void *addr, uint64_t count);
+
+/* ── NVMe Register Map (BAR0) ────────────────────────────────── */
+
+#define NVME_REG_CAP        0x00   /* Controller Capabilities (64-bit) */
+#define NVME_REG_VS         0x08   /* Version */
+#define NVME_REG_CC         0x14   /* Controller Configuration */
+#define NVME_REG_CSTS       0x1C   /* Controller Status */
+#define NVME_REG_AQA        0x24   /* Admin Queue Attributes */
+#define NVME_REG_ASQ        0x28   /* Admin SQ Base (64-bit) */
+#define NVME_REG_ACQ        0x30   /* Admin CQ Base (64-bit) */
+
+/* Doorbell stride from CAP */
+#define NVME_CAP_DSTRD(cap) (((cap) >> 32) & 0xF)
+#define NVME_DOORBELL_BASE  0x1000
+
+/* CC fields */
+#define NVME_CC_EN          (1 << 0)
+#define NVME_CC_CSS_NVM     (0 << 4)
+#define NVME_CC_MPS_4K      (0 << 7)
+#define NVME_CC_AMS_RR      (0 << 11)
+#define NVME_CC_SHN_NONE    (0 << 14)
+#define NVME_CC_IOSQES      (6 << 16)  /* 64 bytes */
+#define NVME_CC_IOCQES      (4 << 20)  /* 16 bytes */
+
+#define NVME_CSTS_RDY       (1 << 0)
+
+/* ── NVMe Command Structures ────────────────────────────────── */
+
+typedef struct __attribute__((packed)) {
+    uint32_t cdw0;      /* opcode(7:0), fuse(9:8), psdt(15:14), cid(31:16) */
+    uint32_t nsid;
+    uint64_t reserved;
+    uint64_t mptr;
+    uint64_t prp1;
+    uint64_t prp2;
+    uint32_t cdw10;
+    uint32_t cdw11;
+    uint32_t cdw12;
+    uint32_t cdw13;
+    uint32_t cdw14;
+    uint32_t cdw15;
+} nvme_sqe_t;          /* 64 bytes */
+
+typedef struct __attribute__((packed)) {
+    uint32_t result;
+    uint32_t reserved;
+    uint16_t sq_head;
+    uint16_t sq_id;
+    uint16_t cid;
+    uint16_t status;    /* phase bit in bit 0, status in 1:15 */
+} nvme_cqe_t;          /* 16 bytes */
+
+/* ── NVMe Opcodes ────────────────────────────────────────────── */
+
+#define NVME_ADMIN_IDENTIFY       0x06
+#define NVME_ADMIN_CREATE_IOSQ    0x01
+#define NVME_ADMIN_CREATE_IOCQ    0x05
+
+#define NVME_IO_READ              0x02
+#define NVME_IO_WRITE             0x01
+
+/* ── Queue sizes ─────────────────────────────────────────────── */
+
+#define ADMIN_QUEUE_SIZE    16
+#define IO_QUEUE_SIZE       64
+#define NVME_PRP_LIST_ENTRIES 512
+
+/* ── Driver state ────────────────────────────────────────────── */
+
+typedef struct {
+    volatile void *bar0;      /* MMIO base */
+    uint32_t dstrd;           /* Doorbell stride (in 32-bit units) */
+
+    /* Admin queue */
+    nvme_sqe_t *asq;
+    nvme_cqe_t *acq;
+    uint16_t    asq_tail;
+    uint16_t    acq_head;
+    uint8_t     acq_phase;
+
+    /* I/O queue (queue ID = 1) */
+    nvme_sqe_t *iosq;
+    nvme_cqe_t *iocq;
+    uint64_t   *io_prp_list;
+    uint64_t    io_prp_list_phys;
+    uint16_t    iosq_tail;
+    uint16_t    iocq_head;
+    uint8_t     iocq_phase;
+
+    /* Identify data */
+    uint64_t    total_lbas;
+    uint32_t    lba_size;     /* bytes per LBA */
+    uint32_t    max_transfer; /* max transfer size in LBAs */
+
+    uint16_t    cmd_id;
+    bool        initialized;
+} nvme_state_t;
+
+static nvme_state_t nvme;
+
+/* The controller has one shared I/O SQ/CQ. Serialize ownership so concurrent
+ * pread calls cannot consume each other's completion or race the queue heads. */
+static volatile uint32_t nvme_io_queue_lock;
+static volatile uint32_t nvme_async_active;
+static volatile uint64_t nvme_debug_watch_phys_page = UINT64_MAX;
+static volatile uint64_t nvme_debug_watch_virt;
+static volatile uint64_t nvme_debug_watch_sequence;
+
+static uint64_t nvme_io_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    while (__atomic_exchange_n(&nvme_io_queue_lock, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+    return flags;
+}
+
+static void nvme_io_unlock_irqrestore(uint64_t flags)
+{
+    __atomic_store_n(&nvme_io_queue_lock, 0, __ATOMIC_RELEASE);
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
+
+void nvme_debug_watch_set(uint64_t phys, uint64_t virt)
+{
+    __atomic_store_n(&nvme_debug_watch_virt, virt, __ATOMIC_RELEASE);
+    __atomic_store_n(&nvme_debug_watch_phys_page,
+                     phys == UINT64_MAX ? UINT64_MAX : phys & ~0xFFFULL,
+                     __ATOMIC_RELEASE);
+    serial_puts("[NVMe-WATCH] set va=0x");
+    serial_puthex(virt, 16);
+    serial_puts(" phys=0x");
+    serial_puthex(phys, 16);
+    serial_puts(" page=0x");
+    serial_puthex(phys == UINT64_MAX ? UINT64_MAX : phys & ~0xFFFULL, 16);
+    serial_puts("\n");
+}
+
+static bool nvme_debug_range_hits(uint64_t address, uint64_t bytes,
+                                  uint64_t watched_page)
+{
+    if (!bytes || address >= watched_page + 4096) return false;
+    return address + bytes > watched_page;
+}
+
+static bool nvme_debug_prps_hit(const nvme_sqe_t *cmd, uint64_t bytes,
+                                uint64_t watched_page)
+{
+    uint64_t first_bytes = 4096 - (cmd->prp1 & 0xFFFULL);
+    if (first_bytes > bytes) first_bytes = bytes;
+    if (nvme_debug_range_hits(cmd->prp1, first_bytes, watched_page))
+        return true;
+
+    uint64_t remaining = bytes - first_bytes;
+    if (!remaining || !cmd->prp2) return false;
+    if (remaining <= 4096)
+        return nvme_debug_range_hits(cmd->prp2, remaining, watched_page);
+
+    uint32_t page_count = (uint32_t)((remaining + 4095) >> 12);
+    if (page_count > NVME_PRP_LIST_ENTRIES) return false;
+    const uint64_t *prps = (const uint64_t *)PHYS_TO_VIRT(cmd->prp2);
+    for (uint32_t i = 0; i < page_count; i++) {
+        uint64_t page_bytes = remaining > 4096 ? 4096 : remaining;
+        if (nvme_debug_range_hits(prps[i], page_bytes, watched_page))
+            return true;
+        remaining -= page_bytes;
+    }
+    return false;
+}
+
+static void nvme_debug_log_command(const nvme_sqe_t *cmd, uint16_t cid)
+{
+    uint64_t watched_page = __atomic_load_n(&nvme_debug_watch_phys_page,
+                                             __ATOMIC_ACQUIRE);
+    uint8_t opcode = (uint8_t)cmd->cdw0;
+    if (watched_page == UINT64_MAX ||
+        (opcode != NVME_IO_READ && opcode != NVME_IO_WRITE))
+        return;
+
+    uint64_t bytes = ((uint64_t)(cmd->cdw12 & 0xFFFFU) + 1) * nvme.lba_size;
+    if (!nvme_debug_prps_hit(cmd, bytes, watched_page))
+        return;
+
+    uint64_t sequence = __atomic_add_fetch(&nvme_debug_watch_sequence, 1,
+                                            __ATOMIC_RELAXED);
+    serial_puts("[NVMe-WATCH] DMA overlap seq=");
+    serial_putdec(sequence);
+    serial_puts(" op=");
+    serial_puts(opcode == NVME_IO_READ ? "read" : "write");
+    serial_puts(" cid=");
+    serial_putdec(cid);
+    serial_puts(" lba=");
+    serial_putdec(((uint64_t)cmd->cdw11 << 32) | cmd->cdw10);
+    serial_puts(" bytes=");
+    serial_putdec(bytes);
+    serial_puts(" prp1=0x");
+    serial_puthex(cmd->prp1, 16);
+    serial_puts(" prp2=0x");
+    serial_puthex(cmd->prp2, 16);
+    serial_puts(" watched-va=0x");
+    serial_puthex(__atomic_load_n(&nvme_debug_watch_virt, __ATOMIC_ACQUIRE), 16);
+    serial_puts(" watched-page=0x");
+    serial_puthex(watched_page, 16);
+    serial_puts("\n");
+}
+
+void nvme_debug_watch_cpu_write(void *destination, uint64_t bytes,
+                                const char *source)
+{
+    uint64_t watched_page = __atomic_load_n(&nvme_debug_watch_phys_page,
+                                             __ATOMIC_ACQUIRE);
+    if (watched_page == UINT64_MAX || !bytes) return;
+
+    extern uint64_t proc_current_cr3(void);
+    uint64_t cr3 = proc_current_cr3();
+    uint64_t start = (uint64_t)(uintptr_t)destination;
+    uint64_t end = start + bytes;
+    for (uint64_t va = start; va < end;) {
+        uint64_t phys = paging_translate_in_cr3(cr3, va);
+        uint64_t page_bytes = 4096 - (va & 0xFFFULL);
+        if (page_bytes > end - va) page_bytes = end - va;
+        if (phys != UINT64_MAX && (phys & ~0xFFFULL) == watched_page) {
+            serial_puts("[NVMe-WATCH] CPU alias write source=");
+            serial_puts(source ? source : "unknown");
+            serial_puts(" dst=0x");
+            serial_puthex(va, 16);
+            serial_puts(" phys=0x");
+            serial_puthex(phys, 16);
+            serial_puts(" bytes=");
+            serial_putdec(page_bytes);
+            serial_puts(" watched-va=0x");
+            serial_puthex(__atomic_load_n(&nvme_debug_watch_virt,
+                                          __ATOMIC_ACQUIRE), 16);
+            serial_puts("\n");
+        }
+        va += page_bytes;
+    }
+}
+
+/* ── Register access ─────────────────────────────────────────── */
+
+static uint32_t nvme_read32(uint32_t offset)
+{
+    return mmio_read32((volatile void *)((uint64_t)nvme.bar0 + offset));
+}
+
+static uint64_t nvme_read64(uint32_t offset)
+{
+    return mmio_read64((volatile void *)((uint64_t)nvme.bar0 + offset));
+}
+
+static void nvme_write32(uint32_t offset, uint32_t val)
+{
+    mmio_write32((volatile void *)((uint64_t)nvme.bar0 + offset), val);
+}
+
+static void nvme_write64(uint32_t offset, uint64_t val)
+{
+    mmio_write64((volatile void *)((uint64_t)nvme.bar0 + offset), val);
+}
+
+/* ── Doorbell writes ─────────────────────────────────────────── */
+
+static void nvme_ring_sq_doorbell(uint16_t qid, uint16_t tail)
+{
+    uint32_t offset = NVME_DOORBELL_BASE + (2 * qid) * (4 << nvme.dstrd);
+    nvme_write32(offset, tail);
+}
+
+static void nvme_ring_cq_doorbell(uint16_t qid, uint16_t head)
+{
+    uint32_t offset = NVME_DOORBELL_BASE + (2 * qid + 1) * (4 << nvme.dstrd);
+    nvme_write32(offset, head);
+}
+
+/* ── Submit and wait (polling) ───────────────────────────────── */
+
+static int nvme_admin_submit_wait(nvme_sqe_t *cmd)
+{
+    cmd->cdw0 = (cmd->cdw0 & 0xFFFF) | ((uint32_t)nvme.cmd_id++ << 16);
+
+    nvme.asq[nvme.asq_tail] = *cmd;
+    nvme.asq_tail = (nvme.asq_tail + 1) % ADMIN_QUEUE_SIZE;
+    wmb();
+    nvme_ring_sq_doorbell(0, nvme.asq_tail);
+
+    /* Poll CQ */
+    for (uint32_t timeout = 0; timeout < 10000000; timeout++) {
+        volatile nvme_cqe_t *cqe = &nvme.acq[nvme.acq_head];
+        if ((cqe->status & 1) == nvme.acq_phase) {
+            rmb();
+            uint16_t status = cqe->status >> 1;
+            nvme.acq_head = (nvme.acq_head + 1) % ADMIN_QUEUE_SIZE;
+            if (nvme.acq_head == 0) nvme.acq_phase ^= 1;
+            nvme_ring_cq_doorbell(0, nvme.acq_head);
+            return (status == 0) ? 0 : -1;
+        }
+        __asm__ volatile ("pause");
+    }
+
+    serial_puts("[NVMe] Admin command timeout\n");
+    return -1;
+}
+
+static int nvme_prepare_sync_prps(nvme_sqe_t *cmd, const void *buffer,
+                                  uint64_t bytes)
+{
+    if (!bytes) return 0;
+    if (!buffer) return -1;
+
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    uintptr_t address = (uintptr_t)buffer;
+    uint64_t first_page_bytes = 4096 - (address & 4095U);
+    cmd->prp1 = paging_translate_in_cr3(cr3, address);
+    if (cmd->prp1 == UINT64_MAX) return -1;
+    cmd->prp2 = 0;
+    if (bytes <= first_page_bytes) return 0;
+
+    const uint8_t *next_page = (const uint8_t *)buffer + first_page_bytes;
+    uint64_t remaining = bytes - first_page_bytes;
+    if (remaining <= 4096) {
+        cmd->prp2 = paging_translate_in_cr3(cr3, (uintptr_t)next_page);
+        return cmd->prp2 == UINT64_MAX ? -1 : 0;
+    }
+
+    uint32_t page_count = (uint32_t)((remaining + 4095) >> 12);
+    if (!nvme.io_prp_list || page_count > NVME_PRP_LIST_ENTRIES)
+        return -1;
+    for (uint32_t i = 0; i < page_count; i++) {
+        uint64_t phys = paging_translate_in_cr3(
+            cr3, (uintptr_t)(next_page + (uint64_t)i * 4096));
+        if (phys == UINT64_MAX) return -1;
+        nvme.io_prp_list[i] = phys;
+    }
+    wmb();
+    cmd->prp2 = nvme.io_prp_list_phys;
+    return 0;
+}
+
+static int nvme_io_submit_wait(nvme_sqe_t *cmd, const void *buffer,
+                               uint64_t bytes)
+{
+    uint64_t irq_flags;
+    for (;;) {
+        irq_flags = nvme_io_lock_irqsave();
+        if (!__atomic_load_n(&nvme_async_active, __ATOMIC_ACQUIRE))
+            break;
+        nvme_io_unlock_irqrestore(irq_flags);
+        __asm__ volatile ("pause");
+    }
+
+    if (nvme_prepare_sync_prps(cmd, buffer, bytes) < 0) {
+        nvme_io_unlock_irqrestore(irq_flags);
+        return -1;
+    }
+
+    uint16_t cid = nvme.cmd_id++;
+    cmd->cdw0 = (cmd->cdw0 & 0xFFFF) | ((uint32_t)cid << 16);
+    nvme_debug_log_command(cmd, cid);
+
+    nvme.iosq[nvme.iosq_tail] = *cmd;
+    nvme.iosq_tail = (nvme.iosq_tail + 1) % IO_QUEUE_SIZE;
+    wmb();
+    nvme_ring_sq_doorbell(1, nvme.iosq_tail);
+
+    /* ponytail: this queue allows one owner at a time.  Do not abandon an
+     * in-flight command without resetting the controller; its late CQE would
+     * otherwise be consumed by the next command. */
+    for (;;) {
+        volatile nvme_cqe_t *cqe = &nvme.iocq[nvme.iocq_head];
+        if ((cqe->status & 1) == nvme.iocq_phase) {
+            rmb();
+            uint16_t completed_cid = cqe->cid;
+            uint16_t status = cqe->status >> 1;
+            nvme.iocq_head = (nvme.iocq_head + 1) % IO_QUEUE_SIZE;
+            if (nvme.iocq_head == 0) nvme.iocq_phase ^= 1;
+            nvme_ring_cq_doorbell(1, nvme.iocq_head);
+
+            if (completed_cid != cid) {
+                serial_puts("[NVMe] Unexpected sync completion CID expected=");
+                serial_putdec(cid);
+                serial_puts(" got=");
+                serial_putdec(completed_cid);
+                serial_puts("\n");
+                continue;
+            }
+
+            rmb();
+            nvme_io_unlock_irqrestore(irq_flags);
+            return (status == 0) ? 0 : -1;
+        }
+        __asm__ volatile ("pause");
+    }
+
+}
+
+/* ── Async I/O: submit without waiting ─────────────────────── */
+
+/* Submit an I/O command and return immediately with the cmd_id.
+ * Caller must later call nvme_poll_cq() or nvme_wait_cq() to
+ * check/wait for completion. Max 2 in-flight for ping-pong. */
+
+static volatile uint32_t nvme_inflight;
+
+uint16_t nvme_io_submit_async(nvme_sqe_t *cmd)
+{
+    uint64_t irq_flags;
+    for (;;) {
+        irq_flags = nvme_io_lock_irqsave();
+        if (!__atomic_load_n(&nvme_async_active, __ATOMIC_ACQUIRE))
+            break;
+        nvme_io_unlock_irqrestore(irq_flags);
+        __asm__ volatile ("pause");
+    }
+    __atomic_store_n(&nvme_async_active, 1, __ATOMIC_RELEASE);
+
+    uint16_t cid = nvme.cmd_id++;
+    cmd->cdw0 = (cmd->cdw0 & 0xFFFF) | ((uint32_t)cid << 16);
+    nvme_debug_log_command(cmd, cid);
+
+    nvme.iosq[nvme.iosq_tail] = *cmd;
+    nvme.iosq_tail = (nvme.iosq_tail + 1) % IO_QUEUE_SIZE;
+    wmb();
+    nvme_ring_sq_doorbell(1, nvme.iosq_tail);
+    nvme_inflight++;
+    nvme_io_unlock_irqrestore(irq_flags);
+    return cid;
+}
+
+/* Non-blocking: check if a specific command completed. Returns:
+ *   0 = completed OK,  -1 = not yet,  -2 = error */
+int nvme_poll_cq(uint16_t expected_cid)
+{
+    uint64_t irq_flags = nvme_io_lock_irqsave();
+    volatile nvme_cqe_t *cqe = &nvme.iocq[nvme.iocq_head];
+    if ((cqe->status & 1) != nvme.iocq_phase) {
+        nvme_io_unlock_irqrestore(irq_flags);
+        return -1;  /* no completion yet */
+    }
+
+    rmb();
+    uint16_t cid = cqe->cid;
+    uint16_t status = cqe->status >> 1;
+    nvme.iocq_head = (nvme.iocq_head + 1) % IO_QUEUE_SIZE;
+    if (nvme.iocq_head == 0) nvme.iocq_phase ^= 1;
+    nvme_ring_cq_doorbell(1, nvme.iocq_head);
+
+    if (cid != expected_cid) {
+        serial_puts("[NVMe] Unexpected async completion CID expected=");
+        serial_putdec(expected_cid);
+        serial_puts(" got=");
+        serial_putdec(cid);
+        serial_puts("\n");
+        nvme_io_unlock_irqrestore(irq_flags);
+        return -1;
+    }
+
+    if (nvme_inflight > 0) nvme_inflight--;
+    __atomic_store_n(&nvme_async_active, 0, __ATOMIC_RELEASE);
+    rmb();
+    nvme_io_unlock_irqrestore(irq_flags);
+    return (status == 0) ? 0 : -2;
+}
+
+/* Blocking: spin until the command completes */
+int nvme_wait_cq(uint16_t cid)
+{
+    for (;;) {
+        int r = nvme_poll_cq(cid);
+        if (r >= -1 && r != -1) return r;  /* 0 or -2 */
+        __asm__ volatile ("pause");
+    }
+}
+
+/* High-level: async read of LBAs to a physical address.
+ * Returns cmd_id (use nvme_wait_cq to wait). Limits to 2 pages. */
+int nvme_read_async(uint64_t lba, uint32_t count, uint64_t phys_addr)
+{
+    if (!nvme.initialized || count == 0) return -1;
+    uint32_t lbas_per_page = 4096 / nvme.lba_size;
+    if (count > lbas_per_page * 2) count = lbas_per_page * 2;
+
+    nvme_sqe_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_IO_READ;
+    cmd.nsid = 1;
+    cmd.prp1 = phys_addr;
+    if ((uint64_t)count * nvme.lba_size > 4096)
+        cmd.prp2 = phys_addr + 4096;
+    cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF);
+    cmd.cdw11 = (uint32_t)(lba >> 32);
+    cmd.cdw12 = count - 1;
+
+    return (int)nvme_io_submit_async(&cmd);
+}
+
+/* Accessor for external code */
+uint32_t nvme_get_lba_size(void) { return nvme.initialized ? nvme.lba_size : 512; }
+
+/* ── Initialize NVMe controller ──────────────────────────────── */
+
+int __initk nvme_init(const pci_dev_t *device)
+{
+    if (!device || !device->bar[0]) return -1;
+    uint64_t bar0_phys = device->bar[0];
+    uint16_t pci_command = pci_cfg_read16(device->bus, device->dev, device->func, 4);
+    if (pci_command == 0xffff) return -1;
+    pci_cfg_write16(device->bus, device->dev, device->func, 4, (pci_command | 2) & ~4U);
+    if ((pci_cfg_read16(device->bus, device->dev, device->func, 4) & 6) != 2) {
+        serial_puts("[NVMe] Cannot acquire quiescent PCI endpoint\n");
+        return -1;
+    }
+    memset(&nvme, 0, sizeof(nvme));
+    /* Use the upper-half MMIO alias so register accesses work from
+     * any CR3 (paging_map_mmio installs BAR pages at both identity
+     * and KERNEL_VBASE+phys). */
+    nvme.bar0 = (volatile void *)PHYS_TO_VIRT(bar0_phys);
+
+    serial_puts("[NVMe] Initializing, BAR0=");
+    serial_puthex(bar0_phys, 16);
+    serial_puts("\n");
+
+    /* Read capabilities */
+    uint64_t cap = nvme_read64(NVME_REG_CAP);
+    nvme.dstrd = NVME_CAP_DSTRD(cap);
+    uint32_t mqes = (cap & 0xFFFF) + 1; /* Max queue entries */
+
+    uint32_t vs = nvme_read32(NVME_REG_VS);
+    serial_puts("[NVMe] Version ");
+    serial_putdec((vs >> 16) & 0xFFFF);
+    serial_puts(".");
+    serial_putdec((vs >> 8) & 0xFF);
+    serial_puts(", MQES=");
+    serial_putdec(mqes);
+    serial_puts("\n");
+
+    /* Disable controller */
+    nvme_write32(NVME_REG_CC, 0);
+    /* Wait for not ready */
+    for (uint32_t i = 0; i < 1000000; i++) {
+        if (!(nvme_read32(NVME_REG_CSTS) & NVME_CSTS_RDY)) break;
+        __asm__ volatile ("pause");
+    }
+    if (nvme_read32(NVME_REG_CSTS) & NVME_CSTS_RDY) {
+        serial_puts("[NVMe] Controller did not stop\n");
+        return -1;
+    }
+
+    /* Allocate admin queues (page-aligned). The struct fields hold
+     * upper-half virt pointers so kernel CPU code can read/write the
+     * queue entries via the direct map; the hardware register writes
+     * below convert back to phys via VIRT_TO_PHYS. */
+    void *asq_phys = mem_alloc_aligned(ADMIN_QUEUE_SIZE * sizeof(nvme_sqe_t), 4096);
+    void *acq_phys = mem_alloc_aligned(ADMIN_QUEUE_SIZE * sizeof(nvme_cqe_t), 4096);
+    if (!asq_phys || !acq_phys) {
+        serial_puts("[NVMe] Failed to allocate admin queues\n");
+        return -1;
+    }
+    nvme.asq = (nvme_sqe_t *)PHYS_TO_VIRT(asq_phys);
+    nvme.acq = (nvme_cqe_t *)PHYS_TO_VIRT(acq_phys);
+    memset(nvme.asq, 0, ADMIN_QUEUE_SIZE * sizeof(nvme_sqe_t));
+    memset(nvme.acq, 0, ADMIN_QUEUE_SIZE * sizeof(nvme_cqe_t));
+
+    nvme.asq_tail = 0;
+    nvme.acq_head = 0;
+    nvme.acq_phase = 1;
+
+    /* Configure admin queues — hardware needs the physical addresses. */
+    nvme_write32(NVME_REG_AQA, ((ADMIN_QUEUE_SIZE - 1) << 16) | (ADMIN_QUEUE_SIZE - 1));
+    nvme_write64(NVME_REG_ASQ, VIRT_TO_PHYS(nvme.asq));
+    nvme_write64(NVME_REG_ACQ, VIRT_TO_PHYS(nvme.acq));
+
+    /* Firmware is not the owner after kexec. Establish the DMA path only
+     * after old queues stopped and the new admin queues are installed. */
+    pci_dma_path_t path;
+    const char *path_error = pci_prepare_dma_path(device, &path);
+    if (path_error) {
+        serial_puts("[NVMe] DMA path: "); serial_puts(path_error); serial_puts("\n");
+        return -1;
+    }
+    pci_command = pci_cfg_read16(device->bus, device->dev, device->func, 4);
+    pci_cfg_write16(device->bus, device->dev, device->func, 4, pci_command | 6);
+    if ((pci_cfg_read16(device->bus, device->dev, device->func, 4) & 6) != 6) {
+        serial_puts("[NVMe] Bus mastering did not enable\n");
+        return -1;
+    }
+
+    /* Enable controller */
+    uint32_t cc = NVME_CC_EN | NVME_CC_CSS_NVM | NVME_CC_MPS_4K |
+                  NVME_CC_IOSQES | NVME_CC_IOCQES;
+    nvme_write32(NVME_REG_CC, cc);
+
+    /* Wait for ready */
+    for (uint32_t i = 0; i < 10000000; i++) {
+        if (nvme_read32(NVME_REG_CSTS) & NVME_CSTS_RDY) break;
+        __asm__ volatile ("pause");
+    }
+    if (!(nvme_read32(NVME_REG_CSTS) & NVME_CSTS_RDY)) {
+        serial_puts("[NVMe] Controller not ready\n");
+        return -1;
+    }
+
+    serial_puts("[NVMe] Controller ready\n");
+
+    /* Identify controller — DMA buffer (controller fills it). CPU reads
+     * the model name etc. afterwards, so we keep both views handy. */
+    void *identify_phys = mem_alloc_aligned(4096, 4096);
+    if (!identify_phys) return -1;
+    void *identify_buf  = PHYS_TO_VIRT(identify_phys);
+    memset(identify_buf, 0, 4096);
+
+    nvme_sqe_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_ADMIN_IDENTIFY;
+    cmd.prp1 = (uint64_t)identify_phys;
+    cmd.cdw10 = 1; /* Controller identify */
+
+    if (nvme_admin_submit_wait(&cmd) < 0) {
+        serial_puts("[NVMe] Identify controller failed\n");
+        return -1;
+    }
+
+    /* Print model name (bytes 24-63) */
+    char *model = (char *)identify_buf + 24;
+    serial_puts("[NVMe] Model: ");
+    for (int i = 0; i < 40 && model[i]; i++)
+        serial_putc(model[i]);
+    serial_puts("\n");
+
+    fb_puts(" NVMe: ");
+    for (int i = 0; i < 40 && model[i]; i++) {
+        if (model[i] >= 32 && model[i] < 127) {
+            char tmp[2] = { model[i], 0 };
+            fb_puts(tmp);
+        }
+    }
+    fb_puts("\n");
+
+    /* Identify namespace 1 */
+    memset(identify_buf, 0, 4096);
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_ADMIN_IDENTIFY;
+    cmd.nsid = 1;
+    cmd.prp1 = (uint64_t)identify_phys;
+    cmd.cdw10 = 0; /* Namespace identify */
+
+    if (nvme_admin_submit_wait(&cmd) < 0) {
+        serial_puts("[NVMe] Identify namespace failed\n");
+        return -1;
+    }
+
+    uint64_t nsze = *(uint64_t *)identify_buf; /* Namespace Size */
+    uint8_t flbas = *((uint8_t *)identify_buf + 26); /* Formatted LBA Size */
+    uint32_t lbaf_offset = 128 + (flbas & 0xF) * 4;
+    uint32_t lbaf = *(uint32_t *)((uint8_t *)identify_buf + lbaf_offset);
+    uint32_t lba_ds = (lbaf >> 16) & 0xFF; /* LBA Data Size (power of 2) */
+
+    nvme.total_lbas = nsze;
+    nvme.lba_size = 1 << lba_ds;
+    nvme.max_transfer = 256; /* Conservative: 256 LBAs per command */
+
+    serial_puts("[NVMe] NS1: ");
+    serial_putdec(nsze);
+    serial_puts(" LBAs x ");
+    serial_putdec(nvme.lba_size);
+    serial_puts(" bytes = ");
+    serial_putdec(nsze * nvme.lba_size / (1024 * 1024 * 1024));
+    serial_puts(" GB\n");
+
+    /* Create I/O Completion Queue (ID=1) */
+    void *iocq_phys = mem_alloc_aligned(IO_QUEUE_SIZE * sizeof(nvme_cqe_t), 4096);
+    if (!iocq_phys) return -1;
+    nvme.iocq = (nvme_cqe_t *)PHYS_TO_VIRT(iocq_phys);
+    memset(nvme.iocq, 0, IO_QUEUE_SIZE * sizeof(nvme_cqe_t));
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_ADMIN_CREATE_IOCQ;
+    cmd.prp1 = (uint64_t)iocq_phys;
+    cmd.cdw10 = ((IO_QUEUE_SIZE - 1) << 16) | 1;  /* QID=1, size */
+    cmd.cdw11 = 1; /* Physically contiguous */
+
+    if (nvme_admin_submit_wait(&cmd) < 0) {
+        serial_puts("[NVMe] Create IOCQ failed\n");
+        return -1;
+    }
+
+    /* Create I/O Submission Queue (ID=1, CQ=1) */
+    void *iosq_phys = mem_alloc_aligned(IO_QUEUE_SIZE * sizeof(nvme_sqe_t), 4096);
+    if (!iosq_phys) return -1;
+    nvme.iosq = (nvme_sqe_t *)PHYS_TO_VIRT(iosq_phys);
+    memset(nvme.iosq, 0, IO_QUEUE_SIZE * sizeof(nvme_sqe_t));
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_ADMIN_CREATE_IOSQ;
+    cmd.prp1 = (uint64_t)iosq_phys;
+    cmd.cdw10 = ((IO_QUEUE_SIZE - 1) << 16) | 1;  /* QID=1, size */
+    cmd.cdw11 = (1 << 16) | 1; /* CQID=1, physically contiguous */
+
+    if (nvme_admin_submit_wait(&cmd) < 0) {
+        serial_puts("[NVMe] Create IOSQ failed\n");
+        return -1;
+    }
+
+    void *prp_list_phys = mem_alloc_aligned(4096, 4096);
+    if (!prp_list_phys) {
+        serial_puts("[NVMe] PRP list allocation failed\n");
+        return -1;
+    }
+    nvme.io_prp_list_phys = (uint64_t)(uintptr_t)prp_list_phys;
+    nvme.io_prp_list = (uint64_t *)PHYS_TO_VIRT(prp_list_phys);
+    memset(nvme.io_prp_list, 0, 4096);
+
+    nvme.iosq_tail = 0;
+    nvme.iocq_head = 0;
+    nvme.iocq_phase = 1;
+    nvme.initialized = true;
+
+    serial_puts("[NVMe] I/O queues created, driver ready\n");
+
+    /* Register as a block device. NVMe driver currently uses one global
+     * `nvme` so multi-controller setups overwrite each other; the most
+     * recent successful nvme_init wins both nvme_read AND the blkdev
+     * read function. main.c iterates controllers sequentially during
+     * boot to find OsitoFS, which is consistent with this single-active
+     * model. */
+    extern int  blkdev_register(const char *name, uint8_t type,
+                                uint32_t sector_size, uint64_t sector_count,
+                                int (*read)(uint64_t, uint32_t, void *),
+                                int (*write)(uint64_t, uint32_t, const void *));
+    extern int  nvme_read(uint64_t lba, uint32_t count, void *buf);
+    extern int  nvme_write(uint64_t lba, uint32_t count, const void *buf);
+    blkdev_register("nvme0", 0 /* BLKDEV_NVME */,
+                    nvme.lba_size, nvme.total_lbas,
+                    nvme_read, nvme_write);
+
+    return 0;
+}
+
+/* ── Read LBAs ───────────────────────────────────────────────── */
+
+int nvme_read(uint64_t lba, uint32_t count, void *buf)
+{
+    if (!nvme.initialized) return -1;
+    if (count == 0 || !buf || !nvme.max_transfer) return -1;
+
+    /* Each command may use a direct PRP pair or the shared PRP-list page. */
+    uint8_t *dst = (uint8_t *)buf;
+
+    while (count > 0) {
+        uint32_t this_count = count;
+        if (this_count > nvme.max_transfer) this_count = nvme.max_transfer;
+
+        uint64_t bytes = (uint64_t)this_count * nvme.lba_size;
+
+        nvme_sqe_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.cdw0 = NVME_IO_READ;
+        cmd.nsid = 1;
+        /* PRP mapping is prepared after acquiring the shared queue lock. */
+        cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF);
+        cmd.cdw11 = (uint32_t)(lba >> 32);
+        cmd.cdw12 = this_count - 1; /* 0-based */
+
+        if (nvme_io_submit_wait(&cmd, dst, bytes) < 0) return -1;
+
+        dst += bytes;
+        lba += this_count;
+        count -= this_count;
+    }
+
+    return 0;
+}
+
+/* ── Read bytes at arbitrary offset ──────────────────────────── */
+
+int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
+{
+    if (!nvme.initialized) return -1;
+
+    uint64_t lba = byte_offset / nvme.lba_size;
+    uint64_t lba_offset = byte_offset % nvme.lba_size;
+
+    /* Allocate an aligned buffer and pass its direct-map alias through the
+     * synchronous API; nvme_read translates that virtual range into PRPs. */
+    void *temp_phys = mem_alloc_aligned(4096 * 2, 4096);
+    if (!temp_phys) return -1;
+    uint8_t *temp_virt = (uint8_t *)PHYS_TO_VIRT(temp_phys);
+
+    uint8_t *dst = (uint8_t *)buf;
+    uint64_t remaining = len;
+    uint64_t cur_lba = lba;
+    uint64_t cur_offset = lba_offset;
+
+    while (remaining > 0) {
+        uint32_t read_lbas = (uint32_t)((cur_offset + remaining + nvme.lba_size - 1) / nvme.lba_size);
+        if (read_lbas > 8) read_lbas = 8;  /* 4KB at a time */
+
+        if (nvme_read(cur_lba, read_lbas, temp_virt) < 0) {
+            mem_free_pages(temp_phys, 2);
+            return -1;
+        }
+
+        uint64_t avail = (uint64_t)read_lbas * nvme.lba_size - cur_offset;
+        uint64_t copy = remaining < avail ? remaining : avail;
+        memcpy(dst, temp_virt + cur_offset, copy);
+
+        dst += copy;
+        remaining -= copy;
+        cur_lba += read_lbas;
+        cur_offset = 0;
+    }
+
+    mem_free_pages(temp_phys, 2);
+    return 0;
+}
+
+/* ── Write LBAs ──────────────────────────────────────────────── */
+
+int nvme_write(uint64_t lba, uint32_t count, const void *buf)
+{
+    if (!nvme.initialized) return -1;
+    if (count == 0 || !buf || !nvme.max_transfer) return -1;
+
+    const uint8_t *src = (const uint8_t *)buf;
+
+    while (count > 0) {
+        uint32_t this_count = count;
+        if (this_count > nvme.max_transfer) this_count = nvme.max_transfer;
+
+        uint64_t bytes = (uint64_t)this_count * nvme.lba_size;
+
+        nvme_sqe_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.cdw0 = NVME_IO_WRITE;
+        cmd.nsid = 1;
+        /* PRP mapping is prepared after acquiring the shared queue lock. */
+        cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF);
+        cmd.cdw11 = (uint32_t)(lba >> 32);
+        cmd.cdw12 = this_count - 1; /* 0-based */
+
+        if (nvme_io_submit_wait(&cmd, src, bytes) < 0) return -1;
+
+        src += bytes;
+        lba += this_count;
+        count -= this_count;
+    }
+
+    return 0;
+}
+
+/* ── Write bytes at arbitrary offset ─────────────────────────── */
+
+int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
+{
+    if (!nvme.initialized) return -1;
+    if (len == 0) return 0;
+
+    uint64_t lba = byte_offset / nvme.lba_size;
+    uint64_t lba_offset = byte_offset % nvme.lba_size;
+
+    void *temp_phys = mem_alloc_aligned(4096 * 2, 4096);
+    if (!temp_phys) return -1;
+    uint8_t *temp_virt = (uint8_t *)PHYS_TO_VIRT(temp_phys);
+
+    const uint8_t *src = (const uint8_t *)buf;
+    uint64_t remaining = len;
+    uint64_t cur_lba = lba;
+    uint64_t cur_offset = lba_offset;
+
+    while (remaining > 0) {
+        uint32_t rw_lbas = (uint32_t)((cur_offset + remaining + nvme.lba_size - 1) / nvme.lba_size);
+        if (rw_lbas > 8) rw_lbas = 8;
+
+        /* Read-modify-write if not aligned */
+        if (cur_offset != 0 || remaining < (uint64_t)rw_lbas * nvme.lba_size) {
+            if (nvme_read(cur_lba, rw_lbas, temp_virt) < 0) {
+                mem_free_pages(temp_phys, 2);
+                return -1;
+            }
+        }
+
+        uint64_t avail = (uint64_t)rw_lbas * nvme.lba_size - cur_offset;
+        uint64_t copy = remaining < avail ? remaining : avail;
+        memcpy(temp_virt + cur_offset, src, copy);
+
+        if (nvme_write(cur_lba, rw_lbas, temp_virt) < 0) {
+            mem_free_pages(temp_phys, 2);
+            return -1;
+        }
+
+        src += copy;
+        remaining -= copy;
+        cur_lba += rw_lbas;
+        cur_offset = 0;
+    }
+
+    mem_free_pages(temp_phys, 2);
+    return 0;
+}
+
+/* ── Flush ───────────────────────────────────────────────────── */
+
+int nvme_flush(void)
+{
+    if (!nvme.initialized) return -1;
+
+    nvme_sqe_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = 0x00; /* Flush opcode */
+    cmd.nsid = 1;
+
+    return nvme_io_submit_wait(&cmd, NULL, 0);
+}
+
+/* ── Accessors ───────────────────────────────────────────────── */
+
+bool nvme_is_ready(void)  { return nvme.initialized; }
+uint32_t nvme_lba_size(void) { return nvme.lba_size; }
+uint64_t nvme_total_lbas(void) { return nvme.total_lbas; }

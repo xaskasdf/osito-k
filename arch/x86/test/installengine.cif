@@ -1,0 +1,45 @@
+[Version]
+Signature=$Chicago$
+DisplayName=%Title%
+DetDlls=probe-a.dll,probe-b.dll
+
+[GroupA]
+SectionType=Group
+DisplayName=Group description
+Priority=19
+
+[ComponentA]
+SectionType=Component
+DisplayName=%Name%
+Details=Component details
+Group=GroupA
+Size=23,17,13
+FileSize=11
+DownloadSize=29
+ExtractSize=31
+InstallSize=19
+GUID={12345678-1234-5678-9ABC-001122334455}
+Version=1,2,3,4
+Priority=7
+Platform=Win98,NT5
+AdminCheck=1
+Reboot=1
+UIVisible=1
+URL1="alpha.cab",3
+URL2="http://example.invalid/beta.cab",0
+Locale=EN
+
+[ComponentB]
+SectionType=Component
+DisplayName=Second component
+URL1=second.cab,3
+Version=2,3,4,5
+Size=5,7
+
+[Strings]
+Title=Neutral title
+Name=Neutral component
+
+[Strings.eng]
+Title=English title
+Name=English component

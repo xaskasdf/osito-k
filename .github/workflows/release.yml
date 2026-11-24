@@ -34,5 +34,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            build/osito0x00000.bin
-            build/osito.elf
+            arch/xtensa/build/osito0x00000.bin
+            arch/xtensa/build/osito.elf

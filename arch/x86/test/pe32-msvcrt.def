@@ -1,0 +1,4 @@
+LIBRARY MSVCRT.dll
+EXPORTS
+    _except_handler3
+    _except_handler4_common

@@ -1,0 +1,309 @@
+/*
+ * OsitoK — DOS INT Handler Stubs for Native 32-bit Execution
+ *
+ * When a DPMI client enters 32-bit protected mode, its DOS, BIOS, DPMI,
+ * and mouse interrupts trap here through the IDT. We save the full register
+ * state, call the C dispatcher, restore registers, and IRETQ back.
+ *
+ * Uses IST2 (separate from Win32's IST1) to avoid stack conflicts.
+ * Every entry owns its FP image, including while a nested IRQ runs host C.
+ *
+ * DOS INTs pass arguments in registers (AH=function, DS:DX=buffer, etc.)
+ * so we pass the entire saved register frame to the C handler.
+ */
+
+#include "dos_native_fp.h"
+
+.code64
+.text
+
+/*
+ * Common handler body — entered with the interrupt number pushed by the
+ * vector stub immediately above the CPU's IRET frame.
+ * Calls dos_int_native_dispatch(int_num, regs_ptr, fp_image), then restores.
+ */
+dos_int_common:
+    /* CPU loaded RSP from TSS.IST2 and pushed a 40-byte IRET frame. The
+     * vector stub then pushed one qword without clobbering a guest GPR. */
+
+    /* Save all registers */
+    push %rax
+    push %rbx
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %rbp
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+
+    /* Save segment registers (as 64-bit pushes, only low 16 bits matter) */
+    xor %rax, %rax
+    mov %ds, %ax
+    push %rax
+    mov %es, %ax
+    push %rax
+    mov %fs, %ax
+    push %rax
+    mov %gs, %ax
+    push %rax
+
+    /* Save old IST2 on stack (for reentrancy) */
+    movq tss_ist2_ptr(%rip), %r11
+    pushq (%r11)
+
+    /* Update IST2 below current RSP for nested INTs */
+    movq %rsp, %r10
+    subq $16384, %r10
+    movq %r10, (%r11)
+
+    /*
+     * Stack layout after the common saves:
+     *   [RSP +   0]:  saved old IST2
+     *   [RSP +   8]:  GS (start of dos_native_regs_t)
+     *   [RSP +  16]:  FS
+     *   [RSP +  24]:  ES
+     *   [RSP +  32]:  DS
+     *   [RSP +  40]:  R15
+     *   ...
+     *   [RSP + 104]:  RBP
+     *   [RSP + 112]:  RDI
+     *   [RSP + 120]:  RSI
+     *   [RSP + 128]:  RDX
+     *   [RSP + 136]:  RCX
+     *   [RSP + 144]:  RBX
+     *   [RSP + 152]:  RAX
+     *   [RSP + 160]:  interrupt number
+     *   [RSP + 168]:  IRET RIP
+     *   [RSP + 176]:  IRET CS
+     *   [RSP + 184]:  IRET RFLAGS
+     *   [RSP + 192]:  IRET RSP
+     *   [RSP + 200]:  IRET SS
+     */
+
+    /* Restore 64-bit data segments for kernel C code */
+    movw $0x30, %ax         /* GDT_SEL_DATA64 = 0x30 */
+    mov %ax, %ds
+    mov %ax, %es
+    cld                    /* C ABI; the saved IRET frame retains client DF. */
+
+    mov %rsp, %rbp
+    sub $DOS_NATIVE_FP_FRAME_BYTES, %rsp
+    and $~0x3F, %rsp
+    mov %rsp, %rdi
+    call dos_native_fp_save
+
+    /* Call C dispatcher:
+     *   RDI = interrupt number
+     *   RSI = pointer to saved register frame on stack
+     *   RDX = private FP image (also retained for non-local PM/RM exits)
+     * The C function reads/writes registers via the frame pointer. */
+    movq 160(%rbp), %rdi
+    leaq 8(%rbp), %rsi
+    movq %rsp, %rdx
+
+    call dos_int_native_dispatch
+    movq %rsp, %rdi
+    call dos_native_fp_restore
+    mov %rbp, %rsp
+
+    /* Restore IST2 */
+    movq tss_ist2_ptr(%rip), %r11
+    popq (%r11)
+
+    /* Restore segment registers */
+    pop %rax
+    mov %ax, %gs
+    pop %rax
+    mov %ax, %fs
+    pop %rax
+    mov %ax, %es
+    pop %rax
+    mov %ax, %ds
+
+    /* Restore GPRs */
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rbp
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rbx
+    pop %rax
+
+    addq $8, %rsp           /* discard interrupt number */
+    jmp x86_compat_iret
+
+/* Assembly callers own a 64-byte-aligned DOS_NATIVE_FP_FRAME_BYTES image.
+ * Keep the generic ISR and the DOS service gates on the same host policy. */
+.globl dos_native_fp_save
+dos_native_fp_save:
+    pushfq
+    cli
+    /* EM/TS belong to the interrupted context, never to kernel C code. */
+    mov %cr0, %rax
+    mov %rax, DOS_NATIVE_FP_CR0_OFFSET(%rdi)
+    mov %rax, %rdx
+    and $~0xc, %rax
+    cmp %rdx, %rax
+    je 1f
+    mov %rax, %cr0
+1:
+    /* XSAVE does not initialize reserved header bits on an unowned stack. */
+    movq $0, 512(%rdi)
+    movq $0, 520(%rdi)
+    movq $0, 528(%rdi)
+    movq $0, 536(%rdi)
+    movq $0, 544(%rdi)
+    movq $0, 552(%rdi)
+    movq $0, 560(%rdi)
+    movq $0, 568(%rdi)
+    cmpl $0, cpu_xsave_active(%rip)
+    je .Ldos_fxsave
+    movl $7, %eax
+    xorl %edx, %edx
+    xsave64 (%rdi)
+    jmp .Ldos_fp_saved
+.Ldos_fxsave:
+    fxsave64 (%rdi)
+.Ldos_fp_saved:
+    fnstenv DOS_NATIVE_FP_BYTES(%rdi)
+    movl $0, DOS_NATIVE_FP_COMPAT_OFFSET(%rdi)
+    /* FLDENV can retain legacy diagnostics only for 32-bit offsets. Never
+     * truncate a host pointer just because FNSTENV exposes a selector. */
+    movl 12(%rdi), %eax
+    orl 20(%rdi), %eax
+    jnz .Ldos_fp_host
+    movl $1, DOS_NATIVE_FP_COMPAT_OFFSET(%rdi)
+.Ldos_fp_host:
+    fninit
+    ldmxcsr dos_native_default_mxcsr(%rip)
+    popfq
+    ret
+
+/* Final assembly tail only: leave IF clear until IRET (or the test epilogue)
+ * restores the interrupted flags. R11 holds native-entry operands. */
+.globl dos_native_fp_restore
+dos_native_fp_restore:
+    cli
+    cmpl $0, cpu_xsave_active(%rip)
+    je .Ldos_fxrstor
+    movl $7, %eax
+    xorl %edx, %edx
+    xrstor64 (%rdi)
+    jmp .Ldos_restore_environment
+.Ldos_fxrstor:
+    fxrstor64 (%rdi)
+.Ldos_restore_environment:
+    cmpl $0, DOS_NATIVE_FP_COMPAT_OFFSET(%rdi)
+    je .Ldos_restore_cr0
+    /* Restore compatibility diagnostics even on CPUs whose FXRSTOR omits
+     * them with ES=0. The full tags/control/status match the restored data. */
+    fnclex
+    fldenv DOS_NATIVE_FP_BYTES(%rdi)
+.Ldos_restore_cr0:
+    mov DOS_NATIVE_FP_CR0_OFFSET(%rdi), %rax
+    mov %cr0, %rdx
+    cmp %rdx, %rax
+    je 1f
+    mov %rax, %cr0
+1:
+    ret
+
+/*
+ * Individual INT stubs push the vector without changing guest registers.
+ */
+
+.globl dos_int08_stub
+dos_int08_stub:             /* Timer (IRQ 0) */
+    pushq $0x08
+    jmp dos_int_common
+
+.globl dos_int10_stub
+dos_int10_stub:             /* BIOS Video */
+    pushq $0x10
+    jmp dos_int_common
+
+.globl dos_int16_stub
+dos_int16_stub:             /* BIOS Keyboard */
+    pushq $0x16
+    jmp dos_int_common
+
+.globl dos_int1a_stub
+dos_int1a_stub:             /* BIOS clock */
+    pushq $0x1A
+    jmp dos_int_common
+
+.globl dos_int20_stub
+dos_int20_stub:             /* DOS Terminate */
+    pushq $0x20
+    jmp dos_int_common
+
+.globl dos_int21_stub
+dos_int21_stub:             /* DOS API */
+    pushq $0x21
+    jmp dos_int_common
+
+.globl dos_int2f_stub
+dos_int2f_stub:             /* DOS Multiplex */
+    pushq $0x2F
+    jmp dos_int_common
+
+.globl dos_int31_stub
+dos_int31_stub:             /* DPMI */
+    pushq $0x31
+    jmp dos_int_common
+
+.globl dos_int33_stub
+dos_int33_stub:             /* Mouse */
+    pushq $0x33
+    jmp dos_int_common
+
+.globl dos_int67_stub
+dos_int67_stub:             /* EMS / VCPI */
+    pushq $0x67
+    jmp dos_int_common
+
+.globl dos_intf9_stub
+dos_intf9_stub:             /* DPMI default protected-mode reflector */
+    pushq $0xF9
+    jmp dos_int_common
+
+.globl dos_intfa_stub
+dos_intfa_stub:             /* DPMI real-mode callback return */
+    pushq $0xFA
+    jmp dos_int_common
+
+.globl dos_intfc_stub
+dos_intfc_stub:             /* DPMI raw PM-to-RM switch */
+    pushq $0xFC
+    jmp dos_int_common
+
+.globl dos_intfd_stub
+dos_intfd_stub:             /* DPMI processor-exception return */
+    pushq $0xFD
+    jmp dos_int_common
+
+.globl dos_exc01_stub
+dos_exc01_stub:             /* #DB, distinguished from software INT 01h */
+    pushq $0x101
+    jmp dos_int_common
+
+.section .note.GNU-stack,"",%progbits
+
+.section .rodata
+.balign 4
+dos_native_default_mxcsr: .long 0x1f80

@@ -1,0 +1,3 @@
+LIBRARY vstdlib_s64.dll
+EXPORTS
+KeyValuesSystemSteam

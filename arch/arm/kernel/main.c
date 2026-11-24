@@ -1,0 +1,357 @@
+/*
+ * main.c -- Osito-K AArch64 kernel entry point
+ *
+ * Initializes platform, prints banner and CPU info, then halts.
+ */
+
+#include "../include/hal.h"
+#include "../include/aarch64.h"
+#include "task.h"
+#include <stdbool.h>
+
+/* PCI + HDA */
+typedef struct {
+    uint8_t  bus, dev, func;
+    uint16_t vendor_id, device_id;
+    uint8_t  class_code, subclass;
+    uint64_t bar[6];
+} pci_dev_t;
+
+extern void pci_scan(void);
+extern pci_dev_t *pci_get_hda(void);
+extern pci_dev_t *pci_get_device(uint16_t vendor, uint16_t device);
+extern int  hda_init(uint64_t bar0, uint8_t bus, uint8_t dev, uint8_t func);
+extern void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
+extern bool hda_is_ready(void);
+
+/* ========================================================================
+ * Banner
+ * ======================================================================== */
+
+static void print_banner(void)
+{
+    serial_puts("\n");
+    serial_puts("  ___  ____ ___ _____ ___        _  __\n");
+    serial_puts(" / _ \\/ ___|_ _|_   _/ _ \\      | |/ /\n");
+    serial_puts("| | | \\___ \\| |  | || | | |_____| ' / \n");
+    serial_puts("| |_| |___) | |  | || |_| |_____| . \\ \n");
+    serial_puts(" \\___/|____/___| |_| \\___/      |_|\\_\\\n");
+    serial_puts("\n");
+    serial_puts("  Osito-K AArch64 kernel\n");
+    serial_puts("  naranjositos.tech\n");
+    serial_puts("\n");
+}
+
+/* ========================================================================
+ * CPU info
+ * ======================================================================== */
+
+/* Core name from MIDR_EL1, or NULL if unknown */
+const char *cpu_core_name(uint64_t midr)
+{
+    if (((midr >> 24) & 0xFF) != 0x41)     /* ARM Ltd */
+        return NULL;
+    switch ((midr >> 4) & 0xFFF) {
+    case 0xD05: return "Cortex-A55";
+    case 0xD0B: return "Cortex-A76";
+    case 0xD41: return "Cortex-A78";
+    case 0xD44: return "Cortex-X1";
+    case 0xD08: return "Cortex-A72";
+    case 0xD07: return "Cortex-A57";
+    case 0xD03: return "Cortex-A53";
+    }
+    return NULL;
+}
+
+static void print_cpu_info(void)
+{
+    uint64_t midr = read_midr_el1();
+    uint64_t mpidr = read_mpidr_el1();
+    uint64_t el = read_currentel();
+
+    uint32_t implementer = (midr >> 24) & 0xFF;
+    uint32_t variant = (midr >> 20) & 0xF;
+    uint32_t part = (midr >> 4) & 0xFFF;
+    uint32_t revision = midr & 0xF;
+
+    serial_puts("[CPU ] MIDR_EL1 = ");
+    serial_puthex(midr, 8);
+
+    serial_puts("  (impl=");
+    serial_puthex(implementer, 2);
+
+    serial_puts(" part=");
+    serial_puthex(part, 3);
+
+    serial_puts(" r");
+    serial_putdec(variant);
+    serial_puts("p");
+    serial_putdec(revision);
+    serial_puts(")\n");
+
+    /* Identify core */
+    serial_puts("[CPU ] Core: ");
+    const char *name = cpu_core_name(midr);
+    if (name) {
+        serial_puts(name);
+    } else if (implementer == 0x41) {  /* ARM Ltd */
+        serial_puts("ARM unknown (");
+        serial_puthex(part, 3);
+        serial_puts(")");
+    } else {
+        serial_puts("Unknown implementer ");
+        serial_puthex(implementer, 2);
+    }
+    serial_puts("\n");
+
+    serial_puts("[CPU ] MPIDR_EL1 = ");
+    serial_puthex(mpidr, 16);
+    serial_puts("\n");
+
+    serial_puts("[CPU ] CurrentEL = EL");
+    serial_putdec(el);
+    serial_puts("\n");
+}
+
+/* ========================================================================
+ * Weak default exception handlers
+ * ======================================================================== */
+
+/* QEMU virt has RAM at 0x40000000. SM8350 has none of virt's devices (PCI
+ * ECAM, virtio-mmio) and touching them is a synchronous external abort;
+ * virt in turn has no splash framebuffer at 0xE5000000. */
+static int on_qemu_virt(void)
+{
+    return platform_ram_base() == 0x40000000UL;
+}
+
+#ifndef SCREEN_DEBUG
+#define SCREEN_DEBUG 0
+#endif
+volatile int screen_debug = SCREEN_DEBUG;
+
+/* Panic telemetry on the SM8350 splash FB, for when no UART is attached:
+ * a colored band at rows 500-529, then three rows of 32 cells (MSB first,
+ * white = 1, grey = 0): ESR, ELR[31:0] and the runtime address of _start.
+ * The kernel is linked at 0, so ELR - _start is the faulting symbol's
+ * address in kernel.elf. Drawn outside debug mode too, over the console:
+ * it needs no lock, and the CPU that panicked may not get the console. */
+extern char _start[];
+
+static void fb_panic(uint32_t color, uint32_t esr, uint32_t elr)
+{
+    if (on_qemu_virt())
+        return;
+    volatile uint32_t *fb = (volatile uint32_t *)0xE5000000UL;
+    for (int y = 500; y < 530; y++)
+        for (int x = 0; x < 1080; x++)
+            fb[y * 1080 + x] = color;
+    uint32_t vals[3] = { esr, elr, (uint32_t)(uintptr_t)_start };
+    for (int v = 0; v < 3; v++)
+        for (int y = 540 + v * 40; y < 570 + v * 40; y++)
+            for (int x = 0; x < 32 * 32; x++)
+                fb[y * 1080 + x] = (x % 32 == 31) ? 0 :
+                    ((vals[v] >> (31 - x / 32)) & 1) ? 0x00FFFFFF : 0x00404040;
+}
+
+/* syscall.c: ends the running program instead, if the fault is its own */
+extern void proc_fault(uint64_t esr, uint64_t elr, uint64_t far);
+
+__attribute__((weak))
+void exception_handler(uint64_t esr, uint64_t elr, uint64_t far)
+{
+    proc_fault(esr, elr, far);
+    fb_panic(0x00FF8000, (uint32_t)esr, (uint32_t)elr);  /* orange */
+    serial_puts("\n[PANIC] Synchronous exception!\n");
+    serial_puts("  ESR_EL1 = ");
+    serial_puthex(esr, 8);
+    serial_puts("\n");
+    serial_puts("  ELR_EL1 = ");
+    serial_puthex(elr, 16);
+    serial_puts("\n");
+    serial_puts("  FAR_EL1 = ");
+    serial_puthex(far, 16);
+    serial_puts("\n");
+
+    for (;;)
+        __asm__ volatile("wfe");
+}
+
+/* On every CPU, on its IRQ stack (context_switch.S) */
+void irq_handler(void)
+{
+    struct cpu_sched *c = this_cpu();
+    uint32_t irqnr = gic_ack_irq();
+
+    if (irqnr == 27) {  /* Virtual timer PPI (CNTV) */
+        timer_tick_handler(c->boot);
+
+        /* SM8350 heartbeat: each CPU's square at rows 420-449 (x = 70 *
+         * cpu) toggles every 0.5 s, proof that its timer IRQs and the
+         * scheduler are alive. */
+        if (++c->ticks % 50 == 0)
+            FB_CPU_MARK(c->id, (c->ticks / 50) & 1 ? 0x00FFFFFF : 0x00000000);
+        sched_tick();
+    } else if (irqnr == SGI_YIELD) {
+        c->need_schedule = 1;
+    } else if (irqnr == SGI_STOP) {
+        gic_end_irq(irqnr);
+        smp_cpu_off();
+    } else if (irqnr != 1023) {
+        serial_puts("[IRQ ] Unhandled INTID: ");
+        serial_putdec(irqnr);
+        serial_puts("\n");
+    }
+
+    if (c->need_schedule && c->current) {
+        c->need_schedule = 0;
+        schedule();
+    }
+
+    if (irqnr != 1023)
+        gic_end_irq(irqnr);
+}
+
+__attribute__((weak))
+void serror_handler(uint64_t esr)
+{
+    fb_panic(0x008000FF, (uint32_t)esr, 0);  /* purple */
+    serial_puts("\n[PANIC] SError!\n");
+    serial_puts("  ESR_EL1 = ");
+    serial_puthex(esr, 8);
+    serial_puts("\n");
+
+    for (;;)
+        __asm__ volatile("wfe");
+}
+
+/* ========================================================================
+ * Shell wrapper (matches task_func_t signature)
+ * ======================================================================== */
+
+static void shell_wrapper(void *arg)
+{
+    (void)arg;
+    shell_run();
+}
+
+/* ========================================================================
+ * Kernel entry
+ * ======================================================================== */
+
+/* Screen debug mode: boot progress, one bar per step reached */
+static void fb_debug_bar(int row, uint32_t color)
+{
+    if (!screen_debug || on_qemu_virt())
+        return;
+    volatile uint32_t *fb = (volatile uint32_t *)(0xE5000000UL + row * 4320);
+    for (int i = 0; i < 1080 * 4; i++)  /* 4 rows wide, full width */
+        fb[i] = color;
+}
+
+void kernel_main(void *dtb)
+{
+    /* === VISUAL DEBUG: 30px tall bars, colors from shim (0x00RRGGBB) === */
+
+    /* Bar 1: RED = kernel_main reached */
+    for (int r = 20; r < 50; r++) fb_debug_bar(r, 0x00FF0000);
+
+    platform_init(dtb);
+    /* TPIDR_EL1 -> this CPU's scheduler state, which irq_vector_entry
+     * reads on every IRQ */
+    sched_cpu_init(smp_this_core(), 1);
+
+    /* Bar 2: GREEN = platform_init OK */
+    for (int r = 60; r < 90; r++) fb_debug_bar(r, 0x0000FF00);
+
+    serial_puts("[KERN] Serial OK\n");
+    print_banner();
+    print_cpu_info();
+
+    /* Bar 3: BLUE = pre-GIC */
+    for (int r = 100; r < 130; r++) fb_debug_bar(r, 0x000000FF);
+
+    /* Step 2: GIC */
+    gic_init();
+
+    /* Bar 4: YELLOW = GIC OK */
+    for (int r = 140; r < 170; r++) fb_debug_bar(r, 0x00FFFF00);
+
+    /* Step 3: Timer (100 Hz) */
+    timer_init(100);
+
+    /* Bar 5: CYAN = timer OK */
+    for (int r = 180; r < 210; r++) fb_debug_bar(r, 0x0000FFFF);
+
+    /* Step 4: Memory manager */
+    mem_init(platform_ram_base(), platform_ram_size());
+
+    /* Bar 6: MAGENTA = mem OK */
+    for (int r = 220; r < 250; r++) fb_debug_bar(r, 0x00FF00FF);
+
+    /* Step 5: MMU + caches (virt: kernel/paging.c, SM8350: platform/sm8350/mmu.c) */
+    platform_mmu_init();
+
+    /* Bar 7: WHITE = ALL INIT OK! */
+    for (int r = 260; r < 290; r++) fb_debug_bar(r, 0x00FFFFFF);
+
+    /* Step 6: Heap */
+    heap_init();
+
+    /* Step 7: PCI + HDA (QEMU virt only: no ECAM on SM8350) */
+    if (on_qemu_virt()) {
+        pci_scan();
+        pci_dev_t *hda = pci_get_hda();
+        if (hda && hda->bar[0]) {
+            hda_init(hda->bar[0], hda->bus, hda->dev, hda->func);
+        }
+    }
+
+    /* Enable IRQs early — needed for QEMU TCG DMA completion processing */
+    irq_enable();
+
+    /* Steps 8-9 probe QEMU virt devices (virtio-mmio), absent on SM8350 */
+    if (on_qemu_virt()) {
+        /* Step 8: VirtIO-blk (MMIO transport) + OsitoFS */
+        extern int osfs3_mount(uint64_t part_offset);
+        if (virtio_blk_init(0, 0, 0, (uint64_t[]){0,0,0,0,0,0}) == 0 &&
+            osfs3_mount(0) != 0)
+            osfs2_mount(0);  /* v3, else v2; at offset 0 (no GPT) */
+
+        /* Step 9: VirtIO-net + network stack */
+        extern int virtio_net_init(void);
+        extern void net_init(const uint8_t ip[4]);
+        if (virtio_net_init() == 0) {
+            uint8_t ip[] = {10, 0, 2, 15};  /* QEMU SLIRP default */
+            net_init(ip);
+        }
+    }
+    platform_probe_devices();
+
+    /* Step 10: SMP. The APs come up and park until sched_start releases
+     * them into the scheduler. PSCI is HVC on QEMU virt (try 4 cores),
+     * SMC on SM8350 (8 cores). */
+    if (on_qemu_virt())
+        smp_boot_aps(4, 0);
+    else
+        smp_boot_aps(8, 1);
+    /* With the cores on: a domain whose cores are all off doesn't report
+     * the new frequency yet */
+    platform_cpufreq_init();
+
+    /* Bar 8: GREY = devices done */
+    for (int r = 300; r < 330; r++) fb_debug_bar(r, 0x00808080);
+
+    /* Step 11: Scheduler + shell */
+    sched_init();
+    term_init();
+    task_create("shell", shell_wrapper, (void *)0, 1);
+    platform_start_tasks();
+
+    serial_puts("[KERN] Boot complete.\n");
+
+    /* Bar 9: DARK GREEN = scheduler starting (heartbeat square follows) */
+    for (int r = 340; r < 370; r++) fb_debug_bar(r, 0x00008000);
+
+    sched_start();  /* Never returns */
+}

@@ -1,0 +1,10 @@
+LIBRARY KERNEL32.dll
+EXPORTS
+    GetStdHandle@4
+    WriteFile@20
+    CreateFileA@28
+    ReadFile@20
+    SetFilePointer@16
+    CloseHandle@4
+    Sleep@4
+    ExitProcess@4

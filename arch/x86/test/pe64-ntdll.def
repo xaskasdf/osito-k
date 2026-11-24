@@ -1,0 +1,13 @@
+LIBRARY ntdll.dll
+EXPORTS
+    LdrLockLoaderLock
+    LdrUnlockLoaderLock
+    RtlAcquirePebLock
+    RtlTryAcquirePebLock
+    RtlReleasePebLock
+    RtlCaptureContext
+    RtlRaiseException
+    RtlRaiseStatus
+    RtlRestoreContext
+    RtlUnwindEx
+    RtlVirtualUnwind

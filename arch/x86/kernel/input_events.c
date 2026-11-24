@@ -1,0 +1,572 @@
+/*
+ * OsitoK x86-64 — Raw Input Event System (X-RETINA)
+ *
+ * High-priority input event queue with TSC timestamps.
+ * Supports keyboard and mouse events with event coalescing
+ * for compositor consumption.
+ *
+ * Design:
+ *   - Lock-free SPSC ring buffer (ISR writes, compositor reads)
+ *   - TSC timestamps for input prediction
+ *   - Event coalescing: mouse deltas accumulated between frames
+ *   - Keyboard events preserved individually (no loss)
+ *
+ * This module sits between the PS/2 hardware (keyboard.c) and
+ * the compositor. It provides raw events that the Win32 shim
+ * (user32_shim.c in exe-reverse) can also consume.
+ */
+
+#include "../include/input_events.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
+/* ── External functions ──────────────────────────────────────── */
+
+extern void serial_puts(const char *s);
+extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
+
+/* ── TSC (Time Stamp Counter) ────────────────────────────────── */
+
+static inline uint64_t rdtsc(void)
+{
+#ifdef __EMSCRIPTEN__
+    return (uint64_t)emscripten_get_now();
+#else
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+#endif
+}
+
+/* ── Event Types ─────────────────────────────────────────────── */
+
+#define INPUT_NONE       0
+#define INPUT_KEY_DOWN   1
+#define INPUT_KEY_UP     2
+#define INPUT_MOUSE_MOVE 3
+#define INPUT_MOUSE_BTN  4
+#define INPUT_MOUSE_WHEEL 5
+
+/* Mouse button flags */
+#define MOUSE_BTN_LEFT   (1 << 0)
+#define MOUSE_BTN_RIGHT  (1 << 1)
+#define MOUSE_BTN_MIDDLE (1 << 2)
+
+/* ── Input Event Structure ───────────────────────────────────── */
+
+typedef struct {
+    uint8_t  type;           /* INPUT_KEY_DOWN, INPUT_MOUSE_MOVE, etc. */
+    uint8_t  scancode;       /* HID keyboard-page usage (all transports) */
+    uint8_t  buttons;        /* current mouse button state */
+    uint8_t  flags;          /* KEY_FLAG_* modifiers */
+    int16_t  dx, dy;         /* mouse delta (for MOUSE_MOVE) */
+    int16_t  wheel;          /* mouse wheel delta */
+    uint16_t _pad;
+    uint64_t timestamp;      /* TSC at event time */
+} input_event_t;
+
+_Static_assert(sizeof(input_event_t) == 24, "input_event must be 24 bytes");
+
+/* ── Ring Buffer ─────────────────────────────────────────────── */
+
+#define INPUT_QUEUE_SIZE 256   /* power of 2 */
+#define INPUT_QUEUE_MASK (INPUT_QUEUE_SIZE - 1)
+
+static input_event_t input_queue[INPUT_QUEUE_SIZE];
+static volatile uint32_t input_head;   /* write index (ISR only) */
+static volatile uint32_t input_tail;   /* read index (consumer only) */
+
+/* Game mode: when a fullscreen compositor window is active (e.g. DOOM),
+ * the compositor's drain loop stops before keyboard events so the process
+ * can read them directly via SYS_GET_INPUT_EVENT → input_pop_event().
+ * Without this, the compositor drains KEY_DOWN/KEY_UP at 60fps and DOOM
+ * never sees them → keys appear stuck or need to be held very long. */
+bool input_game_mode = false;
+
+/* ── Mouse State ─────────────────────────────────────────────── */
+
+static int32_t  mouse_x, mouse_y;     /* absolute cursor position */
+static int32_t  screen_w, screen_h;   /* screen bounds for clamping */
+static uint8_t  mouse_buttons;        /* current button state */
+static int64_t  mouse_motion_x;
+static int64_t  mouse_motion_y;
+static uint64_t mouse_press_count[INPUT_MOUSE_BUTTON_COUNT];
+static uint64_t mouse_release_count[INPUT_MOUSE_BUTTON_COUNT];
+static int32_t  mouse_press_x[INPUT_MOUSE_BUTTON_COUNT];
+static int32_t  mouse_press_y[INPUT_MOUSE_BUTTON_COUNT];
+static int32_t  mouse_release_x[INPUT_MOUSE_BUTTON_COUNT];
+static int32_t  mouse_release_y[INPUT_MOUSE_BUTTON_COUNT];
+
+/* ── Keyboard Modifier State ─────────────────────────────────── */
+
+static uint8_t kb_modifiers;  /* current KEY_FLAG_* state */
+static uint8_t kb_modifier_keys; /* one bit per HID modifier, left and right */
+static bool kb_caps_down;
+
+#define INPUT_KEYBOARD_BYTES 256U
+static const void *keyboard_owner;
+static uint8_t keyboard_bytes[INPUT_KEYBOARD_BYTES];
+static uint32_t keyboard_read, keyboard_write, keyboard_count;
+static bool keyboard_overrun;
+static uint8_t keyboard_lock;
+
+static uint64_t input_keyboard_lock(void)
+{
+    uint64_t flags = 0;
+#if !defined(__EMSCRIPTEN__) && !defined(INPUT_HOST_TEST)
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+    while (__atomic_test_and_set(&keyboard_lock, __ATOMIC_ACQUIRE)) { }
+    return flags;
+}
+
+static void input_keyboard_unlock(uint64_t flags)
+{
+    __atomic_clear(&keyboard_lock, __ATOMIC_RELEASE);
+#if !defined(__EMSCRIPTEN__) && !defined(INPUT_HOST_TEST)
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+#else
+    (void)flags;
+#endif
+}
+
+bool input_keyboard_acquire(const void *owner)
+{
+    if (!owner) return false;
+    uint64_t flags = input_keyboard_lock();
+    bool acquired = !keyboard_owner;
+    if (acquired) {
+        keyboard_read = keyboard_write = keyboard_count = 0;
+        keyboard_overrun = false;
+        keyboard_owner = owner;
+    }
+    input_keyboard_unlock(flags);
+    return acquired;
+}
+
+void input_keyboard_release(const void *owner)
+{
+    uint64_t flags = input_keyboard_lock();
+    if (owner && keyboard_owner == owner) {
+        keyboard_owner = NULL;
+        keyboard_read = keyboard_write = keyboard_count = 0;
+        keyboard_overrun = false;
+    }
+    input_keyboard_unlock(flags);
+}
+
+bool input_keyboard_is_owner(const void *owner)
+{
+    uint64_t flags = input_keyboard_lock();
+    bool owned = owner && keyboard_owner == owner;
+    input_keyboard_unlock(flags);
+    return owned;
+}
+
+bool input_keyboard_post_set1(const uint8_t *bytes, uint32_t count)
+{
+    uint64_t flags = input_keyboard_lock();
+    bool captured = keyboard_owner != NULL;
+    if (captured && bytes && count) {
+        if (count > INPUT_KEYBOARD_BYTES - keyboard_count) {
+            keyboard_overrun = true;
+        } else {
+            for (uint32_t i = 0; i < count; i++) {
+                keyboard_bytes[keyboard_write] = bytes[i];
+                keyboard_write = (keyboard_write + 1U) % INPUT_KEYBOARD_BYTES;
+            }
+            keyboard_count += count;
+        }
+    }
+    input_keyboard_unlock(flags);
+    return captured;
+}
+
+bool input_keyboard_read_set1(const void *owner, uint8_t *byte)
+{
+    if (!owner || !byte) return false;
+    uint64_t flags = input_keyboard_lock();
+    bool available = keyboard_owner == owner &&
+                     (keyboard_count || keyboard_overrun);
+    if (available) {
+        if (keyboard_count) {
+            *byte = keyboard_bytes[keyboard_read];
+            keyboard_read = (keyboard_read + 1U) % INPUT_KEYBOARD_BYTES;
+            keyboard_count--;
+        } else {
+            *byte = 0; /* Set-1 buffer-overrun indication. */
+            keyboard_overrun = false;
+        }
+    }
+    input_keyboard_unlock(flags);
+    return available;
+}
+
+/* ── Enqueue event (called from ISR context) ─────────────────── */
+
+static void input_enqueue(input_event_t *evt)
+{
+    uint32_t next = (input_head + 1) & INPUT_QUEUE_MASK;
+    if (next == input_tail) {
+        /* Queue full — drop oldest event */
+        input_tail = (input_tail + 1) & INPUT_QUEUE_MASK;
+    }
+    input_queue[input_head] = *evt;
+    input_head = next;
+}
+
+/* ── Keyboard Events (called from keyboard IRQ handler) ──────── */
+
+void input_post_key(uint8_t usage, bool pressed, bool extended)
+{
+    if (usage <= 3) return; /* HID empty/error usages are not key transitions. */
+    if (usage >= 0xE0 && usage <= 0xE7) {
+        uint8_t bit = 1U << (usage - 0xE0);
+        if (pressed) kb_modifier_keys |= bit;
+        else         kb_modifier_keys &= ~bit;
+        kb_modifiers &= KEY_FLAG_CAPS;
+        if (kb_modifier_keys & 0x22) kb_modifiers |= KEY_FLAG_SHIFT;
+        if (kb_modifier_keys & 0x11) kb_modifiers |= KEY_FLAG_CTRL;
+        if (kb_modifier_keys & 0x44) kb_modifiers |= KEY_FLAG_ALT;
+    } else if (usage == 0x39) {
+        if (pressed && !kb_caps_down) kb_modifiers ^= KEY_FLAG_CAPS;
+        kb_caps_down = pressed;
+    }
+
+    input_event_t evt;
+    memset(&evt, 0, sizeof(evt));
+    evt.type = pressed ? INPUT_KEY_DOWN : INPUT_KEY_UP;
+    evt.scancode = usage;
+    evt.flags = kb_modifiers;
+    if (extended) evt.flags |= KEY_FLAG_EXTENDED;
+    evt.timestamp = rdtsc();
+    input_enqueue(&evt);
+}
+
+/* ── Mouse Events (called from mouse IRQ handler or PS/2 aux) ── */
+
+/* Simple mouse acceleration: small movements stay 1:1, fast movements
+ * get amplified. Threshold at 4 units, 2x multiplier above that.
+ * Feels natural without being jarring. */
+static int16_t accel(int16_t d)
+{
+    int16_t a = d < 0 ? -d : d;
+    if (a <= 4) return d;
+    /* Scale excess by 2x */
+    int16_t extra = (a - 4) * 2;
+    return d < 0 ? -(4 + extra) : (4 + extra);
+}
+
+void input_post_mouse_move(int16_t dx, int16_t dy)
+{
+    mouse_motion_x += dx;
+    mouse_motion_y += dy;
+
+    /* Apply acceleration curve then clamp */
+    mouse_x += accel(dx);
+    mouse_y += accel(dy);
+    if (mouse_x < 0) mouse_x = 0;
+    if (mouse_y < 0) mouse_y = 0;
+    if (mouse_x >= screen_w) mouse_x = screen_w - 1;
+    if (mouse_y >= screen_h) mouse_y = screen_h - 1;
+
+    input_event_t evt;
+    memset(&evt, 0, sizeof(evt));
+    evt.type = INPUT_MOUSE_MOVE;
+    evt.dx = dx;
+    evt.dy = dy;
+    evt.buttons = mouse_buttons;
+    evt.timestamp = rdtsc();
+    input_enqueue(&evt);
+}
+
+void input_set_mouse_abs(int32_t abs_x, int32_t abs_y)
+{
+    /* Scale from tablet coords (0-32767) to screen coords */
+    int32_t new_x = (abs_x * screen_w) / 32768;
+    int32_t new_y = (abs_y * screen_h) / 32768;
+    if (new_x < 0) new_x = 0;
+    if (new_y < 0) new_y = 0;
+    if (new_x >= screen_w) new_x = screen_w - 1;
+    if (new_y >= screen_h) new_y = screen_h - 1;
+
+    int16_t dx = (int16_t)(new_x - mouse_x);
+    int16_t dy = (int16_t)(new_y - mouse_y);
+    mouse_motion_x += dx;
+    mouse_motion_y += dy;
+    mouse_x = new_x;
+    mouse_y = new_y;
+
+    if (dx != 0 || dy != 0) {
+        input_event_t evt;
+        memset(&evt, 0, sizeof(evt));
+        evt.type = INPUT_MOUSE_MOVE;
+        evt.dx = dx;
+        evt.dy = dy;
+        evt.buttons = mouse_buttons;
+        evt.timestamp = rdtsc();
+        input_enqueue(&evt);
+    }
+}
+
+void input_post_mouse_button(uint8_t buttons)
+{
+    uint8_t changed = buttons ^ mouse_buttons;
+    if (!changed) return;
+
+    for (uint32_t i = 0; i < INPUT_MOUSE_BUTTON_COUNT; i++) {
+        uint8_t mask = (uint8_t)(1U << i);
+        if (!(changed & mask)) continue;
+        if (buttons & mask) {
+            mouse_press_count[i]++;
+            mouse_press_x[i] = mouse_x;
+            mouse_press_y[i] = mouse_y;
+        } else {
+            mouse_release_count[i]++;
+            mouse_release_x[i] = mouse_x;
+            mouse_release_y[i] = mouse_y;
+        }
+    }
+    mouse_buttons = buttons;
+
+    input_event_t evt;
+    memset(&evt, 0, sizeof(evt));
+    evt.type = INPUT_MOUSE_BTN;
+    evt.buttons = buttons;
+    evt.timestamp = rdtsc();
+    input_enqueue(&evt);
+}
+
+void input_post_mouse_wheel(int16_t delta)
+{
+    input_event_t evt;
+    memset(&evt, 0, sizeof(evt));
+    evt.type = INPUT_MOUSE_WHEEL;
+    evt.wheel = delta;
+    evt.buttons = mouse_buttons;
+    evt.timestamp = rdtsc();
+    input_enqueue(&evt);
+}
+
+/* ── Event Coalescing (called by compositor before each frame) ── */
+
+/* Drain all pending events with coalescing:
+ * - Mouse move deltas are accumulated into a single dx,dy
+ * - Key events are preserved individually
+ * Returns total number of key events written to key_out. */
+
+int input_drain_coalesced(int16_t *out_mouse_dx, int16_t *out_mouse_dy,
+                          uint8_t *out_buttons, int16_t *out_wheel,
+                          input_event_t *key_out, int key_max)
+{
+    int key_count = 0;
+    int32_t mdx = 0, mdy = 0;
+    int32_t wheel_accum = 0;
+    uint8_t btn_pressed_accum = 0;
+    *out_buttons = mouse_buttons;
+
+    while (input_tail != input_head) {
+        input_event_t *e = &input_queue[input_tail & INPUT_QUEUE_MASK];
+
+        /* Game mode: stop drain before keyboard events so the running
+         * process can read them via SYS_GET_INPUT_EVENT. */
+        if (input_game_mode &&
+            (e->type == INPUT_KEY_DOWN || e->type == INPUT_KEY_UP))
+            break;
+
+        input_tail = (input_tail + 1) & INPUT_QUEUE_MASK;
+
+        switch (e->type) {
+        case INPUT_MOUSE_MOVE:
+            /* Coalesce: accumulate deltas */
+            mdx += e->dx;
+            mdy += e->dy;
+            break;
+        case INPUT_MOUSE_BTN:
+            /* Accumulate any transient press so a click within one frame
+             * isn't lost when the release also arrives in the same drain. */
+            btn_pressed_accum |= (e->buttons & ~(*out_buttons));
+            *out_buttons = e->buttons;
+            break;
+        case INPUT_KEY_DOWN:
+        case INPUT_KEY_UP:
+            /* Preserve every key event */
+            if (key_count < key_max) {
+                key_out[key_count++] = *e;
+            }
+            break;
+        case INPUT_MOUSE_WHEEL:
+            /* Coalesce: accumulate wheel deltas between frames */
+            wheel_accum += e->wheel;
+            break;
+        }
+    }
+
+    /* Re-assert any button pressed then released within this frame */
+    *out_buttons |= btn_pressed_accum;
+
+    *out_mouse_dx = (int16_t)mdx;
+    *out_mouse_dy = (int16_t)mdy;
+    *out_wheel = (int16_t)wheel_accum;
+    return key_count;
+}
+
+/* ── Input Prediction (X-RETINA) ─────────────────────────────── */
+
+/* Predict cursor position for the next frame based on velocity.
+ * This hides input latency by extrapolating cursor movement.
+ * Call with the time until next frame display (in TSC ticks). */
+
+static int32_t prev_mouse_x, prev_mouse_y;
+static uint64_t prev_prediction_tsc;
+
+void input_predict_cursor(int32_t *predicted_x, int32_t *predicted_y,
+                          uint64_t frame_tsc_budget)
+{
+    uint64_t now = rdtsc();
+    uint64_t dt = now - prev_prediction_tsc;
+
+    if (dt == 0 || prev_prediction_tsc == 0) {
+        *predicted_x = mouse_x;
+        *predicted_y = mouse_y;
+        prev_mouse_x = mouse_x;
+        prev_mouse_y = mouse_y;
+        prev_prediction_tsc = now;
+        return;
+    }
+
+    /* Velocity in pixels per TSC tick */
+    int32_t vx = mouse_x - prev_mouse_x;
+    int32_t vy = mouse_y - prev_mouse_y;
+
+    /* Extrapolate by frame_tsc_budget / dt */
+    int32_t px = mouse_x + (int32_t)((int64_t)vx * (int64_t)frame_tsc_budget / (int64_t)dt);
+    int32_t py = mouse_y + (int32_t)((int64_t)vy * (int64_t)frame_tsc_budget / (int64_t)dt);
+
+    /* Clamp to screen */
+    if (px < 0) px = 0;
+    if (py < 0) py = 0;
+    if (px >= screen_w) px = screen_w - 1;
+    if (py >= screen_h) py = screen_h - 1;
+
+    *predicted_x = px;
+    *predicted_y = py;
+
+    prev_mouse_x = mouse_x;
+    prev_mouse_y = mouse_y;
+    prev_prediction_tsc = now;
+}
+
+/* ── Query Functions ─────────────────────────────────────────── */
+
+void input_get_cursor(int32_t *x, int32_t *y)
+{
+    *x = mouse_x;
+    *y = mouse_y;
+}
+
+uint8_t input_get_buttons(void) { return mouse_buttons; }
+uint8_t input_get_modifiers(void) { return kb_modifiers; }
+
+void input_get_mouse_snapshot(input_mouse_snapshot_t *snapshot)
+{
+    if (!snapshot) return;
+
+#ifndef __EMSCRIPTEN__
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+
+    snapshot->x = mouse_x;
+    snapshot->y = mouse_y;
+    snapshot->buttons = mouse_buttons;
+    memset(snapshot->reserved, 0, sizeof(snapshot->reserved));
+    snapshot->motion_x = mouse_motion_x;
+    snapshot->motion_y = mouse_motion_y;
+    for (uint32_t i = 0; i < INPUT_MOUSE_BUTTON_COUNT; i++) {
+        snapshot->press_count[i] = mouse_press_count[i];
+        snapshot->release_count[i] = mouse_release_count[i];
+        snapshot->press_x[i] = mouse_press_x[i];
+        snapshot->press_y[i] = mouse_press_y[i];
+        snapshot->release_x[i] = mouse_release_x[i];
+        snapshot->release_y[i] = mouse_release_y[i];
+    }
+
+#ifndef __EMSCRIPTEN__
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+#endif
+}
+
+bool input_has_events(void)
+{
+    return input_head != input_tail;
+}
+
+bool input_pop_event(input_event_t *out_evt)
+{
+    if (input_head == input_tail) return false;
+    *out_evt = input_queue[input_tail & INPUT_QUEUE_MASK];
+    input_tail = (input_tail + 1) & INPUT_QUEUE_MASK;
+    return true;
+}
+
+uint32_t input_queue_count(void)
+{
+    return (input_head - input_tail) & INPUT_QUEUE_MASK;
+}
+
+/* Discard all queued events — call before exec'ing a new process
+ * to prevent stale shell keystrokes from reaching the new process
+ * via SYS_GET_INPUT_EVENT. */
+void input_flush(void)
+{
+    input_tail = input_head;
+}
+
+/* ── Initialize ──────────────────────────────────────────────── */
+
+void input_events_init(uint32_t scr_width, uint32_t scr_height)
+{
+    input_head = 0;
+    input_tail = 0;
+    mouse_x = (int32_t)scr_width / 2;
+    mouse_y = (int32_t)scr_height / 2;
+    screen_w = (int32_t)scr_width;
+    screen_h = (int32_t)scr_height;
+    mouse_buttons = 0;
+    mouse_motion_x = 0;
+    mouse_motion_y = 0;
+    memset(mouse_press_count, 0, sizeof(mouse_press_count));
+    memset(mouse_release_count, 0, sizeof(mouse_release_count));
+    memset(mouse_press_x, 0, sizeof(mouse_press_x));
+    memset(mouse_press_y, 0, sizeof(mouse_press_y));
+    memset(mouse_release_x, 0, sizeof(mouse_release_x));
+    memset(mouse_release_y, 0, sizeof(mouse_release_y));
+    kb_modifiers = 0;
+    kb_modifier_keys = 0;
+    kb_caps_down = false;
+    prev_mouse_x = mouse_x;
+    prev_mouse_y = mouse_y;
+    prev_prediction_tsc = 0;
+
+    serial_puts("[INPUT] Event system initialized (");
+    serial_putdec(scr_width);
+    serial_puts("x");
+    serial_putdec(scr_height);
+    serial_puts(", queue=");
+    serial_putdec(INPUT_QUEUE_SIZE);
+    serial_puts(")\n");
+}
+
+/* Update screen bounds after modeset/resize.
+ * Re-clamps cursor to new dimensions. */
+void input_update_screen_bounds(uint32_t new_w, uint32_t new_h)
+{
+    screen_w = (int32_t)new_w;
+    screen_h = (int32_t)new_h;
+    if (mouse_x >= screen_w) mouse_x = screen_w - 1;
+    if (mouse_y >= screen_h) mouse_y = screen_h - 1;
+}

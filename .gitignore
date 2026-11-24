@@ -1,9 +1,28 @@
 # Build output
 build/
 
-# Toolchain (large, download separately)
-tools/xtensa-lx106-elf/
+# Local copy of binji/wasm-clang toolchain (60MB), hosted on
+# wasm.naranjositos.tech/toolchain/ — see docs/wasm-cc.md
+# Ignore the heavy binaries / vendored sources individually so our own
+# ositok.h next to them stays tracked.
+arch/wasm/cc-toolchain/clang.wasm
+arch/wasm/cc-toolchain/lld.wasm
+arch/wasm/cc-toolchain/memfs.wasm
+arch/wasm/cc-toolchain/sysroot.tar
+arch/wasm/cc-toolchain/shared.js
+arch/wasm/cc-toolchain/shared_web.js
+arch/wasm/cc-toolchain/worker.js
+arch/wasm/cc-toolchain/web.js
+arch/wasm/cc-toolchain/index.html
+
+# Toolchain (large, download separately) — Xtensa toolchain lives
+# under the xtensa arch directory after the 2026 migration.
+arch/xtensa/tools/xtensa-lx106-elf/
+arch/xtensa/tools/*.tar.gz
 tools/*.tar.gz
+# Pre-migration toolchain location (kept ignored for users who haven't
+# moved their existing extracted copy to the new arch/xtensa/tools/).
+tools/xtensa-lx106-elf/
 
 # Python venv
 .venv/
@@ -17,5 +36,84 @@ backup/
 *.swo
 *~
 
+# Object files and compiled tools
+*.o
+tools/ositofs/mkfs.ositofs
+tools/ositofs/mkfs.ositofs3
+tools/ositofs/ositofs-info
+tools/ositofs/ositofs-ls
+tools/ositofs/ositofs-write
+tools/ositofs/ositofs-write3
+tools/ositofs/ositofs-delete
+tools/ositofs/ositofs-read
+tools/ositofs/ositofs-rename
+tools/ositofs/ositofs-defrag
+tools/ositofs/ositofs-fsck
+tools/ositofs/ositofs-fsck3
+tools/ositofs/ositofs-read3
+tools/uzdecomp/uzdecomp
+
+# Local agent/tool state
+.agents/
+.omo/
+.wrangler/
+.debug/
+.tmp-*
+**/__pycache__/
+
+# Game / workload artifacts (binaries, discs, NVMe images)
+*.WAD
+*.wad
+*.iso
+*.ISO
+nvme_*.img
+doom.elf
+quake2.elf
+kernel.elf
+UnrealTournament.ini
+DOOM*.zip
+/Core.dll
+/Engine.dll
+/Window.dll
+/UnrealTournament.exe
+/Engine.u
+/*.dll
+/*.DLL
+/*.exe
+/*.EXE
+/*.u
+/*.U
+/*.bin
+/*.bundle
+/*UnrealTournament*
+/fix_*.py
+/EFI/
+/startup.nsh
+arch/x86/out/
+arch/x86/scripts/*.bin
+
+# In-tree test/build outputs
+arch/x86/test/*.elf
+arch/arm/test/hello
+arch/arm/test/neon_bench
+arch/arm/test/neon_test
+arch/x86/dos/test/*.COM
+arch/wasm/*.so
+
+# QEMU serial logs from local runs
+serial.*.log
+serial_*.log
+/log/
+
+# UnrealEngine .int localization files
+*.int
+
+# ARM test scratch area
+arch/arm/test/models/
+
+# macOS Finder metadata
+.DS_Store
+
 # Claude Code session data
 .claude/
+.gitnexus

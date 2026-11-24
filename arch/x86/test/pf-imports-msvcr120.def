@@ -1,0 +1,3 @@
+LIBRARY MSVCR120.dll
+EXPORTS
+_ismbblead

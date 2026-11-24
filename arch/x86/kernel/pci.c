@@ -1,0 +1,1108 @@
+/*
+ * OsitoK x86-64 — PCIe Enumeration (ECAM via MCFG)
+ *
+ * Scans all PCIe buses using ECAM (Enhanced Configuration Access Mechanism).
+ * MCFG ACPI table provides the base address for memory-mapped config space.
+ * Falls back to legacy I/O port access (CF8/CFC) if MCFG unavailable.
+ */
+
+#include "../include/types.h"
+#include "../include/pci.h"
+#include "../drivers/gpu.h"
+#include "../drivers/intel_gfx.h"
+
+/* ── Declarations ────────────────────────────────────────────── */
+
+extern int paging_map_mmio(uint64_t phys, uint64_t size);
+
+extern void serial_puts(const char *s);
+extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
+extern void fb_puts(const char *s);
+extern void fb_puthex(uint64_t val, int digits);
+extern void fb_putdec(uint64_t val);
+extern void fb_putc(char c, uint32_t color);
+
+/* ── ACPI Tables ─────────────────────────────────────────────── */
+
+typedef struct __attribute__((packed)) {
+    char     signature[4];
+    uint32_t length;
+    uint8_t  revision;
+    uint8_t  checksum;
+    char     oem_id[6];
+    char     oem_table_id[8];
+    uint32_t oem_revision;
+    uint32_t creator_id;
+    uint32_t creator_revision;
+} acpi_sdt_header_t;
+
+typedef struct __attribute__((packed)) {
+    char     signature[8];   /* "RSD PTR " */
+    uint8_t  checksum;
+    char     oem_id[6];
+    uint8_t  revision;
+    uint32_t rsdt_addr;
+    uint32_t length;
+    uint64_t xsdt_addr;
+    uint8_t  ext_checksum;
+    uint8_t  reserved[3];
+} acpi_rsdp_t;
+
+typedef struct __attribute__((packed)) {
+    uint64_t base_addr;
+    uint16_t segment;
+    uint8_t  start_bus;
+    uint8_t  end_bus;
+    uint32_t reserved;
+} mcfg_entry_t;
+
+/* ── PCI Config ──────────────────────────────────────────────── */
+
+#define PCI_CONFIG_PORT  0xCF8
+#define PCI_DATA_PORT    0xCFC
+
+/* PCI class codes we care about */
+#define PCI_CLASS_STORAGE    0x01
+#define PCI_CLASS_NETWORK    0x02
+#define PCI_CLASS_DISPLAY    0x03
+#define PCI_SUBCLASS_VGA     0x00
+#define PCI_SUBCLASS_NVME    0x08
+#define PCI_SUBCLASS_ETHERNET 0x00
+
+/* ECAM state */
+static uint64_t ecam_base;
+static uint8_t  ecam_start_bus;
+static uint8_t  ecam_end_bus;
+static uint16_t ecam_segment;
+
+/* Detected devices */
+#define MAX_PCI_DEVICES 64
+
+static pci_dev_t pci_devices[MAX_PCI_DEVICES];
+static int       pci_device_count;
+
+/* GPU, NVMe, NIC, and xHCI devices (set during scan) */
+gpu_device_t gpu_dev;
+#define MAX_NVME_DEVS 4
+static pci_dev_t nvme_dev_stores[MAX_NVME_DEVS];
+static int       nvme_dev_count;
+static pci_dev_t nic_dev_store, xhci_dev_store, hda_dev_store;
+static pci_dev_t virtio_gpu_dev_store;
+static pci_dev_t intel_gfx_dev_store;
+static int       has_virtio_gpu;
+static int       has_intel_gfx;
+static pci_dev_t *nvme_dev;   /* first NVMe (backward compat) */
+static pci_dev_t *nic_dev;
+static pci_dev_t *xhci_dev;
+static pci_dev_t *hda_dev;
+static pci_dev_t wlan_dev_store;
+static pci_dev_t *wlan_dev;
+
+/* CF8 selects a register globally, including across CPUs. */
+static uint8_t pci_io_lock;
+
+#ifdef PCI_HOST_TEST
+extern uint64_t pci_test_irq_save(void);
+extern void pci_test_irq_restore(uint64_t flags);
+extern void pci_test_outw(uint16_t port, uint16_t value);
+#endif
+
+static uint64_t pci_io_begin(void)
+{
+    uint64_t flags;
+#ifdef PCI_HOST_TEST
+    flags = pci_test_irq_save();
+#else
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+#endif
+    while (__atomic_test_and_set(&pci_io_lock, __ATOMIC_ACQUIRE))
+        __asm__ volatile ("pause");
+    return flags;
+}
+
+static void pci_io_end(uint64_t flags)
+{
+    __atomic_clear(&pci_io_lock, __ATOMIC_RELEASE);
+#ifdef PCI_HOST_TEST
+    pci_test_irq_restore(flags);
+#else
+    if (flags & (1ULL << 9)) __asm__ volatile ("sti" ::: "memory");
+#endif
+}
+
+/* ── Legacy PCI I/O access ───────────────────────────────────── */
+
+static uint32_t pci_io_read32(uint8_t bus, uint8_t dev, uint8_t func, uint8_t offset)
+{
+    uint32_t addr = (1U << 31) | ((uint32_t)bus << 16) | ((uint32_t)dev << 11) |
+                    ((uint32_t)func << 8) | (offset & 0xFC);
+    uint64_t flags = pci_io_begin();
+    outl(PCI_CONFIG_PORT, addr);
+    uint32_t value = inl(PCI_DATA_PORT);
+    pci_io_end(flags);
+    return value;
+}
+
+/* ── ECAM access ─────────────────────────────────────────────── */
+
+static volatile void *ecam_addr(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offset)
+{
+    uint64_t addr = ecam_base +
+                    (((uint64_t)(bus - ecam_start_bus) << 20) |
+                     ((uint64_t)dev << 15) |
+                     ((uint64_t)func << 12) |
+                     offset);
+    return (volatile void *)addr;
+}
+
+static uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offset)
+{
+    if (ecam_base && bus >= ecam_start_bus && bus <= ecam_end_bus)
+        return mmio_read32(ecam_addr(bus, dev, func, offset));
+    return pci_io_read32(bus, dev, func, (uint8_t)offset);
+}
+
+static uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offset)
+{
+    if (ecam_base && bus >= ecam_start_bus && bus <= ecam_end_bus) {
+        volatile uint16_t *p = (volatile uint16_t *)ecam_addr(bus, dev, func, offset);
+        return *p;
+    }
+    uint32_t val = pci_io_read32(bus, dev, func, (uint8_t)(offset & 0xFC));
+    return (uint16_t)(val >> ((offset & 2) * 8));
+}
+
+static void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offset, uint32_t val)
+{
+    if (ecam_base && bus >= ecam_start_bus && bus <= ecam_end_bus)
+        mmio_write32(ecam_addr(bus, dev, func, offset), val);
+    else {
+        uint32_t addr = (1U << 31) | ((uint32_t)bus << 16) | ((uint32_t)dev << 11) |
+                        ((uint32_t)func << 8) | (offset & 0xFC);
+        uint64_t flags = pci_io_begin();
+        outl(PCI_CONFIG_PORT, addr);
+        outl(PCI_DATA_PORT, val);
+        pci_io_end(flags);
+    }
+}
+
+/* ── Read PCI BAR ────────────────────────────────────────────── */
+
+static uint64_t pci_read_bar(uint8_t bus, uint8_t dev, uint8_t func, int bar_idx)
+{
+    uint16_t offset = (uint16_t)(0x10 + bar_idx * 4);
+    uint32_t lo = pci_read32(bus, dev, func, offset);
+
+    if (lo == 0) return 0;
+
+    /* Check if 64-bit BAR */
+    if ((lo & 0x6) == 0x4) {
+        uint32_t hi = pci_read32(bus, dev, func, offset + 4);
+        return ((uint64_t)hi << 32) | (lo & ~0xFULL);
+    }
+    return lo & ~0xFULL;
+}
+
+/* ── Read PCI BAR Size ───────────────────────────────────────── */
+
+static uint64_t pci_read_bar_size(uint8_t bus, uint8_t dev, uint8_t func, int bar_idx)
+{
+    uint16_t offset = (uint16_t)(0x10 + bar_idx * 4);
+
+    /* Save original BAR value */
+    uint32_t orig_lo = pci_read32(bus, dev, func, offset);
+    if (orig_lo == 0) return 0;
+
+    bool is_64bit = ((orig_lo & 0x6) == 0x4);
+    uint32_t orig_hi = 0;
+    if (is_64bit)
+        orig_hi = pci_read32(bus, dev, func, offset + 4);
+
+    /* Write all-ones to get size mask */
+    pci_write32(bus, dev, func, offset, 0xFFFFFFFF);
+    uint32_t mask_lo = pci_read32(bus, dev, func, offset);
+
+    uint64_t mask;
+
+    if (is_64bit) {
+        pci_write32(bus, dev, func, offset + 4, 0xFFFFFFFF);
+        uint32_t mask_hi = pci_read32(bus, dev, func, offset + 4);
+        mask = ((uint64_t)mask_hi << 32) | (mask_lo & ~0xFULL);
+        /* Restore high */
+        pci_write32(bus, dev, func, offset + 4, orig_hi);
+    } else {
+        /* 32-bit BAR: set upper 32 bits so ~mask doesn't overflow */
+        mask = 0xFFFFFFFF00000000ULL | (mask_lo & ~0xFULL);
+    }
+
+    /* Restore original */
+    pci_write32(bus, dev, func, offset, orig_lo);
+
+    if (mask == (uint64_t)-1 || (mask & 0xFFFFFFFFULL) == 0xFFFFFFF0ULL) return 0;
+    return (~mask) + 1;
+}
+
+/* ── Find MCFG ACPI table ────────────────────────────────────── */
+
+/* RSDP from UEFI config table (set by main.c from boot_info) */
+extern uint64_t kernel_acpi_rsdp;
+
+static int find_mcfg(void)
+{
+    acpi_rsdp_t *rsdp = NULL;
+
+    /* Try UEFI-provided RSDP first (from EFI configuration table) */
+    if (kernel_acpi_rsdp) {
+        /* Map RSDP page before accessing (may be in ACPI Reclaim above mapped RAM) */
+        paging_map_mmio(kernel_acpi_rsdp & ~0xFFFULL, 8192);
+        __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+        char *p = (char *)kernel_acpi_rsdp;
+        if (p[0] == 'R' && p[1] == 'S' && p[2] == 'D' && p[3] == ' ' &&
+            p[4] == 'P' && p[5] == 'T' && p[6] == 'R' && p[7] == ' ') {
+            rsdp = (acpi_rsdp_t *)kernel_acpi_rsdp;
+        } else {
+            fb_puts(" PCI: RSDP sig bad at ");
+            fb_puthex(kernel_acpi_rsdp, 16);
+            fb_puts("\n");
+        }
+    } else {
+        fb_puts(" PCI: no UEFI RSDP\n");
+    }
+
+    /* Fallback: scan BIOS ROM area (works in QEMU/legacy BIOS) */
+    if (!rsdp) {
+        for (uint64_t addr = 0x000E0000; addr < 0x00100000; addr += 16) {
+            char *p = (char *)addr;
+            if (p[0] == 'R' && p[1] == 'S' && p[2] == 'D' && p[3] == ' ' &&
+                p[4] == 'P' && p[5] == 'T' && p[6] == 'R' && p[7] == ' ') {
+                rsdp = (acpi_rsdp_t *)addr;
+                break;
+            }
+        }
+    }
+
+    if (!rsdp) {
+        serial_puts("[PCI] RSDP not found, using legacy I/O\n");
+        fb_puts(" PCI: RSDP not found\n");
+        return -1;
+    }
+
+    serial_puts("[PCI] RSDP found at ");
+    serial_puthex((uint64_t)rsdp, 16);
+    serial_puts(" rev=");
+    serial_putdec(rsdp->revision);
+    serial_puts("\n");
+    /* RSDP details go to serial only */
+
+    /* Use XSDT if revision >= 2 */
+    acpi_sdt_header_t *root;
+    int use_xsdt = (rsdp->revision >= 2 && rsdp->xsdt_addr != 0);
+
+    if (use_xsdt)
+        root = (acpi_sdt_header_t *)rsdp->xsdt_addr;
+    else
+        root = (acpi_sdt_header_t *)(uint64_t)rsdp->rsdt_addr;
+
+    /* XSDT/RSDT details go to serial only */
+
+    /* Map the XSDT/RSDT pages before accessing (may be above mapped RAM) */
+    paging_map_mmio((uint64_t)root & ~0xFFFULL, 16384);
+    __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+    /* Validate XSDT/RSDT signature */
+    if (use_xsdt) {
+        if (root->signature[0] != 'X' || root->signature[1] != 'S' ||
+            root->signature[2] != 'D' || root->signature[3] != 'T') {
+            fb_puts(" PCI: XSDT sig invalid!\n");
+            return -1;
+        }
+    } else {
+        if (root->signature[0] != 'R' || root->signature[1] != 'S' ||
+            root->signature[2] != 'D' || root->signature[3] != 'T') {
+            fb_puts(" PCI: RSDT sig invalid!\n");
+            return -1;
+        }
+    }
+
+    /* Search for MCFG table */
+    int entry_size = use_xsdt ? 8 : 4;
+    int entries = (root->length - sizeof(acpi_sdt_header_t)) / entry_size;
+    uint8_t *entry_ptr = (uint8_t *)root + sizeof(acpi_sdt_header_t);
+
+    /* ACPI table count goes to serial only */
+
+    for (int i = 0; i < entries; i++) {
+        uint64_t table_addr;
+        if (use_xsdt)
+            table_addr = *(uint64_t *)(entry_ptr + i * 8);
+        else
+            table_addr = *(uint32_t *)(entry_ptr + i * 4);
+
+        /* Map each ACPI table page before reading its header */
+        paging_map_mmio(table_addr & ~0xFFFULL, 8192);
+        __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+        acpi_sdt_header_t *hdr = (acpi_sdt_header_t *)table_addr;
+        if (hdr->signature[0] == 'M' && hdr->signature[1] == 'C' &&
+            hdr->signature[2] == 'F' && hdr->signature[3] == 'G') {
+            /* Found MCFG */
+            mcfg_entry_t *mcfg = (mcfg_entry_t *)((uint8_t *)hdr + sizeof(acpi_sdt_header_t) + 8);
+            ecam_base = mcfg->base_addr;
+            ecam_start_bus = mcfg->start_bus;
+            ecam_end_bus = mcfg->end_bus;
+            ecam_segment = mcfg->segment;
+
+            serial_puts("[PCI] MCFG: ECAM base ");
+            serial_puthex(ecam_base, 16);
+            serial_puts(", buses ");
+            serial_putdec(ecam_start_bus);
+            serial_puts("-");
+            serial_putdec(ecam_end_bus);
+            serial_puts("\n");
+            /* ECAM details go to serial only */
+
+            /* Map ECAM MMIO region into page tables.
+             * Each bus uses 1MB of config space (32 devs × 8 funcs × 4KB).
+             * Total = (end_bus - start_bus + 1) MB. */
+            uint64_t ecam_size = (uint64_t)(ecam_end_bus - ecam_start_bus + 1) << 20;
+            paging_map_mmio(ecam_base, ecam_size);
+            /* Flush TLB so ECAM reads work immediately */
+            __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+            return 0;
+        }
+    }
+
+    serial_puts("[PCI] MCFG not found, using legacy I/O\n");
+    fb_puts(" PCI: no MCFG found\n");
+    return -1;
+}
+
+/* ── PCI Scan ────────────────────────────────────────────────── */
+
+static void pci_add_device(uint8_t bus, uint8_t dev, uint8_t func,
+                           uint16_t vendor, uint16_t device,
+                           uint8_t class, uint8_t subclass)
+{
+    /* Always detect important devices (GPU, NVMe, NIC, xHCI) even if array full */
+    pci_dev_t tmp_dev;
+    pci_dev_t *d;
+
+    if (pci_device_count < MAX_PCI_DEVICES) {
+        d = &pci_devices[pci_device_count];
+    } else {
+        d = &tmp_dev; /* Use stack temp — still detect special devices */
+    }
+
+    d->bus = bus;
+    d->dev = dev;
+    d->func = func;
+    d->vendor_id = vendor;
+    d->device_id = device;
+    d->class_code = class;
+    d->subclass = subclass;
+
+    /* Read BARs */
+    for (int i = 0; i < 6; i++)
+        d->bar[i] = pci_read_bar(bus, dev, func, i);
+
+    /* Check if NVIDIA GPU */
+    if (vendor == PCI_VENDOR_NVIDIA && class == PCI_CLASS_DISPLAY) {
+        gpu_dev.vendor_id = vendor;
+        gpu_dev.device_id = device;
+        gpu_dev.generation = gpu_detect_gen(device);
+        gpu_dev.backend = GPU_BACKEND_NVIDIA_GSP;
+        gpu_dev.bar0_base = d->bar[0];
+        gpu_dev.bar1_base = d->bar[1];
+        gpu_dev.pci_bus  = bus;
+        gpu_dev.pci_dev  = dev;
+        gpu_dev.pci_func = func;
+        gpu_dev.bar0_size = pci_read_bar_size(bus, dev, func, 0);
+        gpu_dev.bar1_size = pci_read_bar_size(bus, dev, func, 1);
+
+        serial_puts("[PCI] GPU BAR0: ");
+        serial_putdec(gpu_dev.bar0_size >> 20);
+        serial_puts(" MB, BAR1: ");
+        serial_putdec(gpu_dev.bar1_size >> 20);
+        serial_puts(" MB\n");
+    }
+
+    /* Check if Intel integrated display controller (Gen9 handled by intel_gfx.c) */
+    if (vendor == 0x8086 && class == PCI_CLASS_DISPLAY && !has_intel_gfx) {
+        intel_gfx_dev_store = *d;
+        has_intel_gfx = 1;
+        serial_puts("[PCI] Intel display: ");
+        serial_puthex(vendor, 4);
+        serial_puts(":");
+        serial_puthex(device, 4);
+        serial_puts(" ");
+        serial_puts(intel_gfx_device_name(device));
+        serial_puts(" BAR0=0x");
+        serial_puthex(d->bar[0], 16);
+        serial_puts(" BAR2=0x");
+        serial_puthex(d->bar[2], 16);
+        serial_puts("\n");
+    }
+
+    /* Check if virtio-gpu (vendor 0x1AF4, device 0x1050) */
+    if (vendor == 0x1AF4 && device == 0x1050) {
+        /* Read BARs directly — the generic scan may have missed them */
+        for (int b = 0; b < 4; b++) {
+            uint32_t raw = pci_read32(bus, dev, func, 0x10 + b*4);
+            serial_puts("[PCI] virtio-gpu raw BAR"); serial_putdec(b);
+            serial_puts("=0x"); serial_puthex(raw, 8); serial_puts("\n");
+            if (raw && !d->bar[b])
+                d->bar[b] = raw & ~0xFULL;
+        }
+        virtio_gpu_dev_store = *d;
+        has_virtio_gpu = 1;
+        serial_puts("[PCI] virtio-gpu at ");
+        serial_putdec(bus); serial_puts(":"); serial_putdec(dev);
+        serial_puts("."); serial_putdec(func);
+        serial_puts(" BAR0=0x"); serial_puthex(d->bar[0], 16);
+        serial_puts(" BAR1=0x"); serial_puthex(d->bar[1], 16);
+        serial_puts("\n");
+    }
+
+    /* Check if NVMe controller */
+    if (class == PCI_CLASS_STORAGE && subclass == PCI_SUBCLASS_NVME) {
+        if (nvme_dev_count < MAX_NVME_DEVS) {
+            nvme_dev_stores[nvme_dev_count++] = *d;
+            if (!nvme_dev) nvme_dev = &nvme_dev_stores[0];
+        }
+    }
+
+    /* Check if Ethernet NIC */
+    if (class == PCI_CLASS_NETWORK && subclass == PCI_SUBCLASS_ETHERNET) {
+        nic_dev_store = *d;
+        nic_dev = &nic_dev_store;
+    }
+
+    /* Keep WLAN separate: an unassociated radio is not an Ethernet link. */
+    if (class == PCI_CLASS_NETWORK && subclass == 0x80 &&
+        vendor == 0x8086 && device == 0x2723 && !wlan_dev) {
+        wlan_dev_store = *d;
+        wlan_dev = &wlan_dev_store;
+        serial_puts("[PCI] Intel AX200 WLAN detected (native iwx diagnostics)\n");
+    }
+
+    /* Check if xHCI USB 3.x controller (class 0x0C, subclass 0x03, prog_if 0x30) */
+    if (class == 0x0C && subclass == 0x03) {
+        uint32_t reg2 = pci_read32(bus, dev, func, 8);
+        uint8_t prog_if = (reg2 >> 8) & 0xFF;
+        if (prog_if == 0x30 && !xhci_dev) {
+            xhci_dev_store = *d;
+            xhci_dev = &xhci_dev_store;
+            serial_puts("[PCI] xHCI controller: ");
+            serial_puthex(vendor, 4);
+            serial_puts(":");
+            serial_puthex(device, 4);
+            serial_puts(" BAR0=");
+            serial_puthex(d->bar[0], 16);
+            serial_puts("\n");
+        }
+    }
+
+    /* Check if HDA controller (class 0x04, subclass 0x03) */
+    if (class == 0x04 && subclass == 0x03 && !hda_dev) {
+        hda_dev_store = *d;
+        hda_dev = &hda_dev_store;
+    }
+
+    if (pci_device_count < MAX_PCI_DEVICES)
+        pci_device_count++;
+}
+
+static const char *pci_class_name(uint8_t class, uint8_t subclass)
+{
+    /* NOTE: -fno-jump-tables in KCFLAGS prevents GCC from generating
+     * relative jump tables that break under EFI relocation. */
+    if (class == 0x01) {
+        if (subclass == 0x06) return "SATA";
+        if (subclass == 0x08) return "NVMe";
+        return "Storage";
+    }
+    if (class == 0x02) return "Network";
+    if (class == 0x03) return "Display";
+    if (class == 0x04) {
+        if (subclass == 0x03) return "HDA";
+        return "Multimedia";
+    }
+    if (class == 0x06) {
+        if (subclass == 0x00) return "Host Bridge";
+        if (subclass == 0x01) return "ISA Bridge";
+        if (subclass == 0x04) return "PCI Bridge";
+        return "Bridge";
+    }
+    if (class == 0x0C) {
+        if (subclass == 0x03) return "USB";
+        if (subclass == 0x05) return "SMBus";
+        return "Serial Bus";
+    }
+    return "Other";
+}
+
+void __initk pci_scan(void)
+{
+    pci_device_count = 0;
+    memset(&gpu_dev, 0, sizeof(gpu_dev));
+    nvme_dev = NULL;
+    nvme_dev_count = 0;
+    nic_dev = NULL;
+    wlan_dev = NULL;
+    xhci_dev = NULL;
+    hda_dev = NULL;
+    has_virtio_gpu = 0;
+    has_intel_gfx = 0;
+
+    /* Try ECAM first */
+    find_mcfg();
+
+    uint8_t max_bus = ecam_base ? ecam_end_bus : 255;
+
+    /* Track subordinate buses from PCI bridges (for legacy scan optimization) */
+    uint8_t bus_active[256];
+    memset(bus_active, 0, 256);
+    bus_active[0] = 1; /* Always scan bus 0 */
+
+    serial_puts("\n[PCI] Scanning (");
+    serial_puts(ecam_base ? "ECAM" : "legacy");
+    serial_puts(")...\n");
+
+    /* PCIe device list goes to serial only */
+
+    /* Two-pass scan for legacy mode: first pass finds bridges on bus 0,
+     * second pass scans subordinate buses discovered from bridges.
+     * With ECAM, single pass scanning all buses. */
+    int pass, max_pass = ecam_base ? 1 : 2;
+    for (pass = 0; pass < max_pass; pass++) {
+    for (uint16_t bus = 0; bus <= max_bus; bus++) {
+        /* In legacy mode, only scan buses we know about */
+        if (!ecam_base && !bus_active[bus]) continue;
+
+        for (uint8_t dev = 0; dev < 32; dev++) {
+            for (uint8_t func = 0; func < 8; func++) {
+                uint32_t reg0 = pci_read32((uint8_t)bus, dev, func, 0);
+                uint16_t vendor = reg0 & 0xFFFF;
+                uint16_t device = reg0 >> 16;
+
+                if (vendor == 0xFFFF || vendor == 0) continue;
+
+                uint32_t reg2 = pci_read32((uint8_t)bus, dev, func, 8);
+                uint8_t class = (reg2 >> 24) & 0xFF;
+                uint8_t subclass = (reg2 >> 16) & 0xFF;
+
+                /* PCI-to-PCI bridge: record subordinate buses for next pass */
+                if (class == 0x06 && subclass == 0x04 && pass == 0) {
+                    uint32_t busreg = pci_read32((uint8_t)bus, dev, func, 0x18);
+                    uint8_t secondary = (busreg >> 8) & 0xFF;
+                    uint8_t subordinate = (busreg >> 16) & 0xFF;
+                    if (secondary > 0 && secondary <= max_bus) {
+                        for (uint16_t b = secondary;
+                             b <= subordinate && b <= max_bus; b++)
+                            bus_active[b] = 1;
+                    }
+                    serial_puts("  Bridge: bus ");
+                    serial_putdec(secondary);
+                    serial_puts("-");
+                    serial_putdec(subordinate);
+                    serial_puts("\n");
+                }
+
+                /* Only add devices on second pass (or first if ECAM) */
+                if (pass > 0 || ecam_base) {
+                    pci_add_device((uint8_t)bus, dev, func, vendor, device, class, subclass);
+
+                    /* Print to serial */
+                    serial_puts("  ");
+                    serial_puthex(bus, 2);
+                    serial_puts(":");
+                    serial_puthex(dev, 2);
+                    serial_puts(".");
+                    serial_putdec(func);
+                    serial_puts(" [");
+                    serial_puthex(vendor, 4);
+                    serial_puts(":");
+                    serial_puthex(device, 4);
+                    serial_puts("] ");
+                    serial_puts(pci_class_name(class, subclass));
+                    serial_puts("\n");
+
+                    /* Device list to framebuffer removed — use serial for details */
+                }
+
+                /* If not multi-function, skip remaining functions */
+                if (func == 0) {
+                    uint32_t hdr = pci_read32((uint8_t)bus, dev, 0, 0x0C);
+                    if (!((hdr >> 16) & 0x80)) break;
+                }
+            }
+        }
+    }
+    } /* end pass loop */
+
+    serial_puts("[PCI] Found ");
+    serial_putdec((uint64_t)pci_device_count);
+    serial_puts(" devices\n");
+
+    /* PCI summary moved to main.c pre-shell display */
+}
+
+/* ── Accessors ───────────────────────────────────────────────── */
+
+gpu_device_t *pci_get_gpu(void)
+{
+    return gpu_dev.vendor_id ? &gpu_dev : NULL;
+}
+
+pci_dev_t *pci_get_virtio_gpu(void)
+{
+    return has_virtio_gpu ? &virtio_gpu_dev_store : NULL;
+}
+
+pci_dev_t *pci_get_intel_gfx(void)
+{
+    return has_intel_gfx ? &intel_gfx_dev_store : NULL;
+}
+
+pci_dev_t *pci_get_nvme(void)
+{
+    return nvme_dev;
+}
+
+int pci_get_nvme_count(void)
+{
+    return nvme_dev_count;
+}
+
+pci_dev_t *pci_get_nvme_idx(int idx)
+{
+    return (idx >= 0 && idx < nvme_dev_count) ? &nvme_dev_stores[idx] : NULL;
+}
+
+pci_dev_t *pci_get_nic(void)
+{
+    return nic_dev;
+}
+
+const pci_dev_t *pci_get_wlan(void)
+{
+    return wlan_dev;
+}
+
+pci_dev_t *pci_get_xhci(void)
+{
+    return xhci_dev;
+}
+
+pci_dev_t *pci_get_hda(void)
+{
+    return hda_dev;
+}
+
+int pci_get_device_count(void)
+{
+    return pci_device_count;
+}
+
+bool pci_kexec_quiesce(void)
+{
+    if (pci_device_count >= MAX_PCI_DEVICES) return false;
+    /* Stop DMA at its source. Bridge forwarding belongs to the PCI bus,
+     * not to a device driver; preserve it and all BAR decode for reinit. */
+    for (int i = 0; i < pci_device_count; i++) {
+        const pci_dev_t *p = &pci_devices[i];
+        if (p->class_code == 6) continue;
+        uint16_t cmd = pci_cfg_read16(p->bus, p->dev, p->func, 4);
+        if (cmd == 0xffff) return false;
+        pci_cfg_write16(p->bus, p->dev, p->func, 4, cmd & ~4U);
+        if (pci_cfg_read16(p->bus, p->dev, p->func, 4) & 4) return false;
+        if (!(pci_cfg_read16(p->bus, p->dev, p->func, 6) & 0x10)) continue;
+        uint16_t cap = pci_cfg_read16(p->bus, p->dev, p->func, 0x34) & 0xff;
+        uint64_t seen = 0;
+        while (cap) {
+            if (cap < 0x40 || cap > 0xfc || (cap & 3) || (seen & (1ULL << (cap / 4)))) return false;
+            seen |= 1ULL << (cap / 4);
+            uint16_t value = pci_cfg_read16(p->bus, p->dev, p->func, cap);
+            if ((value & 0xff) == 0x10) {
+                if (cap > 0xf4) return false;
+                unsigned budget = 1000000;
+                while (pci_cfg_read16(p->bus, p->dev, p->func, cap + 10) & 0x20) {
+                    if (!--budget) return false;
+                    __asm__ volatile ("pause");
+                }
+                break;
+            }
+            cap = value >> 8;
+        }
+    }
+    __asm__ volatile ("mfence" ::: "memory");
+    return true;
+}
+
+/* Public PCI config access (for drivers that need direct config reads) */
+bool pci_cfg_write8(uint8_t bus, uint8_t dev, uint8_t func,
+                    uint16_t offset, uint8_t value)
+{
+    if (dev > 31 || func > 7 || offset > 4095) return false;
+    if (ecam_base && bus >= ecam_start_bus && bus <= ecam_end_bus) {
+        *(volatile uint8_t *)ecam_addr(bus, dev, func, offset) = value;
+        return true;
+    }
+    if (offset > 255) return false;
+    uint32_t addr = (1U << 31) | ((uint32_t)bus << 16) |
+                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (offset & 0xfc);
+    uint16_t port = PCI_DATA_PORT + (offset & 3);
+    uint64_t flags = pci_io_begin();
+    outl(PCI_CONFIG_PORT, addr);
+#ifdef PCI_HOST_TEST
+    extern void pci_test_outb(uint16_t, uint8_t);
+    pci_test_outb(port, value);
+#else
+    __asm__ volatile ("outb %0, %1" :: "a"(value), "Nd"(port) : "memory");
+#endif
+    pci_io_end(flags);
+    return true;
+}
+
+uint16_t pci_cfg_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offset)
+{
+    if ((offset & 1) || offset > 254) return 0xffff;
+    return pci_read16(bus, dev, func, offset);
+}
+
+void pci_cfg_write16(uint8_t bus, uint8_t dev, uint8_t func,
+                     uint16_t offset, uint16_t value)
+{
+    if ((offset & 1) || offset > 254) return;
+    if (ecam_base && bus >= ecam_start_bus && bus <= ecam_end_bus) {
+        *(volatile uint16_t *)ecam_addr(bus, dev, func, offset) = value;
+        return;
+    }
+    uint32_t addr = (1U << 31) | ((uint32_t)bus << 16) |
+                    ((uint32_t)dev << 11) | ((uint32_t)func << 8) | (offset & 0xfc);
+    uint16_t port = PCI_DATA_PORT + (offset & 2);
+    uint64_t flags = pci_io_begin();
+    outl(PCI_CONFIG_PORT, addr);
+    /* Do not echo adjacent W1C Status bits when changing Command/PMCSR. */
+#ifdef PCI_HOST_TEST
+    pci_test_outw(port, value);
+#else
+    __asm__ volatile ("outw %0, %1" :: "a"(value), "Nd"(port) : "memory");
+#endif
+    pci_io_end(flags);
+}
+
+uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offset)
+{
+    return pci_read32(bus, dev, func, offset);
+}
+
+void pci_cfg_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offset, uint32_t val)
+{
+    pci_write32(bus, dev, func, offset, val);
+}
+
+/* ECAM status for diagnostics */
+bool pci_diag_read32(uint8_t bus, uint8_t dev, uint8_t func,
+                     uint16_t offset, uint32_t *value)
+{
+    if (!value || dev > 31 || func > 7 || (offset & 3) || offset > 4092)
+        return false;
+    if (offset >= 256 && !(ecam_base && bus >= ecam_start_bus && bus <= ecam_end_bus))
+        return false;
+    *value = pci_read32(bus, dev, func, offset);
+    return true;
+}
+
+uint16_t pci_diag_segment(uint8_t bus)
+{
+    return ecam_base && bus >= ecam_start_bus && bus <= ecam_end_bus ? ecam_segment : 0;
+}
+
+int pci_diag_parent(const pci_dev_t *child, pci_dev_t *parent)
+{
+    if (!child || !parent || pci_device_count >= MAX_PCI_DEVICES) return -1;
+    bool found = false;
+    for (int i = 0; i < pci_device_count; i++) {
+        const pci_dev_t *p = &pci_devices[i];
+        if (p->class_code != 6 || p->subclass != 4 ||
+            pci_diag_segment(p->bus) != pci_diag_segment(child->bus)) continue;
+        uint32_t buses, header, id;
+        if (!pci_diag_read32(p->bus, p->dev, p->func, 0, &id) ||
+            id != (p->vendor_id | ((uint32_t)p->device_id << 16)) ||
+            !pci_diag_read32(p->bus, p->dev, p->func, 0x0c, &header) ||
+            ((header >> 16) & 0x7f) != 1 ||
+            !pci_diag_read32(p->bus, p->dev, p->func, 0x18, &buses)) return -1;
+        unsigned primary = buses & 255, secondary = (buses >> 8) & 255;
+        unsigned subordinate = (buses >> 16) & 255;
+        if (primary != p->bus || !secondary || primary == secondary || secondary > subordinate)
+            return -1;
+        if (secondary != child->bus) continue;
+        if (found) return -1;
+        *parent = *p;
+        found = true;
+    }
+    return found ? 1 : 0;
+}
+
+uint64_t pci_get_ecam_base(void) { return ecam_base; }
+uint8_t  pci_get_ecam_end_bus(void) { return ecam_end_bus; }
+
+static uint8_t pci_dma_lock;
+
+static bool pci_dma_endpoint_stopped(const pci_dev_t *d)
+{
+    uint32_t id, header, class;
+    if (!pci_diag_read32(d->bus, d->dev, d->func, 0, &id) ||
+        id != (d->vendor_id | ((uint32_t)d->device_id << 16)) ||
+        !pci_diag_read32(d->bus, d->dev, d->func, 0x0c, &header) ||
+        ((header >> 16) & 0x7f) != 0 ||
+        !pci_diag_read32(d->bus, d->dev, d->func, 8, &class) ||
+        (class >> 16) != ((unsigned)d->class_code << 8 | d->subclass)) return false;
+    uint16_t command = pci_cfg_read16(d->bus, d->dev, d->func, 4);
+    return command != 0xffff && !(command & 4);
+}
+
+static bool pci_dma_bridge_state(const pci_dma_bridge_t *p, uint16_t *command)
+{
+    uint32_t id, header, class, buses, control;
+    if (!pci_diag_read32(p->bus, p->dev, p->func, 0, &id) || id != p->id ||
+        !pci_diag_read32(p->bus, p->dev, p->func, 0x0c, &header) ||
+        ((header >> 16) & 0x7f) != 1 ||
+        !pci_diag_read32(p->bus, p->dev, p->func, 8, &class) || (class >> 16) != 0x0604 ||
+        !pci_diag_read32(p->bus, p->dev, p->func, 0x18, &buses) ||
+        (buses & 0xffffff) != p->buses ||
+        !pci_diag_read32(p->bus, p->dev, p->func, 0x3c, &control) ||
+        control == UINT32_MAX || (control & (0x40U << 16))) return false;
+    *command = pci_cfg_read16(p->bus, p->dev, p->func, 4);
+    /* Require firmware-configured memory decode; do not invent bridge windows. */
+    return *command != 0xffff && (*command & 2);
+}
+
+static const char *pci_dma_prepare(const pci_dev_t *d, pci_dma_path_t *r)
+{
+    if (!d || d->dev > 31 || d->func > 7 || !d->vendor_id || d->vendor_id == 0xffff)
+        return "invalid PCI DMA endpoint";
+    if (pci_device_count <= 0 || pci_device_count >= MAX_PCI_DEVICES)
+        return "PCI inventory incomplete for DMA path";
+    unsigned matches = 0;
+    for (int i = 0; i < pci_device_count; i++) {
+        const pci_dev_t *p = &pci_devices[i];
+        if (p->bus == d->bus && p->dev == d->dev && p->func == d->func) {
+            if (p->vendor_id != d->vendor_id || p->device_id != d->device_id ||
+                p->class_code != d->class_code || p->subclass != d->subclass)
+                return "PCI DMA endpoint differs from inventory";
+            matches++;
+        }
+    }
+    if (matches != 1 || !pci_dma_endpoint_stopped(d))
+        return "PCI DMA endpoint missing, changed or bus mastering active";
+    r->segment = pci_diag_segment(d->bus);
+    /* MCFG describes config-space coverage, not host-bridge root buses.
+     * Until ACPI root-bridge enumeration exists, only bus 0 is established. */
+    const unsigned root_bus = 0;
+    pci_dev_t child = *d, parent;
+    for (;;) {
+        int found = pci_diag_parent(&child, &parent);
+        if (found < 0) return "PCI DMA parent topology invalid/ambiguous";
+        if (!found) {
+            if (child.bus != root_bus) return "PCI DMA path does not reach known root bus";
+            break;
+        }
+        if (child.bus == root_bus || pci_diag_segment(parent.bus) != r->segment)
+            return "PCI DMA path crosses root/segment";
+        for (unsigned i = 0; i < r->count; i++)
+            if (r->bridge[i].bus == parent.bus)
+                return "PCI DMA bridge cycle";
+        if (r->count == PCI_DMA_PATH_MAX) return "PCI DMA bridge depth exceeded";
+        uint32_t buses;
+        if (!pci_diag_read32(parent.bus, parent.dev, parent.func, 0x18, &buses))
+            return "PCI DMA bridge bus registers inaccessible";
+        if ((buses & 255) != parent.bus || ((buses >> 8) & 255) != child.bus ||
+            ((buses >> 16) & 255) < d->bus || ((buses >> 8) & 255) > d->bus)
+            return "PCI DMA bridge range does not contain endpoint";
+        pci_dma_bridge_t *p = &r->bridge[r->count++];
+        *p = (pci_dma_bridge_t){.bus = parent.bus, .dev = parent.dev, .func = parent.func,
+            .id = parent.vendor_id | ((uint32_t)parent.device_id << 16),
+            .buses = buses & 0xffffff};
+        if (!pci_dma_bridge_state(p, &p->before))
+            return "PCI DMA bridge identity/decode/reset invalid";
+        p->after = p->before;
+        child = parent;
+    }
+    /* Every bridge claiming the endpoint bus must belong to this one path.
+     * This also rejects a missing direct parent hidden by a wider bus window. */
+    for (int i = 0; i < pci_device_count; i++) {
+        const pci_dev_t *p = &pci_devices[i];
+        if (p->class_code != 6 || p->subclass != 4 ||
+            pci_diag_segment(p->bus) != r->segment) continue;
+        uint32_t buses;
+        if (!pci_diag_read32(p->bus, p->dev, p->func, 0x18, &buses))
+            return "PCI DMA topology unreadable";
+        if (((buses >> 8) & 255) > d->bus || ((buses >> 16) & 255) < d->bus) continue;
+        unsigned j;
+        for (j = 0; j < r->count; j++)
+            if (r->bridge[j].bus == p->bus && r->bridge[j].dev == p->dev &&
+                r->bridge[j].func == p->func) break;
+        if (j == r->count) return "PCI DMA bridge windows overlap outside path";
+    }
+    /* Only monotonic BME enables on shared infrastructure. Never roll these
+     * back behind another child; the caller retains endpoint DMA ownership. */
+    for (unsigned i = r->count; i; i--) {
+        pci_dma_bridge_t *p = &r->bridge[i - 1];
+        uint16_t command;
+        if (!pci_dma_endpoint_stopped(d) || !pci_dma_bridge_state(p, &command))
+            return "PCI DMA path changed before bridge enable";
+        p->before = command;
+        if (!(command & 4)) {
+            p->written = true;
+            pci_cfg_write16(p->bus, p->dev, p->func, 4, command | 4);
+        }
+        if (!pci_dma_bridge_state(p, &p->after) || p->after != (uint16_t)(command | 4))
+            return "PCI DMA bridge bus mastering did not latch";
+        p->verified = true;
+    }
+    for (unsigned i = 0; i < r->count; i++) {
+        pci_dma_bridge_t *p = &r->bridge[i];
+        if (!pci_dma_bridge_state(p, &p->after) || !(p->after & 4)) {
+            p->verified = false;
+            return "PCI DMA bridge changed during path verification";
+        }
+    }
+    if (!pci_dma_endpoint_stopped(d)) return "PCI DMA endpoint changed during preparation";
+    r->ready = true;
+    return NULL;
+}
+
+const char *pci_prepare_dma_path(const pci_dev_t *endpoint, pci_dma_path_t *r)
+{
+    if (!r) return "PCI DMA path report is required";
+    memset(r, 0, sizeof(*r));
+    r->attempted = true;
+    if (__atomic_test_and_set(&pci_dma_lock, __ATOMIC_ACQUIRE))
+        return r->error = "PCI DMA path preparation busy";
+    r->error = pci_dma_prepare(endpoint, r);
+    __atomic_clear(&pci_dma_lock, __ATOMIC_RELEASE);
+    return r->error;
+}
+
+/* Enable bus mastering + memory space for a PCI device */
+void pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func)
+{
+    uint32_t cmd_before = pci_read32(bus, dev, func, 0x04);
+    uint32_t cmd_after  = cmd_before | (1u << 1) | (1u << 2);  /* Memory + BusMaster */
+    pci_write32(bus, dev, func, 0x04, cmd_after);
+    uint32_t cmd_read = pci_read32(bus, dev, func, 0x04);
+    serial_puts("[PCI] BM enable B/D/F=");
+    serial_puthex(bus, 2);  serial_puts(":");
+    serial_puthex(dev, 2);  serial_puts(".");
+    serial_puthex(func, 1);
+    serial_puts(" CMD before=0x"); serial_puthex(cmd_before & 0xFFFF, 4);
+    serial_puts(" wrote=0x");      serial_puthex(cmd_after  & 0xFFFF, 4);
+    serial_puts(" readback=0x");   serial_puthex(cmd_read   & 0xFFFF, 4);
+    serial_puts("\n");
+}
+
+/* Enable MSI for a PCI device — program MSI message address/data and set enable.
+ * MSI writes directly to LAPIC (bypasses IOAPIC). vector = IDT vector number. */
+int pci_enable_msi(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector)
+{
+    /* Walk capability list to find MSI capability (Cap ID = 0x05).
+     *
+     * The PCI Status register is at config offset 0x06 (16 bits). MMIO
+     * reads of ECAM space MUST be naturally aligned (UC memory; Intel
+     * SDM 11.3) — reading from byte 0x06 with a 32-bit access is
+     * undefined behaviour and was returning 0 here, killing MSI for
+     * every device including the i211 NIC.
+     *
+     * Read the aligned dword at 0x04 (Cmd[15:0] + Status[31:16] in the
+     * dword view) and test bit 20 = bit 4 of Status = "Capabilities
+     * List present". */
+    uint32_t cmd_status = pci_read32(bus, dev, func, 0x04);
+    if (!(cmd_status & (1u << 20))) {
+        serial_puts("[PCI] No capability list (cmd_status=0x");
+        serial_puthex(cmd_status, 8);
+        serial_puts(")\n");
+        return -1;
+    }
+
+    uint8_t cap_ptr = (uint8_t)(pci_read32(bus, dev, func, 0x34) & 0xFF);
+    while (cap_ptr) {
+        uint32_t cap_hdr = pci_read32(bus, dev, func, cap_ptr);
+        uint8_t cap_id   = cap_hdr & 0xFF;
+        uint8_t next_ptr = (cap_hdr >> 8) & 0xFF;
+
+        if (cap_id == 0x05) {
+            /* Found MSI capability */
+            uint16_t msg_ctrl = (uint16_t)(cap_hdr >> 16);
+
+            /* Message Address (cap+4): target BSP LAPIC (ID 0).
+             *
+             * x86 MSI message-address layout (Intel SDM Vol 3 §11.11.1):
+             *   bits  0..1 : reserved (00)
+             *   bit   2    : DM   (destination mode: 0=physical, 1=logical)
+             *   bit   3    : RH   (redirection hint: 0=direct, 1=lowest-pri)
+             *   bits  4..11: 0xFEE (LAPIC base low nibble fixed)
+             *   bits 12..19: destination ID (target APIC ID)
+             *   bits 20..31: 0xFEE (LAPIC base high)
+             *
+             * 0xFEE00000 = 0xFEE.00.0.0.0 = APIC ID 0 (BSP), physical mode,
+             * direct delivery — what we want for a single-CPU MSI target. */
+            uint32_t msg_addr = 0xFEE00000;
+            pci_write32(bus, dev, func, cap_ptr + 4, msg_addr);
+
+            /* 64-bit address? Check bit 7 of Message Control */
+            uint16_t data_offset = (msg_ctrl & (1 << 7)) ? 12 : 8;
+            if (msg_ctrl & (1 << 7))
+                pci_write32(bus, dev, func, cap_ptr + 8, 0);  /* upper 32 bits = 0 */
+
+            /* Message Data (cap+8 or cap+12).
+             *
+             * x86 MSI message-data layout (Intel SDM Vol 3 §11.11.2):
+             *   bits  0..7 : vector
+             *   bits  8..10: delivery mode (000=Fixed, 010=SMI, 100=NMI,
+             *                               101=INIT, 111=ExtINT)
+             *   bits 11..13: reserved
+             *   bit   14   : trigger level (only for level-triggered)
+             *   bit   15   : trigger mode  (0=edge, 1=level)
+             *   bits 16..31: reserved
+             *
+             * For x86 MSI we want vector + Fixed delivery + Edge trigger,
+             * which is just the bare vector with all upper bits = 0.  We
+             * write that explicitly so it's obvious what's intended; if a
+             * future bug asks "is this edge-triggered?" the answer is in
+             * the source. */
+            uint32_t msg_data = (uint32_t)vector;   /* DM=000 Fixed, TM=0 Edge */
+            pci_write32(bus, dev, func, cap_ptr + data_offset, msg_data);
+
+            /* Enable MSI: set bit 0 of Message Control (at cap+2) */
+            uint32_t ctrl_dword = pci_read32(bus, dev, func, cap_ptr);
+            ctrl_dword |= (1 << 16);  /* MSI Enable = bit 0 of msg_ctrl = bit 16 of dword */
+            pci_write32(bus, dev, func, cap_ptr, ctrl_dword);
+
+            /* Disable INTx (prevent legacy interrupt alongside MSI) */
+            uint32_t cmd = pci_read32(bus, dev, func, 0x04);
+            cmd |= (1 << 10);  /* Interrupt Disable */
+            pci_write32(bus, dev, func, 0x04, cmd);
+
+            serial_puts("[PCI] MSI enabled: vector ");
+            serial_putdec(vector);
+            serial_puts(" for ");
+            serial_putdec(bus);
+            serial_puts(":");
+            serial_putdec(dev);
+            serial_puts(".");
+            serial_putdec(func);
+            serial_puts("\n");
+            return 0;
+        }
+
+        cap_ptr = next_ptr;
+    }
+
+    serial_puts("[PCI] MSI capability not found\n");
+    return -1;
+}

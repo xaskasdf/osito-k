@@ -1,0 +1,49 @@
+LIBRARY MSVCR100.dll
+EXPORTS
+    ?_type_info_dtor_internal_method@type_info@@QAEXXZ
+    __CppXcptFilter
+    __clean_type_info_names_internal
+    __daylight
+    __p__environ
+    __timezone
+    _errno
+    _CIexp
+    _CIlog10
+    _CIsqrt
+    _daylight DATA
+    _environ DATA
+    _chmod
+    _close
+    _ctime64
+    _fdopen
+    _finite
+    _ftime
+    _fstat64
+    _getdcwd
+    _getdrive
+    _get_osfhandle
+    _open
+    _putenv_s
+    _stat64i32
+    _timezone DATA
+    _unlink
+    _wunlink
+    _wremove
+    _wcserror
+    _wgetdcwd
+    fclose
+    free
+    malloc
+    mbstowcs
+    raise
+    remove
+    rename
+    signal
+    strtok
+    strtod
+    wcstombs
+    _wrename
+    _vswprintf_c_l
+    _snwprintf
+    _iob DATA
+    fwprintf

@@ -1,0 +1,19 @@
+LIBRARY USER32.dll
+EXPORTS
+    RegisterClassA@4
+    UnregisterClassA@8
+    CreateWindowExA@48
+    DestroyWindow@4
+    DefWindowProcA@16
+    SendMessageA@16
+    InvalidateRect@12
+    ValidateRect@8
+    GetUpdateRect@12
+    UpdateWindow@4
+    CreateDialogIndirectParamA@20
+    GetSysColor@4
+    BeginPaint@8
+    EndPaint@8
+    GetDC@4
+    ReleaseDC@8
+    FillRect@12

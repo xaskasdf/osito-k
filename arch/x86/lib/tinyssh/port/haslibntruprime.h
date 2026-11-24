@@ -1,0 +1,1 @@
+/* Use the vendored portable NTRU Prime implementation. */

@@ -1,0 +1,23 @@
+LIBRARY kernel32.dll
+EXPORTS
+ExitProcess@4
+LoadLibraryA@4
+GetProcAddress@8
+GetLastError@0
+GetCurrentProcessId@0
+GetCommandLineA@0
+GetStdHandle@4
+SetStdHandle@8
+SetHandleInformation@12
+AllocConsole@0
+FreeConsole@0
+GetConsoleMode@8
+OutputDebugStringA@4
+CreateProcessA@40
+WaitForSingleObject@8
+GetExitCodeProcess@8
+CloseHandle@4
+CreateFileA@28
+WriteFile@20
+GetFileSize@8
+DeleteFileA@4

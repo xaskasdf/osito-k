@@ -1,0 +1,36 @@
+# Repo origin is macOS (LF). Windows editors/tools were introducing CRLF into
+# some committed source files, producing 1000s-of-lines whitespace diffs.
+# Force LF for text source so working trees stay consistent across platforms.
+.gitattributes text eol=lf
+*.c        text eol=lf
+*.h        text eol=lf
+*.cpp      text eol=lf
+*.hpp      text eol=lf
+*.S        text eol=lf
+*.s        text eol=lf
+*.md       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.sh       text eol=lf
+*.py       text eol=lf
+*.java     text eol=lf
+*.inc      text eol=lf
+*.patch    text eol=lf
+arch/x86/scripts/patches/*.patch -whitespace
+*.ld       text eol=lf
+*.autoload text eol=lf
+*.def      text eol=lf
+Makefile   text eol=lf
+*.mk       text eol=lf
+.gitignore text eol=lf
+
+# Binary assets — never normalize.
+*.bin      binary
+*.img      binary
+*.elf      binary
+*.efi      binary
+*.dll      binary
+*.exe      binary
+*.u        binary
+*.gguf     binary
+*.png      binary

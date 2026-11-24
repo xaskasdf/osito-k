@@ -1,0 +1,1 @@
+/* Signal delivery is not part of the kernel console channel. */

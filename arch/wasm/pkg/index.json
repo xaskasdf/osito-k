@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "updated": "2026-05-10",
+  "packages": [
+    {
+      "name": "hello",
+      "url": "hello.wasm",
+      "desc": "minimal WASI hello-world (writes \"hello, osito\\n\" to stdout)",
+      "size": 184
+    },
+    {
+      "name": "fib",
+      "url": "fib.wasm",
+      "desc": "iterative fibonacci(30) demo, prints result",
+      "size": 477
+    },
+    {
+      "name": "echo",
+      "url": "echo.wasm",
+      "desc": "reads argv and prints each arg on its own line",
+      "size": 404
+    },
+    {
+      "name": "cat",
+      "url": "cat.wasm",
+      "desc": "stream stdin to stdout in 4 KiB chunks",
+      "size": 246
+    },
+    {
+      "name": "wc",
+      "url": "wc.wasm",
+      "desc": "count lines and bytes from stdin (POSIX wc -lc)",
+      "size": 529
+    },
+    {
+      "name": "rev",
+      "url": "rev.wasm",
+      "desc": "reverse each line from stdin (POSIX rev)",
+      "size": 376
+    },
+    {
+      "name": "upper",
+      "url": "upper.wasm",
+      "desc": "ascii a-z -> A-Z, like tr a-z A-Z",
+      "size": 315
+    },
+    {
+      "name": "yes",
+      "url": "yes.wasm",
+      "desc": "print 'y\\n' forever until SIGPIPE (POSIX yes)",
+      "size": 188
+    },
+    {
+      "name": "grep",
+      "url": "grep.wasm",
+      "desc": "filter stdin lines containing argv[1] substring (no regex)",
+      "size": 625
+    },
+    {
+      "name": "head",
+      "url": "head.wasm",
+      "desc": "print first N lines (head 5 or head -n 5; default 10)",
+      "size": 574
+    },
+    {
+      "name": "seq",
+      "url": "seq.wasm",
+      "desc": "print 1..N one per line (seq 5)",
+      "size": 567
+    },
+    {
+      "name": "nl",
+      "url": "nl.wasm",
+      "desc": "number stdin lines, '<n>\\t<line>'",
+      "size": 519
+    },
+    {
+      "name": "tail",
+      "url": "tail.wasm",
+      "desc": "print last N lines (tail 5 or tail -n 5; default 10; 64 KiB max input)",
+      "size": 597
+    },
+    {
+      "name": "base64",
+      "url": "base64.wasm",
+      "desc": "encode stdin to base64 (RFC 2045, 76-column lines)",
+      "size": 628
+    }
+  ]
+}
